@@ -3201,6 +3201,29 @@ function isBootstrapComplete() {
     return false
   }
 
+  // OTTO release installs (packaged): a newly-installed release ships a shell
+  // whose install-stamp pins a NEWER commit than the backend clone was
+  // bootstrapped at (an in-place upgrade replaces the shell but does not
+  // re-bootstrap). Report "not complete" so startup re-runs the existing
+  // bootstrap path pinned to INSTALL_STAMP.commit — a one-time "updating…" that
+  // fast-forwards the backend clone so it matches the installed shell, then
+  // rewrites this marker with the new pinnedCommit (so it runs once per
+  // release). Source installs manage HEAD via git-update and are unaffected
+  // (isReleaseInstall is false without a productVersion stamp).
+  // NOTE: this fast-forward needs network at that launch; an offline launch
+  // right after an upgrade will show the install overlay until reachable.
+  if (
+    isReleaseInstall(INSTALL_STAMP, IS_PACKAGED) &&
+    INSTALL_STAMP?.commit &&
+    marker.pinnedCommit !== INSTALL_STAMP.commit
+  ) {
+    rememberLog(
+      `[updates] release shell pins ${INSTALL_STAMP.commit.slice(0, 12)}, backend clone at ${marker.pinnedCommit.slice(0, 12)}; re-bootstrapping to fast-forward the backend`
+    )
+
+    return false
+  }
+
   // We DELIBERATELY do NOT verify that the checkout is currently at the
   // pinned commit -- users update via the in-app update path or `hermes
   // update`, which moves HEAD legitimately. The marker just attests "we
