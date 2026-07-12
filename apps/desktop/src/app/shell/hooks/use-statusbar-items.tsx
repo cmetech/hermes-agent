@@ -181,10 +181,22 @@ export function useStatusbarItems({
     const behind = updateStatus?.behind ?? 0
     const applying = updateApply.applying || updateApply.stage === 'restart'
     const remote = connection?.mode === 'remote'
+    // OTTO release installs update by downloading the next release, so the
+    // footer shows a generic "(update)" hint instead of a git "(+N)" count.
+    const isRelease = updateStatus?.mode === 'release'
+    const updateAvailable = isRelease ? Boolean(updateStatus?.updateAvailable) : behind > 0
 
     const version = appVersion ? `v${appVersion}` : (sha ?? copy.unknown)
     const base = remote ? copy.clientLabel(appVersion ?? sha ?? copy.unknown) : version
-    const behindHint = !applying && behind > 0 ? ` (+${behind})` : ''
+    const behindHint = applying
+      ? ''
+      : isRelease
+        ? updateAvailable
+          ? ` (${copy.update})`
+          : ''
+        : behind > 0
+          ? ` (+${behind})`
+          : ''
 
     const label = applying
       ? `${base} · ${updateApply.stage === 'restart' ? copy.restart : copy.update}`
@@ -192,7 +204,8 @@ export function useStatusbarItems({
 
     const tooltip = [
       applying ? updateApply.message || copy.updateInProgress : null,
-      !applying && behind > 0 && copy.commitsBehind(behind, updateStatus?.branch ?? '...'),
+      !applying && !isRelease && behind > 0 && copy.commitsBehind(behind, updateStatus?.branch ?? '...'),
+      !applying && isRelease && updateAvailable && copy.update,
       appVersion && copy.desktopVersion(appVersion),
       sha && copy.commit(sha),
       updateStatus?.branch && copy.branch(updateStatus.branch)
@@ -201,7 +214,7 @@ export function useStatusbarItems({
       .join(' · ')
 
     return {
-      className: !applying && behind > 0 ? 'text-primary hover:text-primary' : undefined,
+      className: !applying && updateAvailable ? 'text-primary hover:text-primary' : undefined,
       detail: appVersion && sha && !applying && !remote ? sha : undefined,
       hidden: !appVersion && !sha,
       icon: applying ? <Loader2 className="size-3 animate-spin" /> : <Hash className="size-3" />,
@@ -220,7 +233,9 @@ export function useStatusbarItems({
     updateApply.stage,
     updateStatus?.behind,
     updateStatus?.branch,
-    updateStatus?.currentSha
+    updateStatus?.currentSha,
+    updateStatus?.mode,
+    updateStatus?.updateAvailable
   ])
 
   const backendVersionItem = useMemo<StatusbarItem | null>(() => {
