@@ -154,6 +154,27 @@ current git commit/branch — so build from a clean `otto` checkout.
 
 ---
 
+## Branded update / About / uninstall surfaces
+
+Real install testing surfaced several places that pointed at upstream Hermes. All are now branded:
+
+| Surface | Where | Behavior |
+|---|---|---|
+| **Self-update branch** | `main.ts` `readDesktopUpdateConfig` | Fresh installs track the branch from `install-stamp.json` (`otto`), not the hardcoded `main`. Prevents the desktop from showing a phantom "update available" (comparing `otto` against upstream `main`) and from self-updating OTTO onto upstream. |
+| **Release notes** link | `about-settings.tsx` `RELEASE_NOTES_URL` | Opens `https://github.com/cmetech/otto/releases`. |
+| **"See what's new"** | `updates-overlay.tsx` | Renders `git log HEAD..origin/otto` — the actual OTTO commits you'd pull. No config needed beyond the correct update branch. |
+| **Uninstall** (Win) | `desktop-uninstall.ts` | The removable-dir guard is `/Hermes$/` in source but ships as `/OTTO$/` via the build transform, matching the `…\OTTO` install dir. `HERMES_HOME` drives data removal dynamically, so all 3 modes (GUI-only / +agent / everything) clean up correctly. |
+
+### How to test release notes + "what's new"
+
+- **Release notes** always shows in Settings → About. Click it → it should open the OTTO releases page. Ensure the release has a body (the CI workflow writes one).
+- **"See what's new" / "Update now"** only appear when the install is *behind* `origin/otto`. To exercise them:
+  1. Install a build (its stamp pins commit *C*).
+  2. Push one more commit to `otto` (e.g. a `CHANGELOG.md` entry) so `origin/otto` is ahead of *C*.
+  3. In the app, Settings → About → **Check now** → it shows "1 behind", and **See what's new** lists that commit; **Release notes** opens `cmetech/otto/releases`; **Update now** performs the real `git pull otto` + rebuild self-update.
+
+  This is the intended end-to-end test of the corrected update path.
+
 ## See also
 - Design of record: `docs/superpowers/specs/2026-07-12-otto-desktop-release-install-design.md`
 - OTTO customization surface + merge rules: workspace `CLAUDE.md`

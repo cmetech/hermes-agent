@@ -21,7 +21,10 @@ import {
 import { ListRow, SectionHeading, SettingsContent } from './primitives'
 import { UninstallSection } from './uninstall-section'
 
-const RELEASE_NOTES_URL = 'https://github.com/NousResearch/hermes-agent/releases'
+// OTTO releases live in the dedicated releases repo, not upstream. This URL is
+// lowercased in the path (`hermes-agent`) so the build-time \bHermes\b→OTTO
+// transform can't rewrite it — it must be flipped in source. See CLAUDE.md.
+const RELEASE_NOTES_URL = 'https://github.com/cmetech/otto/releases'
 
 function relativeTime(ms: number | undefined, a: Translations['settings']['about']) {
   if (!ms) {

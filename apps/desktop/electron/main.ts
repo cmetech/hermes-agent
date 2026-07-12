@@ -1974,13 +1974,20 @@ function recentHermesLog() {
 // ─── Self-update (git-pull against the running backend's hermes root) ──────
 
 function readDesktopUpdateConfig() {
+  // Fresh installs have no updates.json yet. Fall back to the branch the app was
+  // BUILT from (install-stamp) BEFORE the generic default, so a fork install
+  // (e.g. OTTO on `otto`) tracks its own branch and never compares against — or
+  // self-updates onto — upstream `main`, which would clobber the fork.
+  const stampBranch = typeof INSTALL_STAMP?.branch === 'string' ? INSTALL_STAMP.branch.trim() : ''
+  const fallbackBranch = stampBranch || DEFAULT_UPDATE_BRANCH
+
   try {
     const parsed = JSON.parse(fs.readFileSync(DESKTOP_UPDATE_CONFIG_PATH, 'utf8'))
     const branch = typeof parsed?.branch === 'string' ? parsed.branch.trim() : ''
 
-    return { branch: branch || DEFAULT_UPDATE_BRANCH }
+    return { branch: branch || fallbackBranch }
   } catch {
-    return { branch: DEFAULT_UPDATE_BRANCH }
+    return { branch: fallbackBranch }
   }
 }
 

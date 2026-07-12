@@ -3,12 +3,11 @@
   "name": "OTTO",
   "protect": [
     "X-Hermes-[A-Za-z0-9-]+",
-    "Hermes\\.app",
     "Hermes-Desktop"
   ],
   "rules": [
     ["\\bHermes\\b", "OTTO"]
   ],
-  "$protectNote": "protect = regexes for FUNCTIONAL title-case 'Hermes' strings that must NOT be rebranded: the X-Hermes-Session-Token auth header (rewriting it breaks desktop↔backend auth → 401), Hermes.app updater-resolution paths, and the Hermes-Desktop User-Agent. Matches are masked before rules run and restored after. Add any newly-discovered functional 'Hermes' string here.",
+  "$protectNote": "protect = regexes for FUNCTIONAL title-case 'Hermes' strings that must NOT be rebranded: the X-Hermes-Session-Token auth header (rewriting it breaks desktop↔backend auth → 401) and the Hermes-Desktop User-Agent. Matches are masked before rules run and restored after. Add any newly-discovered functional 'Hermes' string here. NOTE: 'Hermes\\.app' is intentionally NOT protected — the mac updater's relaunch paths (main.ts release/mac*/…app) must become OTTO.app because electron-builder outputs the app under productName (OTTO); protecting it left self-update looking for a non-existent Hermes.app.",
   "$rulesNote": "Rules are [regexPattern, replacement], applied in order with the global flag and CASE SENSITIVITY. Case-sensitive \\bHermes\\b matches only the title-case display word; it never matches lower/UPPER/camelCase identifiers (hermes_cli, HERMES_HOME, .hermes, resolveHermesBackend). Anything in `protect` is exempt. Add more specific phrase rules BEFORE the generic one if a surface needs different wording."
 }
