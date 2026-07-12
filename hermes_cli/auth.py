@@ -6425,10 +6425,12 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     key_source = ""
     api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
 
-    # No-auth LM Studio: substitute a placeholder so runtime / auxiliary_client
-    # see the local server as configured. doctor still reports unconfigured
-    # because get_api_key_provider_status uses the raw secret resolver.
-    if not api_key and provider_id == "lmstudio":
+    # No-auth LM Studio / OTTO gateway: substitute a placeholder so runtime /
+    # auxiliary_client see the local server as configured (the OpenAI SDK
+    # rejects an empty key). doctor still reports unconfigured because
+    # get_api_key_provider_status uses the raw secret resolver. The OTTO gateway
+    # accepts any key when launched without AUTH_TOKEN; a real OTTO_API_KEY wins.
+    if not api_key and provider_id in ("lmstudio", "otto"):
         api_key = LMSTUDIO_NOAUTH_PLACEHOLDER
         key_source = key_source or "default"
 
