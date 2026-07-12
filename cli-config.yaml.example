@@ -8,9 +8,12 @@
 model:
   # Default model to use (can be overridden with --model flag)
   # Both "default" and "model" work as the key name here.
-  # OTTO default: route through the OTTO gateway (→ Kilo/kiro-cli). "auto" lets
-  # the gateway pick its current model; run `otto model` to list/switch.
-  default: "otto/auto"
+  # OTTO default: route through the OTTO gateway (→ Kilo/kiro-cli). Use the BARE
+  # model id "auto" (NOT "otto/auto") — provider is set below. The gateway maps
+  # "auto" to kiro's current model; any other string is forwarded to kiro as a
+  # modelId, so a "provider/" prefix leaks through and errors. Run `otto model`
+  # to list/switch to a specific kiro model (e.g. "claude-sonnet-5").
+  default: "auto"
   
   # Inference provider selection:
   #   "auto"         - Auto-detect from credentials (default)
