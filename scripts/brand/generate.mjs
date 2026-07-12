@@ -8,6 +8,7 @@ import { pyprojectScriptsEmitter } from './emitters/pyproject-scripts.mjs'
 import { skinEmitter } from './emitters/skin.mjs'
 import { packageJsonEmitter } from './emitters/package-json.mjs'
 import { mainIdentityEmitter } from './emitters/main-identity.mjs'
+import { brandConfigEmitter } from './emitters/brand-config.mjs'
 
 export const DEFAULT_EMITTERS = [
   providerEmitter,
@@ -15,7 +16,8 @@ export const DEFAULT_EMITTERS = [
   pyprojectScriptsEmitter,
   skinEmitter,
   packageJsonEmitter,
-  mainIdentityEmitter
+  mainIdentityEmitter,
+  brandConfigEmitter
 ]
 
 export function runEmitters(descriptor, { root, mode, emitters = DEFAULT_EMITTERS }) {
