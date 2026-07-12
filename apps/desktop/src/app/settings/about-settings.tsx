@@ -68,6 +68,9 @@ export function AboutSettings() {
   const behind = status?.behind ?? 0
   const supported = status?.supported !== false
   const applying = apply.applying || apply.stage === 'restart'
+  // OTTO release installs (packaged): "Update now" downloads the next release
+  // installer; the git-only "See what's new" commit overlay doesn't apply.
+  const isRelease = status?.mode === 'release'
 
   const handleCheck = async () => {
     setJustChecked(false)
@@ -150,9 +153,11 @@ export function AboutSettings() {
                 <Button onClick={() => startActiveUpdate()} size="sm">
                   {a.updateNow}
                 </Button>
-                <Button onClick={() => openUpdatesWindow()} size="sm" variant="textStrong">
-                  {a.seeWhatsNew}
-                </Button>
+                {!isRelease && (
+                  <Button onClick={() => openUpdatesWindow()} size="sm" variant="textStrong">
+                    {a.seeWhatsNew}
+                  </Button>
+                )}
               </>
             )}
 

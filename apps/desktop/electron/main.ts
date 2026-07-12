@@ -2178,7 +2178,7 @@ async function checkUpdates() {
       return {
         supported: true,
         mode: 'release',
-        error: true,
+        error: 'unreachable',
         currentVersion: current,
         latestVersion: null,
         updateAvailable: false,
@@ -2562,6 +2562,18 @@ async function releaseBackendLock(updateRoot, tag) {
 // Detection (checkUpdates / commit changelog / "N behind") stays in the UI;
 // only this apply action changed.
 async function applyUpdates(opts = {}) {
+  // Release installs don't git-update; they reinstall from a downloaded release.
+  // Open the newest installer asset (or the release page) and let the user run
+  // it — the packaged GUI can't be replaced by an in-place git rebuild.
+  if (isReleaseInstall(INSTALL_STAMP, IS_PACKAGED)) {
+    const releases = await fetchLatestReleases()
+    const latest = parseLatestRelease(releases, process.platform, process.arch)
+    const url = latest?.assetUrl || latest?.releaseUrl || 'https://github.com/cmetech/otto/releases'
+    await shell.openExternal(url)
+
+    return { ok: true, mode: 'release', opened: url }
+  }
+
   if (updateInFlight) {
     throw new Error('An update is already in progress.')
   }

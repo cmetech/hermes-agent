@@ -302,6 +302,13 @@ export interface DesktopUpdateStatus {
   commits?: DesktopUpdateCommit[]
   dirty?: boolean
   fetchedAt?: number
+  // OTTO release-mode fields (packaged installs update via GitHub releases,
+  // not git). `mode: 'release'` selects the download-the-next-release UI.
+  mode?: 'git' | 'release'
+  currentVersion?: string
+  latestVersion?: string | null
+  releaseUrl?: string | null
+  assetUrl?: string | null
 }
 
 export type DesktopUpdateDirtyStrategy = 'abort' | 'stash' | 'force'
