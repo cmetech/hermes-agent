@@ -158,9 +158,14 @@ current git commit/branch — so build from a clean `otto` checkout.
 
 Real install testing surfaced several places that pointed at upstream Hermes. All are now branded:
 
+### Two update modes
+
+- **Release install** (packaged nsis/dmg — `install-stamp.json` has `productVersion`): the desktop checks the **latest `cmetech/otto` release** and, if newer, shows "Update available → **Update now**" which downloads the next installer. On the next launch after installing it, the backend clone **fast-forwards** to the shell's pinned commit (a one-time "updating…") so shell and backend stay paired. Logic: `isReleaseInstall` branches in `checkUpdates`/`applyUpdates`/`isBootstrapComplete` (see `electron/release-update.ts`).
+- **Source install** (git clone + build): self-updates by `git pull` of the `otto` branch + rebuild (the original Hermes path), tracking the branch from the install-stamp.
+
 | Surface | Where | Behavior |
 |---|---|---|
-| **Self-update branch** | `main.ts` `readDesktopUpdateConfig` | Fresh installs track the branch from `install-stamp.json` (`otto`), not the hardcoded `main`. Prevents the desktop from showing a phantom "update available" (comparing `otto` against upstream `main`) and from self-updating OTTO onto upstream. |
+| **Self-update branch** (source) | `main.ts` `readDesktopUpdateConfig` | Source installs track the branch from `install-stamp.json` (`otto`), not the hardcoded `main`. Prevents a phantom "update available" (comparing `otto` against upstream `main`) and self-updating OTTO onto upstream. |
 | **Release notes** link | `about-settings.tsx` `RELEASE_NOTES_URL` | Opens `https://github.com/cmetech/otto/releases`. |
 | **"See what's new"** | `updates-overlay.tsx` | Renders `git log HEAD..origin/otto` — the actual OTTO commits you'd pull. No config needed beyond the correct update branch. |
 | **Uninstall** (Win) | `desktop-uninstall.ts` | The removable-dir guard is `/Hermes$/` in source but ships as `/OTTO$/` via the build transform, matching the `…\OTTO` install dir. `HERMES_HOME` drives data removal dynamically, so all 3 modes (GUI-only / +agent / everything) clean up correctly. |

@@ -3,6 +3,15 @@
 Notable changes to the OTTO desktop app. OTTO is a branded fork of Hermes;
 releases are published at https://github.com/cmetech/otto/releases.
 
+## Unreleased
+
+- Feature: **packaged installs now update via GitHub releases, not git.** A
+  release install checks the latest `cmetech/otto` release; "Update now"
+  downloads the next installer (the git-pull path skewed a packaged GUI). The
+  footer shows `(update)` instead of a git `(+N)` count, and after installing a
+  new release the backend clone fast-forwards to match the shell on next launch.
+  Source installs keep the git-pull update path.
+
 ## v0.1.2 — 2026-07-12
 
 - Fix: **About panel and the status-bar footer now show the OTTO release version**
