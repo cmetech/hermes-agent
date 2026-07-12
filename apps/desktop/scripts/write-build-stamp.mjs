@@ -102,13 +102,25 @@ function main() {
     )
   }
 
+  // OTTO product version (the release tag, e.g. "0.1.2"), provided by CI via
+  // $OTTO_PRODUCT_VERSION. This is the single source of truth for the version
+  // the desktop shows in About + the footer — distinct from the upstream Hermes
+  // agent version (hermes_cli/__init__.py). Absent for dev/local builds, in
+  // which case the desktop falls back to the agent version (unchanged upstream
+  // behavior). See resolveHermesVersion() in electron/main.ts.
+  const productVersion =
+    typeof process.env.OTTO_PRODUCT_VERSION === "string" && process.env.OTTO_PRODUCT_VERSION.trim()
+      ? process.env.OTTO_PRODUCT_VERSION.trim()
+      : null
+
   const payload = {
     schemaVersion: STAMP_SCHEMA_VERSION,
     commit: stamp.commit,
     branch: stamp.branch,
     builtAt: new Date().toISOString(),
     dirty: stamp.dirty,
-    source: stamp.source
+    source: stamp.source,
+    productVersion: productVersion
   }
 
   mkdirSync(OUT_DIR, { recursive: true })

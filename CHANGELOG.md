@@ -3,10 +3,14 @@
 Notable changes to the OTTO desktop app. OTTO is a branded fork of Hermes;
 releases are published at https://github.com/cmetech/otto/releases.
 
-## Unreleased
+## v0.1.2 — 2026-07-12
 
-- Docs: add this changelog (also serves as the first "See what's new" test entry —
-  installing v0.1.1 and checking for updates should surface this commit).
+- Fix: **About panel and the status-bar footer now show the OTTO release version**
+  (e.g. `0.1.2`) instead of the upstream Hermes agent version (`0.18.2`). The
+  version is carried in `install-stamp.json` (`productVersion`, set by CI) and
+  read first by the desktop; the upstream agent version is left untouched.
+- Fix: release **artifact filenames** now match the release version
+  (`OTTO-0.1.2-…`) instead of the inherited `0.17.0`.
 
 ## v0.1.1 — 2026-07-12
 

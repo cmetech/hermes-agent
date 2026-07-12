@@ -253,6 +253,8 @@ function loadInstallStamp() {
           builtAt: parsed.builtAt || null,
           dirty: Boolean(parsed.dirty),
           source: parsed.source || null,
+          // OTTO product version (release tag) written by CI; absent upstream.
+          productVersion: parsed.productVersion || null,
           path: p
         })
       }
@@ -8633,6 +8635,15 @@ ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
 // which historically drifted (stuck at 0.0.2). Falls back to app.getVersion()
 // when the source tree can't be read (e.g. a packaged build without the repo).
 function resolveHermesVersion() {
+  // OTTO: the release-tag product version (from install-stamp, written by CI) is
+  // the single source of truth for the version shown in About + the footer. It
+  // is distinct from the upstream Hermes AGENT version (hermes_cli/__init__.py),
+  // which we intentionally leave untouched so upstream merges stay clean. Absent
+  // for dev/local builds → fall through to the agent version (upstream behavior).
+  if (INSTALL_STAMP?.productVersion) {
+    return INSTALL_STAMP.productVersion
+  }
+
   try {
     const root = resolveUpdateRoot()
     const initPath = path.join(root, 'hermes_cli', '__init__.py')
