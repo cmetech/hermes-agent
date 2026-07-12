@@ -5,6 +5,8 @@ releases are published at https://github.com/cmetech/otto/releases.
 
 ## Unreleased
 
+- Branding: the in-app logo (About, update overlay, install overlay) is now the
+  **Ericsson mark**, theme-aware — white on dark surfaces, black on light.
 - Feature: **packaged installs now update via GitHub releases, not git.** A
   release install checks the latest `cmetech/otto` release; "Update now"
   downloads the next installer (the git-pull path skewed a packaged GUI). The
