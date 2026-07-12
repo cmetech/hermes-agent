@@ -87,14 +87,17 @@ const TEMPLATE = `    "__SLUG__": {
 export function renderSkin(d) {
   const bannerLogo = (d.cli && d.cli.bannerLogo) || ''
   const bannerHero = (d.cli && d.cli.bannerHero) || ''
+  // Use split/join for every substitution so a literal `$` in a replacement
+  // value (a future brand's displayName or banner art) is inserted verbatim —
+  // String.prototype.replace would treat `$&`/`$$`/`$'` as special patterns.
   return TEMPLATE
     .split('__SLUG__').join(d.slug)
-    .replace('__DESCRIPTION__', `${d.displayName} — gold on black brand theme`)
-    .replace('__AGENT_NAME__', d.displayName)
-    .replace('__WELCOME__', `Welcome to ${d.displayName}! Type your message or /help for commands.`)
-    .replace('__RESPONSE_LABEL__', ` ⚕ ${d.displayName} `)
-    .replace('__BANNER_LOGO__', bannerLogo)
-    .replace('__BANNER_HERO__', bannerHero)
+    .split('__DESCRIPTION__').join(`${d.displayName} — gold on black brand theme`)
+    .split('__AGENT_NAME__').join(d.displayName)
+    .split('__WELCOME__').join(`Welcome to ${d.displayName}! Type your message or /help for commands.`)
+    .split('__RESPONSE_LABEL__').join(` ⚕ ${d.displayName} `)
+    .split('__BANNER_LOGO__').join(bannerLogo)
+    .split('__BANNER_HERO__').join(bannerHero)
 }
 
 // Brace-matches the "<slug>": {...}, block out of a skin_engine.py source
