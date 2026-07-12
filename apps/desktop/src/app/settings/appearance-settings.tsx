@@ -48,14 +48,17 @@ function ThemePreview({ name, mode }: { name: string; mode: 'light' | 'dark' }) 
         <div className="flex flex-1 flex-col gap-2 p-3">
           <div className="h-2.5 w-16 rounded-full" style={{ backgroundColor: c.foreground }} />
           <div className="h-2 w-24 rounded-full" style={{ backgroundColor: c.mutedForeground }} />
-          <div className="mt-auto flex justify-end">
+          <div className="mt-auto flex items-center justify-end gap-1.5">
             <div
-              className="h-5 w-16 rounded-full border"
+              className="h-5 w-12 rounded-full border"
               style={{
                 backgroundColor: c.userBubble ?? c.muted,
                 borderColor: c.userBubbleBorder ?? c.border
               }}
             />
+            {/* Accent/primary swatch — distinguishes themes that share neutrals
+                but differ by accent hue (e.g. the OTTO family). */}
+            <div className="size-5 rounded-full" style={{ backgroundColor: c.primary }} />
           </div>
         </div>
       </div>

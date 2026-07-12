@@ -64,15 +64,18 @@ const LIGHT: DesktopThemeColors = {
   userBubbleBorder: '#E0E0E0'
 }
 
-/** Build one OTTO family member: shared neutrals + a brand accent hue. */
-function ottoTheme(
-  name: string,
-  label: string,
-  description: string,
-  accent: string,
-  onAccent: string
-): DesktopTheme {
-  const accentTokens = (base: DesktopThemeColors): DesktopThemeColors => ({
+interface AccentPair {
+  /** Bright hue for DARK mode (pops on black). */
+  dark: string
+  onDark: string
+  /** Darker hue for LIGHT mode (bright accents wash out on a light bg). */
+  light: string
+  onLight: string
+}
+
+/** Build one OTTO family member: shared neutrals + a per-mode brand accent. */
+function ottoTheme(name: string, label: string, description: string, a: AccentPair): DesktopTheme {
+  const accentTokens = (base: DesktopThemeColors, accent: string, onAccent: string): DesktopThemeColors => ({
     ...base,
     primary: accent,
     primaryForeground: onAccent,
@@ -84,19 +87,32 @@ function ottoTheme(
     name,
     label,
     description,
-    colors: accentTokens(LIGHT),
-    darkColors: accentTokens(DARK)
+    colors: accentTokens(LIGHT, a.light, a.onLight),
+    darkColors: accentTokens(DARK, a.dark, a.onDark)
   }
 }
 
-// Brand accents from oscar-adminui customColors. onAccent chosen for contrast:
-// dark text on bright hues (gold/teal/purple/green/orange), white on blue.
-export const ottoGoldTheme = ottoTheme('otto', 'OTTO', 'Gold on black — the OTTO brand', '#FAD22D', '#0C0C0C')
-export const ottoTealTheme = ottoTheme('otto-teal', 'OTTO Teal', 'Teal accent on OTTO dark', '#1FA6A6', '#0C0C0C')
-export const ottoPurpleTheme = ottoTheme('otto-purple', 'OTTO Purple', 'Purple accent on OTTO dark', '#AF78D2', '#0C0C0C')
-export const ottoBlueTheme = ottoTheme('otto-blue', 'OTTO Blue', 'Blue accent on OTTO dark', '#1174E6', '#FFFFFF')
-export const ottoGreenTheme = ottoTheme('otto-green', 'OTTO Green', 'Green accent on OTTO dark', '#0FC373', '#0C0C0C')
-export const ottoOrangeTheme = ottoTheme('otto-orange', 'OTTO Orange', 'Orange accent on OTTO dark', '#FF8C0A', '#0C0C0C')
+// Brand accents from oscar-adminui customColors. Dark mode uses the bright brand
+// hue (dark text, except blue); light mode uses a DARKER shade (white text) so
+// the accent stays visible on the light background instead of washing out.
+export const ottoGoldTheme = ottoTheme('otto', 'OTTO', 'Gold — the OTTO brand', {
+  dark: '#FAD22D', onDark: '#0C0C0C', light: '#B38600', onLight: '#FFFFFF'
+})
+export const ottoTealTheme = ottoTheme('otto-teal', 'OTTO Teal', 'Teal accent', {
+  dark: '#1FA6A6', onDark: '#0C0C0C', light: '#157F7F', onLight: '#FFFFFF'
+})
+export const ottoPurpleTheme = ottoTheme('otto-purple', 'OTTO Purple', 'Purple accent', {
+  dark: '#AF78D2', onDark: '#0C0C0C', light: '#7E52A0', onLight: '#FFFFFF'
+})
+export const ottoBlueTheme = ottoTheme('otto-blue', 'OTTO Blue', 'Blue accent', {
+  dark: '#4D97ED', onDark: '#0C0C0C', light: '#0F5FBF', onLight: '#FFFFFF'
+})
+export const ottoGreenTheme = ottoTheme('otto-green', 'OTTO Green', 'Green accent', {
+  dark: '#0FC373', onDark: '#0C0C0C', light: '#0A8A50', onLight: '#FFFFFF'
+})
+export const ottoOrangeTheme = ottoTheme('otto-orange', 'OTTO Orange', 'Orange accent', {
+  dark: '#FF8C0A', onDark: '#0C0C0C', light: '#C26A00', onLight: '#FFFFFF'
+})
 
 /** OTTO family, keyed by name. Spread into BUILTIN_THEMES (OTTO first). */
 export const OTTO_THEMES: Record<string, DesktopTheme> = {
