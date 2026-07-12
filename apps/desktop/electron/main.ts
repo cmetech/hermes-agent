@@ -115,6 +115,7 @@ import {
   sandboxFallbackFromEnv,
   sandboxPreflight
 } from './update-relaunch'
+import { buildReleaseUpdateStatus, isReleaseInstall, parseLatestRelease } from './release-update'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import {
@@ -2127,9 +2128,71 @@ async function resolveHealedBranch(updateRoot, branch) {
   return 'main'
 }
 
+// Fetch cmetech/otto releases (public, no auth). Returns [] on any failure so
+// the caller degrades to a "can't reach" status rather than throwing.
+function fetchLatestReleases(): Promise<any[]> {
+  return new Promise(resolve => {
+    const req = https.get(
+      'https://api.github.com/repos/cmetech/otto/releases?per_page=10',
+      { headers: { 'User-Agent': 'OTTO-Desktop', Accept: 'application/vnd.github+json' } },
+      res => {
+        if (res.statusCode && res.statusCode >= 400) {
+          res.resume()
+          resolve([])
+
+          return
+        }
+
+        let body = ''
+        res.on('data', c => (body += c))
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(body))
+          } catch {
+            resolve([])
+          }
+        })
+      }
+    )
+    req.on('error', () => resolve([]))
+    req.setTimeout(10_000, () => {
+      req.destroy()
+      resolve([])
+    })
+  })
+}
+
 async function checkUpdates() {
   const updateRoot = resolveUpdateRoot()
   let { branch } = readDesktopUpdateConfig()
+
+  // OTTO release installs (packaged nsis/dmg) update by downloading the next
+  // published release, NOT by git-pulling the backend clone (that skews the
+  // packaged GUI vs the rebuilt one). Check the latest cmetech/otto release
+  // instead of counting commits. Source installs fall through to the git path.
+  if (isReleaseInstall(INSTALL_STAMP, IS_PACKAGED)) {
+    const current = INSTALL_STAMP!.productVersion as string
+    const releases = await fetchLatestReleases()
+
+    if (!Array.isArray(releases) || releases.length === 0) {
+      return {
+        supported: true,
+        mode: 'release',
+        error: true,
+        currentVersion: current,
+        latestVersion: null,
+        updateAvailable: false,
+        behind: 0,
+        branch,
+        fetchedAt: Date.now()
+      }
+    }
+
+    const latest = parseLatestRelease(releases, process.platform, process.arch)
+
+    return { ...buildReleaseUpdateStatus(current, latest, branch), fetchedAt: Date.now() }
+  }
+
   const gitDir = path.join(updateRoot, '.git')
 
   if (!directoryExists(gitDir)) {
