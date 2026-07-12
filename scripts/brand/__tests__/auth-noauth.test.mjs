@@ -39,6 +39,27 @@ test('addSlugToNoauth is idempotent once already in tuple form (converted-from-s
   assert.equal(twice, once)
 })
 
+test('addSlugToNoauth converts only the no-auth scalar line, leaving an unrelated collision line untouched', () => {
+  const src = [
+    'if not api_key and provider_id == "lmstudio":',
+    '    api_key = "not-needed"',
+    '',
+    'def _normalize_lmstudio_runtime_base_url(base_url):',
+    '    if provider_id == "lmstudio":',
+    '        base_url = _normalize(base_url)',
+    '    return base_url',
+  ].join('\n')
+
+  const converted = addSlugToNoauth(src, 'otto')
+
+  assert.match(converted, /if not api_key and provider_id in \("lmstudio", "otto"\):/)
+  // The unrelated base-url normalization check must be left exactly as-is.
+  assert.match(converted, /    if provider_id == "lmstudio":\n        base_url = _normalize\(base_url\)/)
+  // Only one line should have been rewritten.
+  assert.equal((converted.match(/provider_id ==/g) || []).length, 1)
+  assert.equal((converted.match(/provider_id in \(/g) || []).length, 1)
+})
+
 test('check reports ok:false on the upstream scalar (neutral) form, ok:true on the otto tuple form', () => {
   const d = loadDescriptor('otto', { root: ROOT })
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'authwrite-'))
