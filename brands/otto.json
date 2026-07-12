@@ -1,0 +1,19 @@
+{
+  "slug": "otto",
+  "displayName": "OTTO",
+  "wordmark": "OTTO COWORKER",
+  "tagline": "OTTO orchestrates your thoughts and tasks into effective outcomes.",
+  "appId": "io.cmetech.otto",
+  "scheme": "otto",
+  "homeDir": ".otto",
+  "releasesRepo": "cmetech/otto",
+  "updateCommand": "otto update",
+  "theme": "otto",
+  "gateway": "otto",
+  "curation": {
+    "skills": { "exclude": [], "disabledByDefault": [] },
+    "tools": { "excludeToolsets": [], "disabledByDefault": [] }
+  },
+  "capabilitySets": [],
+  "personaSets": []
+}

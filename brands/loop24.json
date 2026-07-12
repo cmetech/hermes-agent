@@ -1,0 +1,18 @@
+{
+  "slug": "loop24",
+  "wordmark": "LOOP24 AGENT",
+  "tagline": "Loop24 orchestrates your thoughts and tasks into effective outcomes.",
+  "appId": "io.cmetech.loop24",
+  "scheme": "loop24",
+  "homeDir": ".loop24",
+  "releasesRepo": "cmetech/loop24",
+  "updateCommand": "loop24 update",
+  "theme": "otto",
+  "gateway": "otto",
+  "curation": {
+    "skills": { "exclude": ["media/spotify"], "disabledByDefault": [] },
+    "tools": { "excludeToolsets": ["home_assistant"], "disabledByDefault": ["spotify"] }
+  },
+  "capabilitySets": [],
+  "personaSets": []
+}

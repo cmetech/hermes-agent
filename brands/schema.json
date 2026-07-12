@@ -1,0 +1,107 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/cmetech/hermes-agent/brands/schema.json",
+  "title": "Brand descriptor",
+  "description": "Descriptor consumed by scripts/brand/descriptor.mjs (loadDescriptor) to drive the brand generator.",
+  "type": "object",
+  "required": ["slug"],
+  "additionalProperties": false,
+  "properties": {
+    "slug": {
+      "type": "string",
+      "description": "Brand slug; must match the file name brands/<slug>.json.",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "displayName": {
+      "type": "string",
+      "description": "Human-facing brand name. Defaults to slug.toUpperCase()."
+    },
+    "wordmark": {
+      "type": "string",
+      "description": "Intro splash wordmark. Defaults to \"${displayName} AGENT\"."
+    },
+    "tagline": {
+      "type": "string",
+      "description": "Short tagline. Defaults to a templated sentence using displayName."
+    },
+    "appId": {
+      "type": "string",
+      "description": "Desktop app bundle id. Defaults to \"io.cmetech.${slug}\"."
+    },
+    "scheme": {
+      "type": "string",
+      "description": "Deep-link URL scheme. Defaults to slug."
+    },
+    "homeDir": {
+      "type": "string",
+      "description": "Per-brand home directory name (Plan 2 target; recorded but not consumed by Plan 1). Defaults to \".${slug}\"."
+    },
+    "releasesRepo": {
+      "type": "string",
+      "description": "GitHub \"owner/repo\" for release distribution. Defaults to \"cmetech/${slug}\"."
+    },
+    "updateCommand": {
+      "type": "string",
+      "description": "Update command shown to users. Defaults to \"${slug} update\"."
+    },
+    "theme": {
+      "type": "string",
+      "description": "Desktop theme/skin family to use. Defaults to \"otto\"."
+    },
+    "gateway": {
+      "type": "string",
+      "description": "Model gateway provider slug. Defaults to \"otto\"."
+    },
+    "curation": {
+      "type": "object",
+      "description": "Skill/tool curation overrides for this brand.",
+      "additionalProperties": false,
+      "properties": {
+        "skills": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "exclude": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": []
+            },
+            "disabledByDefault": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": []
+            }
+          }
+        },
+        "tools": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "excludeToolsets": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": []
+            },
+            "disabledByDefault": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": []
+            }
+          }
+        }
+      }
+    },
+    "capabilitySets": {
+      "type": "array",
+      "description": "Named capability sets enabled for this brand.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "personaSets": {
+      "type": "array",
+      "description": "Named persona sets enabled for this brand.",
+      "items": { "type": "string" },
+      "default": []
+    }
+  }
+}
