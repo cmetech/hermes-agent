@@ -73,6 +73,12 @@ SKIP_BROWSER=false
 NO_SKILLS=false
 BRANCH="main"
 INSTALL_COMMIT=""
+# DISCARD_LOCAL (OTTO): managed release fast-forward only. When true, the
+# repository update path hard-resets tracked churn BEFORE the pinned checkout
+# instead of stash+restore, so `git checkout $INSTALL_COMMIT` can't fail on a
+# dirty managed clone and the tree ends clean. Only the Electron
+# bootstrap-runner passes --discard-local, and only for release installs.
+DISCARD_LOCAL=false
 ENSURE_DEPS=""
 POSTINSTALL_MODE=false
 MANIFEST_MODE=false
@@ -116,6 +122,10 @@ while [[ $# -gt 0 ]]; do
         --commit|-Commit)
             INSTALL_COMMIT="$2"
             shift 2
+            ;;
+        --discard-local|-DiscardLocal)
+            DISCARD_LOCAL=true
+            shift
             ;;
         --manifest|-Manifest)
             MANIFEST_MODE=true
@@ -1194,7 +1204,21 @@ clone_repo() {
 
             local autostash_ref=""
             discard_update_lockfile_churn "$INSTALL_DIR"
-            if [ -n "$(git status --porcelain)" ]; then
+            if [ "$DISCARD_LOCAL" = true ]; then
+                # OTTO managed release fast-forward: this clone is a
+                # reproducible pin, not a repo the user edits. Hard-reset tracked
+                # churn BEFORE the checkout so `git checkout $INSTALL_COMMIT`
+                # can't fail on a dirty tree and the tree ends CLEAN (no repeated
+                # autostash on every launch/update). reset --hard touches ONLY
+                # tracked files -- the venv and other untracked artifacts are
+                # never affected. Clear any unmerged index entries from a prior
+                # interrupted update first so the reset can't abort.
+                if [ -n "$(git ls-files --unmerged)" ]; then
+                    git reset -q
+                fi
+                log_info "Managed release fast-forward: discarding local churn before checkout..."
+                git reset --hard HEAD
+            elif [ -n "$(git status --porcelain)" ]; then
                 # A previously interrupted update can leave the index with
                 # unmerged entries. In that state `git stash` aborts with
                 # "could not write index" and the later `git checkout` aborts

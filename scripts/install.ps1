@@ -23,6 +23,16 @@ param(
     # exact ref.  Precedence: Commit > Tag > Branch.
     [string]$Commit = "",
     [string]$Tag = "",
+    # -DiscardLocal (OTTO): managed release fast-forward only. The backend
+    # clone under %LOCALAPPDATA%\hermes\hermes-agent is a reproducible pin, not
+    # a repo the user edits -- so on the desktop release-update re-bootstrap we
+    # hard-reset tracked churn (package-lock rewrites, CRLF renormalization)
+    # BEFORE the pinned checkout instead of stash+restore. This guarantees
+    # `git checkout $Commit` can't fail on a dirty tree AND leaves the tree
+    # CLEAN (no repeated autostash on every launch/update). Only the Electron
+    # bootstrap-runner passes this, and only when isReleaseInstall is true;
+    # source installs / user `-Commit` pins keep the safe stash+restore path.
+    [switch]$DiscardLocal,
     [string]$HermesHome = $(if ($env:HERMES_HOME) { $env:HERMES_HOME } else { "$env:LOCALAPPDATA\hermes" }),
     [string]$InstallDir = $(if ($env:HERMES_HOME) { "$env:HERMES_HOME\hermes-agent" } else { "$env:LOCALAPPDATA\hermes\hermes-agent" }),
 
@@ -1337,6 +1347,23 @@ function Install-Repository {
                 # created in the first place.
                 git -c windows.appendAtomically=false config core.autocrlf false 2>$null
                 Discard-LockfileChurn $InstallDir
+                if ($DiscardLocal) {
+                    # OTTO managed release fast-forward: this clone is a
+                    # reproducible pin, not a repo the user edits. Hard-reset
+                    # tracked churn BEFORE the checkout so `git checkout $Commit`
+                    # can't fail on a dirty tree and the tree ends CLEAN (no
+                    # repeated autostash on every launch/update). reset --hard
+                    # touches ONLY tracked files -- the venv and other untracked
+                    # artifacts are never affected. An interrupted prior update
+                    # can leave unmerged index entries; clear them first so the
+                    # reset can't abort.
+                    $unmergedOut = git -c windows.appendAtomically=false ls-files --unmerged 2>$null
+                    if (-not [string]::IsNullOrWhiteSpace(($unmergedOut -join "`n"))) {
+                        git -c windows.appendAtomically=false reset -q 2>$null
+                    }
+                    Write-Info "Managed release fast-forward: discarding local churn before checkout..."
+                    git -c windows.appendAtomically=false reset --hard HEAD 2>$null
+                }
                 # Preserve any real local changes before the checkout instead of
                 # discarding them with `reset --hard HEAD`. The old hard reset
                 # silently destroyed agent-edited source on managed clones (the
@@ -1344,6 +1371,8 @@ function Install-Repository {
                 # nothing is lost, and a failed restore leaves the work in a
                 # git stash for manual recovery. Untracked files are included so
                 # agent-created dirs (e.g. tinker-atropos/) survive too.
+                # (-DiscardLocal above already cleaned the tree, so this is a
+                # no-op in that path -- status is clean.)
                 $statusOut = git -c windows.appendAtomically=false status --porcelain 2>$null
                 if (-not [string]::IsNullOrWhiteSpace(($statusOut -join "`n"))) {
                     # A previously interrupted update can leave the index with

@@ -4834,6 +4834,25 @@ def _run_npm_install_deterministic(
             return ci_result
         # Fall through to `npm install` — lockfile may be out of sync on a
         # WIP fork/branch, or `npm ci` may not be available on very old npm.
+        # `--no-package-lock` keeps this helper true to its name: a fallback
+        # install must NOT rewrite the committed lockfile. Without it, npm >= 10
+        # rewrites package-lock.json (stripping "peer": true, reordering, etc.),
+        # leaving the working tree dirty. On the managed desktop backend clone
+        # (`otto desktop --build-only` / the release fast-forward's build) that
+        # dirt then forces every subsequent `hermes update` to autostash the
+        # lockfile — and previously could block the backend fast-forward. A dev
+        # who intends to update the lockfile runs `npm install` directly.
+        install_cmd = [npm, "install", "--no-package-lock", *extra_args]
+        return subprocess.run(
+            install_cmd,
+            cwd=cwd,
+            env=run_env,
+            capture_output=capture_output,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
     install_cmd = [npm, "install", *extra_args]
     return subprocess.run(
         install_cmd,

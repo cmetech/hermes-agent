@@ -114,6 +114,40 @@ test('existing-checkout bootstrap args keep branch but skip the packaged commit 
   )
 })
 
+test('release fast-forward args pin the commit AND request discard-local (OTTO)', () => {
+  const installStamp = { commit: 'a'.repeat(40), branch: 'otto' }
+
+  // A release install fast-forwarding an existing checkout: pin the stamp
+  // commit and tell the installer to hard-reset local churn before checkout.
+  assert.deepEqual(buildPinArgs(installStamp, { pinCommit: true, discardLocal: true }), [
+    '-Commit',
+    installStamp.commit,
+    '-Branch',
+    'otto',
+    '-DiscardLocal'
+  ])
+  assert.deepEqual(
+    buildPosixPinArgs({
+      installStamp,
+      activeRoot: '/tmp/hermes-agent',
+      hermesHome: '/tmp/hermes',
+      pinCommit: true,
+      discardLocal: true
+    }),
+    [
+      '--dir',
+      '/tmp/hermes-agent',
+      '--hermes-home',
+      '/tmp/hermes',
+      '--branch',
+      'otto',
+      '--commit',
+      installStamp.commit,
+      '--discard-local'
+    ]
+  )
+})
+
 test('resolveInstallScript prefers a cached script without touching the network', async () => {
   const home = mkTmpHome()
 

@@ -545,7 +545,7 @@ function spawnBash(scriptPath, args, { emit, stageName, abortSignal, hermesHome 
 // is fresh-install only: once a managed checkout already exists, bootstrap is
 // a repair/update path and must not let an old packaged app detach the checkout
 // back to the commit baked into that app.
-function buildPinArgs(installStamp, { pinCommit = true } = {}) {
+function buildPinArgs(installStamp, { pinCommit = true, discardLocal = false } = {}) {
   const args = []
 
   if (pinCommit && installStamp && installStamp.commit) {
@@ -556,10 +556,18 @@ function buildPinArgs(installStamp, { pinCommit = true } = {}) {
     args.push('-Branch', installStamp.branch)
   }
 
+  // OTTO: managed release fast-forward over an existing checkout. Tell the
+  // installer to hard-reset tracked churn before the pinned checkout instead of
+  // stash+restore, so a dirty backend clone can't block the fast-forward and
+  // the tree ends clean. Only set for release installs on an existing checkout.
+  if (discardLocal) {
+    args.push('-DiscardLocal')
+  }
+
   return args
 }
 
-function buildPosixPinArgs({ installStamp, activeRoot, hermesHome, pinCommit = true }) {
+function buildPosixPinArgs({ installStamp, activeRoot, hermesHome, pinCommit = true, discardLocal = false }) {
   const args = ['--dir', activeRoot, '--hermes-home', hermesHome]
 
   if (installStamp && installStamp.branch) {
@@ -568,6 +576,12 @@ function buildPosixPinArgs({ installStamp, activeRoot, hermesHome, pinCommit = t
 
   if (pinCommit && installStamp && installStamp.commit) {
     args.push('--commit', installStamp.commit)
+  }
+
+  // OTTO: see buildPinArgs above -- discard managed-clone churn before the
+  // pinned checkout for release fast-forwards.
+  if (discardLocal) {
+    args.push('--discard-local')
   }
 
   return args
@@ -652,7 +666,8 @@ async function runStage({
   activeRoot,
   abortSignal,
   installStamp,
-  pinCommit
+  pinCommit,
+  discardLocal
 }) {
   const startedAt = Date.now()
   emit({ type: 'stage', name: stage.name, state: 'running' })
@@ -665,9 +680,9 @@ async function runStage({
         stage.name,
         '--non-interactive',
         '--json',
-        ...buildPosixPinArgs({ installStamp, activeRoot, hermesHome, pinCommit })
+        ...buildPosixPinArgs({ installStamp, activeRoot, hermesHome, pinCommit, discardLocal })
       ]
-    : ['-Stage', stage.name, '-NonInteractive', '-Json', ...buildPinArgs(installStamp, { pinCommit })]
+    : ['-Stage', stage.name, '-NonInteractive', '-Json', ...buildPinArgs(installStamp, { pinCommit, discardLocal })]
 
   const result = await (isPosix ? spawnBash : spawnPowerShell)(scriptPath, args, {
     emit,
@@ -756,7 +771,8 @@ async function runBootstrap(opts) {
     logRoot,
     onEvent,
     abortSignal,
-    writeMarker // callback to write the bootstrap-complete marker; main.ts provides
+    writeMarker, // callback to write the bootstrap-complete marker; main.ts provides
+    isReleaseInstall // OTTO: true for packaged release installs (INSTALL_STAMP.productVersion present) -- enables the pin-and-fast-forward-over-existing-checkout path below
   } = opts
 
   // Bail before spawning anything if the user already cancelled — otherwise an
@@ -806,14 +822,28 @@ async function runBootstrap(opts) {
 
   try {
     const existingCheckout = hasExistingGitCheckout(activeRoot)
-    const pinCommit = !existingCheckout
+    // OTTO release-update model: a release install (isReleaseInstall) whose
+    // backend clone lags the newly-installed shell must fast-forward the clone
+    // to the shell's pinned commit. So for release installs we DO pin to the
+    // install stamp even when a checkout already exists (main.ts only reaches
+    // here for a release install when marker.pinnedCommit != stamp.commit), and
+    // we ask the installer to hard-reset any tracked churn before the pinned
+    // checkout (-DiscardLocal / --discard-local) so a dirty clone can't block
+    // the fast-forward. Source installs (isReleaseInstall=false) keep the
+    // existing behavior: an existing checkout follows its branch and is never
+    // detached back to an old app's baked-in commit.
+    const releaseFastForward = existingCheckout && !!isReleaseInstall
+    const pinCommit = !existingCheckout || !!isReleaseInstall
+    const discardLocal = releaseFastForward
 
     if (existingCheckout && installStamp && installStamp.commit) {
       emit({
         type: 'log',
-        line:
-          `[bootstrap] existing checkout detected at ${activeRoot}; ` +
-          `not pinning to packaged install stamp ${installStamp.commit.slice(0, 12)}`
+        line: releaseFastForward
+          ? `[bootstrap] existing checkout at ${activeRoot}; release fast-forward ` +
+            `pinning to stamp ${installStamp.commit.slice(0, 12)} (discarding local churn)`
+          : `[bootstrap] existing checkout detected at ${activeRoot}; ` +
+            `not pinning to packaged install stamp ${installStamp.commit.slice(0, 12)}`
       })
     }
 
@@ -858,7 +888,8 @@ async function runBootstrap(opts) {
         activeRoot,
         abortSignal,
         installStamp,
-        pinCommit
+        pinCommit,
+        discardLocal
       })
 
       if (ev.state === 'failed') {

@@ -3675,6 +3675,11 @@ async function ensureRuntime(backend) {
       hermesHome: HERMES_HOME,
       logRoot: path.join(HERMES_HOME, 'logs'),
       abortSignal: bootstrapAbortController.signal,
+      // OTTO: release installs fast-forward an existing backend clone to the
+      // shell's pinned commit and hard-reset local churn first, so a dirty
+      // clone can't freeze the backend at an old release (see bootstrap-runner
+      // runBootstrap). Source installs pass false -> unchanged branch-follow.
+      isReleaseInstall: isReleaseInstall(INSTALL_STAMP, IS_PACKAGED),
       onEvent: ev => {
         // Tee every bootstrap event to (a) the desktop log for forensics
         // and (b) the renderer for live progress UI. Either may be absent;
