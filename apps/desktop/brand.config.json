@@ -1,8 +1,14 @@
 {
   "$comment": "OTTO branding — SINGLE source of truth for the desktop's user-facing product name. Applied at BUILD TIME only (see scripts/brand-transform.mjs); source .ts/.tsx files are never modified, so upstream Hermes merges never conflict on branding. To rebrand: change name + rules and rebuild. To get stock Hermes behavior: set name to \"Hermes\" (transform becomes a no-op).",
   "name": "OTTO",
+  "protect": [
+    "X-Hermes-[A-Za-z0-9-]+",
+    "Hermes\\.app",
+    "Hermes-Desktop"
+  ],
   "rules": [
     ["\\bHermes\\b", "OTTO"]
   ],
-  "$rulesNote": "Rules are [regexPattern, replacement], applied in order with the global flag and CASE SENSITIVITY. Case-sensitive \\bHermes\\b matches only the title-case display word; it never matches functional identifiers (hermes_cli, HERMES_HOME, .hermes, hermes-agent, resolveHermesBackend) because those differ in case or are camelCase-glued. Add more specific phrase rules BEFORE the generic one if a surface needs different wording."
+  "$protectNote": "protect = regexes for FUNCTIONAL title-case 'Hermes' strings that must NOT be rebranded: the X-Hermes-Session-Token auth header (rewriting it breaks desktop↔backend auth → 401), Hermes.app updater-resolution paths, and the Hermes-Desktop User-Agent. Matches are masked before rules run and restored after. Add any newly-discovered functional 'Hermes' string here.",
+  "$rulesNote": "Rules are [regexPattern, replacement], applied in order with the global flag and CASE SENSITIVITY. Case-sensitive \\bHermes\\b matches only the title-case display word; it never matches lower/UPPER/camelCase identifiers (hermes_cli, HERMES_HOME, .hermes, resolveHermesBackend). Anything in `protect` is exempt. Add more specific phrase rules BEFORE the generic one if a surface needs different wording."
 }
