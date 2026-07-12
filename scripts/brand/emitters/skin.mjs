@@ -11,6 +11,17 @@ export function hasActiveSkin(source, slug) {
   return source.includes(`_active_skin_name: str = "${slug}"`)
 }
 
+const ACTIVE_SKIN_RE = /_active_skin_name: str = "[^"]*"/
+
+// Sets the module-level `_active_skin_name` default to the given slug via a
+// targeted line replacement. Idempotent (no-op) when already the slug.
+export function setActiveSkin(source, slug) {
+  const target = `_active_skin_name: str = "${slug}"`
+  if (source.includes(target)) return source
+  if (!ACTIVE_SKIN_RE.test(source)) return source
+  return source.replace(ACTIVE_SKIN_RE, target)
+}
+
 // Template = the current "otto" skin dict block from hermes_cli/skin_engine.py,
 // verbatim, with only the brand-varying tokens swapped for placeholders. The
 // shared gold palette (`colors`), `spinner`, and `tool_prefix` stay LITERAL —
@@ -150,24 +161,37 @@ export const skinEmitter = {
     const src = fs.readFileSync(file, 'utf8')
     const rendered = renderSkin(d)
     const existing = extractSkinBlock(src, d.slug)
+
+    let withBlock
+    let blockChanged
     if (existing !== null) {
-      if (existing === rendered) return { changed: false, detail: file }
-      const idx = src.indexOf(existing)
-      const next = src.slice(0, idx) + rendered + src.slice(idx + existing.length)
-      fs.writeFileSync(file, next)
-      return { changed: true, detail: file }
+      if (existing === rendered) {
+        withBlock = src
+        blockChanged = false
+      } else {
+        const idx = src.indexOf(existing)
+        withBlock = src.slice(0, idx) + rendered + src.slice(idx + existing.length)
+        blockChanged = true
+      }
+    } else {
+      // No existing block for this slug: splice a new one in immediately
+      // before the "mono" block — a guaranteed-present upstream skin — so
+      // every brand skin lands in the same position regardless of whether
+      // other brand blocks are present.
+      const anchorText = `    "mono": {`
+      const insertAt = src.indexOf(anchorText)
+      if (insertAt < 0) {
+        throw new Error(`skin emitter: could not find an insertion point for "${d.slug}" in ${FILE}`)
+      }
+      withBlock = src.slice(0, insertAt) + rendered + src.slice(insertAt)
+      blockChanged = true
     }
-    // No existing block for this slug: splice a new one in immediately before
-    // the "otto" block (or at the top of _BUILTIN_SKINS if "otto" is missing
-    // too), so every brand skin lives alongside the others.
-    const anchor = extractSkinBlock(src, 'otto')
-    const anchorText = anchor !== null ? `    "otto": {` : null
-    const insertAt = anchorText !== null ? src.indexOf(anchorText) : null
-    if (insertAt === null || insertAt < 0) {
-      throw new Error(`skin emitter: could not find an insertion point for "${d.slug}" in ${FILE}`)
-    }
-    const next = src.slice(0, insertAt) + rendered + src.slice(insertAt)
-    fs.writeFileSync(file, next)
+
+    const withActive = setActiveSkin(withBlock, d.slug)
+    const activeChanged = withActive !== withBlock
+
+    if (!blockChanged && !activeChanged) return { changed: false, detail: file }
+    fs.writeFileSync(file, withActive)
     return { changed: true, detail: file }
   }
 }

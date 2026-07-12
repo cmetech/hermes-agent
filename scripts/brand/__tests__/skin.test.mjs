@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadDescriptor } from '../descriptor.mjs'
-import { skinEmitter, hasBrandSkin, hasActiveSkin, renderSkin, extractSkinBlock } from '../emitters/skin.mjs'
+import { skinEmitter, hasBrandSkin, hasActiveSkin, renderSkin, extractSkinBlock, setActiveSkin } from '../emitters/skin.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
@@ -104,6 +104,91 @@ test('renderSkin substitutes a $-bearing displayName verbatim into every label (
   // 4 occurrences: "description", "agent_name", "welcome", "response_label".
   assert.equal((rendered.match(/FIX\$TURE/g) || []).length, 4)
   assert.ok(!rendered.includes('FIXTURE'), 'the literal $ must never be dropped from the displayName')
+})
+
+test('setActiveSkin sets the module default and is idempotent', () => {
+  const src = '_active_skin_name: str = "default"\n'
+  const once = setActiveSkin(src, 'otto')
+  assert.equal(once, '_active_skin_name: str = "otto"\n')
+  assert.equal(setActiveSkin(once, 'otto'), once)
+})
+
+test('write on the neutralized (no-otto, active=default) source restores the otto block immediately before "mono" AND sets _active_skin_name, byte-identical to the real tree', () => {
+  // The real tree (ROOT) is the source of truth for what "restored" looks
+  // like: extract its otto block as the expected rendered block, then build
+  // a synthetic "upstream-neutral" source by removing that block and
+  // reverting the active-skin default — mirroring exactly what the cutover
+  // neutralization step does — and prove write() reconstructs the original
+  // bytes exactly.
+  const realSrc = fs.readFileSync(path.join(ROOT, 'hermes_cli/skin_engine.py'), 'utf8')
+  const ottoBlock = extractSkinBlock(realSrc, 'otto')
+  assert.ok(ottoBlock, 'precondition: otto block extractable from the real tree')
+  assert.ok(hasActiveSkin(realSrc, 'otto'), 'precondition: real tree active skin is otto')
+
+  const blockIdx = realSrc.indexOf(ottoBlock)
+  const withoutBlock = realSrc.slice(0, blockIdx) + realSrc.slice(blockIdx + ottoBlock.length)
+  const neutralSrc = withoutBlock.replace(
+    '_active_skin_name: str = "otto"',
+    '_active_skin_name: str = "default"'
+  )
+  assert.notEqual(neutralSrc, realSrc)
+  assert.equal(hasBrandSkin(neutralSrc, 'otto'), false)
+  assert.equal(hasActiveSkin(neutralSrc, 'otto'), false)
+  // Otto block must sit immediately before "mono" in the real tree (the
+  // structural fact the new insertion anchor relies on).
+  assert.ok(realSrc.indexOf(ottoBlock) + ottoBlock.length === realSrc.indexOf('    "mono": {'))
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'skinwrite-neutral-'))
+  fs.mkdirSync(path.join(tmpRoot, 'hermes_cli'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'hermes_cli/skin_engine.py')
+  fs.writeFileSync(tmpFile, neutralSrc)
+
+  const d = loadDescriptor('otto', { root: ROOT })
+  const r1 = skinEmitter.write(d, { root: tmpRoot })
+  assert.equal(r1.changed, true)
+  const restored = fs.readFileSync(tmpFile, 'utf8')
+  assert.equal(restored, realSrc, 'write() must reconstruct the real tree byte-for-byte')
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
+test('write is a no-op (changed:false) on the already-otto tree — combined idempotency on block AND active name', () => {
+  const realSrc = fs.readFileSync(path.join(ROOT, 'hermes_cli/skin_engine.py'), 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'skinwrite-idem-'))
+  fs.mkdirSync(path.join(tmpRoot, 'hermes_cli'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'hermes_cli/skin_engine.py')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  const d = loadDescriptor('otto', { root: ROOT })
+  const r1 = skinEmitter.write(d, { root: tmpRoot })
+  assert.equal(r1.changed, false)
+  assert.equal(fs.readFileSync(tmpFile, 'utf8'), realSrc)
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
+test('check passes on the otto form, fails on the neutral (no-otto, active=default) form', () => {
+  const realSrc = fs.readFileSync(path.join(ROOT, 'hermes_cli/skin_engine.py'), 'utf8')
+  const ottoBlock = extractSkinBlock(realSrc, 'otto')
+  const blockIdx = realSrc.indexOf(ottoBlock)
+  const withoutBlock = realSrc.slice(0, blockIdx) + realSrc.slice(blockIdx + ottoBlock.length)
+  const neutralSrc = withoutBlock.replace(
+    '_active_skin_name: str = "otto"',
+    '_active_skin_name: str = "default"'
+  )
+
+  const d = loadDescriptor('otto', { root: ROOT })
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'skincheck-'))
+  fs.mkdirSync(path.join(tmpRoot, 'hermes_cli'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'hermes_cli/skin_engine.py')
+
+  fs.writeFileSync(tmpFile, realSrc)
+  assert.equal(skinEmitter.check(d, { root: tmpRoot }).ok, true)
+
+  fs.writeFileSync(tmpFile, neutralSrc)
+  assert.equal(skinEmitter.check(d, { root: tmpRoot }).ok, false)
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
 })
 
 test('renderSkin($-bearing fixture) round-trips through write/extract on a temp skin_engine.py', () => {
