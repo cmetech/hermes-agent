@@ -223,6 +223,35 @@ export const skinEmitter = {
     if (!blockChanged && !activeChanged && !initChanged) return { changed: false, detail: file }
     fs.writeFileSync(file, withInitSkin)
     return { changed: true, detail: file }
+  },
+  // Inverse of write(): removes the "<slug>" skin block entirely and resets
+  // both default-skin anchors (_active_skin_name and the two
+  // init_skin_from_config literals) to the upstream neutral value "default".
+  // Reuses setActiveSkin/setInitSkinDefault, which are already
+  // slug-parameterized (not otto-specific), so passing 'default' is a
+  // straight literal-target replacement, exactly mirroring write()'s shape.
+  neutralize(d, { root, dryRun = false } = {}) {
+    const file = path.join(root, FILE)
+    const src = fs.readFileSync(file, 'utf8')
+    const existing = extractSkinBlock(src, d.slug)
+
+    let withoutBlock = src
+    let blockChanged = false
+    if (existing !== null) {
+      const idx = src.indexOf(existing)
+      withoutBlock = src.slice(0, idx) + src.slice(idx + existing.length)
+      blockChanged = true
+    }
+
+    const withDefaultActive = setActiveSkin(withoutBlock, 'default')
+    const activeChanged = withDefaultActive !== withoutBlock
+
+    const withDefaultInit = setInitSkinDefault(withDefaultActive, 'default')
+    const initChanged = withDefaultInit !== withDefaultActive
+
+    if (!blockChanged && !activeChanged && !initChanged) return { changed: false, detail: file }
+    if (!dryRun) fs.writeFileSync(file, withDefaultInit)
+    return { changed: true, detail: file }
   }
 }
 

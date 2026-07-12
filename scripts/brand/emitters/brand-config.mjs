@@ -56,6 +56,22 @@ export function renderBrandConfig(descriptor, currentJsonText) {
   return next
 }
 
+// Neutral (identity) form for the rebrand-config: `name` reverts to
+// "Hermes", and each rule's replacement side reverts to matching its own
+// pattern's case (\bHermes\b -> "Hermes", \bHERMES\b -> "HERMES"), making
+// brand-transform.mjs a no-op. This is deliberately NOT renderBrandConfig()
+// with displayName:'Hermes' — that would set BOTH rules' replacement to the
+// same "Hermes" value (renderBrandConfig always substitutes one
+// descriptor.displayName into both), which is not the case-identity form
+// the neutral state requires.
+export function renderNeutralBrandConfig(currentJsonText) {
+  let next = currentJsonText
+  next = next.replace(/^(\s*"name"\s*:\s*")(?:\\.|[^"\\])*(")/m, (_m, pre, post) => `${pre}Hermes${post}`)
+  next = next.replace(/(\\\\bHermes\\\\b"\s*,\s*")(?:\\.|[^"\\])*(")/, (_m, pre, post) => `${pre}Hermes${post}`)
+  next = next.replace(/(\\\\bHERMES\\\\b"\s*,\s*")(?:\\.|[^"\\])*(")/, (_m, pre, post) => `${pre}HERMES${post}`)
+  return next
+}
+
 export const brandConfigEmitter = {
   id: 'brand-config',
   check(d, { root }) {
@@ -76,6 +92,14 @@ export const brandConfigEmitter = {
     const next = renderBrandConfig(d, src)
     if (next === src) return { changed: false }
     fs.writeFileSync(p, next)
+    return { changed: true, detail: p }
+  },
+  neutralize(d, { root, dryRun = false } = {}) {
+    const p = path.join(root, FILE)
+    const src = fs.readFileSync(p, 'utf8')
+    const next = renderNeutralBrandConfig(src)
+    if (next === src) return { changed: false }
+    if (!dryRun) fs.writeFileSync(p, next)
     return { changed: true, detail: p }
   }
 }

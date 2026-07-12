@@ -2,10 +2,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadDescriptor } from '../descriptor.mjs'
-import { renderPackageJson, packageJsonEmitter, setPath } from '../emitters/package-json.mjs'
+import { renderPackageJson, renderNeutralPackageJson, packageJsonEmitter, setPath } from '../emitters/package-json.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 const PKG = path.join(ROOT, 'apps/desktop/package.json')
@@ -57,4 +58,88 @@ test('setPath still succeeds and mutates in place when every key on the path exi
   const result = setPath(obj, 'build.mac.extendInfo.CFBundleName', 'new')
   assert.equal(result, true)
   assert.equal(obj.build.mac.extendInfo.CFBundleName, 'new')
+})
+
+test('renderNeutralPackageJson sets every brand field path to the upstream Hermes value', () => {
+  const onDisk = fs.readFileSync(PKG, 'utf8')
+  const out = renderNeutralPackageJson(onDisk)
+  const j = JSON.parse(out)
+  assert.equal(j.name, 'hermes')
+  assert.equal(j.productName, 'Hermes')
+  assert.equal(j.description, 'Native desktop shell for Hermes Agent.')
+  assert.equal(j.build.appId, 'com.nousresearch.hermes')
+  assert.equal(j.build.productName, 'Hermes')
+  assert.equal(j.build.executableName, 'Hermes')
+  assert.equal(j.build.artifactName, 'Hermes-${version}-${os}-${arch}.${ext}')
+  assert.deepEqual(j.build.protocols[0], { name: 'Hermes Protocol', schemes: ['hermes'] })
+  assert.equal(j.build.mac.extendInfo.CFBundleDisplayName, 'Hermes')
+  assert.equal(j.build.mac.extendInfo.CFBundleExecutable, 'Hermes')
+  assert.equal(j.build.mac.extendInfo.CFBundleName, 'Hermes')
+  assert.equal(j.build.mac.extendInfo.NSAudioCaptureUsageDescription, 'Hermes uses audio capture for voice conversations.')
+  assert.equal(
+    j.build.mac.extendInfo.NSMicrophoneUsageDescription,
+    'Hermes uses the microphone for voice input and voice conversations.'
+  )
+  assert.equal(j.build.win.legalTrademarks, 'Hermes')
+  assert.equal(j.build.linux.synopsis, 'Native desktop shell for Hermes Agent.')
+  assert.equal(j.build.dmg.title, 'Install Hermes')
+  assert.equal(j.build.nsis.shortcutName, 'Hermes')
+  assert.equal(j.build.nsis.uninstallDisplayName, 'Hermes')
+})
+
+test('renderNeutralPackageJson preserves every other field (deep-equal apart from the brand paths)', () => {
+  const onDisk = fs.readFileSync(PKG, 'utf8')
+  const out = renderNeutralPackageJson(onDisk)
+  const before = JSON.parse(onDisk)
+  const after = JSON.parse(out)
+  assert.deepEqual(Object.keys(after).sort(), Object.keys(before).sort())
+  assert.deepEqual(after.dependencies, before.dependencies)
+  assert.deepEqual(after.scripts, before.scripts)
+})
+
+test('neutralize(otto) reverts the real package.json to neutral Hermes values in a temp root', () => {
+  const d = loadDescriptor('otto', { root: ROOT })
+  const realSrc = fs.readFileSync(PKG, 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pkgneutral-'))
+  fs.mkdirSync(path.join(tmpRoot, 'apps/desktop'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'apps/desktop/package.json')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  const r = packageJsonEmitter.neutralize(d, { root: tmpRoot })
+  assert.equal(r.changed, true)
+  const after = JSON.parse(fs.readFileSync(tmpFile, 'utf8'))
+  assert.equal(after.productName, 'Hermes')
+  assert.equal(after.build.appId, 'com.nousresearch.hermes')
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
+test('neutralize dryRun:true reports changed but does not write the file', () => {
+  const d = loadDescriptor('otto', { root: ROOT })
+  const realSrc = fs.readFileSync(PKG, 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pkgneutral-dry-'))
+  fs.mkdirSync(path.join(tmpRoot, 'apps/desktop'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'apps/desktop/package.json')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  const r = packageJsonEmitter.neutralize(d, { root: tmpRoot, dryRun: true })
+  assert.equal(r.changed, true)
+  assert.equal(fs.readFileSync(tmpFile, 'utf8'), realSrc, 'dry run must not mutate the file')
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
+test('ROUND-TRIP: neutralize then write(otto) reproduces the current on-disk package.json byte-for-byte', () => {
+  const d = loadDescriptor('otto', { root: ROOT })
+  const realSrc = fs.readFileSync(PKG, 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pkg-roundtrip-'))
+  fs.mkdirSync(path.join(tmpRoot, 'apps/desktop'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'apps/desktop/package.json')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  packageJsonEmitter.neutralize(d, { root: tmpRoot })
+  packageJsonEmitter.write(d, { root: tmpRoot })
+  assert.equal(fs.readFileSync(tmpFile, 'utf8'), realSrc)
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
 })

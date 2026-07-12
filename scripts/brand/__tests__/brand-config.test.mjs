@@ -2,10 +2,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadDescriptor } from '../descriptor.mjs'
-import { renderBrandConfig, brandConfigEmitter } from '../emitters/brand-config.mjs'
+import { renderBrandConfig, renderNeutralBrandConfig, brandConfigEmitter } from '../emitters/brand-config.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 const FILE = path.join(ROOT, 'apps/desktop/brand.config.json')
@@ -101,6 +102,74 @@ test('renderBrandConfig is idempotent under double-application for a quote-beari
   assert.equal(parsedTwice.name, 'He said "hi"')
   assert.deepEqual(parsedTwice.rules[0], ['\\bHermes\\b', 'He said "hi"'])
   assert.deepEqual(parsedTwice.rules[1], ['\\bHERMES\\b', 'He said "hi"'])
+})
+
+test('renderNeutralBrandConfig sets name to Hermes and each rule to its case-identity form', () => {
+  const onDisk = fs.readFileSync(FILE, 'utf8')
+  const out = renderNeutralBrandConfig(onDisk)
+  const j = JSON.parse(out)
+  assert.equal(j.name, 'Hermes')
+  assert.deepEqual(j.rules[0], ['\\bHermes\\b', 'Hermes'])
+  assert.deepEqual(j.rules[1], ['\\bHERMES\\b', 'HERMES'])
+})
+
+test('renderNeutralBrandConfig preserves protect and $note keys byte-for-byte', () => {
+  const onDisk = fs.readFileSync(FILE, 'utf8')
+  const out = renderNeutralBrandConfig(onDisk)
+  const before = JSON.parse(onDisk)
+  const after = JSON.parse(out)
+  assert.deepEqual(after.protect, before.protect)
+  assert.equal(after.$comment, before.$comment)
+  assert.equal(after.$protectNote, before.$protectNote)
+  assert.equal(after.$rulesNote, before.$rulesNote)
+})
+
+test('neutralize(otto) reverts the real brand.config.json to identity rules in a temp root', () => {
+  const d = loadDescriptor('otto', { root: ROOT })
+  const realSrc = fs.readFileSync(FILE, 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brandconfigneutral-'))
+  fs.mkdirSync(path.join(tmpRoot, 'apps/desktop'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'apps/desktop/brand.config.json')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  const r = brandConfigEmitter.neutralize(d, { root: tmpRoot })
+  assert.equal(r.changed, true)
+  const after = JSON.parse(fs.readFileSync(tmpFile, 'utf8'))
+  assert.equal(after.name, 'Hermes')
+  assert.deepEqual(after.rules[0], ['\\bHermes\\b', 'Hermes'])
+  assert.deepEqual(after.rules[1], ['\\bHERMES\\b', 'HERMES'])
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
+test('neutralize dryRun:true reports changed but does not write the file', () => {
+  const d = loadDescriptor('otto', { root: ROOT })
+  const realSrc = fs.readFileSync(FILE, 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brandconfigneutral-dry-'))
+  fs.mkdirSync(path.join(tmpRoot, 'apps/desktop'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'apps/desktop/brand.config.json')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  const r = brandConfigEmitter.neutralize(d, { root: tmpRoot, dryRun: true })
+  assert.equal(r.changed, true)
+  assert.equal(fs.readFileSync(tmpFile, 'utf8'), realSrc, 'dry run must not mutate the file')
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
+test('ROUND-TRIP: neutralize then write(otto) reproduces the current on-disk brand.config.json byte-for-byte', () => {
+  const d = loadDescriptor('otto', { root: ROOT })
+  const realSrc = fs.readFileSync(FILE, 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brandconfig-roundtrip-'))
+  fs.mkdirSync(path.join(tmpRoot, 'apps/desktop'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'apps/desktop/brand.config.json')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  brandConfigEmitter.neutralize(d, { root: tmpRoot })
+  brandConfigEmitter.write(d, { root: tmpRoot })
+  assert.equal(fs.readFileSync(tmpFile, 'utf8'), realSrc)
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
 })
 
 test('renderBrandConfig preserves protect and $note keys byte-for-byte', () => {

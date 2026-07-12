@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadDescriptor } from '../descriptor.mjs'
@@ -9,7 +10,9 @@ import {
   hasWordmark,
   setWordmark,
   hasTagline,
-  setTagline
+  setTagline,
+  NEUTRAL_WORDMARK,
+  NEUTRAL_TAGLINE
 } from '../emitters/intro.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
@@ -80,4 +83,52 @@ test('setTagline escapes an embedded double quote for the double-quoted JS liter
   assert.ok(m, `expected a double-quoted const declaration, got: ${next}`)
   const evaluated = Function(`'use strict'; return "${m[1]}";`)()
   assert.equal(evaluated, FIXTURE_QUOTE.tagline)
+})
+
+test('neutralize(otto) reverts the real intro.tsx WORDMARK/TAGLINE to neutral Hermes values in a temp root, keeping the TAGLINE const declaration', () => {
+  const d = loadDescriptor('otto', { root: ROOT })
+  const realSrc = fs.readFileSync(path.join(ROOT, 'apps/desktop/src/components/chat/intro.tsx'), 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'introneutral-'))
+  fs.mkdirSync(path.join(tmpRoot, 'apps/desktop/src/components/chat'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'apps/desktop/src/components/chat/intro.tsx')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  const r = introEmitter.neutralize(d, { root: tmpRoot })
+  assert.equal(r.changed, true)
+  const after = fs.readFileSync(tmpFile, 'utf8')
+  assert.equal(hasWordmark(after, NEUTRAL_WORDMARK), true)
+  assert.equal(hasTagline(after, NEUTRAL_TAGLINE), true)
+  assert.match(after, /const TAGLINE = "/, 'TAGLINE const declaration must be kept, not removed')
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
+test('neutralize dryRun:true reports changed but does not write the file', () => {
+  const d = loadDescriptor('otto', { root: ROOT })
+  const realSrc = fs.readFileSync(path.join(ROOT, 'apps/desktop/src/components/chat/intro.tsx'), 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'introneutral-dry-'))
+  fs.mkdirSync(path.join(tmpRoot, 'apps/desktop/src/components/chat'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'apps/desktop/src/components/chat/intro.tsx')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  const r = introEmitter.neutralize(d, { root: tmpRoot, dryRun: true })
+  assert.equal(r.changed, true)
+  assert.equal(fs.readFileSync(tmpFile, 'utf8'), realSrc, 'dry run must not mutate the file')
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
+test('ROUND-TRIP: neutralize then write(otto) reproduces the current on-disk intro.tsx byte-for-byte', () => {
+  const d = loadDescriptor('otto', { root: ROOT })
+  const realSrc = fs.readFileSync(path.join(ROOT, 'apps/desktop/src/components/chat/intro.tsx'), 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'intro-roundtrip-'))
+  fs.mkdirSync(path.join(tmpRoot, 'apps/desktop/src/components/chat'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'apps/desktop/src/components/chat/intro.tsx')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  introEmitter.neutralize(d, { root: tmpRoot })
+  introEmitter.write(d, { root: tmpRoot })
+  assert.equal(fs.readFileSync(tmpFile, 'utf8'), realSrc)
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
 })

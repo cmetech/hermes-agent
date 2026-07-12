@@ -83,5 +83,15 @@ export const providerEmitter = {
       if (prev !== content) { fs.writeFileSync(p, content); changed = true }
     }
     return { changed, detail: dir }
+  },
+  // Inverse of write(): the neutral/upstream state has no
+  // plugins/model-providers/<slug>/ directory at all (the provider is a
+  // pure additive new-file — see the OTTO customization surface table).
+  // Guarded no-op if already absent.
+  neutralize(d, { root, dryRun = false } = {}) {
+    const dir = path.join(root, 'plugins/model-providers', d.slug)
+    if (!fs.existsSync(dir)) return { changed: false, detail: dir }
+    if (!dryRun) fs.rmSync(dir, { recursive: true, force: true })
+    return { changed: true, detail: dir }
   }
 }

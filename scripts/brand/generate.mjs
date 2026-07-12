@@ -23,11 +23,17 @@ export const DEFAULT_EMITTERS = [
   introEmitter
 ]
 
-export function runEmitters(descriptor, { root, mode, emitters = DEFAULT_EMITTERS }) {
+export function runEmitters(descriptor, { root, mode, emitters = DEFAULT_EMITTERS, write: applyWrite = false }) {
   const results = emitters.map(e => {
     if (mode === 'check') {
       const { ok, detail } = e.check(descriptor, { root })
       return { id: e.id, ok, detail }
+    }
+    if (mode === 'neutralize') {
+      // dryRun by default: without --write, neutralize() computes what it
+      // WOULD change but must not touch the filesystem.
+      const { changed, detail } = e.neutralize(descriptor, { root, dryRun: !applyWrite })
+      return { id: e.id, changed, detail }
     }
     const { changed, detail } = e.write(descriptor, { root })
     return { id: e.id, changed, detail }
@@ -40,24 +46,36 @@ function repoRoot() {
 }
 
 // Parses CLI args for the generator. The slug is OPTIONAL: any arg starting
-// with "--" is a flag (--write / --check); the first non-flag arg is the
-// slug. Flags and the slug may appear in either order. If no slug is given,
-// it resolves to the active brand (env OTTO_BRAND > brand/active marker >
-// 'otto' — see resolveActiveBrand). No flag, or any flag other than
-// --write, means mode 'check'.
+// with "--" is a flag (--write / --check / --neutralize); the first
+// non-flag arg is the slug. Flags and the slug may appear in either order.
+// If no slug is given, it resolves to the active brand (env OTTO_BRAND >
+// brand/active marker > 'otto' — see resolveActiveBrand). No flag, or any
+// flag other than --write/--neutralize, means mode 'check'.
+//
+// --neutralize sets those same emitters to their neutral/upstream values
+// (the inverse of --write) — brand-independent in spirit (the neutral
+// values don't depend on the descriptor for most emitters), but a
+// descriptor/slug is still resolved and loaded so provider/skin (which key
+// off the slug to find what to remove) know which applied brand to strip.
+// Without --write it is a dry run: emitters compute and report what they
+// WOULD change but do not touch the filesystem. With --write, applies.
 export function parseArgs(argv, { root }) {
   const flags = argv.filter(a => a.startsWith('--'))
   const positional = argv.filter(a => !a.startsWith('--'))
-  const mode = flags.includes('--write') ? 'write' : 'check'
+  const write = flags.includes('--write')
+  const mode = flags.includes('--neutralize') ? 'neutralize' : (write ? 'write' : 'check')
   const slug = positional[0] || resolveActiveBrand({ root })
-  return { slug, mode }
+  return { slug, mode, write }
 }
 
 async function main() {
   const root = repoRoot()
-  const { slug, mode } = parseArgs(process.argv.slice(2), { root })
+  const { slug, mode, write } = parseArgs(process.argv.slice(2), { root })
   const descriptor = loadDescriptor(slug, { root })
-  const { results } = runEmitters(descriptor, { root, mode })
+  const { results } = runEmitters(descriptor, { root, mode, write })
+  if (mode === 'neutralize' && !write) {
+    console.log('(dry run — pass --write to apply)')
+  }
   for (const r of results) {
     const status = mode === 'check' ? (r.ok ? 'OK ' : 'XX ') : (r.changed ? '~~ ' : '== ')
     console.log(`${status}${r.id}${r.detail ? ' — ' + r.detail : ''}`)

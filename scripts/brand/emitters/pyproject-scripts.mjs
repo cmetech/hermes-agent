@@ -29,6 +29,17 @@ export function addBrandScripts(source, slug, displayName) {
   return source.replace(ANCHOR, block)
 }
 
+// Inverse of addBrandScripts(): removes the exact brand comment+scripts
+// block that addBrandScripts spliced in (byte-for-byte, since brandBlock()
+// is deterministic from slug+displayName), collapsing back to the bare
+// upstream ANCHOR line. No-op if the block isn't present.
+export function removeBrandScripts(source, slug, displayName) {
+  if (!hasBrandScripts(source, slug)) return source
+  const block = `${ANCHOR}${brandBlock(displayName, slug)}`
+  if (!source.includes(block)) return source
+  return source.replace(block, ANCHOR)
+}
+
 export const pyprojectScriptsEmitter = {
   id: 'pyproject-scripts',
   check(d, { root }) {
@@ -41,6 +52,14 @@ export const pyprojectScriptsEmitter = {
     const next = addBrandScripts(src, d.slug, d.displayName)
     if (next === src) return { changed: false }
     fs.writeFileSync(p, next)
+    return { changed: true, detail: p }
+  },
+  neutralize(d, { root, dryRun = false } = {}) {
+    const p = path.join(root, FILE)
+    const src = fs.readFileSync(p, 'utf8')
+    const next = removeBrandScripts(src, d.slug, d.displayName)
+    if (next === src) return { changed: false }
+    if (!dryRun) fs.writeFileSync(p, next)
     return { changed: true, detail: p }
   }
 }

@@ -63,6 +63,45 @@ function fieldPaths(d) {
   ]
 }
 
+// Neutral (upstream `main`) values for the same field paths — the inverse
+// target for neutralize(). Fixed, not descriptor-driven: these are verbatim
+// upstream Hermes strings (confirmed against `git show main:apps/desktop/package.json`).
+const NEUTRAL_DESCRIPTION = 'Native desktop shell for Hermes Agent.'
+function neutralFieldPaths() {
+  return [
+    ['name', 'hermes'],
+    ['productName', 'Hermes'],
+    ['description', NEUTRAL_DESCRIPTION],
+    ['build.appId', 'com.nousresearch.hermes'],
+    ['build.productName', 'Hermes'],
+    ['build.executableName', 'Hermes'],
+    ['build.artifactName', 'Hermes-${version}-${os}-${arch}.${ext}'],
+    ['build.protocols.0.name', 'Hermes Protocol'],
+    ['build.protocols.0.schemes', ['hermes']],
+    ['build.mac.extendInfo.CFBundleDisplayName', 'Hermes'],
+    ['build.mac.extendInfo.CFBundleExecutable', 'Hermes'],
+    ['build.mac.extendInfo.CFBundleName', 'Hermes'],
+    ['build.mac.extendInfo.NSAudioCaptureUsageDescription', 'Hermes uses audio capture for voice conversations.'],
+    [
+      'build.mac.extendInfo.NSMicrophoneUsageDescription',
+      'Hermes uses the microphone for voice input and voice conversations.'
+    ],
+    ['build.win.legalTrademarks', 'Hermes'],
+    ['build.linux.synopsis', NEUTRAL_DESCRIPTION],
+    ['build.dmg.title', 'Install Hermes'],
+    ['build.nsis.shortcutName', 'Hermes'],
+    ['build.nsis.uninstallDisplayName', 'Hermes']
+  ]
+}
+
+export function renderNeutralPackageJson(currentJsonText) {
+  const obj = JSON.parse(currentJsonText)
+  for (const [dotted, value] of neutralFieldPaths()) {
+    setPath(obj, dotted, value)
+  }
+  return JSON.stringify(obj, null, 2) + '\n'
+}
+
 function getPath(obj, dotted) {
   return dotted.split('.').reduce((cur, key) => (cur == null ? undefined : cur[key]), obj)
 }
@@ -118,6 +157,14 @@ export const packageJsonEmitter = {
     const next = renderPackageJson(d, src)
     if (next === src) return { changed: false }
     fs.writeFileSync(p, next)
+    return { changed: true, detail: p }
+  },
+  neutralize(d, { root, dryRun = false } = {}) {
+    const p = path.join(root, FILE)
+    const src = fs.readFileSync(p, 'utf8')
+    const next = renderNeutralPackageJson(src)
+    if (next === src) return { changed: false }
+    if (!dryRun) fs.writeFileSync(p, next)
     return { changed: true, detail: p }
   }
 }

@@ -77,5 +77,22 @@ export const mainIdentityEmitter = {
     if (next === src) return { changed: false }
     fs.writeFileSync(p, next)
     return { changed: true, detail: p }
+  },
+  // Inverse of write(): sets the three anchors to their upstream `main`
+  // neutral values. Fixed, not descriptor-driven — `d` is accepted only for
+  // signature symmetry with the other emitters' neutralize(). OTTO_PROTOCOL's
+  // const NAME + DEEP_LINK_PROTOCOLS + HERMES_PROTOCOL are left untouched
+  // (this emitter never manages them); only OTTO_PROTOCOL's *value* reverts
+  // to 'hermes' (matching HERMES_PROTOCOL's value, since upstream has no
+  // separate scheme const at all).
+  neutralize(_d, { root, dryRun = false } = {}) {
+    const p = path.join(root, MAIN_TS_FILE)
+    const src = fs.readFileSync(p, 'utf8')
+    let next = setAppName(src, 'Hermes')
+    next = setAppId(next, 'com.nousresearch.hermes')
+    next = setScheme(next, 'hermes')
+    if (next === src) return { changed: false }
+    if (!dryRun) fs.writeFileSync(p, next)
+    return { changed: true, detail: p }
   }
 }

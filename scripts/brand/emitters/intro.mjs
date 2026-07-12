@@ -16,6 +16,16 @@ import path from 'node:path'
 
 const INTRO_FILE = 'apps/desktop/src/components/chat/intro.tsx'
 
+// Neutral (upstream `main`) wordmark, and a neutral Hermes-worded tagline
+// for the inverse of write(). main has no WORDMARK/TAGLINE consts at all
+// (see the OTTO customization surface table); this is the defined neutral
+// target for THIS emitter's two anchors, keeping the `const TAGLINE = "…"`
+// declaration in place (per the neutralization task brief) rather than
+// removing it.
+export const NEUTRAL_WORDMARK = 'HERMES AGENT'
+export const NEUTRAL_TAGLINE =
+  "Hermes orchestrates your thoughts and tasks into effective outcomes — tell me what you need and I'll take it from there."
+
 // Matches: const WORDMARK = '...'  (single-quoted). setWordmark() escapes `'`
 // and `\` before substituting so the emitted line is always syntactically
 // valid TS. NOTE: this regex's `[^']*` does NOT tolerate an escaped `\'`
@@ -80,6 +90,15 @@ export const introEmitter = {
     next = setTagline(next, d.tagline)
     if (next === src) return { changed: false }
     fs.writeFileSync(p, next)
+    return { changed: true, detail: p }
+  },
+  neutralize(_d, { root, dryRun = false } = {}) {
+    const p = path.join(root, INTRO_FILE)
+    const src = fs.readFileSync(p, 'utf8')
+    let next = setWordmark(src, NEUTRAL_WORDMARK)
+    next = setTagline(next, NEUTRAL_TAGLINE)
+    if (next === src) return { changed: false }
+    if (!dryRun) fs.writeFileSync(p, next)
     return { changed: true, detail: p }
   }
 }

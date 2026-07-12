@@ -323,6 +323,79 @@ test('write also applies setInitSkinDefault, factored into the changed decision,
   fs.rmSync(tmpRoot, { recursive: true, force: true })
 })
 
+test('neutralize(otto) removes the otto block and resets both default-skin anchors to "default" on a temp copy of the real tree', () => {
+  const realSrc = fs.readFileSync(path.join(ROOT, 'hermes_cli/skin_engine.py'), 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'skinneutral-'))
+  fs.mkdirSync(path.join(tmpRoot, 'hermes_cli'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'hermes_cli/skin_engine.py')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  const d = loadDescriptor('otto', { root: ROOT })
+  const r = skinEmitter.neutralize(d, { root: tmpRoot })
+  assert.equal(r.changed, true)
+
+  const after = fs.readFileSync(tmpFile, 'utf8')
+  assert.equal(hasBrandSkin(after, 'otto'), false)
+  assert.equal(hasActiveSkin(after, 'otto'), false)
+  assert.match(after, /_active_skin_name: str = "default"/)
+  assert.match(after, /skin_name = display\.get\("skin", "default"\)/)
+  assert.match(after, /else:\n {8}set_active_skin\("default"\)/)
+  // Other builtin skins untouched.
+  assert.ok(extractSkinBlock(after, 'default'), 'default skin block preserved')
+  assert.ok(extractSkinBlock(after, 'mono'), 'mono skin block preserved')
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
+test('neutralize dryRun:true reports changed but does not write the file', () => {
+  const realSrc = fs.readFileSync(path.join(ROOT, 'hermes_cli/skin_engine.py'), 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'skinneutral-dry-'))
+  fs.mkdirSync(path.join(tmpRoot, 'hermes_cli'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'hermes_cli/skin_engine.py')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  const d = loadDescriptor('otto', { root: ROOT })
+  const r = skinEmitter.neutralize(d, { root: tmpRoot, dryRun: true })
+  assert.equal(r.changed, true)
+  assert.equal(fs.readFileSync(tmpFile, 'utf8'), realSrc, 'dry run must not mutate the file')
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
+test('neutralize is idempotent (changed:false) once already neutral', () => {
+  const realSrc = fs.readFileSync(path.join(ROOT, 'hermes_cli/skin_engine.py'), 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'skinneutral-idem-'))
+  fs.mkdirSync(path.join(tmpRoot, 'hermes_cli'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'hermes_cli/skin_engine.py')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  const d = loadDescriptor('otto', { root: ROOT })
+  const r1 = skinEmitter.neutralize(d, { root: tmpRoot })
+  assert.equal(r1.changed, true)
+  const afterFirst = fs.readFileSync(tmpFile, 'utf8')
+
+  const r2 = skinEmitter.neutralize(d, { root: tmpRoot })
+  assert.equal(r2.changed, false)
+  assert.equal(fs.readFileSync(tmpFile, 'utf8'), afterFirst)
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
+test('ROUND-TRIP: neutralize then write(otto) reproduces the current on-disk skin_engine.py byte-for-byte', () => {
+  const realSrc = fs.readFileSync(path.join(ROOT, 'hermes_cli/skin_engine.py'), 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'skin-roundtrip-'))
+  fs.mkdirSync(path.join(tmpRoot, 'hermes_cli'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'hermes_cli/skin_engine.py')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  const d = loadDescriptor('otto', { root: ROOT })
+  skinEmitter.neutralize(d, { root: tmpRoot })
+  skinEmitter.write(d, { root: tmpRoot })
+  assert.equal(fs.readFileSync(tmpFile, 'utf8'), realSrc)
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
 test('renderSkin($-bearing fixture) round-trips through write/extract on a temp skin_engine.py', () => {
   const realSrc = fs.readFileSync(path.join(ROOT, 'hermes_cli/skin_engine.py'), 'utf8')
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'skinwrite-quote-'))
