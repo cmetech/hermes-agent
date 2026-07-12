@@ -45,13 +45,13 @@ export function renderBrandConfig(descriptor, currentJsonText) {
 
   // (a) top-level "name" value. Anchored to start-of-line so this can never
   // match "name" appearing inside a $comment/$note string value.
-  next = next.replace(/^(\s*"name"\s*:\s*")[^"]*(")/m, (_m, pre, post) => `${pre}${value}${post}`)
+  next = next.replace(/^(\s*"name"\s*:\s*")(?:\\.|[^"\\])*(")/m, (_m, pre, post) => `${pre}${value}${post}`)
 
   // (b) the replacement (2nd) element of each rules pair. The pattern side
   // (raw text `\\bHermes\\b` / `\\bHERMES\\b`, i.e. two literal backslashes
   // either side of the case) is matched verbatim and left untouched.
-  next = next.replace(/(\\\\bHermes\\\\b"\s*,\s*")[^"]*(")/, (_m, pre, post) => `${pre}${value}${post}`)
-  next = next.replace(/(\\\\bHERMES\\\\b"\s*,\s*")[^"]*(")/, (_m, pre, post) => `${pre}${value}${post}`)
+  next = next.replace(/(\\\\bHermes\\\\b"\s*,\s*")(?:\\.|[^"\\])*(")/, (_m, pre, post) => `${pre}${value}${post}`)
+  next = next.replace(/(\\\\bHERMES\\\\b"\s*,\s*")(?:\\.|[^"\\])*(")/, (_m, pre, post) => `${pre}${value}${post}`)
 
   return next
 }

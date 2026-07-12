@@ -73,6 +73,36 @@ test('renderBrandConfig restores OTTO values in place on a neutralized-but-singl
   assert.equal(restored, onDisk, 'regenerating from a neutralized-but-single-line source should exactly reproduce the OTTO file')
 })
 
+test('renderBrandConfig is idempotent under double-application for a quote-bearing displayName', () => {
+  // Minimal single-line-rules fixture, independent of the real on-disk file.
+  const fixture = [
+    '{',
+    '  "name": "Hermes",',
+    '  "rules": [',
+    '    ["\\\\bHermes\\\\b", "Hermes"],',
+    '    ["\\\\bHERMES\\\\b", "HERMES"]',
+    '  ]',
+    '}',
+    ''
+  ].join('\n')
+
+  const descriptor = { displayName: 'He said "hi"' }
+
+  const once = renderBrandConfig(descriptor, fixture)
+  const twice = renderBrandConfig(descriptor, once)
+
+  assert.equal(twice, once, 'a second application (fed the first application\'s own output) must be a no-op')
+
+  const parsedOnce = JSON.parse(once)
+  const parsedTwice = JSON.parse(twice)
+  assert.equal(parsedOnce.name, 'He said "hi"')
+  assert.deepEqual(parsedOnce.rules[0], ['\\bHermes\\b', 'He said "hi"'])
+  assert.deepEqual(parsedOnce.rules[1], ['\\bHERMES\\b', 'He said "hi"'])
+  assert.equal(parsedTwice.name, 'He said "hi"')
+  assert.deepEqual(parsedTwice.rules[0], ['\\bHermes\\b', 'He said "hi"'])
+  assert.deepEqual(parsedTwice.rules[1], ['\\bHERMES\\b', 'He said "hi"'])
+})
+
 test('renderBrandConfig preserves protect and $note keys byte-for-byte', () => {
   const onDisk = fs.readFileSync(FILE, 'utf8')
   const out = renderBrandConfig(loadDescriptor('loop24', { root: ROOT }), onDisk)
