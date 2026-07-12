@@ -27,7 +27,8 @@ function withDefaults(raw) {
       tools: { excludeToolsets: tools.excludeToolsets || [], disabledByDefault: tools.disabledByDefault || [] }
     },
     capabilitySets: raw.capabilitySets || [],
-    personaSets: raw.personaSets || []
+    personaSets: raw.personaSets || [],
+    cli: raw.cli || { bannerLogo: '', bannerHero: '' }
   }
 }
 

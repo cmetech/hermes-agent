@@ -15,5 +15,9 @@
     "tools": { "excludeToolsets": [], "disabledByDefault": [] }
   },
   "capabilitySets": [],
-  "personaSets": []
+  "personaSets": [],
+  "cli": {
+    "bannerLogo": "[bold #8A6D1A] ██████╗ ████████╗████████╗ ██████╗ [/]\n[bold #B8901F]██╔═══██╗╚══██╔══╝╚══██╔══╝██╔═══██╗[/]\n[#E0B325]██║   ██║   ██║      ██║   ██║   ██║[/]\n[#FAD22D]██║   ██║   ██║      ██║   ██║   ██║[/]\n[#FFDE5C]╚██████╔╝   ██║      ██║   ╚██████╔╝[/]\n[#FFE98A] ╚═════╝    ╚═╝      ╚═╝    ╚═════╝ [/]",
+    "bannerHero": "[#FFDE5C]           ╻          [/]\n[#E0B325]      ╭────┸────╮      [/]\n[#FAD22D]      │  ●   ●  │      [/]\n[#FAD22D]      │   ▿▿▿   │      [/]\n[#E0B325]      ╰──┬───┬──╯      [/]\n[#B8901F]     ╭───┴───┴───╮     [/]\n[bold #FAD22D]     │  O T T O  │     [/]\n[#B8901F]     ╰───────────╯     [/]\n[dim #8A6D1A]       gateway online  [/]"
+  }
 }

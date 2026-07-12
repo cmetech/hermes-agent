@@ -26,3 +26,9 @@ test('defaults derive displayName and wordmark from slug', () => {
 test('rejects an invalid slug', () => {
   assert.throws(() => loadDescriptor('Bad Slug', { root: ROOT }), /slug/i)
 })
+
+test('descriptor surfaces the cli banner art', () => {
+  const d = loadDescriptor('otto', { root: ROOT })
+  assert.match(d.cli.bannerLogo, /█/) // otto ASCII art present
+  assert.equal(typeof d.cli.bannerHero, 'string')
+})

@@ -14,5 +14,9 @@
     "tools": { "excludeToolsets": ["home_assistant"], "disabledByDefault": ["spotify"] }
   },
   "capabilitySets": [],
-  "personaSets": []
+  "personaSets": [],
+  "cli": {
+    "bannerLogo": "[bold #FAD22D]╭──────────────╮[/]\n[bold #FAD22D]│    LOOP24    │[/]\n[bold #FAD22D]╰──────────────╯[/]",
+    "bannerHero": "[#FAD22D]     ╭───╮     [/]\n[#FAD22D]     │ 24│     [/]\n[#FAD22D]     ╰───╯     [/]\n[dim #8A6D1A]  loop online  [/]"
+  }
 }
