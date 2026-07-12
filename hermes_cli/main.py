@@ -5610,6 +5610,46 @@ def _desktop_launch_options() -> tuple[list[str], str]:
     return flags, disable_gpu
 
 
+def _installed_desktop_app() -> Optional[Path]:
+    """Locate an OS-installed *packaged* OTTO desktop app (placed by the nsis/dmg
+    installer), as opposed to a build from this source checkout. Returns the
+    launchable path (the .app bundle on macOS, the .exe on Windows, the AppImage
+    on Linux) or None. Lets ``otto desktop`` prefer the real installed release
+    over a divergent source build (which reports the agent version + git-updates).
+    """
+    home = Path.home()
+    if sys.platform == "darwin":
+        for base in ("/Applications", str(home / "Applications")):
+            app = Path(base) / "OTTO.app"
+            if app.is_dir():
+                return app
+        return None
+    if os.name == "nt":
+        candidates: list[Path] = []
+        for env in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+            root = os.environ.get(env)
+            if root:
+                candidates.append(Path(root) / "Programs" / "OTTO" / "OTTO.exe")
+                candidates.append(Path(root) / "OTTO" / "OTTO.exe")
+        for exe in candidates:
+            if exe.is_file():
+                return exe
+        return None
+    # Linux: AppImage location isn't standardized; check a couple common spots.
+    for exe in (home / ".local" / "bin" / "OTTO.AppImage", Path("/opt/OTTO/otto")):
+        if exe.exists():
+            return exe
+    return None
+
+
+def _launch_installed_desktop_app(target: Path) -> None:
+    """Launch the installed packaged desktop app detached, then return."""
+    if sys.platform == "darwin" and target.suffix == ".app":
+        subprocess.Popen(["open", str(target)])
+    else:
+        subprocess.Popen([str(target)], cwd=str(target.parent))
+
+
 def cmd_gui(args: argparse.Namespace):
     """Build and launch the native Electron desktop GUI."""
     desktop_dir = PROJECT_ROOT / "apps" / "desktop"
@@ -5649,6 +5689,20 @@ def cmd_gui(args: argparse.Namespace):
     source_mode = getattr(args, "source", False)
     skip_build = getattr(args, "skip_build", False)
     force_build = getattr(args, "force_build", False)
+    build_only = getattr(args, "build_only", False)
+
+    # OTTO: prefer the OS-installed packaged app (from the installer) over
+    # building/running from this source checkout. Otherwise `otto desktop`
+    # silently launches a divergent source build — it reports the Hermes agent
+    # version (not the OTTO release version) and self-updates via git. Explicit
+    # overrides (--source, --build-only, --skip-build) keep the source path.
+    if not source_mode and not build_only and not skip_build:
+        installed_app = _installed_desktop_app()
+        if installed_app is not None:
+            print(f"→ Launching the installed OTTO desktop app: {installed_app}")
+            print("  (Run `otto desktop --source` to build/run from this checkout instead.)")
+            _launch_installed_desktop_app(installed_app)
+            return
 
     packaged_executable = _desktop_packaged_executable(desktop_dir)
 

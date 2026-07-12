@@ -5,6 +5,10 @@ releases are published at https://github.com/cmetech/otto/releases.
 
 ## Unreleased
 
+- Fix: `otto desktop` now launches the **installed packaged OTTO app** when one
+  exists, instead of building/running from a source checkout (which showed the
+  agent version and git-updated). Use `otto desktop --source` for the checkout.
+
 - Safety: the CLI update paths (`otto update`, `--check`, the Windows ZIP
   fallback) now default to the **`otto`** branch and the **cmetech** repo — a bare
   `otto update` can no longer default to upstream `main` and replace OTTO with
