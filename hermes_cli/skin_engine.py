@@ -268,6 +268,73 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
 [#DD4A3A]⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⚔⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[/]
 [dim #6B1717]⠀⠀⠀⠀⠀⠀⠀⠀war god online⠀⠀⠀⠀⠀⠀⠀⠀[/]""",
     },
+    "otto": {
+        "name": "otto",
+        "description": "OTTO — teal & cyan automation theme",
+        "colors": {
+            "banner_border": "#0E7C7B",
+            "banner_title": "#5EEAD4",
+            "banner_accent": "#2DD4BF",
+            "banner_dim": "#0B4F4E",
+            "banner_text": "#E6FFFB",
+            "ui_accent": "#2DD4BF",
+            "ui_label": "#5EEAD4",
+            "ui_ok": "#4caf50",
+            "ui_error": "#ef5350",
+            "ui_warn": "#ffa726",
+            "prompt": "#E6FFFB",
+            "input_rule": "#0E7C7B",
+            "response_border": "#17BEBB",
+            "status_bar_bg": "#06201F",
+            "status_bar_text": "#E6FFFB",
+            "status_bar_strong": "#5EEAD4",
+            "status_bar_dim": "#4B6E6B",
+            "status_bar_good": "#7BC96F",
+            "status_bar_warn": "#5EEAD4",
+            "status_bar_bad": "#EF5350",
+            "status_bar_critical": "#EF5350",
+            "session_label": "#5EEAD4",
+            "session_border": "#4B6E6B",
+        },
+        "spinner": {
+            "waiting_faces": ["(◎)", "(◉)", "(⊙)", "(◈)", "(◇)"],
+            "thinking_faces": ["(◉)", "(◎)", "(⊙)", "(◈)", "(◇)"],
+            "thinking_verbs": [
+                "routing", "spinning up", "warming the gateway", "reaching kilo",
+                "orchestrating", "wiring it up", "queuing", "syncing",
+            ],
+            "wings": [
+                ["⟪◈", "◈⟫"],
+                ["⟪◉", "◉⟫"],
+                ["⟪⊙", "⊙⟫"],
+                ["⟪◇", "◇⟫"],
+            ],
+        },
+        "branding": {
+            "agent_name": "OTTO",
+            "welcome": "Welcome to OTTO! Type your message or /help for commands.",
+            "goodbye": "Goodbye! ⚕",
+            "response_label": " ⚕ OTTO ",
+            "prompt_symbol": "❯",
+            "help_header": "(◉‿◉) Available Commands",
+        },
+        "tool_prefix": "┊",
+        "banner_logo": """[bold #0E7C7B] ██████╗ ████████╗████████╗ ██████╗ [/]
+[bold #12A0A0]██╔═══██╗╚══██╔══╝╚══██╔══╝██╔═══██╗[/]
+[#17BEBB]██║   ██║   ██║      ██║   ██║   ██║[/]
+[#2DD4BF]██║   ██║   ██║      ██║   ██║   ██║[/]
+[#38E0C8]╚██████╔╝   ██║      ██║   ╚██████╔╝[/]
+[#5EEAD4] ╚═════╝    ╚═╝      ╚═╝    ╚═════╝ [/]""",
+        "banner_hero": """[#5EEAD4]           ╻          [/]
+[#17BEBB]      ╭────┸────╮      [/]
+[#2DD4BF]      │  ●   ●  │      [/]
+[#2DD4BF]      │   ▿▿▿   │      [/]
+[#17BEBB]      ╰──┬───┬──╯      [/]
+[#12A0A0]     ╭───┴───┴───╮     [/]
+[bold #5EEAD4]     │  O T T O  │     [/]
+[#12A0A0]     ╰───────────╯     [/]
+[dim #0E7C7B]       gateway online  [/]""",
+    },
     "mono": {
         "name": "mono",
         "description": "Monochrome — clean grayscale",
@@ -650,7 +717,7 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
 # =============================================================================
 
 _active_skin: Optional[SkinConfig] = None
-_active_skin_name: str = "default"
+_active_skin_name: str = "otto"
 
 
 def _skins_dir() -> Path:
@@ -795,11 +862,11 @@ def init_skin_from_config(config: dict) -> None:
     display = config.get("display") or {}
     if not isinstance(display, dict):
         display = {}
-    skin_name = display.get("skin", "default")
+    skin_name = display.get("skin", "otto")
     if isinstance(skin_name, str) and skin_name.strip():
         set_active_skin(skin_name.strip())
     else:
-        set_active_skin("default")
+        set_active_skin("otto")
 
 
 # =============================================================================
