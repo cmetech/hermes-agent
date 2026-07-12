@@ -1,0 +1,76 @@
+// scripts/brand/emitters/intro.mjs
+//
+// Chat intro splash emitter for apps/desktop/src/components/chat/intro.tsx.
+//
+// The wordmark and tagline are real source edits (not build-time branding —
+// see the workspace CLAUDE.md "Desktop UI branding is BUILD-TIME" note and
+// the intro.tsx row in the OTTO customization surface table). This emitter
+// sets/checks the two `const` declarations directly:
+//   const WORDMARK = 'OTTO COWORKER'                (single-quoted)
+//   const TAGLINE = "OTTO orchestrates ... there."   (double-quoted, may
+//                                                      contain an em-dash
+//                                                      and an apostrophe)
+
+import fs from 'node:fs'
+import path from 'node:path'
+
+const INTRO_FILE = 'apps/desktop/src/components/chat/intro.tsx'
+
+// Matches: const WORDMARK = '...'  (single-quoted, no embedded quote handling
+// needed — wordmarks are short brand names).
+const WORDMARK_RE = /(const WORDMARK = ')([^']*)(')/
+
+// Matches: const TAGLINE = "..."  (double-quoted). The value may contain an
+// em-dash and apostrophes but not an unescaped double quote, so capturing
+// up to the next `"` is safe and matches the exact current line.
+const TAGLINE_RE = /(const TAGLINE = ")([^"]*)(")/
+
+export function hasWordmark(source, wordmark) {
+  const m = source.match(WORDMARK_RE)
+  if (!m) return false
+  return m[2] === wordmark
+}
+
+export function setWordmark(source, wordmark) {
+  if (!WORDMARK_RE.test(source)) return source
+  return source.replace(WORDMARK_RE, (_all, a, _val, c) => `${a}${wordmark}${c}`)
+}
+
+export function hasTagline(source, tagline) {
+  const m = source.match(TAGLINE_RE)
+  if (!m) return false
+  return m[2] === tagline
+}
+
+function escapeForDoubleQuotedString(value) {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+}
+
+export function setTagline(source, tagline) {
+  if (!TAGLINE_RE.test(source)) return source
+  const escaped = escapeForDoubleQuotedString(tagline)
+  return source.replace(TAGLINE_RE, (_all, a, _val, c) => `${a}${escaped}${c}`)
+}
+
+export const introEmitter = {
+  id: 'intro',
+  check(d, { root }) {
+    const src = fs.readFileSync(path.join(root, INTRO_FILE), 'utf8')
+    if (!hasWordmark(src, d.wordmark)) {
+      return { ok: false, detail: `WORDMARK is not '${d.wordmark}'` }
+    }
+    if (!hasTagline(src, d.tagline)) {
+      return { ok: false, detail: `TAGLINE is not "${d.tagline}"` }
+    }
+    return { ok: true }
+  },
+  write(d, { root }) {
+    const p = path.join(root, INTRO_FILE)
+    const src = fs.readFileSync(p, 'utf8')
+    let next = setWordmark(src, d.wordmark)
+    next = setTagline(next, d.tagline)
+    if (next === src) return { changed: false }
+    fs.writeFileSync(p, next)
+    return { changed: true, detail: p }
+  }
+}

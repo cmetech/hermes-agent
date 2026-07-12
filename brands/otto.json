@@ -2,7 +2,7 @@
   "slug": "otto",
   "displayName": "OTTO",
   "wordmark": "OTTO COWORKER",
-  "tagline": "OTTO orchestrates your thoughts and tasks into effective outcomes.",
+  "tagline": "OTTO orchestrates your thoughts and tasks into effective outcomes — tell me what you need and I'll take it from there.",
   "appId": "io.cmetech.otto",
   "scheme": "otto",
   "homeDir": ".otto",
