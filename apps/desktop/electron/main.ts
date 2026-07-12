@@ -424,7 +424,7 @@ const BOOT_FAKE_STEP_MS = (() => {
   return Math.max(120, raw)
 })()
 
-const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME || 'Hermes'
+const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME || 'OTTO'
 const TITLEBAR_HEIGHT = 34
 const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
 
@@ -717,12 +717,12 @@ app.setName(APP_NAME)
 // Windows toast notifications silently no-op unless an AppUserModelID is set:
 // `new Notification().show()` returns without error and nothing appears. The
 // AUMID must match the installed Start Menu shortcut's AUMID, which
-// electron-builder derives from the build `appId` (com.nousresearch.hermes) —
+// electron-builder derives from the build `appId` (io.cmetech.otto) —
 // keep this string in sync with package.json `build.appId`. macOS/Linux don't
 // need this, so gate it on Windows. (Fixes: desktop approval/turn notifications
 // never firing on Windows.)
 if (IS_WINDOWS) {
-  app.setAppUserModelId('com.nousresearch.hermes')
+  app.setAppUserModelId('io.cmetech.otto')
 }
 
 // Seed the native About panel with the live Hermes version. This is refreshed
@@ -8888,12 +8888,19 @@ ipcMain.handle('hermes:vscode-theme:fetch', async (_event, id) => fetchMarketpla
 ipcMain.handle('hermes:vscode-theme:search', async (_event, query) => searchMarketplaceThemes(String(query || ''), 20))
 
 // ---------------------------------------------------------------------------
-// hermes:// deep links (e.g. hermes://blueprint/morning-brief?time=08:00).
+// otto:// / hermes:// deep links (e.g. otto://blueprint/morning-brief?time=08:00).
 // A docs/dashboard "Send to App" button opens this URL; we route it into the
 // running app's chat composer. Three delivery paths: macOS 'open-url',
 // Win/Linux running-app 'second-instance' (argv), Win/Linux cold-start argv.
+//
+// OTTO branding: `otto` is the canonical scheme, but we ALSO register and
+// accept `hermes` so pre-existing hermes:// links (the backend still emits
+// them — cron/blueprint_catalog.py, Honcho OAuth) keep resolving. Keep both in
+// DEEP_LINK_PROTOCOLS until the backend is migrated to otto://.
 // ---------------------------------------------------------------------------
+const OTTO_PROTOCOL = 'otto'
 const HERMES_PROTOCOL = 'hermes'
+const DEEP_LINK_PROTOCOLS = [OTTO_PROTOCOL, HERMES_PROTOCOL]
 let _pendingDeepLink = null
 let _rendererReadyForDeepLink = false
 
@@ -8902,7 +8909,11 @@ function _extractDeepLink(argv) {
     return null
   }
 
-  return argv.find(a => typeof a === 'string' && a.startsWith(`${HERMES_PROTOCOL}://`)) || null
+  return (
+    argv.find(
+      a => typeof a === 'string' && DEEP_LINK_PROTOCOLS.some(p => a.startsWith(`${p}://`))
+    ) || null
+  )
 }
 
 function handleDeepLink(url) {
@@ -8955,7 +8966,7 @@ ipcMain.handle('hermes:deep-link-ready', () => {
     const queued = _pendingDeepLink
     _pendingDeepLink = null
     handleDeepLink(
-      `${HERMES_PROTOCOL}://${queued.kind}/${encodeURIComponent(queued.name)}` +
+      `${OTTO_PROTOCOL}://${queued.kind}/${encodeURIComponent(queued.name)}` +
         (Object.keys(queued.params).length ? '?' + new URLSearchParams(queued.params).toString() : '')
     )
   }
@@ -8964,16 +8975,19 @@ ipcMain.handle('hermes:deep-link-ready', () => {
 })
 
 function registerDeepLinkProtocol() {
-  try {
-    if (process.defaultApp && process.argv.length >= 2) {
-      // Dev: register with the electron exec path + entry script so the OS can
-      // relaunch us with the URL.
-      app.setAsDefaultProtocolClient(HERMES_PROTOCOL, process.execPath, [path.resolve(process.argv[1])])
-    } else {
-      app.setAsDefaultProtocolClient(HERMES_PROTOCOL)
+  // Register every accepted scheme (otto + hermes) so the OS routes both to us.
+  for (const scheme of DEEP_LINK_PROTOCOLS) {
+    try {
+      if (process.defaultApp && process.argv.length >= 2) {
+        // Dev: register with the electron exec path + entry script so the OS can
+        // relaunch us with the URL.
+        app.setAsDefaultProtocolClient(scheme, process.execPath, [path.resolve(process.argv[1])])
+      } else {
+        app.setAsDefaultProtocolClient(scheme)
+      }
+    } catch (err) {
+      rememberLog(`[deeplink] protocol registration failed for ${scheme}://: ${err.message}`)
     }
-  } catch (err) {
-    rememberLog(`[deeplink] protocol registration failed: ${err.message}`)
   }
 }
 
