@@ -1,5 +1,5 @@
 // scripts/brand/generate.mjs
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import path from 'node:path'
 import { loadDescriptor } from './descriptor.mjs'
 import { resolveActiveBrand } from './active.mjs'
@@ -65,6 +65,6 @@ async function main() {
   if (mode === 'check' && results.some(r => !r.ok)) process.exit(1)
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch(err => { console.error(err); process.exit(1) })
 }
