@@ -6,12 +6,14 @@ import { providerEmitter } from './emitters/provider.mjs'
 import { authNoauthEmitter } from './emitters/auth-noauth.mjs'
 import { pyprojectScriptsEmitter } from './emitters/pyproject-scripts.mjs'
 import { skinEmitter } from './emitters/skin.mjs'
+import { packageJsonEmitter } from './emitters/package-json.mjs'
 
 export const DEFAULT_EMITTERS = [
   providerEmitter,
   authNoauthEmitter,
   pyprojectScriptsEmitter,
-  skinEmitter
+  skinEmitter,
+  packageJsonEmitter
 ]
 
 export function runEmitters(descriptor, { root, mode, emitters = DEFAULT_EMITTERS }) {
