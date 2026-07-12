@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadDescriptor } from '../descriptor.mjs'
-import { renderPackageJson, packageJsonEmitter } from '../emitters/package-json.mjs'
+import { renderPackageJson, packageJsonEmitter, setPath } from '../emitters/package-json.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 const PKG = path.join(ROOT, 'apps/desktop/package.json')
@@ -42,4 +42,19 @@ test('renderPackageJson(otto) round-trips with no fields lost (deep-equal, not b
   const onDisk = fs.readFileSync(PKG, 'utf8')
   const out = renderPackageJson(loadDescriptor('otto', { root: ROOT }), onDisk)
   assert.deepEqual(JSON.parse(out), JSON.parse(onDisk))
+})
+
+test('setPath throws (does not silently no-op) on a missing intermediate key, naming the path', () => {
+  assert.throws(() => setPath({ build: {} }, 'build.mac.extendInfo.CFBundleName', 'X'), /build\.mac\.extendInfo\.CFBundleName/)
+})
+
+test('setPath throws (does not silently no-op) on a missing last key, naming the path', () => {
+  assert.throws(() => setPath({ build: { mac: {} } }, 'build.mac.doesNotExist', 'X'), /build\.mac\.doesNotExist/)
+})
+
+test('setPath still succeeds and mutates in place when every key on the path exists', () => {
+  const obj = { build: { mac: { extendInfo: { CFBundleName: 'old' } } } }
+  const result = setPath(obj, 'build.mac.extendInfo.CFBundleName', 'new')
+  assert.equal(result, true)
+  assert.equal(obj.build.mac.extendInfo.CFBundleName, 'new')
 })

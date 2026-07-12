@@ -67,16 +67,26 @@ function getPath(obj, dotted) {
   return dotted.split('.').reduce((cur, key) => (cur == null ? undefined : cur[key]), obj)
 }
 
-function setPath(obj, dotted, value) {
+// Throws (rather than silently no-oping) when an intermediate or final key is
+// missing from `obj`, naming the full dotted path in the message. A silent
+// skip here would mean a brand-driven field quietly never gets written if
+// apps/desktop/package.json's shape ever drifts from what fieldPaths()
+// expects — exactly the kind of failure that must be loud once `write` is
+// authoritative against the real tree (Plan 3).
+export function setPath(obj, dotted, value) {
   const keys = dotted.split('.')
   let cur = obj
   for (let i = 0; i < keys.length - 1; i++) {
     const key = keys[i]
-    if (cur[key] == null) return false // path doesn't exist in this document; skip
+    if (cur[key] == null) {
+      throw new Error(`setPath: missing intermediate key "${key}" while setting "${dotted}"`)
+    }
     cur = cur[key]
   }
   const last = keys[keys.length - 1]
-  if (cur[last] === undefined) return false
+  if (cur[last] === undefined) {
+    throw new Error(`setPath: missing key "${last}" while setting "${dotted}"`)
+  }
   cur[last] = value
   return true
 }

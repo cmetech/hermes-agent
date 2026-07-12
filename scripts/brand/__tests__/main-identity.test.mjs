@@ -37,6 +37,17 @@ test('setScheme sets OTTO_PROTOCOL value only, leaves HERMES_PROTOCOL untouched'
   assert.equal(setScheme(once, 'loop24'), once) // idempotent
 })
 
+test('check() fails against the real main.ts when the descriptor identity is wrong', () => {
+  const badDescriptor = {
+    displayName: 'NOT-A-REAL-BRAND',
+    appId: 'io.cmetech.not-a-real-brand',
+    scheme: 'not-a-real-brand'
+  }
+  const result = mainIdentityEmitter.check(badDescriptor, { root: ROOT })
+  assert.equal(result.ok, false)
+  assert.match(result.detail, /NOT-A-REAL-BRAND/)
+})
+
 test('setAppId replaces app id and is idempotent', () => {
   const line = "app.setAppUserModelId('io.cmetech.otto')"
   const once = setAppId(line, 'io.cmetech.loop24')

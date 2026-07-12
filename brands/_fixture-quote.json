@@ -1,0 +1,23 @@
+{
+  "slug": "_fixture-quote",
+  "displayName": "FIX$TURE",
+  "wordmark": "L'OOP \"24\"",
+  "tagline": "It's a \"test\" — really.",
+  "appId": "io.cmetech.fixture-quote",
+  "scheme": "fixture-quote",
+  "homeDir": ".fixture-quote",
+  "releasesRepo": "cmetech/fixture-quote",
+  "updateCommand": "fixture-quote update",
+  "theme": "otto",
+  "gateway": "otto",
+  "curation": {
+    "skills": { "exclude": [], "disabledByDefault": [] },
+    "tools": { "excludeToolsets": [], "disabledByDefault": [] }
+  },
+  "capabilitySets": [],
+  "personaSets": [],
+  "cli": {
+    "bannerLogo": "[bold #FAD22D]Q-BRAND LOGO[/]",
+    "bannerHero": "[#FAD22D]Q-BRAND HERO[/]"
+  }
+}

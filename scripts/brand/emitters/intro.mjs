@@ -16,8 +16,12 @@ import path from 'node:path'
 
 const INTRO_FILE = 'apps/desktop/src/components/chat/intro.tsx'
 
-// Matches: const WORDMARK = '...'  (single-quoted, no embedded quote handling
-// needed — wordmarks are short brand names).
+// Matches: const WORDMARK = '...'  (single-quoted). setWordmark() escapes `'`
+// and `\` before substituting so the emitted line is always syntactically
+// valid TS. NOTE: this regex's `[^']*` does NOT tolerate an escaped `\'`
+// inside the captured value, so hasWordmark()/setWordmark() are not
+// guaranteed to round-trip a wordmark that itself contains a `'` — only to
+// emit valid syntax for it. No real brand's wordmark contains a quote today.
 const WORDMARK_RE = /(const WORDMARK = ')([^']*)(')/
 
 // Matches: const TAGLINE = "..."  (double-quoted). The value may contain an
@@ -31,9 +35,14 @@ export function hasWordmark(source, wordmark) {
   return m[2] === wordmark
 }
 
+function escapeForSingleQuotedString(value) {
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+}
+
 export function setWordmark(source, wordmark) {
   if (!WORDMARK_RE.test(source)) return source
-  return source.replace(WORDMARK_RE, (_all, a, _val, c) => `${a}${wordmark}${c}`)
+  const escaped = escapeForSingleQuotedString(wordmark)
+  return source.replace(WORDMARK_RE, (_all, a, _val, c) => `${a}${escaped}${c}`)
 }
 
 export function hasTagline(source, tagline) {

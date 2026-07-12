@@ -9,6 +9,13 @@ import { skinEmitter, hasBrandSkin, hasActiveSkin, renderSkin, extractSkinBlock 
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
+// Loaded directly (not via loadDescriptor) — its slug starts with `_` and
+// deliberately fails descriptor.mjs's SLUG_RE, which is what keeps it out of
+// real-brand enumeration. It already carries the full descriptor shape
+// (including a `$`-bearing displayName), so a plain JSON.parse is a valid
+// stand-in for a loaded descriptor in these tests.
+const FIXTURE_QUOTE = JSON.parse(fs.readFileSync(path.join(ROOT, 'brands/_fixture-quote.json'), 'utf8'))
+
 test('current skin_engine has the otto skin and active default', () => {
   const src = fs.readFileSync(path.join(ROOT, 'hermes_cli/skin_engine.py'), 'utf8')
   assert.equal(hasBrandSkin(src, 'otto'), true)
@@ -80,6 +87,38 @@ test('write splices a new brand block, is idempotent, and leaves existing blocks
   // Exactly one loop24 block header exists (no duplication).
   const occurrences = after2.split('\n    "loop24": {').length - 1
   assert.equal(occurrences, 1)
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
+test('renderSkin substitutes a $-bearing displayName verbatim into every label (split/join, not regex-replace $-patterns)', () => {
+  const rendered = renderSkin(FIXTURE_QUOTE)
+  assert.ok(FIXTURE_QUOTE.displayName.includes('$'), 'precondition: fixture displayName is $-bearing')
+  assert.match(rendered, /"agent_name": "FIX\$TURE"/)
+  assert.match(rendered, /Welcome to FIX\$TURE! Type your message/)
+  assert.match(rendered, / ⚕ FIX\$TURE /)
+  // Guard against String.prototype.replace-style $-pattern corruption (e.g. a
+  // literal `$&`/`$'` displayName would be mishandled by a naive .replace()
+  // call): every label occurrence must carry the `$` immediately, not have
+  // it swallowed or the surrounding text mangled.
+  // 4 occurrences: "description", "agent_name", "welcome", "response_label".
+  assert.equal((rendered.match(/FIX\$TURE/g) || []).length, 4)
+  assert.ok(!rendered.includes('FIXTURE'), 'the literal $ must never be dropped from the displayName')
+})
+
+test('renderSkin($-bearing fixture) round-trips through write/extract on a temp skin_engine.py', () => {
+  const realSrc = fs.readFileSync(path.join(ROOT, 'hermes_cli/skin_engine.py'), 'utf8')
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'skinwrite-quote-'))
+  fs.mkdirSync(path.join(tmpRoot, 'hermes_cli'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'hermes_cli/skin_engine.py')
+  fs.writeFileSync(tmpFile, realSrc)
+
+  const r1 = skinEmitter.write(FIXTURE_QUOTE, { root: tmpRoot })
+  assert.equal(r1.changed, true)
+  const after = fs.readFileSync(tmpFile, 'utf8')
+  const spliced = extractSkinBlock(after, FIXTURE_QUOTE.slug)
+  assert.ok(spliced, `${FIXTURE_QUOTE.slug} block spliced in`)
+  assert.equal(spliced, renderSkin(FIXTURE_QUOTE))
 
   fs.rmSync(tmpRoot, { recursive: true, force: true })
 })
