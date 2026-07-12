@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildDescriptor, applyReleaseSwaps, stageReleases, RESERVED_SLUGS } from '../create-clone.mjs'
+import { buildDescriptor, applyReleaseSwaps, stageReleases, RESERVED_SLUGS, parseCloneArgs } from '../create-clone.mjs'
 
 test('buildDescriptor: defaults use house style (COWORKER wordmark, cmetech appId/releases)', () => {
   const d = buildDescriptor('acme')
@@ -57,6 +57,27 @@ test('applyReleaseSwaps: swaps functional otto tokens, preserves shared refs', (
   assert.equal(applyReleaseSwaps('repository: cmetech/hermes-agent', ctx), 'repository: cmetech/hermes-agent')
   assert.equal(applyReleaseSwaps('docs/otto-desktop-release-install.md', ctx), 'docs/otto-desktop-release-install.md')
   assert.equal(applyReleaseSwaps('the otto_hermes workspace', ctx), 'the otto_hermes workspace')
+})
+
+test('applyReleaseSwaps: preserves OTTO_ env-var identifiers, swaps display OTTO', () => {
+  const ctx = { slug: 'loop24', displayName: 'LOOP24' }
+  assert.equal(applyReleaseSwaps('OTTO_PRODUCT_VERSION: ${{ github.event.inputs.version }}', ctx), 'OTTO_PRODUCT_VERSION: ${{ github.event.inputs.version }}')
+  assert.equal(applyReleaseSwaps('env:\n  OTTO_VERSION: 1', ctx), 'env:\n  OTTO_VERSION: 1')
+  assert.equal(applyReleaseSwaps('Launch OTTO from /Applications', ctx), 'Launch LOOP24 from /Applications')
+  assert.equal(applyReleaseSwaps('files: dist/OTTO-*', ctx), 'files: dist/LOOP24-*')
+})
+
+test('parseCloneArgs: --releases-dir value does not leak into wordmark/tagline', () => {
+  assert.deepEqual(parseCloneArgs(['loop24', '--releases-dir', '../loop24-releases']),
+    { slug: 'loop24', wordmark: undefined, tagline: undefined, releasesDir: '../loop24-releases', force: false })
+})
+test('parseCloneArgs: positional wordmark/tagline + --force', () => {
+  assert.deepEqual(parseCloneArgs(['loop24', 'LOOP24 COWORKER', 'Tag.', '--force']),
+    { slug: 'loop24', wordmark: 'LOOP24 COWORKER', tagline: 'Tag.', releasesDir: undefined, force: true })
+})
+test('parseCloneArgs: positional wordmark alongside --releases-dir (no tagline)', () => {
+  assert.deepEqual(parseCloneArgs(['loop24', 'WM', '--releases-dir', '../x']),
+    { slug: 'loop24', wordmark: 'WM', tagline: undefined, releasesDir: '../x', force: false })
 })
 
 test('stageReleases: copies+swaps into a target dir, preserving workflow subpath', () => {

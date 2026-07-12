@@ -36,21 +36,15 @@ export function buildDescriptor(slug, { wordmark, tagline } = {}) {
   }
 }
 
-// Ordered, case-sensitive. Longest / most-specific tokens first so a broad
-// `OTTO`→display swap never eats `OTTO.app` / `OTTO-` / `cmetech/otto`, and so
-// lowercase shared refs (`cmetech/hermes-agent`, `otto-desktop-release-install`,
-// `otto_hermes`) are never touched.
-function swapPairs(slug, display) {
+// Lowercase / mixed-case tokens that need literal, context-specific swaps.
+// (Bare lowercase `otto` is intentionally NOT swapped so shared refs survive:
+// cmetech/hermes-agent, otto-desktop-release-install.md, otto_hermes, otto-gateway.)
+function lowercaseSwapPairs(slug) {
   return [
     ['cmetech/otto', `cmetech/${slug}`],
     ['cmetech/hermes-agent@otto', `cmetech/hermes-agent@${slug}`],
     ['hermes-agent@otto', `hermes-agent@${slug}`],
     ['ref=otto', `ref=${slug}`],
-    ['OTTO.AppImage', `${display}.AppImage`],
-    ['OTTO.app', `${display}.app`],
-    ['OTTO-', `${display}-`],
-    ['OTTO Desktop', `${display} Desktop`],
-    ['OTTO', display],
     ['[otto]', `[${slug}]`],
     ['otto-installer', `${slug}-installer`],
     ['otto-release-', `${slug}-release-`],
@@ -62,7 +56,11 @@ function swapPairs(slug, display) {
 
 export function applyReleaseSwaps(content, { slug, displayName }) {
   let out = content
-  for (const [from, to] of swapPairs(slug, displayName)) out = out.split(from).join(to)
+  for (const [from, to] of lowercaseSwapPairs(slug)) out = out.split(from).join(to)
+  // Uppercase display OTTO -> displayName, but NEVER an OTTO_ env-var identifier
+  // (OTTO_PRODUCT_VERSION / OTTO_VERSION are a cross-repo env contract read by
+  // the source build — the trailing underscore marks an identifier, like HERMES_HOME).
+  out = out.replace(/OTTO(?!_)/g, displayName)
   return out
 }
 
@@ -90,18 +88,26 @@ function branchExists(root, name) {
   try { git(root, ['rev-parse', '--verify', '--quiet', `refs/heads/${name}`]); return true } catch { return false }
 }
 
+export function parseCloneArgs(argv) {
+  let releasesDir
+  let force = false
+  const positional = []
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (a === '--force') { force = true; continue }
+    if (a === '--releases-dir') { releasesDir = argv[++i]; continue }
+    if (a.startsWith('--')) continue // unknown flag: ignore
+    positional.push(a)
+  }
+  return { slug: positional[0], wordmark: positional[1], tagline: positional[2], releasesDir, force }
+}
+
 export async function main(argv) {
-  const flags = argv.filter(a => a.startsWith('--'))
-  const positional = argv.filter(a => !a.startsWith('--'))
-  const slug = positional[0]
-  const wordmark = positional[1]
-  const tagline = positional[2]
+  const { slug, wordmark, tagline, releasesDir: relArg, force } = parseCloneArgs(argv)
   if (!slug) throw new Error('usage: create-clone <slug> [wordmark] [tagline] [--releases-dir <path>] [--force]')
-  const force = flags.includes('--force')
-  const relIdx = argv.indexOf('--releases-dir')
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
   const descriptor = buildDescriptor(slug, { wordmark, tagline })
-  const releasesDir = relIdx >= 0 ? path.resolve(argv[relIdx + 1]) : path.join(root, '..', `${slug}-releases`)
+  const releasesDir = relArg ? path.resolve(relArg) : path.join(root, '..', `${slug}-releases`)
 
   // Preconditions
   if (git(root, ['status', '--porcelain']) !== '') throw new Error('working tree is not clean; commit or stash first')
