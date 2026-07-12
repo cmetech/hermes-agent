@@ -2,18 +2,19 @@
 //
 // Desktop rebrand-config emitter for apps/desktop/brand.config.json.
 //
-// NOTE on approach: this deliberately does NOT require byte-for-byte JSON
-// reserialization (JSON.parse -> JSON.stringify is not guaranteed to
-// reproduce source formatting exactly). Instead:
+// NOTE on approach: this is FORMAT-PRESERVING, not a JSON.parse ->
+// JSON.stringify reserialization (that reflows formatting - e.g. it expands
+// the single-line `["\\bHermes\\b", "OTTO"]` rule pairs onto multiple lines
+// - which dirties the tree on every otherwise-no-op build). Instead:
 //   - `check` is PATH-BASED: parse the on-disk file and assert `name` and
 //     `rules` equal the descriptor's expected values.
-//   - `renderBrandConfig` parses the input text, sets exactly `name` and
-//     `rules` from the descriptor, and PRESERVES `protect` plus every
-//     `$comment`/`$note`/other key unchanged, then reserializes with
-//     `JSON.stringify(obj, null, 2) + '\n'`. It is used by `write` to
-//     produce a new brand's brand.config.json; it does not need to be
-//     byte-identical to the source text, only valid JSON with the right
-//     values and all other keys intact.
+//   - `renderBrandConfig` does TARGETED in-place string replacement of just
+//     (a) the top-level `"name"` value and (b) the replacement (2nd)
+//     element of each `rules` pair (the pattern side, `\\bHermes\\b` /
+//     `\\bHERMES\\b`, is upstream-invariant and untouched). Every other
+//     byte - `protect`, all `$comment`/`$note` keys, whitespace, line
+//     breaks - is left exactly as found. On a tree that already has the
+//     descriptor's values, `write` is a byte-for-byte no-op.
 //
 // `protect` is the list of FUNCTIONAL title-case "Hermes" strings that must
 // never be rewritten (X-Hermes-Session-Token auth header, Hermes-Desktop
@@ -32,11 +33,27 @@ function expectedRules(displayName) {
   ]
 }
 
+// JSON-escape a string for insertion between existing quotes in raw JSON
+// text (i.e. the escaped contents without the surrounding quote chars).
+function jsonInner(s) {
+  return JSON.stringify(s).slice(1, -1)
+}
+
 export function renderBrandConfig(descriptor, currentJsonText) {
-  const obj = JSON.parse(currentJsonText)
-  obj.name = descriptor.displayName
-  obj.rules = expectedRules(descriptor.displayName)
-  return JSON.stringify(obj, null, 2) + '\n'
+  const value = jsonInner(descriptor.displayName)
+  let next = currentJsonText
+
+  // (a) top-level "name" value. Anchored to start-of-line so this can never
+  // match "name" appearing inside a $comment/$note string value.
+  next = next.replace(/^(\s*"name"\s*:\s*")[^"]*(")/m, (_m, pre, post) => `${pre}${value}${post}`)
+
+  // (b) the replacement (2nd) element of each rules pair. The pattern side
+  // (raw text `\\bHermes\\b` / `\\bHERMES\\b`, i.e. two literal backslashes
+  // either side of the case) is matched verbatim and left untouched.
+  next = next.replace(/(\\\\bHermes\\\\b"\s*,\s*")[^"]*(")/, (_m, pre, post) => `${pre}${value}${post}`)
+  next = next.replace(/(\\\\bHERMES\\\\b"\s*,\s*")[^"]*(")/, (_m, pre, post) => `${pre}${value}${post}`)
+
+  return next
 }
 
 export const brandConfigEmitter = {

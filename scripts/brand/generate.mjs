@@ -2,6 +2,7 @@
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { loadDescriptor } from './descriptor.mjs'
+import { resolveActiveBrand } from './active.mjs'
 import { providerEmitter } from './emitters/provider.mjs'
 import { authNoauthEmitter } from './emitters/auth-noauth.mjs'
 import { pyprojectScriptsEmitter } from './emitters/pyproject-scripts.mjs'
@@ -38,14 +39,23 @@ function repoRoot() {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 }
 
+// Parses CLI args for the generator. The slug is OPTIONAL: any arg starting
+// with "--" is a flag (--write / --check); the first non-flag arg is the
+// slug. Flags and the slug may appear in either order. If no slug is given,
+// it resolves to the active brand (env OTTO_BRAND > brand/active marker >
+// 'otto' — see resolveActiveBrand). No flag, or any flag other than
+// --write, means mode 'check'.
+export function parseArgs(argv, { root }) {
+  const flags = argv.filter(a => a.startsWith('--'))
+  const positional = argv.filter(a => !a.startsWith('--'))
+  const mode = flags.includes('--write') ? 'write' : 'check'
+  const slug = positional[0] || resolveActiveBrand({ root })
+  return { slug, mode }
+}
+
 async function main() {
-  const [slug, flag] = process.argv.slice(2)
-  const mode = flag === '--write' ? 'write' : 'check'
-  if (!slug) {
-    console.error('usage: node generate.mjs <slug> [--check|--write]')
-    process.exit(2)
-  }
   const root = repoRoot()
+  const { slug, mode } = parseArgs(process.argv.slice(2), { root })
   const descriptor = loadDescriptor(slug, { root })
   const { results } = runEmitters(descriptor, { root, mode })
   for (const r of results) {
