@@ -4,6 +4,8 @@
  */
 
 import type { DesktopTheme, DesktopThemeTypography } from './types'
+// OTTO brand theme family (additive — keeps upstream merges clean).
+import { OTTO_THEMES } from './otto-presets'
 
 // Color-emoji fonts to append to every stack as a last resort. None of the UI
 // text/mono fonts carry emoji glyphs, so without this emoji render as tofu
@@ -278,6 +280,9 @@ export const slateTheme: DesktopTheme = {
 }
 
 export const BUILTIN_THEMES: Record<string, DesktopTheme> = {
+  // OTTO brand family first (6), then the upstream themes (6) = 12 total, which
+  // fills complete rows in both the 2-col and 3-col Settings grid layouts.
+  ...OTTO_THEMES,
   nous: nousTheme,
   midnight: midnightTheme,
   ember: emberTheme,
@@ -289,4 +294,4 @@ export const BUILTIN_THEMES: Record<string, DesktopTheme> = {
 export const BUILTIN_THEME_LIST = Object.values(BUILTIN_THEMES)
 
 /** Skin used when nothing is persisted or the persisted name is retired. */
-export const DEFAULT_SKIN_NAME = 'nous'
+export const DEFAULT_SKIN_NAME = 'otto'

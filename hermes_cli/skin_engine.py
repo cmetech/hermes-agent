@@ -270,31 +270,31 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
     },
     "otto": {
         "name": "otto",
-        "description": "OTTO — teal & cyan automation theme",
+        "description": "OTTO — gold on black brand theme",
         "colors": {
-            "banner_border": "#0E7C7B",
-            "banner_title": "#5EEAD4",
-            "banner_accent": "#2DD4BF",
-            "banner_dim": "#0B4F4E",
-            "banner_text": "#E6FFFB",
-            "ui_accent": "#2DD4BF",
-            "ui_label": "#5EEAD4",
-            "ui_ok": "#4caf50",
-            "ui_error": "#ef5350",
-            "ui_warn": "#ffa726",
-            "prompt": "#E6FFFB",
-            "input_rule": "#0E7C7B",
-            "response_border": "#17BEBB",
-            "status_bar_bg": "#06201F",
-            "status_bar_text": "#E6FFFB",
-            "status_bar_strong": "#5EEAD4",
-            "status_bar_dim": "#4B6E6B",
-            "status_bar_good": "#7BC96F",
-            "status_bar_warn": "#5EEAD4",
-            "status_bar_bad": "#EF5350",
-            "status_bar_critical": "#EF5350",
-            "session_label": "#5EEAD4",
-            "session_border": "#4B6E6B",
+            "banner_border": "#8A6D1A",
+            "banner_title": "#FAD22D",
+            "banner_accent": "#FFDE5C",
+            "banner_dim": "#5C4E14",
+            "banner_text": "#FAFAFA",
+            "ui_accent": "#FAD22D",
+            "ui_label": "#FFDE5C",
+            "ui_ok": "#0FC373",
+            "ui_error": "#FF3232",
+            "ui_warn": "#FF8C0A",
+            "prompt": "#FAFAFA",
+            "input_rule": "#8A6D1A",
+            "response_border": "#C9A227",
+            "status_bar_bg": "#1A1500",
+            "status_bar_text": "#FAFAFA",
+            "status_bar_strong": "#FAD22D",
+            "status_bar_dim": "#6E6144",
+            "status_bar_good": "#0FC373",
+            "status_bar_warn": "#FAD22D",
+            "status_bar_bad": "#FF3232",
+            "status_bar_critical": "#FF3232",
+            "session_label": "#FAD22D",
+            "session_border": "#6E6144",
         },
         "spinner": {
             "waiting_faces": ["(◎)", "(◉)", "(⊙)", "(◈)", "(◇)"],
@@ -319,21 +319,21 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
             "help_header": "(◉‿◉) Available Commands",
         },
         "tool_prefix": "┊",
-        "banner_logo": """[bold #0E7C7B] ██████╗ ████████╗████████╗ ██████╗ [/]
-[bold #12A0A0]██╔═══██╗╚══██╔══╝╚══██╔══╝██╔═══██╗[/]
-[#17BEBB]██║   ██║   ██║      ██║   ██║   ██║[/]
-[#2DD4BF]██║   ██║   ██║      ██║   ██║   ██║[/]
-[#38E0C8]╚██████╔╝   ██║      ██║   ╚██████╔╝[/]
-[#5EEAD4] ╚═════╝    ╚═╝      ╚═╝    ╚═════╝ [/]""",
-        "banner_hero": """[#5EEAD4]           ╻          [/]
-[#17BEBB]      ╭────┸────╮      [/]
-[#2DD4BF]      │  ●   ●  │      [/]
-[#2DD4BF]      │   ▿▿▿   │      [/]
-[#17BEBB]      ╰──┬───┬──╯      [/]
-[#12A0A0]     ╭───┴───┴───╮     [/]
-[bold #5EEAD4]     │  O T T O  │     [/]
-[#12A0A0]     ╰───────────╯     [/]
-[dim #0E7C7B]       gateway online  [/]""",
+        "banner_logo": """[bold #8A6D1A] ██████╗ ████████╗████████╗ ██████╗ [/]
+[bold #B8901F]██╔═══██╗╚══██╔══╝╚══██╔══╝██╔═══██╗[/]
+[#E0B325]██║   ██║   ██║      ██║   ██║   ██║[/]
+[#FAD22D]██║   ██║   ██║      ██║   ██║   ██║[/]
+[#FFDE5C]╚██████╔╝   ██║      ██║   ╚██████╔╝[/]
+[#FFE98A] ╚═════╝    ╚═╝      ╚═╝    ╚═════╝ [/]""",
+        "banner_hero": """[#FFDE5C]           ╻          [/]
+[#E0B325]      ╭────┸────╮      [/]
+[#FAD22D]      │  ●   ●  │      [/]
+[#FAD22D]      │   ▿▿▿   │      [/]
+[#E0B325]      ╰──┬───┬──╯      [/]
+[#B8901F]     ╭───┴───┴───╮     [/]
+[bold #FAD22D]     │  O T T O  │     [/]
+[#B8901F]     ╰───────────╯     [/]
+[dim #8A6D1A]       gateway online  [/]""",
     },
     "mono": {
         "name": "mono",

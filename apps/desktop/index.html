@@ -19,9 +19,10 @@
         let bg = localStorage.getItem('hermes-boot-background')
         let scheme = localStorage.getItem('hermes-boot-color-scheme')
         if (!bg) {
-          const dark = window.matchMedia('(prefers-color-scheme: dark)').matches
-          bg = dark ? '#111111' : '#f7f7f7'
-          scheme = dark ? 'dark' : 'light'
+          // OTTO default: dark first-paint (matches the dark default in
+          // context.tsx / the OTTO theme background) until the user picks a mode.
+          bg = '#0C0C0C'
+          scheme = 'dark'
         }
         document.documentElement.style.backgroundColor = bg
         if (scheme === 'dark' || scheme === 'light') {
