@@ -3,6 +3,9 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
 import fs from 'fs'
+// OTTO branding — build-time product-name rewrite (src stays upstream-identical).
+// Single source of truth: brand.config.json. See scripts/brand-transform.mjs.
+import { brandVitePlugin } from './scripts/brand-transform.mjs'
 
 // `hgui` symlinks a worktree's node_modules to the main checkout. Vite realpaths
 // those before enforcing server.fs.allow, so codicon/font assets resolve outside
@@ -27,7 +30,7 @@ const fsAllow = [
 
 export default defineConfig({
   base: './',
-  plugins: [react(), tailwindcss()],
+  plugins: [brandVitePlugin(), react(), tailwindcss()],
   css: {
     // Pin an explicit (empty) PostCSS config. Tailwind is handled entirely by
     // `@tailwindcss/vite`, so the renderer needs no PostCSS plugins — and

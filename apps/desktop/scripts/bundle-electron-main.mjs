@@ -12,7 +12,10 @@
 import { build } from 'esbuild'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+// OTTO branding — rewrite user-facing "Hermes" in the bundled main process
+// (boot/update overlay strings). Source is untouched. See brand.config.json.
+import { applyBrand } from './brand-transform.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
@@ -48,6 +51,7 @@ await build({
   define,
   logLevel: 'info',
 })
+writeFileSync(mainOut, applyBrand(readFileSync(mainOut, 'utf8')))
 console.log(`bundled ${mainOut}${isDev ? ' (dev)' : ''}`)
 
 // Bundle preload.ts → dist/electron-preload.js
@@ -62,4 +66,5 @@ await build({
   define,
   logLevel: 'info',
 })
+writeFileSync(preloadOut, applyBrand(readFileSync(preloadOut, 'utf8')))
 console.log(`bundled ${preloadOut}${isDev ? ' (dev)' : ''}`)

@@ -1,0 +1,8 @@
+{
+  "$comment": "OTTO branding — SINGLE source of truth for the desktop's user-facing product name. Applied at BUILD TIME only (see scripts/brand-transform.mjs); source .ts/.tsx files are never modified, so upstream Hermes merges never conflict on branding. To rebrand: change name + rules and rebuild. To get stock Hermes behavior: set name to \"Hermes\" (transform becomes a no-op).",
+  "name": "OTTO",
+  "rules": [
+    ["\\bHermes\\b", "OTTO"]
+  ],
+  "$rulesNote": "Rules are [regexPattern, replacement], applied in order with the global flag and CASE SENSITIVITY. Case-sensitive \\bHermes\\b matches only the title-case display word; it never matches functional identifiers (hermes_cli, HERMES_HOME, .hermes, hermes-agent, resolveHermesBackend) because those differ in case or are camelCase-glued. Add more specific phrase rules BEFORE the generic one if a surface needs different wording."
+}
