@@ -22,6 +22,30 @@ export function setActiveSkin(source, slug) {
   return source.replace(ACTIVE_SKIN_RE, target)
 }
 
+const INIT_SKIN_GET_RE = /(display\.get\("skin", ")([^"]*)("\))/
+// Anchor to the else-block so docstring set_active_skin("ares"/"mytheme")
+// and the variable call set_active_skin(skin_name.strip()) are never matched.
+const INIT_SKIN_ELSE_RE = /(else:\n {8}set_active_skin\(")([^"]*)("\))/
+
+export function hasInitSkinDefault(source, slug) {
+  const g = source.match(INIT_SKIN_GET_RE)
+  const e = source.match(INIT_SKIN_ELSE_RE)
+  return !!g && !!e && g[2] === slug && e[2] === slug
+}
+
+// Sets init_skin_from_config's two default-skin literals (the display.get(...)
+// fallback and the else-block set_active_skin(...) fallback) to the given
+// slug. Idempotent (no-op) when already the slug. The else-block regex is
+// anchored to the `else:\n        set_active_skin("...")` structure so it can
+// never match the module-docstring examples (set_active_skin("ares") /
+// set_active_skin("mytheme")) or the variable call set_active_skin(skin_name.strip()).
+export function setInitSkinDefault(source, slug) {
+  let next = source
+  if (INIT_SKIN_GET_RE.test(next)) next = next.replace(INIT_SKIN_GET_RE, (_a, p, _v, s) => `${p}${slug}${s}`)
+  if (INIT_SKIN_ELSE_RE.test(next)) next = next.replace(INIT_SKIN_ELSE_RE, (_a, p, _v, s) => `${p}${slug}${s}`)
+  return next
+}
+
 // Template = the current "otto" skin dict block from hermes_cli/skin_engine.py,
 // verbatim, with only the brand-varying tokens swapped for placeholders. The
 // shared gold palette (`colors`), `spinner`, and `tool_prefix` stay LITERAL —
@@ -146,6 +170,9 @@ export const skinEmitter = {
     if (!(hasBrandSkin(src, d.slug) && hasActiveSkin(src, d.slug))) {
       return { ok: false, detail: `skin/active for ${d.slug} missing` }
     }
+    if (!hasInitSkinDefault(src, d.slug)) {
+      return { ok: false, detail: `init_skin_from_config default for ${d.slug} missing` }
+    }
     const expected = renderSkin(d)
     const actual = extractSkinBlock(src, d.slug)
     if (actual === null) {
@@ -190,8 +217,11 @@ export const skinEmitter = {
     const withActive = setActiveSkin(withBlock, d.slug)
     const activeChanged = withActive !== withBlock
 
-    if (!blockChanged && !activeChanged) return { changed: false, detail: file }
-    fs.writeFileSync(file, withActive)
+    const withInitSkin = setInitSkinDefault(withActive, d.slug)
+    const initChanged = withInitSkin !== withActive
+
+    if (!blockChanged && !activeChanged && !initChanged) return { changed: false, detail: file }
+    fs.writeFileSync(file, withInitSkin)
     return { changed: true, detail: file }
   }
 }

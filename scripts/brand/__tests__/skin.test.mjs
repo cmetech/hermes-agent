@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadDescriptor } from '../descriptor.mjs'
-import { skinEmitter, hasBrandSkin, hasActiveSkin, renderSkin, extractSkinBlock, setActiveSkin } from '../emitters/skin.mjs'
+import { skinEmitter, hasBrandSkin, hasActiveSkin, renderSkin, extractSkinBlock, setActiveSkin, hasInitSkinDefault, setInitSkinDefault } from '../emitters/skin.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
@@ -187,6 +187,138 @@ test('check passes on the otto form, fails on the neutral (no-otto, active=defau
 
   fs.writeFileSync(tmpFile, neutralSrc)
   assert.equal(skinEmitter.check(d, { root: tmpRoot }).ok, false)
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
+// A minimal but structurally faithful mirror of the real skin_engine.py
+// regions this task must own: the module docstring examples (~line 89-96,
+// carrying `set_active_skin("ares")` / `set_active_skin("mytheme")`) and
+// `init_skin_from_config` (~line 857-869, carrying the `display.get(...)`
+// fallback, the `skin_name.strip()` variable call, and the `else:` fallback).
+function buildInitSkinFixture(fallback) {
+  return `def foo():
+    """Example:
+
+    from hermes_cli.skin_engine import get_active_skin, list_skins, set_active_skin
+
+    set_active_skin("ares")               # Switch to built-in ares skin
+    set_active_skin("mytheme")            # Switch to user skin from ~/.hermes/skins/
+    """
+
+
+def init_skin_from_config(config: dict) -> None:
+    """Initialize the active skin from CLI config at startup.
+
+    Call this once during CLI init with the loaded config dict.
+    """
+    display = config.get("display") or {}
+    if not isinstance(display, dict):
+        display = {}
+    skin_name = display.get("skin", "${fallback}")
+    if isinstance(skin_name, str) and skin_name.strip():
+        set_active_skin(skin_name.strip())
+    else:
+        set_active_skin("${fallback}")
+`
+}
+
+test('setInitSkinDefault on a NEUTRAL fixture (both literals "default") sets both to the slug', () => {
+  const src = buildInitSkinFixture('default')
+  const next = setInitSkinDefault(src, 'otto')
+  assert.match(next, /display\.get\("skin", "otto"\)/)
+  assert.match(next, /else:\n {8}set_active_skin\("otto"\)/)
+  assert.doesNotMatch(next, /display\.get\("skin", "default"\)/)
+  assert.doesNotMatch(next, /else:\n {8}set_active_skin\("default"\)/)
+})
+
+test('setInitSkinDefault is idempotent on the slug form', () => {
+  const src = buildInitSkinFixture('otto')
+  const once = setInitSkinDefault(src, 'otto')
+  assert.equal(once, src)
+  assert.equal(setInitSkinDefault(once, 'otto'), once)
+})
+
+test('setInitSkinDefault collision guard: docstring set_active_skin("ares") and the skin_name.strip() variable call are untouched', () => {
+  const src = buildInitSkinFixture('default')
+  const next = setInitSkinDefault(src, 'otto')
+  assert.match(next, /set_active_skin\("ares"\)/)
+  assert.match(next, /set_active_skin\("mytheme"\)/)
+  assert.match(next, /set_active_skin\(skin_name\.strip\(\)\)/)
+  // Byte-identical lines, not just "contains" — extract and compare exactly.
+  const aresLine = src.split('\n').find((l) => l.includes('set_active_skin("ares")'))
+  const stripLine = src.split('\n').find((l) => l.includes('skin_name.strip()'))
+  const nextAresLine = next.split('\n').find((l) => l.includes('set_active_skin("ares")'))
+  const nextStripLine = next.split('\n').find((l) => l.includes('skin_name.strip()'))
+  assert.equal(nextAresLine, aresLine)
+  assert.equal(nextStripLine, stripLine)
+})
+
+test('hasInitSkinDefault true on the otto form, false when a literal is "default"', () => {
+  const ottoSrc = buildInitSkinFixture('otto')
+  const neutralSrc = buildInitSkinFixture('default')
+  assert.equal(hasInitSkinDefault(ottoSrc, 'otto'), true)
+  assert.equal(hasInitSkinDefault(neutralSrc, 'otto'), false)
+})
+
+test('hasInitSkinDefault false when only one of the two literals matches the slug', () => {
+  const mixedGet = buildInitSkinFixture('otto').replace(
+    'display.get("skin", "otto")',
+    'display.get("skin", "default")'
+  )
+  assert.equal(hasInitSkinDefault(mixedGet, 'otto'), false)
+
+  const mixedElse = buildInitSkinFixture('otto').replace(
+    'else:\n        set_active_skin("otto")',
+    'else:\n        set_active_skin("default")'
+  )
+  assert.equal(hasInitSkinDefault(mixedElse, 'otto'), false)
+})
+
+test('check(otto) fails when init_skin_from_config fallback is still "default"', () => {
+  const realSrc = fs.readFileSync(path.join(ROOT, 'hermes_cli/skin_engine.py'), 'utf8')
+  const neutralized = realSrc.replace(
+    'skin_name = display.get("skin", "otto")',
+    'skin_name = display.get("skin", "default")'
+  )
+  assert.notEqual(neutralized, realSrc, 'precondition: replacement applied')
+
+  const d = loadDescriptor('otto', { root: ROOT })
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'skincheck-initdefault-'))
+  fs.mkdirSync(path.join(tmpRoot, 'hermes_cli'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'hermes_cli/skin_engine.py')
+
+  fs.writeFileSync(tmpFile, neutralized)
+  assert.equal(skinEmitter.check(d, { root: tmpRoot }).ok, false)
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+})
+
+test('write also applies setInitSkinDefault, factored into the changed decision, and is a no-op on the already-otto tree', () => {
+  const realSrc = fs.readFileSync(path.join(ROOT, 'hermes_cli/skin_engine.py'), 'utf8')
+  const neutralized = realSrc.replace(
+    'skin_name = display.get("skin", "otto")',
+    'skin_name = display.get("skin", "default")'
+  ).replace(
+    'else:\n        set_active_skin("otto")',
+    'else:\n        set_active_skin("default")'
+  )
+  assert.notEqual(neutralized, realSrc)
+
+  const d = loadDescriptor('otto', { root: ROOT })
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'skinwrite-initdefault-'))
+  fs.mkdirSync(path.join(tmpRoot, 'hermes_cli'), { recursive: true })
+  const tmpFile = path.join(tmpRoot, 'hermes_cli/skin_engine.py')
+
+  fs.writeFileSync(tmpFile, neutralized)
+  const r1 = skinEmitter.write(d, { root: tmpRoot })
+  assert.equal(r1.changed, true)
+  assert.equal(fs.readFileSync(tmpFile, 'utf8'), realSrc, 'write() must restore the init-skin fallbacks byte-for-byte')
+
+  // Second write on the already-restored (otto) tree: no-op.
+  const r2 = skinEmitter.write(d, { root: tmpRoot })
+  assert.equal(r2.changed, false)
+  assert.equal(fs.readFileSync(tmpFile, 'utf8'), realSrc)
 
   fs.rmSync(tmpRoot, { recursive: true, force: true })
 })
