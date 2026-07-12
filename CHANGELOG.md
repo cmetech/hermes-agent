@@ -5,6 +5,12 @@ releases are published at https://github.com/cmetech/otto/releases.
 
 ## Unreleased
 
+- Safety: the CLI update paths (`otto update`, `--check`, the Windows ZIP
+  fallback) now default to the **`otto`** branch and the **cmetech** repo — a bare
+  `otto update` can no longer default to upstream `main` and replace OTTO with
+  Hermes. An OTTO install is also no longer treated as a "fork," so the
+  upstream-sync prompt is skipped.
+
 - Branding: the in-app logo (About, update overlay, install overlay) is now the
   **Ericsson mark**, theme-aware — white on dark surfaces, black on light.
 - Branding: **desktop app icon** is now the OTTO/Ericsson mark (white three

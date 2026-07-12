@@ -6250,13 +6250,13 @@ def _update_via_zip(args):
     from urllib.request import urlretrieve
 
     # The ZIP fallback exists for Windows git-file-I/O breakage. It pulls a
-    # static archive from GitHub, which is fine for the default "main"
-    # channel but would silently ignore --branch and update from main even
-    # if the user asked for something else — exactly the silent-divergence
-    # bug --branch was added to prevent. Refuse to proceed in that case
-    # rather than lie.
+    # static per-branch archive from GitHub. OTTO: the archive URL is
+    # branch-correct against cmetech, so both the OTTO default branch (`otto`)
+    # and `main` are supported; anything else is refused rather than silently
+    # updating from the wrong ref. Critically the URL points at cmetech (this
+    # fork), NOT NousResearch — a ZIP fallback must never fetch upstream Hermes.
     branch = _resolve_update_branch(args)
-    if branch != "main":
+    if branch not in ("otto", "main"):
         print(
             f"✗ --branch={branch} is not supported on the Windows ZIP-fallback "
             "update path."
@@ -6264,12 +6264,12 @@ def _update_via_zip(args):
         print(
             "  This path runs when git file I/O is broken on the system. "
             "Either resolve the git-side breakage (typically an antivirus "
-            "or NTFS filter holding files open) and rerun `hermes update "
-            f"--branch {branch}`, or update against main with `hermes update`."
+            "or NTFS filter holding files open) and rerun `otto update "
+            f"--branch {branch}`, or update the OTTO branch with `otto update`."
         )
         sys.exit(1)
     zip_url = (
-        f"https://github.com/NousResearch/hermes-agent/archive/refs/heads/{branch}.zip"
+        f"https://github.com/cmetech/hermes-agent/archive/refs/heads/{branch}.zip"
     )
 
     print("→ Downloading latest version...")
@@ -6676,7 +6676,17 @@ def _discard_stashed_changes(
 # Fork detection and upstream management for `hermes update`
 # =========================================================================
 
+# OTTO: cmetech/hermes-agent (this fork) is the "official" OTTO repo, so an OTTO
+# install is NOT treated as a fork — `_is_fork` returns False and the upstream
+# fork-sync (the "your fork isn't tracking official Hermes … pull upstream main"
+# prompt + `git pull --ff-only upstream main`) is skipped entirely. OTTO tracks
+# upstream via the manual `otto-upstream-merge` flow, not this auto-sync. The
+# NousResearch entries stay so a genuine upstream checkout is still recognized.
 OFFICIAL_REPO_URLS = {
+    "https://github.com/cmetech/hermes-agent.git",
+    "git@github.com:cmetech/hermes-agent.git",
+    "https://github.com/cmetech/hermes-agent",
+    "git@github.com:cmetech/hermes-agent",
     "https://github.com/NousResearch/hermes-agent.git",
     "git@github.com:NousResearch/hermes-agent.git",
     "https://github.com/NousResearch/hermes-agent",
@@ -8398,15 +8408,21 @@ def _finalize_update_output(state):
 def _resolve_update_branch(args) -> str:
     """Normalize ``args.branch`` into a non-empty branch name.
 
-    Centralizes the "default to main, accept --branch override, treat empty
-    or whitespace-only values as the default" parsing so every consumer of
-    ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
-    the same answer.
+    Centralizes the "default to the OTTO branch, accept --branch override, treat
+    empty or whitespace-only values as the default" parsing so every consumer of
+    ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on the
+    same answer.
+
+    OTTO: the default is ``otto`` (NOT ``main``). A bare ``otto update`` — or the
+    Windows ZIP-fallback — must never default to ``main``, which on this fork is
+    the upstream-Hermes mirror; doing so would silently replace OTTO with Hermes.
+    The desktop already passes ``--branch otto`` explicitly; this protects the
+    raw-CLI and fallback paths. See the OTTO customization surface in CLAUDE.md.
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    return (getattr(args, "branch", None) or "otto").strip() or "otto"
 
 
-def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
+def _cmd_update_check(branch: str = "otto", *, branch_explicit: bool = False):
     """Implement ``hermes update --check``: fetch and report without installing.
 
     ``branch`` selects which branch the check compares against. Default is

@@ -120,8 +120,11 @@ _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
 # (e.g. nix-built hermes — no local git history to count against).
 UPDATE_AVAILABLE_NO_COUNT = -1
 
-_UPSTREAM_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
-_OFFICIAL_REPO_CANONICAL = "github.com/nousresearch/hermes-agent"
+# OTTO: update-check + official-remote recognition target the OTTO fork, not
+# upstream Hermes (see CLAUDE.md). Comparing against upstream would show a
+# phantom "update available" and risk pulling Hermes over OTTO.
+_UPSTREAM_REPO_URL = "https://github.com/cmetech/hermes-agent.git"
+_OFFICIAL_REPO_CANONICAL = "github.com/cmetech/hermes-agent"
 
 
 def _canonical_github_remote(url: str | None) -> str:
@@ -178,7 +181,7 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     """
     try:
         result = subprocess.run(
-            ["git", "ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"],
+            ["git", "ls-remote", _UPSTREAM_REPO_URL, "refs/heads/otto"],
             capture_output=True, text=True, timeout=10,
         )
     except Exception:
@@ -457,7 +460,7 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
 
 
-_RELEASE_URL_BASE = "https://github.com/NousResearch/hermes-agent/releases/tag"
+_RELEASE_URL_BASE = "https://github.com/cmetech/hermes-agent/releases/tag"
 _latest_release_cache: Optional[tuple] = None  # (tag, url) once resolved
 
 

@@ -161,9 +161,11 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_update_falls_back_to_main_when_branch_not_on_remote(
+    def test_update_defaults_to_otto_from_feature_branch(
         self, mock_run, _mock_which, mock_args, capsys
     ):
+        """OTTO: a bare `otto update` from any other branch targets `otto`
+        (the OTTO default), NOT the current feature branch and NOT `main`."""
         mock_run.side_effect = _make_run_side_effect(
             branch="fix/stoicneko", verify_ok=False, commit_count="3"
         )
@@ -172,24 +174,26 @@ class TestCmdUpdateBranchFallback:
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
 
-        # rev-list should use origin/main, not origin/fix/stoicneko
+        # rev-list should use origin/otto, not origin/fix/stoicneko or origin/main
         rev_list_cmds = [c for c in commands if "rev-list" in c]
         assert len(rev_list_cmds) == 1
-        assert "origin/main" in rev_list_cmds[0]
+        assert "origin/otto" in rev_list_cmds[0]
         assert "origin/fix/stoicneko" not in rev_list_cmds[0]
+        assert "origin/main" not in rev_list_cmds[0]
 
-        # pull should use main, not fix/stoicneko
+        # pull should use otto
         pull_cmds = [c for c in commands if "pull" in c]
         assert len(pull_cmds) == 1
-        assert "main" in pull_cmds[0]
+        assert "otto" in pull_cmds[0]
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_update_uses_current_branch_when_on_remote(
+    def test_update_defaults_to_otto_branch(
         self, mock_run, _mock_which, mock_args, capsys
     ):
+        """OTTO: a bare `otto update` targets the `otto` branch by default."""
         mock_run.side_effect = _make_run_side_effect(
-            branch="main", verify_ok=True, commit_count="2"
+            branch="otto", verify_ok=True, commit_count="2"
         )
 
         cmd_update(mock_args)
@@ -198,11 +202,11 @@ class TestCmdUpdateBranchFallback:
 
         rev_list_cmds = [c for c in commands if "rev-list" in c]
         assert len(rev_list_cmds) == 1
-        assert "origin/main" in rev_list_cmds[0]
+        assert "origin/otto" in rev_list_cmds[0]
 
         pull_cmds = [c for c in commands if "pull" in c]
         assert len(pull_cmds) == 1
-        assert "main" in pull_cmds[0]
+        assert "otto" in pull_cmds[0]
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -238,13 +242,17 @@ class TestCmdUpdateBranchFallback:
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="0"
         )
+        # OTTO: the upstream fork-sync only fires when targeting `main` (a bare
+        # `otto update` defaults to `otto` and skips it), so pass --branch main
+        # explicitly to exercise the #26172 regression path.
+        main_args = SimpleNamespace(branch="main")
 
         with patch.object(
             hm,
             "_get_origin_url",
             return_value="https://github.com/example/hermes-agent.git",
         ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
-            cmd_update(mock_args)
+            cmd_update(main_args)
 
         sync_mock.assert_called_once_with(["git"], PROJECT_ROOT)
         captured = capsys.readouterr()
@@ -596,10 +604,11 @@ class TestCmdUpdateBranchFlag:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_branch_flag_defaults_to_main_when_none(self, mock_run, _mock_which, capsys):
-        """No --branch (or --branch=None) preserves the historical 'main' default."""
+    def test_branch_flag_defaults_to_otto_when_none(self, mock_run, _mock_which, capsys):
+        """OTTO: no --branch (or --branch=None) defaults to the `otto` branch,
+        NOT `main` (which on this fork is the upstream-Hermes mirror)."""
         mock_run.side_effect = self._branch_side_effect(
-            current_branch="main", target_branch="main", commit_count="0"
+            current_branch="otto", target_branch="otto", commit_count="0"
         )
         args = SimpleNamespace(branch=None)
 
@@ -607,7 +616,7 @@ class TestCmdUpdateBranchFlag:
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
         rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert all("origin/main" in c for c in rev_list_cmds), rev_list_cmds
+        assert all("origin/otto" in c for c in rev_list_cmds), rev_list_cmds
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -781,14 +790,16 @@ class TestCmdUpdateCheckBranchFlag:
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
     @patch("subprocess.run")
-    def test_check_default_main_still_prefers_upstream(
+    def test_check_branch_main_prefers_upstream(
         self, mock_run, _mock_method, capsys
     ):
-        """No --branch (or --branch=None) preserves the upstream-then-origin probe."""
+        """OTTO: `--check --branch main` preserves the upstream-then-origin probe.
+        (A bare `--check` now defaults to `otto`, which compares origin/otto and
+        does not probe upstream; that path is covered elsewhere.)"""
         mock_run.side_effect = self._check_side_effect(
             target_branch="main", verify_ok=True, commit_count="0"
         )
-        args = SimpleNamespace(check=True, branch=None)
+        args = SimpleNamespace(check=True, branch="main")
 
         cmd_update(args)
 
