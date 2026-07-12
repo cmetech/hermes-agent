@@ -5119,22 +5119,30 @@ def _write_desktop_build_stamp(project_root: Path, *, source_mode: bool) -> None
 
 
 def _desktop_packaged_executable(desktop_dir: Path) -> Optional[Path]:
-    """Return the current platform's unpacked Electron app executable."""
+    """Return the current platform's unpacked Electron app executable.
+
+    Name-agnostic on macOS: matches whatever ``<productName>.app`` electron-
+    builder produced (OTTO after rebranding, Hermes upstream) so a productName
+    change never hides the built app. Windows/Linux check the OTTO names first,
+    then fall back to the upstream Hermes names.
+    """
     release_dir = desktop_dir / "release"
     if sys.platform == "darwin":
-        candidates = list(release_dir.glob("mac*/Hermes.app/Contents/MacOS/Hermes"))
+        candidates = [
+            app / "Contents" / "MacOS" / app.stem
+            for app in release_dir.glob("mac*/*.app")
+        ]
     elif sys.platform == "win32":
         candidates = [
-            release_dir / "win-unpacked" / "Hermes.exe",
-            release_dir / "win-ia32-unpacked" / "Hermes.exe",
-            release_dir / "win-arm64-unpacked" / "Hermes.exe",
+            release_dir / d / f"{name}.exe"
+            for d in ("win-unpacked", "win-ia32-unpacked", "win-arm64-unpacked")
+            for name in ("OTTO", "Hermes")
         ]
     else:
         candidates = [
-            release_dir / "linux-unpacked" / "hermes",
-            release_dir / "linux-unpacked" / "Hermes",
-            release_dir / "linux-arm64-unpacked" / "hermes",
-            release_dir / "linux-arm64-unpacked" / "Hermes",
+            release_dir / d / name
+            for d in ("linux-unpacked", "linux-arm64-unpacked")
+            for name in ("otto", "OTTO", "hermes", "Hermes")
         ]
 
     existing = [p for p in candidates if p.exists()]
