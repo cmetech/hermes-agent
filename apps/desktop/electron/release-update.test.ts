@@ -121,6 +121,13 @@ test('installerFileName derives the basename from the asset URL', () => {
   assert.equal(installerFileName('https://x/y/LOOP24-0.1.3-win-x64.exe'), 'LOOP24-0.1.3-win-x64.exe')
 })
 
+test('installerFileName strips a query string and hash fragment from the asset URL', () => {
+  assert.equal(
+    installerFileName('https://x/y/OTTO-0.1.3-mac-arm64.dmg?X-Amz-Signature=abc&X-Amz-Expires=300#frag'),
+    'OTTO-0.1.3-mac-arm64.dmg'
+  )
+})
+
 test('installerLaunch: win runs the exe directly; mac opens the dmg', () => {
   assert.deepEqual(installerLaunch('C:\\t\\OTTO-0.1.12-win-x64.exe', 'win32'), {
     cmd: 'C:\\t\\OTTO-0.1.12-win-x64.exe',

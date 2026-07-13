@@ -115,7 +115,13 @@ import {
   sandboxFallbackFromEnv,
   sandboxPreflight
 } from './update-relaunch'
-import { buildReleaseUpdateStatus, isReleaseInstall, parseLatestRelease } from './release-update'
+import {
+  buildReleaseUpdateStatus,
+  installerFileName,
+  installerLaunch,
+  isReleaseInstall,
+  parseLatestRelease
+} from './release-update'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import {
@@ -2158,6 +2164,41 @@ function fetchLatestReleases(): Promise<any[]> {
   })
 }
 
+// Stream-download a URL to destPath, following GitHub's 3xx redirects (the
+// browser_download_url 302s to a signed codeload/S3 URL). Calls onProgress
+// with (receivedBytes, totalBytes|null). Rejects on non-2xx / network error.
+function downloadFile(url, destPath, onProgress, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    if (redirects > 5) return reject(new Error('too many redirects'))
+    const req = https.get(url, { headers: { 'User-Agent': 'Hermes-Desktop' } }, res => {
+      const status = res.statusCode || 0
+      if (status >= 300 && status < 400 && res.headers.location) {
+        res.resume()
+        return resolve(downloadFile(res.headers.location, destPath, onProgress, redirects + 1))
+      }
+      if (status !== 200) {
+        res.resume()
+        return reject(new Error(`download failed: HTTP ${status}`))
+      }
+      const total = Number(res.headers['content-length']) || null
+      let received = 0
+      const out = fs.createWriteStream(destPath)
+      res.on('data', chunk => {
+        received += chunk.length
+        try {
+          onProgress(received, total)
+        } catch {}
+      })
+      res.pipe(out)
+      out.on('finish', () => out.close(() => resolve(destPath)))
+      out.on('error', reject)
+      res.on('error', reject)
+    })
+    req.on('error', reject)
+    req.setTimeout(60000, () => req.destroy(new Error('download timed out')))
+  })
+}
+
 async function checkUpdates() {
   const updateRoot = resolveUpdateRoot()
   let { branch } = readDesktopUpdateConfig()
@@ -2559,15 +2600,78 @@ async function releaseBackendLock(updateRoot, tag) {
 // only this apply action changed.
 async function applyUpdates(opts = {}) {
   // Release installs don't git-update; they reinstall from a downloaded release.
-  // Open the newest installer asset (or the release page) and let the user run
-  // it — the packaged GUI can't be replaced by an in-place git rebuild.
+  // Download the newest installer asset in-app (with progress), then launch it
+  // and quit so it can replace the running app — the packaged GUI can't be
+  // replaced by an in-place git rebuild, and shell.openExternal() only drops
+  // the file in the user's browser downloads with no follow-through.
   if (isReleaseInstall(INSTALL_STAMP, IS_PACKAGED)) {
     const releases = await fetchLatestReleases()
     const latest = parseLatestRelease(releases, process.platform, process.arch)
-    const url = latest?.assetUrl || latest?.releaseUrl || `https://github.com/${RELEASES_REPO}/releases`
-    await shell.openExternal(url)
+    const assetUrl = latest?.assetUrl
+    const fallbackUrl = latest?.releaseUrl || `https://github.com/${RELEASES_REPO}/releases`
 
-    return { ok: true, mode: 'release', opened: url }
+    if (!assetUrl) {
+      // No matching installer asset — open the release page so the user can pick one.
+      await shell.openExternal(fallbackUrl)
+
+      return { ok: true, mode: 'release', opened: fallbackUrl, note: 'no-asset' }
+    }
+
+    const dest = path.join(app.getPath('temp'), installerFileName(assetUrl))
+
+    try {
+      emitUpdateProgress({ stage: 'update', message: 'Downloading update…', percent: 0 })
+      await downloadFile(assetUrl, dest, (recv, total) => {
+        const pct = total ? Math.round((recv / total) * 100) : null
+        emitUpdateProgress({
+          stage: 'update',
+          message: pct != null ? `Downloading update… ${pct}%` : 'Downloading update…',
+          percent: pct
+        })
+      })
+      emitUpdateProgress({ stage: 'restart', message: 'Starting installer…', percent: 100 })
+
+      const { cmd, args } = installerLaunch(dest, process.platform)
+
+      if (process.platform === 'linux') {
+        try {
+          fs.chmodSync(dest, 0o755)
+        } catch {}
+      }
+
+      const child = spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: false })
+
+      child.unref()
+      rememberLog(`[updates] launched release installer: ${cmd} ${args.join(' ')} (${dest})`)
+
+      // Quit so the installer can replace the running app (mirrors the
+      // uninstall hand-off): app.quit() then a guaranteed app.exit fallback,
+      // since a renderer beforeunload/close veto can swallow app.quit().
+      isQuittingForHandoff = true
+      setTimeout(() => {
+        try {
+          app.quit()
+        } catch {
+          /* fall through to force-exit */
+        }
+        setTimeout(() => {
+          try {
+            app.exit(0)
+          } catch {
+            process.exit(0)
+          }
+        }, 1500)
+      }, 400)
+
+      return { ok: true, mode: 'release', launched: dest }
+    } catch (err) {
+      // Never strand the user: fall back to the browser download.
+      rememberLog(`[updates] in-app installer download/launch failed: ${err?.message || err}`)
+      emitUpdateProgress({ stage: 'error', message: 'Download failed — opening the release page…', error: 'download-failed' })
+      await shell.openExternal(fallbackUrl)
+
+      return { ok: false, mode: 'release', error: 'download-failed', opened: fallbackUrl }
+    }
   }
 
   if (updateInFlight) {
