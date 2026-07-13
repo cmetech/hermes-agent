@@ -2183,6 +2183,11 @@ function downloadFile(url, destPath, onProgress, redirects = 0) {
       const total = Number(res.headers['content-length']) || null
       let received = 0
       const out = fs.createWriteStream(destPath)
+      const fail = (err) => {
+        try { out.destroy() } catch {}
+        try { fs.unlink(destPath, () => {}) } catch {}
+        reject(err)
+      }
       res.on('data', chunk => {
         received += chunk.length
         try {
@@ -2191,8 +2196,8 @@ function downloadFile(url, destPath, onProgress, redirects = 0) {
       })
       res.pipe(out)
       out.on('finish', () => out.close(() => resolve(destPath)))
-      out.on('error', reject)
-      res.on('error', reject)
+      out.on('error', fail)
+      res.on('error', fail)
     })
     req.on('error', reject)
     req.setTimeout(60000, () => req.destroy(new Error('download timed out')))
@@ -2661,9 +2666,9 @@ async function applyUpdates(opts = {}) {
             process.exit(0)
           }
         }, 1500)
-      }, 400)
+      }, UPDATE_HANDOFF_DWELL_MS)
 
-      return { ok: true, mode: 'release', launched: dest }
+      return { ok: true, mode: 'release', handedOff: true, launched: dest }
     } catch (err) {
       // Never strand the user: fall back to the browser download.
       rememberLog(`[updates] in-app installer download/launch failed: ${err?.message || err}`)
