@@ -295,6 +295,51 @@ test('windows full script dialog is JS-string-safe for a \\x path (Finding: msht
   assert.doesNotMatch(script, /Popup\('%MSG%'/)
 })
 
+test('windows script uses the passed productName for the log path, header, and dialog title', () => {
+  const script = buildWindowsCleanupScript({
+    desktopPid: 7, pythonExe: 'py.exe', pythonPath: null, agentRoot: 'C:\\h\\hermes-agent',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
+    appPath: 'C:\\Users\\x\\AppData\\Local\\Programs\\LOOP24',
+    hermesHome: 'C:\\Users\\x\\AppData\\Local\\loop24',
+    removeUserData: true, removeAgent: true,
+    productName: 'LOOP24'
+  })
+  assert.match(script, /loop24-uninstall-result\.log/)
+  assert.match(script, /LOOP24 uninstall/)
+  assert.doesNotMatch(script, /OTTO uninstall/)
+})
+
+test('posix script uses the passed productName for the log path, header, and dialog title', () => {
+  const script = buildPosixCleanupScript({
+    desktopPid: 7, pythonExe: '/usr/bin/python3', pythonPath: null, agentRoot: '/Users/x/.loop24/hermes-agent',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
+    appPath: '/Applications/LOOP24.app', hermesHome: '/Users/x/.loop24',
+    removeUserData: true, removeAgent: true,
+    productName: 'LOOP24'
+  })
+  assert.match(script, /loop24-uninstall-result\.log/)
+  assert.match(script, /LOOP24 uninstall/)
+  assert.doesNotMatch(script, /OTTO uninstall/)
+})
+
+test('scripts default productName to OTTO when omitted (backward compatible)', () => {
+  const winScript = buildWindowsCleanupScript({
+    desktopPid: 1, pythonExe: 'py.exe', pythonPath: null, agentRoot: 'C:\\h',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'gui'],
+    appPath: null, hermesHome: 'C:\\h'
+  })
+  assert.match(winScript, /otto-uninstall-result\.log/)
+  assert.match(winScript, /OTTO uninstall/)
+
+  const posixScript = buildPosixCleanupScript({
+    desktopPid: 1, pythonExe: '/usr/bin/python3', pythonPath: null, agentRoot: '/a',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'gui'],
+    appPath: null, hermesHome: '/h'
+  })
+  assert.match(posixScript, /otto-uninstall-result\.log/)
+  assert.match(posixScript, /OTTO uninstall/)
+})
+
 test('posix full script rm -rf home + agent and shows osascript dialog on mac', () => {
   const script = buildPosixCleanupScript({
     desktopPid: 5, pythonExe: '/usr/bin/python3', pythonPath: null, agentRoot: '/Users/x/.hermes/hermes-agent',

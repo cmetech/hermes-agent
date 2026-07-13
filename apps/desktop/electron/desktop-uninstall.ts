@@ -155,7 +155,8 @@ function buildPosixCleanupScript({
   appPath,
   hermesHome,
   removeUserData = false,
-  removeAgent = false
+  removeAgent = false,
+  productName = 'OTTO'
 }) {
   const q = s => `'${String(s).replace(/'/g, `'\\''`)}'`
 
@@ -198,10 +199,12 @@ function buildPosixCleanupScript({
   // log to temp, and surface a native dialog (macOS) with success or leftovers.
   const checks = [appPath, removeAgent ? agentRoot : null, removeUserData ? hermesHome : null].filter(Boolean)
 
+  const logSlug = String(productName).toLowerCase()
+
   lines.push(
     'LEFT=""',
-    'RESULT="$TMPDIR/otto-uninstall-result.log"',
-    ': > "$RESULT" 2>/dev/null || RESULT=/tmp/otto-uninstall-result.log'
+    `RESULT="$TMPDIR/${logSlug}-uninstall-result.log"`,
+    `: > "$RESULT" 2>/dev/null || RESULT=/tmp/${logSlug}-uninstall-result.log`
   )
 
   for (const p of checks) {
@@ -209,8 +212,8 @@ function buildPosixCleanupScript({
   }
 
   lines.push(
-    'if [ -n "$LEFT" ]; then MSG="OTTO was removed, but could not delete:$LEFT"; else MSG="OTTO was fully removed."; fi',
-    `if [ "$(uname)" = "Darwin" ]; then osascript -e "display dialog \\"$MSG\\" buttons {\\"OK\\"} with title \\"OTTO uninstall\\"" >/dev/null 2>&1 || true; fi`
+    `if [ -n "$LEFT" ]; then MSG="${productName} was removed, but could not delete:$LEFT"; else MSG="${productName} was fully removed."; fi`,
+    `if [ "$(uname)" = "Darwin" ]; then osascript -e "display dialog \\"$MSG\\" buttons {\\"OK\\"} with title \\"${productName} uninstall\\"" >/dev/null 2>&1 || true; fi`
   )
 
   // Self-delete the script LAST.
@@ -254,7 +257,8 @@ function buildWindowsCleanupScript({
   appPath,
   hermesHome,
   removeUserData = false,
-  removeAgent = false
+  removeAgent = false,
+  productName = 'OTTO'
 }) {
   const pid = Number(desktopPid) || 0
   // cmd.exe has no string escaping inside quotes; strip embedded quotes (paths
@@ -338,9 +342,10 @@ function buildWindowsCleanupScript({
   // Validation pass: check every path that should now be gone, write a result
   // log to temp, and pop a native modal dialog (via mshta) with success or
   // the leftover list — the app has already quit, so this is the only UI.
-  const resultLog = '%TEMP%\\otto-uninstall-result.log'
+  const logSlug = String(productName).toLowerCase()
+  const resultLog = `%TEMP%\\${logSlug}-uninstall-result.log`
 
-  lines.push('set "LEFT="', `> "${resultLog}" echo OTTO uninstall (%MODE%) result:`)
+  lines.push('set "LEFT="', `> "${resultLog}" echo ${productName} uninstall (%MODE%) result:`)
 
   const checkPaths = [appPath, removeAgent ? agentRoot : null, removeUserData ? hermesHome : null].filter(Boolean)
 
@@ -353,7 +358,7 @@ function buildWindowsCleanupScript({
   }
 
   lines.push(
-    'if defined LEFT ( set "MSG=OTTO was removed, but these could not be deleted:%LEFT%  (delete them manually)" ) else ( set "MSG=OTTO was fully removed." )',
+    `if defined LEFT ( set "MSG=${productName} was removed, but these could not be deleted:%LEFT%  (delete them manually)" ) else ( set "MSG=${productName} was fully removed." )`,
     // JScript treats a bare `\x` as a hex-escape introducer, so a leftover path
     // containing e.g. `\x` (C:\Users\x\...) inside the single-quoted JS string
     // below would throw "Invalid hexadecimal escape sequence" and the dialog
@@ -362,7 +367,7 @@ function buildWindowsCleanupScript({
     // JScript literal instead of the raw %MSG%.
     'set "MSGJS=%MSG:\\=\\\\%"',
     // mshta shows a modal even though the app has quit; escape quotes for VBScript.
-    `mshta "javascript:var m=new ActiveXObject('WScript.Shell');m.Popup('%MSGJS%',0,'OTTO uninstall',64);close();" 2>nul`
+    `mshta "javascript:var m=new ActiveXObject('WScript.Shell');m.Popup('%MSGJS%',0,'${productName} uninstall',64);close();" 2>nul`
   )
 
   // Self-delete the script LAST.

@@ -8989,7 +8989,8 @@ async function runDesktopUninstall(mode) {
     appPath: removeBundle,
     hermesHome: HERMES_HOME,
     removeAgent: modeRemovesAgent(mode),
-    removeUserData: modeRemovesUserData(mode)
+    removeUserData: modeRemovesUserData(mode),
+    productName: APP_NAME
   }
 
   let scriptPath

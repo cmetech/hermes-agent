@@ -29,6 +29,49 @@ def test_remove_desktop_shortcuts_unlinks_only_matching(tmp_path, monkeypatch):
     assert (sm / "Other.lnk").exists()
 
 
+def test_active_brand_identity_derives_loop24(monkeypatch):
+    def fake_resolve_active_brand(*a, **k):
+        return "loop24"
+
+    def fake_load_brand(slug, *a, **k):
+        assert slug == "loop24"
+        return {"displayName": "LOOP24", "scheme": "loop24"}
+
+    monkeypatch.setattr(
+        "hermes_cli.brand_config.resolve_active_brand", fake_resolve_active_brand
+    )
+    monkeypatch.setattr("hermes_cli.brand_config.load_brand", fake_load_brand)
+
+    assert u._active_brand_identity() == ("LOOP24", ["loop24", "hermes"])
+
+
+def test_active_brand_identity_derives_otto(monkeypatch):
+    def fake_resolve_active_brand(*a, **k):
+        return "otto"
+
+    def fake_load_brand(slug, *a, **k):
+        assert slug == "otto"
+        return {"displayName": "OTTO", "scheme": "otto"}
+
+    monkeypatch.setattr(
+        "hermes_cli.brand_config.resolve_active_brand", fake_resolve_active_brand
+    )
+    monkeypatch.setattr("hermes_cli.brand_config.load_brand", fake_load_brand)
+
+    assert u._active_brand_identity() == ("OTTO", ["otto", "hermes"])
+
+
+def test_active_brand_identity_falls_back_to_otto_on_failure(monkeypatch):
+    def raise_resolve(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        "hermes_cli.brand_config.resolve_active_brand", raise_resolve
+    )
+
+    assert u._active_brand_identity() == ("OTTO", ["otto", "hermes"])
+
+
 def test_remove_protocols_missing_intermediate_still_deletes_root(monkeypatch):
     # Regression test: remove_deep_link_protocols_windows() must delete each
     # of the 4 registry keys independently. Previously all 4 DeleteKey calls
@@ -57,3 +100,23 @@ def test_remove_protocols_missing_intermediate_still_deletes_root(monkeypatch):
     assert "Software\\Classes\\otto" in deleted
     assert "Software\\Classes\\hermes" in deleted
     assert "otto" in out and "hermes" in out
+
+
+def test_remove_protocols_accepts_custom_schemes(monkeypatch):
+    # A LOOP24 install must clean loop24:// (+ hermes://), not otto://.
+    deleted = []
+
+    class FakeWinreg:
+        HKEY_CURRENT_USER = 0
+
+        @staticmethod
+        def DeleteKey(root, sub):
+            deleted.append(sub)
+
+    monkeypatch.setitem(sys.modules, "winreg", FakeWinreg)
+
+    out = u.remove_deep_link_protocols_windows(["loop24", "hermes"])
+
+    assert "loop24" in out and "hermes" in out
+    assert "otto" not in out
+    assert any(sub.startswith("Software\\Classes\\loop24") for sub in deleted)

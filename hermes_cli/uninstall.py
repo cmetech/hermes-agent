@@ -409,16 +409,38 @@ def _interpreter_inside(home: Path, executable: str | None = None) -> bool:
         return False
 
 
-def remove_deep_link_protocols_windows() -> list[str]:
-    """Delete the otto:// / hermes:// deep-link handler keys the app registered
-    at runtime (HKCU\\Software\\Classes\\<scheme>). Electron never unregisters
-    them on uninstall."""
+def _active_brand_identity() -> "tuple[str, list[str]]":
+    """Return (display_name, deep_link_schemes) for the active brand, derived
+    from the brand descriptor. Falls back to slug-derived values, then to the
+    historical OTTO identity, so it never raises during uninstall."""
+    try:
+        from hermes_cli.brand_config import resolve_active_brand, load_brand
+        slug = resolve_active_brand()
+    except Exception:
+        return "OTTO", ["otto", "hermes"]
+    display, scheme = slug.upper(), slug
+    try:
+        brand = load_brand(slug)
+        display = brand.get("displayName") or display
+        scheme = brand.get("scheme") or scheme
+    except Exception:
+        pass
+    schemes = [scheme] + (["hermes"] if scheme != "hermes" else [])
+    return display, schemes
+
+
+def remove_deep_link_protocols_windows(schemes: "list[str] | None" = None) -> list[str]:
+    """Delete the <scheme>:// / hermes:// deep-link handler keys the app
+    registered at runtime (HKCU\\Software\\Classes\\<scheme>). Electron never
+    unregisters them on uninstall."""
     try:
         import winreg
     except ImportError:
         return []
+    if schemes is None:
+        schemes = ["otto", "hermes"]
     removed: list[str] = []
-    for scheme in ("otto", "hermes"):
+    for scheme in schemes:
         subkeys = [
             f"Software\\Classes\\{scheme}\\shell\\open\\command",
             f"Software\\Classes\\{scheme}\\shell\\open",
@@ -819,7 +841,13 @@ def _perform_uninstall(
     print()
     print(color("Uninstalling...", Colors.CYAN, Colors.BOLD))
     print()
-    
+
+    # Derive the active brand's display name + deep-link schemes once, up
+    # front, so both the Windows deep-link cleanup and the shortcut cleanup
+    # below use the same values (never hardcode "OTTO" — a LOOP24 install
+    # must clean LOOP24.lnk / loop24://, not OTTO's).
+    _brand_display, _brand_schemes = _active_brand_identity()
+
     # 1. Stop and uninstall gateway service + kill standalone processes
     log_info("Checking for running gateway...")
     if not uninstall_gateway_service():
@@ -856,7 +884,7 @@ def _perform_uninstall(
         else:
             log_info("No Hermes-set User env vars to remove")
 
-        removed_protocols = remove_deep_link_protocols_windows()
+        removed_protocols = remove_deep_link_protocols_windows(_brand_schemes)
         if removed_protocols:
             log_success(f"Removed deep-link handlers: {', '.join(removed_protocols)}")
 
@@ -935,7 +963,7 @@ def _perform_uninstall(
     # 4c. Remove Start-Menu / Desktop shortcuts the installer created. Not
     #     gated on _is_windows() since remove_desktop_shortcuts() is a no-op
     #     wherever the dirs don't exist.
-    removed_shortcuts = remove_desktop_shortcuts("OTTO")
+    removed_shortcuts = remove_desktop_shortcuts(_brand_display)
     for s in removed_shortcuts:
         log_success(f"Removed shortcut {s}")
 
