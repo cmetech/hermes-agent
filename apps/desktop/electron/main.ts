@@ -8987,7 +8987,10 @@ async function runDesktopUninstall(mode) {
     agentRoot: ACTIVE_HERMES_ROOT,
     uninstallArgs,
     appPath: removeBundle,
-    hermesHome: HERMES_HOME
+    hermesHome: HERMES_HOME,
+    removeAgent: modeRemovesAgent(mode),
+    removeUserData: modeRemovesUserData(mode),
+    productName: APP_NAME
   }
 
   let scriptPath
@@ -8999,7 +9002,7 @@ async function runDesktopUninstall(mode) {
       scriptPath = path.join(app.getPath('temp'), `hermes-uninstall-${Date.now()}.cmd`)
       fs.writeFileSync(scriptPath, buildWindowsCleanupScript(scriptArgs))
       runner = process.env.ComSpec || 'cmd.exe'
-      runnerArgs = ['/c', scriptPath]
+      runnerArgs = ['/c', 'start', '""', '/min', scriptPath]
     } else {
       scriptPath = path.join(app.getPath('temp'), `hermes-uninstall-${Date.now()}.sh`)
       fs.writeFileSync(scriptPath, buildPosixCleanupScript(scriptArgs), { mode: 0o755 })
@@ -9030,7 +9033,13 @@ async function runDesktopUninstall(mode) {
   // Give the renderer a beat to show its "uninstalling…" state, then quit so
   // the venv python shim + app bundle unlock and the cleanup script can run.
   isQuittingForHandoff = true
-  setTimeout(() => app.quit(), 800)
+  setTimeout(() => {
+    try { app.quit() } catch { /* fall through to force-exit */ }
+    // Guaranteed hand-off: a renderer beforeunload / close veto can swallow
+    // app.quit(), stranding the cleanup script in its PID-wait. Force the
+    // process to die shortly after so the detached script always proceeds.
+    setTimeout(() => { try { app.exit(0) } catch { process.exit(0) } }, 1500)
+  }, 800)
 
   return { ok: true, mode, willRemoveAppBundle: Boolean(removeBundle), scriptPath }
 }
