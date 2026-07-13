@@ -169,45 +169,56 @@ def stage_bundle(bundle: Path, set_name: str, home: Path | str) -> bool:
     from hermes_cli import config as config_mod
     from hermes_cli.brand_config import _union
 
-    cfg = config_mod.load_config() or {}
-    changed = False
+    # config IO must target the SAME home being staged, never the ambient process
+    # home: load_config()/save_config() otherwise resolve via get_hermes_home()
+    # (context override -> HERMES_HOME env -> platform default), which can differ
+    # from `home` for tests/tooling/future callers and silently pollute the wrong
+    # config.yaml.
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    mcp_rel = manifest.get("mcpServers")
-    if mcp_rel and (bundle / mcp_rel).is_file():
-        fragment = yaml.safe_load((bundle / mcp_rel).read_text(encoding="utf-8")) or {}
-        entries = fragment.get("mcp_servers") or {}
-        text_sub = str(home / "plugins")
-        existing = cfg.setdefault("mcp_servers", {})
-        for name, entry in entries.items():
-            if name in existing:
-                continue  # NEVER clobber a user-configured server
-            resolved = _resolve_placeholders(entry, text_sub)
-            existing[name] = resolved
-            changed = True
+    token = set_hermes_home_override(str(home))
+    try:
+        cfg = config_mod.load_config() or {}
+        changed = False
 
-    dbd = manifest.get("disabledByDefault") or {}
-    skills_off = dbd.get("skills") or []
-    tools_off = dbd.get("toolsets") or []
-    if skills_off:
-        skills_cfg = cfg.setdefault("skills", {})
-        merged = _union(skills_cfg.get("disabled"), skills_off)
-        if merged != skills_cfg.get("disabled"):
-            skills_cfg["disabled"] = merged
-            changed = True
-    if tools_off:
-        merged = _union(cfg.get("disabled_toolsets"), tools_off)
-        if merged != cfg.get("disabled_toolsets"):
-            cfg["disabled_toolsets"] = merged
-            changed = True
-    if plugin_names:
-        plugins_cfg = cfg.setdefault("plugins", {})
-        merged = _union(plugins_cfg.get("enabled"), plugin_names)
-        if merged != plugins_cfg.get("enabled"):
-            plugins_cfg["enabled"] = merged
-            changed = True
+        mcp_rel = manifest.get("mcpServers")
+        if mcp_rel and (bundle / mcp_rel).is_file():
+            fragment = yaml.safe_load((bundle / mcp_rel).read_text(encoding="utf-8")) or {}
+            entries = fragment.get("mcp_servers") or {}
+            text_sub = str(home / "plugins")
+            existing = cfg.setdefault("mcp_servers", {})
+            for name, entry in entries.items():
+                if name in existing:
+                    continue  # NEVER clobber a user-configured server
+                resolved = _resolve_placeholders(entry, text_sub)
+                existing[name] = resolved
+                changed = True
 
-    if changed:
-        config_mod.save_config(cfg)
+        dbd = manifest.get("disabledByDefault") or {}
+        skills_off = dbd.get("skills") or []
+        tools_off = dbd.get("toolsets") or []
+        if skills_off:
+            skills_cfg = cfg.setdefault("skills", {})
+            merged = _union(skills_cfg.get("disabled"), skills_off)
+            if merged != skills_cfg.get("disabled"):
+                skills_cfg["disabled"] = merged
+                changed = True
+        if tools_off:
+            merged = _union(cfg.get("disabled_toolsets"), tools_off)
+            if merged != cfg.get("disabled_toolsets"):
+                cfg["disabled_toolsets"] = merged
+                changed = True
+        if plugin_names:
+            plugins_cfg = cfg.setdefault("plugins", {})
+            merged = _union(plugins_cfg.get("enabled"), plugin_names)
+            if merged != plugins_cfg.get("enabled"):
+                plugins_cfg["enabled"] = merged
+                changed = True
+
+        if changed:
+            config_mod.save_config(cfg)
+    finally:
+        reset_hermes_home_override(token)
     return True
 
 

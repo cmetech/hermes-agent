@@ -213,3 +213,21 @@ def test_stage_bundle_rejects_absolute_path(tmp_path, home, fake_config):
     cs.stage_bundle(b, "ericsson", home)
     assert not (home / "skills" / "etc").exists()
     assert not (home / "etc").exists()
+
+
+def test_stage_bundle_config_targets_staged_home(tmp_path, monkeypatch):
+    """stage_bundle's config round-trip must target the `home` PARAMETER, never
+    the ambient process home (HERMES_HOME env / context override / platform
+    default). Deliberately does NOT use the fake_config fixture: it exercises
+    the real load_config()/save_config() to prove the context-override fix
+    actually redirects config IO, not just a stubbed call.
+    """
+    other_home = tmp_path / "other"; other_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(other_home))   # ambient process home elsewhere
+    staged_home = tmp_path / "staged"; staged_home.mkdir()
+    b = make_bundle(tmp_path)
+    cs.stage_bundle(b, "ericsson", staged_home)
+    assert (staged_home / "config.yaml").exists()
+    text = (staged_home / "config.yaml").read_text()
+    assert "ericsson-jira" in text and "outlook" in text
+    assert not (other_home / "config.yaml").exists() or "ericsson" not in (other_home / "config.yaml").read_text()
