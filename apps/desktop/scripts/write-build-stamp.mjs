@@ -29,6 +29,9 @@
 import { mkdirSync, writeFileSync, readFileSync } from "fs"
 import { resolve, join, relative } from "path"
 import { execSync } from "child_process"
+import { resolveActiveBrand } from "../../../scripts/brand/active.mjs"
+import { loadDescriptor } from "../../../scripts/brand/descriptor.mjs"
+import { brandJsonPayload } from "../../../scripts/brand/brand-json.mjs"
 
 const STAMP_SCHEMA_VERSION = 1
 
@@ -146,6 +149,19 @@ function main() {
       (stamp.branch ? " (" + stamp.branch + ")" : "") +
       (stamp.dirty ? " [DIRTY]" : "")
   )
+
+  // Also emit build/brand.json — the discoverable brand identity the tray reads from the
+  // packaged app before first launch (mirrors $HERMES_HOME/brand.json written at runtime).
+  // Best-effort: dev/out-of-repo builds without the brand marker simply skip it.
+  try {
+    const slug = resolveActiveBrand({ root: REPO_ROOT })
+    const descriptor = loadDescriptor(slug, { root: REPO_ROOT })
+    const brandFile = join(OUT_DIR, "brand.json")
+    writeFileSync(brandFile, JSON.stringify(brandJsonPayload(descriptor), null, 2) + "\n", "utf8")
+    console.log("[write-build-stamp] wrote " + relative(REPO_ROOT, brandFile) + " -> " + slug)
+  } catch (err) {
+    console.warn("[write-build-stamp] skipped brand.json: " + (err && err.message))
+  }
 }
 
 main()
