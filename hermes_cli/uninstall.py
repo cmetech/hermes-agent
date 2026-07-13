@@ -324,7 +324,7 @@ def _hermes_path_markers(hermes_home: Path) -> list[str]:
     root = str(hermes_home).rstrip("\\/")
     # Match on prefix so sub-entries (git\cmd, git\bin, git\usr\bin, node, etc.)
     # all get swept.  Also match the bare hermes-agent install dir.
-    markers = [root + "\\hermes-agent", root + "\\git", root + "\\node", root + "\\venv"]
+    markers = [root + "\\hermes-agent", root + "\\git", root + "\\node", root + "\\venv", root + "\\bin"]
     # Also match if HERMES_HOME was customised to somewhere else — find-and-nuke
     # any entry whose path component contains "hermes".  We don't want to catch
     # unrelated entries like "chermes-foo" or "ephermeral", so we look for
@@ -394,6 +394,63 @@ def remove_hermes_env_vars_windows() -> list[str]:
                     log_warn(f"Could not delete {name} from User env: {e}")
     except OSError as e:
         log_warn(f"Could not open User Environment key: {e}")
+    return removed
+
+
+def _interpreter_inside(home: Path, executable: str | None = None) -> bool:
+    """True when the running Python interpreter lives inside ``home`` (so a
+    self-rmtree of ``home`` would hit the mandatory-locked running .exe on
+    Windows). The outer cleanup script removes ``home`` in that case."""
+    exe = Path(executable or sys.executable).resolve()
+    try:
+        exe.relative_to(home.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def remove_deep_link_protocols_windows() -> list[str]:
+    """Delete the otto:// / hermes:// deep-link handler keys the app registered
+    at runtime (HKCU\\Software\\Classes\\<scheme>). Electron never unregisters
+    them on uninstall."""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    removed: list[str] = []
+    for scheme in ("otto", "hermes"):
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{scheme}\\shell\\open\\command")
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{scheme}\\shell\\open")
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{scheme}\\shell")
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{scheme}")
+            removed.append(scheme)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log_warn(f"Could not remove {scheme}:// handler: {e}")
+    return removed
+
+
+def remove_desktop_shortcuts(product_name: str, dirs: "list[Path] | None" = None) -> list[Path]:
+    """Remove Start-Menu + Desktop ``<product>.lnk`` shortcuts the NSIS installer
+    created (the Python uninstall never touched them)."""
+    if dirs is None:
+        appdata = os.environ.get("APPDATA", "")
+        home = Path.home()
+        dirs = []
+        if appdata:
+            dirs.append(Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs")
+        dirs.append(home / "Desktop")
+    removed: list[Path] = []
+    for d in dirs:
+        lnk = Path(d) / f"{product_name}.lnk"
+        try:
+            if lnk.exists():
+                lnk.unlink()
+                removed.append(lnk)
+        except OSError as e:
+            log_warn(f"Could not remove shortcut {lnk}: {e}")
     return removed
 
 
@@ -791,7 +848,11 @@ def _perform_uninstall(
                 log_success(f"Removed User env var: {name}")
         else:
             log_info("No Hermes-set User env vars to remove")
-    
+
+        removed_protocols = remove_deep_link_protocols_windows()
+        if removed_protocols:
+            log_success(f"Removed deep-link handlers: {', '.join(removed_protocols)}")
+
     # 3. Remove wrapper script
     log_info("Removing hermes command...")
     removed_wrappers = remove_wrapper_script()
@@ -863,7 +924,14 @@ def _perform_uninstall(
                 log_success(f"Removed {path}")
         else:
             log_info("No Windows installer artifacts to remove")
-    
+
+    # 4c. Remove Start-Menu / Desktop shortcuts the installer created. Not
+    #     gated on _is_windows() since remove_desktop_shortcuts() is a no-op
+    #     wherever the dirs don't exist.
+    removed_shortcuts = remove_desktop_shortcuts("OTTO")
+    for s in removed_shortcuts:
+        log_success(f"Removed shortcut {s}")
+
     # 5. Optionally remove ~/.hermes/ data directory (and named profiles)
     if full_uninstall:
         # 5a. Stop and remove each named profile's gateway service and
@@ -876,13 +944,19 @@ def _perform_uninstall(
                 _uninstall_profile(prof)
 
         log_info("Removing configuration and data...")
-        try:
-            if hermes_home.exists():
-                shutil.rmtree(hermes_home)
-                log_success(f"Removed {hermes_home}")
-        except Exception as e:
-            log_warn(f"Could not fully remove {hermes_home}: {e}")
-            log_info("You may need to manually remove it")
+        if _interpreter_inside(hermes_home):
+            log_info(
+                "Running from inside the home dir — deferring its removal to the "
+                "cleanup script (it runs outside the locked venv)."
+            )
+        else:
+            try:
+                if hermes_home.exists():
+                    shutil.rmtree(hermes_home)
+                    log_success(f"Removed {hermes_home}")
+            except Exception as e:
+                log_warn(f"Could not fully remove {hermes_home}: {e}")
+                log_info("You may need to manually remove it")
     else:
         log_info(f"Keeping configuration and data in {hermes_home}")
     
