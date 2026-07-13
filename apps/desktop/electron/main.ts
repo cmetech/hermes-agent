@@ -316,10 +316,10 @@ function resolveHermesHome() {
   }
 
   if (IS_WINDOWS && process.env.LOCALAPPDATA) {
-    return path.join(process.env.LOCALAPPDATA, 'hermes')
+    return path.join(process.env.LOCALAPPDATA, 'loop24')
   }
 
-  return path.join(app.getPath('home'), '.hermes')
+  return path.join(app.getPath('home'), '.loop24')
 }
 
 const HERMES_HOME = resolveHermesHome()

@@ -55,9 +55,9 @@ const APP = (() => {
 // HERMES_HOME and never touches this.
 const DEFAULT_HERMES_HOME = (() => {
   if (PLATFORM === 'win32' && process.env.LOCALAPPDATA) {
-    return path.join(process.env.LOCALAPPDATA, 'hermes')
+    return path.join(process.env.LOCALAPPDATA, 'loop24')
   }
-  return path.join(os.homedir(), '.hermes')
+  return path.join(os.homedir(), '.loop24')
 })()
 const VENV_ROOT = path.join(DEFAULT_HERMES_HOME, 'hermes-agent', 'venv')
 const FRESH_SANDBOX_ROOT = path.join(os.tmpdir(), 'hermes-desktop-fresh-install')
