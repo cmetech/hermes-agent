@@ -15,7 +15,8 @@ import {
   installerFileName,
   installerLaunch,
   isReleaseInstall,
-  parseLatestRelease
+  parseLatestRelease,
+  releaseUpdatePending
 } from './release-update'
 
 test('isReleaseInstall: true only when packaged AND productVersion present', () => {
@@ -134,4 +135,31 @@ test('installerLaunch: win runs the exe directly; mac opens the dmg', () => {
     args: []
   })
   assert.deepEqual(installerLaunch('/t/OTTO.dmg', 'darwin'), { cmd: 'open', args: ['/t/OTTO.dmg'] })
+})
+
+const RELEASE = { productVersion: '1.0.0', commit: 'aaaaaaaaaaaa' }
+
+test('releaseUpdatePending: true when release stamp commit differs from marker pinnedCommit', () => {
+  assert.equal(releaseUpdatePending(RELEASE, { pinnedCommit: 'bbbbbbbbbbbb' }, true), true)
+})
+
+test('releaseUpdatePending: false when marker pinnedCommit equals stamp commit', () => {
+  assert.equal(releaseUpdatePending(RELEASE, { pinnedCommit: 'aaaaaaaaaaaa' }, true), false)
+})
+
+test('releaseUpdatePending: false when not a release install (no productVersion)', () => {
+  assert.equal(releaseUpdatePending({ commit: 'aaaaaaaaaaaa' }, { pinnedCommit: 'bbbbbbbbbbbb' }, true), false)
+})
+
+test('releaseUpdatePending: false when not packaged', () => {
+  assert.equal(releaseUpdatePending(RELEASE, { pinnedCommit: 'bbbbbbbbbbbb' }, false), false)
+})
+
+test('releaseUpdatePending: false when marker or its pinnedCommit is missing (first install)', () => {
+  assert.equal(releaseUpdatePending(RELEASE, null, true), false)
+  assert.equal(releaseUpdatePending(RELEASE, {}, true), false)
+})
+
+test('releaseUpdatePending: false when stamp is null', () => {
+  assert.equal(releaseUpdatePending(null, { pinnedCommit: 'bbbbbbbbbbbb' }, true), false)
 })
