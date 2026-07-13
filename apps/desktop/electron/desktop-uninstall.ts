@@ -354,8 +354,15 @@ function buildWindowsCleanupScript({
 
   lines.push(
     'if defined LEFT ( set "MSG=OTTO was removed, but these could not be deleted:%LEFT%  (delete them manually)" ) else ( set "MSG=OTTO was fully removed." )',
+    // JScript treats a bare `\x` as a hex-escape introducer, so a leftover path
+    // containing e.g. `\x` (C:\Users\x\...) inside the single-quoted JS string
+    // below would throw "Invalid hexadecimal escape sequence" and the dialog
+    // would never show. Build a JS-string-safe copy by doubling every
+    // backslash (cmd substring substitution) and interpolate THAT into the
+    // JScript literal instead of the raw %MSG%.
+    'set "MSGJS=%MSG:\\=\\\\%"',
     // mshta shows a modal even though the app has quit; escape quotes for VBScript.
-    `mshta "javascript:var m=new ActiveXObject('WScript.Shell');m.Popup('%MSG%',0,'OTTO uninstall',64);close();" 2>nul`
+    `mshta "javascript:var m=new ActiveXObject('WScript.Shell');m.Popup('%MSGJS%',0,'OTTO uninstall',64);close();" 2>nul`
   )
 
   // Self-delete the script LAST.

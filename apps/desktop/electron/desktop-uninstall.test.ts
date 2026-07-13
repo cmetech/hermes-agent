@@ -275,6 +275,26 @@ test('windows lite script keeps the home (only agent + app removed)', () => {
   assert.match(script, /rmdir \/s \/q "C:\\h\\hermes-agent"/)
 })
 
+test('windows full script dialog is JS-string-safe for a \\x path (Finding: mshta hex-escape crash)', () => {
+  const script = buildWindowsCleanupScript({
+    desktopPid: 42, pythonExe: 'py.exe', pythonPath: null, agentRoot: 'C:\\h\\hermes-agent',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
+    appPath: 'C:\\Users\\x\\AppData\\Local\\Programs\\OTTO',
+    // The fixture that triggers the bug: a leftover path containing `\x`,
+    // which JScript reads as a hex-escape introducer inside a plain '%MSG%'.
+    hermesHome: 'C:\\Users\\x\\AppData\\Local\\hermes',
+    removeUserData: true, removeAgent: true
+  })
+
+  // A JS-string-safe copy of MSG (every backslash doubled) must be built...
+  assert.match(script, /set "MSGJS=%MSG:\\=\\\\%"/)
+  // ...and the mshta/JScript line must interpolate %MSGJS%, not a raw %MSG%
+  // (which would embed single backslashes — e.g. `\x` — into the JS string
+  // literal and throw "Invalid hexadecimal escape sequence").
+  assert.match(script, /Popup\('%MSGJS%',0,'OTTO uninstall',64\)/)
+  assert.doesNotMatch(script, /Popup\('%MSG%'/)
+})
+
 test('posix full script rm -rf home + agent and shows osascript dialog on mac', () => {
   const script = buildPosixCleanupScript({
     desktopPid: 5, pythonExe: '/usr/bin/python3', pythonPath: null, agentRoot: '/Users/x/.hermes/hermes-agent',
