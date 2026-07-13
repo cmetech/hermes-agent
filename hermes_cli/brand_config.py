@@ -57,10 +57,14 @@ def get_channel_allowlist(slug: str, root: Path | None = None) -> set[str] | Non
     """The brand's messaging allowlist, or None (show all) if empty/absent/error."""
     try:
         brand = load_brand(slug, root)
+        curation = brand.get("curation") if isinstance(brand, dict) else None
+        channels = curation.get("channels") if isinstance(curation, dict) else None
+        allow = channels.get("allow") if isinstance(channels, dict) else None
+        if isinstance(allow, list) and allow:
+            return set(allow)
+        return None
     except Exception:
         return None
-    allow = (((brand or {}).get("curation") or {}).get("channels") or {}).get("allow") or []
-    return set(allow) if allow else None
 
 
 def visible_platform_ids(config: dict | None = None, root: Path | None = None) -> set[str] | None:

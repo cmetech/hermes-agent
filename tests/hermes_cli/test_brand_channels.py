@@ -40,6 +40,17 @@ def test_get_channel_allowlist_missing_is_none(tmp_path):
 def test_get_channel_allowlist_missing_file_is_none(tmp_path):
     assert bc.get_channel_allowlist("nope", root=tmp_path) is None   # never raises
 
+def test_get_channel_allowlist_malformed_non_dict_json_is_none(tmp_path):
+    (tmp_path / "brands").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "brands" / "bad.json").write_text('["telegram"]')   # top-level list, not an object
+    assert bc.get_channel_allowlist("bad", root=tmp_path) is None    # must not raise
+
+def test_get_channel_allowlist_non_list_allow_is_none(tmp_path):
+    (tmp_path / "brands").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "brands" / "z.json").write_text(json.dumps(
+        {"slug": "z", "curation": {"channels": {"allow": "telegram"}}}))  # string, not a list
+    assert bc.get_channel_allowlist("z", root=tmp_path) is None
+
 def test_visible_config_override_wins(tmp_path, monkeypatch):
     root = _brand_root(tmp_path, "otto", ["telegram"])
     (tmp_path / "brand").mkdir(); (tmp_path / "brand" / "active").write_text("otto")
