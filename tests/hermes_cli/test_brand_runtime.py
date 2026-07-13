@@ -127,6 +127,42 @@ def test_stage_nonempty_sets_no_resolver_no_crash(tmp_path, monkeypatch):
     assert not (home / capability_staging.STAGING_MANIFEST).exists()
 
 
+def test_descriptor_env_gate_blocks_before_resolve(tmp_path, monkeypatch):
+    # A descriptor-level capabilityRequiresEnv gate must block BEFORE any
+    # resolve_capability_bundle call (i.e. before any network I/O), not just
+    # after resolution via the in-repo manifest's requiresEnv.
+    monkeypatch.delenv("ERICSSON_ENV", raising=False)
+    monkeypatch.delenv("OTTO_CAPABILITY_SOURCE", raising=False)
+    root = tmp_path / "repo"
+    (root / "brands").mkdir(parents=True)
+    (root / "brands" / "g.json").write_text(
+        json.dumps({
+            "slug": "g",
+            "capabilitySets": ["ericsson"],
+            "capabilitySources": {"ericsson": "https://example.invalid/x.git"},
+            "capabilityRequiresEnv": {"ericsson": {"ERICSSON_ENV": "1"}},
+        }),
+        encoding="utf-8",
+    )
+    (root / "brand").mkdir(parents=True, exist_ok=True)
+    (root / "brand" / "active").write_text("g", encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir()
+
+    def _boom(*a, **k):
+        raise AssertionError("resolve called")
+
+    monkeypatch.setattr(capability_staging, "resolve_capability_bundle", _boom)
+    capability_staging.stage_brand_capabilities(home, root=root)  # must not raise
+    assert list(home.iterdir()) == []
+
+    # gate met -> resolve IS called (returning None here still must not crash)
+    monkeypatch.setenv("ERICSSON_ENV", "1")
+    monkeypatch.setattr(capability_staging, "resolve_capability_bundle", lambda *a, **k: None)
+    capability_staging.stage_brand_capabilities(home, root=root)  # must not raise
+    assert not (home / capability_staging.STAGING_MANIFEST).exists()
+
+
 def test_run_brand_startup_is_fault_safe(tmp_path, monkeypatch):
     # Point at a non-existent brand so load_brand raises internally; run_brand_startup
     # must swallow it and not propagate.

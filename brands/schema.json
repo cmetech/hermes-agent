@@ -113,6 +113,14 @@
       "additionalProperties": {"type": "string"},
       "description": "Map of capability-set name -> public git URL the staging seam clones/pulls at startup (P2)."
     },
+    "capabilityRequiresEnv": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {"type": "string"}
+      },
+      "description": "Per-set env gate checked BEFORE any network resolution — set name -> {ENV_VAR: required value}"
+    },
     "personaSets": {
       "type": "array",
       "description": "Named persona sets enabled for this brand.",

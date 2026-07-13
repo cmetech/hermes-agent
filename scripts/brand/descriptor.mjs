@@ -30,6 +30,7 @@ export function withDefaults(raw) {
     },
     capabilitySets: raw.capabilitySets || [],
     capabilitySources: raw.capabilitySources || {},
+    capabilityRequiresEnv: raw.capabilityRequiresEnv || {},
     personaSets: raw.personaSets || [],
     cli: raw.cli || { bannerLogo: '', bannerHero: '' }
   }

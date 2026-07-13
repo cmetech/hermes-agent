@@ -32,6 +32,7 @@ export function buildDescriptor(slug, { wordmark, tagline } = {}) {
     curation: { skills: { exclude: [], disabledByDefault: [] }, tools: { excludeToolsets: [], disabledByDefault: [] }, channels: { allow: [] } },
     capabilitySets: [],
     capabilitySources: {},
+    capabilityRequiresEnv: {},
     personaSets: [],
     cli: { bannerLogo: '', bannerHero: '' }
   }

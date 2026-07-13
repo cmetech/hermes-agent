@@ -4,6 +4,11 @@ Dependency-light (stdlib + brand_config only) so it is safe on the CLI/backend s
 path. As of P2, the resolver + staging are live for brands that ship capabilitySets.
 Remains fail-safe and no-op when sets are empty or ungated. Every step is individually
 fail-safe: capability staging must NEVER block startup.
+
+Staging is gated at two levels: a descriptor-level `capabilityRequiresEnv` gate is
+checked BEFORE any network resolution (clone/pull), so an unmet gate costs zero I/O;
+the in-repo manifest's `requiresEnv` is then checked AFTER resolution as defense in
+depth (it remains authoritative, since the descriptor gate is optional/best-effort).
 """
 from __future__ import annotations
 
@@ -112,7 +117,10 @@ def stage_bundle(bundle: Path, set_name: str, home: Path | str) -> bool:
     Copies skills/plugins/mcpLocal/workflows, merges missing mcp_servers entries
     (resolving ${CAPABILITY_DIR} to <home>/plugins), and seeds disabled-by-default
     + plugins.enabled via ONE config round-trip. Returns True (reserved for
-    future partial-failure reporting).
+    future partial-failure reporting). Note: a version bump re-runs this staging,
+    which re-applies disabledByDefault seeding — managed content, so a user's
+    manual re-enable of a seeded skill/toolset is re-disabled on set upgrade by
+    design.
     """
     import yaml
 
@@ -121,7 +129,8 @@ def stage_bundle(bundle: Path, set_name: str, home: Path | str) -> bool:
 
     # skills: preserve the repo-relative layout under skills/ (keeps the category dir)
     for rel in manifest.get("skills") or []:
-        if ".." in Path(rel).parts:
+        p = Path(rel)
+        if p.is_absolute() or ".." in p.parts:
             log.debug("skipping skills entry %r: path traversal", rel)
             continue
         src = bundle / rel
@@ -134,7 +143,8 @@ def stage_bundle(bundle: Path, set_name: str, home: Path | str) -> bool:
     plugin_names: list[str] = []
     for key in ("plugins", "mcpLocal"):
         for rel in manifest.get(key) or []:
-            if ".." in Path(rel).parts:
+            p = Path(rel)
+            if p.is_absolute() or ".." in p.parts:
                 log.debug("skipping %s entry %r: path traversal", key, rel)
                 continue
             src = bundle / rel
@@ -145,7 +155,8 @@ def stage_bundle(bundle: Path, set_name: str, home: Path | str) -> bool:
                 plugin_names.append(src.name)
 
     for rel in manifest.get("workflows") or []:
-        if ".." in Path(rel).parts:
+        p = Path(rel)
+        if p.is_absolute() or ".." in p.parts:
             log.debug("skipping workflows entry %r: path traversal", rel)
             continue
         src = bundle / rel
@@ -214,6 +225,7 @@ def stage_brand_capabilities(home: Path | str, root: Path | None = None) -> None
     if not cap_sets and not persona_sets:
         return  # empty sets — the original no-op path
     sources = descriptor.get("capabilitySources") or {}
+    gates = descriptor.get("capabilityRequiresEnv") or {}
 
     home = Path(home)
     stamp_path = home / STAGING_MANIFEST
@@ -226,6 +238,11 @@ def stage_brand_capabilities(home: Path | str, root: Path | None = None) -> None
     dirty = False
     for name in [*cap_sets, *persona_sets]:
         try:
+            gate = gates.get(name)
+            if isinstance(gate, dict) and gate and not all(
+                    os.environ.get(k) == v for k, v in gate.items()):
+                log.debug("capability set %r gated off pre-resolve (descriptor env gate unmet)", name)
+                continue
             bundle = resolve_capability_bundle(name, sources.get(name), home, root)
             if bundle is None:
                 continue

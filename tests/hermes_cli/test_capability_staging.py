@@ -202,3 +202,14 @@ def test_stage_bundle_rejects_path_traversal(tmp_path, home, fake_config):
     # the guard must skip the entry before any copy is attempted: the traversal
     # source dir should be untouched (still just its original marker file)
     assert [p.name for p in (tmp_path / "evil").iterdir()] == ["marker.txt"]
+
+
+def test_stage_bundle_rejects_absolute_path(tmp_path, home, fake_config):
+    b = make_bundle(tmp_path)
+    manifest_path = b / "sets/ericsson.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["skills"] = ["/etc"]
+    manifest_path.write_text(json.dumps(manifest))
+    cs.stage_bundle(b, "ericsson", home)
+    assert not (home / "skills" / "etc").exists()
+    assert not (home / "etc").exists()

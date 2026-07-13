@@ -52,3 +52,10 @@ test('withDefaults normalizes capabilitySources', () => {
     withDefaults({ slug: 'x', capabilitySources: { ericsson: 'https://example/e.git' } }).capabilitySources,
     { ericsson: 'https://example/e.git' })
 })
+
+test('withDefaults normalizes capabilityRequiresEnv', () => {
+  assert.deepEqual(withDefaults({ slug: 'x' }).capabilityRequiresEnv, {})
+  assert.deepEqual(
+    withDefaults({ slug: 'x', capabilityRequiresEnv: { ericsson: { ERICSSON_ENV: '1' } } }).capabilityRequiresEnv,
+    { ericsson: { ERICSSON_ENV: '1' } })
+})
