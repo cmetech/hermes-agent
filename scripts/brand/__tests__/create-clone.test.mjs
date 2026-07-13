@@ -18,7 +18,11 @@ test('buildDescriptor: defaults use house style (COWORKER wordmark, cmetech appI
   assert.equal(d.updateCommand, 'acme update')
   assert.equal(d.theme, 'otto')
   assert.equal(d.gateway, 'otto')
-  assert.deepEqual(d.curation, { skills: { exclude: [], disabledByDefault: [] }, tools: { excludeToolsets: [], disabledByDefault: [] } })
+  assert.deepEqual(d.curation, {
+    skills: { exclude: [], disabledByDefault: [] },
+    tools: { excludeToolsets: [], disabledByDefault: [] },
+    channels: { allow: [] }
+  })
   assert.deepEqual(d.capabilitySets, [])
   assert.deepEqual(d.personaSets, [])
   assert.deepEqual(d.cli, { bannerLogo: '', bannerHero: '' })

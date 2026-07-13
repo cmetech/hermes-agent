@@ -10,6 +10,7 @@ function withDefaults(raw) {
   const curation = raw.curation || {}
   const skills = curation.skills || {}
   const tools = curation.tools || {}
+  const channels = curation.channels || {}
   return {
     slug,
     displayName,
@@ -24,7 +25,8 @@ function withDefaults(raw) {
     gateway: raw.gateway || 'otto',
     curation: {
       skills: { exclude: skills.exclude || [], disabledByDefault: skills.disabledByDefault || [] },
-      tools: { excludeToolsets: tools.excludeToolsets || [], disabledByDefault: tools.disabledByDefault || [] }
+      tools: { excludeToolsets: tools.excludeToolsets || [], disabledByDefault: tools.disabledByDefault || [] },
+      channels: { allow: channels.allow || [] }
     },
     capabilitySets: raw.capabilitySets || [],
     personaSets: raw.personaSets || [],

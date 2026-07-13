@@ -32,3 +32,16 @@ test('descriptor surfaces the cli banner art', () => {
   assert.match(d.cli.bannerLogo, /█/) // otto ASCII art present
   assert.equal(typeof d.cli.bannerHero, 'string')
 })
+
+test('withDefaults: curation.channels.allow defaults to [] and passes through', () => {
+  // otto.json carries the 11-id messaging-channel allowlist.
+  const otto = loadDescriptor('otto', { root: ROOT })
+  assert.equal(otto.curation.channels.allow.length, 11)
+  assert.ok(otto.curation.channels.allow.includes('telegram'))
+  assert.ok(otto.curation.channels.allow.includes('msgraph_webhook'))
+
+  // A brand descriptor that omits `curation.channels` entirely (loop24 has no
+  // curation block at all) must still normalize to allow: [].
+  const loop24 = loadDescriptor('loop24', { root: ROOT })
+  assert.deepEqual(loop24.curation.channels, { allow: [] })
+})

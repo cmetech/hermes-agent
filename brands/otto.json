@@ -12,7 +12,8 @@
   "gateway": "otto",
   "curation": {
     "skills": { "exclude": [], "disabledByDefault": [] },
-    "tools": { "excludeToolsets": [], "disabledByDefault": [] }
+    "tools": { "excludeToolsets": [], "disabledByDefault": [] },
+    "channels": { "allow": ["telegram","slack","whatsapp","whatsapp_cloud","email","sms","api_server","webhook","msgraph_webhook","teams","discord"] }
   },
   "capabilitySets": [],
   "personaSets": [],
