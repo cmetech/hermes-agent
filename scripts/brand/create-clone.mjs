@@ -31,6 +31,7 @@ export function buildDescriptor(slug, { wordmark, tagline } = {}) {
     gateway: 'otto',
     curation: { skills: { exclude: [], disabledByDefault: [] }, tools: { excludeToolsets: [], disabledByDefault: [] }, channels: { allow: [] } },
     capabilitySets: [],
+    capabilitySources: {},
     personaSets: [],
     cli: { bannerLogo: '', bannerHero: '' }
   }

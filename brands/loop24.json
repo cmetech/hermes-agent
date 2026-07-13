@@ -14,6 +14,7 @@
     "tools": { "excludeToolsets": ["home_assistant"], "disabledByDefault": ["spotify"] }
   },
   "capabilitySets": [],
+  "capabilitySources": {"ericsson": "https://github.com/cmetech/ericsson-capabilities.git"},
   "personaSets": [],
   "cli": {
     "bannerLogo": "[bold #FAD22D]╭──────────────╮[/]\n[bold #FAD22D]│    LOOP24    │[/]\n[bold #FAD22D]╰──────────────╯[/]",

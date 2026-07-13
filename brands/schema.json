@@ -108,6 +108,11 @@
       "items": { "type": "string" },
       "default": []
     },
+    "capabilitySources": {
+      "type": "object",
+      "additionalProperties": {"type": "string"},
+      "description": "Map of capability-set name -> public git URL the staging seam clones/pulls at startup (P2)."
+    },
     "personaSets": {
       "type": "array",
       "description": "Named persona sets enabled for this brand.",

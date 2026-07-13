@@ -4,7 +4,7 @@ import path from 'node:path'
 
 const SLUG_RE = /^[a-z][a-z0-9-]*$/
 
-function withDefaults(raw) {
+export function withDefaults(raw) {
   const slug = raw.slug
   const displayName = raw.displayName || slug.toUpperCase()
   const curation = raw.curation || {}
@@ -29,6 +29,7 @@ function withDefaults(raw) {
       channels: { allow: channels.allow || [] }
     },
     capabilitySets: raw.capabilitySets || [],
+    capabilitySources: raw.capabilitySources || {},
     personaSets: raw.personaSets || [],
     cli: raw.cli || { bannerLogo: '', bannerHero: '' }
   }
