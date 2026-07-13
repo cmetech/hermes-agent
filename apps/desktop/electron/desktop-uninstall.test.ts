@@ -248,3 +248,40 @@ test('buildWindowsCleanupScript omits PYTHONPATH + rmdir when not needed (gui, n
   assert.doesNotMatch(script, /rmdir/)
   assert.doesNotMatch(script, /set "PYTHONPATH=/)
 })
+
+// --- outer-script removal + validation + native dialog (Task 2) ---
+
+test('windows full script removes home + agent + app, validates, and shows a dialog', () => {
+  const script = buildWindowsCleanupScript({
+    desktopPid: 123, pythonExe: 'py.exe', pythonPath: null, agentRoot: 'C:\\h\\hermes-agent',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
+    appPath: 'C:\\Users\\x\\AppData\\Local\\Programs\\OTTO',
+    hermesHome: 'C:\\Users\\x\\AppData\\Local\\hermes',
+    removeUserData: true, removeAgent: true
+  })
+  assert.match(script, /rmdir \/s \/q "C:\\Users\\x\\AppData\\Local\\hermes"/)  // home removed by the script
+  assert.match(script, /rmdir \/s \/q "C:\\h\\hermes-agent"/)                    // agent removed
+  assert.match(script, /mshta/)                                                  // native dialog
+  assert.match(script, /otto-uninstall-result\.log/)                            // result log
+})
+
+test('windows lite script keeps the home (only agent + app removed)', () => {
+  const script = buildWindowsCleanupScript({
+    desktopPid: 1, pythonExe: 'py.exe', pythonPath: null, agentRoot: 'C:\\h\\hermes-agent',
+    uninstallArgs: ['-m','hermes_cli.uninstall','--mode','lite'],
+    appPath: 'C:\\p\\OTTO', hermesHome: 'C:\\h', removeUserData: false, removeAgent: true
+  })
+  assert.doesNotMatch(script, /rmdir \/s \/q "C:\\h" /)   // home NOT removed
+  assert.match(script, /rmdir \/s \/q "C:\\h\\hermes-agent"/)
+})
+
+test('posix full script rm -rf home + agent and shows osascript dialog on mac', () => {
+  const script = buildPosixCleanupScript({
+    desktopPid: 5, pythonExe: '/usr/bin/python3', pythonPath: null, agentRoot: '/Users/x/.hermes/hermes-agent',
+    uninstallArgs: ['-m','hermes_cli.uninstall','--mode','full'],
+    appPath: '/Applications/OTTO.app', hermesHome: '/Users/x/.hermes',
+    removeUserData: true, removeAgent: true
+  })
+  assert.match(script, /rm -rf '\/Users\/x\/\.hermes'/)
+  assert.match(script, /osascript/)
+})

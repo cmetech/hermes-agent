@@ -130,14 +130,33 @@ function shouldRemoveAppBundle(isPackaged, appPath) {
  * Build a POSIX cleanup shell script (macOS / Linux). It:
  *   1. waits (bounded ~30s) for the desktop PID to exit (venv/bundle unlock),
  *   2. runs the Python uninstall module with the mode,
- *   3. removes the app bundle if one was resolved.
+ *   3. removes the agent dir (if `removeAgent`), the home dir (if
+ *      `removeUserData`), then the app bundle if one was resolved,
+ *   4. validates the paths that should now be gone and writes a result log,
+ *   5. shows a native dialog (macOS `osascript`) reporting success/leftovers.
  *
  * `pythonExe` should be a Python OUTSIDE the venv for lite/full (the venv is
  * being deleted); `pythonPath` is prepended to PYTHONPATH so `import hermes_cli`
  * resolves from the agent source. `q()` single-quote-escapes for the shell
  * (closes-escapes-reopens any embedded apostrophe), defending against spaces.
+ *
+ * The outer script does the destructive removal itself (rather than leaving it
+ * to the Python uninstaller) because it runs from `bash`, outside whatever
+ * directory is being deleted — the Python step can still run first for its
+ * non-filesystem cleanup, but the actual rm -rf of the agent/home dirs happens
+ * here where nothing has that path open.
  */
-function buildPosixCleanupScript({ desktopPid, pythonExe, pythonPath, agentRoot, uninstallArgs, appPath, hermesHome }) {
+function buildPosixCleanupScript({
+  desktopPid,
+  pythonExe,
+  pythonPath,
+  agentRoot,
+  uninstallArgs,
+  appPath,
+  hermesHome,
+  removeUserData = false,
+  removeAgent = false
+}) {
   const q = s => `'${String(s).replace(/'/g, `'\\''`)}'`
 
   const lines = [
@@ -161,11 +180,40 @@ function buildPosixCleanupScript({ desktopPid, pythonExe, pythonPath, agentRoot,
 
   lines.push(`cd ${q(agentRoot)} 2>/dev/null || true`, `${q(pythonExe)} ${uninstallArgs.map(q).join(' ')} || true`)
 
+  // Destructive removal happens here, in the detached outer script — not the
+  // Python uninstaller — since this script runs outside any dir being deleted.
+  if (removeAgent) {
+    lines.push(`rm -rf ${q(agentRoot)} || true`)
+  }
+
+  if (removeUserData) {
+    lines.push(`rm -rf ${q(hermesHome)} || true`)
+  }
+
   if (appPath) {
     lines.push(`rm -rf ${q(appPath)} || true`)
   }
 
-  // Self-delete the script.
+  // Validation pass: check every path that should now be gone, write a result
+  // log to temp, and surface a native dialog (macOS) with success or leftovers.
+  const checks = [appPath, removeAgent ? agentRoot : null, removeUserData ? hermesHome : null].filter(Boolean)
+
+  lines.push(
+    'LEFT=""',
+    'RESULT="$TMPDIR/otto-uninstall-result.log"',
+    ': > "$RESULT" 2>/dev/null || RESULT=/tmp/otto-uninstall-result.log'
+  )
+
+  for (const p of checks) {
+    lines.push(`if [ -e ${q(p)} ]; then LEFT="$LEFT ${p}"; echo "LEFT: ${p}" >> "$RESULT"; else echo "GONE: ${p}" >> "$RESULT"; fi`)
+  }
+
+  lines.push(
+    'if [ -n "$LEFT" ]; then MSG="OTTO was removed, but could not delete:$LEFT"; else MSG="OTTO was fully removed."; fi',
+    `if [ "$(uname)" = "Darwin" ]; then osascript -e "display dialog \\"$MSG\\" buttons {\\"OK\\"} with title \\"OTTO uninstall\\"" >/dev/null 2>&1 || true; fi`
+  )
+
+  // Self-delete the script LAST.
   lines.push('rm -f "$0" 2>/dev/null || true')
   lines.push('')
 
@@ -189,6 +237,13 @@ function buildPosixCleanupScript({ desktopPid, pythonExe, pythonPath, agentRoot,
  *
  * Removal: even after the desktop PID is gone, Windows releases directory
  * handles lazily, so a single `rmdir /s /q` can half-fail — retry up to 10x.
+ *
+ * The script itself does the destructive removal (agent dir / home dir), not
+ * the Python uninstaller — on Windows the Python step runs from the venv
+ * inside the very dir(s) being deleted, so it can't reliably remove them. The
+ * outer `.cmd` runs from `cmd.exe`, outside those dirs, so it can. After the
+ * removals it validates the paths that should be gone, writes a result log to
+ * temp, and pops a native `mshta` dialog reporting success or the leftovers.
  */
 function buildWindowsCleanupScript({
   desktopPid,
@@ -197,19 +252,26 @@ function buildWindowsCleanupScript({
   agentRoot,
   uninstallArgs,
   appPath,
-  hermesHome
+  hermesHome,
+  removeUserData = false,
+  removeAgent = false
 }) {
   const pid = Number(desktopPid) || 0
   // cmd.exe has no string escaping inside quotes; strip embedded quotes (paths
   // under %LOCALAPPDATA% never contain them). `&`/`^` in a path would still be
   // a problem, but Hermes install paths don't use them.
   const q = s => `"${String(s).replace(/"/g, '')}"`
+  const mode = (() => {
+    const idx = (uninstallArgs || []).indexOf('--mode')
+    return idx >= 0 ? uninstallArgs[idx + 1] : ''
+  })()
 
   const lines = [
     '@echo off',
     'setlocal enableextensions',
     `set "HERMES_HOME=${String(hermesHome).replace(/"/g, '')}"`,
-    `set "PID=${pid}"`
+    `set "PID=${pid}"`,
+    `set "MODE=${String(mode).replace(/"/g, '')}"`
   ]
 
   if (pythonPath) {
@@ -234,6 +296,30 @@ function buildWindowsCleanupScript({
     `${q(pythonExe)} ${uninstallArgs.map(q).join(' ')}`
   )
 
+  // Destructive removal happens here, in the detached outer script — not the
+  // Python uninstaller — since a running .exe/venv locks its own dir on
+  // Windows. Retry loop: Windows releases directory handles lazily.
+  const rmdirRetry = (target, label) => [
+    `set /a ${label}=0`,
+    `:${label}loop`,
+    `if not exist ${q(target)} goto ${label}done`,
+    `rmdir /s /q ${q(target)} >nul 2>&1`,
+    `if not exist ${q(target)} goto ${label}done`,
+    `set /a ${label}+=1`,
+    `if %${label}% geq 10 goto ${label}done`,
+    'timeout /t 1 /nobreak >nul',
+    `goto ${label}loop`,
+    `:${label}done`
+  ]
+
+  if (removeAgent) {
+    lines.push(...rmdirRetry(agentRoot, 'rmagent'))
+  }
+
+  if (removeUserData) {
+    lines.push(...rmdirRetry(hermesHome, 'rmhome'))
+  }
+
   if (appPath) {
     lines.push(
       'set /a tries=0',
@@ -249,6 +335,30 @@ function buildWindowsCleanupScript({
     )
   }
 
+  // Validation pass: check every path that should now be gone, write a result
+  // log to temp, and pop a native modal dialog (via mshta) with success or
+  // the leftover list — the app has already quit, so this is the only UI.
+  const resultLog = '%TEMP%\\otto-uninstall-result.log'
+
+  lines.push('set "LEFT="', `> "${resultLog}" echo OTTO uninstall (%MODE%) result:`)
+
+  const checkPaths = [appPath, removeAgent ? agentRoot : null, removeUserData ? hermesHome : null].filter(Boolean)
+
+  for (const p of checkPaths) {
+    const plain = String(p).replace(/"/g, '')
+
+    lines.push(
+      `if exist ${q(p)} ( set "LEFT=%LEFT% ${plain}" & >> "${resultLog}" echo LEFT: ${plain} ) else ( >> "${resultLog}" echo GONE: ${plain} )`
+    )
+  }
+
+  lines.push(
+    'if defined LEFT ( set "MSG=OTTO was removed, but these could not be deleted:%LEFT%  (delete them manually)" ) else ( set "MSG=OTTO was fully removed." )',
+    // mshta shows a modal even though the app has quit; escape quotes for VBScript.
+    `mshta "javascript:var m=new ActiveXObject('WScript.Shell');m.Popup('%MSG%',0,'OTTO uninstall',64);close();" 2>nul`
+  )
+
+  // Self-delete the script LAST.
   lines.push('del "%~f0"')
   lines.push('')
 
