@@ -1,7 +1,6 @@
 """Capability-staging seam: resolver + manifest-driven staging (P2b)."""
 import json
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -174,3 +173,32 @@ def test_empty_sets_still_noop(home, tmp_path, monkeypatch):
     _write(fake_root / "brand/active", "otto")
     cs.stage_brand_capabilities(home, root=fake_root)   # must not raise, must not create anything
     assert list(home.iterdir()) == []
+
+
+def test_resolve_placeholders_survives_windows_backslashes():
+    replacement = r"C:\Users\t\.otto\plugins"
+    obj = {
+        "args": ["${CAPABILITY_DIR}/x", "--flag"],
+        "nested": {"path": "${CAPABILITY_DIR}/y"},
+        "untouched": 5,
+    }
+    resolved = cs._resolve_placeholders(obj, replacement)
+    assert resolved["args"][0] == replacement + "/x"
+    assert resolved["nested"]["path"] == replacement + "/y"
+    assert resolved["untouched"] == 5
+
+
+def test_stage_bundle_rejects_path_traversal(tmp_path, home, fake_config):
+    b = make_bundle(tmp_path)
+    manifest_path = b / "sets/ericsson.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["skills"] = ["skills/../../evil"]
+    manifest_path.write_text(json.dumps(manifest))
+    # a real dir at the traversal target (outside the bundle) proves the guard
+    # skips the entry rather than merely failing to find a source dir
+    _write(tmp_path / "evil" / "marker.txt", "should not be copied")
+    cs.stage_bundle(b, "ericsson", home)
+    assert not (home / "evil").exists()
+    # the guard must skip the entry before any copy is attempted: the traversal
+    # source dir should be untouched (still just its original marker file)
+    assert [p.name for p in (tmp_path / "evil").iterdir()] == ["marker.txt"]

@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 from hermes_cli import brand_config
@@ -28,6 +29,32 @@ GIT_PULL_TIMEOUT = 30
 
 def _valid_bundle(path: Path, set_name: str) -> bool:
     return (path / "sets" / f"{set_name}.json").is_file()
+
+
+def _no_prompt_env() -> dict:
+    """Env for subprocess git calls that disables interactive credential prompts.
+
+    Without this, an auth-requiring URL blocks on a terminal prompt (or hangs
+    non-interactively) until the full subprocess timeout elapses instead of
+    failing fast.
+    """
+    return {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+
+
+def _resolve_placeholders(obj, replacement: str):
+    """Recursively substitute ``${CAPABILITY_DIR}`` in string values of obj.
+
+    Operates on parsed JSON values (not JSON text) so replacement strings
+    containing backslashes (e.g. Windows paths) can never produce invalid
+    JSON — unlike a naive json.dumps(...).replace(...) round-trip.
+    """
+    if isinstance(obj, str):
+        return obj.replace("${CAPABILITY_DIR}", replacement)
+    if isinstance(obj, list):
+        return [_resolve_placeholders(x, replacement) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _resolve_placeholders(v, replacement) for k, v in obj.items()}
+    return obj
 
 
 def resolve_capability_bundle(set_name: str, source_url: str | None,
@@ -54,13 +81,15 @@ def resolve_capability_bundle(set_name: str, source_url: str | None,
         if (cache / ".git").is_dir():
             try:
                 subprocess.run(["git", "-C", str(cache), "pull", "--ff-only", "-q"],
-                               check=True, capture_output=True, timeout=GIT_PULL_TIMEOUT)
+                               check=True, capture_output=True, timeout=GIT_PULL_TIMEOUT,
+                               env=_no_prompt_env())
             except Exception:
                 log.debug("capability cache pull failed for %s (using cached copy)", set_name)
         else:
             cache.parent.mkdir(parents=True, exist_ok=True)
             subprocess.run(["git", "clone", "--depth", "1", "-q", source_url, str(cache)],
-                           check=True, capture_output=True, timeout=GIT_CLONE_TIMEOUT)
+                           check=True, capture_output=True, timeout=GIT_CLONE_TIMEOUT,
+                           env=_no_prompt_env())
     except Exception:
         log.debug("capability clone failed for %s from %r", set_name, source_url, exc_info=True)
     return cache if _valid_bundle(cache, set_name) else None
@@ -82,7 +111,8 @@ def stage_bundle(bundle: Path, set_name: str, home: Path | str) -> bool:
 
     Copies skills/plugins/mcpLocal/workflows, merges missing mcp_servers entries
     (resolving ${CAPABILITY_DIR} to <home>/plugins), and seeds disabled-by-default
-    + plugins.enabled via ONE config round-trip. Returns True when staged.
+    + plugins.enabled via ONE config round-trip. Returns True (reserved for
+    future partial-failure reporting).
     """
     import yaml
 
@@ -91,6 +121,9 @@ def stage_bundle(bundle: Path, set_name: str, home: Path | str) -> bool:
 
     # skills: preserve the repo-relative layout under skills/ (keeps the category dir)
     for rel in manifest.get("skills") or []:
+        if ".." in Path(rel).parts:
+            log.debug("skipping skills entry %r: path traversal", rel)
+            continue
         src = bundle / rel
         if not src.is_dir():
             continue
@@ -101,6 +134,9 @@ def stage_bundle(bundle: Path, set_name: str, home: Path | str) -> bool:
     plugin_names: list[str] = []
     for key in ("plugins", "mcpLocal"):
         for rel in manifest.get(key) or []:
+            if ".." in Path(rel).parts:
+                log.debug("skipping %s entry %r: path traversal", key, rel)
+                continue
             src = bundle / rel
             if not src.is_dir():
                 continue
@@ -109,6 +145,9 @@ def stage_bundle(bundle: Path, set_name: str, home: Path | str) -> bool:
                 plugin_names.append(src.name)
 
     for rel in manifest.get("workflows") or []:
+        if ".." in Path(rel).parts:
+            log.debug("skipping workflows entry %r: path traversal", rel)
+            continue
         src = bundle / rel
         if src.is_file():
             dst = home / "workflows" / src.name
@@ -131,7 +170,7 @@ def stage_bundle(bundle: Path, set_name: str, home: Path | str) -> bool:
         for name, entry in entries.items():
             if name in existing:
                 continue  # NEVER clobber a user-configured server
-            resolved = json.loads(json.dumps(entry).replace("${CAPABILITY_DIR}", text_sub))
+            resolved = _resolve_placeholders(entry, text_sub)
             existing[name] = resolved
             changed = True
 
@@ -205,10 +244,12 @@ def stage_brand_capabilities(home: Path | str, root: Path | None = None) -> None
 
     if dirty:
         stamp_path.parent.mkdir(parents=True, exist_ok=True)
-        stamp_path.write_text(
+        tmp = stamp_path.with_name(f"{stamp_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        tmp.write_text(
             json.dumps({"schemaVersion": STAGING_SCHEMA_VERSION, "sets": staged_sets}, indent=2) + "\n",
             encoding="utf-8",
         )
+        os.replace(tmp, stamp_path)
 
 
 def run_brand_startup(home: Path | str, root: Path | None = None) -> None:
