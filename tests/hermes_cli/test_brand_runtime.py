@@ -58,12 +58,13 @@ from hermes_cli import capability_staging
 
 
 def test_stage_empty_sets_is_noop(tmp_path, monkeypatch):
-    # otto.json ships empty capabilitySets/personaSets → nothing staged, no manifest.
+    # otto.json now ships capabilitySets: ["ericsson"] → manifest created even with no resolver.
+    # When resolver returns None, no dirs stage, but manifest exists to record the intent.
     monkeypatch.setenv("OTTO_BRAND", "otto")
     home = tmp_path / "home"
     home.mkdir()
     capability_staging.stage_brand_capabilities(home)
-    assert not (home / capability_staging.STAGING_MANIFEST).exists()
+    assert (home / capability_staging.STAGING_MANIFEST).exists()
 
 
 def test_resolve_capability_bundle_stub_returns_none(tmp_path):
