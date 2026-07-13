@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
-import { loadDescriptor } from '../descriptor.mjs'
+import { loadDescriptor, withDefaults } from '../descriptor.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
@@ -44,4 +44,18 @@ test('withDefaults: curation.channels.allow defaults to [] and passes through', 
   // curation block at all) must still normalize to allow: [].
   const loop24 = loadDescriptor('loop24', { root: ROOT })
   assert.deepEqual(loop24.curation.channels, { allow: [] })
+})
+
+test('withDefaults normalizes capabilitySources', () => {
+  assert.deepEqual(withDefaults({ slug: 'x' }).capabilitySources, {})
+  assert.deepEqual(
+    withDefaults({ slug: 'x', capabilitySources: { ericsson: 'https://example/e.git' } }).capabilitySources,
+    { ericsson: 'https://example/e.git' })
+})
+
+test('withDefaults normalizes capabilityRequiresEnv', () => {
+  assert.deepEqual(withDefaults({ slug: 'x' }).capabilityRequiresEnv, {})
+  assert.deepEqual(
+    withDefaults({ slug: 'x', capabilityRequiresEnv: { ericsson: { ERICSSON_ENV: '1' } } }).capabilityRequiresEnv,
+    { ericsson: { ERICSSON_ENV: '1' } })
 })
