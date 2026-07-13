@@ -88,6 +88,17 @@
               "default": []
             }
           }
+        },
+        "channels": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allow": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": []
+            }
+          }
         }
       }
     },

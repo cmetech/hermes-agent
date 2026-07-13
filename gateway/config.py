@@ -23,6 +23,25 @@ from utils import is_truthy_value
 logger = logging.getLogger(__name__)
 
 
+def _brand_visible_platform_ids():
+    """Effective brand channel allowlist, or ``None`` for "no restriction".
+
+    Lazily imports ``hermes_cli.brand_config.visible_platform_ids`` so this
+    module has no hard dependency on the brand-config subsystem. Any failure
+    (missing module, malformed brand descriptor, etc.) fails OPEN — returns
+    ``None`` so ``get_connected_platforms`` shows/allows every platform,
+    rather than risk silently hiding all messaging channels. Indirection
+    (module-level function, not an inline import) exists so tests can
+    monkeypatch this single symbol.
+    """
+    try:
+        from hermes_cli.brand_config import visible_platform_ids
+
+        return visible_platform_ids()
+    except Exception:
+        return None  # fail open
+
+
 def _coerce_bool(value: Any, default: bool = True) -> bool:
     """Coerce bool-ish config values, preserving a caller-provided default."""
     if value is None:
@@ -724,7 +743,10 @@ class GatewayConfig:
     def get_connected_platforms(self) -> List[Platform]:
         """Return list of platforms that are enabled and configured."""
         connected = []
+        visible = _brand_visible_platform_ids()
         for platform, config in self.platforms.items():
+            if visible is not None and platform.value not in visible:
+                continue
             if not config.enabled:
                 continue
             if self._is_platform_connected(platform, config):

@@ -6670,7 +6670,28 @@ def _messaging_platform_catalog() -> tuple[dict[str, Any], ...]:
     entries.sort(
         key=lambda e: (order.get(e["id"], len(_PLATFORM_ORDER)), e["name"].lower())
     )
+
+    try:
+        from hermes_cli.brand_config import visible_platform_ids
+
+        entries = _apply_platform_visibility(entries, visible_platform_ids())
+    except Exception:
+        _log.debug("channel visibility filter skipped", exc_info=True)  # fail open
+
     return tuple(entries)
+
+
+def _apply_platform_visibility(
+    entries: list[dict[str, Any]], visible: set[str] | None
+) -> list[dict[str, Any]]:
+    """Filter catalog ``entries`` to the brand's channel allowlist.
+
+    ``visible=None`` means "no allowlist configured" — return entries
+    unchanged (fail open: never hide everything by default).
+    """
+    if visible is None:
+        return entries
+    return [e for e in entries if e["id"] in visible]
 
 
 def _channel_managed_env_keys() -> frozenset[str]:
@@ -7847,6 +7868,17 @@ async def get_messaging_platforms(profile: Optional[str] = None):
 async def update_messaging_platform(
     platform_id: str, body: MessagingPlatformUpdate, profile: Optional[str] = None
 ):
+    try:
+        from hermes_cli.brand_config import visible_platform_ids
+
+        vis = visible_platform_ids()
+        if vis is not None and platform_id not in vis:
+            raise HTTPException(status_code=404, detail="platform not available")
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # fail open
+
     entry = _catalog_lookup(platform_id)
     if not entry:
         raise HTTPException(
