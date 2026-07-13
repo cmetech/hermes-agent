@@ -11,6 +11,7 @@ import { packageJsonEmitter } from './emitters/package-json.mjs'
 import { mainIdentityEmitter } from './emitters/main-identity.mjs'
 import { brandConfigEmitter } from './emitters/brand-config.mjs'
 import { introEmitter } from './emitters/intro.mjs'
+import { homeEmitter } from './emitters/home.mjs'
 
 export const DEFAULT_EMITTERS = [
   providerEmitter,
@@ -20,7 +21,8 @@ export const DEFAULT_EMITTERS = [
   packageJsonEmitter,
   mainIdentityEmitter,
   brandConfigEmitter,
-  introEmitter
+  introEmitter,
+  homeEmitter
 ]
 
 export function runEmitters(descriptor, { root, mode, emitters = DEFAULT_EMITTERS, write: applyWrite = false }) {

@@ -170,7 +170,9 @@ def slack_manifest_command(args) -> int:
 
                 target = Path(get_hermes_home()) / "slack-manifest.json"
             except Exception:
-                target = Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")) / "slack-manifest.json"
+                from hermes_constants import get_hermes_home
+
+                target = Path(get_hermes_home()) / "slack-manifest.json"
         else:
             target = Path(write_target).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)
