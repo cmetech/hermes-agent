@@ -419,16 +419,23 @@ def remove_deep_link_protocols_windows() -> list[str]:
         return []
     removed: list[str] = []
     for scheme in ("otto", "hermes"):
-        try:
-            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{scheme}\\shell\\open\\command")
-            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{scheme}\\shell\\open")
-            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{scheme}\\shell")
-            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{scheme}")
+        subkeys = [
+            f"Software\\Classes\\{scheme}\\shell\\open\\command",
+            f"Software\\Classes\\{scheme}\\shell\\open",
+            f"Software\\Classes\\{scheme}\\shell",
+            f"Software\\Classes\\{scheme}",
+        ]
+        deleted_any = False
+        for sub in subkeys:
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, sub)
+                deleted_any = True
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log_warn(f"Could not remove registry key {sub}: {e}")
+        if deleted_any:
             removed.append(scheme)
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            log_warn(f"Could not remove {scheme}:// handler: {e}")
     return removed
 
 

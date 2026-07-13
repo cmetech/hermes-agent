@@ -27,3 +27,33 @@ def test_remove_desktop_shortcuts_unlinks_only_matching(tmp_path, monkeypatch):
     names = sorted(p.name for p in removed)
     assert names == ["OTTO.lnk", "OTTO.lnk"]
     assert (sm / "Other.lnk").exists()
+
+
+def test_remove_protocols_missing_intermediate_still_deletes_root(monkeypatch):
+    # Regression test: remove_deep_link_protocols_windows() must delete each
+    # of the 4 registry keys independently. Previously all 4 DeleteKey calls
+    # shared one try/except FileNotFoundError, so a missing intermediate key
+    # (e.g. the deepest "...\\shell\\open\\command" already gone) aborted the
+    # whole chain and left the root "Software\\Classes\\<scheme>" key behind.
+    deleted = []
+
+    class FakeWinreg:
+        HKEY_CURRENT_USER = 0
+
+        @staticmethod
+        def DeleteKey(root, sub):
+            # Simulate: the deepest 'command' key is already gone, but the
+            # shallower keys (including the root) still exist.
+            if sub.endswith("command"):
+                raise FileNotFoundError
+            deleted.append(sub)
+
+    monkeypatch.setitem(sys.modules, "winreg", FakeWinreg)
+
+    out = u.remove_deep_link_protocols_windows()
+
+    # Root keys for both schemes must have been deleted despite the missing
+    # 'command' key raising FileNotFoundError first in the chain.
+    assert "Software\\Classes\\otto" in deleted
+    assert "Software\\Classes\\hermes" in deleted
+    assert "otto" in out and "hermes" in out
