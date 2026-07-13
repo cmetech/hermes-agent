@@ -1,13 +1,13 @@
 {
   "$comment": "OTTO branding — SINGLE source of truth for the desktop's user-facing product name. Applied at BUILD TIME only (see scripts/brand-transform.mjs); source .ts/.tsx files are never modified, so upstream Hermes merges never conflict on branding. To rebrand: change name + rules and rebuild. To get stock Hermes behavior: set name to \"Hermes\" (transform becomes a no-op).",
-  "name": "Hermes",
+  "name": "LOOP24",
   "protect": [
     "X-Hermes-[A-Za-z0-9-]+",
     "Hermes-Desktop"
   ],
   "rules": [
-    ["\\bHermes\\b", "Hermes"],
-    ["\\bHERMES\\b", "HERMES"]
+    ["\\bHermes\\b", "LOOP24"],
+    ["\\bHERMES\\b", "LOOP24"]
   ],
   "$protectNote": "protect = regexes for FUNCTIONAL title-case 'Hermes' strings that must NOT be rebranded: the X-Hermes-Session-Token auth header (rewriting it breaks desktop↔backend auth → 401) and the Hermes-Desktop User-Agent. Matches are masked before rules run and restored after. Add any newly-discovered functional 'Hermes' string here. NOTE: 'Hermes\\.app' is intentionally NOT protected — the mac updater's relaunch paths (main.ts release/mac*/…app) must become OTTO.app because electron-builder outputs the app under productName (OTTO); protecting it left self-update looking for a non-existent Hermes.app.",
   "$rulesNote": "Rules are [regexPattern, replacement], applied in order with the global flag and CASE SENSITIVITY. Case-sensitive \\bHermes\\b matches only the title-case display word; \\bHERMES\\b handles ALL-CAPS display text (e.g. the intro wordmark 'HERMES AGENT' -> 'OTTO AGENT'). Neither matches identifiers: HERMES_HOME / hermes_cli / .hermes / resolveHermesBackend all differ in case or are glued to word chars (the underscore in HERMES_HOME blocks \\bHERMES\\b). Anything in `protect` is exempt. Add more specific phrase rules BEFORE the generic one if a surface needs different wording."

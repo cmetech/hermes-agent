@@ -308,6 +308,12 @@ all = [
 hermes = "hermes_cli.main:main"
 hermes-agent = "run_agent:main"
 hermes-acp = "acp_adapter.entry:main"
+# LOOP24 branding — same entry points under the LOOP24 command name. The `hermes*`
+# commands are kept intact (the desktop backend spawns `hermes serve` and
+# upstream merges expect them); `loop24*` are additive aliases.
+loop24 = "hermes_cli.main:main"
+loop24-agent = "run_agent:main"
+loop24-acp = "acp_adapter.entry:main"
 
 [tool.setuptools]
 py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_bootstrap", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "utils", "mcp_serve"]

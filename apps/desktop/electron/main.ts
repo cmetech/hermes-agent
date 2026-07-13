@@ -427,7 +427,7 @@ const BOOT_FAKE_STEP_MS = (() => {
   return Math.max(120, raw)
 })()
 
-const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME || 'Hermes'
+const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME || 'LOOP24'
 const TITLEBAR_HEIGHT = 34
 const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
 
@@ -725,7 +725,7 @@ app.setName(APP_NAME)
 // need this, so gate it on Windows. (Fixes: desktop approval/turn notifications
 // never firing on Windows.)
 if (IS_WINDOWS) {
-  app.setAppUserModelId('com.nousresearch.hermes')
+  app.setAppUserModelId('io.cmetech.loop24')
 }
 
 // Seed the native About panel with the live Hermes version. This is refreshed
@@ -9019,7 +9019,7 @@ ipcMain.handle('hermes:vscode-theme:search', async (_event, query) => searchMark
 // them — cron/blueprint_catalog.py, Honcho OAuth) keep resolving. Keep both in
 // DEEP_LINK_PROTOCOLS until the backend is migrated to otto://.
 // ---------------------------------------------------------------------------
-const OTTO_PROTOCOL = 'hermes'
+const OTTO_PROTOCOL = 'loop24'
 const HERMES_PROTOCOL = 'hermes'
 const DEEP_LINK_PROTOCOLS = [OTTO_PROTOCOL, HERMES_PROTOCOL]
 let _pendingDeepLink = null

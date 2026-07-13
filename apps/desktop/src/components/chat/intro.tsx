@@ -144,11 +144,11 @@ function pickCopy(copies: IntroCopy[], seed = 0): IntroCopy {
   return copies[Math.abs(seed) % copies.length] || FALLBACK_COPY[0]
 }
 
-const WORDMARK = 'HERMES AGENT'
+const WORDMARK = 'LOOP24 COWORKER'
 
 // OTTO = Orchestrating Thoughts, Tasks & Outcomes. One-line explainer shown as
 // the intro subtitle (replaces the rotating personality copy on the splash).
-const TAGLINE = "Hermes orchestrates your thoughts and tasks into effective outcomes — tell me what you need and I'll take it from there."
+const TAGLINE = "Loop24 closes the loop on every task — turning your intent into outcomes, continuously."
 
 function resolveCopy(personality?: string, seed?: number): IntroCopy {
   const personalityKey = normalizeKey(personality)

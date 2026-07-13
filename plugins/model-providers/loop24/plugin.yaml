@@ -1,0 +1,5 @@
+name: loop24-provider
+kind: model-provider
+version: 1.0.0
+description: LOOP24 gateway → Kilo (kiro-cli), OpenAI-compatible
+author: cmetech
