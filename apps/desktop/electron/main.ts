@@ -2195,7 +2195,16 @@ function downloadFile(url, destPath, onProgress, redirects = 0) {
         } catch {}
       })
       res.pipe(out)
-      out.on('finish', () => out.close(() => resolve(destPath)))
+      out.on('finish', () => out.close(() => {
+        // A finished stream doesn't guarantee a complete/valid body — guard
+        // against a truncated or corrupt-but-complete download before we ever
+        // hand the file to spawn(). An installer is tens of MB, never a few KB.
+        let size = 0
+        try { size = fs.statSync(destPath).size } catch {}
+        if (total != null && size !== total) return fail(new Error(`incomplete download: ${size}/${total}`))
+        if (size < 1_000_000) return fail(new Error(`download too small: ${size} bytes`))
+        resolve(destPath)
+      }))
       out.on('error', fail)
       res.on('error', fail)
     })
@@ -2626,8 +2635,11 @@ async function applyUpdates(opts = {}) {
 
     try {
       emitUpdateProgress({ stage: 'update', message: 'Downloading update…', percent: 0 })
+      let lastPct = -1
       await downloadFile(assetUrl, dest, (recv, total) => {
         const pct = total ? Math.round((recv / total) * 100) : null
+        if (pct === lastPct) return
+        lastPct = pct
         emitUpdateProgress({
           stage: 'update',
           message: pct != null ? `Downloading update… ${pct}%` : 'Downloading update…',
@@ -2645,6 +2657,15 @@ async function applyUpdates(opts = {}) {
       }
 
       const child = spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: false })
+
+      // spawn() failures (bad/missing/truncated exe) surface asynchronously via
+      // the child's 'error' event, not as a thrown exception here — without a
+      // handler the app would already be mid quit-handoff with no fallback and
+      // the unhandled event could throw. Fall back to the release page.
+      child.on('error', (e) => {
+        try { rememberLog(`[update] installer launch failed: ${e?.message || e}`) } catch {}
+        try { shell.openExternal(fallbackUrl) } catch {}
+      })
 
       child.unref()
       rememberLog(`[updates] launched release installer: ${cmd} ${args.join(' ')} (${dest})`)
