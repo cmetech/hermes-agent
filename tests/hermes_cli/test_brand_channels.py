@@ -69,3 +69,12 @@ def test_visible_none_when_no_allowlist(tmp_path, monkeypatch):
     (tmp_path / "brand").mkdir(); (tmp_path / "brand" / "active").write_text("otto")
     monkeypatch.delenv("OTTO_BRAND", raising=False)
     assert bc.visible_platform_ids({}, root=root) is None
+
+def test_visible_scalar_override_falls_through_not_empty(tmp_path, monkeypatch):
+    root = _brand_root(tmp_path, "otto", ["telegram"])
+    (tmp_path / "brand").mkdir(exist_ok=True); (tmp_path / "brand" / "active").write_text("otto")
+    monkeypatch.delenv("OTTO_BRAND", raising=False)
+    cfg = {"messaging": {"allowed_platforms": "telegram"}}  # scalar, NOT a list
+    # must ignore the malformed override and fall through to the descriptor allowlist,
+    # NOT return a char-set / empty set (fail OPEN, never hide everything)
+    assert bc.visible_platform_ids(cfg, root=root) == {"telegram"}
