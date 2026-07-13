@@ -7037,10 +7037,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         startup_retryable_errors: list[str] = []
         
         # Initialize and connect each configured platform
+        from gateway.config import _brand_visible_platform_ids
+        _brand_visible = _brand_visible_platform_ids()   # None = no allowlist (show/allow all)
         for platform, platform_config in self.config.platforms.items():
             if await self._abort_startup_if_shutdown_requested():
                 return True
             if not platform_config.enabled:
+                continue
+            if _brand_visible is not None and platform.value not in _brand_visible:
+                logger.info("skipping platform '%s' — not in this brand's channel allowlist", platform.value)
                 continue
             enabled_platform_count += 1
             
