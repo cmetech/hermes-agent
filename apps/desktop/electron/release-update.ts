@@ -2,7 +2,7 @@
  * Pure helpers for the OTTO release-based update path.
  *
  * OTTO desktop is distributed as packaged installers (nsis/dmg) published to
- * cmetech/otto GitHub Releases. Unlike a source install (git clone + build,
+ * the active brand's GitHub Releases. Unlike a source install (git clone + build,
  * self-updates via `git pull`), a *release* install should update by checking
  * the latest published release and downloading the next installer — the
  * git-pull path causes GUI/backend skew on a packaged binary.
@@ -80,7 +80,8 @@ export function parseLatestRelease(releases: unknown, platform: string, arch: st
 
   return {
     version,
-    releaseUrl: rel.html_url || `https://github.com/cmetech/otto/releases/tag/${rel.tag_name}`,
+    tag_name: rel.tag_name,
+    releaseUrl: rel.html_url ?? null,
     assetUrl: asset?.browser_download_url || null
   }
 }
@@ -106,7 +107,7 @@ export function buildReleaseUpdateStatus(
   current: string,
   latest: LatestRelease | null,
   branch: string,
-  releasesRepo: string = 'cmetech/otto'
+  releasesRepo: string
 ): ReleaseUpdateStatus {
   const updateAvailable = Boolean(latest && compareSemver(latest.version, current) > 0)
 
