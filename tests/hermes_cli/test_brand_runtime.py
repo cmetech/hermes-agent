@@ -66,8 +66,9 @@ def test_stage_empty_sets_is_noop(tmp_path, monkeypatch):
     assert not (home / capability_staging.STAGING_MANIFEST).exists()
 
 
-def test_resolve_capability_bundle_stub_returns_none():
-    assert capability_staging.resolve_capability_bundle("ericsson") is None
+def test_resolve_capability_bundle_stub_returns_none(tmp_path):
+    # With no source_url, resolver returns None (no cache to fall back to)
+    assert capability_staging.resolve_capability_bundle("ericsson", None, tmp_path) is None
 
 
 def test_stage_nonempty_sets_no_resolver_no_crash(tmp_path, monkeypatch):
