@@ -12951,6 +12951,17 @@ def main():
     if _try_termux_fast_cli_launch():
         return
 
+    # Brand runtime: write the discoverable $HERMES_HOME/brand.json (for external tooling
+    # like the tray) and run the capability-staging seam (no-op today — empty sets). Both
+    # are fail-safe and must never block startup. Runs once per process for both the bare
+    # CLI and the `hermes serve` backend (same main() entrypoint).
+    try:
+        from hermes_cli.capability_staging import run_brand_startup
+        from hermes_cli.config import get_hermes_home
+        run_brand_startup(get_hermes_home())
+    except Exception:
+        pass
+
     from hermes_cli._parser import build_top_level_parser
 
     parser, subparsers, chat_parser = build_top_level_parser()

@@ -87,3 +87,51 @@ def visible_platform_ids(config: dict | None = None, root: Path | None = None) -
     except Exception:
         pass
     return get_channel_allowlist(resolve_active_brand(root), root)
+
+
+BRAND_JSON_SCHEMA_VERSION = 1
+
+# Canonical brand.json shape. MUST stay in sync with the JS builder in
+# scripts/brand/brand-json.mjs (brandJsonPayload). Both are asserted against the
+# same key list in tests (test_brand_runtime.py / brand-json.test.mjs).
+def brand_json_payload(slug: str, root: Path | None = None) -> dict:
+    """Resolved brand identity for `slug` — the discoverable descriptor the P4 tray reads.
+
+    Defaults mirror scripts/brand/descriptor.mjs withDefaults so the Python and JS
+    writers produce byte-compatible output for the same slug.
+    """
+    b = load_brand(slug, root)
+    s = b["slug"]
+    display = b.get("displayName") or s.upper()
+    scheme = b.get("scheme") or s
+    return {
+        "schemaVersion": BRAND_JSON_SCHEMA_VERSION,
+        "slug": s,
+        "displayName": display,
+        "appId": b.get("appId") or f"io.cmetech.{s}",
+        "scheme": scheme,
+        "schemes": [scheme, "hermes"],
+        "homeDir": b.get("homeDir") or f".{s}",
+        "releasesRepo": b.get("releasesRepo") or f"cmetech/{s}",
+        "updateCommand": b.get("updateCommand") or f"{s} update",
+        "gateway": b.get("gateway") or "otto",
+    }
+
+
+def write_brand_json(home: Path | str, root: Path | None = None) -> None:
+    """Write <home>/brand.json for the active brand (write-if-changed).
+
+    Best-effort caller (run_brand_startup) wraps this; a redundant identical write is
+    skipped to avoid disk churn on every startup.
+    """
+    slug = resolve_active_brand(root)
+    payload = brand_json_payload(slug, root)
+    text = json.dumps(payload, indent=2) + "\n"
+    target = Path(home) / "brand.json"
+    try:
+        if target.exists() and target.read_text(encoding="utf-8") == text:
+            return
+    except Exception:
+        pass
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
