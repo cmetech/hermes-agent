@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -96,3 +99,17 @@ def test_run_brand_startup_writes_brand_json(tmp_path, monkeypatch):
     home.mkdir()
     capability_staging.run_brand_startup(home)
     assert (home / "brand.json").exists()
+
+
+def test_cli_startup_writes_brand_json(tmp_path):
+    # Drive the real CLI once against a temp home; brand.json must appear.
+    # `hermes` always exists (the branded alias routes to the same main()).
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(tmp_path)
+    env.pop("OTTO_BRAND", None)  # let the brand/active marker decide (otto on this branch)
+    hermes = Path(sys.executable).parent / "hermes"
+    assert hermes.exists(), f"expected {hermes} in the venv"
+    subprocess.run([str(hermes), "--version"], env=env, capture_output=True, timeout=120)
+    assert (tmp_path / "brand.json").exists()
+    data = json.loads((tmp_path / "brand.json").read_text())
+    assert data["schemes"][-1] == "hermes"
