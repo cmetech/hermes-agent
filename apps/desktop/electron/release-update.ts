@@ -32,6 +32,25 @@ export function isReleaseInstall(stamp: { productVersion?: string | null } | nul
   return Boolean(isPackaged && stamp && stamp.productVersion)
 }
 
+/**
+ * A packaged release install whose install-stamp pins a NEWER commit than the
+ * backend clone was last bootstrapped at (the bootstrap marker's pinnedCommit).
+ * When true, the shell MUST re-bootstrap (fast-forward) the backend and must
+ * NOT let a still-healthy old venv satisfy the backend request — otherwise the
+ * backend silently freezes at the previous release. Null/missing marker or
+ * commit → false (first install flows through the normal bootstrap path).
+ */
+export function releaseUpdatePending(
+  stamp: { commit?: string | null; productVersion?: string | null } | null,
+  marker: { pinnedCommit?: string | null } | null,
+  isPackaged: boolean
+): boolean {
+  if (!isReleaseInstall(stamp, isPackaged)) return false
+  const stampCommit = stamp && stamp.commit
+  const markerCommit = marker && marker.pinnedCommit
+  return Boolean(stampCommit && markerCommit && stampCommit !== markerCommit)
+}
+
 function normalize(v: string): number[] {
   return String(v)
     .replace(/^v/, '')
