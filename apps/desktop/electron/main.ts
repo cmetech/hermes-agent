@@ -120,7 +120,8 @@ import {
   installerFileName,
   installerLaunch,
   isReleaseInstall,
-  parseLatestRelease
+  parseLatestRelease,
+  releaseUpdatePending
 } from './release-update'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
@@ -3338,13 +3339,9 @@ function isBootstrapComplete() {
   // (isReleaseInstall is false without a productVersion stamp).
   // NOTE: this fast-forward needs network at that launch; an offline launch
   // right after an upgrade will show the install overlay until reachable.
-  if (
-    isReleaseInstall(INSTALL_STAMP, IS_PACKAGED) &&
-    INSTALL_STAMP?.commit &&
-    marker.pinnedCommit !== INSTALL_STAMP.commit
-  ) {
+  if (releaseUpdatePending(INSTALL_STAMP, marker, IS_PACKAGED)) {
     rememberLog(
-      `[updates] release shell pins ${INSTALL_STAMP.commit.slice(0, 12)}, backend clone at ${marker.pinnedCommit.slice(0, 12)}; re-bootstrapping to fast-forward the backend`
+      `[updates] release shell pins ${INSTALL_STAMP.commit.slice(0, 12)}, backend clone at ${String(marker.pinnedCommit).slice(0, 12)}; backend is stale (see resolveHermesBackend → bootstrap)`
     )
 
     return false
@@ -3590,6 +3587,22 @@ function createActiveBackend(backendArgs) {
   }
 }
 
+function makeBootstrapNeeded(backendArgs) {
+  return {
+    kind: 'bootstrap-needed',
+    label: 'Hermes Agent not installed yet; bootstrap required',
+    command: null,
+    args: backendArgs,
+    bootstrap: true,
+    env: {},
+    shell: false,
+    activeRoot: ACTIVE_HERMES_ROOT,
+    installStamp: INSTALL_STAMP,
+    isPackaged: IS_PACKAGED,
+    platform: process.platform
+  }
+}
+
 function resolveHermesBackend(backendArgs) {
   // 1. Explicit override -- HERMES_DESKTOP_HERMES_ROOT points at a developer
   //    checkout. Honour it as-is (no bootstrap; the user is driving).
@@ -3623,6 +3636,17 @@ function resolveHermesBackend(backendArgs) {
   //    (applyUpdates -> git pull) or `hermes update` from the CLI.
   if (isBootstrapComplete()) {
     return createActiveBackend(backendArgs)
+  }
+
+  // 3b. Release update pending: the shell's install-stamp pins a newer commit
+  //     than the backend clone was bootstrapped at. isBootstrapComplete()
+  //     returned false for exactly this reason. We MUST route to the bootstrap
+  //     fast-forward here and NOT fall through to steps 4/5, where a still-
+  //     healthy old venv would satisfy the request and silently freeze the
+  //     backend at the previous release (the abe1103 freeze bug).
+  if (releaseUpdatePending(INSTALL_STAMP, readBootstrapMarker(), IS_PACKAGED)) {
+    rememberLog('[updates] release update pending; routing to bootstrap to fast-forward the backend')
+    return makeBootstrapNeeded(backendArgs)
   }
 
   // 4. Existing `hermes` on PATH -- installed via install.ps1 / install.sh from
@@ -3730,20 +3754,7 @@ function resolveHermesBackend(backendArgs) {
   //    resolveHermesBackend was the old "no payload" path and forced the
   //    user into a dead end. With the bootstrap protocol, "no install yet"
   //    is a recoverable state the GUI can drive through.
-  return {
-    kind: 'bootstrap-needed',
-    label: 'Hermes Agent not installed yet; bootstrap required',
-    command: null,
-    args: backendArgs,
-    bootstrap: true,
-    env: {},
-    shell: false,
-    // Hints for the bootstrap runner / UI layer:
-    activeRoot: ACTIVE_HERMES_ROOT,
-    installStamp: INSTALL_STAMP, // may be null in dev
-    isPackaged: IS_PACKAGED,
-    platform: process.platform
-  }
+  return makeBootstrapNeeded(backendArgs)
 }
 
 async function ensureRuntime(backend) {
