@@ -11,10 +11,11 @@ import { loadDescriptor } from '../descriptor.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
-// The exact set of on-disk files/dirs the 8 default emitters target, per the
+// The exact set of on-disk files/dirs the 9 default emitters target, per the
 // OTTO customization surface table. Used to build an isolated temp copy of
 // just the relevant tree for full-suite neutralize/write round-trip tests
-// without ever touching the real repo.
+// without ever touching the real repo. The last 6 are the home emitter's
+// resolver files (main.ts is shared with main-identity, already listed).
 const EMITTER_FILES = [
   'plugins/model-providers/otto/__init__.py',
   'plugins/model-providers/otto/plugin.yaml',
@@ -24,7 +25,13 @@ const EMITTER_FILES = [
   'apps/desktop/package.json',
   'apps/desktop/electron/main.ts',
   'apps/desktop/brand.config.json',
-  'apps/desktop/src/components/chat/intro.tsx'
+  'apps/desktop/src/components/chat/intro.tsx',
+  'hermes_constants.py',
+  'apps/bootstrap-installer/src-tauri/src/paths.rs',
+  'apps/desktop/scripts/test-desktop.mjs',
+  'scripts/install.ps1',
+  'scripts/install.sh',
+  'scripts/lib/node-bootstrap.sh'
 ]
 
 function copyEmitterTree(srcRoot, dstRoot) {
@@ -94,13 +101,21 @@ test('parseArgs honors OTTO_BRAND env override when no slug positional is given'
   }
 })
 
-test('resolved active brand on the otto tree is otto and reports zero changes for --write (hermetic: direct emitter call, no CLI spawn)', () => {
-  const slug = resolveActiveBrand({ root: ROOT })
-  assert.equal(slug, 'otto')
-  const descriptor = loadDescriptor(slug, { root: ROOT })
-  const { results } = runEmitters(descriptor, { root: ROOT, mode: 'write', emitters: DEFAULT_EMITTERS })
+test('write(otto) is idempotent in an isolated temp copy — a second write reports zero changes (hermetic: never touches the real repo, branch-independent)', () => {
+  // NOTE: this runs write against a TEMP copy, never the live ROOT. Running
+  // write(otto) against ROOT is only a no-op on the branded otto tree; on the
+  // neutral base tree it would brand ~13 real files. Copy first, then assert
+  // idempotency of write in the isolated copy so this passes on any branch.
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'write-idempotent-'))
+  copyEmitterTree(ROOT, tmpRoot)
+  const descriptor = loadDescriptor('otto', { root: ROOT })
+
+  runEmitters(descriptor, { root: tmpRoot, mode: 'write', emitters: DEFAULT_EMITTERS }) // brand the copy
+  const { results } = runEmitters(descriptor, { root: tmpRoot, mode: 'write', emitters: DEFAULT_EMITTERS }) // second write
   const changed = results.filter(r => r.changed)
-  assert.deepEqual(changed, [], `expected no emitter to report changes on the otto tree, got: ${JSON.stringify(changed)}`)
+  assert.deepEqual(changed, [], `expected the second write to be a no-op, got: ${JSON.stringify(changed)}`)
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
 })
 
 test('parseArgs: --neutralize (no --write) resolves mode "neutralize" and write:false', () => {
@@ -163,7 +178,7 @@ test('DRY-RUN-CLEAN: --neutralize (no --write) against the REAL tree leaves it b
   assert.ok(fs.existsSync(path.join(ROOT, 'plugins/model-providers/otto')), 'provider dir must survive a dry run')
 })
 
-test('CLI --neutralize --write in an isolated temp copy of the tree applies all 8 emitters, and a subsequent write(otto) round-trips every file back byte-for-byte', () => {
+test('CLI --neutralize --write in an isolated temp copy of the tree applies all 9 emitters, and a subsequent write(otto) round-trips every file back byte-for-byte', () => {
   const before = Object.fromEntries(EMITTER_FILES.map(rel => [rel, fs.readFileSync(path.join(ROOT, rel), 'utf8')]))
 
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'neutralize-write-all-'))

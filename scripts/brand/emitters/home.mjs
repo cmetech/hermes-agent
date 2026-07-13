@@ -42,11 +42,6 @@ export const FILE_SPECS = [
   ]},
 ]
 
-function countMatches(src, re) {
-  const g = re.global ? re : new RegExp(re.source, re.flags + 'g')
-  return (src.match(g) || []).length
-}
-
 function applyNames(src, subs, names) {
   let next = src
   for (const s of subs) {
