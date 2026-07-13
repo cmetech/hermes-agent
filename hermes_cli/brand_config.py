@@ -82,7 +82,7 @@ def visible_platform_ids(config: dict | None = None, root: Path | None = None) -
             config = {}
     try:
         override = ((config or {}).get("messaging") or {}).get("allowed_platforms")
-        if override:
+        if isinstance(override, list) and override:
             return set(override)
     except Exception:
         pass
