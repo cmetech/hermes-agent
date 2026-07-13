@@ -65,6 +65,10 @@ export function AboutSettings() {
     void refreshDesktopVersion()
   }, [])
 
+  const releaseNotesUrl = version?.releasesRepo
+    ? `https://github.com/${version.releasesRepo}/releases`
+    : RELEASE_NOTES_URL
+
   const behind = status?.behind ?? 0
   const supported = status?.supported !== false
   const applying = apply.applying || apply.stage === 'restart'
@@ -163,10 +167,10 @@ export function AboutSettings() {
 
             <Button asChild className="ml-auto" size="sm" variant="text">
               <a
-                href={RELEASE_NOTES_URL}
+                href={releaseNotesUrl}
                 onClick={event => {
                   event.preventDefault()
-                  void window.hermesDesktop?.openExternal?.(RELEASE_NOTES_URL)
+                  void window.hermesDesktop?.openExternal?.(releaseNotesUrl)
                 }}
                 rel="noreferrer"
                 target="_blank"

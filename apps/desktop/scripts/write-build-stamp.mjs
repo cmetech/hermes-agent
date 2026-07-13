@@ -26,7 +26,7 @@
  * bootstrap without a stamp.
  */
 
-import { mkdirSync, writeFileSync } from "fs"
+import { mkdirSync, writeFileSync, readFileSync } from "fs"
 import { resolve, join, relative } from "path"
 import { execSync } from "child_process"
 
@@ -113,6 +113,18 @@ function main() {
       ? process.env.OTTO_PRODUCT_VERSION.trim()
       : null
 
+  // Brand releases repo (e.g. "cmetech/loop24") — read from the active brand
+  // descriptor so a packaged build checks ITS OWN releases for self-update,
+  // not a hardcoded one. Best-effort: dev/local builds without the marker omit it.
+  let releasesRepo = null
+  try {
+    const slug = readFileSync(join(REPO_ROOT, "brand", "active"), "utf8").trim()
+    const brand = JSON.parse(readFileSync(join(REPO_ROOT, "brands", `${slug}.json`), "utf8"))
+    releasesRepo = typeof brand.releasesRepo === "string" ? brand.releasesRepo : null
+  } catch {
+    releasesRepo = null
+  }
+
   const payload = {
     schemaVersion: STAMP_SCHEMA_VERSION,
     commit: stamp.commit,
@@ -120,7 +132,8 @@ function main() {
     builtAt: new Date().toISOString(),
     dirty: stamp.dirty,
     source: stamp.source,
-    productVersion: productVersion
+    productVersion: productVersion,
+    releasesRepo: releasesRepo
   }
 
   mkdirSync(OUT_DIR, { recursive: true })

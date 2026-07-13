@@ -259,6 +259,9 @@ export interface DesktopVersionInfo {
   nodeVersion: string
   platform: string
   hermesRoot: string
+  // Active brand's GitHub releases repo (e.g. "cmetech/otto"), used to derive
+  // the About panel's "Release notes" link. See main.ts `RELEASES_REPO`.
+  releasesRepo?: string
 }
 
 export type DesktopUninstallMode = 'full' | 'gui' | 'lite'
