@@ -61,3 +61,9 @@ test('buildReleaseUpdateStatus flags updateAvailable when latest > current', () 
   assert.equal(same.updateAvailable, false)
   assert.equal(same.behind, 0)
 })
+
+test('buildReleaseUpdateStatus fallback releaseUrl uses the given releasesRepo', () => {
+  const latest = { version: '0.1.3', tag_name: 'v0.1.3', assetUrl: null, html_url: null }
+  const s = buildReleaseUpdateStatus('0.1.2', latest, 'loop24', 'cmetech/loop24')
+  assert.match(s.releaseUrl, /github\.com\/cmetech\/loop24\/releases\/tag\/v0\.1\.3/)
+})

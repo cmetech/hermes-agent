@@ -14,8 +14,12 @@
 
 export interface LatestRelease {
   version: string
-  releaseUrl: string
+  releaseUrl?: string | null
   assetUrl: string | null
+  // Optional raw GitHub fields, so buildReleaseUpdateStatus can construct a
+  // brand-correct fallback URL (via releasesRepo) when releaseUrl is absent.
+  tag_name?: string
+  html_url?: string | null
 }
 
 /**
@@ -101,9 +105,15 @@ export interface ReleaseUpdateStatus {
 export function buildReleaseUpdateStatus(
   current: string,
   latest: LatestRelease | null,
-  branch: string
+  branch: string,
+  releasesRepo: string = 'cmetech/otto'
 ): ReleaseUpdateStatus {
   const updateAvailable = Boolean(latest && compareSemver(latest.version, current) > 0)
+
+  const releaseUrl =
+    latest?.releaseUrl ||
+    latest?.html_url ||
+    (latest ? `https://github.com/${releasesRepo}/releases/tag/${latest.tag_name ?? `v${latest.version}`}` : null)
 
   return {
     supported: true,
@@ -111,7 +121,7 @@ export function buildReleaseUpdateStatus(
     currentVersion: current,
     latestVersion: latest?.version ?? null,
     updateAvailable,
-    releaseUrl: latest?.releaseUrl ?? null,
+    releaseUrl,
     assetUrl: latest?.assetUrl ?? null,
     behind: updateAvailable ? 1 : 0,
     branch
