@@ -8,7 +8,15 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { buildReleaseUpdateStatus, compareSemver, isReleaseInstall, parseLatestRelease } from './release-update'
+import {
+  assetPattern,
+  buildReleaseUpdateStatus,
+  compareSemver,
+  installerFileName,
+  installerLaunch,
+  isReleaseInstall,
+  parseLatestRelease
+} from './release-update'
 
 test('isReleaseInstall: true only when packaged AND productVersion present', () => {
   assert.equal(isReleaseInstall({ productVersion: '0.1.2' }, true), true)
@@ -81,4 +89,42 @@ test('parseLatestRelease -> buildReleaseUpdateStatus: absent html_url falls thro
 
   const s = buildReleaseUpdateStatus('0.1.2', latest, 'loop24', 'cmetech/loop24')
   assert.equal(s.releaseUrl, 'https://github.com/cmetech/loop24/releases/tag/v0.1.3')
+})
+
+test('assetPattern is brand-agnostic (matches OTTO and LOOP24, not blockmaps)', () => {
+  const win = assetPattern('win32', 'x64')
+  assert.ok(win.test('OTTO-0.1.12-win-x64.exe'))
+  assert.ok(win.test('LOOP24-0.1.3-win-x64.exe'))
+  assert.ok(!win.test('OTTO-0.1.12-win-x64.exe.blockmap'))
+  assert.ok(!win.test('OTTO-0.1.12-mac-arm64.dmg'))
+  const mac = assetPattern('darwin', 'arm64')
+  assert.ok(mac.test('LOOP24-0.1.3-mac-arm64.dmg'))
+  assert.ok(!mac.test('LOOP24-0.1.3-mac-arm64.dmg.blockmap'))
+})
+
+test('parseLatestRelease resolves the LOOP24 win asset (regression: was OTTO-hardcoded)', () => {
+  const releases = [
+    {
+      tag_name: 'v0.1.3',
+      html_url: 'https://github.com/cmetech/loop24/releases/tag/v0.1.3',
+      assets: [
+        { name: 'LOOP24-0.1.3-win-x64.exe', browser_download_url: 'https://x/LOOP24-0.1.3-win-x64.exe' },
+        { name: 'LOOP24-0.1.3-win-x64.exe.blockmap', browser_download_url: 'https://x/bm' }
+      ]
+    }
+  ]
+  const latest = parseLatestRelease(releases, 'win32', 'x64')
+  assert.equal(latest.assetUrl, 'https://x/LOOP24-0.1.3-win-x64.exe')
+})
+
+test('installerFileName derives the basename from the asset URL', () => {
+  assert.equal(installerFileName('https://x/y/LOOP24-0.1.3-win-x64.exe'), 'LOOP24-0.1.3-win-x64.exe')
+})
+
+test('installerLaunch: win runs the exe directly; mac opens the dmg', () => {
+  assert.deepEqual(installerLaunch('C:\\t\\OTTO-0.1.12-win-x64.exe', 'win32'), {
+    cmd: 'C:\\t\\OTTO-0.1.12-win-x64.exe',
+    args: []
+  })
+  assert.deepEqual(installerLaunch('/t/OTTO.dmg', 'darwin'), { cmd: 'open', args: ['/t/OTTO.dmg'] })
 })
