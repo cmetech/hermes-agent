@@ -165,14 +165,9 @@ def slack_manifest_command(args) -> int:
     if write_target is not None:
         if isinstance(write_target, bool) and write_target:
             # --write with no value → default location
-            try:
-                from hermes_constants import get_hermes_home
+            from hermes_constants import get_hermes_home
 
-                target = Path(get_hermes_home()) / "slack-manifest.json"
-            except Exception:
-                from hermes_constants import get_hermes_home
-
-                target = Path(get_hermes_home()) / "slack-manifest.json"
+            target = Path(get_hermes_home()) / "slack-manifest.json"
         else:
             target = Path(write_target).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)
