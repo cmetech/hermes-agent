@@ -256,6 +256,11 @@ function loadInstallStamp() {
           source: parsed.source || null,
           // OTTO product version (release tag) written by CI; absent upstream.
           productVersion: parsed.productVersion || null,
+          // Brand's GitHub releases repo (e.g. "cmetech/loop24"), written by
+          // write-build-stamp.mjs from the active brand descriptor. Drives
+          // the release-based self-update check so a LOOP24 install checks
+          // its own releases, not a hardcoded cmetech/otto.
+          releasesRepo: typeof parsed.releasesRepo === 'string' ? parsed.releasesRepo : null,
           path: p
         })
       }
@@ -269,6 +274,11 @@ function loadInstallStamp() {
 }
 
 const INSTALL_STAMP = loadInstallStamp()
+
+// The brand's GitHub releases repo (from the install stamp). Drives the
+// release-based self-update check + download so a LOOP24 install checks
+// cmetech/loop24, not a hardcoded cmetech/otto. Dev/no-stamp → cmetech/otto.
+const RELEASES_REPO = (INSTALL_STAMP && INSTALL_STAMP.releasesRepo) || 'cmetech/otto'
 
 if (INSTALL_STAMP) {
   console.log(
@@ -2114,12 +2124,12 @@ async function resolveHealedBranch(updateRoot, branch) {
   return 'main'
 }
 
-// Fetch cmetech/otto releases (public, no auth). Returns [] on any failure so
+// Fetch the brand's releases (RELEASES_REPO, public, no auth). Returns [] on any failure so
 // the caller degrades to a "can't reach" status rather than throwing.
 function fetchLatestReleases(): Promise<any[]> {
   return new Promise(resolve => {
     const req = https.get(
-      'https://api.github.com/repos/cmetech/otto/releases?per_page=10',
+      `https://api.github.com/repos/${RELEASES_REPO}/releases?per_page=10`,
       { headers: { 'User-Agent': 'OTTO-Desktop', Accept: 'application/vnd.github+json' } },
       res => {
         if (res.statusCode && res.statusCode >= 400) {
@@ -2154,7 +2164,7 @@ async function checkUpdates() {
 
   // OTTO release installs (packaged nsis/dmg) update by downloading the next
   // published release, NOT by git-pulling the backend clone (that skews the
-  // packaged GUI vs the rebuilt one). Check the latest cmetech/otto release
+  // packaged GUI vs the rebuilt one). Check the latest RELEASES_REPO release
   // instead of counting commits. Source installs fall through to the git path.
   if (isReleaseInstall(INSTALL_STAMP, IS_PACKAGED)) {
     const current = INSTALL_STAMP!.productVersion as string
@@ -2176,7 +2186,7 @@ async function checkUpdates() {
 
     const latest = parseLatestRelease(releases, process.platform, process.arch)
 
-    return { ...buildReleaseUpdateStatus(current, latest, branch), fetchedAt: Date.now() }
+    return { ...buildReleaseUpdateStatus(current, latest, branch, RELEASES_REPO), fetchedAt: Date.now() }
   }
 
   const gitDir = path.join(updateRoot, '.git')
@@ -2554,7 +2564,7 @@ async function applyUpdates(opts = {}) {
   if (isReleaseInstall(INSTALL_STAMP, IS_PACKAGED)) {
     const releases = await fetchLatestReleases()
     const latest = parseLatestRelease(releases, process.platform, process.arch)
-    const url = latest?.assetUrl || latest?.releaseUrl || 'https://github.com/cmetech/otto/releases'
+    const url = latest?.assetUrl || latest?.releaseUrl || `https://github.com/${RELEASES_REPO}/releases`
     await shell.openExternal(url)
 
     return { ok: true, mode: 'release', opened: url }
@@ -8825,7 +8835,8 @@ ipcMain.handle('hermes:version', async () => ({
   electronVersion: process.versions.electron,
   nodeVersion: process.versions.node,
   platform: process.platform,
-  hermesRoot: resolveUpdateRoot()
+  hermesRoot: resolveUpdateRoot(),
+  releasesRepo: RELEASES_REPO
 }))
 
 // ===========================================================================
