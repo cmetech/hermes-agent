@@ -125,7 +125,9 @@ def _config_default_interface_early() -> str:
         if home:
             cfg_path = os.path.join(home, "config.yaml")
         else:
-            cfg_path = os.path.join(os.path.expanduser("~"), ".hermes", "config.yaml")
+            from hermes_constants import get_hermes_home
+
+            cfg_path = str(get_hermes_home() / "config.yaml")
         if os.path.exists(cfg_path):
             import yaml as _yaml_iface
 
@@ -1630,7 +1632,9 @@ def _ensure_tui_node() -> None:
     if not helper.is_file():
         return
 
-    hermes_home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    from hermes_constants import get_hermes_home
+
+    hermes_home = str(get_hermes_home())
     try:
         # Helper writes logs to stderr; we ask bash to print `command -v node`
         # on stdout once ensure_node succeeds. Subshell PATH edits don't leak
@@ -2020,6 +2024,11 @@ def _launch_tui(
     import tempfile
 
     env = os.environ.copy()
+    from hermes_constants import get_hermes_home
+
+    # Propagate the (baked, per-brand) home to the TUI child so its env
+    # fallbacks (ui-tui/src/lib/*) resolve the brand home, not ~/.hermes.
+    env.setdefault("HERMES_HOME", str(get_hermes_home()))
     try:
         from hermes_cli.config import apply_terminal_config_to_env
         apply_terminal_config_to_env(env=env)

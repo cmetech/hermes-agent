@@ -52,6 +52,19 @@ def _get_platform_default_hermes_home() -> Path:
     return Path.home() / ".hermes"
 
 
+def home_dir_basename() -> str:
+    """Return the platform home-directory basename for the active brand.
+
+    Derives from the single owned literal in
+    ``_get_platform_default_hermes_home`` so callers that must build a home
+    path under a DIFFERENT root (e.g. a foreign user's home for a systemd
+    ``--user`` service) stay brand-correct without a second hardcoded
+    literal.  POSIX → ``".hermes"`` (``".otto"`` on a branded build);
+    Windows → ``"hermes"`` (``"otto"``).
+    """
+    return _get_platform_default_hermes_home().name
+
+
 def get_hermes_home() -> Path:
     """Return the Hermes home directory (default: platform-native path).
 
