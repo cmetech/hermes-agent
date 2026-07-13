@@ -33,19 +33,19 @@ pub fn hermes_home() -> PathBuf {
     {
         // %LOCALAPPDATA%\hermes — matches scripts/install.ps1's $HermesHome.
         if let Some(local_app_data) = dirs::data_local_dir() {
-            return local_app_data.join("hermes");
+            return local_app_data.join("otto");
         }
     }
 
     // macOS + Linux + fallback: ~/.hermes (matches Python get_hermes_home(),
     // install.sh, and the Electron desktop's resolveHermesHome()).
     if let Some(home) = dirs::home_dir() {
-        return home.join(".hermes");
+        return home.join(".otto");
     }
 
     // Last resort — current dir, almost certainly wrong but at least
     // doesn't panic.
-    PathBuf::from(".hermes")
+    PathBuf::from(".otto")
 }
 
 pub fn log_dir() -> PathBuf {
