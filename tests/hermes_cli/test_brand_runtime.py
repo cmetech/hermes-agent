@@ -58,13 +58,52 @@ from hermes_cli import capability_staging
 
 
 def test_stage_empty_sets_is_noop(tmp_path, monkeypatch):
-    # otto.json now ships capabilitySets: ["ericsson"] → manifest created even with no resolver.
-    # When resolver returns None, no dirs stage, but manifest exists to record the intent.
-    monkeypatch.setenv("OTTO_BRAND", "otto")
+    # Pins the Plan-6 "empty sets -> nothing staged" invariant against a FIXTURE
+    # brand — the live otto/loop24 descriptors now ship a non-empty capabilitySets
+    # (["ericsson"]) with a real https source, so they can no longer serve as the
+    # fixture here without risking a live network resolve during pytest.
+    monkeypatch.delenv("OTTO_BRAND", raising=False)
+    root = tmp_path / "repo"
+    (root / "brands").mkdir(parents=True)
+    (root / "brands" / "empty.json").write_text(
+        json.dumps({"slug": "empty", "capabilitySets": [], "personaSets": []}),
+        encoding="utf-8",
+    )
+    (root / "brand").mkdir(parents=True, exist_ok=True)
+    (root / "brand" / "active").write_text("empty", encoding="utf-8")
     home = tmp_path / "home"
     home.mkdir()
-    capability_staging.stage_brand_capabilities(home)
-    assert (home / capability_staging.STAGING_MANIFEST).exists()
+    capability_staging.stage_brand_capabilities(home, root=root)
+    assert not (home / capability_staging.STAGING_MANIFEST).exists()
+    assert list(home.iterdir()) == []
+
+
+def test_nonempty_sets_unresolvable_source_is_noop(tmp_path, monkeypatch):
+    # A fixture brand WITH a capability set whose source is an unresolvable LOCAL
+    # path (never a network URL): `git clone` against a nonexistent local path
+    # fails instantly, so this exercises the "resolver returns None" fault-safe
+    # path with zero network I/O, even under GIT_ALLOW_PROTOCOL=file.
+    monkeypatch.delenv("OTTO_BRAND", raising=False)
+    monkeypatch.delenv("OTTO_CAPABILITY_SOURCE", raising=False)
+    monkeypatch.delenv("ERICSSON_ENV", raising=False)
+    root = tmp_path / "repo"
+    (root / "brands").mkdir(parents=True)
+    (root / "brands" / "x.json").write_text(
+        json.dumps({
+            "slug": "x",
+            "capabilitySets": ["ericsson"],
+            "capabilitySources": {"ericsson": "/nonexistent/local/path.git"},
+        }),
+        encoding="utf-8",
+    )
+    (root / "brand").mkdir(parents=True, exist_ok=True)
+    (root / "brand" / "active").write_text("x", encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir()
+    capability_staging.stage_brand_capabilities(home, root=root)  # must not raise, no network
+    assert not (home / capability_staging.STAGING_MANIFEST).exists()
+    assert not (home / "skills").exists()
+    assert not (home / "plugins").exists()
 
 
 def test_resolve_capability_bundle_stub_returns_none(tmp_path):
@@ -97,6 +136,10 @@ def test_run_brand_startup_is_fault_safe(tmp_path, monkeypatch):
 
 def test_run_brand_startup_writes_brand_json(tmp_path, monkeypatch):
     monkeypatch.setenv("OTTO_BRAND", "otto")
+    # otto.json now ships a real capabilitySets entry (ericsson) with a live
+    # https source; force the resolver's env-override path (checked before any
+    # source_url/git-clone logic) so this never attempts a network git clone.
+    monkeypatch.setenv("OTTO_CAPABILITY_SOURCE", str(tmp_path / "no-such-capability-source"))
     home = tmp_path / "home"
     home.mkdir()
     capability_staging.run_brand_startup(home)
@@ -109,6 +152,10 @@ def test_cli_startup_writes_brand_json(tmp_path):
     env = dict(os.environ)
     env["HERMES_HOME"] = str(tmp_path)
     env.pop("OTTO_BRAND", None)  # let the brand/active marker decide (otto on this branch)
+    # The active brand now ships a real capabilitySets entry with a live https
+    # source; force the resolver's env-override path so this subprocess never
+    # attempts a network git clone.
+    env["OTTO_CAPABILITY_SOURCE"] = str(tmp_path / "no-such-capability-source")
     hermes = Path(sys.executable).parent / "hermes"
     assert hermes.exists(), f"expected {hermes} in the venv"
     subprocess.run([str(hermes), "--version"], env=env, capture_output=True, timeout=120)
