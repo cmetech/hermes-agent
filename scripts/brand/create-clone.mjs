@@ -29,7 +29,7 @@ export function buildDescriptor(slug, { wordmark, tagline } = {}) {
     updateCommand: `${slug} update`,
     theme: 'otto',
     gateway: 'otto',
-    curation: { skills: { exclude: [], disabledByDefault: [] }, tools: { excludeToolsets: [], disabledByDefault: [] } },
+    curation: { skills: { exclude: [], disabledByDefault: [] }, tools: { excludeToolsets: [], disabledByDefault: [] }, channels: { allow: [] } },
     capabilitySets: [],
     personaSets: [],
     cli: { bannerLogo: '', bannerHero: '' }
