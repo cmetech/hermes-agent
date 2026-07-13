@@ -13,7 +13,9 @@
     "skills": { "exclude": ["media/spotify"], "disabledByDefault": [] },
     "tools": { "excludeToolsets": ["home_assistant"], "disabledByDefault": ["spotify"] }
   },
-  "capabilitySets": [],
+  "capabilitySets": ["ericsson"],
+  "capabilitySources": {"ericsson": "https://github.com/cmetech/ericsson-capabilities.git"},
+  "capabilityRequiresEnv": {"ericsson": {"ERICSSON_ENV": "1"}},
   "personaSets": [],
   "cli": {
     "bannerLogo": "[bold #FAD22D]╭──────────────╮[/]\n[bold #FAD22D]│    LOOP24    │[/]\n[bold #FAD22D]╰──────────────╯[/]",
