@@ -53,10 +53,27 @@ export function compareSemver(a: string, b: string): -1 | 0 | 1 {
   return 0
 }
 
-function assetPattern(platform: string, arch: string): RegExp {
+export function assetPattern(platform: string, arch: string): RegExp {
   const os = platform === 'win32' ? 'win' : platform === 'darwin' ? 'mac' : 'linux'
   const ext = platform === 'win32' ? 'exe' : platform === 'darwin' ? 'dmg' : 'AppImage'
-  return new RegExp(`OTTO-.*-${os}-${arch}\\.${ext}$`)
+  // Any brand prefix (OTTO-, LOOP24-, …); anchor the exact os-arch.ext suffix
+  // so `.exe.blockmap` sidecars and other-arch assets don't match.
+  return new RegExp(`-${os}-${arch}\\.${ext}$`)
+}
+
+/** Basename of an installer asset URL (strips query string / hash fragment). */
+export function installerFileName(assetUrl: string): string {
+  const clean = assetUrl.split('?')[0].split('#')[0]
+  const base = clean.substring(clean.lastIndexOf('/') + 1)
+  return base || 'installer'
+}
+
+/** Platform-appropriate way to launch a downloaded installer. */
+export function installerLaunch(filePath: string, platform: string): { cmd: string; args: string[] } {
+  if (platform === 'darwin') return { cmd: 'open', args: [filePath] }
+  if (platform === 'win32') return { cmd: filePath, args: [] }
+  // linux AppImage: marking it executable is the caller's job; run it directly.
+  return { cmd: filePath, args: [] }
 }
 
 /**
