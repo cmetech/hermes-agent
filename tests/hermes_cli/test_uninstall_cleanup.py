@@ -29,6 +29,23 @@ def test_remove_desktop_shortcuts_unlinks_only_matching(tmp_path, monkeypatch):
     assert (sm / "Other.lnk").exists()
 
 
+def test_remove_desktop_shortcuts_removes_coworker_and_legacy_brand(tmp_path):
+    start_menu = tmp_path / "Programs"
+    start_menu.mkdir()
+    coworker = start_menu / "Co-Worker.lnk"
+    legacy = start_menu / "OTTO.lnk"
+    unrelated = start_menu / "SomethingElse.lnk"
+    for f in (coworker, legacy, unrelated):
+        f.write_text("shortcut")
+
+    removed = u.remove_desktop_shortcuts("OTTO", dirs=[start_menu])
+
+    assert not coworker.exists()          # Co-Worker.lnk removed
+    assert not legacy.exists()            # legacy OTTO.lnk removed
+    assert unrelated.exists()             # unrelated shortcut untouched
+    assert set(removed) == {coworker, legacy}
+
+
 def test_active_brand_identity_derives_loop24(monkeypatch):
     def fake_resolve_active_brand(*a, **k):
         return "loop24"

@@ -36,6 +36,7 @@ import { canImportHermesCli, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { runBootstrap } from './bootstrap-runner'
+import { isForeignBrandLocalAppDataPath } from './brand-scope'
 import {
   authModeFromStatus,
   buildGatewayWsUrl,
@@ -310,8 +311,35 @@ if (INSTALL_STAMP) {
 // HERMES_DESKTOP_USER_DATA_DIR (used by test:desktop:fresh) puts the sandbox
 // HERMES_HOME beneath the throwaway userData dir so a fresh-install run never
 // touches the user's real ~/.hermes / %LOCALAPPDATA%\hermes.
+// The baked per-brand default home. The two `return path.join(...)`
+// expressions are the home-emitter's anchors — keep them verbatim (on `base`
+// they are the neutral 'hermes' / '.hermes'; the emitter restamps per brand).
+function perBrandDefaultHome() {
+  if (IS_WINDOWS && process.env.LOCALAPPDATA) {
+    return path.join(process.env.LOCALAPPDATA, 'loop24')
+  }
+
+  return path.join(app.getPath('home'), '.loop24')
+}
+
 function resolveHermesHome() {
-  if (process.env.HERMES_HOME) {
+  const brandDefault = perBrandDefaultHome()
+  const localAppData = process.env.LOCALAPPDATA
+
+  // Multi-brand coexistence: a stale HERMES_HOME (env-inherited or User
+  // registry) can point at ANOTHER brand's %LOCALAPPDATA%\<other> home — e.g.
+  // a second brand installed on a poisoned box before install.ps1 clears the
+  // variable. Ignore such a value in favor of our own baked per-brand default,
+  // but only when that foreign home is actually populated (…\<other>\hermes-agent
+  // exists), so a user's arbitrary custom home is never overridden. Custom
+  // homes (outside LOCALAPPDATA) and our own brand home are always honored.
+  // Windows-only in effect (isForeignBrandLocalAppDataPath is a no-op without
+  // LOCALAPPDATA). See brand-scope.ts + the design spec.
+  const isForeignPoisonedHome = (value: string) =>
+    isForeignBrandLocalAppDataPath({ candidate: value, ourHome: brandDefault, localAppData }) &&
+    directoryExists(path.join(value, 'hermes-agent'))
+
+  if (process.env.HERMES_HOME && !isForeignPoisonedHome(process.env.HERMES_HOME)) {
     return normalizeHermesHomeRoot(process.env.HERMES_HOME)
   }
 
@@ -320,24 +348,18 @@ function resolveHermesHome() {
   }
 
   if (IS_WINDOWS) {
-    // A GUI app launched from Explorer inherits the environment block captured
-    // at login, so a HERMES_HOME set via `setx` AFTER login is invisible in
-    // process.env even though the CLI (a fresh shell) sees it. Without this the
-    // backend silently falls back to %LOCALAPPDATA%\hermes and reports "No
-    // inference provider configured" despite a valid configured home (#45471).
-    // Consult the live User-scoped registry value before the default below.
+    // A GUI app launched from Explorer inherits the login environment block, so
+    // a HERMES_HOME set via setx after login is invisible in process.env even
+    // though the CLI (a fresh shell) sees it. Consult the live User-scoped
+    // registry value before the default below (#45471).
     const fromRegistry = readWindowsUserEnvVar('HERMES_HOME')
 
-    if (fromRegistry) {
+    if (fromRegistry && !isForeignPoisonedHome(fromRegistry)) {
       return normalizeHermesHomeRoot(fromRegistry)
     }
   }
 
-  if (IS_WINDOWS && process.env.LOCALAPPDATA) {
-    return path.join(process.env.LOCALAPPDATA, 'loop24')
-  }
-
-  return path.join(app.getPath('home'), '.loop24')
+  return brandDefault
 }
 
 const HERMES_HOME = resolveHermesHome()
@@ -3678,6 +3700,26 @@ function resolveHermesBackend(backendArgs) {
         rememberLog(`Ignoring desktop app executable on PATH while resolving Hermes CLI: ${hermesCommand}`)
         hermesCommand = null
       }
+    }
+
+    // Multi-brand coexistence: a second brand installed on the same machine
+    // finds the FIRST brand's `hermes.exe` on the shared User PATH (its
+    // venv\Scripts is on PATH) and would run the wrong brand's clone --
+    // registering the wrong provider and never bootstrapping its own backend.
+    // Reject a candidate that lives under a DIFFERENT brand's
+    // %LOCALAPPDATA%\<other> home; fall through to bootstrap our own clone.
+    // Our own venv (under HERMES_HOME) and genuinely-external installs (not
+    // under LOCALAPPDATA) are still honored. See brand-scope.ts + the spec.
+    if (
+      hermesCommand &&
+      isForeignBrandLocalAppDataPath({
+        candidate: hermesCommand,
+        ourHome: HERMES_HOME,
+        localAppData: process.env.LOCALAPPDATA
+      })
+    ) {
+      rememberLog(`Ignoring another brand's Hermes CLI on PATH (foreign per-brand home): ${hermesCommand}`)
+      hermesCommand = null
     }
 
     if (hermesCommand) {

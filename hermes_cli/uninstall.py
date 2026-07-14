@@ -462,8 +462,12 @@ def remove_deep_link_protocols_windows(schemes: "list[str] | None" = None) -> li
 
 
 def remove_desktop_shortcuts(product_name: str, dirs: "list[Path] | None" = None) -> list[Path]:
-    """Remove Start-Menu + Desktop ``<product>.lnk`` shortcuts the NSIS installer
-    created (the Python uninstall never touched them)."""
+    """Remove Start-Menu + Desktop ``.lnk`` shortcuts the NSIS installer created
+    (the Python uninstall never touched them).
+
+    The installer names the shortcut with the brand-neutral ``build.nsis.shortcutName``
+    (``Co-Worker``), so remove that; also remove the legacy ``<product>.lnk`` left
+    by pre-v1.0.5 installs where the shortcut carried the brand display name."""
     if dirs is None:
         appdata = os.environ.get("APPDATA", "")
         home = Path.home()
@@ -471,15 +475,20 @@ def remove_desktop_shortcuts(product_name: str, dirs: "list[Path] | None" = None
         if appdata:
             dirs.append(Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs")
         dirs.append(home / "Desktop")
+    # The current installer's shortcut name (kept in sync with
+    # scripts/brand/emitters/package-json.mjs -> build.nsis.shortcutName) plus the
+    # legacy brand-named shortcut. Dedupe in case a brand is ever named "Co-Worker".
+    names = list(dict.fromkeys(["Co-Worker", product_name]))
     removed: list[Path] = []
     for d in dirs:
-        lnk = Path(d) / f"{product_name}.lnk"
-        try:
-            if lnk.exists():
-                lnk.unlink()
-                removed.append(lnk)
-        except OSError as e:
-            log_warn(f"Could not remove shortcut {lnk}: {e}")
+        for name in names:
+            lnk = Path(d) / f"{name}.lnk"
+            try:
+                if lnk.exists():
+                    lnk.unlink()
+                    removed.append(lnk)
+            except OSError as e:
+                log_warn(f"Could not remove shortcut {lnk}: {e}")
     return removed
 
 

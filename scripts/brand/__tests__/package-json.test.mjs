@@ -39,6 +39,17 @@ test('renderPackageJson(loop24) sets nested mac/win/linux identity fields', () =
   assert.equal(j.build.artifactName, 'LOOP24-${version}-${os}-${arch}.${ext}')
 })
 
+test('renderPackageJson uses the fixed neutral "Co-Worker" shortcutName for every brand', () => {
+  const onDisk = fs.readFileSync(PKG, 'utf8')
+  const loop = JSON.parse(renderPackageJson(loadDescriptor('loop24', { root: ROOT }), onDisk))
+  const otto = JSON.parse(renderPackageJson(loadDescriptor('otto', { root: ROOT }), onDisk))
+  assert.equal(loop.build.nsis.shortcutName, 'Co-Worker')
+  assert.equal(otto.build.nsis.shortcutName, 'Co-Worker')
+  // uninstall display name stays branded (Add/Remove Programs shows the brand)
+  assert.equal(loop.build.nsis.uninstallDisplayName, 'LOOP24')
+  assert.equal(otto.build.nsis.uninstallDisplayName, 'OTTO')
+})
+
 test('renderPackageJson(otto) round-trips with no fields lost (deep-equal, not byte-equal)', () => {
   const onDisk = fs.readFileSync(PKG, 'utf8')
   const out = renderPackageJson(loadDescriptor('otto', { root: ROOT }), onDisk)
