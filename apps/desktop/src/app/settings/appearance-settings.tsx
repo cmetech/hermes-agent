@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import type { DesktopMarketplaceSearchItem } from '@/global'
 import { useI18n } from '@/i18n'
+import { shouldShowLanguagePicker } from '@/i18n/locale-allowlist'
 import { triggerHaptic } from '@/lib/haptics'
 import { Check, Download, Loader2, Palette, Trash2 } from '@/lib/icons'
 import { selectableCardClass } from '@/lib/selectable-card'
@@ -244,7 +245,7 @@ function MarketplaceThemeResults({
 }
 
 export function AppearanceSettings() {
-  const { t, isSavingLocale } = useI18n()
+  const { t, isSavingLocale, locale } = useI18n()
   const { themeName, mode, resolvedMode, availableThemes, setTheme, setMode } = useTheme()
   const toolViewMode = useStore($toolViewMode)
   const zoomPercent = useStore($zoomPercent)
@@ -307,11 +308,15 @@ export function AppearanceSettings() {
         </p>
 
         <div className="mt-2">
-          <ListRow
-            action={<LanguageSwitcher />}
-            description={isSavingLocale ? t.language.saving : t.language.description}
-            title={t.language.label}
-          />
+          {/* OTTO: hide the language row when the locale allowlist leaves only one
+              option (English-only today). See i18n/locale-allowlist.ts. */}
+          {shouldShowLanguagePicker(locale) && (
+            <ListRow
+              action={<LanguageSwitcher />}
+              description={isSavingLocale ? t.language.saving : t.language.description}
+              title={t.language.label}
+            />
+          )}
 
           <ListRow
             below={
