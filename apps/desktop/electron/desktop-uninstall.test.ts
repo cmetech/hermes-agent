@@ -20,7 +20,8 @@ import {
   resolveRemovableAppPath,
   shouldRemoveAppBundle,
   UNINSTALL_MODES,
-  uninstallArgsForMode
+  uninstallArgsForMode,
+  windowsCleanupRunnerArgs
 } from './desktop-uninstall'
 
 // --- uninstallArgsForMode ---
@@ -349,4 +350,56 @@ test('posix full script rm -rf home + agent and shows osascript dialog on mac', 
   })
   assert.match(script, /rm -rf '\/Users\/x\/\.hermes'/)
   assert.match(script, /osascript/)
+})
+
+// --- Option A: launcher window is NOT minimized (was `start "" /min`) ---
+
+test('windowsCleanupRunnerArgs opens a normal (non-minimized) console for the script', () => {
+  const args = windowsCleanupRunnerArgs('C:\\Temp\\otto-uninstall-1.cmd')
+  // cmd.exe /c start "" <script>  — a normal window, no /min
+  assert.deepEqual(args, ['/c', 'start', '""', 'C:\\Temp\\otto-uninstall-1.cmd'])
+  assert.ok(!args.includes('/min'), 'must NOT launch the progress window minimized')
+})
+
+// --- Option A: visible progress so a silent rmdir never looks hung ---
+
+test('windows full script prints a do-not-click banner + per-step progress', () => {
+  const script = buildWindowsCleanupScript({
+    desktopPid: 123, pythonExe: 'py.exe', pythonPath: null, agentRoot: 'C:\\h\\hermes-agent',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
+    appPath: 'C:\\Users\\x\\AppData\\Local\\Programs\\OTTO',
+    hermesHome: 'C:\\Users\\x\\AppData\\Local\\hermes',
+    removeUserData: true, removeAgent: true
+  })
+  assert.match(script, /Do NOT click/i)     // QuickEdit-pause warning banner
+  assert.match(script, /echo\s+Removing/i)  // a status line before the slow deletes
+})
+
+// --- Option C: robocopy empty-mirror fast-deletes large trees (node_modules) ---
+
+test('windows full script fast-deletes large trees via a robocopy empty-mirror', () => {
+  const script = buildWindowsCleanupScript({
+    desktopPid: 123, pythonExe: 'py.exe', pythonPath: null, agentRoot: 'C:\\h\\hermes-agent',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
+    appPath: 'C:\\Users\\x\\AppData\\Local\\Programs\\OTTO',
+    hermesHome: 'C:\\Users\\x\\AppData\\Local\\hermes',
+    removeUserData: true, removeAgent: true
+  })
+  // an empty scratch dir is made, then mirrored over each big tree to empty it fast
+  assert.match(script, /mkdir "%EMPTYDIR%"/)
+  assert.match(script, /robocopy "%EMPTYDIR%" "C:\\h\\hermes-agent" \/mir/)
+  // then the emptied tree is still removed with rmdir (kept for compatibility + final sweep)
+  assert.match(script, /rmdir \/s \/q "C:\\h\\hermes-agent" >nul 2>&1/)
+  // the scratch dir is cleaned up afterward
+  assert.match(script, /rmdir \/s \/q "%EMPTYDIR%"/)
+})
+
+test('windows gui script (nothing to remove) adds no robocopy or scratch dir', () => {
+  const script = buildWindowsCleanupScript({
+    desktopPid: 2, pythonExe: 'C:\\h\\venv\\Scripts\\python.exe', pythonPath: null, agentRoot: 'C:\\h',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'gui'],
+    appPath: null, hermesHome: 'C:\\h'
+  })
+  assert.doesNotMatch(script, /robocopy/)
+  assert.doesNotMatch(script, /EMPTYDIR/)
 })

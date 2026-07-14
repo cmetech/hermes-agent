@@ -61,7 +61,8 @@ import {
   modeRemovesUserData,
   resolveRemovableAppPath,
   shouldRemoveAppBundle,
-  uninstallArgsForMode
+  uninstallArgsForMode,
+  windowsCleanupRunnerArgs
 } from './desktop-uninstall'
 import { installEmbedReferer } from './embed-referer'
 import { readDirForIpc } from './fs-read-dir'
@@ -9154,7 +9155,7 @@ async function runDesktopUninstall(mode) {
       scriptPath = path.join(app.getPath('temp'), `hermes-uninstall-${Date.now()}.cmd`)
       fs.writeFileSync(scriptPath, buildWindowsCleanupScript(scriptArgs))
       runner = process.env.ComSpec || 'cmd.exe'
-      runnerArgs = ['/c', 'start', '""', '/min', scriptPath]
+      runnerArgs = windowsCleanupRunnerArgs(scriptPath)
     } else {
       scriptPath = path.join(app.getPath('temp'), `hermes-uninstall-${Date.now()}.sh`)
       fs.writeFileSync(scriptPath, buildPosixCleanupScript(scriptArgs), { mode: 0o755 })

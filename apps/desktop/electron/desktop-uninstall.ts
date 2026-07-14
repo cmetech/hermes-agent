@@ -270,12 +270,22 @@ function buildWindowsCleanupScript({
     return idx >= 0 ? uninstallArgs[idx + 1] : ''
   })()
 
+  const logSlug = String(productName).toLowerCase()
+
   const lines = [
     '@echo off',
     'setlocal enableextensions',
     `set "HERMES_HOME=${String(hermesHome).replace(/"/g, '')}"`,
     `set "PID=${pid}"`,
-    `set "MODE=${String(mode).replace(/"/g, '')}"`
+    `set "MODE=${String(mode).replace(/"/g, '')}"`,
+    // Visible banner. The window is intentionally shown (not minimized) so the
+    // user can see progress — but a click inside a QuickEdit console pauses the
+    // batch until a key is pressed, which looks like a hang mid-delete. Warn.
+    'echo(',
+    `echo   ${productName} uninstall in progress`,
+    'echo   Please wait. Removing large folders can take a minute.',
+    'echo   Do NOT click inside this window - it closes automatically.',
+    'echo('
   ]
 
   if (pythonPath) {
@@ -283,6 +293,7 @@ function buildWindowsCleanupScript({
   }
 
   lines.push(
+    `echo   Waiting for ${productName} to close...`,
     'set /a waited=0',
     ':waitloop',
     'rem /FI "PID eq %PID%" is an EXACT filter — tasklist outputs the one task',
@@ -296,6 +307,7 @@ function buildWindowsCleanupScript({
     'timeout /t 1 /nobreak >nul',
     'goto waitloop',
     ':waited_done',
+    'echo   Removing runtime and cleaning up...',
     `cd /d ${q(agentRoot)}`,
     `${q(pythonExe)} ${uninstallArgs.map(q).join(' ')}`
   )
@@ -303,10 +315,29 @@ function buildWindowsCleanupScript({
   // Destructive removal happens here, in the detached outer script — not the
   // Python uninstaller — since a running .exe/venv locks its own dir on
   // Windows. Retry loop: Windows releases directory handles lazily.
-  const rmdirRetry = (target, label) => [
+  //
+  // Speed: a plain `rmdir /s /q` on the agent clone (which holds a ~1GB
+  // node_modules with tens of thousands of tiny, deeply-nested files) can take
+  // minutes on Windows. `robocopy /mir` from an EMPTY source empties the tree
+  // far faster (parallel, no shell per-file overhead); the follow-up rmdir then
+  // removes the now-empty skeleton instantly. Each step echoes so the (visible,
+  // non-minimized) window never looks frozen.
+  const hasTreeRemoval = removeAgent || removeUserData || Boolean(appPath)
+
+  if (hasTreeRemoval) {
+    lines.push(
+      `set "EMPTYDIR=%TEMP%\\${logSlug}-uninstall-empty-%RANDOM%"`,
+      'mkdir "%EMPTYDIR%" >nul 2>&1'
+    )
+  }
+
+  const rmTreeFast = (target, label, human) => [
+    `if not exist ${q(target)} goto ${label}done`,
+    `echo   Removing ${human}...`,
     `set /a ${label}=0`,
     `:${label}loop`,
     `if not exist ${q(target)} goto ${label}done`,
+    `robocopy "%EMPTYDIR%" ${q(target)} /mir /nfl /ndl /njh /njs /nc /ns /r:1 /w:0 >nul 2>&1`,
     `rmdir /s /q ${q(target)} >nul 2>&1`,
     `if not exist ${q(target)} goto ${label}done`,
     `set /a ${label}+=1`,
@@ -317,18 +348,21 @@ function buildWindowsCleanupScript({
   ]
 
   if (removeAgent) {
-    lines.push(...rmdirRetry(agentRoot, 'rmagent'))
+    lines.push(...rmTreeFast(agentRoot, 'rmagent', 'runtime files'))
   }
 
   if (removeUserData) {
-    lines.push(...rmdirRetry(hermesHome, 'rmhome'))
+    lines.push(...rmTreeFast(hermesHome, 'rmhome', 'user data'))
   }
 
   if (appPath) {
     lines.push(
+      `if not exist ${q(appPath)} goto rmdone`,
+      'echo   Removing application files...',
       'set /a tries=0',
       ':rmloop',
       `if not exist ${q(appPath)} goto rmdone`,
+      `robocopy "%EMPTYDIR%" ${q(appPath)} /mir /nfl /ndl /njh /njs /nc /ns /r:1 /w:0 >nul 2>&1`,
       `rmdir /s /q ${q(appPath)} >nul 2>&1`,
       `if not exist ${q(appPath)} goto rmdone`,
       'set /a tries+=1',
@@ -339,10 +373,14 @@ function buildWindowsCleanupScript({
     )
   }
 
+  if (hasTreeRemoval) {
+    lines.push('rmdir /s /q "%EMPTYDIR%" >nul 2>&1')
+  }
+
   // Validation pass: check every path that should now be gone, write a result
   // log to temp, and pop a native modal dialog (via mshta) with success or
   // the leftover list — the app has already quit, so this is the only UI.
-  const logSlug = String(productName).toLowerCase()
+  // (logSlug is computed once at the top of this function.)
   const resultLog = `%TEMP%\\${logSlug}-uninstall-result.log`
 
   lines.push('set "LEFT="', `> "${resultLog}" echo ${productName} uninstall (%MODE%) result:`)
@@ -377,6 +415,18 @@ function buildWindowsCleanupScript({
   return lines.join('\r\n')
 }
 
+/**
+ * argv for launching the Windows cleanup .cmd via cmd.exe. Uses `start ""` to
+ * spawn a NORMAL, visible console window (was `start "" /min` — a minimized
+ * window the user had to hunt for, and clicking it to view triggered a
+ * QuickEdit-mode output pause that looked like a hang). The empty `""` is the
+ * (required) window-title placeholder so `start` doesn't treat the script path
+ * as the title; the script prints its own banner for identity.
+ */
+function windowsCleanupRunnerArgs(scriptPath) {
+  return ['/c', 'start', '""', scriptPath]
+}
+
 export {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
@@ -385,5 +435,6 @@ export {
   resolveRemovableAppPath,
   shouldRemoveAppBundle,
   UNINSTALL_MODES,
-  uninstallArgsForMode
+  uninstallArgsForMode,
+  windowsCleanupRunnerArgs
 }
