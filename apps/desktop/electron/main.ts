@@ -36,6 +36,7 @@ import { canImportHermesCli, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { runBootstrap } from './bootstrap-runner'
+import { isForeignBrandLocalAppDataPath } from './brand-scope'
 import {
   authModeFromStatus,
   buildGatewayWsUrl,
@@ -3678,6 +3679,26 @@ function resolveHermesBackend(backendArgs) {
         rememberLog(`Ignoring desktop app executable on PATH while resolving Hermes CLI: ${hermesCommand}`)
         hermesCommand = null
       }
+    }
+
+    // Multi-brand coexistence: a second brand installed on the same machine
+    // finds the FIRST brand's `hermes.exe` on the shared User PATH (its
+    // venv\Scripts is on PATH) and would run the wrong brand's clone --
+    // registering the wrong provider and never bootstrapping its own backend.
+    // Reject a candidate that lives under a DIFFERENT brand's
+    // %LOCALAPPDATA%\<other> home; fall through to bootstrap our own clone.
+    // Our own venv (under HERMES_HOME) and genuinely-external installs (not
+    // under LOCALAPPDATA) are still honored. See brand-scope.ts + the spec.
+    if (
+      hermesCommand &&
+      isForeignBrandLocalAppDataPath({
+        candidate: hermesCommand,
+        ourHome: HERMES_HOME,
+        localAppData: process.env.LOCALAPPDATA
+      })
+    ) {
+      rememberLog(`Ignoring another brand's Hermes CLI on PATH (foreign per-brand home): ${hermesCommand}`)
+      hermesCommand = null
     }
 
     if (hermesCommand) {
