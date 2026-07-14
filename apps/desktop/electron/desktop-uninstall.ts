@@ -333,7 +333,13 @@ function buildWindowsCleanupScript({
   const hasTreeRemoval = removeAgent || removeUserData || Boolean(appPath)
 
   if (hasTreeRemoval) {
-    lines.push(`set "EMPTYDIR=%TEMP%\\${logSlug}-uninstall-empty-%RANDOM%"`, 'mkdir "%EMPTYDIR%" >nul 2>&1')
+    lines.push(
+      // Kill any lingering git holding a just-cloned .git pack open, else its
+      // pack-*.idx stays locked (WinError 5) and blocks the tree removal.
+      'taskkill /f /im git.exe /t >nul 2>&1',
+      `set "EMPTYDIR=%TEMP%\\${logSlug}-uninstall-empty-%RANDOM%"`,
+      'mkdir "%EMPTYDIR%" >nul 2>&1'
+    )
   }
 
   const rmTreeFast = (target, label, human) => [
@@ -417,9 +423,13 @@ function buildWindowsCleanupScript({
     `mshta "javascript:var m=new ActiveXObject('WScript.Shell');m.Popup('%MSGJS%',0,'${productName} uninstall',64);close();" 2>nul`
   )
 
-  // Self-delete the script LAST.
-  lines.push('del "%~f0"')
-  lines.push('')
+  // Self-delete the script LAST. `(goto) 2>nul` pops the batch execution
+  // context (its intentional error is swallowed) BEFORE `del` removes the file,
+  // so cmd is no longer reading this script when it vanishes. A bare
+  // `del "%~f0"` with ANY line after it makes cmd delete the batch, fail to read
+  // the next line ("The batch file cannot be found"), and drop to an interactive
+  // prompt instead of closing the window. Nothing may follow this line.
+  lines.push('(goto) 2>nul & del "%~f0"')
 
   return lines.join('\r\n')
 }

@@ -497,3 +497,46 @@ test('windows full script clears file attributes before deleting each tree', () 
   assert.match(script, /attrib -r -h -s \/s \/d "C:\\h\\hermes-agent"/)
   assert.match(script, /attrib -r -h -s \/s \/d "C:\\Users\\x\\AppData\\Local\\Programs\\OTTO"/)
 })
+
+// --- Fix (v1.0.7): robust self-delete. A bare `del "%~f0"` with a line after it
+// makes cmd delete the batch then fail reading the next line ("The batch file
+// cannot be found") and drop to an interactive prompt instead of closing. The
+// `(goto) 2>nul` pops the batch context BEFORE del, so cmd stops reading the
+// file — clean exit, window closes. ---
+
+test('windows script self-deletes robustly and ends there (no readable line after del)', () => {
+  const script = buildWindowsCleanupScript({
+    desktopPid: 1,
+    pythonExe: 'py.exe',
+    pythonPath: null,
+    agentRoot: 'C:\\h',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'gui'],
+    appPath: null,
+    hermesHome: 'C:\\h'
+  })
+  assert.match(script, /\(goto\) 2>nul & del "%~f0"/)
+  // nothing cmd could try to read after the file is gone
+  assert.ok(script.trimEnd().endsWith('(goto) 2>nul & del "%~f0"'), 'self-delete must be the final line')
+})
+
+// --- Fix (v1.0.7): a freshly-cloned .git pack can be held by a lingering git
+// process; kill it before the tree removal so the pack isn't locked (WinError 5). ---
+
+test('windows full script kills lingering git before removing (unlocks .git packs)', () => {
+  const script = buildWindowsCleanupScript({
+    desktopPid: 1,
+    pythonExe: 'py.exe',
+    pythonPath: null,
+    agentRoot: 'C:\\h\\hermes-agent',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
+    appPath: 'C:\\p\\OTTO',
+    hermesHome: 'C:\\h',
+    removeUserData: true,
+    removeAgent: true
+  })
+  assert.match(script, /taskkill \/f \/im git.exe/i)
+  // and it must happen before the first tree removal
+  const killIdx = script.search(/taskkill \/f \/im git\.exe/i)
+  const firstRemovalIdx = script.search(/robocopy|rmdir \/s \/q/)
+  assert.ok(killIdx > -1 && killIdx < firstRemovalIdx, 'git kill must precede the removals')
+})
