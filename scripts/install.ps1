@@ -2106,13 +2106,25 @@ function Set-PathVariable {
         Write-Info "PATH already configured"
     }
     
-    # Set HERMES_HOME so the Python code finds config/data in the right place.
-    # Only needed on Windows where we install to %LOCALAPPDATA%\hermes instead
-    # of the Unix default ~/.hermes
+    # Persist HERMES_HOME only for a CUSTOM (explicitly-relocated) data dir. Plan 5
+    # baked the per-brand default home into every resolver, so for the DEFAULT home a
+    # global User-scope HERMES_HOME is redundant AND it collides when two brands
+    # coexist on one machine (the second brand would load the first brand's home).
+    $defaultHermesHome = "$env:LOCALAPPDATA\hermes"   # per-brand default (home emitter rewrites the segment)
     $currentHermesHome = [Environment]::GetEnvironmentVariable("HERMES_HOME", "User")
-    if (-not $currentHermesHome -or $currentHermesHome -ne $HermesHome) {
-        [Environment]::SetEnvironmentVariable("HERMES_HOME", $HermesHome, "User")
-        Write-Success "Set HERMES_HOME=$HermesHome"
+    if ($HermesHome -ieq $defaultHermesHome) {
+        # Default home: never persist a global var. Remove a stale auto-set one (any
+        # %LOCALAPPDATA%-scoped value) so a previously-broken coexisting machine self-heals.
+        if ($currentHermesHome -and $currentHermesHome.StartsWith($env:LOCALAPPDATA, [System.StringComparison]::OrdinalIgnoreCase)) {
+            [Environment]::SetEnvironmentVariable("HERMES_HOME", $null, "User")
+            Write-Info "Removed stale user HERMES_HOME=$currentHermesHome (per-brand default resolves automatically)"
+        }
+    } else {
+        # Custom home: persist so the CLI and desktop find the relocated data dir.
+        if (-not $currentHermesHome -or $currentHermesHome -ne $HermesHome) {
+            [Environment]::SetEnvironmentVariable("HERMES_HOME", $HermesHome, "User")
+            Write-Success "Set HERMES_HOME=$HermesHome (custom home)"
+        }
     }
     $env:HERMES_HOME = $HermesHome
     
