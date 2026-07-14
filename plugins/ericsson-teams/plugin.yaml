@@ -1,0 +1,8 @@
+name: ericsson-teams
+version: 1.0.0
+description: "Microsoft Teams channel tools via Graph (MSAL device-code auth) — list teams/channels, read/send/reply. Gated on ERICSSON_ENV."
+author: Ericsson (cmetech)
+kind: backend
+provides_tools: [teams_auth, teams_list, teams_channels, teams_read, teams_send, teams_reply]
+requires_env:
+  - ERICSSON_ENV

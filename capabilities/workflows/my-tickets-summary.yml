@@ -1,0 +1,39 @@
+name: my-tickets-summary
+description: Digest of my open Jira tickets, optionally emailed after approval
+version: 1.0.0
+tags: [ericsson, jira]
+requires:
+  toolsets: [ericsson-jira]
+  env: [ERICSSON_ENV, JIRA_BASE_URL, JIRA_PAT]
+inputs:
+  - {name: deliver_to, default: chat}   # chat | email
+nodes:
+  - id: fetch
+    kind: tool
+    prompt: >
+      Fetch my open Jira tickets with the jira_my_tickets tool (max 25).
+      Save the raw JSON result to tickets.json in the run dir.
+    output: tickets.json
+  - id: summarize
+    kind: prompt
+    depends_on: [fetch]
+    prompt: >
+      Read tickets.json and write summary.md: a markdown digest grouped by
+      priority — one line per ticket (key, summary, status, any GitLab links),
+      then a short "suggested focus" section (max 3 bullets).
+    output: summary.md
+  - id: approve_send
+    kind: approval
+    depends_on: [summarize]
+    when: "$inputs.deliver_to == 'email'"
+    message: Review summary.md before it is emailed to you.
+  - id: send
+    kind: tool
+    depends_on: [approve_send]
+    side_effects: true
+    prompt: >
+      Email summary.md to me using the Outlook message_send tool
+      (subject "My Jira tickets digest", body = the file content, send=true).
+report:
+  kanban: auto
+  notify: []
