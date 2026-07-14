@@ -9,6 +9,16 @@
     ["\\bHermes\\b", "OTTO"],
     ["\\bHERMES\\b", "OTTO"]
   ],
+  "neutralize": [
+    ["Hermes Desktop starts its own local gateway by default. Use a remote gateway when you want this app to control an already-running Hermes backend", "This app starts its own local gateway by default. Use a remote gateway when you want it to control an already-running backend"],
+    ["Start a private Hermes backend on localhost", "Start a private backend on localhost"],
+    ["Connect this desktop shell to a remote Hermes backend", "Connect this desktop shell to a remote backend"],
+    ["Hermes inference gateway", "Inference gateway"],
+    ["Hermes gateway is not connected", "Gateway is not connected"],
+    ["Hermes gateway", "gateway"],
+    ["Hermes Cloud", "Cloud"]
+  ],
+  "$neutralizeNote": "DE-BRAND rules for the Gateway settings page: unlike `rules` (which rebrand Hermes -> <brand>), these REMOVE the product name so the gateway reads as a generic 'Gateway'/'Cloud'/'backend'. Applied BEFORE `rules` (so they consume the 'Hermes' before the generic rule can turn it into the brand) and ONLY when the brand is active (name != 'Hermes'), so `base` builds stay stock. NOT managed by the brand generator (scripts/brand/emitters/brand-config.mjs only owns `name` + `rules`), so this array is carried verbatim across restamps and merges and applies to EVERY brand. Ordering is significant: most-specific/longest phrases first. The first three are EXACT full-copy matches, deliberately scoped so the product name 'Hermes Desktop' is only neutralized in the gateway intro/local/remote copy — it stays branded on About, the version footer, onboarding, etc. (a blanket 'Hermes Desktop' rule would wrongly strip those). If upstream reworks a gateway string, its rule silently stops matching (the string reverts to branded, no build/merge break) — re-verify with the gateway greps in the otto-upstream-merge skill.",
   "$protectNote": "protect = regexes for FUNCTIONAL title-case 'Hermes' strings that must NOT be rebranded: the X-Hermes-Session-Token auth header (rewriting it breaks desktop↔backend auth → 401) and the Hermes-Desktop User-Agent. Matches are masked before rules run and restored after. Add any newly-discovered functional 'Hermes' string here. NOTE: 'Hermes\\.app' is intentionally NOT protected — the mac updater's relaunch paths (main.ts release/mac*/…app) must become OTTO.app because electron-builder outputs the app under productName (OTTO); protecting it left self-update looking for a non-existent Hermes.app.",
   "$rulesNote": "Rules are [regexPattern, replacement], applied in order with the global flag and CASE SENSITIVITY. Case-sensitive \\bHermes\\b matches only the title-case display word; \\bHERMES\\b handles ALL-CAPS display text (e.g. the intro wordmark 'HERMES AGENT' -> 'OTTO AGENT'). Neither matches identifiers: HERMES_HOME / hermes_cli / .hermes / resolveHermesBackend all differ in case or are glued to word chars (the underscore in HERMES_HOME blocks \\bHERMES\\b). Anything in `protect` is exempt. Add more specific phrase rules BEFORE the generic one if a surface needs different wording."
 }
