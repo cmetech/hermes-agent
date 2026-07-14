@@ -89,6 +89,57 @@ def visible_platform_ids(config: dict | None = None, root: Path | None = None) -
     return get_channel_allowlist(resolve_active_brand(root), root)
 
 
+# ── Skill / toolset curation (runtime hide + rename) ─────────────────────────
+# Reads the active brand descriptor's `curation` block and applies it at the
+# enumeration sites (skills scan + toolsets/skills API). Mirrors the channel
+# allowlist above: dependency-light, fail-OPEN (any error → no curation, never
+# hide everything). Unlike `seed_disabled` (which only DISABLES → still shown as
+# a toggle), `exclude`/`excludeToolsets` HIDE the item entirely (dropped from the
+# list and never loaded); `rename` overrides only the display name.
+
+
+def get_hidden_skills(slug: str, root: Path | None = None) -> set[str]:
+    """Skill identifiers (frontmatter name and/or dir name) to hide entirely."""
+    try:
+        brand = load_brand(slug, root)
+        excl = brand.get("curation", {}).get("skills", {}).get("exclude", [])
+        return {str(x) for x in excl} if isinstance(excl, list) else set()
+    except Exception:
+        return set()
+
+
+def get_skill_rename_map(slug: str, root: Path | None = None) -> dict[str, str]:
+    """Map of skill name/dir → display name override (UI title only)."""
+    try:
+        brand = load_brand(slug, root)
+        rn = brand.get("curation", {}).get("skills", {}).get("rename", {})
+        return {str(k): str(v) for k, v in rn.items()} if isinstance(rn, dict) else {}
+    except Exception:
+        return {}
+
+
+def get_excluded_toolsets(slug: str, root: Path | None = None) -> set[str]:
+    """Toolset keys to hide from the configurable-toolsets list entirely."""
+    try:
+        brand = load_brand(slug, root)
+        excl = brand.get("curation", {}).get("tools", {}).get("excludeToolsets", [])
+        return {str(x) for x in excl} if isinstance(excl, list) else set()
+    except Exception:
+        return set()
+
+
+def active_hidden_skills(root: Path | None = None) -> set[str]:
+    return get_hidden_skills(resolve_active_brand(root), root)
+
+
+def active_skill_rename_map(root: Path | None = None) -> dict[str, str]:
+    return get_skill_rename_map(resolve_active_brand(root), root)
+
+
+def active_excluded_toolsets(root: Path | None = None) -> set[str]:
+    return get_excluded_toolsets(resolve_active_brand(root), root)
+
+
 BRAND_JSON_SCHEMA_VERSION = 1
 
 # Canonical brand.json shape. MUST stay in sync with the JS builder in

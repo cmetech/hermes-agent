@@ -626,6 +626,20 @@ def _get_disabled_skill_names() -> Set[str]:
     return get_disabled_skill_names()
 
 
+def _get_brand_hidden_skills() -> Set[str]:
+    """Skill identifiers hidden by the active brand's curation (fail-OPEN).
+
+    Unlike disabled skills (toggled off but still listed), these are dropped
+    from discovery entirely — neither loaded by the agent nor shown in the
+    settings UI. Any error → empty set (never hide skills on a lookup failure).
+    """
+    try:
+        from hermes_cli.brand_config import active_hidden_skills
+        return active_hidden_skills()
+    except Exception:
+        return set()
+
+
 def _get_session_platform() -> str:
     """Resolve the current platform from gateway session context.
 
@@ -689,6 +703,11 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # disabling a skill is a config change with no filesystem mtime bump.
     disabled = set() if skip_disabled else _get_disabled_skill_names()
 
+    # Brand-hidden skills are dropped in BOTH modes (agent + UI). Static per
+    # process (read from the brand descriptor), so it need not enter the cache
+    # signature; folded into `disabled` there only as an invalidation token.
+    hidden = _get_brand_hidden_skills()
+
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
     # SKILLS_DIR can be stale in long-lived runtimes).
@@ -698,7 +717,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         dirs_to_scan.append(active_skills_dir)
     dirs_to_scan.extend(get_external_skills_dirs())
 
-    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    signature = _skills_scan_signature(dirs_to_scan, disabled | hidden)
     now = time.monotonic()
 
     cached = _SKILLS_CACHE.get(cache_key)
@@ -738,6 +757,10 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 if name in seen_names:
                     continue
                 if name in disabled:
+                    continue
+                # Brand curation: hide excluded skills entirely (from the agent
+                # AND the settings UI), matched on frontmatter name or dir name.
+                if hidden and (name in hidden or skill_dir.name in hidden):
                     continue
 
                 description = frontmatter.get("description", "")

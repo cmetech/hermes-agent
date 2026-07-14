@@ -131,7 +131,11 @@ function filteredSkills(skills: SkillInfo[], query: string, desc: boolean): Skil
   return skills
     .filter(
       skill =>
-        !q || includesQuery(skill.name, q) || includesQuery(skill.description, q) || includesQuery(skill.category, q)
+        !q ||
+        includesQuery(skill.name, q) ||
+        includesQuery(skill.displayName, q) ||
+        includesQuery(skill.description, q) ||
+        includesQuery(skill.category, q)
     )
     .sort((a, b) => sign * (usageOf(b) - usageOf(a)) || asText(a.name).localeCompare(asText(b.name)))
 }
@@ -601,8 +605,8 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
                   onSelect={() => setSelectedSkill(skill.name)}
                   onToggle={enabled => void handleToggleSkill(skill, enabled)}
                   subtitle={skillSubtitle(skill)}
-                  title={skill.name}
-                  toggleLabel={skill.name}
+                  title={skill.displayName ?? skill.name}
+                  toggleLabel={skill.displayName ?? skill.name}
                 />
               ))}
             </ListColumn>
@@ -733,7 +737,7 @@ function SkillDetail({ onArchive, onEdit, skill }: { onArchive: () => void; onEd
             )}
           </>
         }
-        title={skill.name}
+        title={skill.displayName ?? skill.name}
       />
       {editable && (
         <div className="flex items-center gap-2">
