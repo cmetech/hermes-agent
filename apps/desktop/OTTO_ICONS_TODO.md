@@ -34,6 +34,27 @@ magick /tmp/m.png -define icon:auto-resize=256,128,64,48,32,16 icon.ico
 cp /tmp/m.png icon.png && cp /tmp/m.png ../public/apple-touch-icon.png
 ```
 
+## loop24 branch — brand overlay (this branch)
+
+On the `loop24` branch the icon + in-app mark artwork is the **loop24** blue
+paint-stroke "24" mark, replaced **in place** at the same paths (no
+`package.json` / code change — `brand-mark.tsx` still points at the
+`ericsson-logo-*.png` filenames, which here hold loop24 art):
+
+- `assets/icon.{icns,ico,png}` + `public/apple-touch-icon.png` — the app/OS/
+  installer icon (loop24 mark on the rounded `#0C0C0C` tile).
+- `public/ericsson-logo-{light,dark}.png` — the in-app `BrandMark` (About,
+  updates overlay, install overlay). Two tuned variants: `-dark` uses the
+  bright gradient (`#8EC2F7 → #4D97ED → #0F5FBF`) for dark surfaces; `-light`
+  uses a deeper gradient (`#3F86DB → #1466C4 → #0A3D77`) for stronger contrast
+  on the light surface (`#F4F5FA`).
+
+Vector source: **`assets/loop24-icon-source.svg`** (the loop24 mark on the
+rounded dark square). Bare mark (no tile) lives in the workspace as
+`loop24.svg`; the `-light` in-app variant is the same mark with the deeper
+gradient above. Regenerate the full icon set exactly as above, substituting
+`loop24-icon-source.svg` for `otto-icon-source.svg`.
+
 ## Still Hermes/default artwork (low-visibility, optional)
 
 - The nsis installer sidebar/header bitmaps and the DMG background use
