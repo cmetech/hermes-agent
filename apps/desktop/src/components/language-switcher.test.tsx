@@ -25,7 +25,10 @@ describe('LanguageSwitcher', () => {
     vi.restoreAllMocks()
   })
 
-  it('persists language changes through display.language config', async () => {
+  // OTTO: the picker is restricted to the locale allowlist (English-only today,
+  // see i18n/locale-allowlist.ts). With English active, opening the picker shows
+  // only English — the non-allowlisted Chinese + Japanese locales are hidden.
+  it('restricts the picker to the allowlisted locales', async () => {
     const saveConfig = vi.fn().mockResolvedValue({ ok: true })
     const latestConfig: HermesConfigRecord = { display: { language: 'en', skin: 'slate' } }
 
@@ -45,9 +48,12 @@ describe('LanguageSwitcher', () => {
     })
 
     fireEvent.click(screen.getByRole('button', { name: 'Switch language' }))
-    fireEvent.click(screen.getByRole('option', { name: /日本語/i }))
 
-    await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1))
-    expect(saveConfig).toHaveBeenCalledWith({ display: { language: 'ja', skin: 'slate' } })
+    // English (allowlisted) renders...
+    expect(screen.getByRole('option', { name: /English/i })).toBeTruthy()
+    // ...but the non-allowlisted locales do not.
+    expect(screen.queryByRole('option', { name: /简体中文/ })).toBeNull()
+    expect(screen.queryByRole('option', { name: /繁體中文/ })).toBeNull()
+    expect(screen.queryByRole('option', { name: /日本語/i })).toBeNull()
   })
 })

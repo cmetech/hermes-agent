@@ -292,11 +292,15 @@
     --dt-border: var(--ui-stroke-secondary);
     --dt-input: var(--ui-stroke-primary);
     /* THE single knob for input-field borders: the resting alpha (% of the ring
-       color). Hover doubles it; focus/open go full. 0% = invisible at rest. */
-    --dt-input-border: 7%;
+       color). Hover doubles it; focus/open go full. 0% = invisible at rest.
+       Set to ~the theme's own input-border token (#E0E0E0 light / #3A3A3A dark,
+       ≈14% of the ink) plus a touch more so a config field reads as a clear well
+       at rest, not only on hover/focus. */
+    --dt-input-border: 16%;
     /* Knob for input-field background fill: alpha (% of --dt-card) across all
-       states. 100% = fully opaque, lower = translucent over the blurred chrome. */
-    --dt-input-bg: 0%;
+       states. 100% = fully opaque, lower = translucent over the blurred chrome.
+       A subtle resting fill lifts the field off the (grayish) page background. */
+    --dt-input-bg: 45%;
     /* Classic recessed "inset" — a crisp 1px inner shadow at the TOP edge.
        :root.dark bumps the alpha since a dark card swallows shadow. Removed on
        focus (the focus border carries the state). */
@@ -429,8 +433,12 @@
     --backdrop-invert-mul: 0;
     /* Dark mode: a dark card needs a stronger black inset to show the recess. */
     --dt-input-inset: inset 0 1px 1px color-mix(in srgb, #000 38%, transparent);
-    /* Dark needs a lighter resting border than light mode. */
-    --dt-input-border: 4%;
+    /* Dark: a 4% ink border over a dark card is effectively invisible — lift it
+       to ≈the theme's #3A3A3A input-border token so config fields are legible. */
+    --dt-input-border: 15%;
+    /* Subtle resting fill so a field reads as a lighter well over the near-black
+       page background (harmless when the field already sits on the card). */
+    --dt-input-bg: 55%;
 
     --ui-inline-code-background: color-mix(in srgb, #ffffff 7%, transparent);
     --ui-inline-code-foreground: color-mix(in srgb, #ffffff 88%, transparent);
