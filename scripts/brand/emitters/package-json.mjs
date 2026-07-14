@@ -58,7 +58,10 @@ function fieldPaths(d) {
     ['build.win.legalTrademarks', displayName],
     ['build.linux.synopsis', description],
     ['build.dmg.title', `Install ${displayName}`],
-    ['build.nsis.shortcutName', displayName],
+    // Brand-neutral, fixed for ALL brands: the Windows toast/Start-Menu
+    // identity line reads "Co-Worker", not the product name. See the design
+    // spec 2026-07-14-coexistence-resolver-and-coworker-notification-design.md.
+    ['build.nsis.shortcutName', 'Co-Worker'],
     ['build.nsis.uninstallDisplayName', displayName]
   ]
 }
