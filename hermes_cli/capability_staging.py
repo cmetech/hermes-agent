@@ -288,16 +288,17 @@ def seed_baked_capabilities(home: Path | str, root: Path | None = None) -> None:
     """Seed baked-in (vendored) capabilities into `home` — LOCAL only, no network.
 
     Reads capabilities/*.json in the repo: merges each mcp-servers fragment into config.yaml
-    (idempotent, never clobbering a user entry, ${CAPABILITY_DIR} -> <home>/plugins) and copies
-    workflows to $HERMES_HOME/workflows/. Fail-safe: never raises.
+    (idempotent, never clobbering a user entry, ${CAPABILITY_DIR} -> the bundled plugins dir,
+    e.g. <clone>/plugins) and copies workflows to $HERMES_HOME/workflows/. Fail-safe: never raises.
     """
     try:
         import yaml
+        from hermes_cli.plugins import get_bundled_plugins_dir
         home = Path(home)
         cap_dir = _repo_root() / "capabilities"
         if not cap_dir.is_dir():
             return
-        text_sub = str(home / "plugins")
+        text_sub = str(get_bundled_plugins_dir())
         for manifest_path in sorted(cap_dir.glob("*.json")):
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

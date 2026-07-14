@@ -14,6 +14,7 @@ def fake_repo(tmp_path, monkeypatch):
         "mcp_servers:\n  outlook:\n    command: python\n    args: [\"${CAPABILITY_DIR}/outlook-mcp/run_server.py\"]\n")
     (root / "capabilities/workflows/w.yml").write_text("name: w\n")
     monkeypatch.setattr(cs, "_repo_root", lambda: root)
+    monkeypatch.setattr("hermes_cli.plugins.get_bundled_plugins_dir", lambda: root / "plugins")
     return root
 
 @pytest.fixture
@@ -28,7 +29,7 @@ def test_seed_mcp_and_workflows(tmp_path, fake_repo, fake_config):
     home = tmp_path / "home"; home.mkdir()
     cs.seed_baked_capabilities(home)
     cfg = fake_config["cfg"]
-    assert cfg["mcp_servers"]["outlook"]["args"][0] == str(home / "plugins") + "/outlook-mcp/run_server.py"
+    assert cfg["mcp_servers"]["outlook"]["args"][0] == str(fake_repo / "plugins") + "/outlook-mcp/run_server.py"
     assert (home / "workflows/w.yml").exists()
 
 def test_seed_never_clobbers_user_mcp(tmp_path, fake_repo, fake_config):
