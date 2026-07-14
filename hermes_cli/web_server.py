@@ -13302,6 +13302,13 @@ async def get_skills(profile: Optional[str] = None):
         # the user may edit/delete from the UI.
         bundled_names = _read_bundled_manifest_names()
         hub_names = _read_hub_installed_names()
+    # Brand curation: override the DISPLAY title for renamed skills (identity
+    # key `name` is untouched, so toggle/usage/invoke keep working). Fail-open.
+    try:
+        from hermes_cli.brand_config import active_skill_rename_map
+        rename = active_skill_rename_map()
+    except Exception:
+        rename = {}
     for s in skills:
         s["enabled"] = s["name"] not in disabled
         s["usage"] = activity_count(usage.get(s["name"], {}))
@@ -13310,6 +13317,9 @@ async def get_skills(profile: Optional[str] = None):
             else "bundled" if s["name"] in bundled_names
             else "agent"
         )
+        display = rename.get(s["name"])
+        if display:
+            s["displayName"] = display
     return skills
 
 

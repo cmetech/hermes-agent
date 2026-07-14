@@ -188,6 +188,16 @@ def _get_effective_configurable_toolsets():
             result.append(entry)
     except Exception:
         pass
+    # Brand curation: hide excluded toolsets entirely — removes them from the
+    # CLI picker, the desktop toolsets list, and toggle-validation, so they can
+    # neither be shown nor enabled. Fail-open (any error → no exclusion).
+    try:
+        from hermes_cli.brand_config import active_excluded_toolsets
+        excluded = active_excluded_toolsets()
+        if excluded:
+            result = [entry for entry in result if entry[0] not in excluded]
+    except Exception:
+        pass
     return result
 
 

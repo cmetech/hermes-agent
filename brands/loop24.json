@@ -10,8 +10,12 @@
   "theme": "otto",
   "gateway": "otto",
   "curation": {
-    "skills": { "exclude": ["media/spotify"], "disabledByDefault": [] },
-    "tools": { "excludeToolsets": ["home_assistant"], "disabledByDefault": ["spotify"] }
+    "skills": {
+      "exclude": ["heartmula","himalaya","manim-video","openhue","p5js","polymarket","segment-anything-model","songsee","songwriting-and-ai-music","touchdesigner-mcp","weights-and-biases","youtube-content","yuanbao"],
+      "rename": { "hermes-agent": "Co-worker", "hermes-agent-skill-authoring": "Co-worker skill authoring" },
+      "disabledByDefault": []
+    },
+    "tools": { "excludeToolsets": ["homeassistant","spotify"], "disabledByDefault": [] }
   },
   "capabilitySets": [],
   "capabilitySources": {"ericsson": "https://github.com/cmetech/ericsson-capabilities.git"},
