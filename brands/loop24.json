@@ -1,7 +1,8 @@
 {
   "slug": "loop24",
-  "wordmark": "LOOP24 AGENT",
-  "tagline": "Loop24 orchestrates your thoughts and tasks into effective outcomes.",
+  "displayName": "LOOP24",
+  "wordmark": "LOOP24 COWORKER",
+  "tagline": "Loop24 closes the loop on every task — turning your intent into outcomes, continuously.",
   "appId": "io.cmetech.loop24",
   "scheme": "loop24",
   "homeDir": ".loop24",
@@ -15,14 +16,15 @@
       "rename": { "hermes-agent": "Co-worker", "hermes-agent-skill-authoring": "Co-worker skill authoring" },
       "disabledByDefault": []
     },
-    "tools": { "excludeToolsets": ["homeassistant","spotify"], "disabledByDefault": [] }
+    "tools": { "excludeToolsets": ["homeassistant","spotify"], "disabledByDefault": [] },
+    "channels": { "allow": ["telegram","slack","whatsapp","whatsapp_cloud","email","sms","api_server","webhook","msgraph_webhook","teams","discord"] }
   },
   "capabilitySets": [],
   "capabilitySources": {"ericsson": "https://github.com/cmetech/ericsson-capabilities.git"},
   "capabilityRequiresEnv": {"ericsson": {"ERICSSON_ENV": "1"}},
   "personaSets": [],
   "cli": {
-    "bannerLogo": "[bold #FAD22D]╭──────────────╮[/]\n[bold #FAD22D]│    LOOP24    │[/]\n[bold #FAD22D]╰──────────────╯[/]",
-    "bannerHero": "[#FAD22D]     ╭───╮     [/]\n[#FAD22D]     │ 24│     [/]\n[#FAD22D]     ╰───╯     [/]\n[dim #8A6D1A]  loop online  [/]"
+    "bannerLogo": "[bold #8A6D1A]██╗      ██████╗  ██████╗ ██████╗ ██████╗ ██╗  ██╗[/]\n[bold #B8901F]██║     ██╔═══██╗██╔═══██╗██╔══██╗╚════██╗██║  ██║[/]\n[#E0B325]██║     ██║   ██║██║   ██║██████╔╝ █████╔╝███████║[/]\n[#FAD22D]██║     ██║   ██║██║   ██║██╔═══╝ ██╔═══╝ ╚════██║[/]\n[#FFDE5C]███████╗╚██████╔╝╚██████╔╝██║     ███████╗     ██║[/]\n[#FFE98A]╚══════╝ ╚═════╝  ╚═════╝ ╚═╝     ╚══════╝     ╚═╝[/]",
+    "bannerHero": "[#FFDE5C]           ╻           [/]\n[#E0B325]      ╭────┸────╮      [/]\n[#FAD22D]      │  ●   ●  │      [/]\n[#FAD22D]      │   ▿▿▿   │      [/]\n[#E0B325]      ╰──┬───┬──╯      [/]\n[#B8901F]     ╭───┴───┴───╮     [/]\n[bold #FAD22D]     │  LOOP 24  │     [/]\n[#B8901F]     ╰───────────╯     [/]\n[dim #8A6D1A]       loop online     [/]"
   }
 }
