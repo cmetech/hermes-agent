@@ -5,6 +5,7 @@ import { Command, CommandInput, CommandItem, CommandList } from '@/components/ui
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet'
 import { useIsMobile } from '@/hooks/use-mobile'
+import { filterAllowedLocales } from '@/i18n/locale-allowlist'
 import { type Locale, LOCALE_META, useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { Check, ChevronDown, Globe } from '@/lib/icons'
@@ -34,7 +35,12 @@ export function LanguageSwitcher({ className, collapsed = false, dropUp = false 
   const isMobile = useIsMobile()
   const useMobileSheet = Boolean(dropUp && isMobile)
   const current = LOCALE_META[locale]
-  const allLocales = Object.entries(LOCALE_META) as Array<[Locale, typeof current]>
+  // OTTO: restrict the picker to the allowlisted locales (English-only today).
+  // Fail-open + keeps the active locale visible. See i18n/locale-allowlist.ts.
+  const allLocales = filterAllowedLocales(
+    Object.entries(LOCALE_META) as Array<[Locale, typeof current]>,
+    locale
+  )
   const title = t.language.switchTo
 
   const selectLocale = async (code: Locale) => {
