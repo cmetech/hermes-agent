@@ -1,0 +1,61 @@
+{
+  "name": "ericsson",
+  "version": "0.2.0",
+  "description": "Shared Ericsson coworker capabilities (OTTO + LOOP24)",
+  "requiresEnv": {
+    "ERICSSON_ENV": "1"
+  },
+  "disabledByDefault": {
+    "skills": [
+      "workflow-orchestrator",
+      "workflow-builder"
+    ],
+    "toolsets": [
+      "ericsson-jira",
+      "ericsson-teams"
+    ]
+  },
+  "skills": [
+    "skills/ericsson/workflow-orchestrator",
+    "skills/ericsson/workflow-builder"
+  ],
+  "plugins": [
+    "plugins/ericsson-jira",
+    "plugins/ericsson-teams"
+  ],
+  "mcpServers": "mcp/mcp-servers.yaml",
+  "mcpLocal": [
+    "mcp/outlook-mcp"
+  ],
+  "workflows": [
+    "capabilities/workflows/my-tickets-summary.yml",
+    "capabilities/workflows/inbox-digest.yml"
+  ],
+  "personas": [],
+  "env": [
+    {
+      "key": "JIRA_BASE_URL",
+      "description": "Ericsson Jira base URL",
+      "category": "tool"
+    },
+    {
+      "key": "JIRA_PAT",
+      "description": "Jira personal access token",
+      "category": "tool",
+      "password": true
+    },
+    {
+      "key": "GLEAN_MCP_URL",
+      "description": "Glean MCP endpoint (internal document search)",
+      "category": "tool"
+    },
+    {
+      "key": "GLEAN_API_TOKEN",
+      "description": "Glean API token",
+      "category": "tool",
+      "password": true
+    }
+  ],
+  "vendoredFrom": "f77929c",
+  "mcpServersFile": "mcp-servers.yaml"
+}
