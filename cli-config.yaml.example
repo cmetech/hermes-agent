@@ -46,7 +46,7 @@ model:
   #   It works with both no-auth and auth-enabled server modes.
   #
   # Can also be overridden for a single invocation with the --provider flag.
-  provider: "otto"
+  provider: "loop24"
 
   # API configuration.
   # For provider "otto": base_url defaults to the OTTO gateway; the API key comes
@@ -1246,7 +1246,7 @@ display:
   #     prompt_symbol: "⚔"                  # Prompt symbol (bare token; renderers add trailing space)
   #   tool_prefix: "╎"                       # Tool output line prefix (default: ┊)
   #
-  skin: otto
+  skin: loop24
 
 # =============================================================================
 # Model Aliases — short names for /model command
