@@ -311,8 +311,35 @@ if (INSTALL_STAMP) {
 // HERMES_DESKTOP_USER_DATA_DIR (used by test:desktop:fresh) puts the sandbox
 // HERMES_HOME beneath the throwaway userData dir so a fresh-install run never
 // touches the user's real ~/.hermes / %LOCALAPPDATA%\hermes.
+// The baked per-brand default home. The two `return path.join(...)`
+// expressions are the home-emitter's anchors — keep them verbatim (on `base`
+// they are the neutral 'hermes' / '.hermes'; the emitter restamps per brand).
+function perBrandDefaultHome() {
+  if (IS_WINDOWS && process.env.LOCALAPPDATA) {
+    return path.join(process.env.LOCALAPPDATA, 'hermes')
+  }
+
+  return path.join(app.getPath('home'), '.hermes')
+}
+
 function resolveHermesHome() {
-  if (process.env.HERMES_HOME) {
+  const brandDefault = perBrandDefaultHome()
+  const localAppData = process.env.LOCALAPPDATA
+
+  // Multi-brand coexistence: a stale HERMES_HOME (env-inherited or User
+  // registry) can point at ANOTHER brand's %LOCALAPPDATA%\<other> home — e.g.
+  // a second brand installed on a poisoned box before install.ps1 clears the
+  // variable. Ignore such a value in favor of our own baked per-brand default,
+  // but only when that foreign home is actually populated (…\<other>\hermes-agent
+  // exists), so a user's arbitrary custom home is never overridden. Custom
+  // homes (outside LOCALAPPDATA) and our own brand home are always honored.
+  // Windows-only in effect (isForeignBrandLocalAppDataPath is a no-op without
+  // LOCALAPPDATA). See brand-scope.ts + the design spec.
+  const isForeignPoisonedHome = (value: string) =>
+    isForeignBrandLocalAppDataPath({ candidate: value, ourHome: brandDefault, localAppData }) &&
+    directoryExists(path.join(value, 'hermes-agent'))
+
+  if (process.env.HERMES_HOME && !isForeignPoisonedHome(process.env.HERMES_HOME)) {
     return normalizeHermesHomeRoot(process.env.HERMES_HOME)
   }
 
@@ -321,24 +348,18 @@ function resolveHermesHome() {
   }
 
   if (IS_WINDOWS) {
-    // A GUI app launched from Explorer inherits the environment block captured
-    // at login, so a HERMES_HOME set via `setx` AFTER login is invisible in
-    // process.env even though the CLI (a fresh shell) sees it. Without this the
-    // backend silently falls back to %LOCALAPPDATA%\hermes and reports "No
-    // inference provider configured" despite a valid configured home (#45471).
-    // Consult the live User-scoped registry value before the default below.
+    // A GUI app launched from Explorer inherits the login environment block, so
+    // a HERMES_HOME set via setx after login is invisible in process.env even
+    // though the CLI (a fresh shell) sees it. Consult the live User-scoped
+    // registry value before the default below (#45471).
     const fromRegistry = readWindowsUserEnvVar('HERMES_HOME')
 
-    if (fromRegistry) {
+    if (fromRegistry && !isForeignPoisonedHome(fromRegistry)) {
       return normalizeHermesHomeRoot(fromRegistry)
     }
   }
 
-  if (IS_WINDOWS && process.env.LOCALAPPDATA) {
-    return path.join(process.env.LOCALAPPDATA, 'hermes')
-  }
-
-  return path.join(app.getPath('home'), '.hermes')
+  return brandDefault
 }
 
 const HERMES_HOME = resolveHermesHome()
