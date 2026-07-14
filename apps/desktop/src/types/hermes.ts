@@ -650,6 +650,8 @@ export interface SkillInfo {
   description: string
   enabled: boolean
   name: string
+  /** Brand display-name override (e.g. hermes-agent → "Co-worker"). Absent = use `name`. */
+  displayName?: string
   /** Total observed activity (use + view + patch). Absent on older backends. */
   usage?: number
   /** 'agent' = learned/local (editable), 'bundled' = ships with Hermes, 'hub' = installed. */
