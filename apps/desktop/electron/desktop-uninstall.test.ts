@@ -254,37 +254,51 @@ test('buildWindowsCleanupScript omits PYTHONPATH + rmdir when not needed (gui, n
 
 test('windows full script removes home + agent + app, validates, and shows a dialog', () => {
   const script = buildWindowsCleanupScript({
-    desktopPid: 123, pythonExe: 'py.exe', pythonPath: null, agentRoot: 'C:\\h\\hermes-agent',
+    desktopPid: 123,
+    pythonExe: 'py.exe',
+    pythonPath: null,
+    agentRoot: 'C:\\h\\hermes-agent',
     uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
     appPath: 'C:\\Users\\x\\AppData\\Local\\Programs\\OTTO',
     hermesHome: 'C:\\Users\\x\\AppData\\Local\\hermes',
-    removeUserData: true, removeAgent: true
+    removeUserData: true,
+    removeAgent: true
   })
-  assert.match(script, /rmdir \/s \/q "C:\\Users\\x\\AppData\\Local\\hermes"/)  // home removed by the script
-  assert.match(script, /rmdir \/s \/q "C:\\h\\hermes-agent"/)                    // agent removed
-  assert.match(script, /mshta/)                                                  // native dialog
-  assert.match(script, /otto-uninstall-result\.log/)                            // result log
+  assert.match(script, /rmdir \/s \/q "C:\\Users\\x\\AppData\\Local\\hermes"/) // home removed by the script
+  assert.match(script, /rmdir \/s \/q "C:\\h\\hermes-agent"/) // agent removed
+  assert.match(script, /mshta/) // native dialog
+  assert.match(script, /otto-uninstall-result\.log/) // result log
 })
 
 test('windows lite script keeps the home (only agent + app removed)', () => {
   const script = buildWindowsCleanupScript({
-    desktopPid: 1, pythonExe: 'py.exe', pythonPath: null, agentRoot: 'C:\\h\\hermes-agent',
-    uninstallArgs: ['-m','hermes_cli.uninstall','--mode','lite'],
-    appPath: 'C:\\p\\OTTO', hermesHome: 'C:\\h', removeUserData: false, removeAgent: true
+    desktopPid: 1,
+    pythonExe: 'py.exe',
+    pythonPath: null,
+    agentRoot: 'C:\\h\\hermes-agent',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'lite'],
+    appPath: 'C:\\p\\OTTO',
+    hermesHome: 'C:\\h',
+    removeUserData: false,
+    removeAgent: true
   })
-  assert.doesNotMatch(script, /rmdir \/s \/q "C:\\h" /)   // home NOT removed
+  assert.doesNotMatch(script, /rmdir \/s \/q "C:\\h" /) // home NOT removed
   assert.match(script, /rmdir \/s \/q "C:\\h\\hermes-agent"/)
 })
 
 test('windows full script dialog is JS-string-safe for a \\x path (Finding: mshta hex-escape crash)', () => {
   const script = buildWindowsCleanupScript({
-    desktopPid: 42, pythonExe: 'py.exe', pythonPath: null, agentRoot: 'C:\\h\\hermes-agent',
+    desktopPid: 42,
+    pythonExe: 'py.exe',
+    pythonPath: null,
+    agentRoot: 'C:\\h\\hermes-agent',
     uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
     appPath: 'C:\\Users\\x\\AppData\\Local\\Programs\\OTTO',
     // The fixture that triggers the bug: a leftover path containing `\x`,
     // which JScript reads as a hex-escape introducer inside a plain '%MSG%'.
     hermesHome: 'C:\\Users\\x\\AppData\\Local\\hermes',
-    removeUserData: true, removeAgent: true
+    removeUserData: true,
+    removeAgent: true
   })
 
   // A JS-string-safe copy of MSG (every backslash doubled) must be built...
@@ -298,11 +312,15 @@ test('windows full script dialog is JS-string-safe for a \\x path (Finding: msht
 
 test('windows script uses the passed productName for the log path, header, and dialog title', () => {
   const script = buildWindowsCleanupScript({
-    desktopPid: 7, pythonExe: 'py.exe', pythonPath: null, agentRoot: 'C:\\h\\hermes-agent',
+    desktopPid: 7,
+    pythonExe: 'py.exe',
+    pythonPath: null,
+    agentRoot: 'C:\\h\\hermes-agent',
     uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
     appPath: 'C:\\Users\\x\\AppData\\Local\\Programs\\LOOP24',
     hermesHome: 'C:\\Users\\x\\AppData\\Local\\loop24',
-    removeUserData: true, removeAgent: true,
+    removeUserData: true,
+    removeAgent: true,
     productName: 'LOOP24'
   })
   assert.match(script, /loop24-uninstall-result\.log/)
@@ -312,10 +330,15 @@ test('windows script uses the passed productName for the log path, header, and d
 
 test('posix script uses the passed productName for the log path, header, and dialog title', () => {
   const script = buildPosixCleanupScript({
-    desktopPid: 7, pythonExe: '/usr/bin/python3', pythonPath: null, agentRoot: '/Users/x/.loop24/hermes-agent',
+    desktopPid: 7,
+    pythonExe: '/usr/bin/python3',
+    pythonPath: null,
+    agentRoot: '/Users/x/.loop24/hermes-agent',
     uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
-    appPath: '/Applications/LOOP24.app', hermesHome: '/Users/x/.loop24',
-    removeUserData: true, removeAgent: true,
+    appPath: '/Applications/LOOP24.app',
+    hermesHome: '/Users/x/.loop24',
+    removeUserData: true,
+    removeAgent: true,
     productName: 'LOOP24'
   })
   assert.match(script, /loop24-uninstall-result\.log/)
@@ -325,17 +348,25 @@ test('posix script uses the passed productName for the log path, header, and dia
 
 test('scripts default productName to OTTO when omitted (backward compatible)', () => {
   const winScript = buildWindowsCleanupScript({
-    desktopPid: 1, pythonExe: 'py.exe', pythonPath: null, agentRoot: 'C:\\h',
+    desktopPid: 1,
+    pythonExe: 'py.exe',
+    pythonPath: null,
+    agentRoot: 'C:\\h',
     uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'gui'],
-    appPath: null, hermesHome: 'C:\\h'
+    appPath: null,
+    hermesHome: 'C:\\h'
   })
   assert.match(winScript, /otto-uninstall-result\.log/)
   assert.match(winScript, /OTTO uninstall/)
 
   const posixScript = buildPosixCleanupScript({
-    desktopPid: 1, pythonExe: '/usr/bin/python3', pythonPath: null, agentRoot: '/a',
+    desktopPid: 1,
+    pythonExe: '/usr/bin/python3',
+    pythonPath: null,
+    agentRoot: '/a',
     uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'gui'],
-    appPath: null, hermesHome: '/h'
+    appPath: null,
+    hermesHome: '/h'
   })
   assert.match(posixScript, /otto-uninstall-result\.log/)
   assert.match(posixScript, /OTTO uninstall/)
@@ -343,10 +374,15 @@ test('scripts default productName to OTTO when omitted (backward compatible)', (
 
 test('posix full script rm -rf home + agent and shows osascript dialog on mac', () => {
   const script = buildPosixCleanupScript({
-    desktopPid: 5, pythonExe: '/usr/bin/python3', pythonPath: null, agentRoot: '/Users/x/.hermes/hermes-agent',
-    uninstallArgs: ['-m','hermes_cli.uninstall','--mode','full'],
-    appPath: '/Applications/OTTO.app', hermesHome: '/Users/x/.hermes',
-    removeUserData: true, removeAgent: true
+    desktopPid: 5,
+    pythonExe: '/usr/bin/python3',
+    pythonPath: null,
+    agentRoot: '/Users/x/.hermes/hermes-agent',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
+    appPath: '/Applications/OTTO.app',
+    hermesHome: '/Users/x/.hermes',
+    removeUserData: true,
+    removeAgent: true
   })
   assert.match(script, /rm -rf '\/Users\/x\/\.hermes'/)
   assert.match(script, /osascript/)
@@ -365,25 +401,33 @@ test('windowsCleanupRunnerArgs opens a normal (non-minimized) console for the sc
 
 test('windows full script prints a do-not-click banner + per-step progress', () => {
   const script = buildWindowsCleanupScript({
-    desktopPid: 123, pythonExe: 'py.exe', pythonPath: null, agentRoot: 'C:\\h\\hermes-agent',
+    desktopPid: 123,
+    pythonExe: 'py.exe',
+    pythonPath: null,
+    agentRoot: 'C:\\h\\hermes-agent',
     uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
     appPath: 'C:\\Users\\x\\AppData\\Local\\Programs\\OTTO',
     hermesHome: 'C:\\Users\\x\\AppData\\Local\\hermes',
-    removeUserData: true, removeAgent: true
+    removeUserData: true,
+    removeAgent: true
   })
-  assert.match(script, /Do NOT click/i)     // QuickEdit-pause warning banner
-  assert.match(script, /echo\s+Removing/i)  // a status line before the slow deletes
+  assert.match(script, /Do NOT click/i) // QuickEdit-pause warning banner
+  assert.match(script, /echo\s+Removing/i) // a status line before the slow deletes
 })
 
 // --- Option C: robocopy empty-mirror fast-deletes large trees (node_modules) ---
 
 test('windows full script fast-deletes large trees via a robocopy empty-mirror', () => {
   const script = buildWindowsCleanupScript({
-    desktopPid: 123, pythonExe: 'py.exe', pythonPath: null, agentRoot: 'C:\\h\\hermes-agent',
+    desktopPid: 123,
+    pythonExe: 'py.exe',
+    pythonPath: null,
+    agentRoot: 'C:\\h\\hermes-agent',
     uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
     appPath: 'C:\\Users\\x\\AppData\\Local\\Programs\\OTTO',
     hermesHome: 'C:\\Users\\x\\AppData\\Local\\hermes',
-    removeUserData: true, removeAgent: true
+    removeUserData: true,
+    removeAgent: true
   })
   // an empty scratch dir is made, then mirrored over each big tree to empty it fast
   assert.match(script, /mkdir "%EMPTYDIR%"/)
@@ -396,10 +440,60 @@ test('windows full script fast-deletes large trees via a robocopy empty-mirror',
 
 test('windows gui script (nothing to remove) adds no robocopy or scratch dir', () => {
   const script = buildWindowsCleanupScript({
-    desktopPid: 2, pythonExe: 'C:\\h\\venv\\Scripts\\python.exe', pythonPath: null, agentRoot: 'C:\\h',
+    desktopPid: 2,
+    pythonExe: 'C:\\h\\venv\\Scripts\\python.exe',
+    pythonPath: null,
+    agentRoot: 'C:\\h',
     uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'gui'],
-    appPath: null, hermesHome: 'C:\\h'
+    appPath: null,
+    hermesHome: 'C:\\h'
   })
   assert.doesNotMatch(script, /robocopy/)
   assert.doesNotMatch(script, /EMPTYDIR/)
+})
+
+// --- Fix (v1.0.6): cd OUT of the tree before deleting it, else cmd.exe loses its
+// CWD mid-run and aborts with "The batch file cannot be found" before the final
+// dialog + self-delete. Also un-pins the dir so it can actually be removed. ---
+
+test('windows full script leaves the deleted tree (cd %SystemRoot%) before removals', () => {
+  const script = buildWindowsCleanupScript({
+    desktopPid: 123,
+    pythonExe: 'py.exe',
+    pythonPath: null,
+    agentRoot: 'C:\\h\\hermes-agent',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
+    appPath: 'C:\\Users\\x\\AppData\\Local\\Programs\\OTTO',
+    hermesHome: 'C:\\Users\\x\\AppData\\Local\\hermes',
+    removeUserData: true,
+    removeAgent: true
+  })
+  assert.match(script, /cd \/d "%SystemRoot%"/)
+  // ordering: python uninstall (needs cwd=agentRoot) -> safe cd -> first removal
+  const pyIdx = script.indexOf('hermes_cli.uninstall')
+  const cdOutIdx = script.indexOf('cd /d "%SystemRoot%"')
+  const firstRemovalIdx = script.search(/attrib|robocopy|rmdir \/s \/q/)
+  assert.ok(
+    pyIdx < cdOutIdx && cdOutIdx < firstRemovalIdx,
+    'safe cd must sit between the python call and the first removal'
+  )
+})
+
+// --- Fix (v1.0.6): clear read-only/hidden/system attrs before deleting, so a
+// stubborn .git pack (WinError 5) doesn't block the tree removal. ---
+
+test('windows full script clears file attributes before deleting each tree', () => {
+  const script = buildWindowsCleanupScript({
+    desktopPid: 123,
+    pythonExe: 'py.exe',
+    pythonPath: null,
+    agentRoot: 'C:\\h\\hermes-agent',
+    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
+    appPath: 'C:\\Users\\x\\AppData\\Local\\Programs\\OTTO',
+    hermesHome: 'C:\\Users\\x\\AppData\\Local\\hermes',
+    removeUserData: true,
+    removeAgent: true
+  })
+  assert.match(script, /attrib -r -h -s \/s \/d "C:\\h\\hermes-agent"/)
+  assert.match(script, /attrib -r -h -s \/s \/d "C:\\Users\\x\\AppData\\Local\\Programs\\OTTO"/)
 })
