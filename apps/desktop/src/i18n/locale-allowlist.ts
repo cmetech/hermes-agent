@@ -1,3 +1,4 @@
+import { LOCALE_META } from './languages'
 import type { Locale } from './types'
 
 // OTTO customization (brand-neutral — lives on `base`, flows to every brand):
@@ -26,6 +27,22 @@ export function filterAllowedLocales<T>(
   entries: Array<[Locale, T]>,
   activeLocale?: Locale
 ): Array<[Locale, T]> {
-  if (LOCALE_ALLOWLIST.length === 0) return entries
+  if (LOCALE_ALLOWLIST.length === 0) {return entries}
+
   return entries.filter(([code]) => isLocaleAllowed(code) || code === activeLocale)
+}
+
+// How many locales the picker would offer for the given active locale (using the
+// same allowlist + keep-active rule as filterAllowedLocales).
+export function visibleLocaleCount(activeLocale?: Locale): number {
+  const ids = Object.keys(LOCALE_META) as Locale[]
+
+  return ids.filter(id => isLocaleAllowed(id) || id === activeLocale).length
+}
+
+// Whether to surface the language picker at all. With an English-only allowlist
+// there is nothing to switch to, so the Settings row is hidden — shown again the
+// moment a second locale is allowlisted (or the active locale is off-list).
+export function shouldShowLanguagePicker(activeLocale?: Locale): boolean {
+  return visibleLocaleCount(activeLocale) > 1
 }
