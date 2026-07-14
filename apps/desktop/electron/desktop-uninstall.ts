@@ -208,7 +208,9 @@ function buildPosixCleanupScript({
   )
 
   for (const p of checks) {
-    lines.push(`if [ -e ${q(p)} ]; then LEFT="$LEFT ${p}"; echo "LEFT: ${p}" >> "$RESULT"; else echo "GONE: ${p}" >> "$RESULT"; fi`)
+    lines.push(
+      `if [ -e ${q(p)} ]; then LEFT="$LEFT ${p}"; echo "LEFT: ${p}" >> "$RESULT"; else echo "GONE: ${p}" >> "$RESULT"; fi`
+    )
   }
 
   lines.push(
@@ -309,7 +311,13 @@ function buildWindowsCleanupScript({
     ':waited_done',
     'echo   Removing runtime and cleaning up...',
     `cd /d ${q(agentRoot)}`,
-    `${q(pythonExe)} ${uninstallArgs.map(q).join(' ')}`
+    `${q(pythonExe)} ${uninstallArgs.map(q).join(' ')}`,
+    // Leave the tree we are about to delete. cmd.exe re-reads the batch and
+    // resolves paths against the CWD as it runs; if the CWD (agentRoot) or its
+    // parent (hermesHome) is deleted out from under it, the run aborts with
+    // "The batch file cannot be found" BEFORE the final dialog + self-delete.
+    // Parking in %SystemRoot% also un-pins the tree so it can be removed.
+    'cd /d "%SystemRoot%"'
   )
 
   // Destructive removal happens here, in the detached outer script — not the
@@ -325,15 +333,15 @@ function buildWindowsCleanupScript({
   const hasTreeRemoval = removeAgent || removeUserData || Boolean(appPath)
 
   if (hasTreeRemoval) {
-    lines.push(
-      `set "EMPTYDIR=%TEMP%\\${logSlug}-uninstall-empty-%RANDOM%"`,
-      'mkdir "%EMPTYDIR%" >nul 2>&1'
-    )
+    lines.push(`set "EMPTYDIR=%TEMP%\\${logSlug}-uninstall-empty-%RANDOM%"`, 'mkdir "%EMPTYDIR%" >nul 2>&1')
   }
 
   const rmTreeFast = (target, label, human) => [
     `if not exist ${q(target)} goto ${label}done`,
     `echo   Removing ${human}...`,
+    // Clear read-only/hidden/system attrs first — a stubborn .git pack (WinError
+    // 5 "access denied") otherwise blocks the whole tree from being removed.
+    `attrib -r -h -s /s /d ${q(target)} >nul 2>&1`,
     `set /a ${label}=0`,
     `:${label}loop`,
     `if not exist ${q(target)} goto ${label}done`,
@@ -359,6 +367,7 @@ function buildWindowsCleanupScript({
     lines.push(
       `if not exist ${q(appPath)} goto rmdone`,
       'echo   Removing application files...',
+      `attrib -r -h -s /s /d ${q(appPath)} >nul 2>&1`,
       'set /a tries=0',
       ':rmloop',
       `if not exist ${q(appPath)} goto rmdone`,
