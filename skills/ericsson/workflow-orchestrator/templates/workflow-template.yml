@@ -1,0 +1,30 @@
+# Template: copy to $HERMES_HOME/workflows/<name>.yml and edit.
+# Validate with: python3 <skill>/scripts/workflow_ctl.py validate <file>
+name: example-digest
+description: Example two-step workflow with an optional email delivery
+version: 1.0.0
+tags: [ericsson, example]
+requires:
+  toolsets: []
+  env: []
+inputs:
+  - {name: deliver_to, default: chat}
+nodes:
+  - id: gather
+    kind: prompt
+    prompt: Gather the information the user asked for; save it as notes.md.
+    output: notes.md
+  - id: digest
+    kind: prompt
+    depends_on: [gather]
+    prompt: Turn notes.md into a short digest; save as digest.md.
+    output: digest.md
+  - id: send
+    kind: tool
+    depends_on: [digest]
+    when: "$inputs.deliver_to == 'email'"
+    side_effects: true
+    prompt: Email digest.md to the user via the Outlook send tool.
+report:
+  kanban: auto
+  notify: []

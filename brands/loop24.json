@@ -13,7 +13,7 @@
     "skills": { "exclude": ["media/spotify"], "disabledByDefault": [] },
     "tools": { "excludeToolsets": ["home_assistant"], "disabledByDefault": ["spotify"] }
   },
-  "capabilitySets": ["ericsson"],
+  "capabilitySets": [],
   "capabilitySources": {"ericsson": "https://github.com/cmetech/ericsson-capabilities.git"},
   "capabilityRequiresEnv": {"ericsson": {"ERICSSON_ENV": "1"}},
   "personaSets": [],

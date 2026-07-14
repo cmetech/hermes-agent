@@ -8476,3 +8476,52 @@ def _inject_platform_plugin_env_vars() -> None:
 
 # Eagerly inject so that platform plugin env vars show up in the setup wizard.
 _inject_platform_plugin_env_vars()
+
+
+_capability_env_vars_injected = False
+
+
+def _inject_capability_env_vars() -> None:
+    """Populate OPTIONAL_ENV_VARS from vendored capability manifests (capabilities/*.json).
+
+    Manifest-driven so adding a capability key later is a manifest edit, not a config.py edit.
+    Idempotent; fail-safe (a malformed manifest can't break CLI import). Skips category 'skill'
+    entries (they never render on the Keys page) — e.g. ERICSSON_ENV.
+    """
+    global _capability_env_vars_injected
+    if _capability_env_vars_injected:
+        return
+    _capability_env_vars_injected = True
+    try:
+        import json as _json
+        repo_root = Path(__file__).resolve().parents[1]
+        cap_dir = repo_root / "capabilities"
+        if not cap_dir.is_dir():
+            return
+        for manifest_path in sorted(cap_dir.glob("*.json")):
+            try:
+                manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            for entry in manifest.get("env") or []:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("key")
+                if not name or name in OPTIONAL_ENV_VARS:
+                    continue
+                category = entry.get("category") or "tool"
+                if category == "skill":
+                    continue  # skill-category keys don't render on the Keys page
+                OPTIONAL_ENV_VARS[name] = {
+                    "description": entry.get("description") or name,
+                    "prompt": entry.get("prompt") or name,
+                    "url": entry.get("url") or None,
+                    "password": bool(entry.get("password")),
+                    "category": category,
+                }
+    except Exception:
+        pass
+
+
+# Eagerly inject so vendored capability keys show up in the Keys page + setup wizard.
+_inject_capability_env_vars()
