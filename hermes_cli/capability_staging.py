@@ -280,6 +280,66 @@ def stage_brand_capabilities(home: Path | str, root: Path | None = None) -> None
         os.replace(tmp, stamp_path)
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def seed_baked_capabilities(home: Path | str, root: Path | None = None) -> None:
+    """Seed baked-in (vendored) capabilities into `home` — LOCAL only, no network.
+
+    Reads capabilities/*.json in the repo: merges each mcp-servers fragment into config.yaml
+    (idempotent, never clobbering a user entry, ${CAPABILITY_DIR} -> <home>/plugins) and copies
+    workflows to $HERMES_HOME/workflows/. Fail-safe: never raises.
+    """
+    try:
+        import yaml
+        home = Path(home)
+        cap_dir = _repo_root() / "capabilities"
+        if not cap_dir.is_dir():
+            return
+        text_sub = str(home / "plugins")
+        for manifest_path in sorted(cap_dir.glob("*.json")):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            # workflows -> $HERMES_HOME/workflows (if absent)
+            for rel in manifest.get("workflows") or []:
+                src = _repo_root() / rel
+                if src.is_file():
+                    dst = home / "workflows" / src.name
+                    if not dst.exists():
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dst)
+            # mcp_servers fragment -> config.yaml (merge missing only)
+            frag_name = manifest.get("mcpServersFile")
+            frag = cap_dir / frag_name if frag_name else None
+            if frag and frag.is_file():
+                try:
+                    entries = (yaml.safe_load(frag.read_text(encoding="utf-8")) or {}).get("mcp_servers") or {}
+                except Exception:
+                    entries = {}
+                if entries:
+                    from hermes_cli import config as config_mod
+                    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+                    token = set_hermes_home_override(str(home))
+                    try:
+                        cfg = config_mod.load_config() or {}
+                        existing = cfg.setdefault("mcp_servers", {})
+                        changed = False
+                        for name, entry in entries.items():
+                            if name in existing:
+                                continue
+                            existing[name] = _resolve_placeholders(entry, text_sub)
+                            changed = True
+                        if changed:
+                            config_mod.save_config(cfg)
+                    finally:
+                        reset_hermes_home_override(token)
+    except Exception:
+        log.debug("seed_baked_capabilities failed", exc_info=True)
+
+
 def run_brand_startup(home: Path | str, root: Path | None = None) -> None:
     """Single startup entry: write the discoverable brand.json + stage capabilities.
 
@@ -293,3 +353,7 @@ def run_brand_startup(home: Path | str, root: Path | None = None) -> None:
         stage_brand_capabilities(home, root)
     except Exception:
         log.debug("stage_brand_capabilities failed", exc_info=True)
+    try:
+        seed_baked_capabilities(home, root)
+    except Exception:
+        log.debug("seed_baked_capabilities failed", exc_info=True)
