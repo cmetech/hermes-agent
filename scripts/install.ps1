@@ -2110,7 +2110,7 @@ function Set-PathVariable {
     # baked the per-brand default home into every resolver, so for the DEFAULT home a
     # global User-scope HERMES_HOME is redundant AND it collides when two brands
     # coexist on one machine (the second brand would load the first brand's home).
-    $defaultHermesHome = "$env:LOCALAPPDATA\hermes"   # per-brand default (home emitter rewrites the segment)
+    $defaultHermesHome = "$env:LOCALAPPDATA\otto"   # per-brand default (home emitter rewrites the segment)
     $currentHermesHome = [Environment]::GetEnvironmentVariable("HERMES_HOME", "User")
     if ($HermesHome -ieq $defaultHermesHome) {
         # Default home: never persist a global var. Remove a stale auto-set one (any
