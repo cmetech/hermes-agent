@@ -12,7 +12,8 @@ all authored workflows follow this document.
 | `description` | yes | one-line human description |
 | `version` | yes | semver string, bump on edit |
 | `tags` | no | list; shown in listings (always include `ericsson`) |
-| `requires.toolsets` | no | toolsets the nodes use (documentation only — NOT validated; availability is checked by the agent at run time) |
+| `requires.toolsets` | no | plugin toolsets whose runtime schemas the nodes use |
+| `requires.mcp_servers` | no | MCP registrations whose checked-in runtime tool schemas the nodes use |
 | `requires.env` | no | env vars needed; unset → validate WARNING (not error) |
 | `inputs` | no | list of `{name, default?}`; set at start with `--input name=value` |
 | `nodes` | yes | ordered list (see below) |
@@ -26,10 +27,18 @@ Common: `id` (slug, unique), `kind`, optional `depends_on` (list of ids), option
 `side_effects: true` (outward action — send/post/create; resume will never
 silently re-run it).
 
+`tools` is an additive, optional list for the generic v1 controller so workflows
+authored before this field remain valid and executable. New workflows should declare
+it. Ericsson manifest-owned workflows must declare a non-empty `tools` list and name
+those same tools in their prompt; catalog validation resolves the names against
+runtime plugin schemas, checked-in local MCP schemas, and the manifest's explicit
+`workflowCoreTools` allowlist. Free-text or globally assumed tools are not accepted
+at that managed-source boundary.
+
 | kind | Required field | Semantics |
 |---|---|---|
 | `prompt` | `prompt` | agent does the work with judgment |
-| `tool` | `prompt` | same, but names the tool(s) to use in the prompt |
+| `tool` | `prompt` | same; optional `tools` records exact names and is required for manifest-owned Ericsson workflows |
 | `script` | `command` | agent runs the command verbatim in the run dir, captures stdout |
 | `approval` | `message` | human gate: run parks until approve/reject |
 

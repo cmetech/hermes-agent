@@ -8486,7 +8486,7 @@ def _inject_capability_env_vars() -> None:
 
     Manifest-driven so adding a capability key later is a manifest edit, not a config.py edit.
     Idempotent; fail-safe (a malformed manifest can't break CLI import). Skips category 'skill'
-    entries (they never render on the Keys page) — e.g. ERICSSON_ENV.
+    entries because they never render on the Keys page.
     """
     global _capability_env_vars_injected
     if _capability_env_vars_injected:
@@ -8502,6 +8502,8 @@ def _inject_capability_env_vars() -> None:
             try:
                 manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
             except Exception:
+                continue
+            if not isinstance(manifest, dict):
                 continue
             for entry in manifest.get("env") or []:
                 if not isinstance(entry, dict):

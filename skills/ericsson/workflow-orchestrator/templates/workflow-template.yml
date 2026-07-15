@@ -6,6 +6,7 @@ version: 1.0.0
 tags: [ericsson, example]
 requires:
   toolsets: []
+  mcp_servers: [outlook]
   env: []
 inputs:
   - {name: deliver_to, default: chat}
@@ -21,10 +22,11 @@ nodes:
     output: digest.md
   - id: send
     kind: tool
+    tools: [message_send]
     depends_on: [digest]
     when: "$inputs.deliver_to == 'email'"
     side_effects: true
-    prompt: Email digest.md to the user via the Outlook send tool.
+    prompt: Email digest.md to the user via the Outlook message_send tool.
 report:
   kanban: auto
   notify: []

@@ -30,7 +30,7 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 NODE_KINDS = {"prompt", "tool", "script", "approval"}
 TOP_KEYS = {"name", "description", "version", "tags", "requires", "inputs", "nodes", "report"}
 NODE_KEYS = {"id", "kind", "prompt", "command", "message", "depends_on", "when",
-             "output", "side_effects", "toolset"}
+             "output", "side_effects", "toolset", "tools"}
 KANBAN_MODES = {"auto", "on", "off"}
 TERMINAL = {"done", "failed", "cancelled", "rejected"}
 STALE_AFTER_MIN = 120  # default; overridable via --stale-after-minutes
@@ -193,6 +193,11 @@ def validate_workflow(doc: dict):
     if requires and not isinstance(requires, dict):
         errors.append("requires must be a mapping")
     elif isinstance(requires, dict):
+        for key in ("toolsets", "mcp_servers"):
+            values = requires.get(key, []) or []
+            if not isinstance(values, list) or any(
+                    not isinstance(value, str) or not value for value in values):
+                errors.append(f"requires.{key} must be a list of non-empty strings")
         for env_var in requires.get("env", []) or []:
             if not os.environ.get(str(env_var)):
                 warnings.append(f"required env var not set: {env_var}")
@@ -222,6 +227,13 @@ def validate_workflow(doc: dict):
             errors.append(f"node {nid}: kind must be one of {sorted(NODE_KINDS)}")
         if kind in ("prompt", "tool") and not node.get("prompt"):
             errors.append(f"node {nid}: kind {kind} requires 'prompt'")
+        tools = node.get("tools")
+        if kind == "tool" and tools is not None and (
+                not isinstance(tools, list) or not tools
+                or any(not isinstance(tool, str) or not tool for tool in tools)):
+            errors.append(f"node {nid}: tools must be a non-empty string list")
+        if kind != "tool" and tools is not None:
+            errors.append(f"node {nid}: only kind tool may declare 'tools'")
         if kind == "script" and not node.get("command"):
             errors.append(f"node {nid}: kind script requires 'command'")
         if kind == "approval" and not node.get("message"):

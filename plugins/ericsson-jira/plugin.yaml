@@ -1,10 +1,9 @@
 name: ericsson-jira
 version: 1.0.0
-description: "Ericsson Jira tools — assigned-ticket listing (with GitLab-URL extraction), issue details, and comments. Gated on ERICSSON_ENV."
+description: "Ericsson Jira tools — assigned-ticket listing (with GitLab-URL extraction), issue details, and comments."
 author: Ericsson (cmetech)
 kind: backend
 provides_tools: [jira_my_tickets, jira_get_issue, jira_add_comment]
 requires_env:
-  - ERICSSON_ENV
   - JIRA_BASE_URL
   - JIRA_PAT
