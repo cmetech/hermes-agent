@@ -4,13 +4,15 @@ version: 1.0.0
 tags: [ericsson, outlook, email]
 requires:
   toolsets: []              # Outlook arrives via MCP; validated at runtime
-  env: [ERICSSON_ENV]
+  mcp_servers: [outlook]
+  env: []
 inputs:
   - {name: since, default: 1d}
   - {name: limit, default: "15"}
 nodes:
   - id: collect
     kind: tool
+    tools: [message_list, message_read]
     prompt: >
       Using the Outlook MCP message_list tool, list unread inbox mail using this run's
       `since` and `limit` input values (shown in the `inputs` field of the workflow_ctl

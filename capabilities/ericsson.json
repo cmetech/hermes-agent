@@ -1,24 +1,12 @@
 {
   "name": "ericsson",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Shared Ericsson coworker capabilities (OTTO + LOOP24)",
-  "requiresEnv": {
-    "ERICSSON_ENV": "1"
-  },
-  "disabledByDefault": {
-    "skills": [
-      "workflow-orchestrator",
-      "workflow-builder"
-    ],
-    "toolsets": [
-      "ericsson-jira",
-      "ericsson-teams"
-    ]
-  },
   "skills": [
     "skills/ericsson/workflow-orchestrator",
     "skills/ericsson/workflow-builder",
-    "skills/ericsson/opportunity-visuals"
+    "skills/ericsson/opportunity-visuals",
+    "skills/ericsson/onboard-ericsson-capabilities"
   ],
   "plugins": [
     "plugins/ericsson-jira",
@@ -28,6 +16,7 @@
   "mcpLocal": [
     "mcp/outlook-mcp"
   ],
+  "workflowCoreTools": [],
   "workflows": [
     "capabilities/workflows/my-tickets-summary.yml",
     "capabilities/workflows/inbox-digest.yml"
@@ -55,8 +44,13 @@
       "description": "Glean API token",
       "category": "tool",
       "password": true
+    },
+    {
+      "key": "ERICSSON_GRAPH_CLIENT_ID",
+      "description": "Optional Microsoft Graph public-client ID override for Ericsson Teams tools",
+      "category": "tool"
     }
   ],
-  "vendoredFrom": "081faab",
+  "vendoredFrom": "4c9f19626e457dd4725fe94e44867ca146d9c33b",
   "mcpServersFile": "mcp-servers.yaml"
 }

@@ -1,0 +1,312 @@
+{
+  "capabilities": [
+    {
+      "aliases": [
+        "GitLab CI audit",
+        "pipeline policy audit",
+        "CI security review"
+      ],
+      "displayName": "CI File Auditor",
+      "entry": "references/capabilities/ci-file-auditor.md",
+      "goals": [
+        "Audit these GitLab projects for CI policy coverage.",
+        "Find unsafe CI variables or pipeline practices.",
+        "Explain what is missing before CI audits can run."
+      ],
+      "id": "ci-file-auditor",
+      "maturity": "planned-not-implemented",
+      "recommendationEligible": false
+    },
+    {
+      "aliases": [
+        "Co-Worker onboarding",
+        "Ericsson capability guide",
+        "capability training"
+      ],
+      "displayName": "Ericsson Capability Onboarding",
+      "entry": "references/capabilities/ericsson-capability-onboarding.md",
+      "goals": [
+        "Onboard me to the Co-Worker capabilities.",
+        "Help me find Ericsson capabilities for my job.",
+        "Resume my Ericsson capability onboarding."
+      ],
+      "id": "ericsson-capability-onboarding",
+      "maturity": "available",
+      "recommendationEligible": false
+    },
+    {
+      "aliases": [
+        "internal knowledge search",
+        "Glean MCP",
+        "enterprise document search"
+      ],
+      "displayName": "Glean Search",
+      "entry": "references/capabilities/glean-search.md",
+      "goals": [
+        "Search our internal knowledge for this product.",
+        "Find internal documents that answer my question.",
+        "Summarize top internal search results with source links."
+      ],
+      "id": "glean-search",
+      "maturity": "available",
+      "recommendationEligible": true
+    },
+    {
+      "aliases": [
+        "my Jira tickets",
+        "assigned issue digest",
+        "Jira workload summary"
+      ],
+      "displayName": "Jira Assigned-Ticket Summary",
+      "entry": "references/capabilities/jira-assigned-ticket-summary.md",
+      "goals": [
+        "Summarize the unresolved Jira tickets assigned to me.",
+        "Group my assigned Jira work by priority.",
+        "Create a chat preview of my Jira ticket digest."
+      ],
+      "id": "jira-assigned-ticket-summary",
+      "maturity": "available",
+      "recommendationEligible": true
+    },
+    {
+      "aliases": [
+        "batch defect automation",
+        "assigned Jira defect triage",
+        "Jira GitLab batch loop"
+      ],
+      "displayName": "Jira Defect Loop",
+      "entry": "references/capabilities/jira-defect-loop.md",
+      "goals": [
+        "Triage and fix all my assigned Jira defects.",
+        "Explain the planned Jira Defect Loop.",
+        "Tell me why the batch defect workflow cannot run."
+      ],
+      "id": "jira-defect-loop",
+      "maturity": "partially-ported",
+      "recommendationEligible": false
+    },
+    {
+      "aliases": [
+        "ticket to merge request",
+        "Jira defect fix",
+        "GitLab fix automation"
+      ],
+      "displayName": "Jira to GitLab",
+      "entry": "references/capabilities/jira-to-gitlab.md",
+      "goals": [
+        "Fix this Jira defect and open a GitLab merge request.",
+        "Explain what is already available for Jira to GitLab.",
+        "Tell me what is missing before ticket-to-MR automation can run."
+      ],
+      "id": "jira-to-gitlab",
+      "maturity": "partially-ported",
+      "recommendationEligible": false
+    },
+    {
+      "aliases": [
+        "Jira issue tools",
+        "Jira ticket lookup",
+        "Jira comment tool"
+      ],
+      "displayName": "Ericsson Jira Tools",
+      "entry": "references/capabilities/jira-tools.md",
+      "goals": [
+        "Show the unresolved Jira tickets assigned to me.",
+        "Get the details of a Jira issue.",
+        "Prepare a Jira comment for my approval."
+      ],
+      "id": "jira-tools",
+      "maturity": "available",
+      "recommendationEligible": true
+    },
+    {
+      "aliases": [
+        "opportunity infographic",
+        "wins visual",
+        "pipeline progression"
+      ],
+      "displayName": "Opportunity Visuals",
+      "entry": "references/capabilities/opportunity-visuals.md",
+      "goals": [
+        "Create an Ericsson wins visual from an opportunity spreadsheet.",
+        "Show positive opportunity progression over selected months.",
+        "Explain exclusions and warnings in a generated visual."
+      ],
+      "id": "opportunity-visuals",
+      "maturity": "available",
+      "recommendationEligible": true
+    },
+    {
+      "aliases": [
+        "unread email digest",
+        "Outlook summary",
+        "inbox action list"
+      ],
+      "displayName": "Outlook Inbox Digest",
+      "entry": "references/capabilities/outlook-inbox-digest.md",
+      "goals": [
+        "Give me a digest of unread Outlook messages.",
+        "Summarize unread email from the last eight hours.",
+        "Explain the action-needed items in my latest inbox digest."
+      ],
+      "id": "outlook-inbox-digest",
+      "maturity": "available",
+      "recommendationEligible": true
+    },
+    {
+      "aliases": [
+        "Outlook MCP",
+        "local email tools",
+        "Outlook calendar tools"
+      ],
+      "displayName": "Outlook Tools",
+      "entry": "references/capabilities/outlook-tools.md",
+      "goals": [
+        "Show unread Outlook messages from the last day.",
+        "Open a draft reply for my review.",
+        "List upcoming Outlook calendar events."
+      ],
+      "id": "outlook-tools",
+      "maturity": "available",
+      "recommendationEligible": true
+    },
+    {
+      "aliases": [
+        "legacy privacy vault",
+        "file anonymization",
+        "sensitive token replacement"
+      ],
+      "displayName": "Pseudonymization",
+      "entry": "references/capabilities/pseudonymization.md",
+      "goals": [
+        "Tell me whether Co-Worker supports the old Pseudonymization flow.",
+        "Explain whether Co-Worker can pseudonymize a file.",
+        "Tell me if a privacy-vault port is planned."
+      ],
+      "id": "pseudonymization",
+      "maturity": "not-supported-no-port-planned",
+      "recommendationEligible": false
+    },
+    {
+      "aliases": [
+        "restore pseudonymized file",
+        "privacy-vault restoration",
+        "token mapping restore"
+      ],
+      "displayName": "Re-Identification",
+      "entry": "references/capabilities/re-identification.md",
+      "goals": [
+        "Restore a legacy pseudonymized file.",
+        "Explain why Re-Identification cannot run.",
+        "Tell me which mapping the old restoration flow requires."
+      ],
+      "id": "re-identification",
+      "maturity": "planned-not-implemented",
+      "recommendationEligible": false
+    },
+    {
+      "aliases": [
+        "Microsoft Teams tools",
+        "Teams channels",
+        "Graph device code"
+      ],
+      "displayName": "Ericsson Teams Tools",
+      "entry": "references/capabilities/teams-tools.md",
+      "goals": [
+        "Show me which Teams and channels I can access.",
+        "Read recent messages from a selected Teams channel.",
+        "Draft a Teams channel message for approval."
+      ],
+      "id": "teams-tools",
+      "maturity": "available",
+      "recommendationEligible": true
+    },
+    {
+      "aliases": [
+        "third-party lifecycle tracker",
+        "3PP LCM",
+        "EOS EOM spreadsheet"
+      ],
+      "displayName": "3PP Support and LCM Tracker",
+      "entry": "references/capabilities/third-party-support-lcm-tracker.md",
+      "goals": [
+        "Check lifecycle and EOS dates in this third-party tracker.",
+        "Explain how the planned LCM enrichment records evidence.",
+        "Tell me what is missing before lifecycle workbook updates can run."
+      ],
+      "id": "third-party-support-lcm-tracker",
+      "maturity": "planned-not-implemented",
+      "recommendationEligible": false
+    },
+    {
+      "aliases": [
+        "test case generation",
+        "requirements to spreadsheet",
+        "TOL test cases"
+      ],
+      "displayName": "TOL Generation",
+      "entry": "references/capabilities/tol-generation.md",
+      "goals": [
+        "Turn this requirements document into structured test cases.",
+        "Explain the planned TOL test-case spreadsheet flow.",
+        "Tell me what parser and export pieces TOL Generation needs."
+      ],
+      "id": "tol-generation",
+      "maturity": "planned-not-implemented",
+      "recommendationEligible": false
+    },
+    {
+      "aliases": [
+        "Windows system report",
+        "laptop troubleshooting",
+        "PowerShell diagnostic"
+      ],
+      "displayName": "Windows Laptop Diagnostic",
+      "entry": "references/capabilities/windows-laptop-diagnostic.md",
+      "goals": [
+        "Diagnose a problem on my Windows laptop.",
+        "Explain the planned Windows laptop diagnostic.",
+        "Tell me what the diagnostic report would inspect."
+      ],
+      "id": "windows-laptop-diagnostic",
+      "maturity": "planned-not-implemented",
+      "recommendationEligible": false
+    },
+    {
+      "aliases": [
+        "build an automation",
+        "workflow designer",
+        "YAML workflow creation"
+      ],
+      "displayName": "Workflow Builder",
+      "entry": "references/capabilities/workflow-builder.md",
+      "goals": [
+        "Help me build a repeatable workflow for this task.",
+        "Design an Outlook digest workflow with an approval before email.",
+        "Change my workflow to post to Teams only when results exist."
+      ],
+      "id": "workflow-builder",
+      "maturity": "available",
+      "recommendationEligible": true
+    },
+    {
+      "aliases": [
+        "workflow runner",
+        "workflow status",
+        "deterministic automation"
+      ],
+      "displayName": "Workflow Orchestrator",
+      "entry": "references/capabilities/workflow-orchestrator.md",
+      "goals": [
+        "Show me which workflows are available.",
+        "Run a validated Ericsson workflow.",
+        "Resume or inspect an interrupted workflow run."
+      ],
+      "id": "workflow-orchestrator",
+      "maturity": "available",
+      "recommendationEligible": true
+    }
+  ],
+  "catalogVersion": "0.4.0",
+  "schemaVersion": 1
+}

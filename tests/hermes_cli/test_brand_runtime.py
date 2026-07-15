@@ -8,10 +8,44 @@ import pytest
 
 from hermes_cli import brand_config
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 CANONICAL_KEYS = [
     "schemaVersion", "slug", "displayName", "appId", "scheme",
     "schemes", "homeDir", "releasesRepo", "updateCommand", "gateway",
 ]
+
+
+def _real_brand_descriptors():
+    for descriptor_path in sorted((REPO_ROOT / "brands").glob("*.json")):
+        if descriptor_path.name == "schema.json" or descriptor_path.name.startswith("_"):
+            continue
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+        if isinstance(descriptor.get("slug"), str):
+            yield descriptor_path, descriptor
+
+
+def test_every_real_brand_exposes_ungated_ericsson_onboarding():
+    for descriptor_path, descriptor in _real_brand_descriptors():
+        # Only the obsolete Ericsson set gate is forbidden. Generic
+        # capabilityRequiresEnv support remains valid for other future sets.
+        assert not descriptor.get("capabilityRequiresEnv", {}).get("ericsson"), descriptor_path
+        skill_curation = descriptor.get("curation", {}).get("skills", {})
+        assert "onboard-ericsson-capabilities" not in skill_curation.get("exclude", []), descriptor_path
+        assert "onboard-ericsson-capabilities" not in skill_curation.get("disabledByDefault", []), descriptor_path
+
+
+def test_capability_env_injection_comment_has_no_obsolete_ericsson_gate():
+    config_source = (REPO_ROOT / "hermes_cli" / "config.py").read_text(encoding="utf-8")
+    assert "e.g. ERICSSON_ENV" not in config_source
+
+
+def test_bundled_ericsson_manifest_lists_onboarding_skill_exactly_once():
+    manifest = json.loads(
+        (REPO_ROOT / "capabilities" / "ericsson.json").read_text(encoding="utf-8")
+    )
+    skill = "skills/ericsson/onboard-ericsson-capabilities"
+    assert manifest["skills"].count(skill) == 1
+    assert (REPO_ROOT / skill / "SKILL.md").is_file()
 
 
 def test_brand_json_payload_otto_keys_and_values():

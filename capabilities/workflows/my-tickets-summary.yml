@@ -4,12 +4,14 @@ version: 1.0.0
 tags: [ericsson, jira]
 requires:
   toolsets: [ericsson-jira]
-  env: [ERICSSON_ENV, JIRA_BASE_URL, JIRA_PAT]
+  mcp_servers: [outlook]
+  env: [JIRA_BASE_URL, JIRA_PAT]
 inputs:
   - {name: deliver_to, default: chat}   # chat | email
 nodes:
   - id: fetch
     kind: tool
+    tools: [jira_my_tickets]
     prompt: >
       Fetch my open Jira tickets with the jira_my_tickets tool (max 25).
       Save the raw JSON result to tickets.json in the run dir.
@@ -29,6 +31,7 @@ nodes:
     message: Review summary.md before it is emailed to you.
   - id: send
     kind: tool
+    tools: [message_send]
     depends_on: [approve_send]
     side_effects: true
     prompt: >
