@@ -341,6 +341,96 @@ def seed_baked_capabilities(home: Path | str, root: Path | None = None) -> None:
         log.debug("seed_baked_capabilities failed", exc_info=True)
 
 
+BRAND_DEFAULTS_MARKER = ".brand-defaults-seeded.json"
+BRAND_DEFAULTS_SCHEMA_VERSION = 1
+
+
+def seed_brand_defaults(home: Path | str, root: Path | None = None) -> None:
+    """Seed the active brand's curation.*.disabledByDefault into config.yaml ONCE.
+
+    Activates the brand descriptor's `curation.skills.disabledByDefault` /
+    `curation.tools.disabledByDefault`: on first run each listed name is unioned
+    into config.yaml (`skills.disabled` / `disabled_toolsets`) so it ships toggled
+    OFF but still visible on the Skills page. A marker file records the names
+    already seeded, so this is a first-run seed only — a user who later re-enables
+    a seeded skill/toolset is NOT re-disabled on the next startup. (Contrast with
+    capability-set staging, which re-disables managed content on a version bump.)
+
+    Fail-safe: any error is logged and swallowed — must never block startup.
+    """
+    try:
+        slug = brand_config.resolve_active_brand(root)
+        try:
+            descriptor = brand_config.load_brand(slug, root)
+        except Exception:
+            log.debug("seed_brand_defaults: could not load descriptor for %r", slug, exc_info=True)
+            return
+        curation = descriptor.get("curation") or {}
+        skills_dbd = [
+            str(x) for x in ((curation.get("skills") or {}).get("disabledByDefault") or [])
+            if isinstance(x, str)
+        ]
+        tools_dbd = [
+            str(x) for x in ((curation.get("tools") or {}).get("disabledByDefault") or [])
+            if isinstance(x, str)
+        ]
+        if not skills_dbd and not tools_dbd:
+            return  # nothing to seed — the no-op path
+
+        home = Path(home)
+        marker_path = home / BRAND_DEFAULTS_MARKER
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except Exception:
+            marker = {}
+        seeded_skills = set(marker.get("skills") or [])
+        seeded_tools = set(marker.get("toolsets") or [])
+
+        new_skills = [s for s in skills_dbd if s not in seeded_skills]
+        new_tools = [t for t in tools_dbd if t not in seeded_tools]
+        if not new_skills and not new_tools:
+            return  # already seeded once — respect the user's toggles
+
+        # config IO must target the SAME home being seeded (see stage_bundle note).
+        from hermes_cli import config as config_mod
+        from hermes_cli.brand_config import _union
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        token = set_hermes_home_override(str(home))
+        try:
+            cfg = config_mod.load_config() or {}
+            changed = False
+            if new_skills:
+                skills_cfg = cfg.setdefault("skills", {})
+                merged = _union(skills_cfg.get("disabled"), new_skills)
+                if merged != skills_cfg.get("disabled"):
+                    skills_cfg["disabled"] = merged
+                    changed = True
+            if new_tools:
+                merged = _union(cfg.get("disabled_toolsets"), new_tools)
+                if merged != cfg.get("disabled_toolsets"):
+                    cfg["disabled_toolsets"] = merged
+                    changed = True
+            if changed:
+                config_mod.save_config(cfg)
+        finally:
+            reset_hermes_home_override(token)
+
+        # Record ALL descriptor defaults as seeded (only reached once the config
+        # round-trip above completed) so they are never reconsidered.
+        marker_out = {
+            "schemaVersion": BRAND_DEFAULTS_SCHEMA_VERSION,
+            "skills": sorted(seeded_skills | set(skills_dbd)),
+            "toolsets": sorted(seeded_tools | set(tools_dbd)),
+        }
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = marker_path.with_name(f"{marker_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        tmp.write_text(json.dumps(marker_out, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, marker_path)
+    except Exception:
+        log.debug("seed_brand_defaults failed", exc_info=True)
+
+
 def run_brand_startup(home: Path | str, root: Path | None = None) -> None:
     """Single startup entry: write the discoverable brand.json + stage capabilities.
 
@@ -358,3 +448,7 @@ def run_brand_startup(home: Path | str, root: Path | None = None) -> None:
         seed_baked_capabilities(home, root)
     except Exception:
         log.debug("seed_baked_capabilities failed", exc_info=True)
+    try:
+        seed_brand_defaults(home, root)
+    except Exception:
+        log.debug("seed_brand_defaults failed", exc_info=True)
