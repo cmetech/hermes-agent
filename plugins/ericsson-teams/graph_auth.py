@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import os
+import secrets
+import stat
 from pathlib import Path
 
 CLIENT_ID = os.environ.get("ERICSSON_GRAPH_CLIENT_ID",
@@ -33,19 +35,201 @@ def cache_path() -> Path:
 def _app():
     import msal
     cache = msal.SerializableTokenCache()
-    p = cache_path()
-    if p.exists():
-        cache.deserialize(p.read_text())
+    serialized = _read_cache_text()
+    if serialized is not None:
+        cache.deserialize(serialized)
     app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY,
                                         token_cache=cache)
     return app, cache
 
 
+def _read_cache_text() -> str | None:
+    try:
+        if os.name == "posix":
+            return _read_cache_posix()
+        path = cache_path()
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+    except (OSError, UnicodeError, ValueError):
+        raise AuthRequired(
+            "could not read the Microsoft Graph sign-in cache securely"
+        ) from None
+
+
+def _read_cache_posix() -> str | None:
+    path = cache_path()
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("secure no-follow opens are unavailable")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        directory_fd = os.open(path.parent, directory_flags)
+    except FileNotFoundError:
+        return None
+    descriptor: int | None = None
+    try:
+        directory_stat = os.fstat(directory_fd)
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise OSError("cache parent is not a directory")
+        if directory_stat.st_uid != os.geteuid():
+            raise OSError("cache parent is not owned by the current user")
+        os.fchmod(directory_fd, 0o700)
+        if stat.S_IMODE(os.fstat(directory_fd).st_mode) != 0o700:
+            raise OSError("cache parent permissions are not private")
+        file_flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(path.name, file_flags, dir_fd=directory_fd)
+        except FileNotFoundError:
+            return None
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError("cache destination is not a regular file")
+        if opened.st_uid != os.geteuid():
+            raise OSError("cache destination is not owned by the current user")
+        os.fchmod(descriptor, 0o600)
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
+            raise OSError("cache permissions are not private")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 16 * 1024 * 1024:
+                raise ValueError("cache is too large")
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_fd)
+
+
 def _persist(cache) -> None:
-    if cache.has_state_changed:
-        p = cache_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(cache.serialize())
+    if not cache.has_state_changed:
+        return
+    try:
+        serialized = cache.serialize().encode("utf-8")
+        if os.name == "posix":
+            _persist_posix(serialized)
+        else:
+            _persist_portable(serialized)
+    except (OSError, UnicodeError, TypeError, ValueError):
+        raise AuthRequired(
+            "could not store the Microsoft Graph sign-in cache securely"
+        ) from None
+
+
+def _persist_posix(serialized: bytes) -> None:
+    """Atomically replace the cache through a private, no-follow directory."""
+    path = cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("secure no-follow opens are unavailable")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_fd = os.open(path.parent, directory_flags)
+    temporary_name: str | None = None
+    temporary_fd: int | None = None
+    try:
+        directory_stat = os.fstat(directory_fd)
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise OSError("cache parent is not a directory")
+        if directory_stat.st_uid != os.geteuid():
+            raise OSError("cache parent is not owned by the current user")
+        os.fchmod(directory_fd, 0o700)
+        if stat.S_IMODE(os.fstat(directory_fd).st_mode) != 0o700:
+            raise OSError("cache parent permissions are not private")
+
+        try:
+            current = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None and not stat.S_ISREG(current.st_mode):
+            raise OSError("cache destination is not a regular file")
+
+        file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow
+        file_flags |= getattr(os, "O_CLOEXEC", 0)
+        for _ in range(8):
+            candidate = f".{path.name}.{secrets.token_hex(8)}.tmp"
+            try:
+                temporary_fd = os.open(
+                    candidate, file_flags, 0o600, dir_fd=directory_fd
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if temporary_fd is None or temporary_name is None:
+            raise OSError("could not reserve a private cache temporary file")
+
+        view = memoryview(serialized)
+        while view:
+            written = os.write(temporary_fd, view)
+            if written <= 0:
+                raise OSError("short cache write")
+            view = view[written:]
+        os.fchmod(temporary_fd, 0o600)
+        temporary_stat = os.fstat(temporary_fd)
+        if not stat.S_ISREG(temporary_stat.st_mode):
+            raise OSError("cache temporary is not a regular file")
+        if temporary_stat.st_uid != os.geteuid():
+            raise OSError("cache temporary is not owned by the current user")
+        if stat.S_IMODE(temporary_stat.st_mode) != 0o600:
+            raise OSError("cache temporary permissions are not private")
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary_name = None
+        os.fsync(directory_fd)
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        os.close(directory_fd)
+
+
+def _persist_portable(serialized: bytes) -> None:
+    """Keep atomic replacement semantics on Windows using native path APIs."""
+    path = cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        view = memoryview(serialized)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short cache write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary, path)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def get_token() -> str:

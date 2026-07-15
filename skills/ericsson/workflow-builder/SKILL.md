@@ -21,7 +21,8 @@ workflow-orchestrator skill can execute. Read the schema FIRST:
 1. **Understand the idea.** Restate it in one sentence; confirm.
 2. **Interview — one question at a time** (see
    `${HERMES_SKILL_DIR}/references/interview-guide.md`). Cover: goal and
-   trigger (on-demand vs scheduled), which tools each step uses (offer the
+   trigger (on-demand vs scheduled), which tools each step uses (record every
+   tool node's exact runtime names in its required `tools` list; offer the
    Ericsson toolsets and MCP tools you can see), step order and data handoff
    (each step's output file), conditions/branches, human approval gates
    (anything outward-facing — email/Teams posts/Jira comments — should have

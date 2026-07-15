@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "fixture_id": "SYNTH-JIRA-DIGEST-001",
+  "synthetic": true,
+  "mode": "offline",
+  "project": "Northstar Sandbox",
+  "assignee": "Example User",
+  "tickets": [
+    {
+      "key": "SYNTH-JIRA-101",
+      "summary": "Confirm sandbox access checklist",
+      "status": "In Progress",
+      "priority": "Highest"
+    },
+    {
+      "key": "SYNTH-JIRA-102",
+      "summary": "Review mock release notes",
+      "status": "To Do",
+      "priority": "High"
+    },
+    {
+      "key": "SYNTH-JIRA-103",
+      "summary": "Validate sample dashboard",
+      "status": "Blocked",
+      "priority": "Medium"
+    }
+  ]
+}
