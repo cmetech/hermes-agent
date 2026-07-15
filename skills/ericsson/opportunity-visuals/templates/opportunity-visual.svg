@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080"
+     viewBox="0 0 1920 1080" role="img" aria-labelledby="title desc">
+  <title id="title">Ericsson Opportunity Visual</title>
+  <desc id="desc">Opportunity stage progression table</desc>
+  <style>
+    text { font-family: "Ericsson Hilda", "Inter", "Segoe UI", Arial, sans-serif; fill: #000000; }
+    .title { font-size: 30px; font-weight: 600; }
+    .header { font-size: 17px; font-weight: 600; }
+    .body { font-size: 16px; }
+    .stage { font-size: 16px; font-weight: 600; fill: #FFFFFF; }
+    .grid { stroke: #D8D8D8; stroke-width: 1; }
+  </style>
+  <rect id="background" width="1920" height="1080" fill="#FFFFFF"/>
+  <g id="content"/>
+</svg>
