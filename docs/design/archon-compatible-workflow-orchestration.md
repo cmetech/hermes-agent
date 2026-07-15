@@ -22,6 +22,8 @@ The workflow engine will live at the edge as an additive plugin plus skills. Her
 6. Provide a workflow-authoring skill that produces an entire valid package, not merely a YAML file.
 7. Keep Ericsson-specific policy and distribution separate from the portable workflow definition.
 8. Keep future merges from upstream Hermes routine by minimizing and documenting changes to upstream-owned files.
+9. Make workflow discovery, description, active/recent run status, pending actions, and sanitized diagnostics available without a visual workflow UI.
+10. Guarantee bounded worker lifecycles, explicit shutdown behavior, restart reconciliation, and resource cleanup on a laptop-class host.
 
 ## Non-Goals
 
@@ -30,7 +32,7 @@ The workflow engine will live at the edge as an additive plugin plus skills. Her
 - Adding a workflow model tool to the permanent Hermes tool schema.
 - Mutating a live conversation's system prompt or toolset.
 - Guaranteeing byte-for-byte behavior for provider-specific Archon SDK fields that Hermes cannot implement safely.
-- Building a workflow dashboard in the first milestone. CLI, chat, gateway, cron, state, and artifacts are the initial surfaces.
+- Building a visual workflow dashboard/editor in the first milestone. Workflow catalog and run inspection remain first-class through CLI, chat, gateway, TUI, desktop, cron-delivered links/IDs, state, and artifacts.
 - Migrating deployed Ericsson workflow runs. There are no deployed installations, so the current schema is replaced rather than versioned alongside the new one.
 
 ## Approaches Considered
@@ -207,7 +209,9 @@ class PluginAgentRunRequest:
     skills: tuple[str, ...] = ()
     workdir: Path | None = None
     max_iterations: int = 90
-    timeout_seconds: float | None = None
+    idle_timeout_seconds: float = 300.0
+    wall_timeout_seconds: float = 1800.0
+    provider_request_timeout_seconds: float = 300.0
 
 @dataclass(frozen=True)
 class PluginAgentRunResult:
@@ -229,6 +233,8 @@ Shared workflow context persists by Hermes session ID, not by reusing a mutable 
 Each node session records a cache fingerprint covering provider, model/API mode, byte-identical system prompt, exposed tool schemas and order, name/toolset policy, MCP schemas, profile, workdir-derived prompt state, reasoning configuration, and other cache-affecting runner inputs. A `context: shared` edge is valid only when its fingerprint matches the predecessor exactly. Resume reconstructs from the snapshotted system prompt and schemas rather than rebuilding dynamic prompt content. If a workflow wants different tools, MCP, model, profile, or prompt-affecting settings, it must use `context: fresh`. Selected skill instructions and command content are snapshotted and combined into the new user message, preserving role alternation without modifying the system prompt.
 
 Every worker installs explicit host-owned approval, clarification, sudo, and secret-capture callbacks. It never falls into Hermes' legacy bare non-interactive auto-approval path. A dangerous action without a live answer returns a sanitized, digest-bound pending interaction and terminates the worker so the workflow can pause durably without holding resources. Resume may grant that exact action once; a changed action pauses again. Clarification answers may be durable. Sudo passwords and secret values are never persisted, logged, returned to the plugin, or carried in a resume token: already-configured profile secrets are resolved inside the host worker, while missing secrets or sudo requirements fail closed with standard setup guidance. Cron honors existing `approvals.cron_mode` and never waits for a person.
+
+The runner uses a generic managed-process primitive extracted from Hermes' existing process-registry behavior. It records PID, process start identity, and process-group/job identity before treating a worker as running; guards against PID reuse; performs cooperative cancel, bounded TERM, bounded KILL, and an unconditional wait/reap; and reconciles the final outcome into durable workflow state. No worker or descendant is fire-and-forget.
 
 ### 2. Workflow plugin
 
@@ -252,7 +258,10 @@ The generic `workflow` skill is the deterministic conversational entry point:
 
 - `/workflow run <name> [arguments]`
 - `/workflow list`
+- `/workflow show <name>`
+- `/workflow runs [--status <state>]`
 - `/workflow status <run-id>`
+- `/workflow events <run-id> [--tail <count>]`
 - `/workflow approve <run-id> [comment]`
 - `/workflow reject <run-id> [reason]`
 - `/workflow resume <run-id>`
@@ -283,11 +292,59 @@ An approval or clarification ends the worker and durably pauses the run. The use
 
 For authoring, a natural request such as “build a workflow that reviews a ticket and asks before posting” selects `workflow-builder`. That skill inventories the current profile's tools, MCP servers, skills, providers, and runtimes; writes an Archon-shaped package; runs `doctor`; and offers on-demand execution or an existing Hermes cron schedule only after the package is runnable.
 
+### Operator experience without a visual workflow UI
+
+The workflow control plane has two read-only views and one action view. They all query the same discovery and run-store APIs, so CLI and conversational answers cannot disagree:
+
+1. **Catalog:** `hermes workflow list [--json]` and `show NAME [--json]` answer what is installed and what it can do. `list` returns name, description, source/precedence, compatibility, and runnable state. `show` adds argument hints, a compact textual topology (for example `collect -> [security, commercial] -> approval -> send`), node types, approval/outward-action points, required tools/skills/MCP/providers/runtimes, relevant Hermes cron schedules, and blocking compatibility findings. Inspection makes no model or network call and never reveals full prompts, secrets, or resolved secret values.
+2. **Runs:** `hermes workflow runs [--workflow NAME] [--status STATE] [--limit N] [--json]` lists active and recent runs. `status RUN_ID [--json]` returns the detailed materialized projection. `events RUN_ID [--tail N] [--json]` returns a sanitized diagnostic tail for questions such as “why did this fail?” without exposing reasoning, secrets, full prompts, or unrestricted tool arguments.
+3. **Actions:** `run`, `approve`, `reject`, `resume`, `cancel`, `abandon`, `cleanup`, and `reset-sessions` operate through compare-and-set runtime APIs. `cleanup` has `--dry-run`; destructive or outward actions retain existing confirmation and approval policy.
+
+Natural-language examples such as “What workflows can I run?”, “What does supplier review do?”, “Which workflows are running?”, “Show workflows waiting for approval”, “How far is run X?”, and “Why did it fail?” cause the workflow skill to invoke the corresponding read-only JSON command and summarize it. Explicit `/workflow ...` remains the deterministic escape hatch.
+
+Catalog and run output is profile-scoped. A local CLI may inspect that profile's runs. Chat and gateway requests additionally default to the current authenticated conversation/user scope; supplying a run ID does not bypass authorization. Cross-profile or cross-user run enumeration is never exposed by the skill.
+
+The stable run summary contract contains `action`, `run_id`, `workflow`, `status`, `started_at`, `updated_at`, `elapsed_ms`, `current_nodes`, `progress`, `attempts`, `next_retry_at`, `pending_interaction`, `last_error`, `artifacts`, `warnings`, and `next_actions`. Run states are `queued`, `running`, `waiting_retry`, `paused`, `interrupted`, `succeeded`, `failed`, `cancelled`, or `abandoned`. Node states are `pending`, `ready`, `claimed`, `running`, `waiting_retry`, `paused`, `succeeded`, `failed`, `skipped`, `cancelled`, or `interrupted`.
+
 ### 4. Scheduling
 
 Scheduled execution uses Hermes cron rather than a second scheduler. A cron job attaches the `workflow` skill and a self-contained run instruction. Existing cron provider/model/toolset/workdir/delivery fields remain authoritative for the outer job; workflow-level node overrides apply inside the run.
 
 An approval gate ends the current cron firing cleanly after delivering the run ID and review instructions. A later user approval resumes the durable workflow; cron does not wait while holding a worker.
+
+## Worker Lifecycle, Deadlines, Shutdown, and Resource Exhaustion
+
+Archon's AI `idle_timeout` and deterministic-node `timeout` remain compatible fields, but they are not the whole lifecycle contract. The runtime distinguishes:
+
+- **Semantic idle timeout:** no model, tool, child-agent, or bounded progress frame. Archon's default AI value maps to 300 seconds. A lease heartbeat proves process ownership only and never resets semantic idle time.
+- **Hard node wall deadline:** an absolute cap on the complete attempt, including provider calls, tools, MCP startup, hooks, and child agents. It defaults to 1,800 seconds for AI attempts when no stricter sidecar/config value exists.
+- **Provider request timeout:** the cap for one model request and its response stream; it is always no greater than the remaining node wall time.
+- **Deterministic process timeout:** Archon's bash/script default maps to 120 seconds unless the workflow specifies a bounded value.
+- **Parent wait deadline:** a parent AI node may wait for declared child agents only within its remaining hard deadline. The effective child deadline is the minimum of its requested limit, the remaining parent deadline, and the workflow global cap. Inline `agents.maxTurns` is an iteration limit, not a timeout.
+- **Shutdown grace:** a short configurable cooperative-cancel interval followed by TERM and KILL grace intervals. `None` never means unbounded; omitted values resolve to safe defaults before spawn.
+
+Every worker follows one state machine:
+
+```text
+spawn requested
+  -> process identity recorded (PID + start identity + group/job)
+  -> running/monitored
+  -> cooperative cancel requested
+  -> grace expires: terminate process tree
+  -> grace expires: kill process tree
+  -> wait/reap
+  -> durable succeeded | failed | cancelled | interrupted
+```
+
+The coordinator owns every worker and descendant group. The IPC channel includes a coordinator lifeline: EOF or parent loss causes the worker to cancel its local model/tool work, terminate its descendants, and exit. The coordinator still performs process-tree cleanup, so either side can finish cleanup after the other fails. PID reuse is rejected using the recorded process start identity.
+
+On an owning Hermes CLI, gateway, cron host, or desktop backend shutdown, the runtime stops admitting new nodes, persists a shutdown event, cooperatively cancels active attempts, escalates and reaps their process trees, marks incomplete attempts `interrupted`, releases leases, and exits within a bounded shutdown deadline. Closing only a renderer while its Hermes backend remains alive does not stop the workflow. The first milestone does not create an independently detached workflow daemon.
+
+After forced termination, laptop power loss, or OS kill, restart reconciliation detects stale leases/process identities, marks attempts `interrupted`, and requires normal resume rules. A suspend/wake or wall-clock jump is detected from the monotonic/UTC heartbeat gap; the coordinator reconciles ownership rather than assuming the attempt succeeded. Unknown external-side-effect outcomes pause for operator reconciliation before retry.
+
+Retries have one combined attempt budget across provider-level and workflow-level retry layers so nested retries cannot multiply unexpectedly. Fatal authentication, authorization, credit, validation, cancellation, and unknown-side-effect errors do not retry. Transient backoff is persisted and interruptible; a sleeping retry holds neither a worker nor a scheduler slot.
+
+Process-tree resident memory, descendant count, open descriptors/handles, output bytes, artifact bytes, event-journal bytes, total run storage, and retention are bounded. Exceeding a limit terminates the attempt with a typed resource error and sanitized diagnostic. Release tests cover repeated spawn/cancel/timeout cycles and assert no upward process, thread, descriptor/handle, memory, or disk-growth trend after cleanup.
 
 ## Run State and Concurrency
 
@@ -381,7 +438,7 @@ Retries are driven by classified errors and persisted next-attempt time. Exponen
 
 ## Performance Requirements
 
-- Listing and validating workflows performs no network or model calls.
+- Listing, showing, and validating workflows performs no network or model calls.
 - Discovery caches by directory metadata and file digest and invalidates deterministically.
 - Scheduler lock critical sections target less than 50 ms under normal local-filesystem load.
 - A run with 1,000 completed nodes can load its projection without replaying the full journal.
@@ -397,7 +454,11 @@ Retries are driven by classified errors and persisted next-attempt time. Exponen
 - A partially initialized run is either absent or recoverable from its snapshot and journal.
 - Corrupt projections are quarantined and rebuilt from a verified journal when possible.
 - Corrupt journals stop the run with an actionable diagnostic; they are never silently truncated.
-- Worker crash, host restart, and duplicate scheduler invocation converge through leases and compare-and-set completion.
+- Worker crash, coordinator loss, forced application shutdown, laptop suspend/wake, host restart, and duplicate scheduler invocation converge through process identity, leases, lifelines, and compare-and-set completion.
+- Provider disconnects, stalled response streams, and model failures are bounded by the provider-request, semantic-idle, and wall deadlines; cleanup does not depend on the provider returning.
+- An owning-process shutdown leaves no live workflow-owned worker or descendant. A hard crash is reconciled to `interrupted` on restart, never inferred as success.
+- Backoff persists `next_retry_at`, consumes no worker while waiting, and obeys one combined retry budget across nested provider/workflow layers.
+- Resource-limit failures are typed, journaled, sanitized, and recoverable; cleanup/retention bounds disk growth from artifacts, output, events, and abandoned runs.
 - Approval and cancellation are idempotent.
 - Resume reuses completed nodes unless `always_run` is set.
 - Workflow source changes affect new runs only.
@@ -431,12 +492,13 @@ Rules for this milestone:
 
 ### Planned upstream-core touch budget
 
-The implementation may modify only two existing upstream-owned files without a design amendment:
+The implementation may modify only three existing upstream-owned files without a design amendment:
 
 - `tools/registry.py`: generic, reversible scoped-name discovery/dispatch view used only inside an isolated worker.
 - `hermes_cli/plugins.py`: lazy `PluginContext.agent` facade, parallel to the existing `PluginContext.llm` facade.
+- `tools/process_registry.py`: consume a generic managed-process-tree primitive while preserving existing terminal background-process behavior.
 
-`agent/plugin_agent.py` and `agent/plugin_agent_worker.py` are new generic modules intended for upstream contribution. The workflow runtime itself does not modify `run_agent.py`, `model_tools.py`, `agent/agent_init.py`, `agent/tool_executor.py`, or `agent/agent_runtime_helpers.py`. If implementation evidence proves another core touch unavoidable, work pauses for an explicit design/ledger update rather than expanding the fork silently.
+`agent/plugin_agent.py`, `agent/plugin_agent_worker.py`, and `tools/managed_process.py` are new generic modules intended for upstream contribution. `tools/managed_process.py` extracts the reusable identity-guard, cross-platform process-tree termination, escalation, and reaping behavior already present in `tools/process_registry.py`; workflow code consumes that public primitive rather than importing private process-registry internals or implementing a second supervisor. The workflow runtime itself does not modify `run_agent.py`, `model_tools.py`, `agent/agent_init.py`, `agent/tool_executor.py`, or `agent/agent_runtime_helpers.py`. If implementation evidence proves another core touch unavoidable, work pauses for an explicit design/ledger update rather than expanding the fork silently.
 
 ## Testing Strategy
 
@@ -455,6 +517,8 @@ The implementation may modify only two existing upstream-owned files without a d
 - Crash between journal append and projection replacement.
 - Lock contention and timeout on POSIX and simulated Windows locking.
 - Cancellation during AI, shell, script, hook, and MCP execution.
+- Coordinator death/IPC EOF, shutdown during every worker lifecycle phase, parent/child deadline inheritance, TERM/KILL escalation, PID reuse, and unconditional wait/reap.
+- Provider stalls/disconnects, suspend/wake gaps, retry-budget exhaustion, resource-limit termination, and repeated cleanup/retention cycles.
 
 ### Integration
 
@@ -475,7 +539,7 @@ The implementation may modify only two existing upstream-owned files without a d
 ## Acceptance Criteria
 
 1. An Archon workflow package can be copied into a project and validated without YAML rewriting.
-2. `/workflow run`, `hermes workflow run`, and cron all execute through the same durable runtime.
+2. `/workflow run`, `hermes workflow run`, and cron all execute through the same durable runtime; `list`, `show`, `runs`, `status`, and sanitized `events` inspect the same catalog/store from natural language, slash commands, and CLI.
 3. Fresh contexts do not mutate the parent conversation; shared contexts resume only the intended node session.
 4. Parallel execution is bounded and duplicate schedulers cannot execute the same claim concurrently.
 5. Approvals survive process restart and accept only one winning decision.
@@ -483,8 +547,9 @@ The implementation may modify only two existing upstream-owned files without a d
 7. Tool, skill, hook, and MCP scopes are enforced at runtime rather than documented only.
 8. Interrupted runs resume without repeating completed nodes or silently repeating unknown side effects.
 9. Existing Ericsson workflows are Archon-shaped and pass portable package validation.
-10. Existing upstream-file modifications remain limited to `tools/registry.py` and `hermes_cli/plugins.py`; the two new generic runner modules and all touches are recorded in the customization ledger and covered by merge-rehearsal tests.
-11. Focused unit, concurrency, integration, security, performance, and end-to-end gates pass on Linux, macOS, and Windows-supported paths.
+10. Existing upstream-file modifications remain limited to `tools/registry.py`, `hermes_cli/plugins.py`, and `tools/process_registry.py`; the three new generic runner/process modules and all touches are recorded in the customization ledger and covered by merge-rehearsal tests.
+11. An owning Hermes shutdown leaves no live workflow-owned worker/descendant, restart reconciliation never guesses success, and repeated timeout/cancel/provider-failure cycles show no process, thread, descriptor/handle, memory, or disk-growth leak.
+12. Focused unit, concurrency, integration, security, performance, and end-to-end gates pass on Linux, macOS, and Windows-supported paths.
 
 ## Open Questions
 
