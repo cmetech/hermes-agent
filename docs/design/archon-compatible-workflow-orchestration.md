@@ -1,6 +1,6 @@
 # Archon-Compatible Workflow Orchestration Design
 
-**Status:** Design of record; approved for implementation planning
+**Status:** Final design of record; approved for implementation
 
 **Date:** 2026-07-15
 
@@ -296,7 +296,7 @@ For authoring, a natural request such as “build a workflow that reviews a tick
 
 The workflow control plane has two read-only views and one action view. They all query the same discovery and run-store APIs, so CLI and conversational answers cannot disagree:
 
-1. **Catalog:** `hermes workflow list [--json]` and `show NAME [--json]` answer what is installed and what it can do. `list` returns name, description, source/precedence, compatibility, and runnable state. `show` adds argument hints, a compact textual topology (for example `collect -> [security, commercial] -> approval -> send`), node types, approval/outward-action points, required tools/skills/MCP/providers/runtimes, relevant Hermes cron schedules, and blocking compatibility findings. Inspection makes no model or network call and never reveals full prompts, secrets, or resolved secret values.
+1. **Catalog:** `hermes workflow list [--json]` and `show NAME [--json]` answer what is installed and what it can do. `list` returns name, description, source/precedence, compatibility, and runnable state. `show` adds argument hints, portable text and Mermaid topology projections, node types, approval/outward-action points, required tools/skills/MCP/providers/runtimes, relevant Hermes cron schedules, and blocking compatibility findings. Inspection makes no model or network call and never reveals full prompts, secrets, or resolved secret values.
 2. **Runs:** `hermes workflow runs [--workflow NAME] [--status STATE] [--limit N] [--json]` lists active and recent runs. `status RUN_ID [--json]` returns the detailed materialized projection. `events RUN_ID [--tail N] [--json]` returns a sanitized diagnostic tail for questions such as “why did this fail?” without exposing reasoning, secrets, full prompts, or unrestricted tool arguments.
 3. **Actions:** `run`, `approve`, `reject`, `resume`, `cancel`, `abandon`, `cleanup`, and `reset-sessions` operate through compare-and-set runtime APIs. `cleanup` has `--dry-run`; destructive or outward actions retain existing confirmation and approval policy.
 
@@ -305,6 +305,31 @@ Natural-language examples such as “What workflows can I run?”, “What does 
 Catalog and run output is profile-scoped. A local CLI may inspect that profile's runs. Chat and gateway requests additionally default to the current authenticated conversation/user scope; supplying a run ID does not bypass authorization. Cross-profile or cross-user run enumeration is never exposed by the skill.
 
 The stable run summary contract contains `action`, `run_id`, `workflow`, `status`, `started_at`, `updated_at`, `elapsed_ms`, `current_nodes`, `progress`, `attempts`, `next_retry_at`, `pending_interaction`, `last_error`, `artifacts`, `warnings`, and `next_actions`. Run states are `queued`, `running`, `waiting_retry`, `paused`, `interrupted`, `succeeded`, `failed`, `cancelled`, or `abandoned`. Node states are `pending`, `ready`, `claimed`, `running`, `waiting_retry`, `paused`, `succeeded`, `failed`, `skipped`, `cancelled`, or `interrupted`.
+
+#### Cross-surface topology contract
+
+`show --json` always returns both renderer-neutral fields for workflows within the visualization limits:
+
+```json
+{
+  "topology_text": "collect -> [security, commercial] -> approval -> send",
+  "topology_mermaid": "flowchart LR\n  n0[\"collect (command)\"]\n  n1[\"security (prompt)\"]\n  n2[\"commercial (prompt)\"]\n  n3[\"approval (approval)\"]\n  n4[\"send (command)\"]\n  n0 --> n1\n  n0 --> n2\n  n1 --> n3\n  n2 --> n3\n  n3 --> n4",
+  "topology_warnings": []
+}
+```
+
+Both projections are generated deterministically from the same validated, normalized DAG; neither is authored by the model or accepted as executable Mermaid from workflow YAML. Nodes use generated aliases (`n0`, `n1`, …), bounded sanitized labels containing only node ID/type display text, and sorted edges. Control/ANSI characters are rejected at schema validation; the projection replaces label characters outside Unicode letters/numbers and ` -_.:/()` with a safe replacement before emission. The generator emits only `flowchart LR`, node declarations, and directed edges: Mermaid initialization directives, raw HTML, links, click handlers, styles, classes, and arbitrary directives are forbidden.
+
+Human CLI output accepts `show NAME --topology text|mermaid|both`; the default is `text`. `--json` always returns both fields and cannot be combined with an explicitly supplied human-output selector. `topology_text` is the portable and accessibility representation. Its UTF-8 encoding is bounded to 12 × 1,024 bytes and may end with a deterministic truncation summary. Mermaid generation is available for at most 100 nodes, 200 edges, and 64 × 1,024 UTF-8 bytes of source; node display labels are truncated deterministically to 80 Unicode code points including the ellipsis. Above a graph/source limit, `topology_mermaid` is `null`, `topology_text` remains available, and `topology_warnings` contains stable issue codes.
+
+Surface selection is explicit:
+
+- **Classic CLI:** use `topology_text`. Its optional Rich Markdown renderer does not execute Mermaid.
+- **Ink TUI and dashboard-embedded TUI:** use `topology_text`. Fenced Mermaid is otherwise displayed only as source code.
+- **Desktop:** include `topology_text` as the accessible/copyable summary and wrap `topology_mermaid` in a fenced `mermaid` block. The existing lazy Mermaid renderer shows source while streaming, renders the diagram after completion, and falls back to source on parse failure.
+- **Unknown or messaging surfaces:** use `topology_text` unless that adapter has an explicitly tested Mermaid capability. Generic Markdown support alone does not imply Mermaid support.
+
+This adds no Mermaid package to Python, core Hermes, CLI, or TUI. The workflow plugin only generates bounded Mermaid source; graphical rendering reuses the existing desktop capability.
 
 ### 4. Scheduling
 
@@ -439,6 +464,7 @@ Retries are driven by classified errors and persisted next-attempt time. Exponen
 ## Performance Requirements
 
 - Listing, showing, and validating workflows performs no network or model calls.
+- Text and Mermaid topology generation is deterministic and linear in nodes plus edges; it invokes no Markdown/Mermaid parser or renderer in the workflow plugin.
 - Discovery caches by directory metadata and file digest and invalidates deterministically.
 - Scheduler lock critical sections target less than 50 ms under normal local-filesystem load.
 - A run with 1,000 completed nodes can load its projection without replaying the full journal.
@@ -509,6 +535,7 @@ The implementation may modify only three existing upstream-owned files without a
 - Trigger rules, conditions, retry classification, backoff bounds, and loop termination.
 - State projection, journal validation, compare-and-set transitions, and lease expiry.
 - Tool filtering, skill scoping, structured output validation, and compatibility diagnostics.
+- Deterministic text/Mermaid graph equivalence, escaping, directive rejection, exact size limits, and text fallback.
 
 ### Concurrency and fault injection
 
@@ -528,6 +555,7 @@ The implementation may modify only three existing upstream-owned files without a
 - Per-node MCP startup and shutdown with a local test server.
 - Cron firing with attached workflow skill, delivery, and approval pause.
 - Skill command dispatch through CLI, gateway, TUI gateway, and desktop command catalog paths.
+- Surface rendering contract: CLI/TUI/dashboard/unknown use text; desktop keeps text and renders the existing fenced Mermaid path with strict security and source fallback.
 
 ### End-to-end
 
@@ -539,7 +567,7 @@ The implementation may modify only three existing upstream-owned files without a
 ## Acceptance Criteria
 
 1. An Archon workflow package can be copied into a project and validated without YAML rewriting.
-2. `/workflow run`, `hermes workflow run`, and cron all execute through the same durable runtime; `list`, `show`, `runs`, `status`, and sanitized `events` inspect the same catalog/store from natural language, slash commands, and CLI.
+2. `/workflow run`, `hermes workflow run`, and cron all execute through the same durable runtime; `list`, `show`, `runs`, `status`, and sanitized `events` inspect the same catalog/store from natural language, slash commands, and CLI. `show` exposes matching bounded text/Mermaid projections, with text on every surface and graphical Mermaid only on explicitly supported surfaces.
 3. Fresh contexts do not mutate the parent conversation; shared contexts resume only the intended node session.
 4. Parallel execution is bounded and duplicate schedulers cannot execute the same claim concurrently.
 5. Approvals survive process restart and accept only one winning decision.
@@ -553,4 +581,4 @@ The implementation may modify only three existing upstream-owned files without a
 
 ## Open Questions
 
-No architectural question blocks implementation planning. Exact mappings for provider-specific Archon fields will be finalized field-by-field in the compatibility table; unsupported fields must remain explicit diagnostics rather than guessed behavior.
+No architectural question blocks implementation. Exact mappings for provider-specific Archon fields will be finalized field-by-field in the compatibility table; unsupported fields must remain explicit diagnostics rather than guessed behavior.

@@ -2,11 +2,13 @@
 
 > **For agentic workers:** Use `superpowers:executing-plans` to implement this plan task-by-task. Use subagents only when the user explicitly authorizes delegation. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Deliver a production-grade, Archon-shaped workflow runtime for Co-worker that reuses Hermes agents, skills, tools, MCP, hooks, approvals, and cron; provides first-class workflow/run discovery and status without a visual editor; and keeps Hermes-core customization small, generic, and mergeable.
+**Goal:** Deliver a production-grade, Archon-shaped workflow runtime for Co-worker that reuses Hermes agents, skills, tools, MCP, hooks, approvals, and cron; provides first-class workflow/run discovery and status with portable text plus desktop Mermaid topology without building a visual editor; and keeps Hermes-core customization small, generic, and mergeable.
 
-**Architecture:** An additive `workflow` plugin owns compatibility, discovery, graph execution, durable state, resources, and operator commands. Generic `workflow` and `workflow-builder` skills provide chat activation and authoring. A narrowly scoped `PluginContext.agent` facade plus a generic managed-process-tree primitive are the only planned upstream-Hermes core seams; they run each agent request in a fresh host-owned worker process with bounded deadlines, shutdown, escalation, and reaping so workflow concurrency cannot mutate the parent process's global tool, MCP, hook, or working-directory state or leave orphaned descendants. Every core touch is recorded and merge-tested.
+**Architecture:** An additive `workflow` plugin owns compatibility, discovery, deterministic text/Mermaid topology projection, graph execution, durable state, resources, and operator commands. Generic `workflow` and `workflow-builder` skills provide chat activation, surface-aware presentation, and authoring. A narrowly scoped `PluginContext.agent` facade plus a generic managed-process-tree primitive are the only planned upstream-Hermes core seams; they run each agent request in a fresh host-owned worker process with bounded deadlines, shutdown, escalation, and reaping so workflow concurrency cannot mutate the parent process's global tool, MCP, hook, or working-directory state or leave orphaned descendants. Every core touch is recorded and merge-tested.
 
-**Tech Stack:** Python 3.11+, PyYAML, dataclasses, `jsonschema` from Hermes' existing `mcp`/`all` install path, Hermes plugin/skill/cron/MCP infrastructure, pytest, Node test runner for capability vendoring and brand generation.
+**Tech Stack:** Python 3.11+, PyYAML, dataclasses, `jsonschema` from Hermes' existing `mcp`/`all` install path, Hermes plugin/skill/cron/MCP infrastructure, the desktop app's existing Mermaid/Streamdown renderer, pytest, Vitest, and Node test runner for capability vendoring and brand generation.
+
+**Status:** Final; approved for implementation
 
 ## Global Constraints
 
@@ -16,6 +18,9 @@
 - The parent conversation's system prompt and tool schema remain byte-stable. `context: fresh` always uses an isolated node session.
 - `context: shared` requires an exact cache fingerprint match and reuses the snapshotted system prompt/tool schemas byte-for-byte; a cache-affecting mismatch must fail validation with guidance to use `fresh`.
 - No new model-facing core tool is added.
+- Workflow topology always has a bounded portable text projection. Bounded Mermaid source is generated from the same normalized DAG, never accepted from workflow-authored directives, and is rendered graphically only by an explicitly tested surface.
+- Classic CLI, Ink TUI, dashboard-embedded TUI, unknown gateways, and ordinary Markdown-only adapters use text topology. Desktop includes the text fallback plus a fenced Mermaid diagram. Generic Markdown support is not treated as Mermaid support.
+- Topology limits are exact: 12 × 1,024 UTF-8 bytes of text, 100 Mermaid nodes, 200 Mermaid edges, 80 Unicode code points per Mermaid node label including its ellipsis, and 64 × 1,024 UTF-8 bytes of Mermaid source. Labels truncate at 80 code points; exceeding a graph/source limit returns `null` plus a warning, never an unbounded diagram.
 - Behavioral settings live in `config.yaml`; credentials alone may use secret environment storage.
 - The plugin is opt-in through existing `plugins.enabled`; there is no workflow-specific loader exception. Ericsson capability staging enables it, while general profiles receive the existing plugin-enable remediation.
 - A lean install lacking `jsonschema` must fail closed before any `output_format` or per-node MCP work and report how to install Hermes' existing `mcp` extra. Schema validation is never silently skipped.
@@ -42,7 +47,7 @@
 - [ ] **S01: Public plugin agent runner** `risk:high` `depends:[]`
   > After this: an enabled test plugin can run a fresh Hermes tool-using worker process with enforced model/tool policy and distinct idle/wall/provider deadlines through a documented host facade; timeout, cancel, coordinator loss, and shutdown terminate and reap its process tree without mutating caller state.
 - [ ] **S02: Archon package discovery and validation** `risk:high` `depends:[]`
-  > After this: `hermes workflow list|show|validate` discovers and explains project/profile/global packages, their topology/requirements, and exact portable, mapped, and unsupported fields without making model or network calls.
+  > After this: `hermes workflow list|show|validate` discovers and explains project/profile/global packages, emits matching bounded text/Mermaid topology projections, and reports their requirements plus exact portable, mapped, and unsupported fields without making model or network calls.
 - [ ] **S03: Durable bash DAG tracer** `risk:high` `depends:[S02]`
   > After this: `hermes workflow run` executes and resumes a two-node bash DAG with snapshots, artifacts, journaled state, and cross-process-safe claims; `runs|status|events` exposes active/recent progress and sanitized diagnostics from the materialized store.
 - [ ] **S04: Command and prompt AI nodes** `risk:high` `depends:[S01,S03]`
@@ -56,7 +61,7 @@
 - [ ] **S08: Per-node tools, skills, hooks, MCP, and provider policy** `risk:high` `depends:[S01,S04,S05]`
   > After this: a node receives only its declared tools, skills, hook policy, and MCP servers, with explicit diagnostics for unsupported provider-specific fields and guaranteed cleanup.
 - [ ] **S09: Chat, gateway, desktop, and cron activation** `risk:medium` `depends:[S07,S08]`
-  > After this: natural chat, `/workflow`, `hermes workflow`, and scheduled jobs all discover workflows; explain what they do; list active/recent/waiting runs; inspect status/failure; and operate the same run/approval lifecycle without adding a permanent model tool.
+  > After this: natural chat, `/workflow`, `hermes workflow`, and scheduled jobs all discover workflows; explain what they do with portable text and desktop Mermaid topology; list active/recent/waiting runs; inspect status/failure; and operate the same run/approval lifecycle without adding a permanent model tool.
 - [ ] **S10: Workflow authoring and compatibility doctor** `risk:medium` `depends:[S02,S04,S06,S07,S08]`
   > After this: the builder skill creates a complete Archon-shaped package and the doctor explains every resource, mapping, warning, and execution blocker before a run starts.
 - [ ] **S11: Ericsson package conversion and branded distribution** `risk:medium` `depends:[S09,S10]`
@@ -67,14 +72,14 @@
 ## Boundary Map
 
 - `S01` produces `PluginAgentRunner`, `PluginAgentRunRequest`, `PluginAgentRunResult`, a fresh worker-process protocol, `ManagedProcessTree`, deadline/termination policies, and enforced name-level tool filtering. `S04`, `S05`, `S06`, and `S08` consume them.
-- `S02` produces immutable workflow definitions, discovery precedence, compatibility reports, and resolved package roots. Every later workflow slice consumes them.
+- `S02` produces immutable workflow definitions, discovery precedence, `TopologyProjection`, compatibility reports, and resolved package roots. Every later workflow slice consumes them.
 - `S03` produces `RunStore`, `RunScheduler`, `NodeClaim`, event records, artifact metadata, bash execution, catalog-independent run queries, stable status JSON, and bounded retention/cleanup. `S04`–`S12` extend rather than bypass these contracts.
 - `S04` produces AI-node execution, command resolution, structured outputs, and node session lineage. `S05`, `S06`, `S08`, and `S10` consume them.
 - `S05` makes scheduling and claims production-safe. Approval, loop, cron, and distribution work cannot ship before it.
 - `S06` produces script/loop/cancel executor contracts. `S07` reuses the loop pause model for rejection rework.
 - `S07` produces compare-and-set approval decisions and resumable gates. `S09` exposes them to users.
 - `S08` produces scoped execution workers and field-level compatibility mapping. `S10` surfaces those mappings during authoring.
-- `S09` produces scope-authorized natural-language/slash/CLI entry points for catalog inspection, run inspection, actions, and cron lifecycle behavior. `S11` enables them for branded capability packages.
+- `S09` produces scope-authorized natural-language/slash/CLI entry points and deterministic surface-selection instructions for text/Mermaid catalog inspection, run inspection, actions, and cron lifecycle behavior. `S11` enables them for branded capability packages.
 - `S10` produces package authoring and doctor output. `S11` uses both to convert Ericsson fixtures.
 - `S12` consumes the assembled system and proves it against real process boundaries and the branch topology.
 
@@ -98,6 +103,7 @@ plugins/workflow/
 ├── scheduler.py
 ├── schema.py
 ├── store.py
+├── topology.py
 └── executors/
     ├── __init__.py
     ├── ai.py
@@ -292,17 +298,20 @@ git commit -m "feat(plugins): expose scoped host agent runner"
 - Create: `plugins/workflow/schema.py`
 - Create: `plugins/workflow/discovery.py`
 - Create: `plugins/workflow/compat.py`
+- Create: `plugins/workflow/topology.py`
 - Create: `plugins/workflow/cli.py`
 - Create: `tests/plugins/workflow/conftest.py`
 - Create: `tests/plugins/workflow/fixtures/portable/.archon/workflows/minimal.yaml`
 - Create: `tests/plugins/workflow/test_schema.py`
 - Create: `tests/plugins/workflow/test_discovery.py`
 - Create: `tests/plugins/workflow/test_compat_matrix.py`
+- Create: `tests/plugins/workflow/test_topology.py`
 - Create: `tests/plugins/workflow/test_catalog_cli.py`
 - Create: `tests/plugins/workflow/test_cli.py`
 
 **Interfaces:**
 - Produces: `WorkflowDefinition`, `WorkflowNode`, `WorkflowPackage`, `ValidationIssue`, `CompatibilityReport`.
+- Produces: `TopologyProjection` and `project_topology(definition)`, with deterministic bounded text/Mermaid fields generated from the normalized DAG.
 - Produces: `load_workflow(path)`, `discover_workflows(workdir, hermes_home, user_home)`, and `validate_package(package)`.
 - Produces: side-effect-free plugin CLI commands `hermes workflow list`, `show`, `validate`, and `doctor --compat-report` with stable human and JSON catalog contracts.
 - Consumes: `PluginContext.register_cli_command` only; no agent or network calls.
@@ -311,7 +320,9 @@ git commit -m "feat(plugins): expose scoped host agent runner"
 
 Cover all seven node types, mutual exclusivity, removed `steps:`, duplicate IDs, cycles, missing dependencies, invalid trigger rules, invalid retry bounds, path traversal, project-over-profile precedence, same-level duplicates, `persist_sessions`/`persist_session`, every published workflow/node option, every hook event/response field, Archon tool aliases, and provider-specific compatibility classification.
 
-Catalog tests prove `list` returns name, description, source/precedence, compatibility, and runnable state, while `show` adds argument hints, compact textual topology, node-type counts, approvals/outward-action points, required tools/skills/MCP/providers/runtimes, related Hermes cron schedules, and blocking findings. Full command/prompt bodies and resolved secrets must be absent.
+Catalog tests prove `list` returns name, description, source/precedence, compatibility, and runnable state, while `show` adds argument hints, `topology_text`, `topology_mermaid`, `topology_warnings`, node-type counts, approvals/outward-action points, required tools/skills/MCP/providers/runtimes, related Hermes cron schedules, and blocking findings. Full command/prompt bodies and resolved secrets must be absent.
+
+Topology tests use sequential, fan-out/fan-in, disconnected-root, and 100-node boundary fixtures. Assert stable topological ordering with `(source_index, id)` tie-breaking; matching nodes/edges across text and Mermaid; generated `n0` aliases; bounded sanitized ID/type labels; no code fence inside JSON; and identical output over repeated loads. Prove schema validation rejects control/ANSI characters in identifiers. Put quotes, brackets, backticks, newlines, `%%{init:...}%%`, `click`, `classDef`, HTML, URLs, and secret canaries in descriptions/prompts and prove they never enter either projection; separately unit-test the label sanitizer with the same adversarial strings and prove none can escape a generated label or become a Mermaid directive.
 
 ```python
 def test_node_requires_exactly_one_archon_type(tmp_path):
@@ -322,9 +333,9 @@ def test_node_requires_exactly_one_archon_type(tmp_path):
 
 - [ ] **Step 2: Run tests and confirm the plugin contracts are absent**
 
-Run: `python3 -m pytest tests/plugins/workflow/test_schema.py tests/plugins/workflow/test_discovery.py -q`
+Run: `python3 -m pytest tests/plugins/workflow/test_schema.py tests/plugins/workflow/test_discovery.py tests/plugins/workflow/test_topology.py -q`
 
-Expected: FAIL on missing `plugins/workflow` modules.
+Expected: FAIL on missing `plugins/workflow` and `plugins.workflow.topology` modules.
 
 - [ ] **Step 3: Implement immutable parsed models and deterministic validation**
 
@@ -334,7 +345,27 @@ Use frozen dataclasses and preserve source locations for diagnostics. Unknown to
 
 Resolve explicit path, project `.archon`, `$HERMES_HOME/workflows`, and `~/.archon` in that order. Sort normalized paths before loading. Cache only successful parses by path, size, mtime-ns, and SHA-256; provide deterministic invalidation.
 
-- [ ] **Step 5: Implement field-level compatibility reporting**
+- [ ] **Step 5: Implement deterministic dual topology projection**
+
+```python
+@dataclass(frozen=True)
+class TopologyProjection:
+    text: str
+    mermaid: str | None
+    warnings: tuple[str, ...]
+    node_count: int
+    edge_count: int
+
+
+def project_topology(definition: WorkflowDefinition) -> TopologyProjection:
+    """Build bounded text and strict-subset Mermaid from one normalized DAG."""
+```
+
+Walk nodes once in stable topological order and edges once in sorted source/target order. Text uses compact layer notation such as `collect -> [security, commercial] -> approval -> send`, bounded to 12 KiB with a deterministic omitted-node/edge suffix. Both projections build display labels only from node ID/type, reject control/ANSI input at validation, and replace characters outside Unicode letters/numbers and ` -_.:/()` with a safe replacement. Mermaid emits raw source beginning with `flowchart LR`; generated aliases (`n0`, `n1`, …); double-quoted sanitized labels; and `nX --> nY` edges only. It never emits initialization directives, raw HTML, URLs, click handlers, styles, classes, subgraphs, or workflow-provided Mermaid.
+
+Truncate node display labels deterministically to 80 Unicode code points including an ellipsis and report `topology_label_truncated`. Bound text/source on valid UTF-8 boundaries. Text truncation reports `topology_text_truncated`. Set Mermaid to `None` when the graph exceeds 100 nodes, 200 edges, or 64 × 1,024 bytes after label truncation, reporting `topology_mermaid_too_many_nodes`, `topology_mermaid_too_many_edges`, or `topology_mermaid_too_large` in that deterministic order. These graph/source limits disable Mermaid while preserving text. Serialize to catalog JSON as `topology_text`, `topology_mermaid`, and `topology_warnings`.
+
+- [ ] **Step 6: Implement field-level compatibility reporting**
 
 ```python
 class CompatibilityLevel(StrEnum):
@@ -351,19 +382,19 @@ class CompatibilityFinding:
     blocking: bool
 ```
 
-- [ ] **Step 6: Register the plugin CLI and keep inspection side-effect free**
+- [ ] **Step 7: Register the plugin CLI and keep inspection side-effect free**
 
-`list`, `show`, `validate`, and `doctor` must not initialize MCP, providers, or `AIAgent`. JSON output is available with `--json`; human output is stable and redacts environment values. `show` renders graph topology as compact text, not a visual editor. Cron linkage is a read-only join against existing profile-local Hermes cron definitions and does not mutate schedules.
+`list`, `show`, `validate`, and `doctor` must not initialize MCP, providers, Mermaid, or `AIAgent`. JSON output is available with `--json`; human output is stable and redacts environment values. Define the parser's `--topology text|mermaid|both` default as `None`; human output resolves `None` to `text`, while `show NAME --json` always returns both topology fields and rejects only an explicitly supplied selector. Mermaid human output is a fenced source block, not terminal rendering. Cron linkage is a read-only join against existing profile-local Hermes cron definitions and does not mutate schedules.
 
-- [ ] **Step 7: Run focused plugin and plugin-discovery tests**
+- [ ] **Step 8: Run focused plugin and plugin-discovery tests**
 
 ```bash
-python3 -m pytest tests/plugins/workflow/test_schema.py tests/plugins/workflow/test_discovery.py tests/plugins/workflow/test_compat_matrix.py tests/plugins/workflow/test_catalog_cli.py tests/plugins/workflow/test_cli.py -q
+python3 -m pytest tests/plugins/workflow/test_schema.py tests/plugins/workflow/test_discovery.py tests/plugins/workflow/test_compat_matrix.py tests/plugins/workflow/test_topology.py tests/plugins/workflow/test_catalog_cli.py tests/plugins/workflow/test_cli.py -q
 python3 -m pytest tests/hermes_cli/test_plugins.py -q
 git diff --check
 ```
 
-- [ ] **Step 8: Commit the validation tracer**
+- [ ] **Step 9: Commit the validation tracer**
 
 ```bash
 git add plugins/workflow tests/plugins/workflow
@@ -773,22 +804,26 @@ git commit -m "feat(workflow): enforce per-node agent resources"
 - Create: `tests/gateway/test_workflow_skill_dispatch.py`
 - Create: `tests/tui_gateway/test_workflow_skill_dispatch.py`
 - Create: `tests/plugins/workflow/test_operator_scope.py`
+- Create: `ui-tui/src/__tests__/workflowTopology.test.ts`
+- Create: `apps/desktop/src/components/assistant-ui/embeds/workflow-topology.test.tsx`
 - Create: `apps/desktop/src/lib/workflow-skill-command.test.ts`
 - Modify: `plugins/workflow/cli.py`
 
 **Interfaces:**
-- Produces: the `/workflow` skill command and conversational list/show/runs/status/events/run/approve/reject/resume/cancel/abandon/cleanup/reset-sessions instructions.
+- Produces: the `/workflow` skill command; deterministic surface-selection instructions for `topology_text`/`topology_mermaid`; and conversational list/show/runs/status/events/run/approve/reject/resume/cancel/abandon/cleanup/reset-sessions instructions.
 - Consumes: normal Hermes skill command injection, workflow CLI, durable approvals, and cron skill/provider/model/toolset/workdir/delivery fields.
 
 - [ ] **Step 1: Write explicit skill-command dispatch tests on every chat surface**
 
 Assert `/workflow run demo`, `/workflow list`, `/workflow show demo`, `/workflow runs`, and `/workflow status RUN_ID` load the skill as a user message in CLI/gateway/TUI/desktop catalog paths, do not register a new model tool, and do not mutate the system prompt or global tool list. Skill/quick-command discovery remains visible in the desktop slash palette rather than being removed by built-in curation.
 
+Add renderer-contract tests using the existing UI components. Ink `Md` receives a fenced Mermaid sample and must display the language/source as a code block rather than pretending to render a graph. Desktop `RichCodeBlock` must route `language="mermaid"` to the lazy Mermaid renderer, retain source during streaming/parse failure, use `securityLevel: "strict"`, and render the completed SVG inside the existing rich boundary. These are regression tests around existing renderer plumbing; no workflow-specific UI renderer or dependency is added.
+
 Also assert that a disabled workflow plugin produces an actionable `hermes plugins enable workflow` response, while an Ericsson-staged profile has the plugin enabled through the existing `plugins.enabled` config path.
 
 - [ ] **Step 2: Write natural-language activation description tests**
 
-Verify the skill description contains run, schedule, list, describe/show, active/recent runs, status/progress, failure diagnostics, approval, reject, resume, cancel, cleanup, reset sessions, automation, and workflow intent terms while remaining concise enough for the stable skill index.
+Verify the skill description contains run, schedule, list, describe/show, topology/diagram, active/recent runs, status/progress, failure diagnostics, approval, reject, resume, cancel, cleanup, reset sessions, automation, and workflow intent terms while remaining concise enough for the stable skill index.
 
 Exercise natural-language requests: “What workflows can I run?”, “What does supplier review do?”, “Which workflows are running?”, “Show workflows waiting for approval”, “How far is run X?”, “Why did it fail?”, and “Cancel the inbox workflow.” Assert each maps to the corresponding read-only/action CLI JSON contract and that ambiguous destructive actions ask for selection/confirmation rather than guessing a run.
 
@@ -800,24 +835,26 @@ Create a real temp-home cron job with `skills=["workflow"]`. Assert it runs the 
 
 The skill treats `hermes workflow` as the control plane, never edits run/session state directly, never changes graph order, and never auto-approves outward action. It distinguishes interactive continuation from background notification and always scopes chat `runs`, `status`, `events`, actions, and `reset-sessions` to the authenticated profile plus current conversation/user identity. An explicit run ID still passes authorization; it is not an enumeration bypass. The local CLI remains profile-scoped.
 
-For catalog questions, the skill uses `list --json` or `show NAME --json` and explains description, runnable/compatibility state, arguments, compact topology, approvals/outward actions, requirements, and schedules. For execution questions, it uses `runs`, `status`, or `events --tail` and explains progress, current nodes, elapsed time, retry/approval state, sanitized error, artifacts, and `next_actions`. It never reads raw run files, full prompts, hidden reasoning, secret material, or unrestricted tool arguments.
+For catalog questions, the skill uses `list --json` or `show NAME --json` and explains description, runnable/compatibility state, arguments, topology, approvals/outward actions, requirements, and schedules. On classic CLI, Ink TUI, dashboard-embedded TUI, unknown, and messaging surfaces it emits `topology_text` only. On desktop it emits `topology_text` first as the accessible/copyable summary, then—when non-null—wraps the raw `topology_mermaid` value in exactly one fenced `mermaid` block. It never puts the fence inside JSON, claims terminal Mermaid source was rendered, or omits the text fallback. For execution questions, it uses `runs`, `status`, or `events --tail` and explains progress, current nodes, elapsed time, retry/approval state, sanitized error, artifacts, and `next_actions`. It never reads raw run files, full prompts, hidden reasoning, secret material, or unrestricted tool arguments.
 
 - [ ] **Step 5: Add machine-readable CLI output required by the skill**
 
-Every invoked CLI command supports `--json`. Catalog records have stable `action`, `workflow`, `description`, `source`, `precedence`, `compatibility`, `runnable`, `topology`, `requirements`, `approvals`, `schedules`, `warnings`, and `next_actions` fields as applicable. Run records use the Task 3 summary contract and detailed status adds node/attempt state. Secret values, credentials, full prompt/command bodies, reasoning, and unrestricted tool arguments are excluded.
+Every invoked CLI command supports `--json`. Catalog records have stable `action`, `workflow`, `description`, `source`, `precedence`, `compatibility`, `runnable`, `topology_text`, `topology_mermaid`, `topology_warnings`, `requirements`, `approvals`, `schedules`, `warnings`, and `next_actions` fields as applicable. `topology_mermaid` is raw source or `null`, never a Markdown fence. Run records use the Task 3 summary contract and detailed status adds node/attempt state. Secret values, credentials, full prompt/command bodies, reasoning, and unrestricted tool arguments are excluded.
 
 - [ ] **Step 6: Run cross-surface and cron tests**
 
 ```bash
 python3 -m pytest tests/agent/test_workflow_skill_command.py tests/gateway/test_workflow_skill_dispatch.py tests/tui_gateway/test_workflow_skill_dispatch.py tests/cron/test_workflow_cron.py tests/plugins/workflow/test_operator_scope.py -q
-cd apps/desktop && npx vitest run src/lib/workflow-skill-command.test.ts src/lib/desktop-slash-commands.test.ts
+cd ui-tui && npx vitest run src/__tests__/workflowTopology.test.ts src/__tests__/markdown.test.ts
+cd ../apps/desktop && npx vitest run src/components/assistant-ui/embeds/workflow-topology.test.tsx src/lib/workflow-skill-command.test.ts src/lib/desktop-slash-commands.test.ts
+cd ../..
 git diff --check
 ```
 
 - [ ] **Step 7: Commit user activation**
 
 ```bash
-git add skills/productivity/workflow plugins/workflow/cli.py tests/agent/test_workflow_skill_command.py tests/gateway/test_workflow_skill_dispatch.py tests/tui_gateway/test_workflow_skill_dispatch.py tests/cron/test_workflow_cron.py tests/plugins/workflow/test_operator_scope.py apps/desktop/src/lib/workflow-skill-command.test.ts
+git add skills/productivity/workflow plugins/workflow/cli.py tests/agent/test_workflow_skill_command.py tests/gateway/test_workflow_skill_dispatch.py tests/tui_gateway/test_workflow_skill_dispatch.py tests/cron/test_workflow_cron.py tests/plugins/workflow/test_operator_scope.py ui-tui/src/__tests__/workflowTopology.test.ts apps/desktop/src/components/assistant-ui/embeds/workflow-topology.test.tsx apps/desktop/src/lib/workflow-skill-command.test.ts
 git commit -m "feat(workflow): activate runs from chat and cron"
 ```
 
@@ -986,7 +1023,7 @@ Run 100 fast spawn/success/cancel/idle-timeout/wall-timeout/provider-failure cyc
 
 - [ ] **Step 3: Add security boundary tests**
 
-Cover YAML aliases/depth limits, oversized documents, traversal, symlink escape, command injection, unsafe uv dependency tokens, secret redaction, MCP environment expansion, unauthorized provider override, hook input mutation, artifact quota, output quota, approval-digest tampering/replay, and proof that no secret or sudo value can enter durable state or plugin-visible IPC.
+Cover YAML aliases/depth limits, oversized documents, traversal, symlink escape, command injection, unsafe uv dependency tokens, secret redaction, MCP environment expansion, unauthorized provider override, hook input mutation, artifact quota, output quota, approval-digest tampering/replay, and proof that no secret or sudo value can enter durable state or plugin-visible IPC. Add topology-injection canaries for Mermaid initialization directives, raw HTML, links, click handlers, styles/classes, quotes, newlines, and fence termination; generated source must remain within the strict graph/node/edge grammar and desktop rendering must retain Mermaid `securityLevel: "strict"`.
 
 - [ ] **Step 4: Add measurable performance tests**
 
@@ -1013,9 +1050,9 @@ def test_agent_workers_leave_parent_process_state_unchanged(runtime):
     assert runtime.capture_parent_process_state() == before
 ```
 
-Measure cold worker startup latency and peak resident memory at concurrency 1 and 4. Store baseline timing in test output, not a brittle committed machine-specific number. Enforce algorithmic/resource invariants plus a generous CI ceiling derived from three CI runs, and fail on worker/process/thread/descriptor growth after completion. Exceed process-tree RSS, descendant, output, artifact, event, per-run storage, and profile-storage limits one at a time; each must terminate/pause with a typed diagnostic, reap descendants, preserve a valid projection/journal, and allow later cleanup.
+Measure cold worker startup latency and peak resident memory at concurrency 1 and 4. Store baseline timing in test output, not a brittle committed machine-specific number. Enforce algorithmic/resource invariants plus a generous CI ceiling derived from three CI runs, and fail on worker/process/thread/descriptor growth after completion. Exceed process-tree RSS, descendant, output, artifact, event, per-run storage, and profile-storage limits one at a time; each must terminate/pause with a typed diagnostic, reap descendants, preserve a valid projection/journal, and allow later cleanup. Generate text/Mermaid projections for 1, 100, and 1,000-node DAGs; prove linear node/edge visits, 12 KiB text truncation, Mermaid availability at the 100-node/200-edge boundary, `null` plus warnings above it, and no Mermaid parser/browser/model/network initialization in the Python control plane.
 
-Add an operator E2E that installs two workflows and creates running, waiting-retry, paused-for-approval, failed, succeeded, cancelled, interrupted, and abandoned runs. Prove `list`, `show`, `runs`, `status`, and `events` agree across CLI JSON, `/workflow`, and natural-language skill paths; compact topology and next actions are correct; current-scope authorization is enforced; and prompt/reasoning/secret/tool-argument canaries never appear.
+Add an operator E2E that installs two workflows and creates running, waiting-retry, paused-for-approval, failed, succeeded, cancelled, interrupted, and abandoned runs. Prove `list`, `show`, `runs`, `status`, and `events` agree across CLI JSON, `/workflow`, and natural-language skill paths; text and Mermaid projections describe the same node/edge graph; CLI/TUI/unknown surfaces receive text; desktop receives text plus one fenced Mermaid block; Mermaid-limit fallback is text-only with warnings; next actions are correct; current-scope authorization is enforced; and prompt/reasoning/secret/tool-argument canaries never appear.
 
 - [ ] **Step 5: Add an isolated upstream-merge rehearsal script**
 
@@ -1039,7 +1076,7 @@ Do not call `test_workflow_upstream_merge.sh` from inside the real merge skill. 
 
 - [ ] **Step 7: Document operations and compatibility**
 
-Document package layout, discovery precedence, `list/show/runs/status/events` examples, natural-language equivalents, textual topology, status/state meanings, cron, approvals, resume/cancel/abandon/cleanup, artifacts, config limits, renderer-versus-owner shutdown behavior, provider/network failures, orphan/restart recovery, storage retention, compatibility levels, security/authorization model, how the merge skill invokes the lightweight checker/smoke gates, and how CI or an explicit preflight invokes the full rehearsal script.
+Document package layout, discovery precedence, `list/show/runs/status/events` examples, natural-language equivalents, text/Mermaid topology fields and limits, `show --topology text|mermaid|both`, the exact CLI/TUI/dashboard/desktop fallback matrix, status/state meanings, cron, approvals, resume/cancel/abandon/cleanup, artifacts, config limits, renderer-versus-owner shutdown behavior, provider/network failures, orphan/restart recovery, storage retention, compatibility levels, security/authorization model, how the merge skill invokes the lightweight checker/smoke gates, and how CI or an explicit preflight invokes the full rehearsal script.
 
 - [ ] **Step 8: Run the full release gate**
 
@@ -1047,7 +1084,8 @@ Document package layout, discovery precedence, `list/show/runs/status/events` ex
 python3 -m pytest tests/agent/test_plugin_agent.py tests/tools/test_managed_process.py tests/tools/test_process_registry.py tests/plugins/workflow tests/cron/test_workflow_cron.py tests/gateway/test_workflow_skill_dispatch.py tests/tui_gateway/test_workflow_skill_dispatch.py -q
 python3 -m pytest tests/plugins/workflow/test_fault_injection.py tests/plugins/workflow/test_security_boundaries.py tests/plugins/workflow/test_performance_bounds.py tests/plugins/workflow/test_process_lifecycle_soak.py tests/plugins/workflow/test_operator_e2e.py -q
 python3 -m pytest tests/scripts/test_workflow_merge_gate.py -q
-cd apps/desktop && npx vitest run src/lib/workflow-skill-command.test.ts src/lib/desktop-slash-commands.test.ts
+cd ui-tui && npx vitest run src/__tests__/workflowTopology.test.ts src/__tests__/markdown.test.ts
+cd ../apps/desktop && npx vitest run src/components/assistant-ui/embeds/workflow-topology.test.tsx src/lib/workflow-skill-command.test.ts src/lib/desktop-slash-commands.test.ts
 cd ../.. && node --test scripts/__tests__/vendor-ericsson.test.mjs scripts/brand/__tests__/*.test.mjs
 python3 scripts/check_upstream_customizations.py --manifest docs/upstream-customizations/workflow-orchestration.yaml --diff main..HEAD
 scripts/test_workflow_upstream_merge.sh --upstream-ref main --base-ref base --brand-ref otto --brand-ref loop24
@@ -1079,6 +1117,7 @@ git commit -m "test(workflow): enforce production and merge gates"
 | Structured output and artifacts | S03, S04 |
 | Tools, skills, hooks, MCP, provider mapping | S01, S08 |
 | Workflow catalog, description, topology, requirements, and schedules | S02, S09, S12 |
+| Portable text plus bounded desktop Mermaid topology | S02, S09, S12 |
 | Active/recent runs, detailed status, sanitized diagnostics, and cleanup | S03, S09, S12 |
 | Natural chat and `/workflow` | S09, S12 |
 | Cron scheduling and delivery | S09 |
@@ -1099,6 +1138,8 @@ git commit -m "test(workflow): enforce production and merge gates"
 - Linux/macOS tests and Windows-specific lock/process simulations pass. Native Windows CI must pass before claiming Windows workflow support; otherwise the release is blocked or Windows workflow support is explicitly disabled and documented.
 - No unbounded worker, retry, loop, output, artifact, lock wait, or subprocess path remains.
 - Natural language, `/workflow`, and `hermes workflow` can list/show workflows, list active/recent/waiting runs, inspect detailed status and sanitized failures, and report actionable next steps from the same catalog/store contracts.
+- Every workflow `show --json` has a bounded `topology_text` and, within the exact limits, strict-subset raw `topology_mermaid`; both represent the same normalized graph and neither contains prompt/secret content or workflow-authored directives.
+- CLI/TUI/dashboard/unknown surfaces present text topology; desktop presents the text fallback plus a rendered fenced Mermaid diagram; oversize or failed Mermaid always degrades to text with a warning.
 - Catalog/status authorization prevents cross-profile and cross-conversation/user disclosure, including when an explicit run ID is supplied.
 - Shutting down an owning Hermes process stops admission, terminates and reaps every workflow process tree within the configured deadline, and leaves active attempts durably `interrupted`; renderer-only closure behavior is documented and tested separately.
 - Parent loss, provider/network stalls, PID reuse, laptop suspend/wake, and forced restart have deterministic bounded outcomes and never infer success.
