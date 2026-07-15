@@ -187,6 +187,10 @@ The sidecar may define delivery defaults, required configured services, retentio
 
 `agent.plugin_agent` will expose immutable request/result contracts and a host-owned runner. `PluginContext.agent` will provide the facade to trusted plugins. Each run executes in a fresh host-owned worker process started with spawn/subprocess semantics, never by forking a live multithreaded Hermes process. The child resolves credentials and constructs `AIAgent`; the plugin receives only sanitized progress and results over bounded IPC.
 
+The worker imports the installed Hermes package and constructs the normal `AIAgent`; it is not a partial copy of Hermes and it is not another gateway, TUI, desktop backend, or daemon. An ordinary workflow AI node enables no delegation tool and runs only that node. Current Hermes `delegate_task` is deliberately not exposed raw inside a workflow worker: today it creates child `AIAgent` objects in the same process, uses threads for parallel children, and returns top-level delegation results asynchronously. Those semantics can outlive an ephemeral node worker and would reintroduce process-global tool/MCP state sharing inside the isolation boundary.
+
+When an Archon node explicitly declares `agents`, the worker receives an ephemeral `workflow_agent` tool backed by the same generic plugin-agent runner. A call sends a synchronous child-run request to the workflow coordinator; the coordinator reserves the node's predeclared descendant capacity and starts each child as a separately spawned, scoped worker process. The parent node waits for bounded child results before it can complete. Child progress is relayed as sanitized nested events, large results become artifacts, and cancellation terminates the parent plus every coordinator-tracked child worker and process group. The raw `delegate_task` background-result path is never used.
+
 Conceptual interface:
 
 ```python
@@ -311,6 +315,7 @@ The definition and resolved command resources are snapshotted at start. Resume n
 - Expired claims become `interrupted`, not automatically successful or failed.
 - Unknown-outcome attempts that may have produced external side effects require operator reconciliation before retry.
 - Parallelism is bounded by `workflow.max_parallel_nodes`; the default is 4. Each AI node consumes one worker-process slot. Loop iterations remain sequential.
+- A node that declares child agents reserves a weighted execution bundle before its parent worker starts: one slot for the node plus its declared maximum simultaneous children. A worker can spawn only within that reservation. This prevents four parent workers from consuming every slot and deadlocking while each waits for an unaccounted child.
 
 ### Persistence
 
@@ -337,6 +342,8 @@ Independent ready nodes run concurrently. `trigger_rule` follows Archon's docume
 - Skills are loaded only for that node.
 - Per-node MCP is started in the isolated execution worker and stopped in `finally` cleanup.
 - Provider-specific options are mapped only when the selected Hermes provider supports them.
+
+Declared inline agents use the worker-local `workflow_agent` tool, never ambient `delegate_task`. Each declared agent gets its own worker process, session, tool/skill/MCP scope, provider policy, iteration budget, and result contract. The parent node receives only the bounded child result and artifact references. Child-agent count, simultaneous children, total descendants, spawn depth, tokens, cost, iterations, and wall time are validated against hard workflow limits; Hermes' more permissive global delegation settings cannot raise those workflow limits.
 
 Strict JSON Schema validation reuses `jsonschema` from Hermes' existing `mcp`/`all` installation path. A lean installation without that dependency may run workflows that do not declare `output_format` or per-node MCP; validation and doctor commands fail closed with the exact existing-extra installation guidance when either feature requires it. The workflow does not silently skip schema validation and does not add an unconditional core dependency.
 
@@ -368,7 +375,7 @@ Retries are driven by classified errors and persisted next-attempt time. Exponen
 - MCP environment references are expanded at execution without writing secret values to state, logs, compatibility reports, or prompts.
 - Hook matchers and responses are schema-validated before execution.
 - Shell/script execution retains Hermes approval and environment-sanitization policy.
-- Workflow concurrency, node iterations, output bytes, artifact bytes, timeout, and retry attempts have config-backed upper bounds.
+- Workflow concurrency, node and child-agent iterations, output bytes, artifact bytes, timeout, retry attempts, descendant count, child concurrency, and spawn depth have config-backed hard upper bounds.
 - `config.yaml` owns behavioral settings; no new non-secret `HERMES_*` user configuration is introduced.
 - Cancellation terminates worker process groups and always releases leases and MCP sessions.
 
@@ -418,9 +425,9 @@ Rules for this milestone:
 3. Every modified upstream-owned file is recorded in `docs/upstream-customizations/workflow-orchestration.yaml` with rationale, owner, tests, upstreamability, merge guidance, and removal condition.
 4. A validation script checks that recorded files and tests exist and that entries remain internally consistent.
 5. Core-seam commits remain separate from workflow-plugin commits so they can be rebased, submitted upstream, replaced, or dropped independently.
-6. The final gate rehearses merging the current upstream mirror into a temporary branch and runs focused tests before branded-branch propagation.
+6. The external merge skill runs the lightweight ledger checker and focused offline workflow tests during a real `main` to `base` merge. The full temporary-worktree rehearsal is a CI/release or explicit preflight gate; it is not invoked recursively from inside the real merge.
 7. If upstream later provides an equivalent API, the customization entry requires an explicit replace-or-remove decision; parallel implementations are not retained.
-8. The repository exposes a stable checker and merge-rehearsal command for the existing external merge skill. Updating that skill at its owning location is a release prerequisite once its path is supplied; the skill itself is not copied into this repository.
+8. The repository exposes a stable checker, focused smoke command, and merge-rehearsal command. The owning skill is `/Users/coreyellis/code/github.com/cmetech/otto_hermes/.claude/skills/otto-upstream-merge/SKILL.md`; it remains outside this repository and is not copied into Hermes.
 
 ### Planned upstream-core touch budget
 

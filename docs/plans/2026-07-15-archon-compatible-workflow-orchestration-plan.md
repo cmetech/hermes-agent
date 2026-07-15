@@ -128,7 +128,7 @@ tests/plugins/workflow/
 **Interfaces:**
 - Produces: `PluginAgentRunRequest`, `PluginAgentRunResult`, `PluginAgentRunner.run(request)`, and `PluginContext.agent`.
 - Produces: `ToolRegistry.scoped_names(allowed_names=None, denied_names=())`, a reversible process-worker scope covering discovery, lookup, Tool Search, and dispatch with generation-based cache invalidation.
-- Produces: `check_upstream_customizations.py --manifest PATH --diff RANGE` for the existing merge workflow to call.
+- Produces: `check_upstream_customizations.py --manifest PATH --diff RANGE` for ledger coverage and optional `--upstream-diff RANGE` overlap reporting against the ledger-owned core surface.
 - Consumes: Hermes runtime provider resolution, `AIAgent`, `SessionDB`, skill payload loading, and existing callbacks.
 
 - [ ] **Step 1: Write failing tool-filter and runner contract tests**
@@ -670,7 +670,11 @@ Run a local stdio echo MCP fixture. Assert only the node sees its tool, environm
 
 - [ ] **Step 4: Add bounded inline-agent tests**
 
-Define Archon `agents` with description, prompt, model, tools, disallowedTools, skills, and maxTurns. Assert the worker-local `workflow_agent` tool enforces kebab-case IDs, child policy, parent/child budget, spawn depth, concurrency, cancellation, and start/stop/task-completed hooks. It must never register a permanent core tool or let a child escape its declared tool scope.
+Define Archon `agents` with description, prompt, model, tools, disallowedTools, skills, and maxTurns. Assert an ordinary node has no `delegate_task` or `workflow_agent`; a node with declarations receives only the ephemeral `workflow_agent`. Prove raw Hermes `delegate_task` is never dispatched, because its current thread-based/background top-level semantics can outlive the ephemeral node worker and share process-global scope.
+
+Assert each `workflow_agent` call is synchronous from the parent node's perspective and executes the child through a separately spawned `PluginAgentRunner` worker owned and accounted for by the coordinator. The parent must not complete or exit until all requested children have returned, failed, or been cancelled. Cover bounded result/artifact return, nested progress events, provider/model/tools/skills isolation, approval brokering, and process-tree cleanup.
+
+Enforce kebab-case IDs, child policy, combined parent/child token and cost budgets, total descendants, hard spawn depth, and weighted concurrency admission. Before starting a parent node, reserve one execution slot plus its declared maximum simultaneous children; prove multiple parent nodes cannot consume every slot and deadlock while waiting for children. Hermes' global `delegation.*` settings may tighten but never raise workflow limits. The tool must never register permanently or let a child escape its declared scope.
 
 - [ ] **Step 5: Extend the scoped worker protocol for node resources**
 
@@ -888,13 +892,15 @@ git commit -m "feat(ericsson): ship Archon-compatible workflow packages"
 - Create: `tests/plugins/workflow/test_fault_injection.py`
 - Create: `tests/plugins/workflow/test_performance_bounds.py`
 - Create: `tests/plugins/workflow/test_security_boundaries.py`
+- Create: `scripts/test_workflow_merge_gate.sh`
 - Create: `scripts/test_workflow_upstream_merge.sh`
+- Create: `tests/scripts/test_workflow_merge_gate.py`
 - Create: `docs/workflow-orchestration.md`
 - Modify: `docs/upstream-customizations/workflow-orchestration.yaml`
 - Modify: `.github/workflows/ci.yml` only if repository CI lacks a suitable existing job
 
 **Interfaces:**
-- Produces: the release evidence bundle, merge rehearsal, operator documentation, and CI gate.
+- Produces: the lightweight offline live-merge gate, release evidence bundle, isolated merge rehearsal, operator documentation, and CI gate.
 - Consumes: all previous slices and the `main → base → otto/loop24` branch topology.
 
 - [ ] **Step 1: Add an unmodified portable Archon end-to-end fixture**
@@ -938,6 +944,8 @@ Measure cold worker startup latency and peak resident memory at concurrency 1 an
 
 - [ ] **Step 5: Add an isolated upstream-merge rehearsal script**
 
+First add `scripts/test_workflow_merge_gate.sh` with `--phase base` and `--phase brand --brand SLUG` modes. The base mode runs the customization checker and focused generic runner/workflow tests. The brand mode performs workflow discovery, package validation, and generic-surface checks without a provider, model call, credentials, or network. Test missing counterparts, invalid phases/brands, base failures, per-brand failures, and successful no-network execution in `tests/scripts/test_workflow_merge_gate.py`.
+
 The script creates temporary worktrees, fetches no network by default, merges the supplied local upstream ref into a temporary base branch, runs the customization checker and focused Python/Node tests, then merges temporary base into temporary OTTO and LOOP24 branches and runs brand equivalence checks. It never mutates real `base`, `otto`, or `loop24` refs.
 
 ```bash
@@ -950,17 +958,20 @@ scripts/test_workflow_upstream_merge.sh \
 
 - [ ] **Step 6: Integrate the existing merge skill at its owning location**
 
-Once the merge skill's repository or path is supplied, add a pre-merge call to `check_upstream_customizations.py` and a post-merge call to `test_workflow_upstream_merge.sh`. Keep the skill change outside this repository, test it against a temporary clone, and record its version or commit in the release evidence. This external integration is a release prerequisite, not a reason to vendor the skill into Hermes.
+Update `/Users/coreyellis/code/github.com/cmetech/otto_hermes/.claude/skills/otto-upstream-merge/SKILL.md` without changing its `main` to `base` to discovered-brand flow. Add a Stage-0 overlap report for ledger-owned core files, then run `check_upstream_customizations.py` plus focused offline workflow tests in the Stage-1 gate before branded propagation. After each brand restamp, run a cheap discovery/validation smoke that performs no model or network call. If the workflow manifest/checker is absent before the feature lands, report that the optional gate is not installed; once either workflow runtime or manifest is present, a missing counterpart fails closed.
+
+Do not call `test_workflow_upstream_merge.sh` from inside the real merge skill. That script repeats the entire branch graph in temporary worktrees and belongs in CI, release verification, or an explicitly requested preflight. Test the skill change against a temporary clone and record its version or commit in release evidence. The skill remains external and is not vendored into Hermes.
 
 - [ ] **Step 7: Document operations and compatibility**
 
-Document package layout, discovery precedence, commands, cron, approvals, resume, artifacts, config limits, compatibility levels, failure recovery, security model, and how the merge skill invokes the customization checker and rehearsal script.
+Document package layout, discovery precedence, commands, cron, approvals, resume, artifacts, config limits, compatibility levels, failure recovery, security model, how the merge skill invokes the lightweight checker/smoke gates, and how CI or an explicit preflight invokes the full rehearsal script.
 
 - [ ] **Step 8: Run the full release gate**
 
 ```bash
 python3 -m pytest tests/agent/test_plugin_agent.py tests/plugins/workflow tests/cron/test_workflow_cron.py tests/gateway/test_workflow_skill_dispatch.py tests/tui_gateway/test_workflow_skill_dispatch.py -q
 python3 -m pytest tests/plugins/workflow/test_fault_injection.py tests/plugins/workflow/test_security_boundaries.py tests/plugins/workflow/test_performance_bounds.py -q
+python3 -m pytest tests/scripts/test_workflow_merge_gate.py -q
 cd apps/desktop && npx vitest run src/lib/workflow-skill-command.test.ts src/lib/desktop-slash-commands.test.ts
 cd ../.. && node --test scripts/__tests__/vendor-ericsson.test.mjs scripts/brand/__tests__/*.test.mjs
 python3 scripts/check_upstream_customizations.py --manifest docs/upstream-customizations/workflow-orchestration.yaml --diff main..HEAD
@@ -977,7 +988,7 @@ Run the repository security-review and code-review skills against the full featu
 - [ ] **Step 10: Commit the production gate and documentation**
 
 ```bash
-git add tests/plugins/workflow scripts/test_workflow_upstream_merge.sh docs/workflow-orchestration.md docs/upstream-customizations/workflow-orchestration.yaml .github/workflows/ci.yml
+git add tests/plugins/workflow tests/scripts/test_workflow_merge_gate.py scripts/test_workflow_merge_gate.sh scripts/test_workflow_upstream_merge.sh docs/workflow-orchestration.md docs/upstream-customizations/workflow-orchestration.yaml .github/workflows/ci.yml
 git commit -m "test(workflow): enforce production and merge gates"
 ```
 
