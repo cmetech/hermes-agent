@@ -855,6 +855,8 @@ Providers that expose verified per-model evidence declare
 - `/v1/model-capabilities` owns verified evidence.
 - The client joins exact IDs and must not carry a static Gateway model or
   capability registry.
+- The client reads known capability keys and ignores additive keys it does not
+  recognize instead of rejecting the entire catalog.
 - `unknown` means unverified, never implicitly supported or unsupported.
 - Existing saved assignments are preserved for review; new or changed
   assignments must satisfy the slot-specific verified capability policy.
