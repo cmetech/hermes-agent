@@ -191,6 +191,11 @@ export function setApiRequestProfile(profile: null | string): void {
   _apiProfile = profile || null
 }
 
+/** Capture the profile currently owning profile-scoped REST requests. */
+export function getApiRequestProfile(): null | string {
+  return _apiProfile
+}
+
 function profileScoped(): { profile?: string } {
   return _apiProfile ? { profile: _apiProfile } : {}
 }
@@ -942,9 +947,15 @@ export function getMoaModels(): Promise<MoaConfigResponse> {
   })
 }
 
-export function saveMoaModels(body: MoaConfigResponse): Promise<MoaConfigResponse & { ok: boolean }> {
+export function saveMoaModels(
+  body: MoaConfigResponse,
+  profileOverride?: null | string
+): Promise<MoaConfigResponse & { ok: boolean }> {
+  const requestProfile =
+    profileOverride === undefined ? profileScoped() : profileOverride ? { profile: profileOverride } : {}
+
   return window.hermesDesktop.api<MoaConfigResponse & { ok: boolean }>({
-    ...profileScoped(),
+    ...requestProfile,
     path: '/api/model/moa',
     method: 'PUT',
     body

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 // Radix Select calls scrollIntoView on its items when the content opens; jsdom
@@ -23,15 +23,17 @@ const saveHermesConfig = vi.fn()
 const startManualProviderOAuth = vi.fn()
 const startManualLocalEndpoint = vi.fn()
 const profileSwitch = vi.hoisted(() => ({ callback: null as null | (() => void) }))
+let apiRequestProfile: null | string = null
 
 vi.mock('@/hermes', () => ({
   getGlobalModelInfo: () => getGlobalModelInfo(),
   getGlobalModelOptions: (options?: unknown) => getGlobalModelOptions(options),
+  getApiRequestProfile: () => apiRequestProfile,
   getAuxiliaryModels: () => getAuxiliaryModels(),
   getMoaModels: () => getMoaModels(),
   setModelAssignment: (body: unknown) => setModelAssignment(body),
   getRecommendedDefaultModel: (slug: string) => getRecommendedDefaultModel(slug),
-  saveMoaModels: (body: unknown) => saveMoaModels(body),
+  saveMoaModels: (body: unknown, profile?: null | string) => saveMoaModels(body, profile),
   setEnvVar: (key: string, value: string) => setEnvVar(key, value),
   getHermesConfigRecord: () => getHermesConfigRecord(),
   saveHermesConfig: (config: unknown) => saveHermesConfig(config)
@@ -59,6 +61,7 @@ vi.mock('../hooks/use-config-record', () => ({
 }))
 
 beforeEach(() => {
+  apiRequestProfile = null
   profileSwitch.callback = null
   getGlobalModelInfo.mockResolvedValue({ provider: 'nous', model: 'hermes-4' })
   getGlobalModelOptions.mockResolvedValue({
@@ -88,6 +91,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
+  vi.useRealTimers()
 })
 
 async function renderModelSettings() {
@@ -156,12 +160,14 @@ function gatewayProvider(overrides: Record<string, unknown> = {}): {
 
 function deferred<T>() {
   let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
 
-  const promise = new Promise<T>(res => {
+  const promise = new Promise<T>((res, rej) => {
     resolve = res
+    reject = rej
   })
 
-  return { promise, resolve }
+  return { promise, reject, resolve }
 }
 
 function moaPreset(overrides: Record<string, unknown> = {}) {
@@ -188,6 +194,17 @@ function moaPreset(overrides: Record<string, unknown> = {}) {
   }
 }
 
+function namedMoaPreset(name: string) {
+  const base = moaPreset()
+
+  return {
+    ...base,
+    active_preset: name,
+    default_preset: name,
+    presets: { [name]: base.presets.default }
+  }
+}
+
 function rowComboboxes(title: string): HTMLElement[] {
   const titleNode = screen.getByText(title)
   const row = titleNode.parentElement?.parentElement
@@ -205,6 +222,7 @@ describe('ModelSettings', () => {
 
     await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalled())
     await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalled())
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(undefined)
 
     // Open the provider Select — only configured providers should be listed.
     const triggers = await screen.findAllByRole('combobox')
@@ -255,7 +273,14 @@ describe('ModelSettings', () => {
     expect(screen.getAllByText('auto · use main model').length).toBeGreaterThan(0)
   })
 
-  it('assigns an auxiliary task to the main model via setModelAssignment', async () => {
+  it('restores an auxiliary task to inherited main-model routing', async () => {
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'auto' })
+    getGlobalModelOptions.mockResolvedValueOnce({ providers: [gatewayProvider()] })
+    getAuxiliaryModels.mockResolvedValueOnce({
+      main: { provider: 'gateway', model: 'auto' },
+      tasks: [{ task: 'vision', provider: 'gateway', model: 'gateway-good', base_url: '' }]
+    })
+
     await renderModelSettings()
 
     // One "Set to main" button per task slot; the first is Vision.
@@ -264,8 +289,8 @@ describe('ModelSettings', () => {
 
     await waitFor(() =>
       expect(setModelAssignment).toHaveBeenCalledWith({
-        model: 'hermes-4',
-        provider: 'nous',
+        model: '',
+        provider: 'auto',
         scope: 'auxiliary',
         task: 'vision'
       })
@@ -440,7 +465,7 @@ describe('ModelSettings', () => {
     expect(await screen.findByText('Reasoning')).toBeTruthy()
   })
 
-  it('forces a fresh catalog and prevents an old profile response from repainting after a profile switch', async () => {
+  it('uses cached catalogs and prevents an old profile response from repainting after a profile switch', async () => {
     const oldOptions = deferred<{ providers: ReturnType<typeof gatewayProvider>[] }>()
     getGlobalModelInfo
       .mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-good' })
@@ -462,8 +487,8 @@ describe('ModelSettings', () => {
     profileSwitch.callback?.()
 
     expect(await screen.findByText('legacy-model')).toBeTruthy()
-    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(1, { refresh: true })
-    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(2, { refresh: true })
+    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(1, undefined)
+    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(2, undefined)
 
     oldOptions.resolve({ providers: [gatewayProvider()] })
     await waitFor(() => expect(screen.queryByText('gateway-good')).toBeNull())
@@ -509,6 +534,8 @@ describe('ModelSettings', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Refresh models' }))
 
     await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalledTimes(2))
+    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(1, undefined)
+    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(2, { refresh: true })
     triggers = screen.getAllByRole('combobox')
     expect(triggers[0].textContent).toContain('Gateway')
     expect(triggers[1].textContent).toContain('auto')
@@ -560,12 +587,7 @@ describe('ModelSettings', () => {
           verified: { ...ALL_SUPPORTED, completion: 'unsupported' }
         }
       },
-      models: [
-        'auto',
-        'gateway-good',
-        'gateway-completion-only',
-        'gateway-tools-unknown'
-      ]
+      models: ['auto', 'gateway-good', 'gateway-completion-only', 'gateway-tools-unknown']
     })
 
     getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-good' })
@@ -577,9 +599,9 @@ describe('ModelSettings', () => {
 
     fireEvent.click(rowComboboxes('Reference 1')[1])
     expect(screen.queryByRole('option', { name: /^auto/ })).toBeNull()
-    expect(
-      screen.getByRole('option', { name: 'gateway-completion-only' }).getAttribute('aria-disabled')
-    ).not.toBe('true')
+    expect(screen.getByRole('option', { name: 'gateway-completion-only' }).getAttribute('aria-disabled')).not.toBe(
+      'true'
+    )
     expect(
       screen.getByRole('option', { name: /gateway-no-completion.*Needs review/ }).getAttribute('aria-disabled')
     ).not.toBe('true')
@@ -638,5 +660,76 @@ describe('ModelSettings', () => {
     expect(screen.getByText('Aggregator')).toBeTruthy()
     expect(screen.getByText(/gateway · gateway-no-completion/)).toBeTruthy()
     expect(screen.queryByText('backend prose must not be shown')).toBeNull()
+  })
+
+  it('cancels a pending MoA autosave when the active profile switches', async () => {
+    apiRequestProfile = 'profile-a'
+    getGlobalModelInfo.mockResolvedValue({ provider: 'gateway', model: 'gateway-good' })
+    getGlobalModelOptions.mockResolvedValue({ providers: [gatewayProvider()] })
+    getMoaModels.mockResolvedValueOnce(namedMoaPreset('profile-a')).mockResolvedValueOnce(namedMoaPreset('profile-b'))
+
+    await renderModelSettings()
+    await screen.findByText('Reference 1')
+    vi.useFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add reference model' }))
+    apiRequestProfile = 'profile-b'
+    profileSwitch.callback?.()
+    await act(async () => vi.advanceTimersByTimeAsync(600))
+
+    expect(saveMoaModels).not.toHaveBeenCalled()
+  })
+
+  it('pins an in-flight MoA autosave to its origin and ignores its late success after a profile switch', async () => {
+    const oldSave = deferred<ReturnType<typeof namedMoaPreset>>()
+    apiRequestProfile = 'profile-a'
+    getGlobalModelInfo.mockResolvedValue({ provider: 'gateway', model: 'gateway-good' })
+    getGlobalModelOptions.mockResolvedValue({ providers: [gatewayProvider()] })
+    getMoaModels.mockResolvedValueOnce(namedMoaPreset('profile-a')).mockResolvedValueOnce(namedMoaPreset('profile-b'))
+    saveMoaModels.mockReturnValueOnce(oldSave.promise)
+
+    await renderModelSettings()
+    await screen.findByText('Reference 1')
+    vi.useFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add reference model' }))
+    await act(async () => vi.advanceTimersByTimeAsync(600))
+    expect(saveMoaModels).toHaveBeenCalledWith(expect.any(Object), 'profile-a')
+
+    apiRequestProfile = 'profile-b'
+    await act(async () => {
+      profileSwitch.callback?.()
+      await Promise.resolve()
+    })
+    expect(screen.getAllByText('profile-b')).toHaveLength(2)
+
+    await act(async () => oldSave.resolve(namedMoaPreset('old-response')))
+    expect(screen.getAllByText('profile-b')).toHaveLength(2)
+    expect(screen.queryByText('old-response')).toBeNull()
+  })
+
+  it('ignores a late MoA autosave error from the previous profile', async () => {
+    const oldSave = deferred<ReturnType<typeof namedMoaPreset>>()
+    apiRequestProfile = 'profile-a'
+    getGlobalModelInfo.mockResolvedValue({ provider: 'gateway', model: 'gateway-good' })
+    getGlobalModelOptions.mockResolvedValue({ providers: [gatewayProvider()] })
+    getMoaModels.mockResolvedValueOnce(namedMoaPreset('profile-a')).mockResolvedValueOnce(namedMoaPreset('profile-b'))
+    saveMoaModels.mockReturnValueOnce(oldSave.promise)
+
+    await renderModelSettings()
+    await screen.findByText('Reference 1')
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: 'Add reference model' }))
+    await act(async () => vi.advanceTimersByTimeAsync(600))
+
+    apiRequestProfile = 'profile-b'
+    await act(async () => {
+      profileSwitch.callback?.()
+      await Promise.resolve()
+    })
+    await act(async () => oldSave.reject(new Error('profile-a save failed')))
+
+    expect(screen.queryByText('profile-a save failed')).toBeNull()
+    expect(screen.getAllByText('profile-b')).toHaveLength(2)
   })
 })

@@ -6,6 +6,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import {
+  getApiRequestProfile,
   getAuxiliaryModels,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -215,8 +216,11 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   // so a request in flight when the user switches profiles can't paint profile
   // A's models/providers into profile B (or fire onMainModelChanged for A).
   const profileEpoch = useRef(0)
+  const moaRef = useRef<MoaConfigResponse | null>(null)
+  const moaSaveGeneration = useRef(0)
+  const moaSaveTimer = useRef<number | null>(null)
 
-  const refresh = useCallback(async (options?: { preserveDraft?: boolean }) => {
+  const refresh = useCallback(async (options?: { preserveDraft?: boolean; refreshCatalog?: boolean }) => {
     const epoch = profileEpoch.current
     setLoading(true)
     setError('')
@@ -224,7 +228,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     try {
       const [modelInfo, modelOptions, auxiliaryModels, moaModels] = await Promise.all([
         getGlobalModelInfo(),
-        getGlobalModelOptions({ refresh: true }),
+        getGlobalModelOptions(options?.refreshCatalog ? { refresh: true } : undefined),
         getAuxiliaryModels(),
         getMoaModels().catch(() => null)
       ])
@@ -270,6 +274,14 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   // new profile (bumping the epoch first so any in-flight A request is discarded).
   useOnProfileSwitch(() => {
     profileEpoch.current += 1
+    moaSaveGeneration.current += 1
+
+    if (moaSaveTimer.current !== null) {
+      window.clearTimeout(moaSaveTimer.current)
+      moaSaveTimer.current = null
+    }
+
+    moaRef.current = null
     setProviders([])
     setMainModel(null)
     setSelectedProvider('')
@@ -352,17 +364,15 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
   // Mirror of `moa` so inline edits compute the next state purely (outside the
   // setState updater) and hand it straight to the debounced autosave.
-  const moaRef = useRef<MoaConfigResponse | null>(null)
-
   useEffect(() => {
     moaRef.current = moa
   }, [moa])
 
-  const moaSaveTimer = useRef<number | null>(null)
-
   useEffect(
     () => () => {
-      if (moaSaveTimer.current) {
+      moaSaveGeneration.current += 1
+
+      if (moaSaveTimer.current !== null) {
         window.clearTimeout(moaSaveTimer.current)
       }
     },
@@ -374,14 +384,30 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   // preset-level ops (set default / add / delete) that already persist on
   // click. No `applying` spinner, so selecting stays responsive.
   const scheduleMoaSave = useCallback((next: MoaConfigResponse) => {
-    if (moaSaveTimer.current) {
+    if (moaSaveTimer.current !== null) {
       window.clearTimeout(moaSaveTimer.current)
     }
 
+    const epoch = profileEpoch.current
+    const generation = ++moaSaveGeneration.current
+    const profile = getApiRequestProfile()
+
     moaSaveTimer.current = window.setTimeout(() => {
-      void saveMoaModels(next)
-        .then(setMoa)
-        .catch(err => setError(err instanceof Error ? err.message : String(err)))
+      moaSaveTimer.current = null
+      void saveMoaModels(next, profile)
+        .then(saved => {
+          if (profileEpoch.current !== epoch || moaSaveGeneration.current !== generation) {
+            return
+          }
+
+          moaRef.current = saved
+          setMoa(saved)
+        })
+        .catch(err => {
+          if (profileEpoch.current === epoch && moaSaveGeneration.current === generation) {
+            setError(err instanceof Error ? err.message : String(err))
+          }
+        })
     }, 600)
   }, [])
 
@@ -697,8 +723,8 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
       try {
         const result = await setModelAssignment({
-          model: mainModel.model,
-          provider: mainModel.provider,
+          model: '',
+          provider: 'auto',
           scope: 'auxiliary',
           task
         })
@@ -877,7 +903,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             <span>{providerReadiness}</span>
             <Button
               disabled={loading}
-              onClick={() => void refresh({ preserveDraft: true })}
+              onClick={() => void refresh({ preserveDraft: true, refreshCatalog: true })}
               size="sm"
               variant="textStrong"
             >
@@ -1213,9 +1239,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                       <SelectTrigger className={cn('min-w-48', CONTROL_TEXT)}>
                         <SelectValue placeholder={m.model} />
                       </SelectTrigger>
-                      <SelectContent>
-                        {renderMoaModelOptions(slot.provider, slot.model, 'moa-reference')}
-                      </SelectContent>
+                      <SelectContent>{renderMoaModelOptions(slot.provider, slot.model, 'moa-reference')}</SelectContent>
                     </Select>
                     <Button
                       disabled={currentMoaPreset.reference_models.length <= 1 || applying}
