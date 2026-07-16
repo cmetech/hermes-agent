@@ -1262,7 +1262,7 @@ def test_contract_provider_failure_statuses_keep_live_and_saved_models_unknown(
             "live-model",
             "saved-out-of-catalog-model",
         ]
-        assert gateway["capability_mismatch_count"] == 2
+        assert gateway["capability_mismatch_count"] == 1
         for model_id in ("live-model", "saved-out-of-catalog-model"):
             assert gateway["capabilities"][model_id]["reasoning"] is False
             assert gateway["capabilities"][model_id]["verified"] == {
@@ -1271,6 +1271,10 @@ def test_contract_provider_failure_statuses_keep_live_and_saved_models_unknown(
                 "vision": "unknown",
                 "reasoning": "unknown",
             }
+        assert (
+            gateway["capabilities"]["saved-out-of-catalog-model"]["live"]
+            is False
+        )
 
 
 def test_contract_provider_alias_keeps_saved_current_model_visible(monkeypatch):
@@ -1326,6 +1330,92 @@ def test_contract_provider_alias_keeps_saved_current_model_visible(monkeypatch):
         "vision": "unknown",
         "reasoning": "unknown",
     }
+
+
+def test_saved_contract_model_is_not_joined_as_live_catalog_evidence(monkeypatch):
+    from hermes_cli.model_capabilities import ModelCapabilityCatalog
+
+    slug = "test-inventory-gateway-stale-saved"
+    saved_model = "saved-out-of-catalog-model"
+    _install_inventory_gateway_profile(monkeypatch, slug)
+    row = {
+        "slug": slug,
+        "name": "Test Inventory Gateway",
+        "models": ["live-model"],
+        "total_models": 1,
+        "is_current": True,
+        "is_user_defined": False,
+        "source": "canonical",
+    }
+    catalog = ModelCapabilityCatalog(
+        status="ready",
+        models={
+            "live-model": _verified_model(
+                "live-model",
+                reasoning="supported",
+            ),
+            saved_model: _verified_model(
+                saved_model,
+                reasoning="supported",
+                evidence={
+                    "tools": {
+                        "source": "stale-capability-catalog",
+                        "reference": "must-not-survive",
+                    }
+                },
+            ),
+        },
+    )
+
+    with (
+        _list_auth_returning([row]) as list_authenticated,
+        patch(
+            "hermes_cli.model_capabilities.fetch_model_capability_catalog",
+            return_value=catalog,
+        ),
+        patch(
+            "hermes_cli.models.model_supports_fast_mode",
+            return_value=False,
+        ),
+        patch(
+            "agent.models_dev.get_model_capabilities",
+            return_value=None,
+        ),
+    ):
+        payload = build_models_payload(
+            _empty_ctx(provider=slug, model=saved_model),
+            capabilities=True,
+        )
+
+    assert list_authenticated.call_args.kwargs["inject_current_model"] is False
+    gateway = next(
+        provider
+        for provider in payload["providers"]
+        if provider["slug"] == slug
+    )
+    assert gateway["models"] == ["auto", "live-model", saved_model]
+    assert gateway["capability_mismatch_count"] == 1
+    assert gateway["capabilities"][saved_model] == {
+        "fast": False,
+        "reasoning": False,
+        "verified": {
+            "completion": "unknown",
+            "tools": "unknown",
+            "vision": "unknown",
+            "reasoning": "unknown",
+        },
+        "selection_mode": "explicit",
+        "evidence": {},
+        "live": False,
+    }
+
+
+def test_saved_contract_model_helper_uses_resolvable_context_annotation():
+    from typing import get_type_hints
+
+    from hermes_cli.inventory import ConfigContext, _append_saved_contract_model
+
+    assert get_type_hints(_append_saved_contract_model)["ctx"] is ConfigContext
 
 
 def test_explicit_only_does_not_globally_retain_noncurrent_lmstudio():

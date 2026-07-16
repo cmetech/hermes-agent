@@ -1211,6 +1211,24 @@ def test_current_custom_model_is_surfaced_in_builtin_provider_row(monkeypatch):
     assert row["models"][0] == custom  # injected at the front
     assert row["total_models"] == 3
 
+    live_only_providers = list_authenticated_providers(
+        current_provider="openrouter",
+        current_model=custom,
+        user_providers={},
+        custom_providers=[],
+        inject_current_model=False,
+    )
+    live_only_row = next(
+        provider
+        for provider in live_only_providers
+        if provider["slug"] == "openrouter"
+    )
+    assert live_only_row["models"] == [
+        "anthropic/claude-opus-4.8",
+        "openai/gpt-5.5",
+    ]
+    assert live_only_row["total_models"] == 2
+
 
 def test_current_custom_model_not_leaked_into_other_provider_rows(monkeypatch):
     """The current model is only injected into the CURRENT provider's row,
