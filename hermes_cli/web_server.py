@@ -5525,6 +5525,112 @@ def get_moa_models(profile: Optional[str] = None):
         raise HTTPException(status_code=500, detail="Failed to read MoA config")
 
 
+def _validate_changed_moa_slots(
+    current: dict,
+    requested: dict,
+) -> list[dict[str, str]]:
+    """Validate Gateway-backed MoA slots before the requested config is saved."""
+    from hermes_cli.model_eligibility import validate_provider_model_selection
+    from providers import get_provider_profile
+
+    warnings: list[dict[str, str]] = []
+    failures: list[dict[str, str]] = []
+    current_presets = current.get("presets", {})
+    requested_presets = requested.get("presets", {})
+
+    def _pair(slot: Any) -> tuple[str, str]:
+        if not isinstance(slot, dict):
+            return "", ""
+        return (
+            str(slot.get("provider", "") or "").strip(),
+            str(slot.get("model", "") or "").strip(),
+        )
+
+    def _has_capability_contract(provider: str) -> bool:
+        profile = get_provider_profile(provider)
+        return bool(profile is not None and profile.model_capabilities_path)
+
+    def _check_slot(
+        *,
+        preset_name: str,
+        slot_name: str,
+        usage: str,
+        current_slot: Any,
+        requested_slot: Any,
+    ) -> None:
+        provider, model = _pair(requested_slot)
+        if not _has_capability_contract(provider):
+            return
+        exact_existing_assignment = _pair(current_slot) == (provider, model)
+        decision = validate_provider_model_selection(
+            provider,
+            model,
+            usage,
+            exact_existing_assignment=exact_existing_assignment,
+        )
+        if exact_existing_assignment:
+            if decision.grandfathered or not decision.eligible:
+                warnings.append(
+                    {
+                        "preset": preset_name,
+                        "slot": slot_name,
+                        "reason": decision.reason,
+                        "message": decision.message,
+                    }
+                )
+            return
+        if not decision.eligible:
+            failures.append(
+                {
+                    "code": "model-selection-ineligible",
+                    "reason": decision.reason,
+                    "usage": usage,
+                    "preset": preset_name,
+                    "slot": slot_name,
+                    "provider": provider,
+                    "model": model,
+                    "message": decision.message,
+                }
+            )
+
+    for preset_name, requested_preset in requested_presets.items():
+        if not isinstance(requested_preset, dict):
+            continue
+        current_preset = current_presets.get(preset_name, {})
+        if not isinstance(current_preset, dict):
+            current_preset = {}
+        current_references = current_preset.get("reference_models", [])
+        if not isinstance(current_references, list):
+            current_references = []
+        requested_references = requested_preset.get("reference_models", [])
+        if not isinstance(requested_references, list):
+            requested_references = []
+
+        for index, requested_slot in enumerate(requested_references):
+            current_slot = (
+                current_references[index] if index < len(current_references) else {}
+            )
+            _check_slot(
+                preset_name=preset_name,
+                slot_name=f"reference:{index}",
+                usage="moa-reference",
+                current_slot=current_slot,
+                requested_slot=requested_slot,
+            )
+
+        _check_slot(
+            preset_name=preset_name,
+            slot_name="aggregator",
+            usage="moa-aggregator",
+            current_slot=current_preset.get("aggregator", {}),
+            requested_slot=requested_preset.get("aggregator", {}),
+        )
+
+    if failures:
+        raise HTTPException(status_code=409, detail=failures[0])
+    return warnings
+
+
 @app.put("/api/model/moa")
 def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
     """Persist the Mixture-of-Agents provider/model slots."""
@@ -5533,6 +5639,9 @@ def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
 
         with _profile_scope(body.profile or profile):
             cfg = load_config()
+            current = normalize_moa_config(
+                cfg.get("moa") if isinstance(cfg, dict) else {}
+            )
             if body.presets:
                 raw = {
                     "default_preset": body.default_preset,
@@ -5559,9 +5668,18 @@ def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
                     "enabled": body.enabled,
                 }
             normalized = normalize_moa_config(raw)
+            selection_warnings = _validate_changed_moa_slots(current, normalized)
             cfg["moa"] = normalized
             save_config(cfg)
-            return {"ok": True, **normalized}
+            return {
+                "ok": True,
+                **normalized,
+                **(
+                    {"selection_warnings": selection_warnings}
+                    if selection_warnings
+                    else {}
+                ),
+            }
     except HTTPException:
         raise
     except Exception:
@@ -5640,11 +5758,60 @@ def _apply_model_assignment_sync(
     HTTPException for validation errors — the async wrapper re-raises them.
     """
     cfg = load_config()
+    from hermes_cli.model_eligibility import validate_provider_model_selection
 
     if scope == "main":
         if not provider or not model:
             raise HTTPException(status_code=400, detail="provider and model required for main")
         provider, model = _normalize_main_model_assignment(provider, model)
+        current_model_cfg = cfg.get("model", {})
+        if isinstance(current_model_cfg, dict):
+            current_provider = str(
+                current_model_cfg.get("provider", "") or ""
+            ).strip()
+            current_model = str(
+                current_model_cfg.get(
+                    "default", current_model_cfg.get("name", "")
+                )
+                or ""
+            ).strip()
+        else:
+            current_provider = ""
+            current_model = str(current_model_cfg or "").strip()
+        exact_existing_assignment = (
+            provider == current_provider and model == current_model
+        )
+        decision = validate_provider_model_selection(
+            provider,
+            model,
+            "main",
+            exact_existing_assignment=exact_existing_assignment,
+        )
+        if not decision.eligible:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "model-selection-ineligible",
+                    "reason": decision.reason,
+                    "usage": "main",
+                    "provider": provider,
+                    "model": model,
+                    "message": decision.message,
+                },
+            )
+        if exact_existing_assignment and decision.grandfathered:
+            return {
+                "ok": True,
+                "scope": "main",
+                "provider": provider,
+                "model": model,
+                "selection_warning": {
+                    "code": "grandfathered-model-assignment",
+                    "message": decision.message,
+                    "reason": decision.reason,
+                },
+            }
+
         model_cfg = _apply_main_model_assignment(
             cfg.get("model", {}), provider, model, base_url, api_key
         )
@@ -5768,6 +5935,68 @@ def _apply_model_assignment_sync(
     for slot in targets:
         if slot not in _AUX_TASK_SLOTS:
             raise HTTPException(status_code=400, detail=f"unknown auxiliary task: {slot}")
+
+    def _current_auxiliary_pair(slot: str) -> tuple[str, str]:
+        slot_cfg = aux.get(slot)
+        if not isinstance(slot_cfg, dict):
+            return "auto", ""
+        return (
+            str(slot_cfg.get("provider", "auto") or "auto").strip(),
+            str(slot_cfg.get("model", "") or "").strip(),
+        )
+
+    exact_existing_assignment = all(
+        _current_auxiliary_pair(slot) == (provider, model) for slot in targets
+    )
+    usages = (
+        ["vision", "auxiliary"]
+        if not task
+        else ["vision" if task == "vision" else "auxiliary"]
+    )
+    decisions = [
+        (
+            usage,
+            validate_provider_model_selection(
+                provider,
+                model,
+                usage,
+                exact_existing_assignment=exact_existing_assignment,
+            ),
+        )
+        for usage in usages
+    ]
+    for usage, decision in decisions:
+        if not decision.eligible:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "model-selection-ineligible",
+                    "reason": decision.reason,
+                    "usage": usage,
+                    "provider": provider,
+                    "model": model,
+                    "message": decision.message,
+                },
+            )
+    grandfathered = next(
+        (decision for _usage, decision in decisions if decision.grandfathered),
+        None,
+    )
+    if exact_existing_assignment and grandfathered is not None:
+        return {
+            "ok": True,
+            "scope": "auxiliary",
+            "tasks": targets,
+            "provider": provider,
+            "model": model,
+            "selection_warning": {
+                "code": "grandfathered-model-assignment",
+                "message": grandfathered.message,
+                "reason": grandfathered.reason,
+            },
+        }
+
+    for slot in targets:
         slot_cfg = aux.get(slot)
         if not isinstance(slot_cfg, dict):
             slot_cfg = {}

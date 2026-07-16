@@ -1622,6 +1622,15 @@ def list_authenticated_providers(
         except Exception:
             return False
 
+    def _noauth_profile(provider: str):
+        try:
+            from providers import get_provider_profile
+
+            profile = get_provider_profile(provider)
+            return profile if profile and profile.supports_unauthenticated else None
+        except Exception:
+            return None
+
     data = fetch_models_dev()
 
     # Build curated model lists keyed by hermes provider ID
@@ -1644,7 +1653,9 @@ def list_authenticated_providers(
     # On auth rejection or unreachable server, fall back to the caller-supplied
     # current model so the picker still shows something when offline / mis-keyed.
     if "lmstudio" not in curated and (
-        os.environ.get("LM_API_KEY") or os.environ.get("LM_BASE_URL") or current_provider.strip().lower() == "lmstudio"
+        os.environ.get("LM_API_KEY")
+        or os.environ.get("LM_BASE_URL")
+        or current_provider.strip().lower() == "lmstudio"
     ):
         from hermes_cli.models import fetch_lmstudio_models
         from hermes_cli.auth import AuthError
@@ -1976,6 +1987,19 @@ def list_authenticated_providers(
             _cp_has_creds = _has_aws_sdk_creds_for_listing(_cp.slug)
 
         if not _cp_has_creds:
+            profile = _noauth_profile(_cp.slug)
+            if profile is not None:
+                from hermes_cli.auth import is_provider_explicitly_configured
+
+                delivered_gateway = bool(profile.model_capabilities_path)
+                local_provider_in_use = (
+                    _cp.slug == current_provider
+                    or is_provider_explicitly_configured(_cp.slug)
+                )
+                if delivered_gateway or local_provider_in_use:
+                    _cp_has_creds = True
+
+        if not _cp_has_creds:
             continue
 
         # For bedrock, use live discovery so the list reflects the active
@@ -1986,6 +2010,10 @@ def list_authenticated_providers(
                 _cp_model_ids = _ids if _ids else curated.get(_cp.slug, [])
             except Exception:
                 _cp_model_ids = curated.get(_cp.slug, [])
+        elif _cp.slug == "lmstudio" and "lmstudio" in curated:
+            # Preserve LM Studio's native /api/v1/models probe, including its
+            # embedding-model filter and current/configured base-URL handling.
+            _cp_model_ids = curated["lmstudio"]
         else:
             # Unified pathway — same as sections 1 and 2.
             _cp_model_ids = cached_provider_model_ids(_cp.slug)

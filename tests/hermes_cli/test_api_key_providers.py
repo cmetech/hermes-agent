@@ -6,6 +6,7 @@ import pytest
 
 from hermes_cli.auth import (
     PROVIDER_REGISTRY,
+    ProviderConfig,
     resolve_provider,
     get_api_key_provider_status,
     resolve_api_key_provider_credentials,
@@ -448,6 +449,74 @@ class TestResolveApiKeyProviderCredentials:
         assert creds["provider"] == "lmstudio"
         assert creds["api_key"] == "dummy-lm-api-key"
         assert creds["base_url"] == "http://127.0.0.1:1234/v1"
+
+    def test_profile_declared_noauth_provider_gets_nonsecret_placeholder(self, monkeypatch):
+        """No shared auth code should need to know a generated brand slug."""
+        import providers as provider_registry
+        from providers.base import ProviderProfile
+
+        slug = "test-capability-gateway"
+        monkeypatch.setitem(
+            provider_registry._REGISTRY,
+            slug,
+            ProviderProfile(
+                name=slug,
+                env_vars=("TEST_CAPABILITY_GATEWAY_API_KEY",),
+                base_url="http://127.0.0.1:19090/v1",
+                auth_type="api_key",
+                supports_unauthenticated=True,
+                model_capabilities_path="model-capabilities",
+            ),
+        )
+        monkeypatch.setitem(
+            PROVIDER_REGISTRY,
+            slug,
+            ProviderConfig(
+                id=slug,
+                name="Test Capability Gateway",
+                auth_type="api_key",
+                inference_base_url="http://127.0.0.1:19090/v1",
+                api_key_env_vars=("TEST_CAPABILITY_GATEWAY_API_KEY",),
+            ),
+        )
+        monkeypatch.delenv("TEST_CAPABILITY_GATEWAY_API_KEY", raising=False)
+
+        creds = resolve_api_key_provider_credentials(slug)
+
+        assert creds["api_key"] == "dummy-lm-api-key"
+        assert creds["source"] == "default"
+
+    def test_ordinary_api_key_profile_without_key_stays_empty(self, monkeypatch):
+        import providers as provider_registry
+        from providers.base import ProviderProfile
+
+        slug = "test-key-required"
+        monkeypatch.setitem(
+            provider_registry._REGISTRY,
+            slug,
+            ProviderProfile(
+                name=slug,
+                env_vars=("TEST_KEY_REQUIRED_API_KEY",),
+                base_url="https://required.example/v1",
+                auth_type="api_key",
+            ),
+        )
+        monkeypatch.setitem(
+            PROVIDER_REGISTRY,
+            slug,
+            ProviderConfig(
+                id=slug,
+                name="Test Key Required",
+                auth_type="api_key",
+                inference_base_url="https://required.example/v1",
+                api_key_env_vars=("TEST_KEY_REQUIRED_API_KEY",),
+            ),
+        )
+        monkeypatch.delenv("TEST_KEY_REQUIRED_API_KEY", raising=False)
+
+        creds = resolve_api_key_provider_credentials(slug)
+
+        assert creds["api_key"] == ""
 
     def test_try_gh_cli_token_uses_homebrew_path_when_not_on_path(self, monkeypatch):
         monkeypatch.setattr("hermes_cli.copilot_auth.shutil.which", lambda command: None)

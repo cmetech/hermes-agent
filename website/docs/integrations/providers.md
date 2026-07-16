@@ -51,6 +51,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **MiniMax OAuth** | `hermes model` → "MiniMax (OAuth)" (provider: `minimax-oauth`; browser PKCE login) |
 | **StepFun** | `STEPFUN_API_KEY` in `~/.hermes/.env` (provider: `stepfun`) |
 | **LM Studio** | `hermes model` → "LM Studio" (provider: `lmstudio`, optional `LM_API_KEY`) |
+| **Branded Gateway** | Built in; `OTTO_API_KEY` is needed only when the Gateway itself requires bearer authentication |
 | **Custom Endpoint** | `hermes model` → choose "Custom endpoint" (saved in `config.yaml`) |
 
 For the official API-key path, see the dedicated [Google Gemini guide](/guides/google-gemini).
@@ -103,6 +104,47 @@ Hermes has **two** model commands that serve different purposes:
 | **`/model`** | Inside a Hermes chat session | Quick switch between **already-configured** providers and models |
 
 If you're trying to switch to a provider you haven't set up yet (e.g. you only have OpenRouter configured and want to use Anthropic), you need `hermes model`, not `/model`. Exit your session first (`Ctrl+C` or `/quit`), run `hermes model`, complete the provider setup, then start a new session.
+
+### Branded Gateway provider
+
+OTTO, LOOP24, and other generated brands include the same Gateway provider
+contract under their own provider identity. The Gateway is an
+OpenAI-compatible service that routes requests through Kiro. Choose:
+
+- **`auto`** for main-model automatic routing.
+- **An explicit live model ID** when you want to pin a concrete model and the
+  Gateway has verified the capabilities required by that assignment.
+
+The Gateway, not the client, owns both sources of truth:
+
+| Gateway endpoint | Owns |
+|---|---|
+| `/v1/models` | Explicit model IDs Kiro currently makes available |
+| `/v1/model-capabilities` | Verified per-model evidence for completion, tools, vision, and reasoning |
+
+Hermes joins these responses by exact model ID and carries no static Gateway
+model registry. Main-slot `auto` is a routing sentinel, not an explicit model
+membership claim, so it remains eligible independently of these responses. A
+listed explicit model is not automatically eligible for every slot. For
+example, a main or fallback model needs verified completion and tool support,
+while the vision slot needs verified completion and vision support. Unknown
+means unverified, not supported and not unsupported.
+
+The provider can operate without a stored credential when the Gateway was
+launched without authentication. If the Gateway requires bearer
+authentication, save `OTTO_API_KEY` on the **Keys** page or in the active
+profile's `.env` file. A live `401` or `403` always means the key is required,
+even though the provider supports no-auth deployments. Never paste the key into
+a chat.
+
+If the Models page says the Gateway must be updated, the inference endpoint is
+reachable but the capability endpoint returned `404`. Follow the inference
+Gateway deployment's approved upgrade procedure, then refresh the model list.
+See
+[Gateway status and explicit model selection](/user-guide/configuring-models#gateway-status-and-explicit-model-selection)
+for every readiness state and the slot requirement matrix, and
+[Verify, start, restart, or upgrade the inference Gateway](/developer-guide/gateway-internals#verify-start-restart-or-upgrade-the-inference-gateway)
+for safe operational steps.
 
 
 ### Anthropic (Native)

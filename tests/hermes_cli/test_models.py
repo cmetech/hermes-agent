@@ -2,6 +2,8 @@
 
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from hermes_cli.nous_account import NousPortalAccountInfo
 from hermes_cli.models import (
     OPENROUTER_MODELS, fetch_openrouter_models, model_ids, detect_provider_for_model,
@@ -17,6 +19,18 @@ LIVE_OPENROUTER_MODELS = [
     ("qwen/qwen3.7-max", ""),
     ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
 ]
+
+
+@pytest.mark.parametrize("provider", [None, "openai"])
+def test_clear_provider_models_cache_also_clears_capability_cache(provider):
+    from hermes_cli.models import clear_provider_models_cache
+
+    with patch(
+        "hermes_cli.model_capabilities.clear_model_capabilities_cache"
+    ) as clear_capabilities:
+        clear_provider_models_cache(provider)
+
+    clear_capabilities.assert_called_once_with(provider)
 
 
 

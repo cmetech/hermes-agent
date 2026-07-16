@@ -837,6 +837,36 @@ without an explicit `kind:` get auto-coerced via a source-text heuristic
 
 Full authoring guide: `website/docs/developer-guide/model-provider-plugin.md`.
 
+#### Gateway model inventory and auth invariants
+
+Providers that can run without a stored API key declare
+`ProviderProfile.supports_unauthenticated`; shared auth code must never
+hardcode brand names or a brand tuple. This declaration only permits a
+non-secret SDK placeholder. It is not proof that the endpoint is ready or
+actually unauthenticated: live `401`/`403` responses require the configured
+provider key.
+
+Providers that expose verified per-model evidence declare
+`ProviderProfile.model_capabilities_path`. For the branded Gateway:
+
+- `/v1/models` owns live availability for explicit IDs; main-slot `auto` is a
+  routing sentinel that remains eligible independently of catalog readiness,
+  live membership, or capability evidence.
+- `/v1/model-capabilities` owns verified evidence.
+- The client joins exact IDs and must not carry a static Gateway model or
+  capability registry.
+- `unknown` means unverified, never implicitly supported or unsupported.
+- Existing saved assignments are preserved for review; new or changed
+  assignments must satisfy the slot-specific verified capability policy.
+
+Never tell users to paste `OTTO_API_KEY` or any credential into chat. It is
+optional only when the Gateway itself was launched without authentication;
+store it in the active profile's `.env` or the desktop Keys surface.
+
+Shared Gateway/provider changes land on `base`, then must be merged, generated,
+tested, and built for every brand discovered from `brands/*.json`. An OTTO-only
+pass is not completion unless the user explicitly excludes the other brands.
+
 ### Dashboard / context-engine / image-gen plugin directories
 
 `plugins/context_engine/`, `plugins/image_gen/`, etc. follow the same

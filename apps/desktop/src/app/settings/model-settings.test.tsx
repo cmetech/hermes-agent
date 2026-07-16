@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 // Radix Select calls scrollIntoView on its items when the content opens; jsdom
@@ -21,10 +21,12 @@ const setEnvVar = vi.fn()
 const getHermesConfigRecord = vi.fn()
 const saveHermesConfig = vi.fn()
 const startManualProviderOAuth = vi.fn()
+const startManualLocalEndpoint = vi.fn()
+const profileSwitch = vi.hoisted(() => ({ callback: null as null | (() => void) }))
 
 vi.mock('@/hermes', () => ({
   getGlobalModelInfo: () => getGlobalModelInfo(),
-  getGlobalModelOptions: () => getGlobalModelOptions(),
+  getGlobalModelOptions: (options?: unknown) => getGlobalModelOptions(options),
   getAuxiliaryModels: () => getAuxiliaryModels(),
   getMoaModels: () => getMoaModels(),
   setModelAssignment: (body: unknown) => setModelAssignment(body),
@@ -36,10 +38,28 @@ vi.mock('@/hermes', () => ({
 }))
 
 vi.mock('@/store/onboarding', () => ({
+  startManualLocalEndpoint: () => startManualLocalEndpoint(),
   startManualProviderOAuth: (slug: string) => startManualProviderOAuth(slug)
 }))
 
+vi.mock('../hooks/use-on-profile-switch', () => ({
+  useOnProfileSwitch: (callback: () => void) => {
+    profileSwitch.callback = callback
+  }
+}))
+
+vi.mock('../hooks/use-config-record', () => ({
+  invalidateHermesConfig: vi.fn(),
+  setHermesConfigCache: vi.fn(),
+  useHermesConfigRecord: () => {
+    getHermesConfigRecord()
+
+    return { data: { agent: { reasoning_effort: 'medium', service_tier: 'normal' } } }
+  }
+}))
+
 beforeEach(() => {
+  profileSwitch.callback = null
   getGlobalModelInfo.mockResolvedValue({ provider: 'nous', model: 'hermes-4' })
   getGlobalModelOptions.mockResolvedValue({
     providers: [
@@ -59,6 +79,7 @@ beforeEach(() => {
   getMoaModels.mockResolvedValue(null)
   setModelAssignment.mockResolvedValue({ provider: 'nous', model: 'hermes-4', gateway_tools: [] })
   getRecommendedDefaultModel.mockResolvedValue({ provider: 'nous', model: 'hermes-4', free_tier: null })
+  saveMoaModels.mockImplementation(async body => body)
   setEnvVar.mockResolvedValue({ ok: true })
   getHermesConfigRecord.mockResolvedValue({ agent: { reasoning_effort: 'medium', service_tier: 'normal' } })
   saveHermesConfig.mockResolvedValue({ ok: true })
@@ -73,6 +94,109 @@ async function renderModelSettings() {
   const { ModelSettings } = await import('./model-settings')
 
   return render(<ModelSettings />)
+}
+
+const ALL_SUPPORTED = {
+  completion: 'supported',
+  reasoning: 'supported',
+  tools: 'supported',
+  vision: 'supported'
+} as const
+
+function gatewayProvider(overrides: Record<string, unknown> = {}): {
+  authenticated: boolean
+  capability_status: string
+  capabilities: Record<string, unknown>
+  key_env: string
+  models: string[]
+  name: string
+  slug: string
+} {
+  return {
+    authenticated: true,
+    capability_status: 'ready',
+    capabilities: {
+      'gateway-good': {
+        evidence: {
+          tools: {
+            reference: 'https://evidence.example/private-catalog'
+          }
+        },
+        fast: false,
+        reasoning: true,
+        selection_mode: 'explicit',
+        verified: ALL_SUPPORTED
+      },
+      'gateway-no-tools': {
+        fast: false,
+        reasoning: true,
+        selection_mode: 'explicit',
+        verified: { ...ALL_SUPPORTED, tools: 'unsupported' }
+      },
+      'gateway-tools-unknown': {
+        fast: false,
+        reasoning: true,
+        selection_mode: 'explicit',
+        verified: { ...ALL_SUPPORTED, reasoning: 'unknown', tools: 'unknown' }
+      },
+      'gateway-no-vision': {
+        fast: false,
+        reasoning: true,
+        selection_mode: 'explicit',
+        verified: { ...ALL_SUPPORTED, vision: 'unsupported' }
+      }
+    },
+    key_env: 'OTTO_API_KEY',
+    models: ['gateway-good', 'gateway-no-tools', 'gateway-tools-unknown', 'gateway-no-vision'],
+    name: 'Gateway',
+    slug: 'gateway',
+    ...overrides
+  }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+
+  const promise = new Promise<T>(res => {
+    resolve = res
+  })
+
+  return { promise, resolve }
+}
+
+function moaPreset(overrides: Record<string, unknown> = {}) {
+  return {
+    active_preset: 'default',
+    aggregator: { provider: 'gateway', model: 'gateway-tools-unknown' },
+    aggregator_temperature: 0.2,
+    default_preset: 'default',
+    enabled: true,
+    max_tokens: 2048,
+    presets: {
+      default: {
+        aggregator: { provider: 'gateway', model: 'gateway-tools-unknown' },
+        aggregator_temperature: 0.2,
+        enabled: true,
+        max_tokens: 2048,
+        reference_models: [{ provider: 'gateway', model: 'gateway-no-completion' }],
+        reference_temperature: 0.7
+      }
+    },
+    reference_models: [{ provider: 'gateway', model: 'gateway-no-completion' }],
+    reference_temperature: 0.7,
+    ...overrides
+  }
+}
+
+function rowComboboxes(title: string): HTMLElement[] {
+  const titleNode = screen.getByText(title)
+  const row = titleNode.parentElement?.parentElement
+
+  if (!row) {
+    throw new Error(`Could not find settings row for ${title}`)
+  }
+
+  return within(row).getAllByRole('combobox')
 }
 
 describe('ModelSettings', () => {
@@ -177,5 +301,342 @@ describe('ModelSettings', () => {
 
     // Banner present on load, no switch required.
     expect(await screen.findByText(/still run on/)).toBeTruthy()
+  })
+
+  it('shows Gateway auto first and keeps unsupported or unknown live main models visible but disabled', async () => {
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-good' })
+    getGlobalModelOptions.mockResolvedValueOnce({ providers: [gatewayProvider()] })
+
+    await renderModelSettings()
+
+    const triggers = await screen.findAllByRole('combobox')
+    fireEvent.click(triggers[1])
+
+    const options = await screen.findAllByRole('option')
+    expect(options.map(option => option.textContent?.trim())).toEqual([
+      'autoAutomatic routing',
+      'gateway-good',
+      'gateway-no-toolsDoes not support tools',
+      'gateway-tools-unknownTool support is not verified',
+      'gateway-no-vision'
+    ])
+    expect(screen.getByRole('option', { name: 'gateway-good' }).getAttribute('aria-disabled')).not.toBe('true')
+    expect(screen.getByRole('option', { name: /gateway-no-tools/ }).getAttribute('aria-disabled')).toBe('true')
+    expect(screen.getByRole('option', { name: /gateway-tools-unknown/ }).getAttribute('aria-disabled')).toBe('true')
+    expect(screen.queryByText(/evidence\.example/)).toBeNull()
+  })
+
+  it('preserves a current unsupported Gateway model and marks it for review without changing it', async () => {
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-no-tools' })
+    getGlobalModelOptions.mockResolvedValueOnce({ providers: [gatewayProvider()] })
+
+    await renderModelSettings()
+
+    const triggers = await screen.findAllByRole('combobox')
+    expect(triggers[1].textContent).toContain('gateway-no-tools')
+    fireEvent.click(triggers[1])
+
+    expect(
+      screen.getByRole('option', { name: /gateway-no-tools.*Needs review/ }).getAttribute('aria-disabled')
+    ).not.toBe('true')
+    expect(setModelAssignment).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['authentication-required', 'Configure OTTO_API_KEY in Keys to use Gateway models.'],
+    ['gateway-upgrade-required', 'Update Gateway to load verified model capabilities.'],
+    ['gateway-unreachable', 'Gateway is unavailable. Refresh the model catalog and try again.'],
+    ['catalog-empty', 'Gateway returned no concrete models. Refresh the model catalog and try again.'],
+    ['capability-response-invalid', 'Gateway returned an incompatible capability response.'],
+    ['unknown', 'Gateway model status is unknown. Refresh the model catalog and try again.']
+  ])('renders the distinct Gateway readiness message for %s', async (status, message) => {
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'auto' })
+    getGlobalModelOptions.mockResolvedValueOnce({
+      providers: [
+        gatewayProvider({
+          authenticated: status !== 'authentication-required',
+          capabilities: {},
+          capability_status: status,
+          models: []
+        })
+      ]
+    })
+
+    await renderModelSettings()
+
+    expect(await screen.findByText(message)).toBeTruthy()
+  })
+
+  it('uses vision eligibility for Vision but ordinary auxiliary eligibility for text tasks', async () => {
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-good' })
+    getGlobalModelOptions.mockResolvedValueOnce({ providers: [gatewayProvider()] })
+    getAuxiliaryModels.mockResolvedValueOnce({
+      main: { provider: 'gateway', model: 'gateway-good' },
+      tasks: [
+        { task: 'vision', provider: 'auto', model: '', base_url: '' },
+        { task: 'compression', provider: 'auto', model: '', base_url: '' }
+      ]
+    })
+
+    await renderModelSettings()
+
+    const changeButtons = await screen.findAllByRole('button', { name: 'Change' })
+    fireEvent.click(changeButtons[0])
+    let triggers = screen.getAllByRole('combobox')
+    fireEvent.click(triggers.at(-1)!)
+
+    expect(
+      screen.getByRole('option', { name: /gateway-no-vision.*Does not support vision/ }).getAttribute('aria-disabled')
+    ).toBe('true')
+    expect(screen.queryByRole('option', { name: /^auto/ })).toBeNull()
+
+    fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' })
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    fireEvent.click(screen.getAllByRole('button', { name: 'Change' })[1])
+    triggers = screen.getAllByRole('combobox')
+    fireEvent.click(triggers.at(-1)!)
+
+    expect(screen.getByRole('option', { name: 'gateway-no-vision' }).getAttribute('aria-disabled')).not.toBe('true')
+    expect(screen.queryByRole('option', { name: /^auto/ })).toBeNull()
+  })
+
+  it('keeps provider=auto and an empty model as the inherited auxiliary assignment', async () => {
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-good' })
+    getGlobalModelOptions.mockResolvedValueOnce({ providers: [gatewayProvider()] })
+    getAuxiliaryModels.mockResolvedValueOnce({
+      main: { provider: 'gateway', model: 'gateway-good' },
+      tasks: [{ task: 'vision', provider: 'auto', model: '', base_url: '' }]
+    })
+
+    await renderModelSettings()
+
+    expect((await screen.findAllByText('auto · use main model')).length).toBeGreaterThan(0)
+    expect(setModelAssignment).not.toHaveBeenCalled()
+  })
+
+  it('shows reasoning defaults only for verified contract support while preserving legacy behavior', async () => {
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-tools-unknown' })
+    getGlobalModelOptions.mockResolvedValueOnce({ providers: [gatewayProvider()] })
+
+    const { unmount } = await renderModelSettings()
+    await waitFor(() => expect(getHermesConfigRecord).toHaveBeenCalled())
+    expect(screen.queryByText('Reasoning')).toBeNull()
+
+    unmount()
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'legacy', model: 'legacy-model' })
+    getGlobalModelOptions.mockResolvedValueOnce({
+      providers: [
+        {
+          name: 'Legacy',
+          slug: 'legacy',
+          models: ['legacy-model'],
+          authenticated: true,
+          capabilities: { 'legacy-model': { reasoning: true, fast: false } }
+        }
+      ]
+    })
+
+    await renderModelSettings()
+    expect(await screen.findByText('Reasoning')).toBeTruthy()
+  })
+
+  it('forces a fresh catalog and prevents an old profile response from repainting after a profile switch', async () => {
+    const oldOptions = deferred<{ providers: ReturnType<typeof gatewayProvider>[] }>()
+    getGlobalModelInfo
+      .mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-good' })
+      .mockResolvedValueOnce({ provider: 'legacy', model: 'legacy-model' })
+    getGlobalModelOptions.mockReturnValueOnce(oldOptions.promise).mockResolvedValueOnce({
+      providers: [
+        {
+          name: 'Legacy',
+          slug: 'legacy',
+          models: ['legacy-model'],
+          authenticated: true,
+          capabilities: { 'legacy-model': { reasoning: true, fast: false } }
+        }
+      ]
+    })
+
+    await renderModelSettings()
+    await waitFor(() => expect(profileSwitch.callback).not.toBeNull())
+    profileSwitch.callback?.()
+
+    expect(await screen.findByText('legacy-model')).toBeTruthy()
+    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(1, { refresh: true })
+    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(2, { refresh: true })
+
+    oldOptions.resolve({ providers: [gatewayProvider()] })
+    await waitFor(() => expect(screen.queryByText('gateway-good')).toBeNull())
+    expect(screen.getByText('legacy-model')).toBeTruthy()
+  })
+
+  it('preserves a draft Gateway provider and model when manually refreshing its readiness', async () => {
+    const legacyProvider = {
+      name: 'Legacy',
+      slug: 'legacy',
+      models: ['legacy-model'],
+      authenticated: true,
+      capabilities: { 'legacy-model': { reasoning: true, fast: false } }
+    }
+
+    getGlobalModelInfo.mockResolvedValue({ provider: 'legacy', model: 'legacy-model' })
+    getGlobalModelOptions
+      .mockResolvedValueOnce({
+        providers: [
+          legacyProvider,
+          gatewayProvider({
+            capabilities: {},
+            capability_status: 'gateway-unreachable',
+            models: []
+          })
+        ]
+      })
+      .mockResolvedValueOnce({
+        providers: [legacyProvider, gatewayProvider()]
+      })
+
+    await renderModelSettings()
+
+    let triggers = await screen.findAllByRole('combobox')
+    fireEvent.click(triggers[0])
+    fireEvent.click(screen.getByRole('option', { name: 'Gateway' }))
+
+    expect(await screen.findByText('Gateway is unavailable. Refresh the model catalog and try again.')).toBeTruthy()
+
+    triggers = screen.getAllByRole('combobox')
+    fireEvent.click(triggers[1])
+    fireEvent.click(screen.getByRole('option', { name: /auto.*Automatic routing/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh models' }))
+
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalledTimes(2))
+    triggers = screen.getAllByRole('combobox')
+    expect(triggers[0].textContent).toContain('Gateway')
+    expect(triggers[1].textContent).toContain('auto')
+
+    fireEvent.click(triggers[1])
+    expect(screen.getByRole('option', { name: 'gateway-good' })).toBeTruthy()
+  })
+
+  it('shows a localized warning when an unchanged grandfathered assignment is accepted as a no-op', async () => {
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-no-tools' })
+    getGlobalModelOptions.mockResolvedValueOnce({ providers: [gatewayProvider()] })
+    setModelAssignment.mockResolvedValueOnce({
+      ok: true,
+      provider: 'gateway',
+      model: 'gateway-no-tools',
+      gateway_tools: [],
+      selection_warning: {
+        code: 'grandfathered-model-assignment',
+        reason: 'tools-unsupported',
+        message: 'backend prose must not be shown'
+      }
+    })
+
+    await renderModelSettings()
+    fireEvent.click(await screen.findByRole('button', { name: 'Apply' }))
+
+    expect(
+      await screen.findByText(
+        'This saved model is grandfathered and was left unchanged. Choose a verified model when you are ready.'
+      )
+    ).toBeTruthy()
+    expect(screen.queryByText('backend prose must not be shown')).toBeNull()
+  })
+
+  it('uses reference and aggregator eligibility while preserving saved invalid MoA slots', async () => {
+    const provider = gatewayProvider({
+      capabilities: {
+        ...gatewayProvider().capabilities,
+        auto: {
+          selection_mode: 'automatic',
+          verified: ALL_SUPPORTED
+        },
+        'gateway-completion-only': {
+          selection_mode: 'explicit',
+          verified: { ...ALL_SUPPORTED, tools: 'unsupported' }
+        },
+        'gateway-no-completion': {
+          selection_mode: 'explicit',
+          verified: { ...ALL_SUPPORTED, completion: 'unsupported' }
+        }
+      },
+      models: [
+        'auto',
+        'gateway-good',
+        'gateway-completion-only',
+        'gateway-tools-unknown'
+      ]
+    })
+
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-good' })
+    getGlobalModelOptions.mockResolvedValueOnce({ providers: [provider] })
+    getMoaModels.mockResolvedValueOnce(moaPreset())
+
+    await renderModelSettings()
+    await screen.findByText('Reference 1')
+
+    fireEvent.click(rowComboboxes('Reference 1')[1])
+    expect(screen.queryByRole('option', { name: /^auto/ })).toBeNull()
+    expect(
+      screen.getByRole('option', { name: 'gateway-completion-only' }).getAttribute('aria-disabled')
+    ).not.toBe('true')
+    expect(
+      screen.getByRole('option', { name: /gateway-no-completion.*Needs review/ }).getAttribute('aria-disabled')
+    ).not.toBe('true')
+
+    fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' })
+    fireEvent.click(rowComboboxes('Aggregator')[1])
+    expect(screen.queryByRole('option', { name: /^auto/ })).toBeNull()
+    expect(
+      screen
+        .getByRole('option', { name: /gateway-completion-only.*Does not support tools/ })
+        .getAttribute('aria-disabled')
+    ).toBe('true')
+    expect(
+      screen.getByRole('option', { name: /gateway-tools-unknown.*Needs review/ }).getAttribute('aria-disabled')
+    ).not.toBe('true')
+  })
+
+  it('renders MoA selection warnings without removing the preserved slots', async () => {
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-good' })
+    getGlobalModelOptions.mockResolvedValueOnce({
+      providers: [
+        gatewayProvider({
+          capabilities: {
+            ...gatewayProvider().capabilities,
+            'gateway-no-completion': {
+              selection_mode: 'explicit',
+              verified: { ...ALL_SUPPORTED, completion: 'unsupported' }
+            }
+          }
+        })
+      ]
+    })
+    getMoaModels.mockResolvedValueOnce(moaPreset())
+    saveMoaModels.mockResolvedValueOnce(
+      moaPreset({
+        selection_warnings: [
+          {
+            message: 'backend prose must not be shown',
+            preset: 'default',
+            reason: 'completion-unsupported',
+            slot: 'reference:0'
+          }
+        ]
+      })
+    )
+
+    await renderModelSettings()
+    fireEvent.click(await screen.findByRole('button', { name: 'Set default' }))
+
+    expect(
+      await screen.findByText(
+        'This saved model is grandfathered and was left unchanged. Choose a verified model when you are ready.'
+      )
+    ).toBeTruthy()
+    expect(screen.getByText('Reference 1')).toBeTruthy()
+    expect(screen.getByText('Aggregator')).toBeTruthy()
+    expect(screen.getByText(/gateway · gateway-no-completion/)).toBeTruthy()
+    expect(screen.queryByText('backend prose must not be shown')).toBeNull()
   })
 })

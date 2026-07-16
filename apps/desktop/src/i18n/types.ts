@@ -5,6 +5,9 @@
 // partial locales should use `defineLocale()` so missing desktop-only strings
 // fall back to English while new keys remain type-checked.
 
+import type { ModelEligibilityReasonKey } from '@/lib/model-eligibility'
+import type { ModelCapabilityCatalogStatus } from '@/types/hermes'
+
 export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja'
 
 export type ToolTitleKey =
@@ -614,6 +617,12 @@ export interface Translations {
       fallbackAdd: string
       fallbackEmpty: string
       notInCatalog: string
+      automaticRouting: string
+      currentNeedsReview: string
+      grandfatheredWarning: string
+      refreshModels: string
+      eligibilityReasons: Record<ModelEligibilityReasonKey, string>
+      providerReadiness: Record<Exclude<ModelCapabilityCatalogStatus, 'ready'>, string>
       tasks: Record<string, AuxTaskCopy>
     }
     providers: {

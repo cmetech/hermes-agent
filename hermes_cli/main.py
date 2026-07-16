@@ -4043,7 +4043,7 @@ def _prompt_api_key(pconfig, existing_key: str, provider_id: str = "") -> tuple:
     ``return`` immediately — the user cancelled entry, declined to replace, or
     cleared the key and is now unconfigured.
     """
-    from hermes_cli.auth import LMSTUDIO_NOAUTH_PLACEHOLDER
+    from hermes_cli.auth import NOAUTH_API_KEY_PLACEHOLDER
     from hermes_cli.config import save_env_value
     from hermes_cli.secret_prompt import masked_secret_prompt
 
@@ -4051,7 +4051,7 @@ def _prompt_api_key(pconfig, existing_key: str, provider_id: str = "") -> tuple:
 
     def _prompt_new_key(*, allow_lmstudio_default: bool) -> str:
         if provider_id == "lmstudio" and allow_lmstudio_default:
-            prompt = f"{key_env} (Enter for no-auth default {LMSTUDIO_NOAUTH_PLACEHOLDER!r}): "
+            prompt = f"{key_env} (Enter for no-auth default {NOAUTH_API_KEY_PLACEHOLDER!r}): "
         else:
             prompt = f"{key_env} (or Enter to cancel): "
         try:
@@ -4060,7 +4060,7 @@ def _prompt_api_key(pconfig, existing_key: str, provider_id: str = "") -> tuple:
             print()
             return ""
         if not entered and provider_id == "lmstudio" and allow_lmstudio_default:
-            return LMSTUDIO_NOAUTH_PLACEHOLDER
+            return NOAUTH_API_KEY_PLACEHOLDER
         return entered
 
     # First-time entry ────────────────────────────────────────────────────

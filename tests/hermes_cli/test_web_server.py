@@ -129,6 +129,66 @@ def _install_example_plugin(_isolate_hermes_home):
         web_server._dashboard_plugins_cache = None
 
 
+@pytest.fixture
+def _no_model_cost_warning(monkeypatch):
+    """Keep model-assignment tests focused on capability validation."""
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning",
+        lambda *_args, **_kwargs: None,
+    )
+
+
+@pytest.fixture
+def _moa_contract_profile():
+    """Register a real capability-contract provider and alias for MoA tests."""
+    import providers
+    from providers.base import ProviderProfile
+
+    name = "moa-contract-test"
+    alias = "moa-contract-alias"
+    prior_profile = providers._REGISTRY.get(name)
+    prior_alias = providers._ALIASES.get(alias)
+    profile = ProviderProfile(
+        name=name,
+        aliases=(alias,),
+        base_url="https://moa-contract.invalid/v1",
+        auth_type="oauth_external",
+        model_capabilities_path="model-capabilities",
+    )
+    profile.fetch_models = lambda **_kwargs: []  # type: ignore[method-assign]
+    providers.register_provider(profile)
+    try:
+        yield profile
+    finally:
+        if prior_profile is None:
+            providers._REGISTRY.pop(name, None)
+        else:
+            providers._REGISTRY[name] = prior_profile
+        if prior_alias is None:
+            providers._ALIASES.pop(alias, None)
+        else:
+            providers._ALIASES[alias] = prior_alias
+
+
+@pytest.fixture
+def _moa_legacy_profile():
+    """Register a provider that deliberately declares no capability contract."""
+    import providers
+    from providers.base import ProviderProfile
+
+    name = "moa-legacy-test"
+    prior_profile = providers._REGISTRY.get(name)
+    profile = ProviderProfile(name=name)
+    providers.register_provider(profile)
+    try:
+        yield profile
+    finally:
+        if prior_profile is None:
+            providers._REGISTRY.pop(name, None)
+        else:
+            providers._REGISTRY[name] = prior_profile
+
+
 # ---------------------------------------------------------------------------
 # reload_env tests
 # ---------------------------------------------------------------------------
@@ -811,6 +871,711 @@ class TestWebServerEndpoints:
         cfg = load_config()
         assert cfg["moa"]["reference_models"] == payload["reference_models"]
         assert cfg["moa"]["aggregator"] == payload["aggregator"]
+
+    def test_put_moa_accepts_changed_completion_supported_reference(
+        self, monkeypatch, _moa_contract_profile
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import load_config, save_config
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        provider = _moa_contract_profile.name
+        cfg = load_config()
+        cfg["moa"] = {
+            "reference_models": [
+                {"provider": "openrouter", "model": "existing-reference"}
+            ],
+            "aggregator": {
+                "provider": "openrouter",
+                "model": "existing-aggregator",
+            },
+        }
+        save_config(cfg)
+        calls = []
+
+        def validate(provider, model, usage, **kwargs):
+            calls.append((provider, model, usage, kwargs))
+            return ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="eligible",
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.put(
+            "/api/model/moa",
+            json={
+                "reference_models": [
+                    {"provider": provider, "model": "completion-supported"}
+                ],
+                "aggregator": {
+                    "provider": "openrouter",
+                    "model": "existing-aggregator",
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        assert calls == [
+            (
+                provider,
+                "completion-supported",
+                "moa-reference",
+                {"exact_existing_assignment": False},
+            )
+        ]
+        assert load_config()["moa"]["reference_models"] == [
+            {"provider": provider, "model": "completion-supported"}
+        ]
+
+    @pytest.mark.parametrize(
+        ("reason", "message"),
+        [
+            (
+                "completion-unknown",
+                "Completion support has not been verified for this model.",
+            ),
+            (
+                "completion-unsupported",
+                "Completion support is not available for this model.",
+            ),
+        ],
+    )
+    def test_put_moa_rejects_changed_ineligible_reference_without_rewrite(
+        self, monkeypatch, _moa_contract_profile, reason, message
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        provider = _moa_contract_profile.name
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "moa:\n"
+            "  reference_models:\n"
+            f"    - {{provider: {provider}, model: existing-reference}}\n"
+            "  aggregator: {provider: openrouter, model: existing-aggregator}\n",
+            encoding="utf-8",
+        )
+        before = config_path.read_bytes()
+
+        def validate(provider, model, usage, **kwargs):
+            if (provider, model) == (
+                _moa_contract_profile.name,
+                "changed-reference",
+            ):
+                return ModelEligibility(
+                    eligible=False,
+                    reason=reason,
+                    message=message,
+                )
+            return ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="eligible",
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.put(
+            "/api/model/moa",
+            json={
+                "reference_models": [
+                    {"provider": provider, "model": "changed-reference"}
+                ],
+                "aggregator": {
+                    "provider": "openrouter",
+                    "model": "existing-aggregator",
+                },
+            },
+        )
+
+        assert resp.status_code == 409
+        assert resp.json() == {
+            "detail": {
+                "code": "model-selection-ineligible",
+                "reason": reason,
+                "usage": "moa-reference",
+                "preset": "default",
+                "slot": "reference:0",
+                "provider": provider,
+                "model": "changed-reference",
+                "message": message,
+            }
+        }
+        assert config_path.read_bytes() == before
+
+    def test_put_moa_changed_aggregator_requires_completion_and_tools(
+        self, monkeypatch, _moa_contract_profile
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import load_config, save_config
+        from hermes_cli.model_eligibility import (
+            ModelEligibility,
+            evaluate_model_eligibility,
+        )
+
+        provider = _moa_contract_profile.name
+        cfg = load_config()
+        cfg["moa"] = {
+            "reference_models": [
+                {"provider": "openrouter", "model": "existing-reference"}
+            ],
+            "aggregator": {
+                "provider": provider,
+                "model": "existing-aggregator",
+            },
+        }
+        save_config(cfg)
+        calls = []
+
+        def validate(provider, model, usage, **kwargs):
+            calls.append((provider, model, usage, kwargs))
+            if model == "changed-aggregator":
+                return evaluate_model_eligibility(
+                    capability_contract=True,
+                    catalog_status="ready",
+                    model=model,
+                    usage=usage,
+                    is_live=True,
+                    selection_mode="explicit",
+                    verified={
+                        "completion": "supported",
+                        "tools": "unsupported",
+                    },
+                    exact_existing_assignment=kwargs["exact_existing_assignment"],
+                )
+            return ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="eligible",
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.put(
+            "/api/model/moa",
+            json={
+                "reference_models": [
+                    {"provider": "openrouter", "model": "existing-reference"}
+                ],
+                "aggregator": {
+                    "provider": provider,
+                    "model": "changed-aggregator",
+                },
+            },
+        )
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["reason"] == "tools-unsupported"
+        assert resp.json()["detail"]["usage"] == "moa-aggregator"
+        assert calls == [
+            (
+                provider,
+                "changed-aggregator",
+                "moa-aggregator",
+                {"exact_existing_assignment": False},
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        ("slot", "usage"),
+        [
+            ("reference", "moa-reference"),
+            ("aggregator", "moa-aggregator"),
+        ],
+    )
+    def test_put_moa_rejects_gateway_auto_for_each_role(
+        self, monkeypatch, _moa_contract_profile, slot, usage
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.model_eligibility import evaluate_model_eligibility
+
+        def validate(provider, model, selected_usage, **kwargs):
+            return evaluate_model_eligibility(
+                capability_contract=True,
+                catalog_status="ready",
+                model=model,
+                usage=selected_usage,
+                is_live=True,
+                selection_mode="automatic",
+                verified=None,
+                exact_existing_assignment=kwargs["exact_existing_assignment"],
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+        provider = _moa_contract_profile.name
+        payload = {
+            "reference_models": [
+                {"provider": "openrouter", "model": "existing-reference"}
+            ],
+            "aggregator": {
+                "provider": "openrouter",
+                "model": "existing-aggregator",
+            },
+        }
+        if slot == "reference":
+            payload["reference_models"] = [{"provider": provider, "model": "auto"}]
+        else:
+            payload["aggregator"] = {"provider": provider, "model": "auto"}
+
+        resp = self.client.put("/api/model/moa", json=payload)
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["reason"] == "automatic-not-allowed"
+        assert resp.json()["detail"]["usage"] == usage
+
+    def test_put_moa_validates_all_changed_slots_before_atomic_rejection(
+        self, monkeypatch, _moa_contract_profile
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        provider = _moa_contract_profile.name
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "# bytes must survive a failed multi-slot request\n"
+            "moa:\n"
+            "  presets:\n"
+            "    council:\n"
+            "      reference_models:\n"
+            f"        - {{provider: {provider}, model: old-a}}\n"
+            f"        - {{provider: {provider}, model: old-b}}\n"
+            f"      aggregator: {{provider: {provider}, model: old-aggregator}}\n"
+            "  default_preset: council\n",
+            encoding="utf-8",
+        )
+        before = config_path.read_bytes()
+        calls = []
+
+        def validate(provider, model, usage, **kwargs):
+            calls.append((provider, model, usage, kwargs))
+            if model == "new-a":
+                return ModelEligibility(
+                    eligible=False,
+                    reason="completion-unknown",
+                    message="Completion support has not been verified for this model.",
+                )
+            return ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="eligible",
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.put(
+            "/api/model/moa",
+            json={
+                "default_preset": "council",
+                "presets": {
+                    "council": {
+                        "reference_models": [
+                            {"provider": provider, "model": "new-a"},
+                            {"provider": provider, "model": "new-b"},
+                        ],
+                        "aggregator": {
+                            "provider": provider,
+                            "model": "new-aggregator",
+                        },
+                    }
+                },
+            },
+        )
+
+        assert resp.status_code == 409
+        assert [
+            (provider, model, usage, kwargs["exact_existing_assignment"])
+            for provider, model, usage, kwargs in calls
+        ] == [
+            (provider, "new-a", "moa-reference", False),
+            (provider, "new-b", "moa-reference", False),
+            (provider, "new-aggregator", "moa-aggregator", False),
+        ]
+        assert config_path.read_bytes() == before
+
+    def test_put_moa_compares_reference_slots_by_preset_and_index(
+        self, monkeypatch, _moa_contract_profile
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import load_config, save_config
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        provider = _moa_contract_profile.name
+        cfg = load_config()
+        cfg["moa"] = {
+            "default_preset": "first",
+            "presets": {
+                "first": {
+                    "reference_models": [
+                        {"provider": provider, "model": "same-model"}
+                    ],
+                    "aggregator": {
+                        "provider": "openrouter",
+                        "model": "aggregator-one",
+                    },
+                },
+                "second": {
+                    "reference_models": [
+                        {"provider": provider, "model": "other-model"},
+                        {"provider": provider, "model": "same-model"},
+                    ],
+                    "aggregator": {
+                        "provider": "openrouter",
+                        "model": "aggregator-two",
+                    },
+                },
+            },
+        }
+        save_config(cfg)
+        calls = []
+
+        def validate(provider, model, usage, **kwargs):
+            calls.append((provider, model, usage, kwargs))
+            return ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="eligible",
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.put(
+            "/api/model/moa",
+            json={
+                "default_preset": "first",
+                "presets": {
+                    "first": {
+                        "reference_models": [
+                            {"provider": provider, "model": "same-model"}
+                        ],
+                        "aggregator": {
+                            "provider": "openrouter",
+                            "model": "aggregator-one",
+                        },
+                    },
+                    "second": {
+                        "reference_models": [
+                            {"provider": provider, "model": "same-model"},
+                            {"provider": provider, "model": "other-model"},
+                        ],
+                        "aggregator": {
+                            "provider": "openrouter",
+                            "model": "aggregator-two",
+                        },
+                    },
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        assert [
+            (provider, model, usage, kwargs["exact_existing_assignment"])
+            for provider, model, usage, kwargs in calls
+        ] == [
+            (provider, "same-model", "moa-reference", True),
+            (provider, "same-model", "moa-reference", False),
+            (provider, "other-model", "moa-reference", False),
+        ]
+
+    def test_put_moa_preserves_unchanged_invalid_slots_with_non_secret_warnings(
+        self, monkeypatch, _moa_contract_profile
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path, load_config
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        provider = _moa_contract_profile.name
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "model:\n"
+            "  api_key: sk-must-not-leak\n"
+            "moa:\n"
+            "  default_preset: council\n"
+            "  presets:\n"
+            "    council:\n"
+            "      reference_models:\n"
+            f"        - {{provider: {provider}, model: grandfathered-reference}}\n"
+            f"      aggregator: {{provider: {provider}, model: grandfathered-aggregator}}\n"
+            "      max_tokens: 4096\n",
+            encoding="utf-8",
+        )
+
+        def validate(provider, model, usage, **kwargs):
+            assert kwargs == {"exact_existing_assignment": True}
+            reason = (
+                "completion-unknown"
+                if usage == "moa-reference"
+                else "tools-unknown"
+            )
+            return ModelEligibility(
+                eligible=True,
+                reason=reason,
+                message=f"The existing {usage} assignment was preserved.",
+                grandfathered=True,
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        readable = self.client.get("/api/model/moa")
+        assert readable.status_code == 200
+        assert readable.json()["presets"]["council"]["reference_models"][0][
+            "model"
+        ] == "grandfathered-reference"
+
+        resp = self.client.put(
+            "/api/model/moa",
+            json={
+                "default_preset": "council",
+                "presets": {
+                    "council": {
+                        "reference_models": [
+                            {
+                                "provider": provider,
+                                "model": "grandfathered-reference",
+                            }
+                        ],
+                        "aggregator": {
+                            "provider": provider,
+                            "model": "grandfathered-aggregator",
+                        },
+                        "max_tokens": 8192,
+                    }
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["selection_warnings"] == [
+            {
+                "preset": "council",
+                "slot": "reference:0",
+                "reason": "completion-unknown",
+                "message": (
+                    "The existing moa-reference assignment was preserved."
+                ),
+            },
+            {
+                "preset": "council",
+                "slot": "aggregator",
+                "reason": "tools-unknown",
+                "message": (
+                    "The existing moa-aggregator assignment was preserved."
+                ),
+            },
+        ]
+        assert "sk-must-not-leak" not in resp.text
+        assert load_config()["moa"]["presets"]["council"]["max_tokens"] == 8192
+
+    def test_put_moa_legacy_flat_payload_uses_changed_slot_validation(
+        self, monkeypatch, _moa_contract_profile
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        provider = _moa_contract_profile.name
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "moa:\n"
+            "  reference_models:\n"
+            "    - {provider: openrouter, model: existing-reference}\n"
+            "  aggregator: {provider: openrouter, model: existing-aggregator}\n",
+            encoding="utf-8",
+        )
+        before = config_path.read_bytes()
+        calls = []
+
+        def validate(provider, model, usage, **kwargs):
+            calls.append((provider, model, usage, kwargs))
+            return ModelEligibility(
+                eligible=False,
+                reason="completion-unknown",
+                message="Completion support has not been verified for this model.",
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.put(
+            "/api/model/moa",
+            json={
+                "reference_models": [
+                    {"provider": provider, "model": "legacy-flat-reference"}
+                ],
+                "aggregator": {
+                    "provider": "openrouter",
+                    "model": "legacy-flat-aggregator",
+                },
+            },
+        )
+
+        assert resp.status_code == 409
+        assert calls == [
+            (
+                provider,
+                "legacy-flat-reference",
+                "moa-reference",
+                {"exact_existing_assignment": False},
+            )
+        ]
+        assert config_path.read_bytes() == before
+
+    def test_put_moa_unregistered_gateway_name_is_legacy_compatible(
+        self, monkeypatch
+    ):
+        import providers
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path, load_config
+
+        monkeypatch.delitem(providers._REGISTRY, "gateway", raising=False)
+        monkeypatch.delitem(providers._ALIASES, "gateway", raising=False)
+        real_validate = model_eligibility.validate_provider_model_selection
+        calls = []
+
+        def validate(*args, **kwargs):
+            calls.append((args, kwargs))
+            return real_validate(*args, **kwargs)
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "moa:\n"
+            "  reference_models:\n"
+            "    - {provider: openrouter, model: existing-reference}\n"
+            "  aggregator: {provider: openrouter, model: existing-aggregator}\n",
+            encoding="utf-8",
+        )
+
+        resp = self.client.put(
+            "/api/model/moa",
+            json={
+                "reference_models": [
+                    {"provider": "gateway", "model": "legacy-auto"}
+                ],
+                "aggregator": {
+                    "provider": "openrouter",
+                    "model": "existing-aggregator",
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        assert calls == []
+        assert load_config()["moa"]["reference_models"] == [
+            {"provider": "gateway", "model": "legacy-auto"}
+        ]
+
+    @pytest.mark.parametrize(
+        ("slot", "provider_attr", "usage"),
+        [
+            ("reference", "name", "moa-reference"),
+            ("aggregator", "aliases", "moa-aggregator"),
+        ],
+    )
+    def test_put_moa_real_contract_provider_rejects_auto_atomically(
+        self,
+        monkeypatch,
+        _moa_contract_profile,
+        slot,
+        provider_attr,
+        usage,
+    ):
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_capabilities import ModelCapabilityCatalog
+
+        monkeypatch.setattr(
+            "hermes_cli.model_eligibility.fetch_model_capability_catalog",
+            lambda *_args, **_kwargs: ModelCapabilityCatalog(
+                status="ready",
+                models={},
+            ),
+        )
+        provider = (
+            _moa_contract_profile.name
+            if provider_attr == "name"
+            else _moa_contract_profile.aliases[0]
+        )
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "# real-validator integration bytes\n"
+            "moa:\n"
+            "  reference_models:\n"
+            "    - {provider: openrouter, model: existing-reference}\n"
+            "  aggregator: {provider: openrouter, model: existing-aggregator}\n",
+            encoding="utf-8",
+        )
+        before = config_path.read_bytes()
+        payload = {
+            "reference_models": [
+                {"provider": "openrouter", "model": "existing-reference"}
+            ],
+            "aggregator": {
+                "provider": "openrouter",
+                "model": "existing-aggregator",
+            },
+        }
+        if slot == "reference":
+            payload["reference_models"] = [{"provider": provider, "model": "auto"}]
+        else:
+            payload["aggregator"] = {"provider": provider, "model": "auto"}
+
+        resp = self.client.put("/api/model/moa", json=payload)
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["reason"] == "automatic-not-allowed"
+        assert resp.json()["detail"]["usage"] == usage
+        assert resp.json()["detail"]["provider"] == provider
+        assert config_path.read_bytes() == before
+
+    def test_put_moa_provider_without_contract_remains_legacy_compatible(
+        self, _moa_legacy_profile
+    ):
+        from hermes_cli.config import load_config
+
+        provider = _moa_legacy_profile.name
+        resp = self.client.put(
+            "/api/model/moa",
+            json={
+                "reference_models": [
+                    {"provider": provider, "model": "legacy-compatible"}
+                ],
+                "aggregator": {
+                    "provider": provider,
+                    "model": "legacy-aggregator",
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        assert load_config()["moa"]["reference_models"] == [
+            {"provider": provider, "model": "legacy-compatible"}
+        ]
 
     # ── GET /api/media (remote image display) ───────────────────────────
 
@@ -2174,6 +2939,502 @@ class TestWebServerEndpoints:
         assert data["ok"] is True
         assert data["provider"] == "openrouter"
         assert data["model"] == "anthropic/claude-sonnet-4.6"
+
+    def test_model_set_accepts_verified_main_explicit(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import load_config
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        calls = []
+
+        def validate(provider, model, usage, **kwargs):
+            calls.append((provider, model, usage, kwargs))
+            return ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="This model is eligible for the requested assignment.",
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "gateway",
+                "model": "verified-main",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert calls == [
+            (
+                "gateway",
+                "verified-main",
+                "main",
+                {"exact_existing_assignment": False},
+            )
+        ]
+        assert load_config()["model"]["default"] == "verified-main"
+
+    @pytest.mark.parametrize(
+        ("reason", "message"),
+        [
+            ("completion-unknown", "Completion support has not been verified."),
+            ("tools-unsupported", "Tool support is not available for this model."),
+            ("tools-unknown", "Tool support has not been verified for this model."),
+            (
+                "model-not-live",
+                "This model is not present in the provider's live model list.",
+            ),
+            (
+                "gateway-upgrade-required",
+                "The Gateway must be updated before it can verify this model.",
+            ),
+            (
+                "gateway-unreachable",
+                "The Gateway is unavailable, so this model cannot be verified.",
+            ),
+            (
+                "capability-response-invalid",
+                "The Gateway returned an invalid model capability response.",
+            ),
+        ],
+    )
+    def test_model_set_rejects_changed_ineligible_selection_without_rewrite(
+        self, monkeypatch, _no_model_cost_warning, reason, message
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "model:\n  provider: gateway\n  default: existing-main\n",
+            encoding="utf-8",
+        )
+        before = config_path.read_bytes()
+
+        monkeypatch.setattr(
+            model_eligibility,
+            "validate_provider_model_selection",
+            lambda *_args, **_kwargs: ModelEligibility(
+                eligible=False,
+                reason=reason,
+                message=message,
+            ),
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "gateway",
+                "model": "changed-main",
+            },
+        )
+
+        assert resp.status_code == 409
+        assert resp.json() == {
+            "detail": {
+                "code": "model-selection-ineligible",
+                "reason": reason,
+                "usage": "main",
+                "provider": "gateway",
+                "model": "changed-main",
+                "message": message,
+            }
+        }
+        assert config_path.read_bytes() == before
+
+    def test_model_set_allows_gateway_auto_only_for_main(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_eligibility import evaluate_model_eligibility
+
+        calls = []
+
+        def validate(provider, model, usage, **kwargs):
+            calls.append((provider, model, usage, kwargs))
+            return evaluate_model_eligibility(
+                capability_contract=True,
+                catalog_status=(
+                    "gateway-upgrade-required" if usage == "main" else "ready"
+                ),
+                model=model,
+                usage=usage,
+                is_live=True,
+                selection_mode="automatic",
+                verified=None,
+                exact_existing_assignment=kwargs.get(
+                    "exact_existing_assignment", False
+                ),
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        main = self.client.post(
+            "/api/model/set",
+            json={"scope": "main", "provider": "gateway", "model": "auto"},
+        )
+        assert main.status_code == 200
+        assert main.json()["ok"] is True
+
+        config_path = get_config_path()
+        before_aux = config_path.read_bytes()
+        auxiliary = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "compression",
+                "provider": "gateway",
+                "model": "auto",
+            },
+        )
+        assert auxiliary.status_code == 409
+        assert auxiliary.json()["detail"]["reason"] == "automatic-not-allowed"
+        assert auxiliary.json()["detail"]["usage"] == "auxiliary"
+        assert config_path.read_bytes() == before_aux
+        assert [(provider, model, usage) for provider, model, usage, _ in calls] == [
+            ("gateway", "auto", "main"),
+            ("gateway", "auto", "auxiliary"),
+        ]
+
+    def test_model_set_accepts_auxiliary_auto_inheritance(
+        self, _no_model_cost_warning
+    ):
+        from hermes_cli.config import load_config
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "compression",
+                "provider": "auto",
+                "model": "",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert load_config()["auxiliary"]["compression"]["provider"] == "auto"
+        assert load_config()["auxiliary"]["compression"]["model"] == ""
+
+    def test_model_set_uses_vision_and_ordinary_auxiliary_requirements(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        usages = []
+
+        def validate(_provider, _model, usage, **_kwargs):
+            usages.append(usage)
+            return ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="eligible",
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        for task in ("vision", "compression"):
+            resp = self.client.post(
+                "/api/model/set",
+                json={
+                    "scope": "auxiliary",
+                    "task": task,
+                    "provider": "gateway",
+                    "model": "verified-aux",
+                },
+            )
+            assert resp.status_code == 200
+
+        assert usages == ["vision", "auxiliary"]
+
+    def test_model_set_all_auxiliary_validates_both_usages_before_mutation(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "auxiliary:\n"
+            "  vision:\n"
+            "    provider: auto\n"
+            "    model: ''\n"
+            "  compression:\n"
+            "    provider: auto\n"
+            "    model: ''\n",
+            encoding="utf-8",
+        )
+        before = config_path.read_bytes()
+        usages = []
+
+        def validate(_provider, _model, usage, **_kwargs):
+            usages.append(usage)
+            if usage == "vision":
+                return ModelEligibility(
+                    eligible=False,
+                    reason="vision-unknown",
+                    message="Vision support has not been verified for this model.",
+                )
+            return ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="eligible",
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "",
+                "provider": "gateway",
+                "model": "text-only",
+            },
+        )
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["usage"] == "vision"
+        assert usages == ["vision", "auxiliary"]
+        assert config_path.read_bytes() == before
+
+    def test_model_set_preserves_exact_invalid_noop_with_warning_without_rewrite(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "# preserve this formatting\n"
+            "model: {provider: gateway, default: grandfathered-main}\n",
+            encoding="utf-8",
+        )
+        before = config_path.read_bytes()
+
+        def validate(provider, model, usage, **kwargs):
+            assert (provider, model, usage) == (
+                "gateway",
+                "grandfathered-main",
+                "main",
+            )
+            assert kwargs == {"exact_existing_assignment": True}
+            return ModelEligibility(
+                eligible=True,
+                reason="tools-unknown",
+                message=(
+                    "The existing assignment was preserved, but it is not eligible "
+                    "for a new assignment. Tool support has not been verified for "
+                    "this model."
+                ),
+                grandfathered=True,
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "gateway",
+                "model": "grandfathered-main",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "ok": True,
+            "scope": "main",
+            "provider": "gateway",
+            "model": "grandfathered-main",
+            "selection_warning": {
+                "code": "grandfathered-model-assignment",
+                "message": (
+                    "The existing assignment was preserved, but it is not eligible "
+                    "for a new assignment. Tool support has not been verified for "
+                    "this model."
+                ),
+                "reason": "tools-unknown",
+            },
+        }
+        assert config_path.read_bytes() == before
+
+    def test_model_set_preserves_exact_invalid_auxiliary_noop_without_rewrite(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "auxiliary:\n"
+            "  vision: {provider: gateway, model: grandfathered-vision}\n",
+            encoding="utf-8",
+        )
+        before = config_path.read_bytes()
+        monkeypatch.setattr(
+            model_eligibility,
+            "validate_provider_model_selection",
+            lambda *_args, **kwargs: ModelEligibility(
+                eligible=kwargs["exact_existing_assignment"],
+                reason="vision-unknown",
+                message="The existing assignment was preserved.",
+                grandfathered=kwargs["exact_existing_assignment"],
+            ),
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "vision",
+                "provider": "gateway",
+                "model": "grandfathered-vision",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["selection_warning"] == {
+            "code": "grandfathered-model-assignment",
+            "message": "The existing assignment was preserved.",
+            "reason": "vision-unknown",
+        }
+        assert config_path.read_bytes() == before
+
+    def test_model_set_provider_without_capability_contract_is_unchanged(
+        self, _no_model_cost_warning
+    ):
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "openrouter",
+                "model": "legacy-compatible/model",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert "selection_warning" not in resp.json()
+
+    def test_model_set_validation_and_write_are_profile_scoped(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility, profiles
+        from hermes_constants import get_hermes_home
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        default_home = get_hermes_home()
+        profiles_root = default_home / "profiles"
+        worker_home = profiles_root / "worker"
+        worker_home.mkdir(parents=True)
+        default_config = default_home / "config.yaml"
+        worker_config = worker_home / "config.yaml"
+        default_config.write_text(
+            "model:\n  provider: openrouter\n  default: default-main\n",
+            encoding="utf-8",
+        )
+        worker_config.write_text(
+            "model:\n  provider: gateway\n  default: worker-old\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: default_home)
+        monkeypatch.setattr(profiles, "_get_profiles_root", lambda: profiles_root)
+        seen = {}
+
+        def validate(provider, model, usage, **kwargs):
+            seen["home"] = get_hermes_home()
+            seen["config"] = get_hermes_home().joinpath("config.yaml").read_text()
+            seen["args"] = (provider, model, usage, kwargs)
+            return ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="eligible",
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "gateway",
+                "model": "worker-new",
+                "profile": "worker",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert seen["home"] == worker_home
+        assert "worker-old" in seen["config"]
+        assert seen["args"] == (
+            "gateway",
+            "worker-new",
+            "main",
+            {"exact_existing_assignment": False},
+        )
+        assert yaml.safe_load(worker_config.read_text())["model"]["default"] == "worker-new"
+        assert yaml.safe_load(default_config.read_text())["model"]["default"] == "default-main"
+
+    def test_model_set_response_never_includes_resolved_credentials(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        monkeypatch.setattr(
+            model_eligibility,
+            "validate_provider_model_selection",
+            lambda *_args, **_kwargs: ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="eligible",
+            ),
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "custom",
+                "model": "private-main",
+                "base_url": "https://private.example/v1",
+                "api_key": "sk-must-not-leak",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert "sk-must-not-leak" not in resp.text
+        assert "api_key" not in resp.json()
 
     def test_ops_import_passes_force_flag(self, tmp_path, monkeypatch):
         """force=True must append --force so the spawned non-interactive

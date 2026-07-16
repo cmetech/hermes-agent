@@ -2714,6 +2714,13 @@ def clear_provider_models_cache(provider: Optional[str] = None) -> None:
     ``hermes model --refresh``.
     """
     try:
+        from hermes_cli.model_capabilities import clear_model_capabilities_cache
+
+        clear_model_capabilities_cache(provider)
+    except Exception:
+        pass
+
+    try:
         if provider is None:
             path = _provider_models_cache_path()
             if path.exists():

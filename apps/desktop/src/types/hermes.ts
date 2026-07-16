@@ -244,7 +244,29 @@ export interface ModelPricing {
   free: boolean
 }
 
+export type ModelCapabilityState = 'supported' | 'unknown' | 'unsupported'
+
+export type ModelSelectionMode = 'automatic' | 'explicit'
+
+export type ModelCapabilityCatalogStatus =
+  | 'authentication-required'
+  | 'capability-response-invalid'
+  | 'catalog-empty'
+  | 'gateway-unreachable'
+  | 'gateway-upgrade-required'
+  | 'ready'
+  | 'unknown'
+
+export interface ModelCapabilityEvidence {
+  notes?: string
+  reference?: string
+  source?: string
+  verified_at?: string
+}
+
 export interface ModelOptionProvider {
+  capability_mismatch_count?: number
+  capability_status?: ModelCapabilityCatalogStatus
   is_current?: boolean
   models?: string[]
   name: string
@@ -276,8 +298,11 @@ export interface ModelOptionProvider {
 }
 
 export interface ModelCapabilities {
+  evidence?: Record<string, ModelCapabilityEvidence>
   fast: boolean
   reasoning: boolean
+  selection_mode?: ModelSelectionMode
+  verified?: Record<'completion' | 'reasoning' | 'tools' | 'vision', ModelCapabilityState>
 }
 
 export interface ModelOptionsResponse {
@@ -859,6 +884,13 @@ export interface MoaModelSlot {
   model: string
 }
 
+export interface MoaSelectionWarning {
+  message: string
+  preset: string
+  reason: string
+  slot: string
+}
+
 export interface MoaConfigResponse {
   default_preset: string
   active_preset: string
@@ -879,6 +911,7 @@ export interface MoaConfigResponse {
   max_tokens: number
   reference_models: MoaModelSlot[]
   reference_temperature: number
+  selection_warnings?: MoaSelectionWarning[]
 }
 
 export interface ModelAssignmentRequest {
@@ -1051,6 +1084,12 @@ export interface DebugShareResponse {
   auto_delete_seconds: number | null
 }
 
+export interface ModelSelectionWarning {
+  code: 'grandfathered-model-assignment'
+  message: string
+  reason: string
+}
+
 export interface ModelAssignmentResponse {
   /** Persisted endpoint URL for custom/local providers (echoed back). */
   base_url?: string
@@ -1062,6 +1101,7 @@ export interface ModelAssignmentResponse {
   ok: boolean
   provider?: string
   reset?: boolean
+  selection_warning?: ModelSelectionWarning
   scope?: string
   /** Auxiliary slots still pinned to a different provider than the new main.
    *  Switching main never clears aux pins; this lets the UI warn the user

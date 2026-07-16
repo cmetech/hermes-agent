@@ -18,6 +18,68 @@ vi.mock('@/hermes', () => ({
 beforeEach(() => {
   getGlobalModelOptions.mockResolvedValue({
     providers: [
+      {
+        name: 'Gateway',
+        slug: 'gateway',
+        models: ['auto', 'gateway-good', 'gateway-no-completion', 'gateway-no-tools', 'gateway-tools-unknown'],
+        capability_status: 'ready',
+        capabilities: {
+          auto: {
+            selection_mode: 'automatic',
+            verified: {
+              completion: 'supported',
+              reasoning: 'supported',
+              tools: 'supported',
+              vision: 'supported'
+            }
+          },
+          'gateway-good': {
+            selection_mode: 'explicit',
+            verified: {
+              completion: 'supported',
+              reasoning: 'supported',
+              tools: 'supported',
+              vision: 'supported'
+            }
+          },
+          'gateway-no-tools': {
+            selection_mode: 'explicit',
+            verified: {
+              completion: 'supported',
+              reasoning: 'supported',
+              tools: 'unsupported',
+              vision: 'supported'
+            }
+          },
+          'gateway-no-completion': {
+            selection_mode: 'explicit',
+            verified: {
+              completion: 'unsupported',
+              reasoning: 'supported',
+              tools: 'supported',
+              vision: 'supported'
+            }
+          },
+          'gateway-retired': {
+            selection_mode: 'explicit',
+            verified: {
+              completion: 'supported',
+              reasoning: 'supported',
+              tools: 'supported',
+              vision: 'supported'
+            }
+          },
+          'gateway-tools-unknown': {
+            selection_mode: 'explicit',
+            verified: {
+              completion: 'supported',
+              reasoning: 'supported',
+              tools: 'unknown',
+              vision: 'supported'
+            }
+          }
+        }
+      },
       { name: 'GitHub Copilot', slug: 'copilot', models: ['gpt-5-mini', 'gpt-5.4-mini'] },
       { name: 'OpenAI Codex', slug: 'openai-codex', models: ['gpt-5.4-mini'] },
       { name: 'Nous', slug: 'nous', models: ['hermes-4'] }
@@ -46,6 +108,7 @@ async function renderField(value: unknown, onChange = vi.fn()) {
 async function renderFieldWithRerender(value: unknown, onChange = vi.fn()) {
   const { FallbackModelsField } = await import('./fallback-models-field')
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
   const view = render(
     <QueryClientProvider client={client}>
       <FallbackModelsField onChange={onChange} value={value} />
@@ -109,5 +172,65 @@ describe('FallbackModelsField', () => {
     rerender([{ provider: 'nous', model: 'hermes-4' }])
 
     await waitFor(() => expect(screen.getAllByLabelText('Remove')).toHaveLength(1))
+  })
+
+  it('requires verified completion and tools while excluding Gateway auto', async () => {
+    await renderField([{ provider: 'gateway', model: 'gateway-good' }])
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalled())
+
+    fireEvent.click(screen.getAllByRole('combobox')[1])
+
+    expect(screen.queryByRole('option', { name: /^auto/ })).toBeNull()
+    expect(screen.getByRole('option', { name: 'gateway-good' }).getAttribute('aria-disabled')).not.toBe('true')
+    expect(
+      screen
+        .getByRole('option', { name: /gateway-no-completion.*Does not support completions/ })
+        .getAttribute('aria-disabled')
+    ).toBe('true')
+    expect(
+      screen.getByRole('option', { name: /gateway-no-tools.*Does not support tools/ }).getAttribute('aria-disabled')
+    ).toBe('true')
+    expect(
+      screen
+        .getByRole('option', { name: /gateway-tools-unknown.*Tool support is not verified/ })
+        .getAttribute('aria-disabled')
+    ).toBe('true')
+  })
+
+  it('keeps a saved invalid Gateway fallback visible and marked for review', async () => {
+    await renderField([{ provider: 'gateway', model: 'gateway-retired' }])
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalled())
+
+    const modelTrigger = screen.getAllByRole('combobox')[1]
+    expect(modelTrigger.textContent).toContain('gateway-retired')
+    fireEvent.click(modelTrigger)
+
+    expect(
+      screen
+        .getByRole('option', { name: /gateway-retired.*No longer in the live model catalog.*Needs review/ })
+        .getAttribute('aria-disabled')
+    ).not.toBe('true')
+  })
+
+  it('preserves legacy provider model behavior', async () => {
+    await renderField([{ provider: 'copilot', model: 'gpt-5-mini' }])
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalled())
+
+    fireEvent.click(screen.getAllByRole('combobox')[1])
+
+    expect(screen.getByRole('option', { name: 'gpt-5-mini' }).getAttribute('aria-disabled')).not.toBe('true')
+    expect(screen.getByRole('option', { name: 'gpt-5.4-mini' }).getAttribute('aria-disabled')).not.toBe('true')
+    expect(screen.queryByText('Needs review')).toBeNull()
+  })
+
+  it('clears the prior model when its provider changes', async () => {
+    const onChange = await renderField([{ provider: 'gateway', model: 'gateway-good' }])
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalled())
+
+    fireEvent.click(screen.getAllByRole('combobox')[0])
+    fireEvent.click(screen.getByRole('option', { name: 'Nous' }))
+
+    expect(screen.getAllByRole('combobox')[1].textContent).toContain('Model')
+    expect(onChange.mock.calls.at(-1)?.[0]).toEqual([])
   })
 })

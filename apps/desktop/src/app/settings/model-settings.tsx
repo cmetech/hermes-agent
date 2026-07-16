@@ -25,6 +25,7 @@ import type {
 } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { AlertTriangle, Cpu, Loader2 } from '@/lib/icons'
+import { evaluateModelEligibility, type ModelUsageKind } from '@/lib/model-eligibility'
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
 import { startManualLocalEndpoint, startManualProviderOAuth } from '@/store/onboarding'
@@ -102,6 +103,18 @@ const effortLabelKey = (v: string) => v as 'high' | 'low' | 'max' | 'medium' | '
 // and an empty `models` list — those need a setup step before a model exists.
 function isProviderReady(p?: ModelOptionProvider): boolean {
   return !!p && (p.authenticated !== false || (p.models?.length ?? 0) > 0)
+}
+
+function hasCapabilityContract(provider?: ModelOptionProvider): boolean {
+  if (!provider) {
+    return false
+  }
+
+  if (provider.capability_status !== undefined) {
+    return true
+  }
+
+  return Object.values(provider.capabilities ?? {}).some(capabilities => capabilities.verified !== undefined)
 }
 
 // Mirrors `_AUX_TASK_SLOTS` in hermes_cli/web_server.py. Friendly labels and
@@ -196,13 +209,14 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   // place — mirrors the onboarding ApiKeyForm but scoped to the model picker.
   const [apiKeyDraft, setApiKeyDraft] = useState('')
   const [activating, setActivating] = useState(false)
+  const [selectionWarning, setSelectionWarning] = useState(false)
 
   // Every profile-scoped async here captures this and bails before writing back,
   // so a request in flight when the user switches profiles can't paint profile
   // A's models/providers into profile B (or fire onMainModelChanged for A).
   const profileEpoch = useRef(0)
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (options?: { preserveDraft?: boolean }) => {
     const epoch = profileEpoch.current
     setLoading(true)
     setError('')
@@ -210,7 +224,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     try {
       const [modelInfo, modelOptions, auxiliaryModels, moaModels] = await Promise.all([
         getGlobalModelInfo(),
-        getGlobalModelOptions(),
+        getGlobalModelOptions({ refresh: true }),
         getAuxiliaryModels(),
         getMoaModels().catch(() => null)
       ])
@@ -221,8 +235,12 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
       setMainModel({ model: modelInfo.model, provider: modelInfo.provider })
       setProviders(modelOptions.providers || [])
-      setSelectedProvider(prev => prev || modelInfo.provider)
-      setSelectedModel(prev => prev || modelInfo.model)
+
+      if (!options?.preserveDraft) {
+        setSelectedProvider(modelInfo.provider)
+        setSelectedModel(modelInfo.model)
+      }
+
       setAuxiliary(auxiliaryModels)
       setMoa(moaModels)
 
@@ -252,6 +270,14 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   // new profile (bumping the epoch first so any in-flight A request is discarded).
   useOnProfileSwitch(() => {
     profileEpoch.current += 1
+    setProviders([])
+    setMainModel(null)
+    setSelectedProvider('')
+    setSelectedModel('')
+    setAuxiliary(null)
+    setMoa(null)
+    setEditingAuxTask(null)
+    setSelectionWarning(false)
     void refresh()
   })
 
@@ -267,27 +293,53 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     [providers, selectedProvider]
   )
 
-  const selectedProviderModels = selectedProviderRow?.models ?? []
+  const selectedProviderHasContract = hasCapabilityContract(selectedProviderRow)
+
+  const selectedMainModels = useMemo(() => {
+    const models = withActive(selectedProviderRow?.models ?? [], selectedModel)
+
+    if (!selectedProviderHasContract) {
+      return models
+    }
+
+    return ['auto', ...models.filter(model => model !== 'auto')]
+  }, [selectedModel, selectedProviderHasContract, selectedProviderRow])
 
   // An unconfigured provider was picked: no credentials yet, so there are no
   // models to choose. `api_key` providers can be activated inline (paste key);
   // OAuth / external flows hand off to the onboarding sign-in.
-  const needsSetup = !!selectedProvider && !isProviderReady(selectedProviderRow)
+  const needsSetup = !!selectedProvider && !selectedProviderHasContract && !isProviderReady(selectedProviderRow)
   const setupIsApiKey = needsSetup && selectedProviderRow?.auth_type === 'api_key' && !!selectedProviderRow?.key_env
+
+  const providerReadiness =
+    selectedProviderRow?.capability_status && selectedProviderRow.capability_status !== 'ready'
+      ? m.providerReadiness[selectedProviderRow.capability_status]
+      : null
 
   // Clear any half-typed key when switching provider so it can't leak across.
   useEffect(() => {
     setApiKeyDraft('')
   }, [selectedProvider])
 
-  const auxDraftProviderModels = useMemo(
-    () => providers.find(provider => provider.slug === auxDraft.provider)?.models ?? [],
+  const auxDraftProviderRow = useMemo(
+    () => providers.find(provider => provider.slug === auxDraft.provider),
     [auxDraft.provider, providers]
   )
 
-  const modelsForProvider = useCallback(
-    (provider: string) => providers.find(row => row.slug === provider)?.models ?? [],
-    [providers]
+  const auxDraftProviderModels = useMemo(() => {
+    const models = auxDraftProviderRow?.models ?? []
+
+    return hasCapabilityContract(auxDraftProviderRow) ? models.filter(model => model !== 'auto') : models
+  }, [auxDraftProviderRow])
+
+  const modelsForUsage = useCallback(
+    (provider: ModelOptionProvider, active: string, usage: ModelUsageKind) =>
+      withActive(provider.models ?? [], active).filter(model => {
+        const eligibility = evaluateModelEligibility(provider, model, usage, { isCurrent: model === active })
+
+        return eligibility.reasonKey !== 'automatic-not-allowed' || eligibility.grandfathered
+      }),
+    []
   )
 
   const currentMoaPreset = useMemo(() => {
@@ -343,6 +395,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
       const next: MoaConfigResponse = {
         ...prev,
+        selection_warnings: undefined,
         presets: {
           ...prev.presets,
           [selectedMoaPreset]: updater(prev.presets[selectedMoaPreset])
@@ -416,8 +469,89 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     return mainModel ? row?.capabilities?.[mainModel.model] : undefined
   }, [providers, mainModel])
 
-  const reasoningSupported = mainCaps?.reasoning ?? true
+  const mainProviderRow = useMemo(
+    () => providers.find(provider => provider.slug === mainModel?.provider),
+    [mainModel?.provider, providers]
+  )
+
+  const mainEligibility = useMemo(
+    () =>
+      mainModel && mainProviderRow
+        ? evaluateModelEligibility(mainProviderRow, mainModel.model, 'main', { isCurrent: true })
+        : null,
+    [mainModel, mainProviderRow]
+  )
+
+  const selectedMainEligibility = useMemo(
+    () =>
+      selectedProviderRow && selectedModel
+        ? evaluateModelEligibility(selectedProviderRow, selectedModel, 'main', {
+            isCurrent: mainModel?.provider === selectedProviderRow.slug && mainModel.model === selectedModel
+          })
+        : null,
+    [mainModel, selectedModel, selectedProviderRow]
+  )
+
+  const reasoningSupported = mainEligibility?.reasoningVerified ?? mainCaps?.reasoning ?? true
   const fastSupported = mainCaps?.fast ?? false
+
+  const auxDraftUsage: ModelUsageKind = editingAuxTask === 'vision' ? 'vision' : 'auxiliary'
+  const currentAuxDraftAssignment = auxiliary?.tasks.find(entry => entry.task === editingAuxTask)
+
+  const auxDraftEligibility =
+    auxDraftProviderRow && auxDraft.model
+      ? evaluateModelEligibility(auxDraftProviderRow, auxDraft.model, auxDraftUsage, {
+          isCurrent:
+            currentAuxDraftAssignment?.provider === auxDraft.provider &&
+            currentAuxDraftAssignment.model === auxDraft.model
+        })
+      : null
+
+  const renderModelOption = (
+    provider: ModelOptionProvider,
+    model: string,
+    usage: ModelUsageKind,
+    isCurrent: boolean
+  ) => {
+    const eligibility = evaluateModelEligibility(provider, model, usage, { isCurrent })
+    const disabled = !eligibility.eligible && !eligibility.grandfathered
+
+    const secondary =
+      model === 'auto' && usage === 'main'
+        ? m.automaticRouting
+        : eligibility.reasonKey
+          ? m.eligibilityReasons[eligibility.reasonKey]
+          : ''
+
+    return (
+      <SelectItem disabled={disabled} key={model} value={model}>
+        <span className="flex min-w-0 flex-col">
+          <span>{model}</span>
+          {(secondary || eligibility.grandfathered) && (
+            <span className="text-[0.65rem] text-muted-foreground">
+              {[secondary, eligibility.grandfathered ? m.currentNeedsReview : ''].filter(Boolean).join(' · ')}
+            </span>
+          )}
+        </span>
+      </SelectItem>
+    )
+  }
+
+  const renderMoaModelOptions = (providerSlug: string, active: string, usage: ModelUsageKind) => {
+    const provider = providers.find(row => row.slug === providerSlug)
+
+    if (!provider) {
+      return active ? (
+        <SelectItem key={active} value={active}>
+          {active}
+        </SelectItem>
+      ) : null
+    }
+
+    return modelsForUsage(provider, active, usage).map(model =>
+      renderModelOption(provider, model, usage, model === active)
+    )
+  }
 
   // Hand-written `reasoning_effort: false`/`off` reaches us as boolean false
   // ("false" once stringified) — show it as Off, not an empty select.
@@ -448,7 +582,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         notifyError(err, m.defaultsFailed)
       }
     },
-    [config, m.defaultsFailed]
+    [config, m.defaultsFailed, setConfig]
   )
 
   // Paste an API key for the selected `api_key` provider, persist it, then
@@ -482,7 +616,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         nextModel = ''
       }
 
-      const options = await getGlobalModelOptions()
+      const options = await getGlobalModelOptions({ refresh: true })
 
       if (profileEpoch.current !== epoch) {
         return
@@ -528,6 +662,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     const epoch = profileEpoch.current
     setApplying(true)
     setError('')
+    setSelectionWarning(false)
 
     try {
       const result = await setModelAssignment({ model: selectedModel, provider: selectedProvider, scope: 'main' })
@@ -540,6 +675,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
       const model = result.model || selectedModel
       setMainModel({ provider, model })
       setSwitchStaleAux(result.stale_aux ?? [])
+      setSelectionWarning(result.selection_warning?.code === 'grandfathered-model-assignment')
       onMainModelChanged?.(provider, model)
       await refresh()
     } catch (err) {
@@ -557,9 +693,17 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
       setApplying(true)
       setError('')
+      setSelectionWarning(false)
 
       try {
-        await setModelAssignment({ model: mainModel.model, provider: mainModel.provider, scope: 'auxiliary', task })
+        const result = await setModelAssignment({
+          model: mainModel.model,
+          provider: mainModel.provider,
+          scope: 'auxiliary',
+          task
+        })
+
+        setSelectionWarning(result.selection_warning?.code === 'grandfathered-model-assignment')
         await refresh()
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err))
@@ -578,9 +722,17 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
       setApplying(true)
       setError('')
+      setSelectionWarning(false)
 
       try {
-        await setModelAssignment({ model: auxDraft.model, provider: auxDraft.provider, scope: 'auxiliary', task })
+        const result = await setModelAssignment({
+          model: auxDraft.model,
+          provider: auxDraft.provider,
+          scope: 'auxiliary',
+          task
+        })
+
+        setSelectionWarning(result.selection_warning?.code === 'grandfathered-model-assignment')
         setEditingAuxTask(null)
         await refresh()
       } catch (err) {
@@ -613,15 +765,18 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
     setApplying(true)
     setError('')
+    setSelectionWarning(false)
 
     try {
-      await setModelAssignment({
+      const result = await setModelAssignment({
         model: mainModel.model,
         provider: mainModel.provider,
         scope: 'auxiliary',
         task: '__reset__'
       })
+
       setSwitchStaleAux([])
+      setSelectionWarning(result.selection_warning?.code === 'grandfathered-model-assignment')
       await refresh()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -688,15 +843,26 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                   <SelectValue placeholder={m.model} />
                 </SelectTrigger>
                 <SelectContent>
-                  {withActive(selectedProviderModels, selectedModel).map(model => (
-                    <SelectItem key={model} value={model}>
-                      {model}
-                    </SelectItem>
-                  ))}
+                  {selectedProviderRow &&
+                    selectedMainModels.map(model =>
+                      renderModelOption(
+                        selectedProviderRow,
+                        model,
+                        'main',
+                        mainModel?.provider === selectedProviderRow.slug && mainModel.model === model
+                      )
+                    )}
                 </SelectContent>
               </Select>
               <Button
-                disabled={!selectedProvider || !selectedModel || applying}
+                disabled={
+                  !selectedProvider ||
+                  !selectedModel ||
+                  applying ||
+                  (!!selectedMainEligibility &&
+                    !selectedMainEligibility.eligible &&
+                    !selectedMainEligibility.grandfathered)
+                }
                 onClick={() => void applyMainModel()}
                 size="sm"
               >
@@ -706,7 +872,20 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             </>
           )}
         </div>
-        {needsSetup && !setupIsApiKey && (
+        {providerReadiness && (
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            <span>{providerReadiness}</span>
+            <Button
+              disabled={loading}
+              onClick={() => void refresh({ preserveDraft: true })}
+              size="sm"
+              variant="textStrong"
+            >
+              {m.refreshModels}
+            </Button>
+          </div>
+        )}
+        {!providerReadiness && needsSetup && !setupIsApiKey && (
           <p className="mt-2 text-xs text-muted-foreground">
             {selectedProviderRow?.auth_type === 'api_key'
               ? `${selectedProviderRow?.name} needs an API key — set it up to choose a model.`
@@ -749,6 +928,12 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
           </div>
         )}
         {error && <div className="mt-2 text-xs text-destructive">{error}</div>}
+        {selectionWarning && (
+          <div className="mt-2 flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+            <AlertTriangle className="size-3.5 shrink-0" />
+            <span>{m.grandfatheredWarning}</span>
+          </div>
+        )}
         {switchStaleAux.length > 0 && (
           <div className="mt-2">
             <StaleAuxWarning
@@ -841,15 +1026,25 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                           <SelectValue placeholder={m.model} />
                         </SelectTrigger>
                         <SelectContent>
-                          {withActive(auxDraftProviderModels, auxDraft.model).map(model => (
-                            <SelectItem key={model} value={model}>
-                              {model}
-                            </SelectItem>
-                          ))}
+                          {auxDraftProviderRow &&
+                            withActive(auxDraftProviderModels, auxDraft.model).map(model =>
+                              renderModelOption(
+                                auxDraftProviderRow,
+                                model,
+                                auxDraftUsage,
+                                currentAuxDraftAssignment?.provider === auxDraft.provider &&
+                                  currentAuxDraftAssignment.model === model
+                              )
+                            )}
                         </SelectContent>
                       </Select>
                       <Button
-                        disabled={!auxDraft.provider || !auxDraft.model || applying}
+                        disabled={
+                          !auxDraft.provider ||
+                          !auxDraft.model ||
+                          applying ||
+                          (!!auxDraftEligibility && !auxDraftEligibility.eligible && !auxDraftEligibility.grandfathered)
+                        }
                         onClick={() => void applyAuxiliaryDraft(meta.key)}
                         size="sm"
                       >
@@ -885,6 +1080,12 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             Configure named presets that appear as models under the Mixture of Agents provider. The aggregator is the
             acting model.
           </p>
+          {!!moa.selection_warnings?.length && (
+            <div className="mb-2 flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+              <AlertTriangle className="size-3.5 shrink-0" />
+              <span>{m.grandfatheredWarning}</span>
+            </div>
+          )}
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <Select onValueChange={setSelectedMoaPreset} value={selectedMoaPreset || moa.default_preset}>
               <SelectTrigger className={cn('min-w-40', CONTROL_TEXT)}>
@@ -1013,11 +1214,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                         <SelectValue placeholder={m.model} />
                       </SelectTrigger>
                       <SelectContent>
-                        {withActive(modelsForProvider(slot.provider), slot.model).map(model => (
-                          <SelectItem key={model} value={model}>
-                            {model}
-                          </SelectItem>
-                        ))}
+                        {renderMoaModelOptions(slot.provider, slot.model, 'moa-reference')}
                       </SelectContent>
                     </Select>
                     <Button
@@ -1090,14 +1287,11 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                       <SelectValue placeholder={m.model} />
                     </SelectTrigger>
                     <SelectContent>
-                      {withActive(
-                        modelsForProvider(currentMoaPreset.aggregator.provider),
-                        currentMoaPreset.aggregator.model
-                      ).map(model => (
-                        <SelectItem key={model} value={model}>
-                          {model}
-                        </SelectItem>
-                      ))}
+                      {renderMoaModelOptions(
+                        currentMoaPreset.aggregator.provider,
+                        currentMoaPreset.aggregator.model,
+                        'moa-aggregator'
+                      )}
                     </SelectContent>
                   </Select>
                 </div>

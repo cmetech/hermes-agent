@@ -54,6 +54,12 @@ class ProviderProfile:
     base_url: str = ""
     models_url: str = ""  # explicit models endpoint; falls back to {base_url}/models
     auth_type: str = "api_key"   # api_key|oauth_device_code|oauth_external|copilot|aws_sdk
+    # Permits a non-secret SDK placeholder; does not prove the endpoint is
+    # reachable or actually accepts unauthenticated requests.
+    supports_unauthenticated: bool = False
+    # Relative to the effective inference base URL; empty disables the
+    # verified-capability contract.
+    model_capabilities_path: str = ""
     supports_health_check: bool = True  # False → doctor skips /models probe for this provider
 
     # ── Vision support ────────────────────────────────────────

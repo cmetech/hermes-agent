@@ -145,11 +145,10 @@ SERVICE_PROVIDER_NAMES: Dict[str, str] = {
     "spotify": "Spotify",
 }
 
-# LM Studio's default no-auth mode still requires *some* non-empty bearer for
-# the API-key code paths (auxiliary_client, runtime resolver) to treat the
-# provider as configured. This sentinel is sent only to LM Studio, never to
-# any remote service.
-LMSTUDIO_NOAUTH_PLACEHOLDER = "dummy-lm-api-key"
+# No-auth OpenAI-compatible providers still require *some* non-empty bearer
+# for SDK/runtime code paths to treat the provider as configured. Provider
+# profiles opt into this non-secret placeholder explicitly.
+NOAUTH_API_KEY_PLACEHOLDER = "dummy-lm-api-key"
 
 
 # =============================================================================
@@ -1530,6 +1529,18 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                 continue
             if has_usable_secret(os.getenv(env_var, "")):
                 return True
+        # A base-URL override is explicit configuration only for providers
+        # that declare they can operate without a secret. Key-required
+        # providers must not become "configured" from an endpoint alone.
+        if pconfig.base_url_env_var and os.getenv(pconfig.base_url_env_var, "").strip():
+            try:
+                from providers import get_provider_profile
+
+                profile = get_provider_profile(normalized)
+                if profile and profile.supports_unauthenticated:
+                    return True
+            except Exception:
+                pass
 
     # 4. Check persisted credential-pool entries that came from EXPLICIT flows
     # the user initiated inside Hermes (manual add / device-code / PKCE), plus
@@ -6446,13 +6457,18 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     key_source = ""
     api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
 
-    # No-auth LM Studio / OTTO gateway: substitute a placeholder so runtime /
-    # auxiliary_client see the local server as configured (the OpenAI SDK
-    # rejects an empty key). doctor still reports unconfigured because
-    # get_api_key_provider_status uses the raw secret resolver. The OTTO gateway
-    # accepts any key when launched without AUTH_TOKEN; a real OTTO_API_KEY wins.
-    if not api_key and provider_id in ("lmstudio", "otto"):
-        api_key = LMSTUDIO_NOAUTH_PLACEHOLDER
+    # Provider-declared no-auth endpoints still need a non-empty SDK bearer.
+    # This is a runtime placeholder only: get_api_key_provider_status() keeps
+    # using the raw secret resolver and does not claim a real key exists.
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider_id)
+    except Exception:
+        profile = None
+
+    if not api_key and profile and profile.supports_unauthenticated:
+        api_key = NOAUTH_API_KEY_PLACEHOLDER
         key_source = key_source or "default"
 
     env_url = ""

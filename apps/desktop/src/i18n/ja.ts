@@ -97,7 +97,8 @@ export const ja = defineLocale({
       remoteSignInHint: signInLabel =>
         `保存済みのリモートブラウザセッションからサインアウトし、${signInLabel}を開きます。代わりにバンドルされたバックエンドに切り替えるには「ローカルゲートウェイを使用」を選択してください。`,
       signOutAndSignIn: 'サインアウトして再サインイン',
-      remoteFailureHint: '「ゲートウェイ設定」でゲートウェイの URL とサインインを確認するか、ローカルゲートウェイに切り替えてください。',
+      remoteFailureHint:
+        '「ゲートウェイ設定」でゲートウェイの URL とサインインを確認するか、ローカルゲートウェイに切り替えてください。',
       hideRecentLogs: '最近のログを非表示',
       showRecentLogs: '最近のログを表示',
       signedInTitle: 'サインインしました',
@@ -767,6 +768,35 @@ export const ja = defineLocale({
       change: '変更',
       autoUseMain: '自動 · メインモデルを使用',
       providerDefault: '(プロバイダーのデフォルト)',
+      automaticRouting: '自動ルーティング',
+      currentNeedsReview: '要確認',
+      grandfatheredWarning:
+        'この保存済みモデルは既存設定として維持され、変更されませんでした。準備ができたら検証済みモデルを選択してください。',
+      refreshModels: 'モデルを更新',
+      eligibilityReasons: {
+        'authentication-required': 'Gateway の認証が必要です',
+        'capability-response-invalid': '機能応答に互換性がありません',
+        'catalog-empty': '利用可能な具体的モデルがありません',
+        'gateway-unreachable': 'Gateway を利用できません',
+        'gateway-upgrade-required': 'Gateway の更新が必要です',
+        unknown: 'モデルの状態が不明です',
+        'automatic-not-allowed': 'ここでは自動ルーティングを固定できません',
+        'model-not-live': '現在のモデルカタログにありません',
+        'completion-unknown': '補完機能は未検証です',
+        'completion-unsupported': '補完をサポートしていません',
+        'tools-unknown': 'ツール対応は未検証です',
+        'tools-unsupported': 'ツールをサポートしていません',
+        'vision-unknown': '画像対応は未検証です',
+        'vision-unsupported': '画像をサポートしていません'
+      },
+      providerReadiness: {
+        'authentication-required': 'Gateway モデルを使用するには、キーで OTTO_API_KEY を設定してください。',
+        'capability-response-invalid': 'Gateway から互換性のない機能応答が返されました。',
+        'catalog-empty': 'Gateway から具体的なモデルが返されませんでした。モデルカタログを更新して再試行してください。',
+        'gateway-unreachable': 'Gateway を利用できません。モデルカタログを更新して再試行してください。',
+        'gateway-upgrade-required': '検証済みモデル機能を読み込むには Gateway を更新してください。',
+        unknown: 'Gateway モデルの状態が不明です。モデルカタログを更新して再試行してください。'
+      },
       tasks: {
         vision: { label: 'ビジョン', hint: '画像分析' },
         web_extract: { label: 'ウェブ抽出', hint: 'ページの要約' },

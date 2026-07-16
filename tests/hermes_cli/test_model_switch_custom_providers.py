@@ -18,6 +18,76 @@ _MOCK_VALIDATION = {
 }
 
 
+def _install_test_canonical_profile(
+    monkeypatch,
+    *,
+    slug: str,
+    supports_unauthenticated: bool,
+    model_capabilities_path: str = "",
+    fetch_models=None,
+):
+    import providers as provider_registry
+    from hermes_cli import auth as auth_mod
+    from hermes_cli import models as models_mod
+    from hermes_cli.auth import ProviderConfig
+    from hermes_cli.models import ProviderEntry
+    from providers.base import ProviderProfile
+
+    env_prefix = slug.upper().replace("-", "_")
+    api_key_env = f"{env_prefix}_API_KEY"
+    base_url_env = f"{env_prefix}_BASE_URL"
+
+    if fetch_models is None:
+        profile = ProviderProfile(
+            name=slug,
+            display_name=slug,
+            env_vars=(api_key_env, base_url_env),
+            base_url=f"http://127.0.0.1/{slug}/v1",
+            auth_type="api_key",
+            supports_unauthenticated=supports_unauthenticated,
+            model_capabilities_path=model_capabilities_path,
+        )
+    else:
+        class TestProfile(ProviderProfile):
+            def fetch_models(self, **kwargs):
+                return fetch_models(**kwargs)
+
+        profile = TestProfile(
+            name=slug,
+            display_name=slug,
+            env_vars=(api_key_env, base_url_env),
+            base_url=f"http://127.0.0.1/{slug}/v1",
+            auth_type="api_key",
+            supports_unauthenticated=supports_unauthenticated,
+            model_capabilities_path=model_capabilities_path,
+        )
+
+    monkeypatch.delenv(api_key_env, raising=False)
+    monkeypatch.delenv(base_url_env, raising=False)
+    monkeypatch.setitem(provider_registry._REGISTRY, slug, profile)
+    monkeypatch.setitem(
+        auth_mod.PROVIDER_REGISTRY,
+        slug,
+        ProviderConfig(
+            id=slug,
+            name=slug,
+            auth_type="api_key",
+            inference_base_url=profile.base_url,
+            api_key_env_vars=(api_key_env,),
+            base_url_env_var=base_url_env,
+        ),
+    )
+    monkeypatch.setattr(
+        models_mod,
+        "CANONICAL_PROVIDERS",
+        [
+            *models_mod.CANONICAL_PROVIDERS,
+            ProviderEntry(slug, slug, f"{slug} test provider"),
+        ],
+    )
+    return profile
+
+
 def test_list_authenticated_providers_includes_custom_providers(monkeypatch):
     """No-args /model menus should include saved custom_providers entries."""
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
@@ -871,13 +941,15 @@ def test_lmstudio_picker_probes_active_config_base_url(monkeypatch):
 
     monkeypatch.setattr("hermes_cli.models.fetch_lmstudio_models", _fake_fetch)
 
-    list_authenticated_providers(
+    providers = list_authenticated_providers(
         current_provider="lmstudio",
         current_base_url="http://192.168.1.10:1234/v1",
         current_model="qwen/qwen3-coder-30b",
     )
 
     assert captured["base_url"] == "http://192.168.1.10:1234/v1"
+    row = next(p for p in providers if p["slug"] == "lmstudio")
+    assert row["models"] == ["qwen/qwen3-coder-30b"]
 
 
 def test_lmstudio_picker_lm_base_url_env_wins_over_active_config(monkeypatch):
@@ -924,12 +996,123 @@ def test_lmstudio_picker_skips_probe_when_not_configured(monkeypatch):
 
     monkeypatch.setattr("hermes_cli.models.fetch_lmstudio_models", _fake_fetch)
 
-    list_authenticated_providers(
+    providers = list_authenticated_providers(
         current_provider="openrouter",
         current_base_url="https://openrouter.ai/api/v1",
     )
 
     assert "base_url" not in captured
+    assert all(p["slug"] != "lmstudio" for p in providers)
+
+
+def test_lmstudio_picker_probes_when_explicitly_configured_but_not_current(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    monkeypatch.setenv("LM_BASE_URL", "http://configured.local:1234/v1")
+    monkeypatch.delenv("LM_API_KEY", raising=False)
+
+    calls = []
+
+    def _fake_fetch(api_key=None, base_url=None, timeout=5.0):
+        calls.append((api_key, base_url, timeout))
+        return ["configured-chat-model"]
+
+    monkeypatch.setattr("hermes_cli.models.fetch_lmstudio_models", _fake_fetch)
+
+    providers = list_authenticated_providers(
+        current_provider="openrouter",
+        current_base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert calls
+    assert calls[0][1] == "http://configured.local:1234/v1"
+    row = next(p for p in providers if p["slug"] == "lmstudio")
+    assert row["models"] == ["configured-chat-model"]
+
+
+def test_delivered_noauth_gateway_is_globally_discoverable(monkeypatch):
+    """Every profile can select a delivered Gateway without storing a key."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    calls = []
+
+    def _fetch_models(**kwargs):
+        calls.append(kwargs)
+        return ["live-gateway-model"]
+
+    slug = "test-delivered-gateway"
+    _install_test_canonical_profile(
+        monkeypatch,
+        slug=slug,
+        supports_unauthenticated=True,
+        model_capabilities_path="model-capabilities",
+        fetch_models=_fetch_models,
+    )
+
+    providers = list_authenticated_providers(
+        current_provider="openrouter",
+        current_model="openrouter/auto",
+        user_providers={},
+    )
+
+    row = next(p for p in providers if p["slug"] == slug)
+    assert calls, "delivered no-auth Gateway should attempt live discovery"
+    assert calls[0]["api_key"] == "dummy-lm-api-key"
+    assert row["models"] == ["live-gateway-model"]
+
+
+def test_local_noauth_provider_is_discoverable_when_base_url_is_explicit(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    calls = []
+
+    def _fetch_models(**kwargs):
+        calls.append(kwargs)
+        return ["local-live-model"]
+
+    slug = "test-local-noauth"
+    _install_test_canonical_profile(
+        monkeypatch,
+        slug=slug,
+        supports_unauthenticated=True,
+        fetch_models=_fetch_models,
+    )
+    monkeypatch.setenv(
+        "TEST_LOCAL_NOAUTH_BASE_URL",
+        "http://configured.local/test-local-noauth/v1",
+    )
+
+    providers = list_authenticated_providers(
+        current_provider="openrouter",
+        user_providers={},
+    )
+
+    row = next(p for p in providers if p["slug"] == slug)
+    assert calls, "explicitly configured local no-auth provider should be probed"
+    assert row["models"] == ["local-live-model"]
+
+
+def test_key_required_provider_without_key_remains_excluded(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+
+    def _unexpected_fetch(**kwargs):
+        raise AssertionError("key-required provider must not be probed")
+
+    slug = "test-key-required-canonical"
+    _install_test_canonical_profile(
+        monkeypatch,
+        slug=slug,
+        supports_unauthenticated=False,
+        fetch_models=_unexpected_fetch,
+    )
+
+    providers = list_authenticated_providers(
+        current_provider="openrouter",
+        user_providers={},
+    )
+
+    assert all(p["slug"] != slug for p in providers)
 
 
 def test_custom_providers_uses_live_models_for_multi_model_endpoint(monkeypatch):
