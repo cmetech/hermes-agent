@@ -144,6 +144,9 @@ def _make_handler(mode: str):
             if mode == "prose":
                 return self._send_json(self._prose(path))
 
+            if mode == "leak":
+                return self._send_json(self._leak(path))
+
             msgs = body.get("messages")
             stream = bool(body.get("stream"))
             tools = _tool_names(body)
@@ -242,6 +245,19 @@ def _make_handler(mode: str):
                 return {"model": "auto", "done": True, "message": {"role": "assistant", "content": txt}}
             return {"error": "not found"}
 
+        # --- leak-mode (surfacing-gap: [tool: …] narration, no structured call) ---
+        def _leak(self, path):
+            txt = "[tool: execute] I'll run that for you."
+            if path == "/v1/messages":
+                return {"id": "msg_l", "type": "message", "role": "assistant", "model": "auto",
+                        "stop_reason": "end_turn", "content": [{"type": "text", "text": txt}]}
+            if path == "/v1/chat/completions":
+                return {"id": "cl", "choices": [{"index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": txt}}]}
+            if path == "/api/chat":
+                return {"model": "auto", "done": True, "message": {"role": "assistant", "content": txt}}
+            return {"error": "not found"}
+
     return Handler
 
 
@@ -261,6 +277,7 @@ def main() -> int:
     good_srv, good_url = _serve("good")
     prose_srv, prose_url = _serve("prose")
     cipher_srv, cipher_url = _serve("cipher")
+    leak_srv, leak_url = _serve("leak")
     failures = 0
     try:
         # 1) good gateway, all suites → every non-skip check passes, exit 0.
@@ -371,10 +388,23 @@ def main() -> int:
                        f"cipher/toolcall:{k} → pii-redaction diagnosis (got: {r['detail'][:60]})")
         except AssertionError as e:
             print(f"  FAIL: {e}"); failures += 1
+
+        # 8) leak gateway ([tool: …] narration, no structured call) → every
+        #    toolcall check hard-FAILs with the surfacing-gap diagnosis, exit 1.
+        results, code = rp.run_selected("toolcall", "all", leak_url, "", retries=1)
+        try:
+            _check(code == 1, "leak/toolcall → exit 1")
+            for k in ("anthropic", "openai", "ollama"):
+                r = next(x for x in results if x["name"] == f"toolcall:{k}")
+                _check("surfacing-gap" in r["detail"],
+                       f"leak/toolcall:{k} → surfacing-gap (got: {r['detail'][:70]})")
+        except AssertionError as e:
+            print(f"  FAIL: {e}"); failures += 1
     finally:
         good_srv.shutdown()
         prose_srv.shutdown()
         cipher_srv.shutdown()
+        leak_srv.shutdown()
 
     print()
     if failures:

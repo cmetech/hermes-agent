@@ -439,6 +439,21 @@ def final_answer_ok(text: str) -> bool:
     return any(h in low for h in _WEATHER_HINTS)
 
 
+_LEAK_MARKER = "[tool:"
+
+
+def _bracket_tool_leak(text: str) -> bool:
+    """True iff assistant text carries a `[tool: …]` tool-call NARRATION leak —
+    kiro's tool call rendered as prose instead of structured tool_calls."""
+    return _LEAK_MARKER in (text or "").lower()
+
+
+_LEAK_DETAIL = (
+    "surfacing-gap: kiro tool call leaked as '[tool: …]' narration instead of "
+    "structured tool_calls"
+)
+
+
 # --------------------------------------------------------------------------- #
 # ACP capture — fetch & classify (diagnosis on FAIL)
 #
@@ -676,6 +691,7 @@ def run_surface(spec, gw_url: str, tool_result: str = TOOL_RESULT) -> dict:
         "error": None,
         "diagnosis": None,
         "http": None,
+        "observed_text": "",
     }
 
     cursor = capture_cursor(gw_url)
@@ -690,10 +706,27 @@ def run_surface(spec, gw_url: str, tool_result: str = TOOL_RESULT) -> dict:
         result["error"] = f"HTTP {status}, non-JSON body: {raw[:200]}"
     tc = spec["extract"](resp)
     result["tool_call"] = tc
+    observed = _client_observed_text(spec, resp)
+    result["observed_text"] = observed
+
+    # A `[tool: …]` leak is a hard surfacing-gap FAIL even if a call is present.
+    if _bracket_tool_leak(observed):
+        enabled, frames, note = fetch_capture(gw_url, cursor)
+        _, _, frame = classify_capture(frames, observed)
+        result["phase1"] = False
+        result["diagnosis"] = {
+            "code": "surfacing-gap",
+            "message": _LEAK_DETAIL,
+            "capture_note": note,
+            "capture_enabled": enabled,
+            "first_frame": format_frame(frame) if frame else None,
+            "observed_text": (observed or "")[:200],
+        }
+        return result
+
     result["phase1"] = toolcall_ok(tc)
 
     if not result["phase1"]:
-        observed = _client_observed_text(spec, resp)
         enabled, frames, note = fetch_capture(gw_url, cursor)
         if tc is not None:
             # A structured tool_call WAS surfaced — the surfacing apparatus works;
@@ -772,6 +805,8 @@ def check_nested_fence_anthropic(gw_url):
         "tools": [_WRITE_TOOL_ANTHROPIC],
     }
     status, resp, raw = post(gw_url + "/v1/messages", body, {"anthropic-version": ANTHROPIC_VERSION})
+    if _bracket_tool_leak(anthropic_final(resp)):
+        return False, _LEAK_DETAIL
     tc = anthropic_extract(resp)
     if not tc or (tc.get("name") or "").lower() != "write_file":
         return False, f"expected write_file tool_use, got {tc} (HTTP {status})"
@@ -794,6 +829,8 @@ def check_invented_name_anthropic(gw_url):
         "tools": [_ANTHROPIC_TOOL],
     }
     status, resp, raw = post(gw_url + "/v1/messages", body, {"anthropic-version": ANTHROPIC_VERSION})
+    if _bracket_tool_leak(anthropic_final(resp)):
+        return False, _LEAK_DETAIL
     tc = anthropic_extract(resp)
     if not tc:
         return False, f"no structured tool_call surfaced (HTTP {status})"
