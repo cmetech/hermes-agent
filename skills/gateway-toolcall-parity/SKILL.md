@@ -114,7 +114,18 @@ Model-dependent checks (tool-call, basic chat, model-normalize) are flagged **fl
 and retried; a `FAIL*(n)` may be a one-off prose response, not a hard regression —
 re-run or read the detail.
 
-## Failure diagnosis (tool-call, from `/admin/api/acp-capture`)
+## Failure diagnosis
+
+**A structured tool_call WAS returned but isn't `get_weather(Paris)`** (the surfacing
+apparatus works — the value is the problem):
+
+| Diagnosis | Meaning |
+|---|---|
+| `pii-redaction` | Right tool + id, but the `city` arg is a ciphertext-shaped token, not "Paris". "Paris" is a LOCATION; the gateway's PII hook (encrypt/mask + NER) is redacting the argument and the **round-trip decrypt isn't restoring tool_call argument values**. Tool-calling works — the fix is decrypting tool_call args on the response side. To isolate tool-calling, re-run with the PII hook off (`PII_NER_ENABLED=false`). |
+| `args-fidelity` | Right tool + id, but the argument value is otherwise wrong. |
+| `wrong-tool-name` | Surfaced a structured call for a different tool. |
+
+**No structured tool_call at all** — classified from `/admin/api/acp-capture` frames:
 
 | ACP frames show… | Diagnosis | Meaning |
 |---|---|---|
@@ -122,7 +133,8 @@ re-run or read the detail.
 | kiro emits `{"tool_call":…}` JSON in prose, client got prose | `track-3b` | saw the tool_call but didn't surface it as structured `tool_calls` |
 | native ACP `tool_call`/`tool_call_chunk` rendered as `[tool: …]` | `surfacing-gap` | structured-surfacing gap on OpenAI/Ollama |
 
-(OTTO capture frames carry `params` as a JSON **string**; the classifier parses it.)
+(OTTO capture frames carry `params` as a JSON **string** with escaped quotes; the
+classifier parses it and concatenates streamed chunks before probing for `{"tool_call`.)
 
 ## Reference (parity) mode
 

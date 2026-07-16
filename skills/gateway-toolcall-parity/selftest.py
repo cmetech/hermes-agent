@@ -27,6 +27,8 @@ import run_parity as rp
 
 FINAL = "The weather in Paris is 18°C and sunny."
 HELLO_REPLY = "Hello there, nice to meet you!"
+# A ciphertext-shaped token (like an AES-GCM PII redaction of "Paris").
+CIPHER_CITY = "9TvKUqBiQ-i3ujOASILCYBHPI_xW_CEYlrWe8FqA9m-D"
 
 
 def _is_phase2(body: dict) -> bool:
@@ -185,18 +187,19 @@ def _make_handler(mode: str):
 
         # --- good-mode response builders --------------------------------------
         def _toolcall(self, path):
+            city = CIPHER_CITY if mode == "cipher" else "Paris"  # cipher = redacted PII
             if path == "/v1/messages":
                 return {"id": "msg_1", "type": "message", "role": "assistant", "model": "auto",
                         "stop_reason": "tool_use", "content": [
-                            {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}}]}
+                            {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": city}}]}
             if path == "/v1/chat/completions":
                 return {"id": "c1", "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
                     "role": "assistant", "content": None, "tool_calls": [
                         {"id": "call_1", "type": "function", "function": {
-                            "name": "get_weather", "arguments": json.dumps({"city": "Paris"})}}]}}]}
+                            "name": "get_weather", "arguments": json.dumps({"city": city})}}]}}]}
             if path == "/api/chat":
                 return {"model": "auto", "done": True, "message": {"role": "assistant", "content": "", "tool_calls": [
-                    {"function": {"name": "get_weather", "arguments": {"city": "Paris"}}}]}}
+                    {"function": {"name": "get_weather", "arguments": {"city": city}}}]}}
             return {"error": "not found"}
 
         def _write_toolcall(self):
@@ -257,6 +260,7 @@ def _check(cond, msg):
 def main() -> int:
     good_srv, good_url = _serve("good")
     prose_srv, prose_url = _serve("prose")
+    cipher_srv, cipher_url = _serve("cipher")
     failures = 0
     try:
         # 1) good gateway, all suites → every non-skip check passes, exit 0.
@@ -333,11 +337,44 @@ def main() -> int:
                       "params": json.dumps({"update": {"sessionUpdate": "tool_call", "kind": "get_weather"}})}
             code2, _, _ = rp.classify_capture([native], "[tool: get_weather]")
             _check(code2 == "surfacing-gap", f"classify_capture: native tool_call → surfacing-gap (got {code2})")
+            # track-3b: {"tool_call"} JSON split across streamed chunks, params as
+            # JSON STRING with ESCAPED quotes — the exact real-OTTO shape that the
+            # old raw-substring probe missed and mislabeled track-3a.
+            tb = [
+                {"seq": 3, "method": "session/update", "params": json.dumps(
+                    {"update": {"sessionUpdate": "agent_message_chunk", "content": {"text": "```json\n{\"tool"}}})},
+                {"seq": 4, "method": "session/update", "params": json.dumps(
+                    {"update": {"sessionUpdate": "agent_message_chunk", "content": {"text": "_call\": {\"name\": \"get_weather\"}}"}}})},
+            ]
+            code3, _, _ = rp.classify_capture(tb, "")
+            _check(code3 == "track-3b", f"classify_capture: escaped split-chunk tool_call → track-3b (got {code3})")
+            # PII-aware diagnosis of a surfaced-but-bad tool_call
+            _check(rp._looks_like_ciphertext(CIPHER_CITY), "_looks_like_ciphertext: token detected")
+            _check(not rp._looks_like_ciphertext("Paris"), "_looks_like_ciphertext: plain value rejected")
+            cp, _ = rp._diagnose_bad_toolcall({"name": "get_weather", "args": {"city": CIPHER_CITY}, "id": "call_1"})
+            _check(cp == "pii-redaction", f"_diagnose_bad_toolcall: ciphertext → pii-redaction (got {cp})")
+            cf, _ = rp._diagnose_bad_toolcall({"name": "get_weather", "args": {"city": "Berlin"}, "id": "x"})
+            _check(cf == "args-fidelity", f"_diagnose_bad_toolcall: wrong city → args-fidelity (got {cf})")
+            cw, _ = rp._diagnose_bad_toolcall({"name": "other_tool", "args": {}, "id": "x"})
+            _check(cw == "wrong-tool-name", f"_diagnose_bad_toolcall: wrong tool → wrong-tool-name (got {cw})")
+        except AssertionError as e:
+            print(f"  FAIL: {e}"); failures += 1
+
+        # 7) cipher gateway (surfaces get_weather with a ciphertext arg) → each
+        #    toolcall check FAILs with the pii-redaction diagnosis, not track-3a.
+        results, code = rp.run_selected("toolcall", "all", cipher_url, "", retries=1)
+        try:
+            _check(code == 1, "cipher/toolcall → exit 1")
+            for k in ("anthropic", "openai", "ollama"):
+                r = next(x for x in results if x["name"] == f"toolcall:{k}")
+                _check("pii-redaction" in r["detail"],
+                       f"cipher/toolcall:{k} → pii-redaction diagnosis (got: {r['detail'][:60]})")
         except AssertionError as e:
             print(f"  FAIL: {e}"); failures += 1
     finally:
         good_srv.shutdown()
         prose_srv.shutdown()
+        cipher_srv.shutdown()
 
     print()
     if failures:

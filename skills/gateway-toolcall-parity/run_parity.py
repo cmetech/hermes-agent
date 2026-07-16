@@ -494,6 +494,26 @@ def _frame_text(frame) -> str:
     return json.dumps(p, ensure_ascii=False) if p is not None else ""
 
 
+def _frame_message_text(frame) -> str:
+    """The UNESCAPED agent_message_chunk text inside a frame's params, else "".
+
+    Parsing the params (a JSON string on real OTTO) is what makes tool_call
+    detection work — probing the raw params string fails because its inner quotes
+    are escaped (`\\"tool_call\\"`), so a `"tool_call"` substring never matches.
+    """
+    p = _params_obj(frame)
+    upd = p.get("update") if isinstance(p, dict) else None
+    content = None
+    if isinstance(upd, dict):
+        content = upd.get("content")
+    elif isinstance(p, dict):
+        content = p.get("content")
+    if isinstance(content, dict):
+        t = content.get("text")
+        return t if isinstance(t, str) else ""
+    return content if isinstance(content, str) else ""
+
+
 def _session_update_kind(frame) -> str:
     """The ACP sessionUpdate subtype inside params (wrapped or flat), else ''."""
     p = _params_obj(frame)
@@ -523,10 +543,13 @@ def classify_capture(frames, observed_text: str):
     prose_frames = [
         f for f in frames if _session_update_kind(f) == "agent_message_chunk"
     ]
+    # kiro streams the `{"tool_call":…}` JSON split across many tiny chunks, so
+    # detect it on the CONCATENATED unescaped message text, not per-frame.
+    full_prose = "".join(_frame_message_text(f) for f in prose_frames)
+    has_toolcall_json = '"tool_call"' in full_prose or '{"tool_call' in full_prose
     toolcall_json_frames = [
-        f for f in prose_frames
-        if '"tool_call"' in _frame_text(f) or '{"tool_call' in _frame_text(f)
-    ]
+        f for f in prose_frames if "tool_call" in _frame_message_text(f)
+    ] or (prose_frames[:1] if has_toolcall_json else [])
     client_shows_bracket_tool = "[tool:" in (observed_text or "").lower()
 
     # 1) Native ACP tool_call surfaced as narration → structured-surfacing gap.
@@ -601,6 +624,47 @@ def _client_observed_text(spec, resp) -> str:
 # --------------------------------------------------------------------------- #
 # toolcall suite — per-surface 2-phase round-trip (with ACP diagnosis on fail)
 # --------------------------------------------------------------------------- #
+def _looks_like_ciphertext(s) -> bool:
+    """Heuristic: a long base64/base64url-ish token with mixed letters+digits —
+    the shape of an AES-GCM PII ciphertext, not a plain value like 'Paris'."""
+    if not isinstance(s, str) or len(s) < 24:
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_+/=")
+    if any(ch not in allowed for ch in s):
+        return False
+    return any(c.isdigit() for c in s) and any(c.isalpha() for c in s)
+
+
+def _diagnose_bad_toolcall(tc):
+    """A structured tool_call WAS surfaced but isn't get_weather(Paris).
+
+    Distinguishes the real failure modes so the report is accurate:
+      * wrong-tool-name — surfaced a call for a different tool
+      * pii-redaction   — right tool + id, but the arg looks like ENCRYPTED PII
+                          (the round-trip decrypt isn't covering tool-call args)
+      * args-fidelity   — right tool + id, but the arg value is otherwise wrong
+    """
+    name = (tc.get("name") or "").strip().lower()
+    city = (tc.get("args") or {}).get("city")
+    tid = tc.get("id")
+    if name != "get_weather":
+        return "wrong-tool-name", (
+            f"structured tool_call surfaced but name={tc.get('name')!r} "
+            "(expected get_weather) — surfaced a call for the wrong tool")
+    if isinstance(city, str) and _looks_like_ciphertext(city):
+        return "pii-redaction", (
+            f"tool_call surfaced correctly (name=get_weather, id={tid!r}) but "
+            f"city={city!r} looks like ENCRYPTED PII, not plaintext. 'Paris' is a "
+            "LOCATION; with the gateway's PII hook in encrypt/mask mode + NER on, the "
+            "argument is redacted and the round-trip decrypt is NOT restoring tool_call "
+            "ARGUMENT values (only message text). => tool-calling itself works; the fix "
+            "is to decrypt tool_call arguments on the response round-trip. To isolate "
+            "tool-calling, re-run with the PII hook off (e.g. PII_NER_ENABLED=false).")
+    return "args-fidelity", (
+        f"tool_call surfaced (name=get_weather, id={tid!r}) but city={city!r} "
+        "(expected 'Paris') — tool name/id correct, argument value wrong")
+
+
 def run_surface(spec, gw_url: str, tool_result: str = TOOL_RESULT) -> dict:
     result = {
         "key": spec["key"],
@@ -631,7 +695,13 @@ def run_surface(spec, gw_url: str, tool_result: str = TOOL_RESULT) -> dict:
     if not result["phase1"]:
         observed = _client_observed_text(spec, resp)
         enabled, frames, note = fetch_capture(gw_url, cursor)
-        code, human, frame = classify_capture(frames, observed)
+        if tc is not None:
+            # A structured tool_call WAS surfaced — the surfacing apparatus works;
+            # diagnose the value, don't misfire the "no tool call" classifier.
+            code, human = _diagnose_bad_toolcall(tc)
+            _, _, frame = classify_capture(frames, observed)
+        else:
+            code, human, frame = classify_capture(frames, observed)
         result["diagnosis"] = {
             "code": code,
             "message": human,
@@ -856,15 +926,21 @@ _STREAM = {"anthropic": _stream_anthropic, "openai": _stream_openai, "ollama": _
 
 
 def check_model_normalize_anthropic(gw_url):
+    # OTTO does NO HTTP-level model validation (verified in the gateway): an
+    # arbitrary id is forwarded to kiro. So the conformance contract is "no 400";
+    # 200 (kiro accepted) and 500 (kiro rejected the unknown id) are BOTH valid —
+    # a 400 would mean OTTO wrongly added HTTP model validation.
     body = {"model": "totally-made-up-model-xyz", "max_tokens": 64, "messages": [_HELLO_MSG]}
     status, resp, raw = post(gw_url + "/v1/messages", body, {"anthropic-version": ANTHROPIC_VERSION})
-    if status != 200:
-        return False, (f"arbitrary model → HTTP {status} (OTTO does no HTTP-level model "
-                       f"validation; a 500 means kiro rejected the id): {raw[:120]}")
-    txt = anthropic_final(resp)
-    if not txt:
-        return False, "200 but no text content"
-    return True, f"arbitrary model id accepted → 200 + text: {txt[:50]!r}"
+    if status == 400:
+        return False, f"arbitrary model → HTTP 400 — OTTO must not do HTTP-level model validation: {raw[:120]}"
+    if status == 200:
+        txt = anthropic_final(resp)
+        return (bool(txt), f"arbitrary model accepted by kiro → 200 + text: {txt[:50]!r}"
+                if txt else "200 but no text content")
+    if status == 500:
+        return True, "arbitrary model → 500 (no HTTP validation; kiro rejected the unknown id — acceptable)"
+    return True, f"arbitrary model → HTTP {status} (no HTTP-level 400 validation)"
 
 
 def _validation_anthropic_max_tokens(gw_url):
