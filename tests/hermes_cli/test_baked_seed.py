@@ -69,6 +69,27 @@ def test_seed_backfills_only_missing_or_blank_mcp_url(
     assert saved["headers"] == {"X-User": "preserve"}
 
 
+def test_seed_backfills_explicit_null_mcp_url_without_clobbering_user_fields(
+    tmp_path, fake_repo, fake_config
+):
+    fake_config["cfg"] = {
+        "mcp_servers": {
+            "glean": {
+                "enabled": True,
+                "url": None,
+                "headers": {"X-User": "preserve"},
+            }
+        }
+    }
+
+    cs.seed_baked_capabilities(tmp_path / "home")
+
+    saved = fake_config["cfg"]["mcp_servers"]["glean"]
+    assert saved["url"] == "https://default.example.test/mcp"
+    assert saved["enabled"] is True
+    assert saved["headers"] == {"X-User": "preserve"}
+
+
 def test_seed_preserves_custom_mcp_url_and_absent_enabled(
     tmp_path, fake_repo, fake_config
 ):
