@@ -5546,12 +5546,7 @@ def _validate_changed_moa_slots(
             str(slot.get("model", "") or "").strip(),
         )
 
-    def _is_gateway_backed(provider: str) -> bool:
-        # ``gateway`` is the neutral test/provider alias. Branded providers
-        # (OTTO, LOOP24, etc.) advertise the same capability contract through
-        # their generated provider profile.
-        if provider.lower() == "gateway":
-            return True
+    def _has_capability_contract(provider: str) -> bool:
         profile = get_provider_profile(provider)
         return bool(profile is not None and profile.model_capabilities_path)
 
@@ -5564,7 +5559,7 @@ def _validate_changed_moa_slots(
         requested_slot: Any,
     ) -> None:
         provider, model = _pair(requested_slot)
-        if not _is_gateway_backed(provider):
+        if not _has_capability_contract(provider):
             return
         exact_existing_assignment = _pair(current_slot) == (provider, model)
         decision = validate_provider_model_selection(

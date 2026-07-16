@@ -138,6 +138,57 @@ def _no_model_cost_warning(monkeypatch):
     )
 
 
+@pytest.fixture
+def _moa_contract_profile():
+    """Register a real capability-contract provider and alias for MoA tests."""
+    import providers
+    from providers.base import ProviderProfile
+
+    name = "moa-contract-test"
+    alias = "moa-contract-alias"
+    prior_profile = providers._REGISTRY.get(name)
+    prior_alias = providers._ALIASES.get(alias)
+    profile = ProviderProfile(
+        name=name,
+        aliases=(alias,),
+        base_url="https://moa-contract.invalid/v1",
+        auth_type="oauth_external",
+        model_capabilities_path="model-capabilities",
+    )
+    profile.fetch_models = lambda **_kwargs: []  # type: ignore[method-assign]
+    providers.register_provider(profile)
+    try:
+        yield profile
+    finally:
+        if prior_profile is None:
+            providers._REGISTRY.pop(name, None)
+        else:
+            providers._REGISTRY[name] = prior_profile
+        if prior_alias is None:
+            providers._ALIASES.pop(alias, None)
+        else:
+            providers._ALIASES[alias] = prior_alias
+
+
+@pytest.fixture
+def _moa_legacy_profile():
+    """Register a provider that deliberately declares no capability contract."""
+    import providers
+    from providers.base import ProviderProfile
+
+    name = "moa-legacy-test"
+    prior_profile = providers._REGISTRY.get(name)
+    profile = ProviderProfile(name=name)
+    providers.register_provider(profile)
+    try:
+        yield profile
+    finally:
+        if prior_profile is None:
+            providers._REGISTRY.pop(name, None)
+        else:
+            providers._REGISTRY[name] = prior_profile
+
+
 # ---------------------------------------------------------------------------
 # reload_env tests
 # ---------------------------------------------------------------------------
@@ -822,12 +873,13 @@ class TestWebServerEndpoints:
         assert cfg["moa"]["aggregator"] == payload["aggregator"]
 
     def test_put_moa_accepts_changed_completion_supported_reference(
-        self, monkeypatch
+        self, monkeypatch, _moa_contract_profile
     ):
         from hermes_cli import model_eligibility
         from hermes_cli.config import load_config, save_config
         from hermes_cli.model_eligibility import ModelEligibility
 
+        provider = _moa_contract_profile.name
         cfg = load_config()
         cfg["moa"] = {
             "reference_models": [
@@ -857,7 +909,7 @@ class TestWebServerEndpoints:
             "/api/model/moa",
             json={
                 "reference_models": [
-                    {"provider": "gateway", "model": "completion-supported"}
+                    {"provider": provider, "model": "completion-supported"}
                 ],
                 "aggregator": {
                     "provider": "openrouter",
@@ -869,14 +921,14 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         assert calls == [
             (
-                "gateway",
+                provider,
                 "completion-supported",
                 "moa-reference",
                 {"exact_existing_assignment": False},
             )
         ]
         assert load_config()["moa"]["reference_models"] == [
-            {"provider": "gateway", "model": "completion-supported"}
+            {"provider": provider, "model": "completion-supported"}
         ]
 
     @pytest.mark.parametrize(
@@ -893,25 +945,29 @@ class TestWebServerEndpoints:
         ],
     )
     def test_put_moa_rejects_changed_ineligible_reference_without_rewrite(
-        self, monkeypatch, reason, message
+        self, monkeypatch, _moa_contract_profile, reason, message
     ):
         from hermes_cli import model_eligibility
         from hermes_cli.config import get_config_path
         from hermes_cli.model_eligibility import ModelEligibility
 
+        provider = _moa_contract_profile.name
         config_path = get_config_path()
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(
             "moa:\n"
             "  reference_models:\n"
-            "    - {provider: gateway, model: existing-reference}\n"
+            f"    - {{provider: {provider}, model: existing-reference}}\n"
             "  aggregator: {provider: openrouter, model: existing-aggregator}\n",
             encoding="utf-8",
         )
         before = config_path.read_bytes()
 
         def validate(provider, model, usage, **kwargs):
-            if (provider, model) == ("gateway", "changed-reference"):
+            if (provider, model) == (
+                _moa_contract_profile.name,
+                "changed-reference",
+            ):
                 return ModelEligibility(
                     eligible=False,
                     reason=reason,
@@ -931,7 +987,7 @@ class TestWebServerEndpoints:
             "/api/model/moa",
             json={
                 "reference_models": [
-                    {"provider": "gateway", "model": "changed-reference"}
+                    {"provider": provider, "model": "changed-reference"}
                 ],
                 "aggregator": {
                     "provider": "openrouter",
@@ -948,7 +1004,7 @@ class TestWebServerEndpoints:
                 "usage": "moa-reference",
                 "preset": "default",
                 "slot": "reference:0",
-                "provider": "gateway",
+                "provider": provider,
                 "model": "changed-reference",
                 "message": message,
             }
@@ -956,7 +1012,7 @@ class TestWebServerEndpoints:
         assert config_path.read_bytes() == before
 
     def test_put_moa_changed_aggregator_requires_completion_and_tools(
-        self, monkeypatch
+        self, monkeypatch, _moa_contract_profile
     ):
         from hermes_cli import model_eligibility
         from hermes_cli.config import load_config, save_config
@@ -965,13 +1021,14 @@ class TestWebServerEndpoints:
             evaluate_model_eligibility,
         )
 
+        provider = _moa_contract_profile.name
         cfg = load_config()
         cfg["moa"] = {
             "reference_models": [
                 {"provider": "openrouter", "model": "existing-reference"}
             ],
             "aggregator": {
-                "provider": "gateway",
+                "provider": provider,
                 "model": "existing-aggregator",
             },
         }
@@ -1011,7 +1068,7 @@ class TestWebServerEndpoints:
                     {"provider": "openrouter", "model": "existing-reference"}
                 ],
                 "aggregator": {
-                    "provider": "gateway",
+                    "provider": provider,
                     "model": "changed-aggregator",
                 },
             },
@@ -1022,7 +1079,7 @@ class TestWebServerEndpoints:
         assert resp.json()["detail"]["usage"] == "moa-aggregator"
         assert calls == [
             (
-                "gateway",
+                provider,
                 "changed-aggregator",
                 "moa-aggregator",
                 {"exact_existing_assignment": False},
@@ -1037,7 +1094,7 @@ class TestWebServerEndpoints:
         ],
     )
     def test_put_moa_rejects_gateway_auto_for_each_role(
-        self, monkeypatch, slot, usage
+        self, monkeypatch, _moa_contract_profile, slot, usage
     ):
         from hermes_cli import model_eligibility
         from hermes_cli.model_eligibility import evaluate_model_eligibility
@@ -1057,6 +1114,7 @@ class TestWebServerEndpoints:
         monkeypatch.setattr(
             model_eligibility, "validate_provider_model_selection", validate
         )
+        provider = _moa_contract_profile.name
         payload = {
             "reference_models": [
                 {"provider": "openrouter", "model": "existing-reference"}
@@ -1067,9 +1125,9 @@ class TestWebServerEndpoints:
             },
         }
         if slot == "reference":
-            payload["reference_models"] = [{"provider": "gateway", "model": "auto"}]
+            payload["reference_models"] = [{"provider": provider, "model": "auto"}]
         else:
-            payload["aggregator"] = {"provider": "gateway", "model": "auto"}
+            payload["aggregator"] = {"provider": provider, "model": "auto"}
 
         resp = self.client.put("/api/model/moa", json=payload)
 
@@ -1078,12 +1136,13 @@ class TestWebServerEndpoints:
         assert resp.json()["detail"]["usage"] == usage
 
     def test_put_moa_validates_all_changed_slots_before_atomic_rejection(
-        self, monkeypatch
+        self, monkeypatch, _moa_contract_profile
     ):
         from hermes_cli import model_eligibility
         from hermes_cli.config import get_config_path
         from hermes_cli.model_eligibility import ModelEligibility
 
+        provider = _moa_contract_profile.name
         config_path = get_config_path()
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(
@@ -1092,9 +1151,9 @@ class TestWebServerEndpoints:
             "  presets:\n"
             "    council:\n"
             "      reference_models:\n"
-            "        - {provider: gateway, model: old-a}\n"
-            "        - {provider: gateway, model: old-b}\n"
-            "      aggregator: {provider: gateway, model: old-aggregator}\n"
+            f"        - {{provider: {provider}, model: old-a}}\n"
+            f"        - {{provider: {provider}, model: old-b}}\n"
+            f"      aggregator: {{provider: {provider}, model: old-aggregator}}\n"
             "  default_preset: council\n",
             encoding="utf-8",
         )
@@ -1126,11 +1185,11 @@ class TestWebServerEndpoints:
                 "presets": {
                     "council": {
                         "reference_models": [
-                            {"provider": "gateway", "model": "new-a"},
-                            {"provider": "gateway", "model": "new-b"},
+                            {"provider": provider, "model": "new-a"},
+                            {"provider": provider, "model": "new-b"},
                         ],
                         "aggregator": {
-                            "provider": "gateway",
+                            "provider": provider,
                             "model": "new-aggregator",
                         },
                     }
@@ -1143,26 +1202,27 @@ class TestWebServerEndpoints:
             (provider, model, usage, kwargs["exact_existing_assignment"])
             for provider, model, usage, kwargs in calls
         ] == [
-            ("gateway", "new-a", "moa-reference", False),
-            ("gateway", "new-b", "moa-reference", False),
-            ("gateway", "new-aggregator", "moa-aggregator", False),
+            (provider, "new-a", "moa-reference", False),
+            (provider, "new-b", "moa-reference", False),
+            (provider, "new-aggregator", "moa-aggregator", False),
         ]
         assert config_path.read_bytes() == before
 
     def test_put_moa_compares_reference_slots_by_preset_and_index(
-        self, monkeypatch
+        self, monkeypatch, _moa_contract_profile
     ):
         from hermes_cli import model_eligibility
         from hermes_cli.config import load_config, save_config
         from hermes_cli.model_eligibility import ModelEligibility
 
+        provider = _moa_contract_profile.name
         cfg = load_config()
         cfg["moa"] = {
             "default_preset": "first",
             "presets": {
                 "first": {
                     "reference_models": [
-                        {"provider": "gateway", "model": "same-model"}
+                        {"provider": provider, "model": "same-model"}
                     ],
                     "aggregator": {
                         "provider": "openrouter",
@@ -1171,8 +1231,8 @@ class TestWebServerEndpoints:
                 },
                 "second": {
                     "reference_models": [
-                        {"provider": "gateway", "model": "other-model"},
-                        {"provider": "gateway", "model": "same-model"},
+                        {"provider": provider, "model": "other-model"},
+                        {"provider": provider, "model": "same-model"},
                     ],
                     "aggregator": {
                         "provider": "openrouter",
@@ -1203,7 +1263,7 @@ class TestWebServerEndpoints:
                 "presets": {
                     "first": {
                         "reference_models": [
-                            {"provider": "gateway", "model": "same-model"}
+                            {"provider": provider, "model": "same-model"}
                         ],
                         "aggregator": {
                             "provider": "openrouter",
@@ -1212,8 +1272,8 @@ class TestWebServerEndpoints:
                     },
                     "second": {
                         "reference_models": [
-                            {"provider": "gateway", "model": "same-model"},
-                            {"provider": "gateway", "model": "other-model"},
+                            {"provider": provider, "model": "same-model"},
+                            {"provider": provider, "model": "other-model"},
                         ],
                         "aggregator": {
                             "provider": "openrouter",
@@ -1229,18 +1289,19 @@ class TestWebServerEndpoints:
             (provider, model, usage, kwargs["exact_existing_assignment"])
             for provider, model, usage, kwargs in calls
         ] == [
-            ("gateway", "same-model", "moa-reference", True),
-            ("gateway", "same-model", "moa-reference", False),
-            ("gateway", "other-model", "moa-reference", False),
+            (provider, "same-model", "moa-reference", True),
+            (provider, "same-model", "moa-reference", False),
+            (provider, "other-model", "moa-reference", False),
         ]
 
     def test_put_moa_preserves_unchanged_invalid_slots_with_non_secret_warnings(
-        self, monkeypatch
+        self, monkeypatch, _moa_contract_profile
     ):
         from hermes_cli import model_eligibility
         from hermes_cli.config import get_config_path, load_config
         from hermes_cli.model_eligibility import ModelEligibility
 
+        provider = _moa_contract_profile.name
         config_path = get_config_path()
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(
@@ -1251,8 +1312,8 @@ class TestWebServerEndpoints:
             "  presets:\n"
             "    council:\n"
             "      reference_models:\n"
-            "        - {provider: gateway, model: grandfathered-reference}\n"
-            "      aggregator: {provider: gateway, model: grandfathered-aggregator}\n"
+            f"        - {{provider: {provider}, model: grandfathered-reference}}\n"
+            f"      aggregator: {{provider: {provider}, model: grandfathered-aggregator}}\n"
             "      max_tokens: 4096\n",
             encoding="utf-8",
         )
@@ -1289,12 +1350,12 @@ class TestWebServerEndpoints:
                     "council": {
                         "reference_models": [
                             {
-                                "provider": "gateway",
+                                "provider": provider,
                                 "model": "grandfathered-reference",
                             }
                         ],
                         "aggregator": {
-                            "provider": "gateway",
+                            "provider": provider,
                             "model": "grandfathered-aggregator",
                         },
                         "max_tokens": 8192,
@@ -1326,12 +1387,13 @@ class TestWebServerEndpoints:
         assert load_config()["moa"]["presets"]["council"]["max_tokens"] == 8192
 
     def test_put_moa_legacy_flat_payload_uses_changed_slot_validation(
-        self, monkeypatch
+        self, monkeypatch, _moa_contract_profile
     ):
         from hermes_cli import model_eligibility
         from hermes_cli.config import get_config_path
         from hermes_cli.model_eligibility import ModelEligibility
 
+        provider = _moa_contract_profile.name
         config_path = get_config_path()
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(
@@ -1360,7 +1422,7 @@ class TestWebServerEndpoints:
             "/api/model/moa",
             json={
                 "reference_models": [
-                    {"provider": "gateway", "model": "legacy-flat-reference"}
+                    {"provider": provider, "model": "legacy-flat-reference"}
                 ],
                 "aggregator": {
                     "provider": "openrouter",
@@ -1372,13 +1434,148 @@ class TestWebServerEndpoints:
         assert resp.status_code == 409
         assert calls == [
             (
-                "gateway",
+                provider,
                 "legacy-flat-reference",
                 "moa-reference",
                 {"exact_existing_assignment": False},
             )
         ]
         assert config_path.read_bytes() == before
+
+    def test_put_moa_unregistered_gateway_name_is_legacy_compatible(
+        self, monkeypatch
+    ):
+        import providers
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path, load_config
+
+        monkeypatch.delitem(providers._REGISTRY, "gateway", raising=False)
+        monkeypatch.delitem(providers._ALIASES, "gateway", raising=False)
+        real_validate = model_eligibility.validate_provider_model_selection
+        calls = []
+
+        def validate(*args, **kwargs):
+            calls.append((args, kwargs))
+            return real_validate(*args, **kwargs)
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "moa:\n"
+            "  reference_models:\n"
+            "    - {provider: openrouter, model: existing-reference}\n"
+            "  aggregator: {provider: openrouter, model: existing-aggregator}\n",
+            encoding="utf-8",
+        )
+
+        resp = self.client.put(
+            "/api/model/moa",
+            json={
+                "reference_models": [
+                    {"provider": "gateway", "model": "legacy-auto"}
+                ],
+                "aggregator": {
+                    "provider": "openrouter",
+                    "model": "existing-aggregator",
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        assert calls == []
+        assert load_config()["moa"]["reference_models"] == [
+            {"provider": "gateway", "model": "legacy-auto"}
+        ]
+
+    @pytest.mark.parametrize(
+        ("slot", "provider_attr", "usage"),
+        [
+            ("reference", "name", "moa-reference"),
+            ("aggregator", "aliases", "moa-aggregator"),
+        ],
+    )
+    def test_put_moa_real_contract_provider_rejects_auto_atomically(
+        self,
+        monkeypatch,
+        _moa_contract_profile,
+        slot,
+        provider_attr,
+        usage,
+    ):
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_capabilities import ModelCapabilityCatalog
+
+        monkeypatch.setattr(
+            "hermes_cli.model_eligibility.fetch_model_capability_catalog",
+            lambda *_args, **_kwargs: ModelCapabilityCatalog(
+                status="ready",
+                models={},
+            ),
+        )
+        provider = (
+            _moa_contract_profile.name
+            if provider_attr == "name"
+            else _moa_contract_profile.aliases[0]
+        )
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "# real-validator integration bytes\n"
+            "moa:\n"
+            "  reference_models:\n"
+            "    - {provider: openrouter, model: existing-reference}\n"
+            "  aggregator: {provider: openrouter, model: existing-aggregator}\n",
+            encoding="utf-8",
+        )
+        before = config_path.read_bytes()
+        payload = {
+            "reference_models": [
+                {"provider": "openrouter", "model": "existing-reference"}
+            ],
+            "aggregator": {
+                "provider": "openrouter",
+                "model": "existing-aggregator",
+            },
+        }
+        if slot == "reference":
+            payload["reference_models"] = [{"provider": provider, "model": "auto"}]
+        else:
+            payload["aggregator"] = {"provider": provider, "model": "auto"}
+
+        resp = self.client.put("/api/model/moa", json=payload)
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["reason"] == "automatic-not-allowed"
+        assert resp.json()["detail"]["usage"] == usage
+        assert resp.json()["detail"]["provider"] == provider
+        assert config_path.read_bytes() == before
+
+    def test_put_moa_provider_without_contract_remains_legacy_compatible(
+        self, _moa_legacy_profile
+    ):
+        from hermes_cli.config import load_config
+
+        provider = _moa_legacy_profile.name
+        resp = self.client.put(
+            "/api/model/moa",
+            json={
+                "reference_models": [
+                    {"provider": provider, "model": "legacy-compatible"}
+                ],
+                "aggregator": {
+                    "provider": provider,
+                    "model": "legacy-aggregator",
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        assert load_config()["moa"]["reference_models"] == [
+            {"provider": provider, "model": "legacy-compatible"}
+        ]
 
     # ── GET /api/media (remote image display) ───────────────────────────
 
