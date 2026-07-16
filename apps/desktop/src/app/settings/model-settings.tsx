@@ -216,7 +216,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   // A's models/providers into profile B (or fire onMainModelChanged for A).
   const profileEpoch = useRef(0)
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (options?: { preserveDraft?: boolean }) => {
     const epoch = profileEpoch.current
     setLoading(true)
     setError('')
@@ -235,8 +235,12 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
       setMainModel({ model: modelInfo.model, provider: modelInfo.provider })
       setProviders(modelOptions.providers || [])
-      setSelectedProvider(modelInfo.provider)
-      setSelectedModel(modelInfo.model)
+
+      if (!options?.preserveDraft) {
+        setSelectedProvider(modelInfo.provider)
+        setSelectedModel(modelInfo.model)
+      }
+
       setAuxiliary(auxiliaryModels)
       setMoa(moaModels)
 
@@ -849,7 +853,12 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         {providerReadiness && (
           <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
             <span>{providerReadiness}</span>
-            <Button disabled={loading} onClick={() => void refresh()} size="sm" variant="textStrong">
+            <Button
+              disabled={loading}
+              onClick={() => void refresh({ preserveDraft: true })}
+              size="sm"
+              variant="textStrong"
+            >
               {m.refreshModels}
             </Button>
           </div>

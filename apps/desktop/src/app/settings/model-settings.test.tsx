@@ -434,6 +434,53 @@ describe('ModelSettings', () => {
     expect(screen.getByText('legacy-model')).toBeTruthy()
   })
 
+  it('preserves a draft Gateway provider and model when manually refreshing its readiness', async () => {
+    const legacyProvider = {
+      name: 'Legacy',
+      slug: 'legacy',
+      models: ['legacy-model'],
+      authenticated: true,
+      capabilities: { 'legacy-model': { reasoning: true, fast: false } }
+    }
+
+    getGlobalModelInfo.mockResolvedValue({ provider: 'legacy', model: 'legacy-model' })
+    getGlobalModelOptions
+      .mockResolvedValueOnce({
+        providers: [
+          legacyProvider,
+          gatewayProvider({
+            capabilities: {},
+            capability_status: 'gateway-unreachable',
+            models: []
+          })
+        ]
+      })
+      .mockResolvedValueOnce({
+        providers: [legacyProvider, gatewayProvider()]
+      })
+
+    await renderModelSettings()
+
+    let triggers = await screen.findAllByRole('combobox')
+    fireEvent.click(triggers[0])
+    fireEvent.click(screen.getByRole('option', { name: 'Gateway' }))
+
+    expect(await screen.findByText('Gateway is unavailable. Refresh the model catalog and try again.')).toBeTruthy()
+
+    triggers = screen.getAllByRole('combobox')
+    fireEvent.click(triggers[1])
+    fireEvent.click(screen.getByRole('option', { name: /auto.*Automatic routing/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh models' }))
+
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalledTimes(2))
+    triggers = screen.getAllByRole('combobox')
+    expect(triggers[0].textContent).toContain('Gateway')
+    expect(triggers[1].textContent).toContain('auto')
+
+    fireEvent.click(triggers[1])
+    expect(screen.getByRole('option', { name: 'gateway-good' })).toBeTruthy()
+  })
+
   it('shows a localized warning when an unchanged grandfathered assignment is accepted as a no-op', async () => {
     getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-no-tools' })
     getGlobalModelOptions.mockResolvedValueOnce({ providers: [gatewayProvider()] })
