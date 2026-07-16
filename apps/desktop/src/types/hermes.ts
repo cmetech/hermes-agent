@@ -300,6 +300,9 @@ export interface ModelOptionProvider {
 export interface ModelCapabilities {
   evidence?: Record<string, ModelCapabilityEvidence>
   fast: boolean
+  /** False when a saved model is retained for presentation but was absent
+   *  from the provider's live model inventory. */
+  live?: boolean
   reasoning: boolean
   selection_mode?: ModelSelectionMode
   verified?: Record<'completion' | 'reasoning' | 'tools' | 'vision', ModelCapabilityState>

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  getApiRequestProfile,
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -10,7 +11,9 @@ import {
   getSessionMessages,
   getStatus,
   listAllProfileSessions,
-  listSessions
+  listSessions,
+  saveMoaModels,
+  setApiRequestProfile
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
 
@@ -33,6 +36,7 @@ describe('Hermes REST session helpers', () => {
   })
 
   afterEach(() => {
+    setApiRequestProfile(null)
     vi.restoreAllMocks()
     Reflect.deleteProperty(window, 'hermesDesktop')
   })
@@ -153,5 +157,23 @@ describe('Hermes REST session helpers', () => {
         path: '/api/model/options?refresh=1&include_unconfigured=1'
       })
     )
+  })
+
+  it('captures and explicitly pins a MoA save to its originating API profile', async () => {
+    setApiRequestProfile('profile-a')
+    expect(getApiRequestProfile()).toBe('profile-a')
+
+    setApiRequestProfile('profile-b')
+    await saveMoaModels({} as never, 'profile-a')
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: {},
+        method: 'PUT',
+        path: '/api/model/moa',
+        profile: 'profile-a'
+      })
+    )
+    setApiRequestProfile(null)
   })
 })

@@ -99,7 +99,7 @@ export function evaluateModelEligibility(
     return ineligible('automatic-not-allowed', reasoningVerified, isCurrent)
   }
 
-  if (!provider.models?.includes(model)) {
+  if (modelCapabilities?.live === false || !provider.models?.includes(model)) {
     return ineligible('model-not-live', reasoningVerified, isCurrent)
   }
 
