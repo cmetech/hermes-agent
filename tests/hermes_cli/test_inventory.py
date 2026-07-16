@@ -1000,13 +1000,19 @@ def test_list_authenticated_providers_refresh_busts_cache():
 # ─── Verified provider capabilities ────────────────────────────────────
 
 
-def _install_inventory_gateway_profile(monkeypatch, slug="test-inventory-gateway"):
+def _install_inventory_gateway_profile(
+    monkeypatch,
+    slug="test-inventory-gateway",
+    *,
+    aliases=(),
+):
     import providers as provider_registry
     from hermes_cli.auth import PROVIDER_REGISTRY, ProviderConfig
     from providers.base import ProviderProfile
 
     profile = ProviderProfile(
         name=slug,
+        aliases=aliases,
         display_name="Test Inventory Gateway",
         env_vars=("OTTO_API_KEY", "OTTO_BASE_URL"),
         base_url="http://127.0.0.1:18080/v1",
@@ -1015,6 +1021,8 @@ def _install_inventory_gateway_profile(monkeypatch, slug="test-inventory-gateway
         model_capabilities_path="model-capabilities",
     )
     monkeypatch.setitem(provider_registry._REGISTRY, slug, profile)
+    for alias in aliases:
+        monkeypatch.setitem(provider_registry._ALIASES, alias, slug)
     monkeypatch.setitem(
         PROVIDER_REGISTRY,
         slug,
@@ -1263,6 +1271,86 @@ def test_contract_provider_failure_statuses_keep_live_and_saved_models_unknown(
                 "vision": "unknown",
                 "reasoning": "unknown",
             }
+
+
+def test_contract_provider_alias_keeps_saved_current_model_visible(monkeypatch):
+    from hermes_cli.model_capabilities import ModelCapabilityCatalog
+
+    slug = "test-inventory-gateway-canonical"
+    alias = f"{slug}-alias"
+    _install_inventory_gateway_profile(
+        monkeypatch,
+        slug,
+        aliases=(alias,),
+    )
+    row = {
+        "slug": slug,
+        "name": "Test Inventory Gateway",
+        "models": ["live-model"],
+        "total_models": 1,
+        "is_current": True,
+        "is_user_defined": False,
+        "source": "canonical",
+    }
+    with (
+        _list_auth_returning([row]),
+        patch(
+            "hermes_cli.model_capabilities.fetch_model_capability_catalog",
+            return_value=ModelCapabilityCatalog(
+                status="gateway-unreachable",
+                models={},
+            ),
+        ),
+    ):
+        payload = build_models_payload(
+            _empty_ctx(
+                provider=alias,
+                model="saved-out-of-catalog-model",
+            ),
+            capabilities=True,
+        )
+
+    gateway = next(
+        provider
+        for provider in payload["providers"]
+        if provider["slug"] == slug
+    )
+    assert gateway["models"] == [
+        "auto",
+        "live-model",
+        "saved-out-of-catalog-model",
+    ]
+    assert gateway["capabilities"]["saved-out-of-catalog-model"]["verified"] == {
+        "completion": "unknown",
+        "tools": "unknown",
+        "vision": "unknown",
+        "reasoning": "unknown",
+    }
+
+
+def test_explicit_only_does_not_globally_retain_noncurrent_lmstudio():
+    rows = [
+        {
+            "slug": "lmstudio",
+            "name": "LM Studio",
+            "models": ["local-model"],
+            "total_models": 1,
+            "is_current": False,
+            "is_user_defined": False,
+            "source": "canonical",
+        }
+    ]
+    ctx = _empty_ctx(provider="openrouter", model="openrouter/auto")
+    with (
+        _list_auth_returning(rows),
+        patch(
+            "hermes_cli.auth.is_provider_explicitly_configured",
+            return_value=False,
+        ),
+    ):
+        payload = build_models_payload(ctx, explicit_only=True)
+
+    assert all(row["slug"] != "lmstudio" for row in payload["providers"])
 
 
 def test_provider_without_capability_contract_keeps_legacy_capability_shape():

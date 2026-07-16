@@ -257,6 +257,15 @@ def build_models_payload(
         if current_slug and current_model and current_model != "auto":
             from providers import get_provider_profile
 
+            try:
+                current_profile = get_provider_profile(current_slug)
+            except Exception:
+                current_profile = None
+            if current_profile is not None:
+                current_slug = str(
+                    current_profile.name or current_slug
+                ).strip().lower()
+
             for row in rows:
                 slug = str(row.get("slug") or "").strip().lower()
                 if slug != current_slug:
