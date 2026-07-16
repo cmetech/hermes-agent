@@ -1010,7 +1010,11 @@ def run_check(check: Check, gw_url: str, retries: int) -> dict:
 
 
 def run_selected(suite: str, surface: str, gw_url: str = GW_URL,
-                 js_gw_url: str = JS_GW_URL, retries: int = DEFAULT_RETRIES):
+                 js_gw_url: str = JS_GW_URL, retries: int = DEFAULT_RETRIES,
+                 on_result=None):
+    """Run the selected checks. If on_result is given it is called with each
+    result the moment that check completes — this is what lets `main()` stream
+    the matrix live (one line per check) instead of batching at the end."""
     registry = build_registry()
     checks = select_checks(registry, suite, surface)
     results = []
@@ -1029,6 +1033,8 @@ def run_selected(suite: str, surface: str, gw_url: str = GW_URL,
                 r["parity"] = "GAP (reference passes, gateway fails)"
             else:
                 r["parity"] = "AHEAD (gateway passes, reference fails)"
+        if on_result:
+            on_result(r)
         results.append(r)
     # exit 0 iff every selected non-SKIP check passes
     exit_code = 0 if all(r["ok"] for r in results if r["kind"] != "skip") else 1
@@ -1040,7 +1046,7 @@ def run_all(gw_url: str = GW_URL, js_gw_url: str = JS_GW_URL):
     return run_selected("toolcall", "all", gw_url, js_gw_url)
 
 
-def print_report(results, gw_url, js_gw_url, suite, surface):
+def print_header(gw_url, js_gw_url, suite, surface):
     print("=" * 78)
     print("  gateway-toolcall-parity")
     print(f"  gateway:   {gw_url}")
@@ -1050,17 +1056,21 @@ def print_report(results, gw_url, js_gw_url, suite, surface):
     print("=" * 78)
     print()
     print(f"  {'CHECK':<34} {'SUITE':<11} {'SURFACE':<9} RESULT")
-    print(f"  {'-'*34} {'-'*11} {'-'*9} ------")
-    for r in results:
-        res = r["status"]
-        if r["status"] == "FAIL" and r["flaky"]:
-            res = f"FAIL*({r['attempts']})"
-        line = f"  {r['name']:<34} {r['suite']:<11} {r['surface']:<9} {res}"
-        if "parity" in r:
-            line += f"   [ref: {r['parity']}]"
-        print(line)
-    print()
+    print(f"  {'-'*34} {'-'*11} {'-'*9} ------", flush=True)
 
+
+def format_result_line(r) -> str:
+    res = r["status"]
+    if r["status"] == "FAIL" and r["flaky"]:
+        res = f"FAIL*({r['attempts']})"
+    line = f"  {r['name']:<34} {r['suite']:<11} {r['surface']:<9} {res}"
+    if "parity" in r:
+        line += f"   [ref: {r['parity']}]"
+    return line
+
+
+def print_footer(results):
+    print()
     for r in results:
         if r["ok"] and r["status"] != "SKIP":
             continue
@@ -1123,9 +1133,23 @@ def main(argv=None) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    results, code = run_selected(args.suite, args.surface, GW_URL, JS_GW_URL, args.retries)
-    print_report(results, GW_URL, JS_GW_URL, args.suite, args.surface)
+    # Stream one line per check as it completes (so a live terminal / the
+    # co-worker agent can show progress), then print the failure details + summary.
+    print_header(GW_URL, JS_GW_URL, args.suite, args.surface)
+    results, code = run_selected(
+        args.suite, args.surface, GW_URL, JS_GW_URL, args.retries,
+        on_result=lambda r: print(format_result_line(r), flush=True),
+    )
+    print_footer(results)
     return code
+
+
+def print_report(results, gw_url, js_gw_url, suite, surface):
+    """Non-streaming full report (back-compat for external callers)."""
+    print_header(gw_url, js_gw_url, suite, surface)
+    for r in results:
+        print(format_result_line(r))
+    print_footer(results)
 
 
 if __name__ == "__main__":

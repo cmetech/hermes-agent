@@ -71,6 +71,9 @@ your job is to run it and relay that, never to end the turn silently.
   matrix, then `python run_parity.py --suite toolcall` (model-dependent) and post its
   matrix, then a one-line combined summary (e.g. "N/M passed, exit 0; 1 FAIL:
   toolcall:openai → track-3a").
+- **For live progress**, the harness prints one line per check the moment it completes
+  (flushed). If your terminal tool can read a still-running command, poll it and relay
+  each line as it appears; otherwise the staged runs above already give visible progress.
 - **Always relay the result.** Post the PASS/FAIL matrix and exit code back to the user.
   If the tool output is long, summarize the matrix but quote any FAIL detail verbatim
   (diagnosis code + first ACP frame). Do **not** finish with an empty message after the
