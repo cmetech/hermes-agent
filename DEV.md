@@ -17,8 +17,13 @@ existing `~/.hermes` install.
 ## Prereqs
 
 - Node `^20.19 || >=22.12` + npm, `uv`, Python 3.11
-- The **OTTO gateway running** (else the default model returns 503):
-  `cd ../otto-gateway && make run` with `kiro-cli` on `PATH`.
+- The **OTTO gateway running** (else the default model returns 503). It lives
+  in a separate `otto-gateway` repository, not inside this checkout. Run
+  `make run` from that repository with `kiro-cli` on `PATH`. In the current
+  cmetech workspace layout, an example from this repo is
+  `cd ../../otto_app/otto-gateway && make run`. If that checkout is absent,
+  request its approved location or repository access from the deployment
+  operator.
 
 ## One-time setup
 

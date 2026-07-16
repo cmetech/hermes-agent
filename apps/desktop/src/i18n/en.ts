@@ -540,8 +540,7 @@ export const en: Translations = {
       localDesc: 'Start a private Hermes backend on localhost. This is the default and works offline.',
       remoteTitle: 'Remote gateway',
       remoteDesc: 'Connect this desktop shell to a remote Hermes backend.',
-      remoteAuthHint:
-        'Hosted gateways use OAuth or a username and password; self-hosted ones may use a session token.',
+      remoteAuthHint: 'Hosted gateways use OAuth or a username and password; self-hosted ones may use a session token.',
       cloudTitle: 'Hermes Cloud',
       cloudDesc: 'Sign in once to Hermes Cloud and pick from the agents on your account — no URL to paste.',
       cloudSignInTitle: 'Hermes Cloud',
@@ -710,6 +709,35 @@ export const en: Translations = {
       fallbackAdd: 'Add fallback',
       fallbackEmpty: 'No fallback models — the default model is used unless it fails.',
       notInCatalog: "isn't in this provider's model list — calls may fall back to a backup.",
+      automaticRouting: 'Automatic routing',
+      currentNeedsReview: 'Needs review',
+      grandfatheredWarning:
+        'This saved model is grandfathered and was left unchanged. Choose a verified model when you are ready.',
+      refreshModels: 'Refresh models',
+      eligibilityReasons: {
+        'authentication-required': 'Gateway authentication is required',
+        'capability-response-invalid': 'Capability response is incompatible',
+        'catalog-empty': 'No concrete models are available',
+        'gateway-unreachable': 'Gateway is unavailable',
+        'gateway-upgrade-required': 'Gateway must be updated',
+        unknown: 'Model status is unknown',
+        'automatic-not-allowed': 'Automatic routing cannot be pinned here',
+        'model-not-live': 'No longer in the live model catalog',
+        'completion-unknown': 'Completion support is not verified',
+        'completion-unsupported': 'Does not support completions',
+        'tools-unknown': 'Tool support is not verified',
+        'tools-unsupported': 'Does not support tools',
+        'vision-unknown': 'Vision support is not verified',
+        'vision-unsupported': 'Does not support vision'
+      },
+      providerReadiness: {
+        'authentication-required': 'Configure OTTO_API_KEY in Keys to use Gateway models.',
+        'capability-response-invalid': 'Gateway returned an incompatible capability response.',
+        'catalog-empty': 'Gateway returned no concrete models. Refresh the model catalog and try again.',
+        'gateway-unreachable': 'Gateway is unavailable. Refresh the model catalog and try again.',
+        'gateway-upgrade-required': 'Update Gateway to load verified model capabilities.',
+        unknown: 'Gateway model status is unknown. Refresh the model catalog and try again.'
+      },
       tasks: {
         vision: { label: 'Vision', hint: 'Image analysis' },
         web_extract: { label: 'Web extract', hint: 'Page summarization' },

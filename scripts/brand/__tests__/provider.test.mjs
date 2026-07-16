@@ -10,18 +10,22 @@ import { providerEmitter, renderProvider } from '../emitters/provider.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
-test('renderProvider(otto) reproduces the current provider files byte-for-byte', () => {
+test('renderProvider(otto) declares provider-owned no-auth gateway capabilities', () => {
   const d = loadDescriptor('otto', { root: ROOT })
   const rendered = renderProvider(d)
-  const initOnDisk = fs.readFileSync(path.join(ROOT, 'plugins/model-providers/otto/__init__.py'), 'utf8')
-  const yamlOnDisk = fs.readFileSync(path.join(ROOT, 'plugins/model-providers/otto/plugin.yaml'), 'utf8')
-  assert.equal(rendered['__init__.py'], initOnDisk)
-  assert.equal(rendered['plugin.yaml'], yamlOnDisk)
+  const source = rendered['__init__.py']
+  assert.match(source, /supports_unauthenticated=True,/)
+  assert.match(source, /model_capabilities_path="model-capabilities",/)
+  assert.doesNotMatch(source, /auth\.py substitutes/)
+  assert.doesNotMatch(source, /hardcoded tuple/)
 })
 
-test('providerEmitter.check(otto) passes against the current tree', () => {
+test('providerEmitter.write(otto) creates files that pass check', () => {
   const d = loadDescriptor('otto', { root: ROOT })
-  assert.equal(providerEmitter.check(d, { root: ROOT }).ok, true)
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-check-'))
+  providerEmitter.write(d, { root: tmpRoot })
+  assert.equal(providerEmitter.check(d, { root: tmpRoot }).ok, true)
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
 })
 
 test('renderProvider(loop24) swaps identity but keeps the OTTO gateway', () => {
@@ -70,23 +74,15 @@ test('neutralize with dryRun:true reports changed but does not delete the direct
   fs.rmSync(tmpRoot, { recursive: true, force: true })
 })
 
-test('ROUND-TRIP: neutralize then write(otto) reproduces the current on-disk provider files byte-for-byte', () => {
+test('ROUND-TRIP: write then neutralize restores the neutral provider-absent state', () => {
   const d = loadDescriptor('otto', { root: ROOT })
-  const initOnDisk = fs.readFileSync(path.join(ROOT, 'plugins/model-providers/otto/__init__.py'), 'utf8')
-  const yamlOnDisk = fs.readFileSync(path.join(ROOT, 'plugins/model-providers/otto/plugin.yaml'), 'utf8')
-
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-roundtrip-'))
   const dir = path.join(tmpRoot, 'plugins/model-providers/otto')
-  fs.mkdirSync(dir, { recursive: true })
-  fs.writeFileSync(path.join(dir, '__init__.py'), initOnDisk)
-  fs.writeFileSync(path.join(dir, 'plugin.yaml'), yamlOnDisk)
-
-  providerEmitter.neutralize(d, { root: tmpRoot })
-  assert.equal(fs.existsSync(dir), false, 'precondition: neutralize removed the dir')
 
   providerEmitter.write(d, { root: tmpRoot })
-  assert.equal(fs.readFileSync(path.join(dir, '__init__.py'), 'utf8'), initOnDisk)
-  assert.equal(fs.readFileSync(path.join(dir, 'plugin.yaml'), 'utf8'), yamlOnDisk)
+  assert.equal(providerEmitter.check(d, { root: tmpRoot }).ok, true)
+  providerEmitter.neutralize(d, { root: tmpRoot })
+  assert.equal(fs.existsSync(dir), false)
 
   fs.rmSync(tmpRoot, { recursive: true, force: true })
 })

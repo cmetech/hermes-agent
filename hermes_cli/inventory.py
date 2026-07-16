@@ -147,7 +147,9 @@ def build_models_payload(
     - ``capabilities``: add a per-row ``capabilities`` map
       ``{model: {fast, reasoning}}`` so pickers can gate the model-options
       controls (fast toggle / reasoning) to what each model actually
-      supports, instead of offering knobs the backend would reject.
+      supports, instead of offering knobs the backend would reject. Providers
+      declaring ``model_capabilities_path`` also receive verified per-model
+      states and a non-secret provider catalog status.
     - ``force_fresh_nous_tier``: bypass the short Nous free-tier cache when
       selecting Portal-recommended Nous models and applying tier gating. Keep
       this false for UI picker opens; explicit auth/model flows can opt in
@@ -250,7 +252,37 @@ def build_models_payload(
     if pricing:
         _apply_pricing(rows, force_fresh_nous_tier=force_fresh_nous_tier)
     if capabilities:
+        current_slug = str(ctx.current_provider or "").strip().lower()
+        current_model = str(ctx.current_model or "").strip()
+        if current_slug and current_model and current_model != "auto":
+            from providers import get_provider_profile
+
+            try:
+                current_profile = get_provider_profile(current_slug)
+            except Exception:
+                current_profile = None
+            if current_profile is not None:
+                current_slug = str(
+                    current_profile.name or current_slug
+                ).strip().lower()
+
+            for row in rows:
+                slug = str(row.get("slug") or "").strip().lower()
+                if slug != current_slug:
+                    continue
+                try:
+                    profile = get_provider_profile(slug)
+                except Exception:
+                    profile = None
+                if profile is not None and profile.model_capabilities_path:
+                    models = list(row.get("models") or [])
+                    if current_model not in models:
+                        models.append(current_model)
+                        row["models"] = models
+                        row["total_models"] = len(models)
+                break
         _apply_capabilities(rows)
+        _apply_verified_provider_capabilities(rows, refresh=refresh)
 
     return {
         "providers": rows,
@@ -295,6 +327,77 @@ def _apply_capabilities(rows: list[dict]) -> None:
             }
 
         row["capabilities"] = caps
+
+
+def _apply_verified_provider_capabilities(
+    rows: list[dict],
+    *,
+    refresh: bool,
+) -> None:
+    """Extend opted-in provider rows with Gateway-verified model metadata."""
+    from hermes_cli.auth import resolve_api_key_provider_credentials
+    from hermes_cli.model_capabilities import (
+        fetch_model_capability_catalog,
+        join_live_model_capabilities,
+    )
+    from hermes_cli.models import model_supports_fast_mode
+    from providers import get_provider_profile
+
+    for row in rows:
+        slug = str(row.get("slug") or "").strip()
+        if not slug:
+            continue
+        try:
+            profile = get_provider_profile(slug)
+        except Exception:
+            profile = None
+        if profile is None or not profile.model_capabilities_path:
+            continue
+
+        api_key = ""
+        base_url = profile.base_url
+        if profile.auth_type == "api_key":
+            try:
+                credentials = resolve_api_key_provider_credentials(slug)
+                api_key = str(credentials.get("api_key") or "")
+                base_url = str(credentials.get("base_url") or base_url)
+            except Exception:
+                pass
+
+        catalog = fetch_model_capability_catalog(
+            slug,
+            api_key=api_key,
+            base_url=base_url,
+            force_refresh=refresh,
+        )
+        models, verified_models, mismatch_count = join_live_model_capabilities(
+            row.get("models") or [],
+            catalog,
+        )
+        row["models"] = models
+        row["total_models"] = len(models)
+        row["capability_status"] = catalog.status
+        row["capability_mismatch_count"] = mismatch_count
+
+        capabilities = row.setdefault("capabilities", {})
+        for model_id in models:
+            verified = verified_models[model_id]
+            existing = capabilities.get(model_id)
+            if not isinstance(existing, dict):
+                existing = {
+                    "fast": bool(model_supports_fast_mode(model_id)),
+                    "reasoning": True,
+                }
+                capabilities[model_id] = existing
+            existing["reasoning"] = (
+                verified.capabilities.get("reasoning") == "supported"
+            )
+            existing["verified"] = dict(verified.capabilities)
+            existing["selection_mode"] = verified.selection_mode
+            existing["evidence"] = {
+                capability: dict(fields)
+                for capability, fields in verified.evidence.items()
+            }
 
 
 # ─── Internal: row post-processing ──────────────────────────────────────
@@ -378,6 +481,7 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
     pickers want the narrower subset the user explicitly configured for Hermes.
     """
     from hermes_cli.auth import is_provider_explicitly_configured
+    from providers import get_provider_profile
 
     current_slug = str(ctx.current_provider or "").strip().lower()
     kept: list[dict] = []
@@ -400,6 +504,18 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
             if _raw_config_has_enabled_moa_preset():
                 kept.append(row)
             continue
+        if slug != "lmstudio":
+            try:
+                profile = get_provider_profile(slug)
+            except Exception:
+                profile = None
+            if (
+                profile is not None
+                and profile.supports_unauthenticated
+                and profile.model_capabilities_path
+            ):
+                kept.append(row)
+                continue
         if is_provider_explicitly_configured(slug):
             kept.append(row)
     return kept

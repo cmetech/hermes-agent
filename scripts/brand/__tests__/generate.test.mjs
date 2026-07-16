@@ -11,15 +11,12 @@ import { loadDescriptor } from '../descriptor.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
-// The exact set of on-disk files/dirs the 9 default emitters target, per the
+// The exact set of neutral-base on-disk files the 8 default emitters target, per the
 // OTTO customization surface table. Used to build an isolated temp copy of
 // just the relevant tree for full-suite neutralize/write round-trip tests
 // without ever touching the real repo. The last 6 are the home emitter's
 // resolver files (main.ts is shared with main-identity, already listed).
 const EMITTER_FILES = [
-  'plugins/model-providers/otto/__init__.py',
-  'plugins/model-providers/otto/plugin.yaml',
-  'hermes_cli/auth.py',
   'pyproject.toml',
   'hermes_cli/skin_engine.py',
   'apps/desktop/package.json',
@@ -46,6 +43,12 @@ function copyEmitterTree(srcRoot, dstRoot) {
 const fakeDescriptor = { slug: 'x' }
 const passing = { id: 'a', check: () => ({ ok: true }), write: () => ({ changed: false }) }
 const failing = { id: 'b', check: () => ({ ok: false, detail: 'nope' }), write: () => ({ changed: true }) }
+
+test('DEFAULT_EMITTERS has eight provider-owned branding emitters', () => {
+  assert.equal(DEFAULT_EMITTERS.length, 8)
+  assert.equal(DEFAULT_EMITTERS.some(e => e.id === 'auth-noauth'), false)
+  assert.equal(EMITTER_FILES.includes('hermes_cli/auth.py'), false)
+})
 
 test('check mode aggregates emitter results', () => {
   const r = runEmitters(fakeDescriptor, { root: '/x', mode: 'check', emitters: [passing, failing] })
@@ -158,27 +161,22 @@ test('runEmitters mode:neutralize with write:true passes dryRun:false through to
   assert.equal(neutralizeCalledWith.dryRun, false)
 })
 
-test('DRY-RUN-CLEAN: --neutralize (no --write) against the REAL tree leaves it byte-for-byte unmodified', () => {
+test('DRY-RUN-CLEAN: --neutralize (no --write) against the REAL neutral tree leaves it byte-for-byte unmodified', () => {
   const slug = resolveActiveBrand({ root: ROOT })
   const descriptor = loadDescriptor(slug, { root: ROOT })
   const before = Object.fromEntries(EMITTER_FILES.map(rel => [rel, fs.readFileSync(path.join(ROOT, rel), 'utf8')]))
 
   const { results } = runEmitters(descriptor, { root: ROOT, mode: 'neutralize', emitters: DEFAULT_EMITTERS, write: false })
 
-  // Every emitter that has something to neutralize on the real (branded)
-  // tree should report changed:true (it's a plan, not a no-op) — but must
-  // not have touched the filesystem.
-  assert.ok(results.some(r => r.changed), 'expected the dry-run plan to report at least one intended change')
+  assert.equal(results.length, 8)
 
   for (const rel of EMITTER_FILES) {
     const after = fs.readFileSync(path.join(ROOT, rel), 'utf8')
     assert.equal(after, before[rel], `${rel} must be byte-identical after a --neutralize dry run`)
   }
-  // The provider dir itself must still exist (dry run never deletes).
-  assert.ok(fs.existsSync(path.join(ROOT, 'plugins/model-providers/otto')), 'provider dir must survive a dry run')
 })
 
-test('CLI --neutralize --write in an isolated temp copy of the tree applies all 9 emitters, and a subsequent write(otto) round-trips every file back byte-for-byte', () => {
+test('write(otto) then neutralize --write applies all 8 emitters and round-trips neutral base byte-for-byte', () => {
   const before = Object.fromEntries(EMITTER_FILES.map(rel => [rel, fs.readFileSync(path.join(ROOT, rel), 'utf8')]))
 
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'neutralize-write-all-'))
@@ -186,18 +184,16 @@ test('CLI --neutralize --write in an isolated temp copy of the tree applies all 
 
   const descriptor = loadDescriptor('otto', { root: ROOT })
 
-  const neutralizeResult = runEmitters(descriptor, { root: tmpRoot, mode: 'neutralize', emitters: DEFAULT_EMITTERS, write: true })
-  assert.ok(neutralizeResult.results.some(r => r.changed), 'expected --neutralize --write to actually change something')
-  // provider dir removed
-  assert.equal(fs.existsSync(path.join(tmpRoot, 'plugins/model-providers/otto')), false)
-
-  // Regenerate with the otto descriptor and confirm every emitter-covered
-  // file is restored byte-for-byte to the original branded content.
   runEmitters(descriptor, { root: tmpRoot, mode: 'write', emitters: DEFAULT_EMITTERS })
+  assert.equal(fs.existsSync(path.join(tmpRoot, 'plugins/model-providers/otto')), true)
+  const neutralizeResult = runEmitters(descriptor, { root: tmpRoot, mode: 'neutralize', emitters: DEFAULT_EMITTERS, write: true })
+  assert.equal(neutralizeResult.results.length, 8)
+  assert.ok(neutralizeResult.results.some(r => r.changed), 'expected --neutralize --write to actually change something')
+  assert.equal(fs.existsSync(path.join(tmpRoot, 'plugins/model-providers/otto')), false)
 
   for (const rel of EMITTER_FILES) {
     const after = fs.readFileSync(path.join(tmpRoot, rel), 'utf8')
-    assert.equal(after, before[rel], `${rel} must round-trip byte-for-byte through neutralize -> write(otto)`)
+    assert.equal(after, before[rel], `${rel} must round-trip byte-for-byte through write(otto) -> neutralize`)
   }
 
   fs.rmSync(tmpRoot, { recursive: true, force: true })

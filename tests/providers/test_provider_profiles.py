@@ -547,6 +547,14 @@ class TestQwenProfile:
 
 
 class TestBaseProfile:
+    def test_unauthenticated_support_defaults_disabled(self):
+        p = ProviderProfile(name="example")
+        assert p.supports_unauthenticated is False
+
+    def test_model_capabilities_path_defaults_disabled(self):
+        p = ProviderProfile(name="example")
+        assert p.model_capabilities_path == ""
+
     def test_prepare_messages_passthrough(self):
         p = ProviderProfile(name="test")
         msgs = [{"role": "user", "content": "hi"}]

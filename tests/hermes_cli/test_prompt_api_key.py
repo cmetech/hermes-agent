@@ -129,16 +129,16 @@ def test_ctrl_c_at_choice_prompt_keeps(profile_env):
 # LM Studio no-auth placeholder ────────────────────────────────────────────────
 
 def test_lmstudio_first_time_empty_uses_placeholder(profile_env):
-    from hermes_cli.auth import LMSTUDIO_NOAUTH_PLACEHOLDER
+    from hermes_cli.auth import NOAUTH_API_KEY_PLACEHOLDER
     from hermes_cli.config import get_env_value
 
     key, abort = _run_prompt(
         existing_key="", choice="", new_key="",
         provider_id="lmstudio", pconfig_name="lmstudio",
     )
-    assert key == LMSTUDIO_NOAUTH_PLACEHOLDER
+    assert key == NOAUTH_API_KEY_PLACEHOLDER
     assert abort is False
-    assert get_env_value("LM_API_KEY") == LMSTUDIO_NOAUTH_PLACEHOLDER
+    assert get_env_value("LM_API_KEY") == NOAUTH_API_KEY_PLACEHOLDER
 
 
 def test_lmstudio_replace_empty_does_not_overwrite_with_placeholder(profile_env):

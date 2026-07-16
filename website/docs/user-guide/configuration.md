@@ -83,6 +83,35 @@ Multiple references in a single value work: `url: "${HOST}:${PORT}"`. If a refer
 
 For AI provider setup (OpenRouter, Anthropic, Copilot, custom endpoints, self-hosted LLMs, fallback models, etc.), see [AI Providers](/integrations/providers).
 
+### Gateway credentials
+
+Branded desktop builds include a local OpenAI-compatible Gateway provider. The
+shared environment-variable names are:
+
+| Variable | Purpose |
+|---|---|
+| `OTTO_BASE_URL` | Optional inference base-URL override. The exact default is `http://127.0.0.1:18080/v1`. |
+| `OTTO_API_KEY` | Bearer token for a Gateway that was launched with authentication enabled. |
+
+`OTTO_API_KEY` is optional only when the Gateway itself is running without
+authentication. The provider declares that unauthenticated operation is
+possible so Hermes can discover a local no-auth Gateway, but that declaration
+is not a readiness check. If the live Gateway returns `401` or `403`, configure
+the matching key and refresh the Models page.
+
+Store the key on the desktop **Keys** page or in the active profile's `.env`
+file:
+
+```dotenv
+OTTO_API_KEY=replace-with-the-gateway-token
+```
+
+Never paste a Gateway key into a chat message, prompt, skill, or project
+instruction file. For model selection, capability states, and older-Gateway
+upgrade behavior, see [Configuring Models](./configuring-models.md#gateway-models-automatic-routing-and-explicit-models).
+For endpoint checks and safe run, restart, or upgrade guidance, see
+[Verify, start, restart, or upgrade the inference Gateway](/developer-guide/gateway-internals#verify-start-restart-or-upgrade-the-inference-gateway).
+
 ### Provider Timeouts
 
 You can set `providers.<id>.request_timeout_seconds` for a provider-wide request timeout, plus `providers.<id>.models.<model>.timeout_seconds` for a model-specific override. Applies to the primary turn client on every transport (OpenAI-wire, native Anthropic, Anthropic-compatible), the fallback chain, rebuilds after credential rotation, and (for OpenAI-wire) the per-request timeout kwarg — so the configured value wins over the legacy `HERMES_API_TIMEOUT` env var.
