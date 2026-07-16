@@ -990,6 +990,32 @@ def _basic_ollama(gw_url):
 _BASIC = {"anthropic": _basic_anthropic, "openai": _basic_openai, "ollama": _basic_ollama}
 
 
+_IDENTITY_BLEED = ("kiro cli", "requires the hermes agent")
+
+
+def _has_persona_bleed(text: str) -> bool:
+    """True iff the reply leaks kiro's built-in identity or a hallucinated
+    capability boundary (fail-OPEN: only these specific signals trip it)."""
+    low = (text or "").lower()
+    if any(s in low for s in _IDENTITY_BLEED):
+        return True
+    return "belongs to" in low and "agent environment" in low
+
+
+def check_identity_openai(gw_url):
+    body = {"model": "auto",
+            "messages": [{"role": "user", "content": "Who are you? Answer in one sentence."}]}
+    status, resp, raw = post(gw_url + "/v1/chat/completions", body)
+    if status != 200:
+        return False, f"HTTP {status}: {raw[:160]}"
+    txt = openai_final(resp)
+    if not txt:
+        return False, f"200 but empty message.content: {raw[:160]}"
+    if _has_persona_bleed(txt):
+        return False, f"persona bleed / capability-boundary refusal: {txt[:160]!r}"
+    return True, f"identity clean: {txt[:80]!r}"
+
+
 def _stream_anthropic(gw_url):
     body = {"model": "auto", "max_tokens": 128, "stream": True, "messages": [_HELLO_MSG]}
     status, raw = post_raw(gw_url + "/v1/messages", body, {"anthropic-version": ANTHROPIC_VERSION})
@@ -1153,6 +1179,8 @@ def build_registry():
         reg.append(Check(f"stream-order:{k}", "conformance", k, _STREAM[k], js=(k == "anthropic")))
     # model normalize/auto (model-dependent, Anthropic)
     reg.append(Check("model-normalize:anthropic", "conformance", "anthropic", check_model_normalize_anthropic, flaky=True, js=True))
+    # persona / identity bleed (model-dependent, OpenAI surface = desktop path)
+    reg.append(Check("identity:openai", "conformance", "openai", check_identity_openai, flaky=True))
     # validation errors (deterministic, per-surface envelopes)
     reg.append(Check("validation-max-tokens:anthropic", "conformance", "anthropic", _validation_anthropic_max_tokens, js=True))
     for k in SURFACE_KEYS:

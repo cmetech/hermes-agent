@@ -240,14 +240,16 @@ def _make_handler(mode: str):
             return {"error": "not found"}
 
         def _basic(self, path):
+            text = ("I am the Kiro CLI; running Hermes skills requires the Hermes agent."
+                    if mode == "identity_bleed" else HELLO_REPLY)
             if path == "/v1/messages":
                 return {"id": "msg_b", "type": "message", "role": "assistant", "model": "auto",
-                        "stop_reason": "end_turn", "content": [{"type": "text", "text": HELLO_REPLY}]}
+                        "stop_reason": "end_turn", "content": [{"type": "text", "text": text}]}
             if path == "/v1/chat/completions":
                 return {"id": "cb", "choices": [{"index": 0, "finish_reason": "stop",
-                        "message": {"role": "assistant", "content": HELLO_REPLY}}]}
+                        "message": {"role": "assistant", "content": text}}]}
             if path == "/api/chat":
-                return {"model": "auto", "done": True, "message": {"role": "assistant", "content": HELLO_REPLY}}
+                return {"model": "auto", "done": True, "message": {"role": "assistant", "content": text}}
             return {"error": "not found"}
 
         # --- prose-mode (Track 3a failure) ------------------------------------
@@ -296,6 +298,7 @@ def main() -> int:
     prose_srv, prose_url = _serve("prose")
     cipher_srv, cipher_url = _serve("cipher")
     leak_srv, leak_url = _serve("leak")
+    identity_srv, identity_url = _serve("identity_bleed")
     failures = 0
     try:
         # 1) good gateway, all suites → every non-skip check passes, exit 0.
@@ -428,10 +431,30 @@ def main() -> int:
                        f"leak/{name} → surfacing-gap (got: {r['detail'][:70]})")
         except AssertionError as e:
             print(f"  FAIL: {e}"); failures += 1
+
+        # 9) identity — good gateway PASSES; a "Kiro CLI / requires the Hermes
+        #    agent" reply FAILS identity:openai.
+        results, _ = rp.run_selected("conformance", "openai", good_url, "", retries=1)
+        try:
+            r = next(x for x in results if x["name"] == "identity:openai")
+            _check(r["ok"], f"good/identity:openai PASS (got: {r['detail'][:60]})")
+        except (AssertionError, StopIteration) as e:
+            print(f"  FAIL: {e}"); failures += 1
+
+        results, code = rp.run_selected("conformance", "openai", identity_url, "", retries=1)
+        try:
+            r = next(x for x in results if x["name"] == "identity:openai")
+            _check(not r["ok"], "bleed/identity:openai FAIL")
+            _check("persona bleed" in r["detail"],
+                   f"bleed/identity:openai → persona bleed (got: {r['detail'][:70]})")
+        except (AssertionError, StopIteration) as e:
+            print(f"  FAIL: {e}"); failures += 1
     finally:
         good_srv.shutdown()
         prose_srv.shutdown()
         cipher_srv.shutdown()
+        leak_srv.shutdown()
+        identity_srv.shutdown()
         leak_srv.shutdown()
 
     print()
