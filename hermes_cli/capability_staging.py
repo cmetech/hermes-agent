@@ -62,6 +62,38 @@ def _resolve_placeholders(obj, replacement: str):
     return obj
 
 
+def _merge_mcp_server_defaults(
+    existing: dict,
+    entries: dict,
+    capability_dir: str,
+) -> bool:
+    """Merge missing servers and fill only missing/blank managed URLs."""
+    changed = False
+    for name, entry in entries.items():
+        resolved = _resolve_placeholders(entry, capability_dir)
+        if name not in existing:
+            existing[name] = resolved
+            changed = True
+            continue
+
+        current = existing.get(name)
+        if not isinstance(current, dict) or not isinstance(resolved, dict):
+            continue
+        current_url = current.get("url")
+        default_url = resolved.get("url")
+        current_url_is_blank = current_url is None or (
+            isinstance(current_url, str) and not current_url.strip()
+        )
+        if (
+            current_url_is_blank
+            and isinstance(default_url, str)
+            and default_url.strip()
+        ):
+            current["url"] = default_url
+            changed = True
+    return changed
+
+
 def resolve_capability_bundle(set_name: str, source_url: str | None,
                               home: Path | str, root: Path | None = None) -> Path | None:
     """Resolve a named capability set to a local checkout directory.
@@ -187,12 +219,7 @@ def stage_bundle(bundle: Path, set_name: str, home: Path | str) -> bool:
             entries = fragment.get("mcp_servers") or {}
             text_sub = str(home / "plugins")
             existing = cfg.setdefault("mcp_servers", {})
-            for name, entry in entries.items():
-                if name in existing:
-                    continue  # NEVER clobber a user-configured server
-                resolved = _resolve_placeholders(entry, text_sub)
-                existing[name] = resolved
-                changed = True
+            changed |= _merge_mcp_server_defaults(existing, entries, text_sub)
 
         dbd = manifest.get("disabledByDefault") or {}
         skills_off = dbd.get("skills") or []
@@ -327,12 +354,7 @@ def seed_baked_capabilities(home: Path | str, root: Path | None = None) -> None:
                     try:
                         cfg = config_mod.load_config() or {}
                         existing = cfg.setdefault("mcp_servers", {})
-                        changed = False
-                        for name, entry in entries.items():
-                            if name in existing:
-                                continue
-                            existing[name] = _resolve_placeholders(entry, text_sub)
-                            changed = True
+                        changed = _merge_mcp_server_defaults(existing, entries, text_sub)
                         if changed:
                             config_mod.save_config(cfg)
                     finally:

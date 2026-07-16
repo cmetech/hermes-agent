@@ -7,12 +7,12 @@ def test_capability_keys_registered_from_vendored_manifest():
     for key in (
         "JIRA_BASE_URL",
         "JIRA_PAT",
-        "GLEAN_MCP_URL",
         "GLEAN_API_TOKEN",
         "ERICSSON_GRAPH_CLIENT_ID",
     ):
         assert key in ov, f"{key} should be registered from the vendored capability manifest"
         assert ov[key]["category"] == "tool"
+    assert "GLEAN_MCP_URL" not in ov
     assert ov["JIRA_PAT"]["password"] is True
     assert ov["GLEAN_API_TOKEN"]["password"] is True
     assert ov["ERICSSON_GRAPH_CLIENT_ID"].get("password") is not True

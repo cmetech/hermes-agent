@@ -17,7 +17,6 @@ implementation:
   tools: []
 platforms: [macos, linux, windows]
 configuration:
-  - {name: GLEAN_MCP_URL, kind: static-setting, required: true, guidance: Configure the organization-provided endpoint in protected Tools & Keys.}
   - {name: GLEAN_API_TOKEN, kind: static-secret, required: true, guidance: Enter the token only in protected Tools & Keys and never in chat.}
 reads: [runtime-discovered Glean search results and documents permitted to the user]
 writes: []
@@ -30,8 +29,10 @@ troubleshooting: [endpoint connection failure, authentication rejected, permissi
 
 ## What it solves
 
-Connects to the configured remote Glean MCP endpoint for read-only internal knowledge
-discovery using whatever search tools the server actually exposes at runtime.
+Connects to the preconfigured remote Glean MCP endpoint for read-only internal
+knowledge discovery using whatever search tools the server actually exposes at runtime.
+The MCP server ships disabled until the user adds the protected token and intentionally
+enables it.
 
 ## Try saying
 
@@ -54,8 +55,9 @@ Glean write path; optional summaries require a user-selected safe destination.
 
 ## Readiness
 
-Check protected key presence without values, connect, list the server's actual tools,
-then run a narrow read-only search. A variable name does not prove authentication.
+Check protected token presence without its value, intentionally enable the server,
+connect, list the server's actual tools, then run a narrow read-only search. The
+endpoint is preconfigured, but a variable name does not prove authentication.
 
 ## Demonstration
 

@@ -1,8 +1,7 @@
 # mcp_servers entries for the `ericsson` capability set.
 # The staging seam merges these into the brand's config.yaml, resolving
-# ${CAPABILITY_DIR} to where mcpLocal content was staged. Entries with
-# unresolved ${ENV_VAR} placeholders (e.g. glean without GLEAN_MCP_URL set)
-# should be merged but remain inert until the user supplies values.
+# ${CAPABILITY_DIR} to where mcpLocal content was staged. Remote entries may
+# retain unresolved secret placeholders and remain unusable until configured.
 mcp_servers:
   outlook:
     # Windows-only: PowerShell -> COM against the logged-in Outlook desktop.
@@ -11,7 +10,8 @@ mcp_servers:
     env: {}
     timeout: 120
   glean:
-    # Internal Glean MCP endpoint (CPI/document search). Values from Keys page.
-    url: "${GLEAN_MCP_URL}"
+    # Shared Ericsson endpoint; the user supplies only the protected token.
+    enabled: false
+    url: https://be.everyday-assistant.ericsson.net/mcp/EEA-KIRO-MCP
     headers:
       Authorization: "Bearer ${GLEAN_API_TOKEN}"
