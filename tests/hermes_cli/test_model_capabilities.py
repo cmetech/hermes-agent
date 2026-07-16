@@ -16,6 +16,7 @@ from hermes_cli.model_capabilities import (
     fetch_model_capability_catalog,
     join_live_model_capabilities,
 )
+from hermes_cli.model_eligibility import evaluate_model_eligibility
 
 
 def _entry(
@@ -171,16 +172,66 @@ def test_valid_payload_parses_all_states_and_normalizes_missing_keys(
     assert request.get_header("X-provider-secret") == "header-secret"
 
 
+def test_unknown_capability_key_is_ignored_without_blocking_eligibility(
+    monkeypatch, capability_profile
+):
+    _install_fake_opener(
+        monkeypatch,
+        [
+            _payload(
+                _entry(
+                    capabilities={
+                        "completion": "supported",
+                        "tools": "supported",
+                        "vision": "unsupported",
+                        "reasoning": "unknown",
+                        "audio": "supported",
+                    },
+                    evidence={
+                        "audio": {
+                            "source": "future_gateway_evidence",
+                        }
+                    },
+                )
+            )
+        ],
+    )
+
+    catalog = _fetch()
+
+    assert catalog.status == "ready"
+    model = catalog.models["model-a"]
+    assert model.capabilities == {
+        "completion": "supported",
+        "tools": "supported",
+        "vision": "unsupported",
+        "reasoning": "unknown",
+    }
+    assert "audio" not in model.capabilities
+    assert evaluate_model_eligibility(
+        capability_contract=True,
+        catalog_status=catalog.status,
+        model=model.id,
+        usage="main",
+        is_live=True,
+        selection_mode=model.selection_mode,
+        verified=model.capabilities,
+    ).eligible is True
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
         lambda payload: payload["data"][0].pop("id"),
         lambda payload: payload["data"][0].update(id=""),
         lambda payload: payload["data"].append(dict(payload["data"][0])),
-        lambda payload: payload["data"][0]["capabilities"].update(audio="supported"),
         lambda payload: payload["data"][0]["capabilities"].update(tools="maybe"),
         lambda payload: payload["data"][0].update(selection_mode="manual"),
+        lambda payload: payload["data"][0].update(available="yes"),
         lambda payload: payload["data"][0].update(available=False),
+        lambda payload: payload["data"][0].update(
+            evidence={"tools": {"source": 3}}
+        ),
         lambda payload: payload.update(object="catalog"),
         lambda payload: payload.update(registry_revision=3),
         lambda payload: payload.update(generated_at=None),
@@ -190,10 +241,11 @@ def test_valid_payload_parses_all_states_and_normalizes_missing_keys(
         "missing-id",
         "empty-id",
         "duplicate-id",
-        "invalid-capability-key",
         "invalid-capability-state",
         "invalid-selection-mode",
+        "non-boolean-available",
         "unavailable-explicit-entry",
+        "non-string-evidence-field",
         "invalid-object",
         "invalid-registry-revision",
         "invalid-generated-at",

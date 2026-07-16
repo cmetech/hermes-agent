@@ -130,8 +130,6 @@ def _parse_catalog_payload(payload: object) -> ModelCapabilityCatalog:
         raw_capabilities = raw_model.get("capabilities")
         if not isinstance(raw_capabilities, dict):
             raise ValueError("capabilities must be an object")
-        if any(key not in CAPABILITY_KEYS for key in raw_capabilities):
-            raise ValueError("invalid capability key")
 
         capabilities: dict[str, CapabilityState] = {}
         for key in CAPABILITY_KEYS:
