@@ -229,13 +229,35 @@ def _compute_relative_dest(skill_dir: Path, bundled_dir: Path) -> Path:
     return SKILLS_DIR / rel
 
 
+# Transient/generated artifacts a skill produces when its scripts are RUN in
+# place (Python bytecode, tool caches). They must never affect a skill's content
+# hash or file list — otherwise executing a delivered skill would flip it to
+# "user-modified" and permanently block bundled updates.
+_TRANSIENT_HASH_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+_TRANSIENT_HASH_SUFFIXES = (".pyc", ".pyo")
+
+
+def _is_transient_artifact(rel: Path) -> bool:
+    """True for generated files (bytecode, tool caches) excluded from skill hashing."""
+    if any(part in _TRANSIENT_HASH_DIRS for part in rel.parts):
+        return True
+    return rel.suffix in _TRANSIENT_HASH_SUFFIXES
+
+
 def _dir_hash(directory: Path) -> str:
-    """Compute a hash of all file contents in a directory for change detection."""
+    """Compute a hash of all file contents in a directory for change detection.
+
+    Transient artifacts (``__pycache__``/``*.pyc`` etc.) are excluded so a skill
+    that gets executed in place doesn't read as user-modified (see
+    ``_is_transient_artifact``).
+    """
     hasher = hashlib.md5()
     try:
         for fpath in sorted(directory.rglob("*")):
             if fpath.is_file():
                 rel = fpath.relative_to(directory)
+                if _is_transient_artifact(rel):
+                    continue
                 hasher.update(str(rel).encode("utf-8"))
                 hasher.update(fpath.read_bytes())
     except (OSError, IOError):
@@ -259,7 +281,10 @@ def _skill_file_list(skill_dir: Path) -> List[str]:
     files: List[str] = []
     for fpath in sorted(skill_dir.rglob("*")):
         if fpath.is_file():
-            files.append(fpath.relative_to(skill_dir).as_posix())
+            rel = fpath.relative_to(skill_dir)
+            if _is_transient_artifact(rel):
+                continue
+            files.append(rel.as_posix())
     return files
 
 
