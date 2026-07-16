@@ -1477,6 +1477,7 @@ def list_authenticated_providers(
     force_fresh_nous_tier: bool = False,
     max_models: int | None = None,
     current_model: str = "",
+    inject_current_model: bool = True,
     refresh: bool = False,
     probe_custom_providers: bool = True,
     probe_current_custom_provider: bool = False,
@@ -1516,6 +1517,11 @@ def list_authenticated_providers(
     opens: probe only the currently-selected custom endpoint so its model list
     matches the active provider without blocking on every saved/offline custom
     endpoint.
+
+    ``inject_current_model`` keeps the historical picker behavior by default:
+    an out-of-catalog saved model is added to the current provider row for
+    presentation. Verified-capability inventory disables this post-pass so it
+    can join only actual live model IDs before preserving the saved selection.
     """
     import os
     from agent.models_dev import (
@@ -2427,7 +2433,7 @@ def list_authenticated_providers(
     # provider's row (matched by slug) so it is selectable and shown. Done as a
     # post-pass so it covers every provider section uniformly, regardless of
     # which branch emitted the row.
-    if current_model:
+    if inject_current_model and current_model:
         for _row in results:
             if not _row.get("is_current"):
                 continue

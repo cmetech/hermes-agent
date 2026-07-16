@@ -170,10 +170,23 @@ def build_models_payload(
     """
     from hermes_cli.model_switch import list_authenticated_providers
 
+    inject_current_model = True
+    if capabilities:
+        from providers import get_provider_profile
+
+        try:
+            current_profile = get_provider_profile(ctx.current_provider)
+        except Exception:
+            current_profile = None
+        inject_current_model = not bool(
+            current_profile and current_profile.model_capabilities_path
+        )
+
     rows = list_authenticated_providers(
         current_provider=ctx.current_provider,
         current_base_url=ctx.current_base_url,
         current_model=ctx.current_model,
+        inject_current_model=inject_current_model,
         user_providers=ctx.user_providers,
         custom_providers=ctx.custom_providers,
         force_fresh_nous_tier=force_fresh_nous_tier,
@@ -252,37 +265,9 @@ def build_models_payload(
     if pricing:
         _apply_pricing(rows, force_fresh_nous_tier=force_fresh_nous_tier)
     if capabilities:
-        current_slug = str(ctx.current_provider or "").strip().lower()
-        current_model = str(ctx.current_model or "").strip()
-        if current_slug and current_model and current_model != "auto":
-            from providers import get_provider_profile
-
-            try:
-                current_profile = get_provider_profile(current_slug)
-            except Exception:
-                current_profile = None
-            if current_profile is not None:
-                current_slug = str(
-                    current_profile.name or current_slug
-                ).strip().lower()
-
-            for row in rows:
-                slug = str(row.get("slug") or "").strip().lower()
-                if slug != current_slug:
-                    continue
-                try:
-                    profile = get_provider_profile(slug)
-                except Exception:
-                    profile = None
-                if profile is not None and profile.model_capabilities_path:
-                    models = list(row.get("models") or [])
-                    if current_model not in models:
-                        models.append(current_model)
-                        row["models"] = models
-                        row["total_models"] = len(models)
-                break
         _apply_capabilities(rows)
         _apply_verified_provider_capabilities(rows, refresh=refresh)
+        _append_saved_contract_model(rows, ctx)
 
     return {
         "providers": rows,
@@ -398,6 +383,60 @@ def _apply_verified_provider_capabilities(
                 capability: dict(fields)
                 for capability, fields in verified.evidence.items()
             }
+
+
+def _append_saved_contract_model(
+    rows: list[dict],
+    ctx: ConfigContext,
+) -> None:
+    """Keep a stale saved model visible without treating it as live."""
+    from providers import get_provider_profile
+
+    current_slug = str(ctx.current_provider or "").strip().lower()
+    current_model = str(ctx.current_model or "").strip()
+    if not current_slug or not current_model or current_model == "auto":
+        return
+
+    try:
+        current_profile = get_provider_profile(current_slug)
+    except Exception:
+        current_profile = None
+    if current_profile is not None:
+        current_slug = str(current_profile.name or current_slug).strip().lower()
+
+    for row in rows:
+        slug = str(row.get("slug") or "").strip().lower()
+        if slug != current_slug:
+            continue
+        try:
+            profile = get_provider_profile(slug)
+        except Exception:
+            profile = None
+        if profile is None or not profile.model_capabilities_path:
+            return
+
+        models = list(row.get("models") or [])
+        if current_model in models:
+            return
+
+        models.append(current_model)
+        row["models"] = models
+        row["total_models"] = len(models)
+        capabilities = row.setdefault("capabilities", {})
+        capabilities[current_model] = {
+            "fast": False,
+            "reasoning": False,
+            "verified": {
+                "completion": "unknown",
+                "tools": "unknown",
+                "vision": "unknown",
+                "reasoning": "unknown",
+            },
+            "selection_mode": "explicit",
+            "evidence": {},
+            "live": False,
+        }
+        return
 
 
 # ─── Internal: row post-processing ──────────────────────────────────────

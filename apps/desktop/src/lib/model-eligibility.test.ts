@@ -200,6 +200,37 @@ describe('evaluateModelEligibility', () => {
     })
   })
 
+  it('rejects an explicitly non-live saved model before its supported capability evidence', () => {
+    expect(
+      evaluateModelEligibility(
+        contractProvider({ capabilities: { live: false, verified: ALL_SUPPORTED } }),
+        'model-a',
+        'fallback'
+      )
+    ).toEqual({
+      eligible: false,
+      grandfathered: false,
+      reasonKey: 'model-not-live',
+      reasoningVerified: true
+    })
+  })
+
+  it('keeps an explicitly non-live exact current model grandfathered for rendering', () => {
+    expect(
+      evaluateModelEligibility(
+        contractProvider({ capabilities: { live: false, verified: ALL_SUPPORTED } }),
+        'model-a',
+        'fallback',
+        { isCurrent: true }
+      )
+    ).toEqual({
+      eligible: false,
+      grandfathered: true,
+      reasonKey: 'model-not-live',
+      reasoningVerified: true
+    })
+  })
+
   it('keeps a current invalid model ineligible but marks it grandfathered for rendering', () => {
     expect(
       evaluateModelEligibility(
