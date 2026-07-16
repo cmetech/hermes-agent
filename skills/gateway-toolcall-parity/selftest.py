@@ -329,6 +329,8 @@ def main() -> int:
                 _check(r["ok"], f"good/toolcall:{k} PASS")
                 e = next(x for x in results if x["name"] == f"toolcall-exec:{k}")
                 _check(e["ok"], f"good/toolcall-exec:{k} PASS (got: {e['detail'][:60]})")
+            _check({r["suite"] for r in results} == {"toolcall"},
+                   "toolcall filter → only toolcall checks")
         except AssertionError as e:
             print(f"  FAIL: {e}"); failures += 1
 
@@ -447,6 +449,14 @@ def main() -> int:
             _check(not r["ok"], "bleed/identity:openai FAIL")
             _check("persona bleed" in r["detail"],
                    f"bleed/identity:openai → persona bleed (got: {r['detail'][:70]})")
+            _check(rp._has_persona_bleed("I am the Kiro CLI."),
+                   "identity: 'kiro cli' signal detected")
+            _check(rp._has_persona_bleed("running that requires the Hermes agent"),
+                   "identity: 'requires the hermes agent' signal detected")
+            _check(rp._has_persona_bleed("These skills belong to your Hermes agent environment."),
+                   "identity: belong-to + agent-environment signal detected (live phrasing)")
+            _check(not rp._has_persona_bleed("I am your helpful assistant."),
+                   "identity: benign reply is fail-open")
         except (AssertionError, StopIteration) as e:
             print(f"  FAIL: {e}"); failures += 1
     finally:

@@ -999,7 +999,8 @@ def _has_persona_bleed(text: str) -> bool:
     low = (text or "").lower()
     if any(s in low for s in _IDENTITY_BLEED):
         return True
-    return "belongs to" in low and "agent environment" in low
+    # Live phrasing: "These skills belong to your Hermes agent environment."
+    return "belong" in low and "agent environment" in low
 
 
 def check_identity_openai(gw_url):
