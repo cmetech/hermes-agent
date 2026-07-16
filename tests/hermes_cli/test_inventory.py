@@ -19,6 +19,7 @@ depend on:
 
 from __future__ import annotations
 
+import json
 from unittest.mock import patch
 
 
@@ -994,3 +995,379 @@ def test_list_authenticated_providers_refresh_busts_cache():
         assert clear.call_count == 0
         model_switch.list_authenticated_providers(refresh=True)
         assert clear.call_count == 1
+
+
+# ─── Verified provider capabilities ────────────────────────────────────
+
+
+def _install_inventory_gateway_profile(monkeypatch, slug="test-inventory-gateway"):
+    import providers as provider_registry
+    from hermes_cli.auth import PROVIDER_REGISTRY, ProviderConfig
+    from providers.base import ProviderProfile
+
+    profile = ProviderProfile(
+        name=slug,
+        display_name="Test Inventory Gateway",
+        env_vars=("OTTO_API_KEY", "OTTO_BASE_URL"),
+        base_url="http://127.0.0.1:18080/v1",
+        auth_type="api_key",
+        supports_unauthenticated=True,
+        model_capabilities_path="model-capabilities",
+    )
+    monkeypatch.setitem(provider_registry._REGISTRY, slug, profile)
+    monkeypatch.setitem(
+        PROVIDER_REGISTRY,
+        slug,
+        ProviderConfig(
+            id=slug,
+            name="Test Inventory Gateway",
+            auth_type="api_key",
+            inference_base_url=profile.base_url,
+            api_key_env_vars=("OTTO_API_KEY",),
+            base_url_env_var="OTTO_BASE_URL",
+        ),
+    )
+    monkeypatch.delenv("OTTO_API_KEY", raising=False)
+    monkeypatch.delenv("OTTO_BASE_URL", raising=False)
+    return profile
+
+
+def _verified_model(
+    model_id: str,
+    *,
+    reasoning: str,
+    selection_mode: str = "explicit",
+    evidence: dict | None = None,
+):
+    from hermes_cli.model_capabilities import VerifiedModelCapability
+
+    return VerifiedModelCapability(
+        id=model_id,
+        name=model_id,
+        selection_mode=selection_mode,
+        capabilities={
+            "completion": "supported",
+            "tools": "supported",
+            "vision": "unsupported",
+            "reasoning": reasoning,
+        },
+        evidence=evidence or {},
+    )
+
+
+def test_noauth_gateway_inventory_is_visible_and_enriched_when_other_provider_is_current(
+    monkeypatch,
+):
+    from hermes_cli.model_capabilities import ModelCapabilityCatalog
+
+    slug = "test-inventory-gateway"
+    _install_inventory_gateway_profile(monkeypatch, slug)
+    rows = [
+        {
+            "slug": slug,
+            "name": "Test Inventory Gateway",
+            "models": [
+                "model-reasoning",
+                "auto",
+                "model-fast",
+                "model-no-reasoning",
+                "model-without-metadata",
+                "auto",
+            ],
+            "total_models": 6,
+            "is_current": False,
+            "is_user_defined": False,
+            "source": "canonical",
+        }
+    ]
+    catalog = ModelCapabilityCatalog(
+        status="ready",
+        models={
+            "auto": _verified_model(
+                "auto",
+                reasoning="unknown",
+                selection_mode="automatic",
+            ),
+            "model-reasoning": _verified_model(
+                "model-reasoning",
+                reasoning="supported",
+                evidence={
+                    "reasoning": {
+                        "source": "gateway_registry",
+                        "reference": "public-model-record",
+                    }
+                },
+            ),
+            "model-fast": _verified_model(
+                "model-fast",
+                reasoning="supported",
+            ),
+            "model-no-reasoning": _verified_model(
+                "model-no-reasoning",
+                reasoning="unsupported",
+            ),
+            "capability-only-model": _verified_model(
+                "capability-only-model",
+                reasoning="supported",
+            ),
+        },
+    )
+    captured = {}
+
+    def _fetch(provider, **kwargs):
+        captured["provider"] = provider
+        captured.update(kwargs)
+        return catalog
+
+    ctx = _empty_ctx(provider="openrouter", model="openrouter/auto")
+    with (
+        _list_auth_returning(rows),
+        patch(
+            "hermes_cli.model_capabilities.fetch_model_capability_catalog",
+            side_effect=_fetch,
+        ),
+        patch(
+            "hermes_cli.models.model_supports_fast_mode",
+            side_effect=lambda model: model == "model-fast",
+        ),
+        patch(
+            "agent.models_dev.get_model_capabilities",
+            return_value=None,
+        ),
+        patch(
+            "hermes_cli.auth.is_provider_explicitly_configured",
+            return_value=False,
+        ),
+    ):
+        payload = build_models_payload(
+            ctx,
+            explicit_only=True,
+            capabilities=True,
+        )
+
+    gateway = next(row for row in payload["providers"] if row["slug"] == slug)
+    assert gateway["models"] == [
+        "auto",
+        "model-reasoning",
+        "model-fast",
+        "model-no-reasoning",
+        "model-without-metadata",
+    ]
+    assert "capability-only-model" not in gateway["models"]
+    assert gateway["capability_status"] == "ready"
+    assert gateway["capability_mismatch_count"] == 2
+    assert captured == {
+        "provider": slug,
+        "api_key": "dummy-lm-api-key",
+        "base_url": "http://127.0.0.1:18080/v1",
+        "force_refresh": False,
+    }
+
+    capabilities = gateway["capabilities"]
+    assert capabilities["model-reasoning"] == {
+        "fast": False,
+        "reasoning": True,
+        "verified": {
+            "completion": "supported",
+            "tools": "supported",
+            "vision": "unsupported",
+            "reasoning": "supported",
+        },
+        "selection_mode": "explicit",
+        "evidence": {
+            "reasoning": {
+                "source": "gateway_registry",
+                "reference": "public-model-record",
+            }
+        },
+    }
+    assert capabilities["model-fast"]["fast"] is True
+    assert capabilities["model-no-reasoning"]["reasoning"] is False
+    assert capabilities["model-without-metadata"] == {
+        "fast": False,
+        "reasoning": False,
+        "verified": {
+            "completion": "unknown",
+            "tools": "unknown",
+            "vision": "unknown",
+            "reasoning": "unknown",
+        },
+        "selection_mode": "explicit",
+        "evidence": {},
+    }
+
+
+def test_contract_provider_failure_statuses_keep_live_and_saved_models_unknown(
+    monkeypatch,
+):
+    from hermes_cli.model_capabilities import ModelCapabilityCatalog
+
+    slug = "test-inventory-gateway-failure"
+    _install_inventory_gateway_profile(monkeypatch, slug)
+    statuses = (
+        "gateway-upgrade-required",
+        "gateway-unreachable",
+        "authentication-required",
+        "capability-response-invalid",
+    )
+    for status in statuses:
+        row = {
+            "slug": slug,
+            "name": "Test Inventory Gateway",
+            "models": ["live-model"],
+            "total_models": 1,
+            "is_current": True,
+            "is_user_defined": False,
+            "source": "canonical",
+        }
+        with (
+            _list_auth_returning([row]),
+            patch(
+                "hermes_cli.model_capabilities.fetch_model_capability_catalog",
+                return_value=ModelCapabilityCatalog(status=status, models={}),
+            ),
+            patch(
+                "hermes_cli.models.model_supports_fast_mode",
+                return_value=False,
+            ),
+            patch(
+                "agent.models_dev.get_model_capabilities",
+                return_value=None,
+            ),
+        ):
+            payload = build_models_payload(
+                _empty_ctx(
+                    provider=slug,
+                    model="saved-out-of-catalog-model",
+                ),
+                capabilities=True,
+            )
+
+        gateway = next(
+            provider
+            for provider in payload["providers"]
+            if provider["slug"] == slug
+        )
+        assert gateway["capability_status"] == status
+        assert gateway["models"] == [
+            "auto",
+            "live-model",
+            "saved-out-of-catalog-model",
+        ]
+        assert gateway["capability_mismatch_count"] == 2
+        for model_id in ("live-model", "saved-out-of-catalog-model"):
+            assert gateway["capabilities"][model_id]["reasoning"] is False
+            assert gateway["capabilities"][model_id]["verified"] == {
+                "completion": "unknown",
+                "tools": "unknown",
+                "vision": "unknown",
+                "reasoning": "unknown",
+            }
+
+
+def test_provider_without_capability_contract_keeps_legacy_capability_shape():
+    rows = [
+        {
+            "slug": "openrouter",
+            "name": "OpenRouter",
+            "models": ["model-a", "model-b"],
+            "total_models": 2,
+            "is_current": True,
+            "is_user_defined": False,
+            "source": "built-in",
+        }
+    ]
+    with (
+        _list_auth_returning(rows),
+        patch(
+            "hermes_cli.models.model_supports_fast_mode",
+            side_effect=lambda model: model == "model-b",
+        ),
+        patch(
+            "agent.models_dev.get_model_capabilities",
+            return_value=None,
+        ),
+    ):
+        payload = build_models_payload(
+            _empty_ctx(provider="openrouter", model="model-a"),
+            capabilities=True,
+        )
+
+    openrouter = next(
+        row for row in payload["providers"] if row["slug"] == "openrouter"
+    )
+    assert openrouter["capabilities"] == {
+        "model-a": {"fast": False, "reasoning": True},
+        "model-b": {"fast": True, "reasoning": True},
+    }
+    assert "capability_status" not in openrouter
+    assert "capability_mismatch_count" not in openrouter
+
+
+def test_inventory_refresh_bypasses_model_and_capability_caches(monkeypatch):
+    from hermes_cli.model_capabilities import ModelCapabilityCatalog
+
+    slug = "test-inventory-gateway-refresh"
+    _install_inventory_gateway_profile(monkeypatch, slug)
+    row = {
+        "slug": slug,
+        "name": "Test Inventory Gateway",
+        "models": ["live-model"],
+        "total_models": 1,
+        "is_current": True,
+        "is_user_defined": False,
+        "source": "canonical",
+    }
+    with (
+        patch(
+            "hermes_cli.model_switch.list_authenticated_providers",
+            return_value=[row],
+        ) as list_providers,
+        patch(
+            "hermes_cli.model_capabilities.fetch_model_capability_catalog",
+            return_value=ModelCapabilityCatalog(status="ready", models={}),
+        ) as fetch_capabilities,
+    ):
+        build_models_payload(
+            _empty_ctx(provider=slug, model="live-model"),
+            capabilities=True,
+            refresh=True,
+        )
+
+    assert list_providers.call_args.kwargs["refresh"] is True
+    assert fetch_capabilities.call_args.kwargs["force_refresh"] is True
+
+
+def test_verified_inventory_serialization_omits_credentials_and_authorization(
+    monkeypatch,
+):
+    from hermes_cli.model_capabilities import ModelCapabilityCatalog
+
+    slug = "test-inventory-gateway-secret"
+    _install_inventory_gateway_profile(monkeypatch, slug)
+    secret = "sk-inventory-canary-must-not-serialize"
+    monkeypatch.setenv("OTTO_API_KEY", secret)
+    row = {
+        "slug": slug,
+        "name": "Test Inventory Gateway",
+        "models": ["live-model"],
+        "total_models": 1,
+        "is_current": True,
+        "is_user_defined": False,
+        "source": "canonical",
+    }
+    with (
+        _list_auth_returning([row]),
+        patch(
+            "hermes_cli.model_capabilities.fetch_model_capability_catalog",
+            return_value=ModelCapabilityCatalog(status="ready", models={}),
+        ),
+    ):
+        payload = build_models_payload(
+            _empty_ctx(provider=slug, model="live-model"),
+            capabilities=True,
+        )
+
+    serialized = json.dumps(payload)
+    assert secret not in serialized
+    assert "Authorization" not in serialized
