@@ -664,6 +664,22 @@ def sync_skills(quiet: bool = False) -> dict:
                 manifest.pop(skill_name, None)
             continue
 
+        # Brand-MANAGED skills we ship → force to the bundled version whenever the
+        # on-disk copy is out of date, regardless of manifest state (untracked,
+        # user-modified, or drifted). We own them, so this heals every stuck case in
+        # one place, before the manifest branching. An explicit deletion is still
+        # respected: if dest is gone we fall through to the normal branches, which
+        # never resurrect a user-deleted skill.
+        if skill_name in managed and dest.exists() and _dir_hash(dest) != bundled_hash:
+            if _update_skill(skill_src, dest, skill_name, bundled_hash, manifest, quiet):
+                updated.append(skill_name)
+                managed_forced.append(skill_name)
+                if not quiet:
+                    print(f"  ⤓ {skill_name} (managed → forced to bundled)")
+            else:
+                skipped += 1
+            continue
+
         if skill_name not in manifest:
             # ── New skill — never offered before ──
             try:
@@ -716,18 +732,9 @@ def sync_skills(quiet: bool = False) -> dict:
                 continue
 
             if _is_tracked_user_modification(origin_hash, user_hash):
-                # Brand-MANAGED skills we ship → force to the bundled version when
-                # it changed, bypassing the user-modified skip (we own them, so this
-                # heals drifted/poisoned manifests). Explicit deletion is still
-                # respected — that path is the separate `else` branch below.
-                if skill_name in managed and bundled_hash != user_hash:
-                    if _update_skill(skill_src, dest, skill_name, bundled_hash, manifest, quiet):
-                        updated.append(skill_name)
-                        managed_forced.append(skill_name)
-                        if not quiet:
-                            print(f"  ⤓ {skill_name} (managed → forced to bundled)")
-                    continue
-                # User modified this skill — don't overwrite their changes
+                # User modified this skill — don't overwrite their changes.
+                # (Brand-managed skills were already force-updated above, before the
+                # manifest branching, so they never reach here.)
                 user_modified.append(skill_name)
                 if not quiet:
                     print(f"  ~ {skill_name} (user-modified, skipping)")
