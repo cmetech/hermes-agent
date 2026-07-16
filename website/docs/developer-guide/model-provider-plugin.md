@@ -99,6 +99,8 @@ Full definition in `providers/base.py`. The most useful ones:
 | `base_url` | str | Default inference endpoint |
 | `models_url` | str | Explicit catalog URL (falls back to `{base_url}/models`) |
 | `auth_type` | str | `api_key` \| `oauth_device_code` \| `oauth_external` \| `copilot` \| `aws_sdk` \| `external_process` |
+| `supports_unauthenticated` | bool | Permits use of a non-secret SDK placeholder when no credential is stored; does not prove the endpoint is reachable or no-auth |
+| `model_capabilities_path` | str | Provider-relative verified-capability endpoint; empty keeps legacy selection behavior |
 | `fallback_models` | `tuple[str, ...]` | Curated list shown when live catalog fetch fails |
 | `default_headers` | `dict[str, str]` | Sent on every request (e.g. Copilot's `Editor-Version`) |
 | `fixed_temperature` | Any | `None` = use caller's value; `OMIT_TEMPERATURE` sentinel = don't send temperature at all (Kimi) |
@@ -156,6 +158,48 @@ Look at these bundled plugins for idioms:
 | `plugins/model-providers/nous/` | Attribution tags, "omit reasoning when disabled" |
 | `plugins/model-providers/custom/` | Ollama `num_ctx` + `think: false` quirks |
 | `plugins/model-providers/bedrock/` | `api_mode="bedrock_converse"`, `fetch_models` returns None (no REST endpoint) |
+
+## Unauthenticated providers and verified capability catalogs
+
+Use the two provider declarations together when a delivered provider can run
+without a literal API key and exposes verified per-model capability evidence:
+
+```python
+gateway = ProviderProfile(
+    name="example-gateway",
+    env_vars=("EXAMPLE_GATEWAY_API_KEY", "EXAMPLE_GATEWAY_BASE_URL"),
+    base_url="http://127.0.0.1:18080/v1",
+    auth_type="api_key",
+    supports_unauthenticated=True,
+    model_capabilities_path="model-capabilities",
+    fallback_models=("auto",),
+)
+```
+
+`supports_unauthenticated=True` is a credential-resolution declaration, not a
+health or readiness claim. It lets the SDK receive a non-secret placeholder
+when no key is stored. The client must still probe the live service:
+
+- `401` or `403` means authentication is required and overrides the no-auth
+  declaration.
+- Connection failures and timeouts mean the provider is unreachable.
+- Do not document a provider key as optional unless that provider's server can
+  actually be launched without authentication.
+
+`model_capabilities_path` is resolved relative to the effective inference base
+URL. An opted-in provider's live model endpoint owns availability, while this
+endpoint owns verified capability evidence. The client exact-joins model IDs;
+it does not infer support from names, models.dev, agent-wide protocol
+capabilities, or previous successful calls.
+
+The capability response must represent `supported`, `unsupported`, and
+`unknown` separately. Unknown means evidence is absent or insufficient. Never
+convert it to supported, and never advertise every listed model as capable of
+tools, vision, or reasoning.
+
+Providers that omit `model_capabilities_path` retain legacy behavior. Their
+existing catalogs, fallbacks, and picker eligibility are not subjected to the
+verified Gateway selection policy.
 
 ## User overrides — replace a built-in without editing the repo
 
@@ -263,6 +307,7 @@ See [Building a Hermes Plugin](/developer-guide/plugins#distribute-via-pip) for 
 
 - [Provider Runtime](/developer-guide/provider-runtime) — resolution precedence + where each layer reads the profile
 - [Adding Providers](/developer-guide/adding-providers) — end-to-end checklist for new inference backends (covers both the fast plugin path and the full CLI/auth integration)
+- [Gateway Internals](/developer-guide/gateway-internals#inference-gateway-model-inventory) — live availability, verified evidence, and failure-state ownership
 - [Memory Provider Plugins](/developer-guide/memory-provider-plugin)
 - [Context Engine Plugins](/developer-guide/context-engine-plugin)
 - [Building a Hermes Plugin](/developer-guide/plugins) — general plugin authoring

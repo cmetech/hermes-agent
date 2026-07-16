@@ -47,6 +47,52 @@ Type in the filter box to narrow by provider name, slug, or model ID.
 
 Pick a model, hit **Switch**, and Hermes writes it to `~/.hermes/config.yaml` under the `model` section. **This applies to new sessions only** — any chat tab you already have open keeps running whatever model it started with. To hot-swap the current chat, use the `/model` slash command inside it.
 
+### Gateway models: automatic routing and explicit models
+
+The branded Gateway provider behaves differently from a normal curated cloud
+provider:
+
+- **`auto`** asks the Gateway and Kiro to choose the model. It is the safe
+  default and is available only for the main-model slot.
+- **An explicit model ID** pins new requests to one concrete model from the
+  Gateway's current live catalog.
+
+The client does not ship a static list of Gateway models. The Gateway's
+`/v1/models` endpoint owns live availability, and its
+`/v1/model-capabilities` endpoint owns verified capability evidence. Hermes
+joins the two responses by exact model ID. A model must be present in the live
+list before it can be selected, even if capability evidence exists for a
+similarly named model.
+
+The picker distinguishes three capability states:
+
+- **Supported** — the Gateway has verified the capability.
+- **Unsupported** — the Gateway has verified that the model does not have it.
+- **Unknown** — support has not been verified. Unknown does not mean supported,
+  and it does not mean unsupported.
+
+The required evidence depends on where you assign the model:
+
+| Assignment | Required verified capabilities | Is Gateway `auto` allowed? |
+|---|---|---|
+| Main model | Completion and tools | Yes |
+| Fallback model | Completion and tools | No |
+| Most auxiliary tasks | Completion | No |
+| Vision | Completion and vision | No |
+| Mixture-of-Agents reference | Completion | No |
+| Mixture-of-Agents aggregator | Completion and tools | No |
+
+Reasoning is not required for assignment, but reasoning controls are shown only
+when reasoning support is verified. A model appearing in the live list is not,
+by itself, proof that it supports tools, vision, or reasoning.
+
+Models that fail a slot's requirements remain visible with an explanation, but
+new assignments are disabled. If an older config already contains that exact
+assignment, Hermes preserves it and marks it **Needs review**. Re-saving the
+unchanged assignment is allowed with a warning; changing to another unverified
+model is not. This avoids silently rewriting existing configurations while
+still preventing new unsafe pins.
+
 ### Mid-session switches and context warnings
 
 When you switch models **inside an active session** (Herm TUI model picker, `hermes` CLI, or `/model` on Telegram/Discord), Hermes estimates whether your **next message** will run **preflight context compression** against the new model's window. If the session is already near or above that model's compression threshold (see [Context Compression](./configuration.md#context-compression)), the switch reply includes a warning — the same `warning_message` path used for expensive-model notices. The switch still applies immediately; compression runs on the **first user message after the switch**, before the model answers.
@@ -62,6 +108,11 @@ Click **Show auxiliary** to reveal the 11 task slots:
 ![Auxiliary panel expanded](/img/docs/dashboard-models/auxiliary-expanded.png)
 
 Every auxiliary task defaults to `auto` — meaning Hermes tries your main model for that job too. If that route is unavailable or hits a capacity-style failure, `auto` follows any task-specific `auxiliary.<task>.fallback_chain`, then the main `fallback_providers` / `fallback_model` chain, then Hermes' built-in auxiliary discovery chain. Override a specific task when you want a cheaper or faster model for a side-job.
+
+This auxiliary `provider: auto` setting is client-side “use the main model”
+routing. It is different from the Gateway model ID named `auto`. The Gateway
+model ID cannot be pinned to an auxiliary, fallback, vision, or
+Mixture-of-Agents slot.
 
 ### Common override patterns
 
@@ -161,11 +212,43 @@ When `fallback_chain` is absent, `auto` uses the top-level `fallback_providers` 
 
 Changes never invalidate prompt caches on running sessions. That's deliberate: swapping the main model inside a session requires a cache reset (the system prompt contains model-specific content), and we reserve that for the explicit `/model` slash command inside chat.
 
+### Refreshing Gateway models
+
+Use **Refresh models** when the Gateway has started, upgraded, changed
+authentication, or Kiro's available models have changed. Refresh re-fetches
+both live availability and verified capability evidence. It preserves the
+provider/model choice you are currently reviewing instead of snapping the form
+back to the saved assignment.
+
+Refresh changes what can be selected; it does not rewrite saved assignments or
+change an existing session. Start a new session after applying a new default,
+or use the active chat's model picker for a deliberate mid-session switch.
+
 ## Troubleshooting
 
 ### "No authenticated providers" in the picker
 
 Hermes lists a provider only if it has a working credential. Check **Keys** in the sidebar — you should see one of: an API key, a successful OAuth, or a custom endpoint URL. If the provider you want isn't there, run `hermes setup` to wire it up, or go to **Keys** and add the env var.
+
+The branded Gateway provider is the exception: it may be discoverable without
+a saved key when the Gateway itself runs without authentication. That
+declaration only permits discovery; it does not prove that the Gateway is
+running or that it accepts unauthenticated requests. See
+[Gateway credentials](./configuration.md#gateway-credentials).
+
+### Gateway status prevents model selection
+
+| Status | Meaning | What to do |
+|---|---|---|
+| **Gateway authentication is required** | The Gateway returned `401` or `403`. A no-auth provider declaration does not override the live server. | Configure `OTTO_API_KEY` in **Keys** or `.env`, then refresh. |
+| **Gateway must be updated** | The Gateway is reachable, but its capability endpoint returned `404`. | Upgrade the Gateway, then refresh. |
+| **Gateway is unavailable** | The Gateway connection failed or timed out. | Start it, verify its base URL, then refresh. |
+| **No concrete models are available** | The Gateway responded, but only automatic routing is currently available. | Check Kiro model discovery and refresh later; `auto` remains valid for the main model. |
+| **Capability response is incompatible** | The Gateway returned malformed or unsupported capability data. | Upgrade or repair the Gateway; do not treat the models as verified. |
+| **Model status is unknown** | Hermes has no usable verified status yet. | Refresh and inspect the Gateway. Unknown is not proof of support or lack of support. |
+
+Never paste `OTTO_API_KEY` or any other credential into a chat. Store it on the
+**Keys** page or in the profile's `.env` file.
 
 ### Main model didn't change in my running chat
 

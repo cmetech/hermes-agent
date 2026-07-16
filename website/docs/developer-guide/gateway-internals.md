@@ -8,6 +8,67 @@ description: "How the messaging gateway boots, authorizes users, routes sessions
 
 The messaging gateway is the long-running process that connects Hermes to 20+ external messaging platforms through a unified architecture.
 
+:::note Two different gateways
+This page primarily describes the Hermes **messaging gateway**. Branded builds
+also use an **inference Gateway** that exposes OpenAI-compatible model APIs and
+routes requests through Kiro. The inference Gateway's model-inventory contract
+is documented below because the desktop Models page consumes it.
+:::
+
+## Inference Gateway model inventory
+
+The client treats live model availability and verified capability evidence as
+two separate Gateway-owned facts:
+
+```text
+Gateway /v1/models
+  → live model IDs
+
+Gateway /v1/model-capabilities
+  → verified capability states and evidence
+
+client exact-ID join
+  → slot eligibility and user-facing status
+```
+
+`/v1/models` is authoritative for what Kiro currently exposes. The client does
+not keep a static Gateway model registry and must not add one. The capability
+endpoint is authoritative for verified completion, tool, vision, and reasoning
+evidence. Agent-wide Kiro capabilities, model names, models.dev metadata, or a
+previous successful request are not substitutes for per-model evidence.
+
+Exact-ID joining is deliberate. Capability evidence for one ID cannot make a
+different spelling, alias, or stale registry entry selectable. A live model
+without matching evidence remains visible with unknown capabilities; unknown
+means unverified, not supported and not unsupported.
+
+The provider profile opts into this contract with:
+
+```python
+supports_unauthenticated=True
+model_capabilities_path="model-capabilities"
+```
+
+The first field permits no-auth deployments to use a non-secret SDK
+placeholder. It does not establish readiness. Live failures retain their own
+meaning:
+
+| Capability request result | Client status |
+|---|---|
+| `200` with verified explicit models | Ready |
+| `200` with no explicit models | Catalog empty; main-model `auto` may still be used |
+| `401` or `403` | Authentication required |
+| `404` | Reachable older Gateway; upgrade required |
+| Connection failure or timeout | Gateway unreachable |
+| Invalid JSON or schema | Capability response invalid |
+
+Only providers that declare a capability path use strict verified selection.
+Other providers retain legacy behavior. For the user-facing slot matrix and
+saved-assignment behavior, see
+[Configuring Models](/user-guide/configuring-models#gateway-models-automatic-routing-and-explicit-models).
+For provider authoring, see
+[Model Provider Plugins](/developer-guide/model-provider-plugin#unauthenticated-providers-and-verified-capability-catalogs).
+
 ## Key Files
 
 | File | Purpose |

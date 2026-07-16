@@ -10,6 +10,27 @@ Hermes fetches curated model lists for **OpenRouter** and **Nous Portal** from a
 
 When the manifest is unreachable (offline, network blocked, hosting failure), Hermes silently falls back to the in-repo snapshot that ships with the CLI. The manifest never breaks the picker — worst case you see whatever list was bundled with your installed version.
 
+## What this catalog does not own
+
+This remote manifest is a curation layer for OpenRouter and Nous Portal. It is
+not the source of truth for the branded inference Gateway.
+
+Gateway model selection uses two live service endpoints:
+
+- `/v1/models` owns current availability.
+- `/v1/model-capabilities` owns verified per-model evidence.
+
+The client joins exact IDs from those endpoints and carries no static Gateway
+registry. Do not add Gateway models or capability claims to this manifest as a
+substitute for fixing the Gateway. A live Gateway model with no matching
+evidence is **unknown**: its support is unverified, not supported and not
+unsupported.
+
+See [Configuring Models](/user-guide/configuring-models#gateway-models-automatic-routing-and-explicit-models)
+for the user-facing selection rules and
+[Gateway Internals](/developer-guide/gateway-internals#inference-gateway-model-inventory)
+for the maintainer contract.
+
 ## Live manifest URL
 
 ```
