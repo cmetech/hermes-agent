@@ -60,6 +60,26 @@ gateway for reference diffing), `GW_SUITE`/`GW_SURFACE` (defaults for the flags)
 Validate the harness itself without a gateway: `python selftest.py` (in-process
 OTTO-shaped mock gateways; prints `SELFTEST OK`).
 
+## Reporting back (when a user triggers this in chat)
+
+The harness always prints a full PASS/FAIL matrix to stdout and sets an exit code —
+your job is to run it and relay that, never to end the turn silently.
+
+- **Tell the user you're starting** (a real-gateway run can take a minute), THEN run it.
+- **Show progress in stages** instead of one long blocking call: run
+  `python run_parity.py --suite conformance` first (fast, deterministic) and post its
+  matrix, then `python run_parity.py --suite toolcall` (model-dependent) and post its
+  matrix, then a one-line combined summary (e.g. "N/M passed, exit 0; 1 FAIL:
+  toolcall:openai → track-3a").
+- **Always relay the result.** Post the PASS/FAIL matrix and exit code back to the user.
+  If the tool output is long, summarize the matrix but quote any FAIL detail verbatim
+  (diagnosis code + first ACP frame). Do **not** finish with an empty message after the
+  tool runs.
+- **If your own reply comes back empty right after the tool runs**, that is a gateway
+  "empty stream after a tool result" symptom — the very class of bug this skill exists to
+  catch. Note it to the user and fall back to the terminal (`python run_parity.py
+  --suite all`), whose output can't be swallowed.
+
 ## Natural-language → command
 
 Map a plain-English request to the invocation:

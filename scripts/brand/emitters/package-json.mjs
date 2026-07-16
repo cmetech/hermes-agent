@@ -58,10 +58,12 @@ function fieldPaths(d) {
     ['build.win.legalTrademarks', displayName],
     ['build.linux.synopsis', description],
     ['build.dmg.title', `Install ${displayName}`],
-    // Brand-neutral, fixed for ALL brands: the Windows toast/Start-Menu
-    // identity line reads "Co-Worker", not the product name. See the design
-    // spec 2026-07-14-coexistence-resolver-and-coworker-notification-design.md.
-    ['build.nsis.shortcutName', 'Co-Worker'],
+    // Per-brand shortcut name so co-installed brands (OTTO + LOOP24) don't
+    // collide on one `<name>.lnk` (the fixed "Co-Worker" caused the 2nd install
+    // to overwrite the 1st's Desktop/Start-Menu shortcut). Trade-off: the
+    // Windows toast/Start-Menu identity line now reads the brand, not
+    // "Co-Worker" (reverses the 2026-07-14 unified-notification design).
+    ['build.nsis.shortcutName', displayName],
     ['build.nsis.uninstallDisplayName', displayName]
   ]
 }
