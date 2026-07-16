@@ -613,6 +613,28 @@ class TestSyncSkills:
         assert "old-skill" not in result["user_modified"]
         assert (user_skill / "SKILL.md").read_text() == "# Old"  # forced to bundled
 
+    def test_managed_skill_force_updated_when_untracked(self, tmp_path):
+        """A managed skill on disk but NOT in the manifest (e.g. after a manual
+        reset/re-seed) whose content drifted from bundled is still force-updated.
+        Managed heals every stuck manifest state, not only user-modified entries.
+        """
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        user_skill = skills_dir / "old-skill"
+        user_skill.mkdir(parents=True)
+        (user_skill / "SKILL.md").write_text("# stale local")  # differs from bundled "# Old"
+        manifest_file.write_text("")  # skill is NOT tracked in the manifest
+
+        with self._patches(bundled, skills_dir, manifest_file), \
+                patch("tools.skills_sync._managed_skill_names", return_value={"old-skill"}):
+            result = sync_skills(quiet=True)
+
+        assert "old-skill" in result["updated"]
+        assert "old-skill" in result["managed_forced"]
+        assert (user_skill / "SKILL.md").read_text() == "# Old"  # forced to bundled
+
     def test_managed_skill_respects_user_deletion(self, tmp_path):
         """A managed skill the user DELETED (in manifest, absent on disk) is NOT
         resurrected — managed fixes poisoning, it does not override deletion.
