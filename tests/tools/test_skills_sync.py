@@ -588,6 +588,50 @@ class TestSyncSkills:
         assert "old-skill" not in result["user_modified"]
         assert (user_skill / "SKILL.md").read_text() == "# Old"
 
+    def test_managed_skill_force_updated_despite_user_modified(self, tmp_path):
+        """A brand-MANAGED skill flagged user-modified is force-updated to bundled
+        (we own it) — closes the poisoned-manifest trap for skills we deliver.
+        """
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        user_skill = skills_dir / "old-skill"
+        user_skill.mkdir(parents=True)
+        (user_skill / "SKILL.md").write_text("# Old v1")
+        old_origin_hash = _dir_hash(user_skill)
+        manifest_file.write_text(f"old-skill:{old_origin_hash}\n")
+        # The on-disk copy drifts from the recorded origin (edit or poisoning).
+        (user_skill / "SKILL.md").write_text("# drifted")
+
+        with self._patches(bundled, skills_dir, manifest_file), \
+                patch("tools.skills_sync._managed_skill_names", return_value={"old-skill"}):
+            result = sync_skills(quiet=True)
+
+        assert "old-skill" in result["updated"]
+        assert "old-skill" in result["managed_forced"]
+        assert "old-skill" not in result["user_modified"]
+        assert (user_skill / "SKILL.md").read_text() == "# Old"  # forced to bundled
+
+    def test_managed_skill_respects_user_deletion(self, tmp_path):
+        """A managed skill the user DELETED (in manifest, absent on disk) is NOT
+        resurrected — managed fixes poisoning, it does not override deletion.
+        """
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        skills_dir.mkdir(parents=True)
+        old_hash = _dir_hash(bundled / "old-skill")
+        manifest_file.write_text(f"old-skill:{old_hash}\n")  # in manifest, not on disk
+
+        with self._patches(bundled, skills_dir, manifest_file), \
+                patch("tools.skills_sync._managed_skill_names", return_value={"old-skill"}):
+            result = sync_skills(quiet=True)
+
+        assert "old-skill" not in result.get("updated", [])
+        assert "old-skill" not in result.get("managed_forced", [])
+        assert not (skills_dir / "old-skill").exists()
+
     def test_unchanged_skill_not_updated(self, tmp_path):
         """Skill in sync (user == bundled == origin) = no action needed."""
         bundled = self._setup_bundled(tmp_path)
@@ -884,7 +928,7 @@ class TestSyncSkills:
         with patch("tools.skills_sync._get_bundled_dir", return_value=tmp_path / "nope"):
             result = sync_skills(quiet=True)
         assert result == {
-            "copied": [], "updated": [], "skipped": 0,
+            "copied": [], "updated": [], "managed_forced": [], "skipped": 0,
             "user_modified": [], "cleaned": [], "suppressed": [], "total_bundled": 0,
             "optional_provenance_backfilled": [],
         }

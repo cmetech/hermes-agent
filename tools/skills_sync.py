@@ -505,6 +505,62 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
     return backfilled
 
 
+def _managed_skill_names() -> set:
+    """Brand-managed skill identifiers — force-updated from bundled on change,
+    bypassing the user-modified skip. Fail-OPEN: any error → empty set. Kept as a
+    thin wrapper so tests can patch it and skills_sync stays decoupled from
+    brand_config at import time."""
+    try:
+        from hermes_cli.brand_config import active_managed_skills
+        return active_managed_skills()
+    except Exception:
+        return set()
+
+
+def _update_skill(skill_src: Path, dest: Path, skill_name: str,
+                  bundled_hash: str, manifest: Dict[str, str], quiet: bool) -> bool:
+    """Replace *dest* with *skill_src* crash-safely (backup → copy → restore-on-fail)
+    and record the new origin hash. Returns True on success. Shared by the normal
+    update path and the managed force-update path."""
+    try:
+        # Move old copy to a backup so we can restore on failure. A stale backup
+        # from an earlier failure would make shutil.move() nest dest *inside* it
+        # (or fail) and poison the restore path — the current dest is the
+        # authoritative copy, so clear any leftover first.
+        backup = dest.with_suffix(".bak")
+        if backup.exists():
+            _rmtree_writable(backup)
+        shutil.move(str(dest), str(backup))
+        try:
+            shutil.copytree(skill_src, dest)
+            manifest[skill_name] = bundled_hash
+            # Remove backup after a successful copy.
+            try:
+                _rmtree_writable(backup)
+            except (OSError, IOError):
+                logger.debug("Could not remove backup %s", backup, exc_info=True)
+            return True
+        except (OSError, IOError):
+            # Restore from backup. A partially-written dest must not shadow the
+            # user's copy or block the restore — clear it first, then move back.
+            if backup.exists():
+                if dest.exists():
+                    try:
+                        _rmtree_writable(dest)
+                    except (OSError, IOError):
+                        logger.warning(
+                            "Could not clear partial copy %s during restore",
+                            dest, exc_info=True,
+                        )
+                if not dest.exists():
+                    shutil.move(str(backup), str(dest))
+            raise
+    except (OSError, IOError) as e:
+        if not quiet:
+            print(f"  ! Failed to update {skill_name}: {e}")
+        return False
+
+
 def sync_skills(quiet: bool = False) -> dict:
     """
     Sync bundled skills into ~/.hermes/skills/ using the manifest.
@@ -522,7 +578,7 @@ def sync_skills(quiet: bool = False) -> dict:
         if not quiet:
             print("  (skipped — profile opted out of bundled skills via .no-bundled-skills)")
         return {
-            "copied": [], "updated": [], "skipped": 0,
+            "copied": [], "updated": [], "managed_forced": [], "skipped": 0,
             "user_modified": [], "cleaned": [], "total_bundled": 0,
             "optional_provenance_backfilled": [], "skipped_opt_out": True,
         }
@@ -530,7 +586,7 @@ def sync_skills(quiet: bool = False) -> dict:
     bundled_dir = _get_bundled_dir()
     if not bundled_dir.exists():
         return {
-            "copied": [], "updated": [], "skipped": 0,
+            "copied": [], "updated": [], "managed_forced": [], "skipped": 0,
             "user_modified": [], "cleaned": [], "suppressed": [], "total_bundled": 0,
             "optional_provenance_backfilled": [],
         }
@@ -544,8 +600,10 @@ def sync_skills(quiet: bool = False) -> dict:
     external_index = _build_external_skill_index()
     shadowed_by_external: List[str] = []
 
+    managed = _managed_skill_names()
     copied = []
     updated = []
+    managed_forced: List[str] = []
     user_modified = []
     suppressed_skipped: List[str] = []
     skipped = 0
@@ -658,6 +716,17 @@ def sync_skills(quiet: bool = False) -> dict:
                 continue
 
             if _is_tracked_user_modification(origin_hash, user_hash):
+                # Brand-MANAGED skills we ship → force to the bundled version when
+                # it changed, bypassing the user-modified skip (we own them, so this
+                # heals drifted/poisoned manifests). Explicit deletion is still
+                # respected — that path is the separate `else` branch below.
+                if skill_name in managed and bundled_hash != user_hash:
+                    if _update_skill(skill_src, dest, skill_name, bundled_hash, manifest, quiet):
+                        updated.append(skill_name)
+                        managed_forced.append(skill_name)
+                        if not quiet:
+                            print(f"  ⤓ {skill_name} (managed → forced to bundled)")
+                    continue
                 # User modified this skill — don't overwrite their changes
                 user_modified.append(skill_name)
                 if not quiet:
@@ -666,46 +735,10 @@ def sync_skills(quiet: bool = False) -> dict:
 
             # User copy matches origin — check if bundled has a newer version
             if bundled_hash != origin_hash:
-                try:
-                    # Move old copy to a backup so we can restore on failure
-                    backup = dest.with_suffix(".bak")
-                    # A stale backup left by an earlier failure would make
-                    # shutil.move() nest dest *inside* it (or fail outright)
-                    # and would poison the restore path below. The current
-                    # dest is the authoritative copy — clear the leftover.
-                    if backup.exists():
-                        _rmtree_writable(backup)
-                    shutil.move(str(dest), str(backup))
-                    try:
-                        shutil.copytree(skill_src, dest)
-                        manifest[skill_name] = bundled_hash
-                        updated.append(skill_name)
-                        if not quiet:
-                            print(f"  ↑ {skill_name} (updated)")
-                        # Remove backup after successful copy
-                        try:
-                            _rmtree_writable(backup)
-                        except (OSError, IOError):
-                            logger.debug("Could not remove backup %s", backup, exc_info=True)
-                    except (OSError, IOError):
-                        # Restore from backup. A partially-written dest must
-                        # not shadow the user's copy or block the restore —
-                        # clear it first, then move the backup home.
-                        if backup.exists():
-                            if dest.exists():
-                                try:
-                                    _rmtree_writable(dest)
-                                except (OSError, IOError):
-                                    logger.warning(
-                                        "Could not clear partial copy %s during restore",
-                                        dest, exc_info=True,
-                                    )
-                            if not dest.exists():
-                                shutil.move(str(backup), str(dest))
-                        raise
-                except (OSError, IOError) as e:
+                if _update_skill(skill_src, dest, skill_name, bundled_hash, manifest, quiet):
+                    updated.append(skill_name)
                     if not quiet:
-                        print(f"  ! Failed to update {skill_name}: {e}")
+                        print(f"  ↑ {skill_name} (updated)")
             else:
                 skipped += 1  # bundled unchanged, user unchanged
 
@@ -735,6 +768,7 @@ def sync_skills(quiet: bool = False) -> dict:
     return {
         "copied": copied,
         "updated": updated,
+        "managed_forced": managed_forced,
         "skipped": skipped,
         "user_modified": user_modified,
         "cleaned": cleaned,
