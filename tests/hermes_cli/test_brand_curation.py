@@ -3,6 +3,7 @@ import json
 from hermes_cli.brand_config import (
     get_excluded_toolsets,
     get_hidden_skills,
+    get_managed_skills,
     get_skill_rename_map,
     seed_disabled,
 )
@@ -33,15 +34,29 @@ def test_get_hidden_skills_and_rename_and_toolsets(tmp_path):
     assert get_excluded_toolsets("acme", root) == {"homeassistant", "spotify"}
 
 
+def test_get_managed_skills(tmp_path):
+    root = _write_brand(
+        tmp_path,
+        "acme",
+        {"skills": {"managed": ["gateway-toolcall-parity", "workflow-builder"]}},
+    )
+    assert get_managed_skills("acme", root) == {
+        "gateway-toolcall-parity",
+        "workflow-builder",
+    }
+
+
 def test_curation_helpers_fail_open(tmp_path):
     # Missing descriptor / missing curation sections → empty, never raise.
     assert get_hidden_skills("nope", tmp_path) == set()
     assert get_skill_rename_map("nope", tmp_path) == {}
     assert get_excluded_toolsets("nope", tmp_path) == set()
+    assert get_managed_skills("nope", tmp_path) == set()
     root = _write_brand(tmp_path, "bare", {})
     assert get_hidden_skills("bare", root) == set()
     assert get_skill_rename_map("bare", root) == {}
     assert get_excluded_toolsets("bare", root) == set()
+    assert get_managed_skills("bare", root) == set()
 
 
 def test_seed_disabled_unions_skills_and_toolsets():
