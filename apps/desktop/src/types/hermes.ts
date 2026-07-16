@@ -244,7 +244,29 @@ export interface ModelPricing {
   free: boolean
 }
 
+export type ModelCapabilityState = 'supported' | 'unknown' | 'unsupported'
+
+export type ModelSelectionMode = 'automatic' | 'explicit'
+
+export type ModelCapabilityCatalogStatus =
+  | 'authentication-required'
+  | 'capability-response-invalid'
+  | 'catalog-empty'
+  | 'gateway-unreachable'
+  | 'gateway-upgrade-required'
+  | 'ready'
+  | 'unknown'
+
+export interface ModelCapabilityEvidence {
+  notes?: string
+  reference?: string
+  source?: string
+  verified_at?: string
+}
+
 export interface ModelOptionProvider {
+  capability_mismatch_count?: number
+  capability_status?: ModelCapabilityCatalogStatus
   is_current?: boolean
   models?: string[]
   name: string
@@ -276,8 +298,11 @@ export interface ModelOptionProvider {
 }
 
 export interface ModelCapabilities {
+  evidence?: Record<string, ModelCapabilityEvidence>
   fast: boolean
   reasoning: boolean
+  selection_mode?: ModelSelectionMode
+  verified?: Record<'completion' | 'reasoning' | 'tools' | 'vision', ModelCapabilityState>
 }
 
 export interface ModelOptionsResponse {
