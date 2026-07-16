@@ -1051,6 +1051,12 @@ export interface DebugShareResponse {
   auto_delete_seconds: number | null
 }
 
+export interface ModelSelectionWarning {
+  code: 'grandfathered-model-assignment'
+  message: string
+  reason: string
+}
+
 export interface ModelAssignmentResponse {
   /** Persisted endpoint URL for custom/local providers (echoed back). */
   base_url?: string
@@ -1062,6 +1068,7 @@ export interface ModelAssignmentResponse {
   ok: boolean
   provider?: string
   reset?: boolean
+  selection_warning?: ModelSelectionWarning
   scope?: string
   /** Auxiliary slots still pinned to a different provider than the new main.
    *  Switching main never clears aux pins; this lets the UI warn the user

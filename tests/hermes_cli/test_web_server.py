@@ -129,6 +129,15 @@ def _install_example_plugin(_isolate_hermes_home):
         web_server._dashboard_plugins_cache = None
 
 
+@pytest.fixture
+def _no_model_cost_warning(monkeypatch):
+    """Keep model-assignment tests focused on capability validation."""
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning",
+        lambda *_args, **_kwargs: None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # reload_env tests
 # ---------------------------------------------------------------------------
@@ -2174,6 +2183,502 @@ class TestWebServerEndpoints:
         assert data["ok"] is True
         assert data["provider"] == "openrouter"
         assert data["model"] == "anthropic/claude-sonnet-4.6"
+
+    def test_model_set_accepts_verified_main_explicit(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import load_config
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        calls = []
+
+        def validate(provider, model, usage, **kwargs):
+            calls.append((provider, model, usage, kwargs))
+            return ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="This model is eligible for the requested assignment.",
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "gateway",
+                "model": "verified-main",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert calls == [
+            (
+                "gateway",
+                "verified-main",
+                "main",
+                {"exact_existing_assignment": False},
+            )
+        ]
+        assert load_config()["model"]["default"] == "verified-main"
+
+    @pytest.mark.parametrize(
+        ("reason", "message"),
+        [
+            ("completion-unknown", "Completion support has not been verified."),
+            ("tools-unsupported", "Tool support is not available for this model."),
+            ("tools-unknown", "Tool support has not been verified for this model."),
+            (
+                "model-not-live",
+                "This model is not present in the provider's live model list.",
+            ),
+            (
+                "gateway-upgrade-required",
+                "The Gateway must be updated before it can verify this model.",
+            ),
+            (
+                "gateway-unreachable",
+                "The Gateway is unavailable, so this model cannot be verified.",
+            ),
+            (
+                "capability-response-invalid",
+                "The Gateway returned an invalid model capability response.",
+            ),
+        ],
+    )
+    def test_model_set_rejects_changed_ineligible_selection_without_rewrite(
+        self, monkeypatch, _no_model_cost_warning, reason, message
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "model:\n  provider: gateway\n  default: existing-main\n",
+            encoding="utf-8",
+        )
+        before = config_path.read_bytes()
+
+        monkeypatch.setattr(
+            model_eligibility,
+            "validate_provider_model_selection",
+            lambda *_args, **_kwargs: ModelEligibility(
+                eligible=False,
+                reason=reason,
+                message=message,
+            ),
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "gateway",
+                "model": "changed-main",
+            },
+        )
+
+        assert resp.status_code == 409
+        assert resp.json() == {
+            "detail": {
+                "code": "model-selection-ineligible",
+                "reason": reason,
+                "usage": "main",
+                "provider": "gateway",
+                "model": "changed-main",
+                "message": message,
+            }
+        }
+        assert config_path.read_bytes() == before
+
+    def test_model_set_allows_gateway_auto_only_for_main(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_eligibility import evaluate_model_eligibility
+
+        calls = []
+
+        def validate(provider, model, usage, **kwargs):
+            calls.append((provider, model, usage, kwargs))
+            return evaluate_model_eligibility(
+                capability_contract=True,
+                catalog_status=(
+                    "gateway-upgrade-required" if usage == "main" else "ready"
+                ),
+                model=model,
+                usage=usage,
+                is_live=True,
+                selection_mode="automatic",
+                verified=None,
+                exact_existing_assignment=kwargs.get(
+                    "exact_existing_assignment", False
+                ),
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        main = self.client.post(
+            "/api/model/set",
+            json={"scope": "main", "provider": "gateway", "model": "auto"},
+        )
+        assert main.status_code == 200
+        assert main.json()["ok"] is True
+
+        config_path = get_config_path()
+        before_aux = config_path.read_bytes()
+        auxiliary = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "compression",
+                "provider": "gateway",
+                "model": "auto",
+            },
+        )
+        assert auxiliary.status_code == 409
+        assert auxiliary.json()["detail"]["reason"] == "automatic-not-allowed"
+        assert auxiliary.json()["detail"]["usage"] == "auxiliary"
+        assert config_path.read_bytes() == before_aux
+        assert [(provider, model, usage) for provider, model, usage, _ in calls] == [
+            ("gateway", "auto", "main"),
+            ("gateway", "auto", "auxiliary"),
+        ]
+
+    def test_model_set_accepts_auxiliary_auto_inheritance(
+        self, _no_model_cost_warning
+    ):
+        from hermes_cli.config import load_config
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "compression",
+                "provider": "auto",
+                "model": "",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert load_config()["auxiliary"]["compression"]["provider"] == "auto"
+        assert load_config()["auxiliary"]["compression"]["model"] == ""
+
+    def test_model_set_uses_vision_and_ordinary_auxiliary_requirements(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        usages = []
+
+        def validate(_provider, _model, usage, **_kwargs):
+            usages.append(usage)
+            return ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="eligible",
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        for task in ("vision", "compression"):
+            resp = self.client.post(
+                "/api/model/set",
+                json={
+                    "scope": "auxiliary",
+                    "task": task,
+                    "provider": "gateway",
+                    "model": "verified-aux",
+                },
+            )
+            assert resp.status_code == 200
+
+        assert usages == ["vision", "auxiliary"]
+
+    def test_model_set_all_auxiliary_validates_both_usages_before_mutation(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "auxiliary:\n"
+            "  vision:\n"
+            "    provider: auto\n"
+            "    model: ''\n"
+            "  compression:\n"
+            "    provider: auto\n"
+            "    model: ''\n",
+            encoding="utf-8",
+        )
+        before = config_path.read_bytes()
+        usages = []
+
+        def validate(_provider, _model, usage, **_kwargs):
+            usages.append(usage)
+            if usage == "vision":
+                return ModelEligibility(
+                    eligible=False,
+                    reason="vision-unknown",
+                    message="Vision support has not been verified for this model.",
+                )
+            return ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="eligible",
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "",
+                "provider": "gateway",
+                "model": "text-only",
+            },
+        )
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["usage"] == "vision"
+        assert usages == ["vision", "auxiliary"]
+        assert config_path.read_bytes() == before
+
+    def test_model_set_preserves_exact_invalid_noop_with_warning_without_rewrite(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "# preserve this formatting\n"
+            "model: {provider: gateway, default: grandfathered-main}\n",
+            encoding="utf-8",
+        )
+        before = config_path.read_bytes()
+
+        def validate(provider, model, usage, **kwargs):
+            assert (provider, model, usage) == (
+                "gateway",
+                "grandfathered-main",
+                "main",
+            )
+            assert kwargs == {"exact_existing_assignment": True}
+            return ModelEligibility(
+                eligible=True,
+                reason="tools-unknown",
+                message=(
+                    "The existing assignment was preserved, but it is not eligible "
+                    "for a new assignment. Tool support has not been verified for "
+                    "this model."
+                ),
+                grandfathered=True,
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "gateway",
+                "model": "grandfathered-main",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "ok": True,
+            "scope": "main",
+            "provider": "gateway",
+            "model": "grandfathered-main",
+            "selection_warning": {
+                "code": "grandfathered-model-assignment",
+                "message": (
+                    "The existing assignment was preserved, but it is not eligible "
+                    "for a new assignment. Tool support has not been verified for "
+                    "this model."
+                ),
+                "reason": "tools-unknown",
+            },
+        }
+        assert config_path.read_bytes() == before
+
+    def test_model_set_preserves_exact_invalid_auxiliary_noop_without_rewrite(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import get_config_path
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "auxiliary:\n"
+            "  vision: {provider: gateway, model: grandfathered-vision}\n",
+            encoding="utf-8",
+        )
+        before = config_path.read_bytes()
+        monkeypatch.setattr(
+            model_eligibility,
+            "validate_provider_model_selection",
+            lambda *_args, **kwargs: ModelEligibility(
+                eligible=kwargs["exact_existing_assignment"],
+                reason="vision-unknown",
+                message="The existing assignment was preserved.",
+                grandfathered=kwargs["exact_existing_assignment"],
+            ),
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "vision",
+                "provider": "gateway",
+                "model": "grandfathered-vision",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["selection_warning"] == {
+            "code": "grandfathered-model-assignment",
+            "message": "The existing assignment was preserved.",
+            "reason": "vision-unknown",
+        }
+        assert config_path.read_bytes() == before
+
+    def test_model_set_provider_without_capability_contract_is_unchanged(
+        self, _no_model_cost_warning
+    ):
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "openrouter",
+                "model": "legacy-compatible/model",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert "selection_warning" not in resp.json()
+
+    def test_model_set_validation_and_write_are_profile_scoped(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility, profiles
+        from hermes_constants import get_hermes_home
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        default_home = get_hermes_home()
+        profiles_root = default_home / "profiles"
+        worker_home = profiles_root / "worker"
+        worker_home.mkdir(parents=True)
+        default_config = default_home / "config.yaml"
+        worker_config = worker_home / "config.yaml"
+        default_config.write_text(
+            "model:\n  provider: openrouter\n  default: default-main\n",
+            encoding="utf-8",
+        )
+        worker_config.write_text(
+            "model:\n  provider: gateway\n  default: worker-old\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: default_home)
+        monkeypatch.setattr(profiles, "_get_profiles_root", lambda: profiles_root)
+        seen = {}
+
+        def validate(provider, model, usage, **kwargs):
+            seen["home"] = get_hermes_home()
+            seen["config"] = get_hermes_home().joinpath("config.yaml").read_text()
+            seen["args"] = (provider, model, usage, kwargs)
+            return ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="eligible",
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "gateway",
+                "model": "worker-new",
+                "profile": "worker",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert seen["home"] == worker_home
+        assert "worker-old" in seen["config"]
+        assert seen["args"] == (
+            "gateway",
+            "worker-new",
+            "main",
+            {"exact_existing_assignment": False},
+        )
+        assert yaml.safe_load(worker_config.read_text())["model"]["default"] == "worker-new"
+        assert yaml.safe_load(default_config.read_text())["model"]["default"] == "default-main"
+
+    def test_model_set_response_never_includes_resolved_credentials(
+        self, monkeypatch, _no_model_cost_warning
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.model_eligibility import ModelEligibility
+
+        monkeypatch.setattr(
+            model_eligibility,
+            "validate_provider_model_selection",
+            lambda *_args, **_kwargs: ModelEligibility(
+                eligible=True,
+                reason="eligible",
+                message="eligible",
+            ),
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "custom",
+                "model": "private-main",
+                "base_url": "https://private.example/v1",
+                "api_key": "sk-must-not-leak",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert "sk-must-not-leak" not in resp.text
+        assert "api_key" not in resp.json()
 
     def test_ops_import_passes_force_flag(self, tmp_path, monkeypatch):
         """force=True must append --force so the spawned non-interactive

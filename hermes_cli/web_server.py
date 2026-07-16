@@ -5640,11 +5640,60 @@ def _apply_model_assignment_sync(
     HTTPException for validation errors — the async wrapper re-raises them.
     """
     cfg = load_config()
+    from hermes_cli.model_eligibility import validate_provider_model_selection
 
     if scope == "main":
         if not provider or not model:
             raise HTTPException(status_code=400, detail="provider and model required for main")
         provider, model = _normalize_main_model_assignment(provider, model)
+        current_model_cfg = cfg.get("model", {})
+        if isinstance(current_model_cfg, dict):
+            current_provider = str(
+                current_model_cfg.get("provider", "") or ""
+            ).strip()
+            current_model = str(
+                current_model_cfg.get(
+                    "default", current_model_cfg.get("name", "")
+                )
+                or ""
+            ).strip()
+        else:
+            current_provider = ""
+            current_model = str(current_model_cfg or "").strip()
+        exact_existing_assignment = (
+            provider == current_provider and model == current_model
+        )
+        decision = validate_provider_model_selection(
+            provider,
+            model,
+            "main",
+            exact_existing_assignment=exact_existing_assignment,
+        )
+        if not decision.eligible:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "model-selection-ineligible",
+                    "reason": decision.reason,
+                    "usage": "main",
+                    "provider": provider,
+                    "model": model,
+                    "message": decision.message,
+                },
+            )
+        if exact_existing_assignment and decision.grandfathered:
+            return {
+                "ok": True,
+                "scope": "main",
+                "provider": provider,
+                "model": model,
+                "selection_warning": {
+                    "code": "grandfathered-model-assignment",
+                    "message": decision.message,
+                    "reason": decision.reason,
+                },
+            }
+
         model_cfg = _apply_main_model_assignment(
             cfg.get("model", {}), provider, model, base_url, api_key
         )
@@ -5768,6 +5817,68 @@ def _apply_model_assignment_sync(
     for slot in targets:
         if slot not in _AUX_TASK_SLOTS:
             raise HTTPException(status_code=400, detail=f"unknown auxiliary task: {slot}")
+
+    def _current_auxiliary_pair(slot: str) -> tuple[str, str]:
+        slot_cfg = aux.get(slot)
+        if not isinstance(slot_cfg, dict):
+            return "auto", ""
+        return (
+            str(slot_cfg.get("provider", "auto") or "auto").strip(),
+            str(slot_cfg.get("model", "") or "").strip(),
+        )
+
+    exact_existing_assignment = all(
+        _current_auxiliary_pair(slot) == (provider, model) for slot in targets
+    )
+    usages = (
+        ["vision", "auxiliary"]
+        if not task
+        else ["vision" if task == "vision" else "auxiliary"]
+    )
+    decisions = [
+        (
+            usage,
+            validate_provider_model_selection(
+                provider,
+                model,
+                usage,
+                exact_existing_assignment=exact_existing_assignment,
+            ),
+        )
+        for usage in usages
+    ]
+    for usage, decision in decisions:
+        if not decision.eligible:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "model-selection-ineligible",
+                    "reason": decision.reason,
+                    "usage": usage,
+                    "provider": provider,
+                    "model": model,
+                    "message": decision.message,
+                },
+            )
+    grandfathered = next(
+        (decision for _usage, decision in decisions if decision.grandfathered),
+        None,
+    )
+    if exact_existing_assignment and grandfathered is not None:
+        return {
+            "ok": True,
+            "scope": "auxiliary",
+            "tasks": targets,
+            "provider": provider,
+            "model": model,
+            "selection_warning": {
+                "code": "grandfathered-model-assignment",
+                "message": grandfathered.message,
+                "reason": grandfathered.reason,
+            },
+        }
+
+    for slot in targets:
         slot_cfg = aux.get(slot)
         if not isinstance(slot_cfg, dict):
             slot_cfg = {}
