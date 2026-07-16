@@ -1,7 +1,7 @@
 ---
 name: gateway-toolcall-parity
 description: "Conformance-test a running OTTO gateway. Two suites, one harness: `toolcall` (structured tool-call parity across Anthropic/OpenAI/Ollama — not prose/`[tool: …]`) and `conformance` (v1-messages-style: health, model listing, basic + streaming chat, model normalize/auto, validation errors, count_tokens). Triggerable by CLI flag or natural language; exits non-zero to gate a release. Disabled by default — enable it to run a check."
-version: 1.1.0
+version: 1.2.0
 platforms: [linux, macos, windows]
 metadata:
   hermes:
@@ -94,6 +94,8 @@ Map a plain-English request to the invocation:
 | "run everything" / "full parity gate" | `python run_parity.py --suite all` |
 | "…on the Anthropic surface only" (or openai/ollama) | append `--surface anthropic` |
 | "…and diff against the JS gateway" | set `JS_GW_URL=http://127.0.0.1:<port>` (reference mode) |
+| "check for the `[tool: …]` narration leak" / "run the execute-tool surfacing check" | `python run_parity.py --suite toolcall` |
+| "check the model's identity / persona" / "is it leaking the Kiro persona?" | `python run_parity.py --suite conformance --surface openai` |
 | "what does it check?" / "list the checks" | `python run_parity.py --list` |
 
 ## What PASS means
@@ -103,12 +105,19 @@ Map a plain-English request to the invocation:
 `message.tool_calls[0].function` — then a tool-result round-trip to a coherent final
 answer. A prose answer or `[tool: …]` narration is a **FAIL**.
 
+**toolcall-exec** (per surface): a **structured** `run_shell(command)` call in response to an
+execute prompt — same shapes as above. A `[tool: …]` narration marker anywhere in the
+assistant text is a **hard surfacing-gap FAIL** on this and every tool-call check (the leak
+guard), even if a structured call is also present.
+
 **conformance** (highlights): `/health` → `status:"ok"` + `pool.alive`; `/v1/models` &
 `/api/tags` list a non-empty catalog including `auto`; streaming emits the right frame
 order (Anthropic `message_start…message_stop`, OpenAI `chat.completion.chunk`…`[DONE]`,
 Ollama NDJSON ending `done:true`); validation returns each surface's real 400 envelope
 (Anthropic `{type:"error",error:{type:"invalid_request_error"}}`, OpenAI
 `{error:{type,param,code}}`, Ollama `{error:"…"}`).
+`identity:openai` sends a benign "who are you?" turn and FAILS if the reply self-identifies as
+"Kiro CLI" or claims host tools/skills "require the Hermes agent" (persona bleed).
 
 Model-dependent checks (tool-call, basic chat, model-normalize) are flagged **flaky**
 and retried; a `FAIL*(n)` may be a one-off prose response, not a hard regression —
