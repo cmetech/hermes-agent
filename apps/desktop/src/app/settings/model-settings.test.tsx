@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 // Radix Select calls scrollIntoView on its items when the content opens; jsdom
@@ -79,6 +79,7 @@ beforeEach(() => {
   getMoaModels.mockResolvedValue(null)
   setModelAssignment.mockResolvedValue({ provider: 'nous', model: 'hermes-4', gateway_tools: [] })
   getRecommendedDefaultModel.mockResolvedValue({ provider: 'nous', model: 'hermes-4', free_tier: null })
+  saveMoaModels.mockImplementation(async body => body)
   setEnvVar.mockResolvedValue({ ok: true })
   getHermesConfigRecord.mockResolvedValue({ agent: { reasoning_effort: 'medium', service_tier: 'normal' } })
   saveHermesConfig.mockResolvedValue({ ok: true })
@@ -161,6 +162,41 @@ function deferred<T>() {
   })
 
   return { promise, resolve }
+}
+
+function moaPreset(overrides: Record<string, unknown> = {}) {
+  return {
+    active_preset: 'default',
+    aggregator: { provider: 'gateway', model: 'gateway-tools-unknown' },
+    aggregator_temperature: 0.2,
+    default_preset: 'default',
+    enabled: true,
+    max_tokens: 2048,
+    presets: {
+      default: {
+        aggregator: { provider: 'gateway', model: 'gateway-tools-unknown' },
+        aggregator_temperature: 0.2,
+        enabled: true,
+        max_tokens: 2048,
+        reference_models: [{ provider: 'gateway', model: 'gateway-no-completion' }],
+        reference_temperature: 0.7
+      }
+    },
+    reference_models: [{ provider: 'gateway', model: 'gateway-no-completion' }],
+    reference_temperature: 0.7,
+    ...overrides
+  }
+}
+
+function rowComboboxes(title: string): HTMLElement[] {
+  const titleNode = screen.getByText(title)
+  const row = titleNode.parentElement?.parentElement
+
+  if (!row) {
+    throw new Error(`Could not find settings row for ${title}`)
+  }
+
+  return within(row).getAllByRole('combobox')
 }
 
 describe('ModelSettings', () => {
@@ -504,6 +540,103 @@ describe('ModelSettings', () => {
         'This saved model is grandfathered and was left unchanged. Choose a verified model when you are ready.'
       )
     ).toBeTruthy()
+    expect(screen.queryByText('backend prose must not be shown')).toBeNull()
+  })
+
+  it('uses reference and aggregator eligibility while preserving saved invalid MoA slots', async () => {
+    const provider = gatewayProvider({
+      capabilities: {
+        ...gatewayProvider().capabilities,
+        auto: {
+          selection_mode: 'automatic',
+          verified: ALL_SUPPORTED
+        },
+        'gateway-completion-only': {
+          selection_mode: 'explicit',
+          verified: { ...ALL_SUPPORTED, tools: 'unsupported' }
+        },
+        'gateway-no-completion': {
+          selection_mode: 'explicit',
+          verified: { ...ALL_SUPPORTED, completion: 'unsupported' }
+        }
+      },
+      models: [
+        'auto',
+        'gateway-good',
+        'gateway-completion-only',
+        'gateway-tools-unknown'
+      ]
+    })
+
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-good' })
+    getGlobalModelOptions.mockResolvedValueOnce({ providers: [provider] })
+    getMoaModels.mockResolvedValueOnce(moaPreset())
+
+    await renderModelSettings()
+    await screen.findByText('Reference 1')
+
+    fireEvent.click(rowComboboxes('Reference 1')[1])
+    expect(screen.queryByRole('option', { name: /^auto/ })).toBeNull()
+    expect(
+      screen.getByRole('option', { name: 'gateway-completion-only' }).getAttribute('aria-disabled')
+    ).not.toBe('true')
+    expect(
+      screen.getByRole('option', { name: /gateway-no-completion.*Needs review/ }).getAttribute('aria-disabled')
+    ).not.toBe('true')
+
+    fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' })
+    fireEvent.click(rowComboboxes('Aggregator')[1])
+    expect(screen.queryByRole('option', { name: /^auto/ })).toBeNull()
+    expect(
+      screen
+        .getByRole('option', { name: /gateway-completion-only.*Does not support tools/ })
+        .getAttribute('aria-disabled')
+    ).toBe('true')
+    expect(
+      screen.getByRole('option', { name: /gateway-tools-unknown.*Needs review/ }).getAttribute('aria-disabled')
+    ).not.toBe('true')
+  })
+
+  it('renders MoA selection warnings without removing the preserved slots', async () => {
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-good' })
+    getGlobalModelOptions.mockResolvedValueOnce({
+      providers: [
+        gatewayProvider({
+          capabilities: {
+            ...gatewayProvider().capabilities,
+            'gateway-no-completion': {
+              selection_mode: 'explicit',
+              verified: { ...ALL_SUPPORTED, completion: 'unsupported' }
+            }
+          }
+        })
+      ]
+    })
+    getMoaModels.mockResolvedValueOnce(moaPreset())
+    saveMoaModels.mockResolvedValueOnce(
+      moaPreset({
+        selection_warnings: [
+          {
+            message: 'backend prose must not be shown',
+            preset: 'default',
+            reason: 'completion-unsupported',
+            slot: 'reference:0'
+          }
+        ]
+      })
+    )
+
+    await renderModelSettings()
+    fireEvent.click(await screen.findByRole('button', { name: 'Set default' }))
+
+    expect(
+      await screen.findByText(
+        'This saved model is grandfathered and was left unchanged. Choose a verified model when you are ready.'
+      )
+    ).toBeTruthy()
+    expect(screen.getByText('Reference 1')).toBeTruthy()
+    expect(screen.getByText('Aggregator')).toBeTruthy()
+    expect(screen.getByText(/gateway · gateway-no-completion/)).toBeTruthy()
     expect(screen.queryByText('backend prose must not be shown')).toBeNull()
   })
 })

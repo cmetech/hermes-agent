@@ -6,6 +6,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { getGlobalModelOptions } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { Plus, X } from '@/lib/icons'
+import { evaluateModelEligibility } from '@/lib/model-eligibility'
 import { cn } from '@/lib/utils'
 
 import { CONTROL_TEXT } from './constants'
@@ -90,9 +91,20 @@ export function FallbackModelsField({
       {rows.map((entry, index) => {
         const providerRow = providers.find(provider => provider.slug === entry.provider)
         const catalog = providerRow?.models ?? []
+
         // Keep an out-of-catalog model selectable so an existing custom
         // provider/model renders instead of showing a blank box.
-        const modelItems = entry.model && !catalog.includes(entry.model) ? [entry.model, ...catalog] : catalog
+        const candidates = entry.model && !catalog.includes(entry.model) ? [entry.model, ...catalog] : catalog
+
+        const modelItems = providerRow
+          ? candidates.filter(model => {
+              const eligibility = evaluateModelEligibility(providerRow, model, 'fallback', {
+                isCurrent: model === entry.model
+              })
+
+              return eligibility.reasonKey !== 'automatic-not-allowed' || eligibility.grandfathered
+            })
+          : candidates
 
         return (
           <div className="flex flex-wrap items-center gap-2" key={index}>
@@ -114,11 +126,31 @@ export function FallbackModelsField({
                 <SelectValue placeholder={m.model} />
               </SelectTrigger>
               <SelectContent>
-                {modelItems.map(model => (
-                  <SelectItem key={model} value={model}>
-                    {model}
-                  </SelectItem>
-                ))}
+                {modelItems.map(model => {
+                  const eligibility = providerRow
+                    ? evaluateModelEligibility(providerRow, model, 'fallback', {
+                        isCurrent: model === entry.model
+                      })
+                    : null
+
+                  const disabled = !!eligibility && !eligibility.eligible && !eligibility.grandfathered
+                  const secondary = eligibility?.reasonKey ? m.eligibilityReasons[eligibility.reasonKey] : ''
+
+                  return (
+                    <SelectItem disabled={disabled} key={model} value={model}>
+                      <span className="flex min-w-0 flex-col">
+                        <span>{model}</span>
+                        {(secondary || eligibility?.grandfathered) && (
+                          <span className="text-[0.65rem] text-muted-foreground">
+                            {[secondary, eligibility?.grandfathered ? m.currentNeedsReview : '']
+                              .filter(Boolean)
+                              .join(' · ')}
+                          </span>
+                        )}
+                      </span>
+                    </SelectItem>
+                  )
+                })}
               </SelectContent>
             </Select>
             <Button

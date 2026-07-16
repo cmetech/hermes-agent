@@ -332,9 +332,14 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     return hasCapabilityContract(auxDraftProviderRow) ? models.filter(model => model !== 'auto') : models
   }, [auxDraftProviderRow])
 
-  const modelsForProvider = useCallback(
-    (provider: string) => providers.find(row => row.slug === provider)?.models ?? [],
-    [providers]
+  const modelsForUsage = useCallback(
+    (provider: ModelOptionProvider, active: string, usage: ModelUsageKind) =>
+      withActive(provider.models ?? [], active).filter(model => {
+        const eligibility = evaluateModelEligibility(provider, model, usage, { isCurrent: model === active })
+
+        return eligibility.reasonKey !== 'automatic-not-allowed' || eligibility.grandfathered
+      }),
+    []
   )
 
   const currentMoaPreset = useMemo(() => {
@@ -390,6 +395,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
       const next: MoaConfigResponse = {
         ...prev,
+        selection_warnings: undefined,
         presets: {
           ...prev.presets,
           [selectedMoaPreset]: updater(prev.presets[selectedMoaPreset])
@@ -528,6 +534,22 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
           )}
         </span>
       </SelectItem>
+    )
+  }
+
+  const renderMoaModelOptions = (providerSlug: string, active: string, usage: ModelUsageKind) => {
+    const provider = providers.find(row => row.slug === providerSlug)
+
+    if (!provider) {
+      return active ? (
+        <SelectItem key={active} value={active}>
+          {active}
+        </SelectItem>
+      ) : null
+    }
+
+    return modelsForUsage(provider, active, usage).map(model =>
+      renderModelOption(provider, model, usage, model === active)
     )
   }
 
@@ -1058,6 +1080,12 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             Configure named presets that appear as models under the Mixture of Agents provider. The aggregator is the
             acting model.
           </p>
+          {!!moa.selection_warnings?.length && (
+            <div className="mb-2 flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+              <AlertTriangle className="size-3.5 shrink-0" />
+              <span>{m.grandfatheredWarning}</span>
+            </div>
+          )}
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <Select onValueChange={setSelectedMoaPreset} value={selectedMoaPreset || moa.default_preset}>
               <SelectTrigger className={cn('min-w-40', CONTROL_TEXT)}>
@@ -1186,11 +1214,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                         <SelectValue placeholder={m.model} />
                       </SelectTrigger>
                       <SelectContent>
-                        {withActive(modelsForProvider(slot.provider), slot.model).map(model => (
-                          <SelectItem key={model} value={model}>
-                            {model}
-                          </SelectItem>
-                        ))}
+                        {renderMoaModelOptions(slot.provider, slot.model, 'moa-reference')}
                       </SelectContent>
                     </Select>
                     <Button
@@ -1263,14 +1287,11 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                       <SelectValue placeholder={m.model} />
                     </SelectTrigger>
                     <SelectContent>
-                      {withActive(
-                        modelsForProvider(currentMoaPreset.aggregator.provider),
-                        currentMoaPreset.aggregator.model
-                      ).map(model => (
-                        <SelectItem key={model} value={model}>
-                          {model}
-                        </SelectItem>
-                      ))}
+                      {renderMoaModelOptions(
+                        currentMoaPreset.aggregator.provider,
+                        currentMoaPreset.aggregator.model,
+                        'moa-aggregator'
+                      )}
                     </SelectContent>
                   </Select>
                 </div>
