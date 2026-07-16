@@ -398,6 +398,10 @@ def main() -> int:
                 r = next(x for x in results if x["name"] == f"toolcall:{k}")
                 _check("surfacing-gap" in r["detail"],
                        f"leak/toolcall:{k} → surfacing-gap (got: {r['detail'][:70]})")
+            for name in ("toolcall-nested-fence:anthropic", "toolcall-invented-name:anthropic"):
+                r = next(x for x in results if x["name"] == name)
+                _check("surfacing-gap" in r["detail"],
+                       f"leak/{name} → surfacing-gap (got: {r['detail'][:70]})")
         except AssertionError as e:
             print(f"  FAIL: {e}"); failures += 1
     finally:
