@@ -128,8 +128,27 @@ def get_excluded_toolsets(slug: str, root: Path | None = None) -> set[str]:
         return set()
 
 
+def get_managed_skills(slug: str, root: Path | None = None) -> set[str]:
+    """Skill identifiers (frontmatter name and/or dir name) that are brand-MANAGED.
+
+    Managed skills are force-updated from the bundled copy when it changes, bypassing
+    the skills-sync "user-modified" skip — so skills we deliver always track what we
+    ship, even on installs whose manifest hash drifted. Fail-OPEN (empty on any error).
+    """
+    try:
+        brand = load_brand(slug, root)
+        mgd = brand.get("curation", {}).get("skills", {}).get("managed", [])
+        return {str(x) for x in mgd} if isinstance(mgd, list) else set()
+    except Exception:
+        return set()
+
+
 def active_hidden_skills(root: Path | None = None) -> set[str]:
     return get_hidden_skills(resolve_active_brand(root), root)
+
+
+def active_managed_skills(root: Path | None = None) -> set[str]:
+    return get_managed_skills(resolve_active_brand(root), root)
 
 
 def active_skill_rename_map(root: Path | None = None) -> dict[str, str]:
