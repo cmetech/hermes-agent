@@ -13,12 +13,13 @@ Endpoint / auth:
   - OpenAI-compatible. Default base URL \`\`http://127.0.0.1:18080/v1\`\`
     (override with \`\`OTTO_BASE_URL\`\`).
   - Bearer auth via \`\`OTTO_API_KEY\`\`. The gateway may run WITHOUT \`\`AUTH_TOKEN\`\`
-    (no auth), but the OpenAI SDK still requires a non-empty key — so when
-    \`\`OTTO_API_KEY\`\` is unset, auth.py substitutes a placeholder for this
-    provider (same mechanism as LM Studio). Set a real \`\`OTTO_API_KEY\`\` only if
-    the gateway was launched with \`\`AUTH_TOKEN\`\`.
+    (no auth). The provider declaration opts into the SDK's non-secret
+    placeholder behavior; set a real \`\`OTTO_API_KEY\`\` only if the gateway was
+    launched with \`\`AUTH_TOKEN\`\`.
   - Model \`\`auto\`\` (the safe default) lets the gateway use kiro's current model;
     \`\`fetch_models\`\` lists the live catalog from \`\`/v1/models\`\`.
+  - Verified model metadata comes from the gateway's
+    \`\`/v1/model-capabilities\`\` endpoint.
 
 Adding this directory is the entire wiring: the loader enumerates
 plugins/model-providers/, \`\`register_provider\`\` self-registers the profile, and
@@ -42,6 +43,8 @@ ${d.slug} = ProviderProfile(
     env_vars=("OTTO_API_KEY", "OTTO_BASE_URL"),
     base_url="http://127.0.0.1:18080/v1",
     auth_type="api_key",
+    supports_unauthenticated=True,
+    model_capabilities_path="model-capabilities",
     # Safe default; the picker also shows live ids from GET /v1/models.
     fallback_models=("auto",),
     # The gateway reports honest-zero usage and does not cap output itself;

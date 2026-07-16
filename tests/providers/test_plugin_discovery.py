@@ -36,7 +36,12 @@ def test_bundled_plugins_discovered():
     plugins_dir = REPO_ROOT / "plugins" / "model-providers"
     assert plugins_dir.is_dir(), f"Missing {plugins_dir}"
 
-    child_dirs = [c for c in plugins_dir.iterdir() if c.is_dir()]
+    child_dirs = [
+        c
+        for c in plugins_dir.iterdir()
+        if c.is_dir()
+        and ((c / "__init__.py").exists() or (c / "plugin.yaml").exists())
+    ]
     assert len(child_dirs) >= 28, f"Expected at least 28 provider plugins, found {len(child_dirs)}"
 
     for child in child_dirs:
@@ -55,7 +60,12 @@ def test_all_profiles_register():
     from providers import list_providers
 
     plugins_dir = REPO_ROOT / "plugins" / "model-providers"
-    plugin_dir_count = sum(1 for c in plugins_dir.iterdir() if c.is_dir())
+    plugin_dir_count = sum(
+        1
+        for c in plugins_dir.iterdir()
+        if c.is_dir()
+        and ((c / "__init__.py").exists() or (c / "plugin.yaml").exists())
+    )
 
     profiles = list_providers()
     names = sorted(p.name for p in profiles)
@@ -71,6 +81,29 @@ def test_all_profiles_register():
         "minimax-oauth", "gmi", "xiaomi", "alibaba-coding-plan", "fireworks",
     ):
         assert required in names, f"Missing profile: {required}"
+
+
+def test_lmstudio_profile_declares_noauth_and_preserves_native_model_filtering(monkeypatch):
+    """LM Studio owns no-auth readiness and its native catalog behavior."""
+    _clear_provider_caches()
+    from providers import get_provider_profile
+
+    profile = get_provider_profile("lmstudio")
+    assert profile is not None
+    assert profile.supports_unauthenticated is True
+
+    monkeypatch.setattr(
+        "hermes_cli.models._lmstudio_fetch_raw_models",
+        lambda **kwargs: [
+            {"key": "text-embedding-nomic", "type": "embedding"},
+            {"key": "qwen/qwen3-coder-30b", "type": "llm"},
+        ],
+    )
+
+    assert profile.fetch_models(
+        api_key="",
+        base_url="http://127.0.0.1:1234/v1",
+    ) == ["qwen/qwen3-coder-30b"]
 
 
 def test_user_plugin_overrides_bundled(tmp_path, monkeypatch):

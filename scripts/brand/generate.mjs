@@ -4,7 +4,6 @@ import path from 'node:path'
 import { loadDescriptor } from './descriptor.mjs'
 import { resolveActiveBrand } from './active.mjs'
 import { providerEmitter } from './emitters/provider.mjs'
-import { authNoauthEmitter } from './emitters/auth-noauth.mjs'
 import { pyprojectScriptsEmitter } from './emitters/pyproject-scripts.mjs'
 import { skinEmitter } from './emitters/skin.mjs'
 import { packageJsonEmitter } from './emitters/package-json.mjs'
@@ -15,7 +14,6 @@ import { homeEmitter } from './emitters/home.mjs'
 
 export const DEFAULT_EMITTERS = [
   providerEmitter,
-  authNoauthEmitter,
   pyprojectScriptsEmitter,
   skinEmitter,
   packageJsonEmitter,
