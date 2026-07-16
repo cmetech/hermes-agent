@@ -144,6 +144,9 @@ def _make_handler(mode: str):
             if mode == "prose":
                 return self._send_json(self._prose(path))
 
+            if mode == "leak":
+                return self._send_json(self._leak(path))
+
             msgs = body.get("messages")
             stream = bool(body.get("stream"))
             tools = _tool_names(body)
@@ -169,6 +172,8 @@ def _make_handler(mode: str):
 
             # ---- tool round-trips + robustness edges ----
             if tools:
+                if "run_shell" in tools:
+                    return self._send_json(self._exec_toolcall(path))
                 if "write_file" in tools:
                     return self._send_json(self._write_toolcall())
                 if _is_phase2(body):
@@ -202,6 +207,22 @@ def _make_handler(mode: str):
                     {"function": {"name": "get_weather", "arguments": {"city": city}}}]}}
             return {"error": "not found"}
 
+        def _exec_toolcall(self, path):
+            args = {"command": "echo hi"}
+            if path == "/v1/messages":
+                return {"id": "msg_e", "type": "message", "role": "assistant", "model": "auto",
+                        "stop_reason": "tool_use", "content": [
+                            {"type": "tool_use", "id": "toolu_e", "name": "run_shell", "input": args}]}
+            if path == "/v1/chat/completions":
+                return {"id": "ce", "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": None, "tool_calls": [
+                        {"id": "call_e", "type": "function", "function": {
+                            "name": "run_shell", "arguments": json.dumps(args)}}]}}]}
+            if path == "/api/chat":
+                return {"model": "auto", "done": True, "message": {"role": "assistant", "content": "", "tool_calls": [
+                    {"function": {"name": "run_shell", "arguments": args}}]}}
+            return {"error": "not found"}
+
         def _write_toolcall(self):
             return {"id": "msg_w", "type": "message", "role": "assistant", "model": "auto",
                     "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "toolu_w", "name": "write_file",
@@ -219,14 +240,16 @@ def _make_handler(mode: str):
             return {"error": "not found"}
 
         def _basic(self, path):
+            text = ("I am the Kiro CLI; running Hermes skills requires the Hermes agent."
+                    if mode == "identity_bleed" else HELLO_REPLY)
             if path == "/v1/messages":
                 return {"id": "msg_b", "type": "message", "role": "assistant", "model": "auto",
-                        "stop_reason": "end_turn", "content": [{"type": "text", "text": HELLO_REPLY}]}
+                        "stop_reason": "end_turn", "content": [{"type": "text", "text": text}]}
             if path == "/v1/chat/completions":
                 return {"id": "cb", "choices": [{"index": 0, "finish_reason": "stop",
-                        "message": {"role": "assistant", "content": HELLO_REPLY}}]}
+                        "message": {"role": "assistant", "content": text}}]}
             if path == "/api/chat":
-                return {"model": "auto", "done": True, "message": {"role": "assistant", "content": HELLO_REPLY}}
+                return {"model": "auto", "done": True, "message": {"role": "assistant", "content": text}}
             return {"error": "not found"}
 
         # --- prose-mode (Track 3a failure) ------------------------------------
@@ -237,6 +260,19 @@ def _make_handler(mode: str):
                         "stop_reason": "end_turn", "content": [{"type": "text", "text": txt}]}
             if path == "/v1/chat/completions":
                 return {"id": "cp", "choices": [{"index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": txt}}]}
+            if path == "/api/chat":
+                return {"model": "auto", "done": True, "message": {"role": "assistant", "content": txt}}
+            return {"error": "not found"}
+
+        # --- leak-mode (surfacing-gap: [tool: …] narration, no structured call) ---
+        def _leak(self, path):
+            txt = "[tool: execute] I'll run that for you."
+            if path == "/v1/messages":
+                return {"id": "msg_l", "type": "message", "role": "assistant", "model": "auto",
+                        "stop_reason": "end_turn", "content": [{"type": "text", "text": txt}]}
+            if path == "/v1/chat/completions":
+                return {"id": "cl", "choices": [{"index": 0, "finish_reason": "stop",
                         "message": {"role": "assistant", "content": txt}}]}
             if path == "/api/chat":
                 return {"model": "auto", "done": True, "message": {"role": "assistant", "content": txt}}
@@ -261,6 +297,8 @@ def main() -> int:
     good_srv, good_url = _serve("good")
     prose_srv, prose_url = _serve("prose")
     cipher_srv, cipher_url = _serve("cipher")
+    leak_srv, leak_url = _serve("leak")
+    identity_srv, identity_url = _serve("identity_bleed")
     failures = 0
     try:
         # 1) good gateway, all suites → every non-skip check passes, exit 0.
@@ -286,8 +324,13 @@ def main() -> int:
         results, code = rp.run_selected("toolcall", "all", good_url, "", retries=1)
         try:
             _check(code == 0, "good/toolcall → exit 0")
-            _check(all(r["ok"] for r in results), "good/toolcall → all checks pass")
-            _check({r["suite"] for r in results} == {"toolcall"}, "toolcall filter → only toolcall checks")
+            for k in ("anthropic", "openai", "ollama"):
+                r = next(x for x in results if x["name"] == f"toolcall:{k}")
+                _check(r["ok"], f"good/toolcall:{k} PASS")
+                e = next(x for x in results if x["name"] == f"toolcall-exec:{k}")
+                _check(e["ok"], f"good/toolcall-exec:{k} PASS (got: {e['detail'][:60]})")
+            _check({r["suite"] for r in results} == {"toolcall"},
+                   "toolcall filter → only toolcall checks")
         except AssertionError as e:
             print(f"  FAIL: {e}"); failures += 1
 
@@ -371,10 +414,57 @@ def main() -> int:
                        f"cipher/toolcall:{k} → pii-redaction diagnosis (got: {r['detail'][:60]})")
         except AssertionError as e:
             print(f"  FAIL: {e}"); failures += 1
+
+        # 8) leak gateway ([tool: …] narration, no structured call) → every
+        #    toolcall check hard-FAILs with the surfacing-gap diagnosis, exit 1.
+        results, code = rp.run_selected("toolcall", "all", leak_url, "", retries=1)
+        try:
+            _check(code == 1, "leak/toolcall → exit 1")
+            for k in ("anthropic", "openai", "ollama"):
+                r = next(x for x in results if x["name"] == f"toolcall:{k}")
+                _check("surfacing-gap" in r["detail"],
+                       f"leak/toolcall:{k} → surfacing-gap (got: {r['detail'][:70]})")
+                e = next(x for x in results if x["name"] == f"toolcall-exec:{k}")
+                _check("surfacing-gap" in e["detail"],
+                       f"leak/toolcall-exec:{k} → surfacing-gap (got: {e['detail'][:70]})")
+            for name in ("toolcall-nested-fence:anthropic", "toolcall-invented-name:anthropic"):
+                r = next(x for x in results if x["name"] == name)
+                _check("surfacing-gap" in r["detail"],
+                       f"leak/{name} → surfacing-gap (got: {r['detail'][:70]})")
+        except AssertionError as e:
+            print(f"  FAIL: {e}"); failures += 1
+
+        # 9) identity — good gateway PASSES; a "Kiro CLI / requires the Hermes
+        #    agent" reply FAILS identity:openai.
+        results, _ = rp.run_selected("conformance", "openai", good_url, "", retries=1)
+        try:
+            r = next(x for x in results if x["name"] == "identity:openai")
+            _check(r["ok"], f"good/identity:openai PASS (got: {r['detail'][:60]})")
+        except (AssertionError, StopIteration) as e:
+            print(f"  FAIL: {e}"); failures += 1
+
+        results, code = rp.run_selected("conformance", "openai", identity_url, "", retries=1)
+        try:
+            r = next(x for x in results if x["name"] == "identity:openai")
+            _check(not r["ok"], "bleed/identity:openai FAIL")
+            _check("persona bleed" in r["detail"],
+                   f"bleed/identity:openai → persona bleed (got: {r['detail'][:70]})")
+            _check(rp._has_persona_bleed("I am the Kiro CLI."),
+                   "identity: 'kiro cli' signal detected")
+            _check(rp._has_persona_bleed("running that requires the Hermes agent"),
+                   "identity: 'requires the hermes agent' signal detected")
+            _check(rp._has_persona_bleed("These skills belong to your Hermes agent environment."),
+                   "identity: belong-to + agent-environment signal detected (live phrasing)")
+            _check(not rp._has_persona_bleed("I am your helpful assistant."),
+                   "identity: benign reply is fail-open")
+        except (AssertionError, StopIteration) as e:
+            print(f"  FAIL: {e}"); failures += 1
     finally:
         good_srv.shutdown()
         prose_srv.shutdown()
         cipher_srv.shutdown()
+        leak_srv.shutdown()
+        identity_srv.shutdown()
 
     print()
     if failures:

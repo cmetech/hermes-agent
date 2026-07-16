@@ -203,6 +203,33 @@ _WRITE_TOOL_ANTHROPIC = {
         "required": ["path", "content"],
     },
 }
+_EXEC_TOOL_ANTHROPIC = {
+    "name": "run_shell",
+    "description": "Run a shell command and return its output",
+    "input_schema": {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
+    },
+}
+_EXEC_FUNCTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "run_shell",
+        "description": "Run a shell command and return its output",
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+}
+EXEC_TOOL_BY_SURFACE = {
+    "anthropic": _EXEC_TOOL_ANTHROPIC,
+    "openai": _EXEC_FUNCTION_TOOL,
+    "ollama": _EXEC_FUNCTION_TOOL,
+}
+EXEC_PROMPT = "Run this command and show me its exact output: echo hi"
 _USER_MSG = {"role": "user", "content": PROMPT}
 _HELLO_MSG = {"role": "user", "content": HELLO}
 
@@ -437,6 +464,21 @@ def final_answer_ok(text: str) -> bool:
         return False
     low = text.lower()
     return any(h in low for h in _WEATHER_HINTS)
+
+
+_LEAK_MARKER = "[tool:"
+
+
+def _bracket_tool_leak(text: str) -> bool:
+    """True iff assistant text carries a `[tool: …]` tool-call NARRATION leak —
+    kiro's tool call rendered as prose instead of structured tool_calls."""
+    return _LEAK_MARKER in (text or "").lower()
+
+
+_LEAK_DETAIL = (
+    "surfacing-gap: kiro tool call leaked as '[tool: …]' narration instead of "
+    "structured tool_calls"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -676,6 +718,7 @@ def run_surface(spec, gw_url: str, tool_result: str = TOOL_RESULT) -> dict:
         "error": None,
         "diagnosis": None,
         "http": None,
+        "observed_text": "",
     }
 
     cursor = capture_cursor(gw_url)
@@ -690,10 +733,27 @@ def run_surface(spec, gw_url: str, tool_result: str = TOOL_RESULT) -> dict:
         result["error"] = f"HTTP {status}, non-JSON body: {raw[:200]}"
     tc = spec["extract"](resp)
     result["tool_call"] = tc
+    observed = _client_observed_text(spec, resp)
+    result["observed_text"] = observed
+
+    # A `[tool: …]` leak is a hard surfacing-gap FAIL even if a call is present.
+    if _bracket_tool_leak(observed):
+        enabled, frames, note = fetch_capture(gw_url, cursor)
+        _, _, frame = classify_capture(frames, observed)
+        result["phase1"] = False
+        result["diagnosis"] = {
+            "code": "surfacing-gap",
+            "message": _LEAK_DETAIL,
+            "capture_note": note,
+            "capture_enabled": enabled,
+            "first_frame": format_frame(frame) if frame else None,
+            "observed_text": (observed or "")[:200],
+        }
+        return result
+
     result["phase1"] = toolcall_ok(tc)
 
     if not result["phase1"]:
-        observed = _client_observed_text(spec, resp)
         enabled, frames, note = fetch_capture(gw_url, cursor)
         if tc is not None:
             # A structured tool_call WAS surfaced — the surfacing apparatus works;
@@ -754,6 +814,51 @@ def _toolcall_check(surface_key):
     return fn
 
 
+def _exec_check(surface_key):
+    """Offer a single run_shell tool + an execute prompt; assert a STRUCTURED
+    run_shell call (not `[tool: …]` narration). Reproduces the live desktop
+    surfacing gap the get_weather round-trip missed. Single-phase."""
+    spec = SURFACE_BY_KEY[surface_key]
+    tool = EXEC_TOOL_BY_SURFACE[surface_key]
+
+    def fn(gw_url):
+        cursor = capture_cursor(gw_url)
+        msg = {"role": "user", "content": EXEC_PROMPT}
+        if surface_key == "anthropic":
+            path, headers = "/v1/messages", {"anthropic-version": ANTHROPIC_VERSION}
+            body = {"model": "auto", "max_tokens": 256, "messages": [msg], "tools": [tool]}
+        elif surface_key == "openai":
+            path, headers = "/v1/chat/completions", {}
+            body = {"model": "auto", "messages": [msg], "tools": [tool]}
+        else:  # ollama
+            path, headers = "/api/chat", {}
+            body = {"model": "auto", "stream": False, "messages": [msg], "tools": [tool]}
+
+        status, resp, raw = post(gw_url + path, body, headers)
+        if status == 0:
+            return False, f"connection failed: {raw}"
+
+        observed = _client_observed_text(spec, resp)
+        if _bracket_tool_leak(observed):
+            return False, f"{_LEAK_DETAIL} (HTTP {status}, text={observed[:80]!r})"
+
+        tc = spec["extract"](resp)
+        if tc and (tc.get("name") or "").strip().lower() == "run_shell":
+            return True, f"structured run_shell call surfaced (args={tc.get('args')})"
+
+        enabled, frames, note = fetch_capture(gw_url, cursor)
+        code, human, frame = classify_capture(frames, observed)
+        parts = [f"HTTP {status}", f"no structured run_shell call (got {tc})",
+                 f"diagnosis[{code}]: {human}"]
+        if note:
+            parts.append(f"capture: {note}")
+        if frame:
+            parts.append(f"frame: {format_frame(frame)}")
+        return False, " | ".join(parts)
+
+    return fn
+
+
 # --------------------------------------------------------------------------- #
 # toolcall suite — robustness edges (Anthropic-first; model-dependent)
 # --------------------------------------------------------------------------- #
@@ -772,6 +877,8 @@ def check_nested_fence_anthropic(gw_url):
         "tools": [_WRITE_TOOL_ANTHROPIC],
     }
     status, resp, raw = post(gw_url + "/v1/messages", body, {"anthropic-version": ANTHROPIC_VERSION})
+    if _bracket_tool_leak(anthropic_final(resp)):
+        return False, _LEAK_DETAIL
     tc = anthropic_extract(resp)
     if not tc or (tc.get("name") or "").lower() != "write_file":
         return False, f"expected write_file tool_use, got {tc} (HTTP {status})"
@@ -794,6 +901,8 @@ def check_invented_name_anthropic(gw_url):
         "tools": [_ANTHROPIC_TOOL],
     }
     status, resp, raw = post(gw_url + "/v1/messages", body, {"anthropic-version": ANTHROPIC_VERSION})
+    if _bracket_tool_leak(anthropic_final(resp)):
+        return False, _LEAK_DETAIL
     tc = anthropic_extract(resp)
     if not tc:
         return False, f"no structured tool_call surfaced (HTTP {status})"
@@ -879,6 +988,33 @@ def _basic_ollama(gw_url):
 
 
 _BASIC = {"anthropic": _basic_anthropic, "openai": _basic_openai, "ollama": _basic_ollama}
+
+
+_IDENTITY_BLEED = ("kiro cli", "requires the hermes agent")
+
+
+def _has_persona_bleed(text: str) -> bool:
+    """True iff the reply leaks kiro's built-in identity or a hallucinated
+    capability boundary (fail-OPEN: only these specific signals trip it)."""
+    low = (text or "").lower()
+    if any(s in low for s in _IDENTITY_BLEED):
+        return True
+    # Live phrasing: "These skills belong to your Hermes agent environment."
+    return "belong" in low and "agent environment" in low
+
+
+def check_identity_openai(gw_url):
+    body = {"model": "auto",
+            "messages": [{"role": "user", "content": "Who are you? Answer in one sentence."}]}
+    status, resp, raw = post(gw_url + "/v1/chat/completions", body)
+    if status != 200:
+        return False, f"HTTP {status}: {raw[:160]}"
+    txt = openai_final(resp)
+    if not txt:
+        return False, f"200 but empty message.content: {raw[:160]}"
+    if _has_persona_bleed(txt):
+        return False, f"persona bleed / capability-boundary refusal: {txt[:160]!r}"
+    return True, f"identity clean: {txt[:80]!r}"
 
 
 def _stream_anthropic(gw_url):
@@ -1028,6 +1164,9 @@ def build_registry():
     # toolcall robustness edges (Anthropic-first)
     reg.append(Check("toolcall-nested-fence:anthropic", "toolcall", "anthropic", check_nested_fence_anthropic, flaky=True))
     reg.append(Check("toolcall-invented-name:anthropic", "toolcall", "anthropic", check_invented_name_anthropic, flaky=True))
+    # execute-tool surfacing (model-dependent) — reproduces the [tool: …] leak
+    for k in SURFACE_KEYS:
+        reg.append(Check(f"toolcall-exec:{k}", "toolcall", k, _exec_check(k), flaky=True))
 
     # conformance suite — deterministic infrastructure
     reg.append(Check("health", "conformance", "n/a", check_health, js=True))
@@ -1041,6 +1180,8 @@ def build_registry():
         reg.append(Check(f"stream-order:{k}", "conformance", k, _STREAM[k], js=(k == "anthropic")))
     # model normalize/auto (model-dependent, Anthropic)
     reg.append(Check("model-normalize:anthropic", "conformance", "anthropic", check_model_normalize_anthropic, flaky=True, js=True))
+    # persona / identity bleed (model-dependent, OpenAI surface = desktop path)
+    reg.append(Check("identity:openai", "conformance", "openai", check_identity_openai, flaky=True))
     # validation errors (deterministic, per-surface envelopes)
     reg.append(Check("validation-max-tokens:anthropic", "conformance", "anthropic", _validation_anthropic_max_tokens, js=True))
     for k in SURFACE_KEYS:
