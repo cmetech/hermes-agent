@@ -1,6 +1,6 @@
 {
   "name": "ericsson",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Shared Ericsson coworker capabilities (OTTO + LOOP24)",
   "skills": [
     "skills/ericsson/workflow-orchestrator",
@@ -35,11 +35,6 @@
       "password": true
     },
     {
-      "key": "GLEAN_MCP_URL",
-      "description": "Glean MCP endpoint (internal document search)",
-      "category": "tool"
-    },
-    {
       "key": "GLEAN_API_TOKEN",
       "description": "Glean API token",
       "category": "tool",
@@ -51,6 +46,6 @@
       "category": "tool"
     }
   ],
-  "vendoredFrom": "4c9f19626e457dd4725fe94e44867ca146d9c33b",
+  "vendoredFrom": "dae405ede7049b621e502d9259f97481c940a65b",
   "mcpServersFile": "mcp-servers.yaml"
 }
