@@ -135,6 +135,25 @@ def test_auto_is_rejected_for_every_non_main_usage(usage):
     )
 
 
+@pytest.mark.parametrize(
+    "usage",
+    ["fallback", "auxiliary", "vision", "moa-reference", "moa-aggregator"],
+)
+def test_non_main_auto_is_rejected_even_with_explicit_supported_metadata(usage):
+    decision = _evaluate(
+        model="auto",
+        usage=usage,
+        selection_mode="explicit",
+        verified={key: "supported" for key in CAPABILITY_KEYS},
+    )
+
+    assert decision == ModelEligibility(
+        eligible=False,
+        reason="automatic-not-allowed",
+        message="Automatic routing is only allowed for the main model.",
+    )
+
+
 def test_other_automatic_models_are_not_the_main_auto_exception():
     decision = _evaluate(
         model="automatic-alias",
@@ -177,6 +196,36 @@ def test_non_ready_catalog_status_is_the_stable_failure_reason(status):
     assert decision.reason == status
     assert decision.message
     assert decision.grandfathered is False
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "authentication-required",
+        "gateway-upgrade-required",
+        "gateway-unreachable",
+        "catalog-empty",
+        "capability-response-invalid",
+        "unknown",
+    ],
+)
+@pytest.mark.parametrize("exact_existing_assignment", [False, True])
+def test_non_ready_catalog_status_precedes_absent_live_model(
+    status, exact_existing_assignment
+):
+    decision = _evaluate(
+        catalog_status=status,
+        is_live=False,
+        exact_existing_assignment=exact_existing_assignment,
+    )
+
+    assert decision.reason == status
+    assert decision.eligible is exact_existing_assignment
+    assert decision.grandfathered is exact_existing_assignment
+    if exact_existing_assignment:
+        assert decision.message.startswith(
+            "The existing assignment was preserved"
+        )
 
 
 def test_provider_without_capability_contract_remains_legacy_compatible():

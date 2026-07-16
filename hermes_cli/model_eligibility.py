@@ -116,7 +116,17 @@ def evaluate_model_eligibility(
             message="Automatic routing is allowed for the main model.",
         )
 
-    if selection_mode == "automatic":
+    if catalog_status != "ready":
+        return _ineligible(
+            catalog_status,
+            _CATALOG_STATUS_MESSAGES.get(
+                catalog_status,
+                _CATALOG_STATUS_MESSAGES["unknown"],
+            ),
+            exact_existing_assignment=exact_existing_assignment,
+        )
+
+    if model == "auto" or selection_mode == "automatic":
         return _ineligible(
             "automatic-not-allowed",
             "Automatic routing is only allowed for the main model.",
@@ -127,16 +137,6 @@ def evaluate_model_eligibility(
         return _ineligible(
             "model-not-live",
             "This model is not present in the provider's live model list.",
-            exact_existing_assignment=exact_existing_assignment,
-        )
-
-    if catalog_status != "ready":
-        return _ineligible(
-            catalog_status,
-            _CATALOG_STATUS_MESSAGES.get(
-                catalog_status,
-                _CATALOG_STATUS_MESSAGES["unknown"],
-            ),
             exact_existing_assignment=exact_existing_assignment,
         )
 
