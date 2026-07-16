@@ -36,7 +36,15 @@ def make_bundle(root: Path, version: str = "0.2.0", requires_env=None) -> Path:
     _write(b / "plugins/ericsson-jira/__init__.py", "")
     _write(b / "mcp/outlook-mcp/run_server.py", "# server")
     _write(b / "mcp/mcp-servers.yaml",
-           "mcp_servers:\n  outlook:\n    command: python\n    args: [\"${CAPABILITY_DIR}/outlook-mcp/run_server.py\"]\n")
+           "mcp_servers:\n"
+           "  outlook:\n"
+           "    command: python\n"
+           "    args: [\"${CAPABILITY_DIR}/outlook-mcp/run_server.py\"]\n"
+           "  glean:\n"
+           "    enabled: false\n"
+           "    url: https://default.example.test/mcp\n"
+           "    headers:\n"
+           "      Authorization: \"Bearer ${GLEAN_API_TOKEN}\"\n")
     _write(b / "workflows/my-tickets-summary.yml", "name: my-tickets-summary\n")
     return b
 
@@ -124,6 +132,43 @@ def test_stage_bundle_never_clobbers_user_mcp(tmp_path, home, fake_config):
     b = make_bundle(tmp_path)
     cs.stage_bundle(b, "ericsson", home)
     assert store["config"]["mcp_servers"]["outlook"] == {"command": "custom"}
+
+
+def test_stage_bundle_backfills_only_blank_mcp_url(tmp_path, home, fake_config):
+    store, _ = fake_config
+    store["config"] = {
+        "mcp_servers": {
+            "glean": {
+                "enabled": True,
+                "url": "   ",
+                "headers": {"X-User": "preserve"},
+            }
+        }
+    }
+    b = make_bundle(tmp_path)
+
+    cs.stage_bundle(b, "ericsson", home)
+
+    assert store["config"]["mcp_servers"]["glean"] == {
+        "enabled": True,
+        "url": "https://default.example.test/mcp",
+        "headers": {"X-User": "preserve"},
+    }
+
+
+def test_stage_bundle_preserves_custom_mcp_url(tmp_path, home, fake_config):
+    store, _ = fake_config
+    glean = {
+        "url": "https://custom.example.test/mcp",
+        "headers": {"X-User": "preserve"},
+    }
+    store["config"] = {"mcp_servers": {"glean": glean}}
+    before = json.loads(json.dumps(glean))
+    b = make_bundle(tmp_path)
+
+    cs.stage_bundle(b, "ericsson", home)
+
+    assert store["config"]["mcp_servers"]["glean"] == before
 
 
 def test_stage_brand_capabilities_end_to_end(tmp_path, home, fake_config, monkeypatch):
