@@ -172,6 +172,8 @@ def _make_handler(mode: str):
 
             # ---- tool round-trips + robustness edges ----
             if tools:
+                if "run_shell" in tools:
+                    return self._send_json(self._exec_toolcall(path))
                 if "write_file" in tools:
                     return self._send_json(self._write_toolcall())
                 if _is_phase2(body):
@@ -203,6 +205,22 @@ def _make_handler(mode: str):
             if path == "/api/chat":
                 return {"model": "auto", "done": True, "message": {"role": "assistant", "content": "", "tool_calls": [
                     {"function": {"name": "get_weather", "arguments": {"city": city}}}]}}
+            return {"error": "not found"}
+
+        def _exec_toolcall(self, path):
+            args = {"command": "echo hi"}
+            if path == "/v1/messages":
+                return {"id": "msg_e", "type": "message", "role": "assistant", "model": "auto",
+                        "stop_reason": "tool_use", "content": [
+                            {"type": "tool_use", "id": "toolu_e", "name": "run_shell", "input": args}]}
+            if path == "/v1/chat/completions":
+                return {"id": "ce", "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": None, "tool_calls": [
+                        {"id": "call_e", "type": "function", "function": {
+                            "name": "run_shell", "arguments": json.dumps(args)}}]}}]}
+            if path == "/api/chat":
+                return {"model": "auto", "done": True, "message": {"role": "assistant", "content": "", "tool_calls": [
+                    {"function": {"name": "run_shell", "arguments": args}}]}}
             return {"error": "not found"}
 
         def _write_toolcall(self):
@@ -303,8 +321,11 @@ def main() -> int:
         results, code = rp.run_selected("toolcall", "all", good_url, "", retries=1)
         try:
             _check(code == 0, "good/toolcall → exit 0")
-            _check(all(r["ok"] for r in results), "good/toolcall → all checks pass")
-            _check({r["suite"] for r in results} == {"toolcall"}, "toolcall filter → only toolcall checks")
+            for k in ("anthropic", "openai", "ollama"):
+                r = next(x for x in results if x["name"] == f"toolcall:{k}")
+                _check(r["ok"], f"good/toolcall:{k} PASS")
+                e = next(x for x in results if x["name"] == f"toolcall-exec:{k}")
+                _check(e["ok"], f"good/toolcall-exec:{k} PASS (got: {e['detail'][:60]})")
         except AssertionError as e:
             print(f"  FAIL: {e}"); failures += 1
 
@@ -398,6 +419,9 @@ def main() -> int:
                 r = next(x for x in results if x["name"] == f"toolcall:{k}")
                 _check("surfacing-gap" in r["detail"],
                        f"leak/toolcall:{k} → surfacing-gap (got: {r['detail'][:70]})")
+                e = next(x for x in results if x["name"] == f"toolcall-exec:{k}")
+                _check("surfacing-gap" in e["detail"],
+                       f"leak/toolcall-exec:{k} → surfacing-gap (got: {e['detail'][:70]})")
             for name in ("toolcall-nested-fence:anthropic", "toolcall-invented-name:anthropic"):
                 r = next(x for x in results if x["name"] == name)
                 _check("surfacing-gap" in r["detail"],

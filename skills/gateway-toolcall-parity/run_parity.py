@@ -203,6 +203,33 @@ _WRITE_TOOL_ANTHROPIC = {
         "required": ["path", "content"],
     },
 }
+_EXEC_TOOL_ANTHROPIC = {
+    "name": "run_shell",
+    "description": "Run a shell command and return its output",
+    "input_schema": {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
+    },
+}
+_EXEC_FUNCTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "run_shell",
+        "description": "Run a shell command and return its output",
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+}
+EXEC_TOOL_BY_SURFACE = {
+    "anthropic": _EXEC_TOOL_ANTHROPIC,
+    "openai": _EXEC_FUNCTION_TOOL,
+    "ollama": _EXEC_FUNCTION_TOOL,
+}
+EXEC_PROMPT = "Run this command and show me its exact output: echo hi"
 _USER_MSG = {"role": "user", "content": PROMPT}
 _HELLO_MSG = {"role": "user", "content": HELLO}
 
@@ -787,6 +814,51 @@ def _toolcall_check(surface_key):
     return fn
 
 
+def _exec_check(surface_key):
+    """Offer a single run_shell tool + an execute prompt; assert a STRUCTURED
+    run_shell call (not `[tool: …]` narration). Reproduces the live desktop
+    surfacing gap the get_weather round-trip missed. Single-phase."""
+    spec = SURFACE_BY_KEY[surface_key]
+    tool = EXEC_TOOL_BY_SURFACE[surface_key]
+
+    def fn(gw_url):
+        cursor = capture_cursor(gw_url)
+        msg = {"role": "user", "content": EXEC_PROMPT}
+        if surface_key == "anthropic":
+            path, headers = "/v1/messages", {"anthropic-version": ANTHROPIC_VERSION}
+            body = {"model": "auto", "max_tokens": 256, "messages": [msg], "tools": [tool]}
+        elif surface_key == "openai":
+            path, headers = "/v1/chat/completions", {}
+            body = {"model": "auto", "messages": [msg], "tools": [tool]}
+        else:  # ollama
+            path, headers = "/api/chat", {}
+            body = {"model": "auto", "stream": False, "messages": [msg], "tools": [tool]}
+
+        status, resp, raw = post(gw_url + path, body, headers)
+        if status == 0:
+            return False, f"connection failed: {raw}"
+
+        observed = _client_observed_text(spec, resp)
+        if _bracket_tool_leak(observed):
+            return False, f"{_LEAK_DETAIL} (HTTP {status}, text={observed[:80]!r})"
+
+        tc = spec["extract"](resp)
+        if tc and (tc.get("name") or "").strip().lower() == "run_shell":
+            return True, f"structured run_shell call surfaced (args={tc.get('args')})"
+
+        enabled, frames, note = fetch_capture(gw_url, cursor)
+        code, human, frame = classify_capture(frames, observed)
+        parts = [f"HTTP {status}", f"no structured run_shell call (got {tc})",
+                 f"diagnosis[{code}]: {human}"]
+        if note:
+            parts.append(f"capture: {note}")
+        if frame:
+            parts.append(f"frame: {format_frame(frame)}")
+        return False, " | ".join(parts)
+
+    return fn
+
+
 # --------------------------------------------------------------------------- #
 # toolcall suite — robustness edges (Anthropic-first; model-dependent)
 # --------------------------------------------------------------------------- #
@@ -1065,6 +1137,9 @@ def build_registry():
     # toolcall robustness edges (Anthropic-first)
     reg.append(Check("toolcall-nested-fence:anthropic", "toolcall", "anthropic", check_nested_fence_anthropic, flaky=True))
     reg.append(Check("toolcall-invented-name:anthropic", "toolcall", "anthropic", check_invented_name_anthropic, flaky=True))
+    # execute-tool surfacing (model-dependent) — reproduces the [tool: …] leak
+    for k in SURFACE_KEYS:
+        reg.append(Check(f"toolcall-exec:{k}", "toolcall", k, _exec_check(k), flaky=True))
 
     # conformance suite — deterministic infrastructure
     reg.append(Check("health", "conformance", "n/a", check_health, js=True))
