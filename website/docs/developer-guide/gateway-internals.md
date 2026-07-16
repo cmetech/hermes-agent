@@ -92,15 +92,25 @@ does not own, start, restart, repair, or upgrade the Gateway. In particular,
 do **not** use `hermes gateway start` for inference failures: that command
 starts the Hermes messaging gateway described by the rest of this page.
 
-For source development, the repository's `DEV.md` documents this command from
-the `hermes-agent` checkout, which enters the sibling `otto-gateway` checkout:
+The inference Gateway lives in a separate `otto-gateway` repository; it is not
+vendored inside `hermes-agent`. For source development, obtain or locate the
+approved team checkout, enter that repository, and run:
 
 ```bash
-cd ../otto-gateway
 make run
 ```
 
-`kiro-cli` must be on `PATH`.
+`kiro-cli` must be on `PATH`. In the current cmetech workspace layout, one
+example from the `hermes-agent` repository is:
+
+```bash
+cd ../../otto_app/otto-gateway
+make run
+```
+
+That relative path is an example, not a portable repository contract. If the
+Gateway checkout is absent, request its repository access or approved location
+from the deployment operator.
 
 For a managed or pilot deployment, use that inference Gateway deployment's
 approved installer or service procedure to restart or upgrade it. Co-Worker
