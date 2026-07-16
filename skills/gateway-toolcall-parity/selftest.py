@@ -455,7 +455,6 @@ def main() -> int:
         cipher_srv.shutdown()
         leak_srv.shutdown()
         identity_srv.shutdown()
-        leak_srv.shutdown()
 
     print()
     if failures:
