@@ -109,6 +109,26 @@ class TestDirHash:
         h = _dir_hash(tmp_path / "nope")
         assert isinstance(h, str)  # returns hash of empty content
 
+    def test_pycache_and_pyc_excluded(self, tmp_path):
+        """__pycache__ dirs and .pyc/.pyo files must NOT affect the dir hash.
+
+        A skill that ships runnable Python (e.g. gateway-toolcall-parity's
+        run_parity.py) writes bytecode into its own dir when executed in place.
+        If that bytecode changed the hash, the skill would flip to
+        'user-modified' and be blocked from bundled updates forever.
+        """
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        for d in (dir_a, dir_b):
+            d.mkdir()
+            (d / "SKILL.md").write_text("# same")
+            (d / "run.py").write_text("print(1)")
+        # dir_b additionally carries bytecode from having been run in place
+        (dir_b / "__pycache__").mkdir()
+        (dir_b / "__pycache__" / "run.cpython-311.pyc").write_bytes(b"\x00bytecode")
+        (dir_b / "run.pyo").write_bytes(b"\x00opt")
+        assert _dir_hash(dir_a) == _dir_hash(dir_b)
+
 
 class TestDiscoverBundledSkills:
     def test_finds_skills_with_skill_md(self, tmp_path):
@@ -536,6 +556,37 @@ class TestSyncSkills:
         assert "old-skill" in result["user_modified"]
         assert "old-skill" not in result.get("updated", [])
         assert (user_skill / "SKILL.md").read_text() == "# My custom version"
+
+    def test_pycache_pollution_does_not_block_update(self, tmp_path):
+        """Running a bundled script in place creates __pycache__/*.pyc inside the
+        skill dir. Those transient artifacts must NOT flip an otherwise-unmodified
+        skill to 'user-modified' and block bundled updates (regression: a runnable
+        skill a user executes would freeze at its installed version forever).
+        """
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        # User has the old version, unmodified — origin hash recorded from it.
+        user_skill = skills_dir / "old-skill"
+        user_skill.mkdir(parents=True)
+        (user_skill / "SKILL.md").write_text("# Old v1")
+        old_origin_hash = _dir_hash(user_skill)
+        manifest_file.write_text(f"old-skill:{old_origin_hash}\n")
+
+        # User RUNS a script in the skill dir → Python writes bytecode in place.
+        pycache = user_skill / "__pycache__"
+        pycache.mkdir()
+        (pycache / "main.cpython-311.pyc").write_bytes(b"\x00\x0d\x0d\x0a blob")
+
+        # Bundled has a newer version ("# Old" != "# Old v1").
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        # The .pyc must be ignored → skill counts as unmodified → updated.
+        assert "old-skill" in result["updated"]
+        assert "old-skill" not in result["user_modified"]
+        assert (user_skill / "SKILL.md").read_text() == "# Old"
 
     def test_unchanged_skill_not_updated(self, tmp_path):
         """Skill in sync (user == bundled == origin) = no action needed."""
