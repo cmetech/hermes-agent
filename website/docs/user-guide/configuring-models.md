@@ -52,17 +52,20 @@ Pick a model, hit **Switch**, and Hermes writes it to `~/.hermes/config.yaml` un
 The branded Gateway provider behaves differently from a normal curated cloud
 provider:
 
-- **`auto`** asks the Gateway and Kiro to choose the model. It is the safe
-  default and is available only for the main-model slot.
+- **`auto`** is a routing sentinel that asks the Gateway and Kiro to choose the
+  model. It is the safe default, is available only for the main-model slot,
+  and remains eligible independently of live-model membership, capability
+  evidence, or catalog readiness.
 - **An explicit model ID** pins new requests to one concrete model from the
   Gateway's current live catalog.
 
 The client does not ship a static list of Gateway models. The Gateway's
-`/v1/models` endpoint owns live availability, and its
+`/v1/models` endpoint owns live availability for explicit model IDs, and its
 `/v1/model-capabilities` endpoint owns verified capability evidence. Hermes
-joins the two responses by exact model ID. A model must be present in the live
-list before it can be selected, even if capability evidence exists for a
-similarly named model.
+joins the two responses by exact model ID. An explicit model must be present
+in the live list before it can be selected, even if capability evidence exists
+for a similarly named model. Main-slot `auto` is the sole exception because it
+is routing behavior rather than a concrete model membership claim.
 
 The picker distinguishes three capability states:
 
@@ -75,7 +78,8 @@ The required evidence depends on where you assign the model:
 
 | Assignment | Required verified capabilities | Is Gateway `auto` allowed? |
 |---|---|---|
-| Main model | Completion and tools | Yes |
+| Main model, explicit ID | Completion and tools | No |
+| Main model, `auto` routing sentinel | None; the Gateway chooses at request time | Yes |
 | Fallback model | Completion and tools | No |
 | Most auxiliary tasks | Completion | No |
 | Vision | Completion and vision | No |
@@ -236,16 +240,22 @@ declaration only permits discovery; it does not prove that the Gateway is
 running or that it accepts unauthenticated requests. See
 [Gateway credentials](./configuration.md#gateway-credentials).
 
-### Gateway status prevents model selection
+### Gateway status and explicit model selection
+
+The states below prevent new **explicit** Gateway assignments until the client
+can verify them. They do not block the main-slot `auto` routing sentinel, which
+remains eligible independently of catalog readiness. A successful `auto`
+request still requires the inference Gateway to be reachable and, when
+configured for authentication, supplied with the correct key.
 
 | Status | Meaning | What to do |
 |---|---|---|
 | **Gateway authentication is required** | The Gateway returned `401` or `403`. A no-auth provider declaration does not override the live server. | Configure `OTTO_API_KEY` in **Keys** or `.env`, then refresh. |
-| **Gateway must be updated** | The Gateway is reachable, but its capability endpoint returned `404`. | Upgrade the Gateway, then refresh. |
-| **Gateway is unavailable** | The Gateway connection failed or timed out. | Start it, verify its base URL, then refresh. |
+| **Gateway must be updated** | The Gateway is reachable, but its capability endpoint returned `404`. | Follow the [inference Gateway recovery procedure](/developer-guide/gateway-internals#verify-start-restart-or-upgrade-the-inference-gateway), then refresh. |
+| **Gateway is unavailable** | The Gateway connection failed or timed out. | Verify the inference endpoints and follow the [approved run or restart procedure](/developer-guide/gateway-internals#verify-start-restart-or-upgrade-the-inference-gateway), then refresh. |
 | **No concrete models are available** | The Gateway responded, but only automatic routing is currently available. | Check Kiro model discovery and refresh later; `auto` remains valid for the main model. |
-| **Capability response is incompatible** | The Gateway returned malformed or unsupported capability data. | Upgrade or repair the Gateway; do not treat the models as verified. |
-| **Model status is unknown** | Hermes has no usable verified status yet. | Refresh and inspect the Gateway. Unknown is not proof of support or lack of support. |
+| **Capability response is incompatible** | The Gateway returned malformed or unsupported capability data. | Follow the [approved repair or upgrade procedure](/developer-guide/gateway-internals#verify-start-restart-or-upgrade-the-inference-gateway); do not treat the models as verified. |
+| **Model status is unknown** | Hermes has no usable verified status yet. | Verify both inference endpoints, then refresh. Unknown is not proof of support or lack of support. |
 
 Never paste `OTTO_API_KEY` or any other credential into a chat. Store it on the
 **Keys** page or in the profile's `.env` file.

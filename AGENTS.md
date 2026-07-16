@@ -849,7 +849,9 @@ provider key.
 Providers that expose verified per-model evidence declare
 `ProviderProfile.model_capabilities_path`. For the branded Gateway:
 
-- `/v1/models` owns live availability.
+- `/v1/models` owns live availability for explicit IDs; main-slot `auto` is a
+  routing sentinel that remains eligible independently of catalog readiness,
+  live membership, or capability evidence.
 - `/v1/model-capabilities` owns verified evidence.
 - The client joins exact IDs and must not carry a static Gateway model or
   capability registry.

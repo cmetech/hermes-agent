@@ -119,14 +119,16 @@ The Gateway, not the client, owns both sources of truth:
 
 | Gateway endpoint | Owns |
 |---|---|
-| `/v1/models` | Models Kiro currently makes available, including `auto` |
+| `/v1/models` | Explicit model IDs Kiro currently makes available |
 | `/v1/model-capabilities` | Verified per-model evidence for completion, tools, vision, and reasoning |
 
 Hermes joins these responses by exact model ID and carries no static Gateway
-model registry. A listed model is not automatically eligible for every slot.
-For example, a main or fallback model needs verified completion and tool
-support, while the vision slot needs verified completion and vision support.
-Unknown means unverified, not supported and not unsupported.
+model registry. Main-slot `auto` is a routing sentinel, not an explicit model
+membership claim, so it remains eligible independently of these responses. A
+listed explicit model is not automatically eligible for every slot. For
+example, a main or fallback model needs verified completion and tool support,
+while the vision slot needs verified completion and vision support. Unknown
+means unverified, not supported and not unsupported.
 
 The provider can operate without a stored credential when the Gateway was
 launched without authentication. If the Gateway requires bearer
@@ -136,9 +138,13 @@ even though the provider supports no-auth deployments. Never paste the key into
 a chat.
 
 If the Models page says the Gateway must be updated, the inference endpoint is
-reachable but the capability endpoint returned `404`. Upgrade the Gateway and
-refresh the model list. See [Configuring Models](/user-guide/configuring-models#gateway-status-prevents-model-selection)
-for every readiness state and the slot requirement matrix.
+reachable but the capability endpoint returned `404`. Follow the inference
+Gateway deployment's approved upgrade procedure, then refresh the model list.
+See
+[Gateway status and explicit model selection](/user-guide/configuring-models#gateway-status-and-explicit-model-selection)
+for every readiness state and the slot requirement matrix, and
+[Verify, start, restart, or upgrade the inference Gateway](/developer-guide/gateway-internals#verify-start-restart-or-upgrade-the-inference-gateway)
+for safe operational steps.
 
 
 ### Anthropic (Native)

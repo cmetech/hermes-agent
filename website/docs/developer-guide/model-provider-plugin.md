@@ -187,10 +187,13 @@ when no key is stored. The client must still probe the live service:
   actually be launched without authentication.
 
 `model_capabilities_path` is resolved relative to the effective inference base
-URL. An opted-in provider's live model endpoint owns availability, while this
-endpoint owns verified capability evidence. The client exact-joins model IDs;
-it does not infer support from names, models.dev, agent-wide protocol
-capabilities, or previous successful calls.
+URL. An opted-in provider's live model endpoint owns explicit model
+availability, while this endpoint owns verified capability evidence. The
+client exact-joins model IDs; it does not infer support from names, models.dev,
+agent-wide protocol capabilities, or previous successful calls. A provider may
+define a routing sentinel such as main-slot `auto` as an explicit policy
+exception before catalog checks; do not treat that sentinel as live model
+membership.
 
 The capability response must represent `supported`, `unsupported`, and
 `unknown` separately. Unknown means evidence is absent or insufficient. Never

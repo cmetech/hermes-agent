@@ -90,7 +90,7 @@ shared environment-variable names are:
 
 | Variable | Purpose |
 |---|---|
-| `OTTO_BASE_URL` | Optional inference base-URL override. The default local endpoint ends in `/v1`. |
+| `OTTO_BASE_URL` | Optional inference base-URL override. The exact default is `http://127.0.0.1:18080/v1`. |
 | `OTTO_API_KEY` | Bearer token for a Gateway that was launched with authentication enabled. |
 
 `OTTO_API_KEY` is optional only when the Gateway itself is running without
@@ -109,6 +109,8 @@ OTTO_API_KEY=replace-with-the-gateway-token
 Never paste a Gateway key into a chat message, prompt, skill, or project
 instruction file. For model selection, capability states, and older-Gateway
 upgrade behavior, see [Configuring Models](./configuring-models.md#gateway-models-automatic-routing-and-explicit-models).
+For endpoint checks and safe run, restart, or upgrade guidance, see
+[Verify, start, restart, or upgrade the inference Gateway](/developer-guide/gateway-internals#verify-start-restart-or-upgrade-the-inference-gateway).
 
 ### Provider Timeouts
 

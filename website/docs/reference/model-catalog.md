@@ -17,14 +17,16 @@ not the source of truth for the branded inference Gateway.
 
 Gateway model selection uses two live service endpoints:
 
-- `/v1/models` owns current availability.
+- `/v1/models` owns current availability for explicit model IDs.
 - `/v1/model-capabilities` owns verified per-model evidence.
 
 The client joins exact IDs from those endpoints and carries no static Gateway
 registry. Do not add Gateway models or capability claims to this manifest as a
 substitute for fixing the Gateway. A live Gateway model with no matching
 evidence is **unknown**: its support is unverified, not supported and not
-unsupported.
+unsupported. Main-slot `auto` is a routing sentinel rather than an explicit
+model ID, so it remains eligible independently of live membership and
+capability-catalog readiness.
 
 See [Configuring Models](/user-guide/configuring-models#gateway-models-automatic-routing-and-explicit-models)
 for the user-facing selection rules and

@@ -22,7 +22,7 @@ two separate Gateway-owned facts:
 
 ```text
 Gateway /v1/models
-  → live model IDs
+  → live explicit model IDs
 
 Gateway /v1/model-capabilities
   → verified capability states and evidence
@@ -31,11 +31,14 @@ client exact-ID join
   → slot eligibility and user-facing status
 ```
 
-`/v1/models` is authoritative for what Kiro currently exposes. The client does
-not keep a static Gateway model registry and must not add one. The capability
-endpoint is authoritative for verified completion, tool, vision, and reasoning
-evidence. Agent-wide Kiro capabilities, model names, models.dev metadata, or a
-previous successful request are not substitutes for per-model evidence.
+`/v1/models` is authoritative for the explicit model IDs Kiro currently
+exposes. The client does not keep a static Gateway model registry and must not
+add one. Main-slot `auto` is a routing sentinel and is eligible before catalog
+status, live membership, or capability checks; it is not a concrete model
+claim. The capability endpoint is authoritative for verified completion, tool,
+vision, and reasoning evidence. Agent-wide Kiro capabilities, model names,
+models.dev metadata, or a previous successful request are not substitutes for
+per-model evidence.
 
 Exact-ID joining is deliberate. Capability evidence for one ID cannot make a
 different spelling, alias, or stale registry entry selectable. A live model
@@ -62,12 +65,51 @@ meaning:
 | Connection failure or timeout | Gateway unreachable |
 | Invalid JSON or schema | Capability response invalid |
 
+Main-slot `auto` remains eligible in every row because readiness states govern
+new explicit assignments, not the automatic-routing sentinel.
+
 Only providers that declare a capability path use strict verified selection.
 Other providers retain legacy behavior. For the user-facing slot matrix and
 saved-assignment behavior, see
 [Configuring Models](/user-guide/configuring-models#gateway-models-automatic-routing-and-explicit-models).
 For provider authoring, see
 [Model Provider Plugins](/developer-guide/model-provider-plugin#unauthenticated-providers-and-verified-capability-catalogs).
+
+### Verify, start, restart, or upgrade the inference Gateway
+
+The exact default inference base URL is
+`http://127.0.0.1:18080/v1`. Check both Gateway-owned endpoints directly:
+
+```text
+http://127.0.0.1:18080/v1/models
+http://127.0.0.1:18080/v1/model-capabilities
+```
+
+If `OTTO_BASE_URL` is configured, use that base URL instead.
+
+Co-Worker consumes this separately deployed Kiro-backed inference Gateway. It
+does not own, start, restart, repair, or upgrade the Gateway. In particular,
+do **not** use `hermes gateway start` for inference failures: that command
+starts the Hermes messaging gateway described by the rest of this page.
+
+For source development, the repository's `DEV.md` documents this command from
+the `hermes-agent` checkout, which enters the sibling `otto-gateway` checkout:
+
+```bash
+cd ../otto-gateway
+make run
+```
+
+`kiro-cli` must be on `PATH`.
+
+For a managed or pilot deployment, use that inference Gateway deployment's
+approved installer or service procedure to restart or upgrade it. Co-Worker
+cannot perform that operation, and organization-specific service commands
+must not be guessed. If no procedure was supplied, contact the deployment
+operator.
+
+After the inference Gateway has started, restarted, or upgraded, return to the
+desktop Models page and choose **Refresh models**.
 
 ## Key Files
 
