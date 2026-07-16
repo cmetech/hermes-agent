@@ -5525,6 +5525,117 @@ def get_moa_models(profile: Optional[str] = None):
         raise HTTPException(status_code=500, detail="Failed to read MoA config")
 
 
+def _validate_changed_moa_slots(
+    current: dict,
+    requested: dict,
+) -> list[dict[str, str]]:
+    """Validate Gateway-backed MoA slots before the requested config is saved."""
+    from hermes_cli.model_eligibility import validate_provider_model_selection
+    from providers import get_provider_profile
+
+    warnings: list[dict[str, str]] = []
+    failures: list[dict[str, str]] = []
+    current_presets = current.get("presets", {})
+    requested_presets = requested.get("presets", {})
+
+    def _pair(slot: Any) -> tuple[str, str]:
+        if not isinstance(slot, dict):
+            return "", ""
+        return (
+            str(slot.get("provider", "") or "").strip(),
+            str(slot.get("model", "") or "").strip(),
+        )
+
+    def _is_gateway_backed(provider: str) -> bool:
+        # ``gateway`` is the neutral test/provider alias. Branded providers
+        # (OTTO, LOOP24, etc.) advertise the same capability contract through
+        # their generated provider profile.
+        if provider.lower() == "gateway":
+            return True
+        profile = get_provider_profile(provider)
+        return bool(profile is not None and profile.model_capabilities_path)
+
+    def _check_slot(
+        *,
+        preset_name: str,
+        slot_name: str,
+        usage: str,
+        current_slot: Any,
+        requested_slot: Any,
+    ) -> None:
+        provider, model = _pair(requested_slot)
+        if not _is_gateway_backed(provider):
+            return
+        exact_existing_assignment = _pair(current_slot) == (provider, model)
+        decision = validate_provider_model_selection(
+            provider,
+            model,
+            usage,
+            exact_existing_assignment=exact_existing_assignment,
+        )
+        if exact_existing_assignment:
+            if decision.grandfathered or not decision.eligible:
+                warnings.append(
+                    {
+                        "preset": preset_name,
+                        "slot": slot_name,
+                        "reason": decision.reason,
+                        "message": decision.message,
+                    }
+                )
+            return
+        if not decision.eligible:
+            failures.append(
+                {
+                    "code": "model-selection-ineligible",
+                    "reason": decision.reason,
+                    "usage": usage,
+                    "preset": preset_name,
+                    "slot": slot_name,
+                    "provider": provider,
+                    "model": model,
+                    "message": decision.message,
+                }
+            )
+
+    for preset_name, requested_preset in requested_presets.items():
+        if not isinstance(requested_preset, dict):
+            continue
+        current_preset = current_presets.get(preset_name, {})
+        if not isinstance(current_preset, dict):
+            current_preset = {}
+        current_references = current_preset.get("reference_models", [])
+        if not isinstance(current_references, list):
+            current_references = []
+        requested_references = requested_preset.get("reference_models", [])
+        if not isinstance(requested_references, list):
+            requested_references = []
+
+        for index, requested_slot in enumerate(requested_references):
+            current_slot = (
+                current_references[index] if index < len(current_references) else {}
+            )
+            _check_slot(
+                preset_name=preset_name,
+                slot_name=f"reference:{index}",
+                usage="moa-reference",
+                current_slot=current_slot,
+                requested_slot=requested_slot,
+            )
+
+        _check_slot(
+            preset_name=preset_name,
+            slot_name="aggregator",
+            usage="moa-aggregator",
+            current_slot=current_preset.get("aggregator", {}),
+            requested_slot=requested_preset.get("aggregator", {}),
+        )
+
+    if failures:
+        raise HTTPException(status_code=409, detail=failures[0])
+    return warnings
+
+
 @app.put("/api/model/moa")
 def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
     """Persist the Mixture-of-Agents provider/model slots."""
@@ -5533,6 +5644,9 @@ def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
 
         with _profile_scope(body.profile or profile):
             cfg = load_config()
+            current = normalize_moa_config(
+                cfg.get("moa") if isinstance(cfg, dict) else {}
+            )
             if body.presets:
                 raw = {
                     "default_preset": body.default_preset,
@@ -5559,9 +5673,18 @@ def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
                     "enabled": body.enabled,
                 }
             normalized = normalize_moa_config(raw)
+            selection_warnings = _validate_changed_moa_slots(current, normalized)
             cfg["moa"] = normalized
             save_config(cfg)
-            return {"ok": True, **normalized}
+            return {
+                "ok": True,
+                **normalized,
+                **(
+                    {"selection_warnings": selection_warnings}
+                    if selection_warnings
+                    else {}
+                ),
+            }
     except HTTPException:
         raise
     except Exception:

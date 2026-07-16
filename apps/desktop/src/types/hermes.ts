@@ -859,6 +859,13 @@ export interface MoaModelSlot {
   model: string
 }
 
+export interface MoaSelectionWarning {
+  message: string
+  preset: string
+  reason: string
+  slot: string
+}
+
 export interface MoaConfigResponse {
   default_preset: string
   active_preset: string
@@ -879,6 +886,7 @@ export interface MoaConfigResponse {
   max_tokens: number
   reference_models: MoaModelSlot[]
   reference_temperature: number
+  selection_warnings?: MoaSelectionWarning[]
 }
 
 export interface ModelAssignmentRequest {
