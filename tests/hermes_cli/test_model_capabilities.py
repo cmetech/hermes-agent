@@ -432,6 +432,28 @@ def test_cache_isolated_by_provider_base_url_and_credential(
     assert len(calls) == 4
 
 
+def test_rotating_provider_default_header_invalidates_cache(
+    monkeypatch, capability_profile
+):
+    calls = _install_fake_opener(
+        monkeypatch,
+        [
+            _payload(_entry("first-header")),
+            _payload(_entry("rotated-header")),
+        ],
+    )
+
+    first = _fetch()
+    capability_profile.default_headers["X-Provider-Secret"] = (
+        "rotated-header-secret"
+    )
+    rotated = _fetch()
+
+    assert list(first.models) == ["first-header"]
+    assert list(rotated.models) == ["rotated-header"]
+    assert len(calls) == 2
+
+
 def test_valid_success_caches_for_one_hour_and_force_refresh_bypasses(
     monkeypatch, capability_profile
 ):
@@ -460,6 +482,45 @@ def test_valid_success_caches_for_one_hour_and_force_refresh_bypasses(
     assert list(forced.models) == ["forced"]
     assert list(expired.models) == ["expired"]
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize(
+    "cached_at",
+    [
+        1001.0,
+        float("nan"),
+        float("inf"),
+    ],
+    ids=["future", "nan", "positive-infinity"],
+)
+def test_nonfinite_or_future_cache_timestamp_is_not_fresh(
+    monkeypatch, capability_profile, cached_at
+):
+    monkeypatch.setattr(
+        "hermes_cli.model_capabilities.time.time", lambda: 1000.0
+    )
+    calls = _install_fake_opener(
+        monkeypatch,
+        [
+            _payload(_entry("cached")),
+            _payload(_entry("refetched")),
+        ],
+    )
+
+    _fetch()
+
+    from hermes_constants import get_hermes_home
+
+    cache_path = get_hermes_home() / "model_capabilities_cache.json"
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    only_entry = next(iter(cache["entries"].values()))
+    only_entry["at"] = cached_at
+    cache_path.write_text(json.dumps(cache), encoding="utf-8")
+
+    result = _fetch()
+
+    assert list(result.models) == ["refetched"]
+    assert len(calls) == 2
 
 
 def test_auto_only_success_is_cached(monkeypatch, capability_profile):
@@ -514,6 +575,42 @@ def test_cache_contains_no_literal_credentials_or_headers(
     assert "Authorization" not in cache_text
     assert "header-secret" not in cache_text
     assert "X-Provider-Secret" not in cache_text
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "not-a-url",
+        "ftp://gateway.example/v1",
+        "http://",
+        "https://[::1",
+    ],
+    ids=[
+        "missing-scheme-host",
+        "unsupported-scheme",
+        "missing-host",
+        "malformed-ipv6",
+    ],
+)
+def test_malformed_base_url_returns_stable_nonsecret_status(
+    monkeypatch, capability_profile, base_url
+):
+    calls = _install_fake_opener(
+        monkeypatch,
+        [_payload(_entry("must-not-fetch"))],
+    )
+
+    catalog = fetch_model_capability_catalog(
+        "gateway",
+        api_key="base-url-secret-key",
+        base_url=base_url,
+    )
+
+    assert catalog.status == "unknown"
+    assert catalog.models == {}
+    assert catalog.detail == "provider base URL is invalid"
+    assert "base-url-secret-key" not in catalog.detail
+    assert calls == []
 
 
 def test_clear_cache_removes_one_provider_or_all(

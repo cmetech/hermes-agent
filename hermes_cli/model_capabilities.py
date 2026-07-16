@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -160,6 +161,8 @@ def _parse_catalog_payload(payload: object) -> ModelCapabilityCatalog:
 def _normalize_base_url(base_url: str) -> str:
     parsed = urlsplit(base_url.strip())
     scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("base URL must use HTTP(S) with a hostname")
     hostname = (parsed.hostname or "").lower().rstrip(".")
     if ":" in hostname and not hostname.startswith("["):
         hostname = f"[{hostname}]"
@@ -179,9 +182,22 @@ def _resolve_capabilities_url(base_url: str, relative_path: str) -> str:
     return urljoin(base_url.rstrip("/") + "/", relative_path.lstrip("/"))
 
 
-def _credential_fingerprint(api_key: str) -> str:
+def _credential_fingerprint(
+    api_key: str,
+    default_headers: dict[str, str],
+) -> str:
+    effective_headers = {
+        name.lower(): value for name, value in default_headers.items()
+    }
+    if api_key:
+        effective_headers["authorization"] = f"Bearer {api_key}"
+    material = json.dumps(
+        sorted(effective_headers.items()),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     return hashlib.blake2b(
-        api_key.encode("utf-8", errors="replace"),
+        material.encode("utf-8", errors="replace"),
         digest_size=8,
     ).hexdigest()
 
@@ -268,7 +284,10 @@ def _cached_catalog(entry: object, *, now: float) -> ModelCapabilityCatalog | No
         cached_at = float(entry["at"])
     except (KeyError, TypeError, ValueError):
         return None
-    if now - cached_at >= MODEL_CAPABILITIES_CACHE_TTL:
+    age = now - cached_at
+    if not math.isfinite(cached_at) or not (
+        0 <= age < MODEL_CAPABILITIES_CACHE_TTL
+    ):
         return None
     try:
         return _parse_catalog_payload(entry["payload"])
@@ -292,17 +311,35 @@ def fetch_model_capability_catalog(
             "provider does not declare a capability endpoint",
         )
 
-    effective_base_url = (base_url or profile.base_url).strip()
+    raw_base_url = base_url or profile.base_url
+    if not isinstance(raw_base_url, str):
+        return _failure_catalog("unknown", "provider base URL is invalid")
+    effective_base_url = raw_base_url.strip()
     if not effective_base_url:
         return _failure_catalog("unknown", "provider base URL is unavailable")
 
     canonical_provider = profile.name or provider
     try:
         normalized_base_url = _normalize_base_url(effective_base_url)
+        request = urllib.request.Request(
+            _resolve_capabilities_url(
+                effective_base_url,
+                profile.model_capabilities_path,
+            ),
+            method="GET",
+        )
+        request.add_header("Accept", "application/json")
+        for name, value in profile.default_headers.items():
+            request.add_header(name, value)
+        if api_key:
+            request.add_header("Authorization", f"Bearer {api_key}")
     except (TypeError, ValueError):
         return _failure_catalog("unknown", "provider base URL is invalid")
 
-    credential_fp = _credential_fingerprint(api_key or "")
+    credential_fp = _credential_fingerprint(
+        api_key or "",
+        profile.default_headers,
+    )
     cache_key = _cache_entry_key(
         canonical_provider,
         normalized_base_url,
@@ -314,19 +351,6 @@ def fetch_model_capability_catalog(
         cached = _cached_catalog(cache["entries"].get(cache_key), now=now)
         if cached is not None:
             return cached
-
-    request = urllib.request.Request(
-        _resolve_capabilities_url(
-            effective_base_url,
-            profile.model_capabilities_path,
-        ),
-        method="GET",
-    )
-    request.add_header("Accept", "application/json")
-    for name, value in profile.default_headers.items():
-        request.add_header(name, value)
-    if api_key:
-        request.add_header("Authorization", f"Bearer {api_key}")
 
     try:
         with open_credentialed_url(request, timeout=timeout) as response:
