@@ -55,3 +55,27 @@ upstream_changes:
   removal_condition: Remove when Hermes upstream exposes a trusted-plugin agent runner
     with isolated name-scoped registry execution.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: kanban-mutation-preconditions
+  change_class: kanban-persistence-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/kanban_db.py
+  - tests/hermes_cli/test_kanban_mutation_preconditions.py
+  owned_symbols:
+  - TaskMutationPrecondition
+  - TaskMutationConflict
+  - set_task_status
+  tests:
+  - tests/hermes_cli/test_kanban_mutation_preconditions.py
+  - tests/hermes_cli/test_kanban_db.py
+  - tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py
+  - tests/hermes_cli/test_kanban_dispatch_lock.py
+  expected_commit_subject: 'feat(kanban): add mutation preconditions'
+  upstream_candidate: true
+  merge_guidance: Preserve same-transaction optional compare-and-set checks,
+    the claim-only running transition, dependency gating, exact-run closure,
+    and signal-after-commit reclaim behavior while reconciling upstream Kanban
+    lifecycle changes.
+  removal_condition: Remove when Hermes upstream provides equivalent generic
+    task mutation preconditions and stale-worker-safe reclaim behavior.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
