@@ -141,7 +141,7 @@ for ref in "${BRAND_REFS[@]}"; do
     while IFS= read -r conflict; do
       [[ -n "$conflict" ]] || continue
       case "$conflict" in
-        apps/desktop/package.json)
+        apps/desktop/package.json|package-lock.json)
           # This whole file is generated brand identity, not a ledger-owned
           # runtime seam. Start from the exact tested neutral file and let the
           # authoritative brand generator restamp its narrow identity fields.
@@ -167,6 +167,20 @@ for ref in "${BRAND_REFS[@]}"; do
   (cd "$worktree" && node scripts/brand/generate.mjs "$slug" --write) \
     >"$REPORT_DIR/$slug-brand.log" 2>&1
   record_command "generate-$slug-overlay" "passed" "$started"
+  if [[ -f "$worktree/package.json" && -f "$worktree/package-lock.json" ]]; then
+    started="$(now_ms)"
+    set +e
+    (cd "$worktree" && npm install --package-lock-only --ignore-scripts --offline) \
+      >"$REPORT_DIR/$slug-package-lock.log" 2>&1
+    LOCK_STATUS=$?
+    set -e
+    if [[ $LOCK_STATUS -ne 0 ]]; then
+      record_command "regenerate-$slug-package-lock" "failed" "$started"
+      echo "brand $slug package-lock regeneration failed offline; no refs were advanced" >&2
+      exit 8
+    fi
+    record_command "regenerate-$slug-package-lock" "passed" "$started"
+  fi
   if ! git -C "$worktree" diff --quiet; then
     git -C "$worktree" add -A
     git -C "$worktree" -c user.name='Workflow Gate' -c user.email='workflow-gate@localhost' \

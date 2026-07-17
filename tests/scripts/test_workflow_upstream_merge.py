@@ -21,6 +21,20 @@ def test_rehearsal_runs_brand_generator_from_the_worktree() -> None:
     source = REHEARSAL.read_text()
 
     assert '(cd "$worktree" && node scripts/brand/generate.mjs' in source
+    assert "npm install --package-lock-only --ignore-scripts --offline" in source
+
+
+def _write_workspace_lock(repo: Path, name: str, version: str) -> None:
+    (repo / "package-lock.json").write_text(json.dumps({
+        "name": "fixture",
+        "lockfileVersion": 3,
+        "requires": True,
+        "packages": {
+            "": {"name": "fixture", "workspaces": ["apps/*"]},
+            "apps/desktop": {"name": name, "version": version},
+            f"node_modules/{name}": {"resolved": "apps/desktop", "link": True},
+        },
+    }, indent=2) + "\n")
 
 
 def test_synthetic_overlap_classes_cover_continue_and_stop_cases(tmp_path: Path) -> None:
@@ -75,6 +89,10 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
     (repo / "apps/desktop/package.json").write_text(
         '{"name":"hermes","version":"1"}\n'
     )
+    (repo / "package.json").write_text(
+        '{"name":"fixture","private":true,"workspaces":["apps/*"]}\n'
+    )
+    _write_workspace_lock(repo, "hermes", "1")
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "seed")
 
@@ -157,13 +175,16 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
     (repo / "apps/desktop/package.json").write_text(
         '{"name":"otto","version":"1"}\n'
     )
+    _write_workspace_lock(repo, "otto", "1")
     _git(repo, "add", "brand.txt")
     _git(repo, "add", "apps/desktop/package.json")
+    _git(repo, "add", "package-lock.json")
     _git(repo, "commit", "-m", "brand overlay")
     _git(repo, "checkout", "base")
     (repo / "apps/desktop/package.json").write_text(
         '{"name":"hermes","version":"2"}\n'
     )
+    _write_workspace_lock(repo, "hermes", "2")
     _git(repo, "commit", "-am", "advance neutral desktop package")
     return repo
 
