@@ -62,6 +62,23 @@ upstream_changes:
   removal_condition: Remove when Hermes upstream exposes a trusted-plugin agent runner
     with isolated name-scoped registry execution.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-agent-override-inspection
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - agent/plugin_agent.py
+  owned_symbols:
+  - _agent_override_allowed
+  tests:
+  - tests/plugins/workflow/test_doctor.py
+  expected_commit_subject: 'fix(workflow): report provider override authorization'
+  upstream_candidate: true
+  merge_guidance: Preserve the optional explicit-config input so side-effect-free
+    inspectors can evaluate the exact same provider/model authorization rule as
+    the runtime without changing ambient profile state.
+  removal_condition: Remove when upstream exposes an equivalent side-effect-free
+    plugin-agent override authorization query.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: kanban-mutation-preconditions
   change_class: kanban-persistence-generic
   owner: workflow-orchestration
