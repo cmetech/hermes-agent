@@ -342,6 +342,8 @@ class PluginContext:
         self._manager = manager
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
+        # Lazy isolated full-agent facade — see ctx.agent property below.
+        self._agent: Any = None
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -361,6 +363,16 @@ class PluginContext:
             plugin_id = self.manifest.key or self.manifest.name
             self._llm = PluginLlm(plugin_id=plugin_id)
         return self._llm
+
+    @property
+    def agent(self) -> Any:
+        """Return this plugin's isolated host-owned agent facade."""
+        if self._agent is None:
+            from agent.plugin_agent import PluginAgentRunner
+
+            plugin_id = self.manifest.key or self.manifest.name
+            self._agent = PluginAgentRunner(plugin_id=plugin_id)
+        return self._agent
 
     # -- profile awareness --------------------------------------------------
 

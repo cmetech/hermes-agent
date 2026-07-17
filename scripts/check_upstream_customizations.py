@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Validate and compare Hermes' machine-readable customization ledger."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+from typing import Any
+
+import yaml
+
+
+_HEX40 = re.compile(r"^[0-9a-f]{40}$")
+_REQUIRED = {
+    "id", "change_class", "owner", "files", "owned_symbols", "tests",
+    "expected_commit_subject", "upstream_candidate", "merge_guidance",
+    "removal_condition", "last_verified_upstream",
+}
+
+
+def _git(repo: Path, *args: str, check: bool = True) -> str:
+    proc = subprocess.run(
+        ["git", *args], cwd=repo, text=True, capture_output=True, check=False
+    )
+    if check and proc.returncode:
+        raise ValueError(proc.stderr.strip() or f"git {' '.join(args)} failed")
+    return proc.stdout
+
+
+def _contained(repo: Path, raw: str) -> Path:
+    path = (repo / raw).resolve()
+    try:
+        path.relative_to(repo.resolve())
+    except ValueError as exc:
+        raise ValueError(f"ledger path is not repository-contained: {raw}") from exc
+    return path
+
+
+def load_and_validate_manifest(
+    manifest_path: Path,
+    repo: Path,
+    *,
+    check_git: bool = True,
+) -> dict[str, Any]:
+    data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or data.get("schema_version") != 1:
+        raise ValueError("manifest schema_version must be 1")
+    entries = data.get("upstream_changes")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("manifest upstream_changes must be a non-empty list")
+    ids: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("every upstream change must be a mapping")
+        missing = sorted(_REQUIRED - set(entry))
+        if missing:
+            raise ValueError(f"entry is missing required fields: {', '.join(missing)}")
+        entry_id = entry.get("id")
+        if not isinstance(entry_id, str) or not entry_id or entry_id in ids:
+            raise ValueError(f"duplicate or invalid customization id: {entry_id!r}")
+        ids.add(entry_id)
+        baseline = entry.get("last_verified_upstream")
+        if not isinstance(baseline, str) or not _HEX40.fullmatch(baseline):
+            raise ValueError(f"{entry_id}.last_verified_upstream must be exact 40-hex")
+        for field in ("files", "tests"):
+            values = entry.get(field)
+            if not isinstance(values, list) or not values:
+                raise ValueError(f"{entry_id}.{field} must be a non-empty list")
+            for raw in values:
+                if not isinstance(raw, str):
+                    raise ValueError(f"{entry_id}.{field} paths must be strings")
+                path = _contained(repo, raw)
+                if not path.is_file():
+                    raise ValueError(f"ledger path does not exist: {raw}")
+        for field in ("owned_symbols",):
+            if not isinstance(entry.get(field), list) or not all(
+                isinstance(value, str) and value for value in entry[field]
+            ):
+                raise ValueError(f"{entry_id}.{field} must contain names")
+        for field in ("expected_commit_subject", "merge_guidance", "removal_condition"):
+            if not isinstance(entry.get(field), str) or not entry[field].strip():
+                raise ValueError(f"{entry_id}.{field} must be non-empty")
+        if check_git:
+            if not _git(repo, "cat-file", "-e", f"{baseline}^{{commit}}", check=False):
+                # cat-file is quiet on success and failure, so inspect status separately.
+                proc = subprocess.run(
+                    ["git", "cat-file", "-e", f"{baseline}^{{commit}}"], cwd=repo
+                )
+                if proc.returncode:
+                    raise ValueError(f"{entry_id} baseline is not a local commit")
+            proc = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", baseline, "HEAD"], cwd=repo
+            )
+            if proc.returncode:
+                raise ValueError(f"{entry_id} baseline is not an ancestor of HEAD")
+    return data
+
+
+def _changed_paths(repo: Path, diff_range: str) -> list[tuple[str, list[str]]]:
+    rows = []
+    for line in _git(repo, "diff", "--name-status", "-M", diff_range).splitlines():
+        parts = line.split("\t")
+        status = parts[0]
+        rows.append((status, parts[1:]))
+    return rows
+
+
+def validate_diff_coverage(data: dict[str, Any], repo: Path, diff_range: str) -> None:
+    covered = {
+        path for entry in data["upstream_changes"] for path in entry["files"]
+    }
+    ignored_prefixes = (
+        "docs/upstream-customizations/", "tests/", "scripts/",
+        "plugins/", "skills/", "optional-skills/",
+    )
+    missing: set[str] = set()
+    for _status, paths in _changed_paths(repo, diff_range):
+        for path in paths:
+            if path in covered or path.startswith(ignored_prefixes):
+                continue
+            missing.add(path)
+    if missing:
+        raise ValueError(
+            "upstream-owned files missing from customization ledger: "
+            + ", ".join(sorted(missing))
+        )
+    changed = {path for _status, paths in _changed_paths(repo, diff_range) for path in paths}
+    dirty = {
+        line[3:] for line in _git(repo, "status", "--porcelain").splitlines()
+        if len(line) > 3
+    }
+    for entry in data["upstream_changes"]:
+        touched = changed & set(entry["files"])
+        if not touched or touched & dirty:
+            # A planned boundary may be validated before its commit; the exact
+            # subject becomes mandatory as soon as the files are clean.
+            continue
+        subjects = _git(
+            repo,
+            "log",
+            "--format=%s",
+            diff_range,
+            "--",
+            *sorted(touched),
+        ).splitlines()
+        expected = entry["expected_commit_subject"]
+        if expected not in subjects:
+            raise ValueError(
+                f"{entry['id']} is not isolated in expected commit subject: {expected}"
+            )
+
+
+def _changed_lines(repo: Path, diff_range: str, paths: list[str] | None = None) -> str:
+    args = ["diff", "--unified=0", diff_range]
+    if paths:
+        args.extend(["--", *paths])
+    text = _git(repo, *args)
+    return "\n".join(
+        line for line in text.splitlines()
+        if (line.startswith("+") and not line.startswith("+++"))
+        or (line.startswith("-") and not line.startswith("---"))
+    )
+
+
+def _symbol_spans(source: str, symbols: list[str]) -> dict[str, list[tuple[int, int]]]:
+    wanted = {symbol.rsplit(".", 1)[-1]: symbol for symbol in symbols}
+    spans = {symbol: [] for symbol in symbols}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return spans
+    for node in ast.walk(tree):
+        name = getattr(node, "name", None)
+        if name in wanted and hasattr(node, "lineno"):
+            spans[wanted[name]].append((node.lineno, getattr(node, "end_lineno", node.lineno)))
+    return spans
+
+
+def _changed_line_numbers(diff: str) -> tuple[set[int], set[int]]:
+    old_lines: set[int] = set()
+    new_lines: set[int] = set()
+    old_no = new_no = 0
+    for line in diff.splitlines():
+        match = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if match:
+            old_no, new_no = int(match.group(1)), int(match.group(2))
+        elif line.startswith("-") and not line.startswith("---"):
+            old_lines.add(old_no)
+            old_no += 1
+        elif line.startswith("+") and not line.startswith("+++"):
+            new_lines.add(new_no)
+            new_no += 1
+        elif not line.startswith("\\"):
+            old_no += 1
+            new_no += 1
+    return old_lines, new_lines
+
+
+def _owned_symbol_hits(
+    entry: dict[str, Any], repo: Path, diff_range: str, paths: list[str]
+) -> list[str]:
+    left = diff_range.split("..", 1)[0]
+    hits: set[str] = set()
+    for path in paths:
+        diff = _git(repo, "diff", "--unified=0", diff_range, "--", path)
+        old_changed, new_changed = _changed_line_numbers(diff)
+        try:
+            new_source = (repo / path).read_text(encoding="utf-8")
+        except OSError:
+            new_source = ""
+        old_source = _git(repo, "show", f"{left}:{path}", check=False)
+        for symbol, spans in _symbol_spans(new_source, entry["owned_symbols"]).items():
+            if any(any(start <= line <= end for line in new_changed) for start, end in spans):
+                hits.add(symbol)
+        for symbol, spans in _symbol_spans(old_source, entry["owned_symbols"]).items():
+            if any(any(start <= line <= end for line in old_changed) for start, end in spans):
+                hits.add(symbol)
+        changed_text = _changed_lines(repo, diff_range, [path])
+        for symbol in entry["owned_symbols"]:
+            if re.search(rf"\b{re.escape(symbol)}\b", changed_text):
+                hits.add(symbol)
+    return sorted(hits)
+
+
+def classify_upstream_overlap(
+    entry: dict[str, Any], repo: Path, diff_range: str
+) -> dict[str, Any]:
+    changes = _changed_paths(repo, diff_range)
+    changed = {path for _status, paths in changes for path in paths}
+    owned_files = set(entry["files"])
+    same_files = sorted(changed & owned_files)
+    symbols = entry["owned_symbols"]
+    owned_hits = _owned_symbol_hits(entry, repo, diff_range, same_files)
+    if owned_hits:
+        classification = "owned_symbol"
+        rationale = f"owned symbols changed: {', '.join(owned_hits)}"
+    elif same_files:
+        classification = "same_file"
+        rationale = f"same ledger-owned file changed: {', '.join(same_files)}"
+    else:
+        all_lines = _changed_lines(repo, diff_range)
+        equivalent_hits = sorted(
+            symbol for symbol in symbols
+            if re.search(rf"\b{re.escape(symbol)}\b", all_lines)
+        )
+        if equivalent_hits:
+            classification = "possible_upstream_equivalent"
+            rationale = f"owned public names appeared elsewhere: {', '.join(equivalent_hits)}"
+        else:
+            classification = "none"
+            rationale = "no file, symbol, or public-contract overlap detected"
+    return {
+        "id": entry["id"],
+        "classification": classification,
+        "rationale": rationale,
+        "merge_guidance": entry["merge_guidance"],
+        "removal_condition": entry["removal_condition"],
+        "tests": entry["tests"],
+        "acknowledged": False,
+    }
+
+
+def _set_verified_upstream(path: Path, data: dict[str, Any], repo: Path, sha: str) -> None:
+    if not _HEX40.fullmatch(sha):
+        raise ValueError("--set-verified-upstream requires exact 40-hex")
+    if subprocess.run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=repo).returncode:
+        raise ValueError("verified upstream is not a local commit")
+    if subprocess.run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], cwd=repo).returncode:
+        raise ValueError("verified upstream is not an ancestor of HEAD")
+    for entry in data["upstream_changes"]:
+        entry["last_verified_upstream"] = sha
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--diff")
+    parser.add_argument("--upstream-diff")
+    parser.add_argument("--report", type=Path)
+    parser.add_argument("--set-verified-upstream")
+    args = parser.parse_args(argv)
+    repo = Path(_git(Path.cwd(), "rev-parse", "--show-toplevel").strip())
+    data = yaml.safe_load(args.manifest.read_text(encoding="utf-8"))
+    try:
+        if args.set_verified_upstream:
+            _set_verified_upstream(args.manifest, data, repo, args.set_verified_upstream)
+        data = load_and_validate_manifest(args.manifest, repo)
+        if args.diff:
+            validate_diff_coverage(data, repo, args.diff)
+        if args.upstream_diff:
+            previous: dict[str, Any] = {}
+            if args.report and args.report.exists():
+                try:
+                    previous = json.loads(args.report.read_text(encoding="utf-8"))
+                except Exception:
+                    previous = {}
+            old_ack = {
+                item.get("id"): bool(item.get("acknowledged"))
+                for item in previous.get("overlaps", [])
+                if isinstance(item, dict)
+            }
+            overlaps = [
+                classify_upstream_overlap(entry, repo, args.upstream_diff)
+                for entry in data["upstream_changes"]
+            ]
+            for item in overlaps:
+                item["acknowledged"] = old_ack.get(item["id"], False)
+            report = {"schema_version": 1, "range": args.upstream_diff, "overlaps": overlaps}
+            if args.report:
+                args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+            else:
+                print(json.dumps(report, indent=2))
+            if any(
+                item["classification"] in {"owned_symbol", "possible_upstream_equivalent"}
+                and not item["acknowledged"]
+                for item in overlaps
+            ):
+                return 2
+    except ValueError as exc:
+        print(f"customization ledger error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

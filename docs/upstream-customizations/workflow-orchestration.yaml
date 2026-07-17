@@ -1,0 +1,47 @@
+schema_version: 1
+feature: workflow-orchestration
+upstream_changes:
+- id: managed-process-tree
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - tools/managed_process.py
+  - tools/process_registry.py
+  owned_symbols:
+  - ProcessIdentity
+  - TerminationPolicy
+  - ManagedProcessTree
+  tests:
+  - tests/tools/test_managed_process.py
+  - tests/tools/test_process_registry.py
+  expected_commit_subject: 'refactor(tools): extract managed process tree'
+  upstream_candidate: true
+  merge_guidance: Reconcile process identity, process-tree termination, escalation,
+    and wait/reap behavior before replaying the extraction.
+  removal_condition: Remove when Hermes upstream exposes an equivalent generic managed-process-tree
+    primitive used by ProcessRegistry.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: plugin-agent-runner
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - tools/registry.py
+  - hermes_cli/plugins.py
+  owned_symbols:
+  - PluginAgentRunRequest
+  - PluginAgentRunResult
+  - PluginAgentRunner
+  - ToolRegistry.scoped_names
+  - PluginContext.agent
+  tests:
+  - tests/agent/test_plugin_agent.py
+  - tests/tools/test_registry.py
+  expected_commit_subject: 'feat(plugins): expose scoped host agent runner'
+  upstream_candidate: true
+  merge_guidance: Reconcile ToolRegistry generation/dispatch behavior and PluginContext
+    facade construction before replaying this commit.
+  removal_condition: Remove when Hermes upstream exposes a trusted-plugin agent runner
+    with isolated name-scoped registry execution.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
