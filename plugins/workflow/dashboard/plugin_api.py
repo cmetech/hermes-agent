@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import secrets
+import time
 from typing import Mapping
 
 from fastapi import APIRouter, Header, HTTPException, Query
@@ -105,7 +106,9 @@ def list_runs(
 
 @router.get("/runs/{run_id}")
 def get_run(run_id: str, operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope")):
-    return _sanitize(_load_authorized(_store(), run_id, operator_scope))
+    store = _store()
+    _load_authorized(store, run_id, operator_scope)
+    return _sanitize(store.get_run_status(run_id, operator_scope=operator_scope))
 
 
 @router.get("/attention")
@@ -120,7 +123,13 @@ def attention(
             if pending is None:
                 continue
             kind = pending.get("type") if isinstance(pending, Mapping) else pending
-            if kind not in {"approval", "loop_input", "capability", "reconcile"}:
+            if kind not in {
+                "approval",
+                "workflow_approval",
+                "loop_input",
+                "capability",
+                "reconcile",
+            }:
                 continue
             items.append({
                 "run_id": run["run_id"], "workflow": run["workflow"],
@@ -136,15 +145,22 @@ def events(
     run_id: str,
     after: int = Query(0, ge=0),
     limit: int = Query(200, ge=1),
-    wait_seconds: float = Query(0, ge=0),
+    wait_seconds: float = Query(0, ge=0, le=30),
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
-    del wait_seconds
     store = _store()
     _load_authorized(store, run_id, operator_scope)
-    return _sanitize(store.events_after(
-        run_id, after=after, limit=min(limit, 200), operator_scope=operator_scope,
-    ))
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        page = store.events_after(
+            run_id,
+            after=after,
+            limit=min(limit, 200),
+            operator_scope=operator_scope,
+        )
+        if page["events"] or wait_seconds == 0 or time.monotonic() >= deadline:
+            return _sanitize(page)
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
 
 class ActionRequest(BaseModel):
@@ -192,4 +208,4 @@ def mutate_run(
         raise HTTPException(status_code=409, detail={"code": "stale_state", "current": _sanitize(_load_authorized(store, run_id, operator_scope))}) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail={"code": "invalid_transition"}) from exc
-    return _sanitize(_load_authorized(store, run_id, operator_scope))
+    return _sanitize(store.get_run_status(run_id, operator_scope=operator_scope))

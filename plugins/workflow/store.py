@@ -557,8 +557,9 @@ class RunStore:
         input_manifest_digest: str,
     ) -> PreparedRunSnapshot:
         self._ensure_free_disk()
-        staging = Path(tempfile.mkdtemp(prefix="run-", dir=self.staging_root))
-        self._write_snapshot_owner(staging)
+        with workflow_lock(self.admission_lock):
+            staging = Path(tempfile.mkdtemp(prefix="run-", dir=self.staging_root))
+            self._write_snapshot_owner(staging)
         return PreparedRunSnapshot(
             staging, definition_digest, policy_digest, input_manifest_digest, 0
         )
@@ -571,9 +572,10 @@ class RunStore:
         values: Mapping[str, str] | None = None,
     ) -> PreparedRunSnapshot:
         self._ensure_free_disk()
-        staging = Path(tempfile.mkdtemp(prefix="run-", dir=self.staging_root))
-        try:
+        with workflow_lock(self.admission_lock):
+            staging = Path(tempfile.mkdtemp(prefix="run-", dir=self.staging_root))
             self._write_snapshot_owner(staging)
+        try:
             package_digest = compute_package_digest(package)
             definition_data = package.workflow_path.read_bytes()
             (staging / "definition.yaml").write_bytes(definition_data)
@@ -1499,6 +1501,17 @@ class RunStore:
             and node.get("state") == "waiting_retry"
             and isinstance(node.get("next_attempt_at"), str)
         ]
+        pending_interaction = next(
+            (
+                {**pending, "node_id": node.get("id")}
+                if isinstance(pending, dict)
+                else {"type": pending, "node_id": node.get("id")}
+                for node in node_values
+                if isinstance(node, dict)
+                and (pending := node.get("pending_interaction")) is not None
+            ),
+            None,
+        )
         health = (
             "terminal"
             if status in {"succeeded", "failed", "cancelled", "abandoned"}
@@ -1530,11 +1543,22 @@ class RunStore:
                 if isinstance(node, dict)
             ),
             "next_retry_at": min(retry_times) if retry_times else None,
-            "next_actions": self._next_actions(status),
+            "pending_interaction": pending_interaction,
+            "next_actions": self._next_actions(status, pending_interaction),
         }
 
     @staticmethod
-    def _next_actions(status: str) -> list[str]:
+    def _next_actions(
+        status: str, pending_interaction: dict[str, object] | None = None
+    ) -> list[str]:
+        if status == "paused" and pending_interaction:
+            interaction_type = pending_interaction.get("type")
+            if interaction_type in {"approval", "workflow_approval"}:
+                return ["status", "events", "approve", "reject", "cancel"]
+            if interaction_type == "loop_input":
+                return ["status", "events", "provide-input", "cancel"]
+            if interaction_type == "reconcile":
+                return ["status", "events", "reconcile", "cancel"]
         if status in {"running", "queued", "waiting_retry", "paused"}:
             return ["status", "events", "cancel"]
         if status in {"failed", "interrupted"}:

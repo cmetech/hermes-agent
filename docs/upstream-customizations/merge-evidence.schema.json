@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-agent.dev/schemas/workflow-merge-evidence-v1.json",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "prior_upstream_commit",
+    "candidate_upstream_commit",
+    "pre_base_commit",
+    "post_base_commit",
+    "tested_base_tree",
+    "ledger_baseline",
+    "ledger_sha256",
+    "patch_sha256",
+    "merge_skill",
+    "entries",
+    "commands",
+    "platform",
+    "brands",
+    "final_ancestry"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "prior_upstream_commit": {"$ref": "#/$defs/sha"},
+    "candidate_upstream_commit": {"$ref": "#/$defs/sha"},
+    "pre_base_commit": {"$ref": "#/$defs/sha"},
+    "post_base_commit": {"$ref": "#/$defs/sha"},
+    "tested_base_tree": {"$ref": "#/$defs/sha"},
+    "ledger_baseline": {"$ref": "#/$defs/sha"},
+    "ledger_sha256": {"$ref": "#/$defs/digest"},
+    "patch_sha256": {"$ref": "#/$defs/digest"},
+    "merge_skill": {"$ref": "#/$defs/mergeSkill"},
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/entry"}
+    },
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/command"}
+    },
+    "platform": {"type": "string", "minLength": 1, "maxLength": 128},
+    "brands": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/brand"}
+    },
+    "final_ancestry": {"const": true}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "safeText": {
+      "type": "string",
+      "maxLength": 512,
+      "not": {"pattern": "(?i)(token|secret|password|prompt|workflow_input)\\s*[=:]"}
+    },
+    "command": {
+      "type": "object",
+      "required": ["name", "result", "duration_ms", "platform"],
+      "properties": {
+        "name": {"$ref": "#/$defs/safeText"},
+        "result": {"enum": ["passed", "failed"]},
+        "duration_ms": {"type": "integer", "minimum": 0},
+        "platform": {"$ref": "#/$defs/safeText"}
+      },
+      "additionalProperties": false
+    },
+    "mergeSkill": {
+      "type": "object",
+      "required": ["path", "sha256", "owner_commit"],
+      "properties": {
+        "path": {"$ref": "#/$defs/safeText"},
+        "sha256": {"$ref": "#/$defs/digest"},
+        "owner_commit": {
+          "oneOf": [
+            {"$ref": "#/$defs/sha"},
+            {"type": "null"}
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "entry": {
+      "type": "object",
+      "required": [
+        "id",
+        "baseline",
+        "files",
+        "patch_sha256",
+        "overlap_class",
+        "decision",
+        "conflict_files",
+        "retained_commit_subjects",
+        "removed_commit_subjects",
+        "tests"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/safeText"},
+        "baseline": {"$ref": "#/$defs/sha"},
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/safeText"}
+        },
+        "patch_sha256": {"$ref": "#/$defs/digest"},
+        "overlap_class": {
+          "enum": ["none", "same_file", "owned_symbol", "possible_upstream_equivalent"]
+        },
+        "decision": {
+          "enum": ["not-required", "preserve", "adapt", "remove-as-upstream-equivalent"]
+        },
+        "conflict_files": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/safeText"}
+        },
+        "retained_commit_subjects": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/safeText"}
+        },
+        "removed_commit_subjects": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/safeText"}
+        },
+        "tests": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/command"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "brand": {
+      "type": "object",
+      "required": [
+        "ref",
+        "commit",
+        "tree",
+        "descriptor_sha256",
+        "contains_tested_base",
+        "generic_runtime_matches_base"
+      ],
+      "properties": {
+        "ref": {"$ref": "#/$defs/safeText"},
+        "commit": {"$ref": "#/$defs/sha"},
+        "tree": {"$ref": "#/$defs/sha"},
+        "descriptor_sha256": {"$ref": "#/$defs/digest"},
+        "contains_tested_base": {"const": true},
+        "generic_runtime_matches_base": {"const": true}
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -15,7 +15,8 @@ const COLUMN_LABELS: Record<string, string> = {
 export function kanbanBoardModel(
   summary: KanbanBoardSummary,
   tasks: readonly KanbanTaskSnapshot[],
-  stale = false
+  stale = false,
+  nextCursor: null | string = null
 ): ActivityBoardModel {
   const columns: ActivityBoardColumn[] = Object.entries(summary.column_counts).map(([id, count]) => ({
     cards: tasks
@@ -32,7 +33,7 @@ export function kanbanBoardModel(
     count,
     id,
     label: COLUMN_LABELS[id] ?? id,
-    nextCursor: null
+    nextCursor
   }))
 
   return {

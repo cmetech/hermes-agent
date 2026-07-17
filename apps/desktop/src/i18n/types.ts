@@ -1385,6 +1385,18 @@ export interface Translations {
     completionEstimate: string
     estimateUnavailable: string
     nextActions: string
+    artifacts: string
+    definition: string
+    retryAt: string
+    timeline: string
+    trigger: string
+    waitingFor: string
+    approve: string
+    reject: string
+    cancel: string
+    resume: string
+    retry: string
+    abandon: string
     workflowUnavailable: string
     kanbanUnavailable: string
     physicalBoard: (board: string) => string

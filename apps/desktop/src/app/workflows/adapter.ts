@@ -37,7 +37,7 @@ function health(run: WorkflowRunSnapshot) {
 
 export function workflowBoardModel(
   runs: readonly WorkflowRunSnapshot[],
-  options: { scopeLabel: string; stale?: boolean } = { scopeLabel: 'Workflows' }
+  options: { nextCursor?: null | string; scopeLabel: string; stale?: boolean } = { scopeLabel: 'Workflows' }
 ): ActivityBoardModel {
   const columns: ActivityBoardColumn[] = COLUMNS.map(([id, label]) => {
     const selected = runs.filter(run => columnId(run) === id)
@@ -55,7 +55,7 @@ export function workflowBoardModel(
       count: selected.length,
       id,
       label,
-      nextCursor: null
+      nextCursor: options.nextCursor ?? null
     }
   })
 

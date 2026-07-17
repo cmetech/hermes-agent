@@ -290,6 +290,12 @@ class RunScheduler:
                 "loop": LoopExecutor(agent_runner),
             })
 
+    @property
+    def active_run_count(self) -> int:
+        """Return the scheduler-local active-run count for lifecycle diagnostics."""
+        with self._activity:
+            return len(self._active_runs)
+
     @staticmethod
     def _read_text(path: Path, *, limit: int = 500_000) -> str:
         data = path.read_bytes()

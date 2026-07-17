@@ -53,6 +53,48 @@ def test_duplicate_start_is_atomic_and_returns_one_run(tmp_path, workflow_writer
     assert len(store.list_runs()) == 1
 
 
+def test_reconciliation_cannot_remove_snapshot_before_owner_marker_is_written(
+    tmp_path, workflow_writer, monkeypatch
+):
+    store = RunStore(tmp_path / "home")
+    package_path = workflow_writer(
+        tmp_path / "package-marker-race",
+        name="marker-race",
+        nodes=[{"id": "first", "bash": "printf first"}],
+    )
+    package = load_workflow(package_path)
+    admission_snapshot = store.prepare_run_snapshot(package)
+    original_write_owner = RunStore._write_snapshot_owner
+    marker_started = threading.Event()
+    allow_marker = threading.Event()
+
+    def delayed_owner_marker(directory):
+        marker_started.set()
+        assert allow_marker.wait(5)
+        original_write_owner(directory)
+
+    monkeypatch.setattr(
+        RunStore, "_write_snapshot_owner", staticmethod(delayed_owner_marker)
+    )
+    start_finished = threading.Event()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        preparing = pool.submit(store.prepare_run_snapshot, package)
+        assert marker_started.wait(5)
+        starting = pool.submit(
+            store.start_run,
+            _request(admission_snapshot, key="marker-race", name="marker-race"),
+            immutable_snapshot=admission_snapshot,
+        )
+        starting.add_done_callback(lambda _future: start_finished.set())
+        assert not start_finished.wait(0.1)
+        allow_marker.set()
+        prepared = preparing.result(timeout=5)
+        admitted = starting.result(timeout=5)
+
+    assert admitted.disposition == "created"
+    assert prepared.staging_directory.exists()
+
+
 def test_reused_key_with_changed_digest_conflicts(tmp_path, workflow_writer):
     store = RunStore(tmp_path / "home")
     prepared = _prepared(store, workflow_writer, tmp_path)

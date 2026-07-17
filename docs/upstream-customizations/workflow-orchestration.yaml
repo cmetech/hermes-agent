@@ -141,8 +141,11 @@ upstream_changes:
   tests:
   - apps/desktop/src/app/routes.test.ts
   - apps/desktop/src/app/workflows/adapter.test.ts
+  - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
   - apps/desktop/src/app/kanban/adapter.test.ts
+  - apps/desktop/src/app/kanban/kanban-operations.e2e.test.tsx
   - apps/desktop/src/components/activity-board/activity-board.test.tsx
+  - apps/desktop/src/components/activity-board/activity-board.performance.test.tsx
   expected_commit_subject: 'feat(desktop): integrate workflow operations navigation'
   upstream_candidate: true
   merge_guidance: Preserve separate Workflow and Kanban lifecycle authorities,
@@ -194,4 +197,25 @@ upstream_changes:
     workflow showcase bundle without broadening arbitrary plugin package data.
   removal_condition: Remove when Hermes upstream ships equivalent authenticated
     workflow showcase package-data coverage.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-native-portability-ci
+  change_class: ci-generic
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  owned_symbols:
+  - workflow-portability
+  tests:
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
+  - tests/plugins/workflow/test_showcase_distribution_e2e.py
+  - tests/plugins/workflow/test_fault_injection.py
+  - tests/plugins/workflow/test_security_boundaries.py
+  - tests/plugins/workflow/test_process_lifecycle_soak.py
+  expected_commit_subject: 'test(workflow): enforce production and merge gates'
+  upstream_candidate: true
+  merge_guidance: Preserve the credential-free Linux, macOS, and Windows matrix
+    and its installed-showcase and process-lifecycle assertions while reconciling
+    upstream CI orchestration changes.
+  removal_condition: Remove when upstream CI provides equivalent native
+    all-platform portable-workflow and installed-showcase coverage.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

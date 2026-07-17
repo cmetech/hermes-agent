@@ -114,6 +114,26 @@ def _tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_package_safety(root: Path, scenario_id: str) -> None:
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ShowcaseCatalogError(
+                f"showcase safety contract rejects symlink: {scenario_id}"
+            )
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8").lower()
+        except UnicodeError as exc:
+            raise ShowcaseCatalogError(
+                f"showcase safety contract rejects binary resource: {scenario_id}"
+            ) from exc
+        if any(token in text for token in _FORBIDDEN_TEXT):
+            raise ShowcaseCatalogError(
+                f"showcase safety contract rejected package bytes: {scenario_id}"
+            )
+
+
 @contextmanager
 def _bundle_path(explicit: Path | None = None) -> Iterator[Path]:
     if explicit is not None:
@@ -179,6 +199,7 @@ def load_showcase_catalog(bundle_root: Path | None = None) -> dict[str, Showcase
             workflow_path = str(item["workflow_path"])
             workflow = _contained(root, workflow_path)
             package_root = workflow.parent.parent
+            _validate_package_safety(package_root, scenario_id)
             actual_digest = _tree_digest(package_root)
             if package_digests.get(scenario_id) != actual_digest:
                 raise ShowcaseCatalogError(f"showcase package digest mismatch: {scenario_id}")

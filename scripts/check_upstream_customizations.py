@@ -256,6 +256,10 @@ def classify_upstream_overlap(
             rationale = "no file, symbol, or public-contract overlap detected"
     return {
         "id": entry["id"],
+        "change_class": entry["change_class"],
+        "files": entry["files"],
+        "owned_symbols": entry["owned_symbols"],
+        "expected_commit_subject": entry["expected_commit_subject"],
         "classification": classification,
         "rationale": rationale,
         "merge_guidance": entry["merge_guidance"],
@@ -284,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--upstream-diff")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--set-verified-upstream")
+    parser.add_argument("--print-verified-upstream", action="store_true")
     args = parser.parse_args(argv)
     repo = Path(_git(Path.cwd(), "rev-parse", "--show-toplevel").strip())
     data = yaml.safe_load(args.manifest.read_text(encoding="utf-8"))
@@ -291,6 +296,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.set_verified_upstream:
             _set_verified_upstream(args.manifest, data, repo, args.set_verified_upstream)
         data = load_and_validate_manifest(args.manifest, repo)
+        if args.print_verified_upstream:
+            baselines = {
+                entry["last_verified_upstream"]
+                for entry in data["upstream_changes"]
+            }
+            if len(baselines) != 1:
+                raise ValueError(
+                    "ledger entries do not share one verified upstream baseline"
+                )
+            print(next(iter(baselines)))
+            return 0
         if args.diff:
             validate_diff_coverage(data, repo, args.diff)
         if args.upstream_diff:
