@@ -33,6 +33,7 @@ upstream_changes:
   - PluginAgentRunRequest
   - PluginAgentRunResult
   - PluginAgentRunner
+  - _exchange_worker
   - ToolRegistry.scoped_names
   - PluginContext.agent
   tests:
@@ -40,8 +41,9 @@ upstream_changes:
   - tests/tools/test_registry.py
   expected_commit_subject: 'feat(plugins): expose scoped host agent runner'
   upstream_candidate: true
-  merge_guidance: Reconcile ToolRegistry generation/dispatch behavior and PluginContext
-    facade construction before replaying this commit.
+  merge_guidance: Reconcile ToolRegistry generation/dispatch behavior, PluginContext
+    facade construction, and caller-driven worker cancellation/lifeline cleanup before
+    replaying this commit.
   removal_condition: Remove when Hermes upstream exposes a trusted-plugin agent runner
     with isolated name-scoped registry execution.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

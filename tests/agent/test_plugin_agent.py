@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 
 import pytest
@@ -16,6 +17,7 @@ from agent.plugin_agent import (
     PluginAgentRunRequest,
     PluginAgentRunResult,
     PluginAgentRunner,
+    _PluginAgentCancelled,
     _exchange_worker,
 )
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -387,6 +389,53 @@ def test_worker_timeout_terminates_descendants(tmp_path: Path) -> None:
         time.sleep(0.02)
     else:
         pytest.fail(f"worker descendant {descendant_pid} survived timeout cleanup")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descendant probe")
+@pytest.mark.live_system_guard_bypass
+def test_worker_cancellation_closes_lifeline_and_terminates_descendants(
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "cancelled-descendant.pid"
+    code = (
+        "import pathlib,subprocess,sys,time;"
+        "sys.stdin.readline();"
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+        "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(p.pid));"
+        "time.sleep(60)"
+    )
+    cancelled = threading.Event()
+
+    def cancel_after_spawn() -> None:
+        deadline = time.monotonic() + 3
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        cancelled.set()
+
+    threading.Thread(target=cancel_after_spawn, daemon=True).start()
+    with pytest.raises(_PluginAgentCancelled):
+        _exchange_worker(
+            {"protocol_version": 1, "type": "run"},
+            workdir=tmp_path,
+            idle_timeout_seconds=5,
+            wall_timeout_seconds=10,
+            worker_argv=[sys.executable, "-c", code],
+            is_cancelled=cancelled.is_set,
+        )
+
+    descendant_pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            proc = psutil.Process(descendant_pid)
+            if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+                break
+        except psutil.NoSuchProcess:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail(f"worker descendant {descendant_pid} survived cancellation")
 
 
 def test_worker_stderr_is_never_exposed_to_plugin() -> None:

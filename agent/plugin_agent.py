@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from types import MappingProxyType
-from typing import Any, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping
 
 from tools.managed_process import ManagedProcessTree, TerminationPolicy
 
@@ -27,6 +27,10 @@ _MAX_REQUEST_BYTES = 1_000_000
 _MAX_FRAME_BYTES = 4_000_000
 _MAX_PROMPT_CHARS = 500_000
 _MAX_POLICY_NAMES = 256
+
+
+class _PluginAgentCancelled(RuntimeError):
+    """Internal control flow for caller-requested worker cancellation."""
 
 
 @dataclass(frozen=True)
@@ -173,6 +177,7 @@ def _exchange_worker(
     idle_timeout_seconds: float,
     wall_timeout_seconds: float,
     worker_argv: list[str] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     if len(encoded.encode("utf-8")) > _MAX_REQUEST_BYTES:
@@ -215,6 +220,8 @@ def _exchange_worker(
     try:
         while True:
             now = time.monotonic()
+            if is_cancelled is not None and is_cancelled():
+                raise _PluginAgentCancelled("plugin-agent run cancelled")
             if now - started >= wall_timeout_seconds:
                 raise TimeoutError("plugin-agent wall timeout")
             if now - last_activity >= idle_timeout_seconds:
@@ -268,7 +275,12 @@ class PluginAgentRunner:
             raise ValueError("plugin_id must be non-empty")
         self.plugin_id = plugin_id.strip()
 
-    def run(self, request: PluginAgentRunRequest) -> PluginAgentRunResult:
+    def run(
+        self,
+        request: PluginAgentRunRequest,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> PluginAgentRunResult:
         _validate_request(request)
         if not _agent_override_allowed(self.plugin_id, "provider", request.provider):
             raise PermissionError(f"plugin {self.plugin_id!r} cannot override provider")
@@ -293,6 +305,7 @@ class PluginAgentRunner:
                 workdir=Path(request.workdir).expanduser().resolve() if request.workdir else None,
                 idle_timeout_seconds=request.idle_timeout_seconds,
                 wall_timeout_seconds=request.wall_timeout_seconds,
+                is_cancelled=is_cancelled,
             )
             result = frame.get("result")
             if not isinstance(result, dict):
@@ -309,6 +322,17 @@ class PluginAgentRunner:
                 pending_interaction=None,
                 usage={},
                 audit={"plugin_id": self.plugin_id, "failure_kind": kind},
+            )
+        except _PluginAgentCancelled:
+            return PluginAgentRunResult(
+                final_response="",
+                session_id=request.session_id or "",
+                provider=request.provider or "",
+                model=request.model or "",
+                status="cancelled",
+                pending_interaction=None,
+                usage={},
+                audit={"plugin_id": self.plugin_id, "failure_kind": "cancelled"},
             )
 
 
