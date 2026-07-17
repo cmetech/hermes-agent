@@ -10,14 +10,16 @@ upstream_changes:
   owned_symbols:
   - ProcessIdentity
   - TerminationPolicy
+  - ProcessResourceLimits
   - ManagedProcessTree
   tests:
   - tests/tools/test_managed_process.py
   - tests/tools/test_process_registry.py
   expected_commit_subject: 'refactor(tools): extract managed process tree'
   upstream_candidate: true
-  merge_guidance: Reconcile process identity, process-tree termination, escalation,
-    and wait/reap behavior before replaying the extraction.
+  merge_guidance: Reconcile process identity, aggregate resource enforcement,
+    process-tree termination, escalation, and wait/reap behavior before replaying
+    the extraction.
   removal_condition: Remove when Hermes upstream exposes an equivalent generic managed-process-tree
     primitive used by ProcessRegistry.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

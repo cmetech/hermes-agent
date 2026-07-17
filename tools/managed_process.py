@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import math
 import os
 import platform
 import signal
@@ -52,6 +53,36 @@ class TerminationPolicy:
             raise ValueError("kill_grace_seconds must be positive")
         if self.wait_timeout_seconds <= 0:
             raise ValueError("wait_timeout_seconds must be positive")
+
+
+@dataclass(frozen=True)
+class ProcessResourceLimits:
+    """Finite aggregate limits for one owned process tree."""
+
+    max_rss_bytes: int = 2048 * 1024 * 1024
+    max_cpu_seconds: float = 900.0
+    max_descendants: int = 32
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_rss_bytes, bool)
+            or not isinstance(self.max_rss_bytes, int)
+            or self.max_rss_bytes <= 0
+        ):
+            raise ValueError("max_rss_bytes must be a positive integer")
+        if (
+            isinstance(self.max_cpu_seconds, bool)
+            or not isinstance(self.max_cpu_seconds, int | float)
+            or not math.isfinite(float(self.max_cpu_seconds))
+            or self.max_cpu_seconds <= 0
+        ):
+            raise ValueError("max_cpu_seconds must be positive and finite")
+        if (
+            isinstance(self.max_descendants, bool)
+            or not isinstance(self.max_descendants, int)
+            or self.max_descendants < 0
+        ):
+            raise ValueError("max_descendants must be a non-negative integer")
 
 
 @dataclass(frozen=True)
@@ -114,6 +145,41 @@ class ManagedProcessTree:
     @property
     def reaped(self) -> bool:
         return self._reaped
+
+    def resource_violation(self, limits: ProcessResourceLimits) -> str | None:
+        """Return a typed aggregate limit violation, failing closed on metrics."""
+        try:
+            import psutil
+
+            root = psutil.Process(self.identity.pid)
+            descendants = root.children(recursive=True)
+            if len(descendants) > limits.max_descendants:
+                return "descendant_limit"
+            rss = 0
+            cpu = 0.0
+            for process in (root, *descendants):
+                try:
+                    rss += int(process.memory_info().rss)
+                    times = process.cpu_times()
+                    cpu += float(times.user) + float(times.system)
+                except psutil.NoSuchProcess:
+                    continue
+            if rss > limits.max_rss_bytes:
+                return "rss_limit"
+            if cpu > limits.max_cpu_seconds:
+                return "cpu_limit"
+            return None
+        except ImportError:
+            return "resource_metrics_unavailable"
+        except Exception as exc:
+            try:
+                import psutil
+
+                if isinstance(exc, psutil.NoSuchProcess):
+                    return None
+            except ImportError:
+                pass
+            return "resource_metrics_unavailable"
 
     @classmethod
     def spawn(

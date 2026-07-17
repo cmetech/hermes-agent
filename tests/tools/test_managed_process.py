@@ -13,6 +13,7 @@ import psutil
 from tools.managed_process import (
     ManagedProcessTree,
     ProcessIdentity,
+    ProcessResourceLimits,
     TerminationPolicy,
 )
 
@@ -229,3 +230,23 @@ def test_spawn_failure_does_not_return_a_partial_owner(monkeypatch) -> None:
 
     with pytest.raises(OSError, match="spawn failed"):
         ManagedProcessTree.spawn(_sleep_argv())
+
+
+@pytest.mark.live_system_guard_bypass
+def test_process_tree_resource_limits_include_descendants() -> None:
+    code = (
+        "import subprocess,sys,time;"
+        "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);"
+        "time.sleep(30)"
+    )
+    tree = ManagedProcessTree.spawn([sys.executable, "-c", code])
+    try:
+        limits = ProcessResourceLimits(max_descendants=0)
+        deadline = time.monotonic() + 2
+        violation = None
+        while violation is None and time.monotonic() < deadline:
+            violation = tree.resource_violation(limits)
+            time.sleep(0.01)
+        assert violation == "descendant_limit"
+    finally:
+        tree.close()
