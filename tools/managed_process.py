@@ -165,6 +165,14 @@ class ManagedProcessTree:
                 return self._returncode
 
             if self.process.poll() is not None:
+                if _IS_WINDOWS:
+                    self.terminate_existing(
+                        self.identity,
+                        term_grace_seconds=self.policy.term_grace_seconds,
+                        kill_grace_seconds=self.policy.kill_grace_seconds,
+                    )
+                else:
+                    self._terminate_owned_posix_group()
                 return self._reap()
 
             # A PIPE-backed stdin is the coordinator lifeline used by isolated
@@ -218,6 +226,8 @@ class ManagedProcessTree:
                         "Direct child pid %d could not be reaped within bounded shutdown",
                         self.process.pid,
                     )
+            if not _IS_WINDOWS:
+                self._terminate_owned_posix_group()
             result = self._reap()
             if not self._reaped:
                 raise RuntimeError(
@@ -225,6 +235,44 @@ class ManagedProcessTree:
                     "the bounded termination policy"
                 )
             return result
+
+    def _terminate_owned_posix_group(self) -> bool:
+        """Terminate group members that outlived the direct owned child."""
+        group_id = self.identity.group_id
+        if group_id is None or group_id <= 0 or group_id == os.getpgrp():
+            return False
+
+        def group_alive() -> bool:
+            try:
+                os.killpg(group_id, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            return True
+
+        if not group_alive():
+            return False
+        try:
+            os.killpg(group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        deadline = time.monotonic() + self.policy.term_grace_seconds
+        while group_alive() and time.monotonic() < deadline:
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        if group_alive():
+            try:
+                os.killpg(group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                return False
+            deadline = time.monotonic() + self.policy.kill_grace_seconds
+            while group_alive() and time.monotonic() < deadline:
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        return not group_alive()
 
     def close(self) -> int | None:
         return self.terminate("owner close")
@@ -266,7 +314,10 @@ class ManagedProcessTree:
         """
         if identity.start_time is not None:
             current = ProcessIdentity.capture(identity.pid)
-            if current.start_time != identity.start_time:
+            if (
+                current.start_time is not None
+                and current.start_time != identity.start_time
+            ):
                 logger.warning(
                     "Refusing to terminate host pid %d: start-time mismatch",
                     identity.pid,

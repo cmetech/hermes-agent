@@ -180,6 +180,46 @@ def test_terminate_cleans_descendants_and_reaps_direct_child() -> None:
         pytest.fail(f"descendant pid {descendant_pid} survived managed cleanup")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group contract")
+@pytest.mark.live_system_guard_bypass
+def test_close_cleans_descendant_after_direct_child_already_exited() -> None:
+    child_code = "import time; time.sleep(60)"
+    parent_code = (
+        "import subprocess,sys;"
+        f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}],"
+        "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+        "print(p.pid, flush=True)"
+    )
+    tree = ManagedProcessTree.spawn([sys.executable, "-c", parent_code])
+    assert tree.process.stdout is not None
+    descendant_pid = int(tree.process.stdout.readline().decode().strip())
+    tree.process.wait(timeout=2)
+
+    try:
+        tree.close()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                descendant = psutil.Process(descendant_pid)
+                if (
+                    not descendant.is_running()
+                    or descendant.status() == psutil.STATUS_ZOMBIE
+                ):
+                    break
+            except psutil.NoSuchProcess:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail(
+                f"descendant pid {descendant_pid} survived exited-parent cleanup"
+            )
+    finally:
+        try:
+            psutil.Process(descendant_pid).kill()
+        except psutil.NoSuchProcess:
+            pass
+
+
 def test_spawn_failure_does_not_return_a_partial_owner(monkeypatch) -> None:
     monkeypatch.setattr(
         subprocess,
