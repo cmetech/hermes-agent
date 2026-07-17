@@ -110,6 +110,14 @@ export function evaluateModelEligibility(
       continue
     }
 
+    // The checks above already prove this is an explicit model in the live
+    // provider catalog. That is sufficient completion evidence when the
+    // additive capability record has not caught up; richer capabilities stay
+    // fail-closed.
+    if (capability === 'completion' && state === 'unknown') {
+      continue
+    }
+
     const normalizedState: UnverifiedCapabilityState = state === 'unsupported' ? 'unsupported' : 'unknown'
 
     return ineligible(`${capability}-${normalizedState}`, reasoningVerified, isCurrent)

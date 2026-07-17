@@ -11,6 +11,7 @@ from plugins import workflow as workflow_plugin
 from plugins.workflow.cli import _runtime_config, register_cli
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
+from plugins.workflow.store import RunStore
 from plugins.workflow.trust import build_risk_summary, compute_package_digest
 from plugins.workflow.trust import WorkflowPackageDigest, WorkflowTrustStore
 from plugins.workflow.compat import assess_compatibility
@@ -275,6 +276,37 @@ def test_run_status_events_and_runs_use_the_durable_store(
     args = parser.parse_args([*common, "runs", "--status", "succeeded", "--json"])
     assert args.func(args) == 0
     assert json.loads(capsys.readouterr().out)[0]["run_id"] == run["run_id"]
+
+
+def test_run_refuses_trusted_package_that_requires_an_isolated_backend(
+    workflow_writer, tmp_path, capsys
+):
+    workdir = tmp_path / "repo"
+    path = _write(workflow_writer, workdir)
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "execution_environment: isolated_backend_required\n",
+        encoding="utf-8",
+    )
+    profile = tmp_path / "profile"
+    package = load_workflow(path)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(profile).trust(
+        digest.sha256, actor="test", risk_digest=risk.risk_digest
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(profile),
+        "run",
+        "sample",
+        "--json",
+    ])
+
+    assert args.func(args) == 1
+    assert "requires a configured isolated backend" in capsys.readouterr().err
+    assert RunStore(profile).list_runs() == ()
 
 
 def test_reset_sessions_requires_confirmation_for_cross_scope_reset(tmp_path, capsys):

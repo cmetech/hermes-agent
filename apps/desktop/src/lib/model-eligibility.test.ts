@@ -106,12 +106,29 @@ describe('evaluateModelEligibility', () => {
           usage
         )
       ).toMatchObject({
-        eligible: false,
+        eligible: capability === 'completion' && state === 'unknown',
         grandfathered: false,
-        reasonKey
+        reasonKey: capability === 'completion' && state === 'unknown' ? null : reasonKey
       })
     }
   })
+
+  it.each<ModelUsageKind>(['main', 'fallback', 'auxiliary', 'vision', 'moa-reference', 'moa-aggregator'])(
+    'accepts a live explicit %s model with unverified completion when its other requirements are supported',
+    usage => {
+      expect(
+        evaluateModelEligibility(
+          contractProvider({ capabilities: { verified: withVerified('completion', 'unknown') } }),
+          'model-a',
+          usage
+        )
+      ).toMatchObject({
+        eligible: true,
+        grandfathered: false,
+        reasonKey: null
+      })
+    }
+  )
 
   it('allows main auto before catalog readiness or model metadata checks', () => {
     expect(
@@ -290,10 +307,7 @@ describe('evaluateModelEligibility', () => {
         'model-a',
         'main'
       )
-    ).toMatchObject({
-      eligible: false,
-      reasonKey: 'completion-unknown'
-    })
+    ).toMatchObject({ eligible: true, reasonKey: null })
   })
 
   it.each([

@@ -619,6 +619,36 @@ describe('ModelSettings', () => {
     ).not.toBe('true')
   })
 
+  it('keeps a newly selected live MoA model whose completion metadata is unverified', async () => {
+    const provider = gatewayProvider({
+      capabilities: {
+        ...gatewayProvider().capabilities,
+        'gateway-completion-unknown': {
+          selection_mode: 'explicit',
+          verified: { ...ALL_SUPPORTED, completion: 'unknown' }
+        }
+      },
+      models: [...gatewayProvider().models, 'gateway-completion-unknown']
+    })
+
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-good' })
+    getGlobalModelOptions.mockResolvedValueOnce({ providers: [provider] })
+    getMoaModels.mockResolvedValueOnce(moaPreset())
+
+    await renderModelSettings()
+    await screen.findByText('Reference 1')
+    vi.useFakeTimers()
+
+    fireEvent.click(rowComboboxes('Reference 1')[1])
+    const option = screen.getByRole('option', { name: 'gateway-completion-unknown' })
+    expect(option.getAttribute('aria-disabled')).not.toBe('true')
+    fireEvent.click(option)
+    await act(async () => vi.advanceTimersByTimeAsync(600))
+
+    expect(saveMoaModels).toHaveBeenCalledTimes(1)
+    expect(rowComboboxes('Reference 1')[1].textContent).toContain('gateway-completion-unknown')
+  })
+
   it('renders MoA selection warnings without removing the preserved slots', async () => {
     getGlobalModelInfo.mockResolvedValueOnce({ provider: 'gateway', model: 'gateway-good' })
     getGlobalModelOptions.mockResolvedValueOnce({

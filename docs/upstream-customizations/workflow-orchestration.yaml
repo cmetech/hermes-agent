@@ -7,7 +7,38 @@ coverage:
     reason: Separate user-requested v2.0.0-alpha.1 release preparation.
   - commit: 27c9b59a0d6887f433450feac56b97d905930e43
     reason: Separate user-requested v2.0.0 stable release preparation.
+  - commit: 6e3d7cbfc36c23a4a17137a2fe13210276e70d76
+    reason: Separate user-requested provider-registry resolution fix.
+  - commit: 3c1eec1d6a14bebc76fd6eb37ea7033504d9f44c
+    reason: Separate user-requested v2.0.1 release preparation.
+  - commit: cbc8b8dbceb084d43b4443fba2e737780ecf706b
+    reason: Separate user-requested v2.0.2 release preparation.
+  - commit: e3e1e5f552810010fe910ede51ed64d040676ea4
+    reason: Separate user-requested v2.0.3 release preparation.
 upstream_changes:
+- id: gateway-live-completion-eligibility
+  change_class: model-selection-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/model_eligibility.py
+  - apps/desktop/src/lib/model-eligibility.ts
+  owned_symbols:
+  - evaluate_model_eligibility
+  - evaluateModelEligibility
+  tests:
+  - tests/hermes_cli/test_model_eligibility.py
+  - tests/hermes_cli/test_web_server.py
+  - apps/desktop/src/lib/model-eligibility.test.ts
+  - apps/desktop/src/app/settings/model-settings.test.tsx
+  expected_commit_subject: 'fix(models): preserve live MoA selections'
+  upstream_candidate: true
+  merge_guidance: Preserve the exact live-model join and allow unknown completion
+    metadata only after catalog readiness, explicit selection, and live-model
+    membership are proven. Keep explicit unsupported completion and every
+    unknown/unsupported tools or vision requirement fail-closed.
+  removal_condition: Remove when upstream treats an explicit live provider model
+    as sufficient completion evidence while retaining richer capability gates.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: managed-process-tree
   change_class: agent-core-generic
   owner: workflow-orchestration
@@ -61,6 +92,40 @@ upstream_changes:
     exposing process-global resources.
   removal_condition: Remove when Hermes upstream exposes a trusted-plugin agent runner
     with isolated name-scoped registry execution.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-agent-override-inspection
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - agent/plugin_agent.py
+  owned_symbols:
+  - _agent_override_allowed
+  tests:
+  - tests/plugins/workflow/test_doctor.py
+  expected_commit_subject: 'fix(workflow): report provider override authorization'
+  upstream_candidate: true
+  merge_guidance: Preserve the optional explicit-config input so side-effect-free
+    inspectors can evaluate the exact same provider/model authorization rule as
+    the runtime without changing ambient profile state.
+  removal_condition: Remove when upstream exposes an equivalent side-effect-free
+    plugin-agent override authorization query.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: worker-deadline-gate-determinism
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - tests/agent/test_plugin_agent.py
+  owned_symbols:
+  - test_worker_stderr_is_never_exposed_to_plugin
+  - test_worker_stderr_does_not_reset_semantic_idle_deadline
+  tests:
+  - tests/agent/test_plugin_agent.py
+  expected_commit_subject: 'test(workflow): make worker gate deterministic'
+  upstream_candidate: true
+  merge_guidance: Preserve direct stderr-secrecy and semantic-idle classification
+    assertions without host-speed deadlines or worker-exit races in release gates.
+  removal_condition: Remove when upstream tests these invariants with equivalent
+    deterministic worker frames and classification checks.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: kanban-mutation-preconditions
   change_class: kanban-persistence-generic
@@ -162,27 +227,83 @@ upstream_changes:
   removal_condition: Remove when Hermes upstream provides equivalent native
     Workflow and Kanban operations pages over the same generic APIs.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-stale-recovery
+  change_class: desktop-composition-generic
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/run-inspector.tsx
+  - apps/desktop/src/components/activity-board/activity-board.tsx
+  - apps/desktop/src/components/activity-board/virtual-card-column.tsx
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  owned_symbols:
+  - WorkflowsView
+  - RunInspector
+  - ActivityBoard
+  - VirtualCardColumn
+  tests:
+  - apps/desktop/src/hermes.test.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/components/activity-board/activity-board.test.tsx
+  - apps/desktop/src/components/activity-board/activity-board.performance.test.tsx
+  expected_commit_subject: 'fix(desktop): recover stale workflow operations'
+  upstream_candidate: true
+  merge_guidance: Preserve synchronous duplicate-action suppression, 409 snapshot
+    refetch, stale/disconnected mutation disablement, bounded selected-run polling,
+    cursor-reset replacement, localized reconnect affordances, and bounded first-paint
+    virtualization while reconciling upstream Desktop query and presentation changes.
+  removal_condition: Remove when upstream Desktop provides equivalent compare-and-set
+    workflow action recovery and tested activity-board accessibility at scale.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: capability-workflow-package-staging
   change_class: capability-staging-generic
   owner: workflow-orchestration
   files:
   - hermes_cli/capability_staging.py
+  - scripts/vendor-ericsson.mjs
   - tests/hermes_cli/test_capability_staging.py
   - tests/hermes_cli/test_baked_seed.py
   owned_symbols:
   - _stage_workflow_package
   - _verified_workflow_package
+  - _repo_root
+  - sourceDestinationPairs
+  - managedDestinations
   tests:
   - tests/hermes_cli/test_capability_staging.py
   - tests/hermes_cli/test_baked_seed.py
+  - scripts/__tests__/vendor-ericsson.test.mjs
   expected_commit_subject: 'feat(ericsson): ship portable workflow packages'
   upstream_candidate: true
   merge_guidance: Preserve atomic complete-package replacement, contained
     symlink-free source validation, distribution-owned digest verification,
     digest-bound trusted_distribution provenance, rollback before publication,
-    and generic plugin-enable configuration while reconciling capability startup.
+    generic plugin-enable configuration, and source-tree/sys.prefix packaged-root
+    resolution while reconciling capability startup.
   removal_condition: Remove when Hermes upstream stages authenticated complete
     workflow package roots with equivalent digest-bound distribution trust.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: capability-workflow-agent-policy
+  change_class: capability-staging-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/capability_staging.py
+  owned_symbols:
+  - _merge_workflow_agent_defaults
+  tests:
+  - tests/hermes_cli/test_capability_staging.py
+  - tests/hermes_cli/test_baked_seed.py
+  expected_commit_subject: 'fix(capabilities): seed workflow agent override policy'
+  upstream_candidate: true
+  merge_guidance: Preserve idempotent workflow-only provider/model authorization
+    defaults while retaining explicit operator denials and the single config
+    round-trip used by capability staging.
+  removal_condition: Remove when the bundled workflow plugin has an upstream-owned
+    authorization policy that remains visible to doctor and runtime paths.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-showcase-distribution
   change_class: packaging-generic
@@ -195,15 +316,56 @@ upstream_changes:
   - workflow/showcases/**/*
   - recursive-include plugins/workflow/showcases *
   - skills/productivity/workflow-showcase
+  - capabilities
+  - capabilities/workflow-packages/ericsson
   tests:
   - tests/test_packaging_metadata.py
   - tests/plugins/workflow/test_showcase_distribution_e2e.py
   expected_commit_subject: 'feat(workflow): add offline guided showcase suite'
   upstream_candidate: true
-  merge_guidance: Preserve narrow wheel and sdist inclusion of the authenticated
-    workflow showcase bundle without broadening arbitrary plugin package data.
+  merge_guidance: Preserve wheel and sdist inclusion of the authenticated
+    workflow showcase bundle plus baked capability descriptors and workflow
+    packages required for clean-install plugin/MCP/workflow seeding, without
+    broadening arbitrary plugin package data.
   removal_condition: Remove when Hermes upstream ships equivalent authenticated
     workflow showcase package-data coverage.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-test-gate
+  change_class: release-gate-generic
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/package.json
+  owned_symbols:
+  - test
+  - test:workflow-ui
+  tests:
+  - tests/test_desktop_workflow_test_gate.py
+  expected_commit_subject: 'test(desktop): define workflow production gate'
+  upstream_candidate: true
+  merge_guidance: Preserve one default npm test entry point that runs the real
+    workflow/Kanban renderer contract and the existing Electron platform suite
+    without mixing Electron node tests into a jsdom process.
+  removal_condition: Remove when upstream Desktop provides an equivalent default
+    split-environment production test entry point.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: customization-checker-completeness
+  change_class: release-gate-generic
+  owner: workflow-orchestration
+  files:
+  - scripts/check_upstream_customizations.py
+  owned_symbols:
+  - validate_diff_coverage
+  - _range_base
+  - _existed_at
+  tests:
+  - tests/scripts/test_check_upstream_customizations.py
+  expected_commit_subject: 'fix(release): enforce existing customization coverage'
+  upstream_candidate: true
+  merge_guidance: Preserve baseline-aware classification so additive plugin and
+    script files remain low-friction while modifications, deletions, or renames
+    of upstream-existing plugin and script files require ledger ownership.
+  removal_condition: Remove when upstream customization tracking distinguishes
+    additive feature roots from existing upstream-owned files equivalently.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-native-portability-ci
   change_class: ci-generic

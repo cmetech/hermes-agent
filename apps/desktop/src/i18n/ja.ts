@@ -1634,6 +1634,8 @@ export const ja = defineLocale({
     resume: '再開',
     retry: '再試行',
     abandon: '破棄',
+    dataStale: 'データが古くなっています。再接続中…',
+    loadMore: 'さらに読み込む',
     workflowUnavailable: 'Workflow プラグインが無効です。hermes plugins enable workflow を実行してください。',
     kanbanUnavailable: 'Kanban プラグインが無効です。hermes plugins enable kanban を実行してください。',
     physicalBoard: board => `マシン共有の物理ボード: ${board}`

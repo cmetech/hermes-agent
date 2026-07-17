@@ -25,3 +25,6 @@ def test_built_wheel_contains_catalog_packages_and_fixture(tmp_path) -> None:
     assert any(name.endswith("mcp/echo-server.py") for name in names)
     assert any(name.endswith("skills/productivity/workflow-showcase/SKILL.md") for name in names)
     assert any(name.endswith("workflow-showcase/workflows/run-showcase.md") for name in names)
+    assert any(name.endswith("capabilities/ericsson.json") for name in names)
+    assert any(name.endswith("capabilities/mcp-servers.yaml") for name in names)
+    assert any(name.endswith("capabilities/workflow-packages/ericsson/digests.json") for name in names)

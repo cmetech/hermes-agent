@@ -33,18 +33,20 @@ class BashExecutor:
         attempt.mkdir(parents=True, exist_ok=False)
         stdout_path = attempt / "stdout.txt"
         stderr_path = attempt / "stderr.txt"
+        variable_spill = attempt / "variables"
         artifacts_dir = context.run_directory / "artifacts"
         artifacts_dir.mkdir(exist_ok=True)
+        command = str(context.node.value)
+        if context.variable_context is not None:
+            command = context.variable_context.render_bash(
+                command, spill_directory=variable_spill
+            )
         if os.name == "nt":  # pragma: no cover - Windows CI path
-            argv = [
-                os.environ.get("COMSPEC", "cmd.exe"),
-                "/d",
-                "/s",
-                "/c",
-                str(context.node.value),
-            ]
+            from tools.environments.local import _find_bash
+
+            argv = [_find_bash(), "-c", command]
         else:
-            argv = ["/bin/sh", "-c", str(context.node.value)]
+            argv = ["/bin/sh", "-c", command]
         allowed_env = {
             key: value
             for key, value in os.environ.items()

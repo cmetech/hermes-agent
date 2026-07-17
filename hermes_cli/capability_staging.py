@@ -17,6 +17,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Callable
@@ -91,6 +92,30 @@ def _merge_mcp_server_defaults(
             and default_url.strip()
         ):
             current["url"] = default_url
+            changed = True
+    return changed
+
+
+def _merge_workflow_agent_defaults(config: dict, plugin_names: list[str]) -> bool:
+    """Seed workflow-only agent overrides without replacing operator choices."""
+    if "workflow" not in plugin_names:
+        return False
+    plugins = config.setdefault("plugins", {})
+    if not isinstance(plugins, dict):
+        return False
+    entries = plugins.setdefault("entries", {})
+    if not isinstance(entries, dict):
+        return False
+    workflow = entries.setdefault("workflow", {})
+    if not isinstance(workflow, dict):
+        return False
+    agent = workflow.setdefault("agent", {})
+    if not isinstance(agent, dict):
+        return False
+    changed = False
+    for key in ("allow_provider_override", "allow_model_override"):
+        if key not in agent:
+            agent[key] = True
             changed = True
     return changed
 
@@ -406,6 +431,7 @@ def stage_bundle(
             if merged != plugins_cfg.get("enabled"):
                 plugins_cfg["enabled"] = merged
                 changed = True
+            changed |= _merge_workflow_agent_defaults(cfg, plugin_names)
 
         if changed:
             config_mod.save_config(cfg)
@@ -478,7 +504,18 @@ def stage_brand_capabilities(home: Path | str, root: Path | None = None) -> None
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    source_root = Path(__file__).resolve().parents[1]
+    if (source_root / "capabilities").is_dir():
+        return source_root
+
+    # setuptools ``data-files`` are installed relative to sys.prefix, not
+    # inside site-packages.  Prefer the source-tree layout during development,
+    # then use the wheel/venv prefix so clean packaged installs can seed the
+    # same authenticated capability bytes.
+    packaged_root = Path(sys.prefix).resolve()
+    if (packaged_root / "capabilities").is_dir():
+        return packaged_root
+    return source_root
 
 
 def seed_baked_capabilities(home: Path | str, root: Path | None = None) -> None:
@@ -542,6 +579,7 @@ def seed_baked_capabilities(home: Path | str, root: Path | None = None) -> None:
                         if merged != plugins_cfg.get("enabled"):
                             plugins_cfg["enabled"] = merged
                             changed = True
+                        changed |= _merge_workflow_agent_defaults(cfg, plugin_names)
                     if changed:
                         config_mod.save_config(cfg)
                 finally:

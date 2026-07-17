@@ -1397,6 +1397,8 @@ export interface Translations {
     resume: string
     retry: string
     abandon: string
+    dataStale: string
+    loadMore: string
     workflowUnavailable: string
     kanbanUnavailable: string
     physicalBoard: (board: string) => string

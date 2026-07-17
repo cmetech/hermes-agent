@@ -77,6 +77,10 @@ def test_seed_mcp_and_workflow_packages(tmp_path, fake_repo, fake_config):
     digest = compute_package_digest(load_workflow(workflow)).sha256
     assert WorkflowTrustStore(home).check(digest) == "trusted"
     assert "workflow" in cfg["plugins"]["enabled"]
+    assert cfg["plugins"]["entries"]["workflow"]["agent"] == {
+        "allow_model_override": True,
+        "allow_provider_override": True,
+    }
 
 
 def test_fresh_windows_checkout_seeds_workflow_and_mcp_defaults(
@@ -209,3 +213,15 @@ def test_seed_preserves_custom_mcp_url_and_absent_enabled(
 def test_seed_is_fail_safe_without_capabilities_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(cs, "_repo_root", lambda: tmp_path / "nope")
     cs.seed_baked_capabilities(tmp_path / "home")   # must not raise
+
+
+def test_repo_root_uses_wheel_data_prefix_when_source_tree_has_no_capabilities(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "site-packages" / "hermes_cli" / "capability_staging.py"
+    prefix = tmp_path / "venv"
+    (prefix / "capabilities").mkdir(parents=True)
+    monkeypatch.setattr(cs, "__file__", str(source))
+    monkeypatch.setattr(cs.sys, "prefix", str(prefix))
+
+    assert cs._repo_root() == prefix

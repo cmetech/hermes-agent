@@ -10,8 +10,13 @@ import {
   getProfiles,
   getSessionMessages,
   getStatus,
+  getWorkflowRun,
   listAllProfileSessions,
   listSessions,
+  listWorkflowAttention,
+  listWorkflowEvents,
+  listWorkflowRuns,
+  mutateWorkflowRun,
   saveMoaModels,
   setApiRequestProfile
 } from './hermes'
@@ -95,6 +100,31 @@ describe('Hermes REST session helpers', () => {
         timeoutMs: 60_000
       })
     )
+  })
+
+  it('routes every workflow operation through the authenticated profile bridge', async () => {
+    api.mockResolvedValue({})
+    setApiRequestProfile('remote-profile')
+
+    await Promise.all([
+      listWorkflowRuns(),
+      getWorkflowRun('run 1'),
+      listWorkflowAttention(),
+      listWorkflowEvents('run 1', 7),
+      mutateWorkflowRun('run 1', 'cancel', { expected_version: 3 })
+    ])
+
+    expect(api).toHaveBeenCalledTimes(5)
+
+    for (const [request] of api.mock.calls) {
+      expect(request).toEqual(expect.objectContaining({ profile: 'remote-profile' }))
+    }
+
+    expect(api).toHaveBeenLastCalledWith(expect.objectContaining({
+      body: { expected_version: 3 },
+      method: 'POST',
+      path: '/api/plugins/workflow/runs/run%201/cancel'
+    }))
   })
 
   it('gives the whole startup data burst the long timeout, not just profiles', async () => {

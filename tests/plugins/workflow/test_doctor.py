@@ -199,3 +199,50 @@ def test_doctor_json_contract_contains_stable_structured_fields(
         "notes",
     }
     assert all({"code", "path", "level", "blocking"} <= item.keys() for item in payload["findings"])
+
+
+def test_doctor_matches_runtime_authorization_for_explicit_provider_and_model(
+    tmp_path: Path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "package",
+        nodes=[
+            {
+                "id": "agent",
+                "prompt": "Inspect fictional evidence",
+                "provider": "custom",
+                "model": "custom-model",
+            }
+        ],
+    )
+    package = load_workflow(workflow)
+    home = tmp_path / "home"
+
+    blocked = doctor_package(package, hermes_home=home)
+
+    assert blocked.runnable is False
+    assert {
+        finding.code for finding in blocked.findings if finding.blocking
+    } == {
+        "model_override_not_authorized",
+        "provider_override_not_authorized",
+    }
+
+    home.mkdir(exist_ok=True)
+    (home / "config.yaml").write_text(
+        "plugins:\n"
+        "  entries:\n"
+        "    workflow:\n"
+        "      agent:\n"
+        "        allow_provider_override: true\n"
+        "        allow_model_override: true\n",
+        encoding="utf-8",
+    )
+
+    authorized = doctor_package(package, hermes_home=home)
+
+    assert authorized.runnable is True
+    assert not any(
+        finding.code.endswith("_override_not_authorized")
+        for finding in authorized.findings
+    )

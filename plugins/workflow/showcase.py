@@ -400,6 +400,91 @@ def _event_ref(event: Mapping[str, object]) -> str:
     return f"event:{int(event['sequence'])}:{event['event_type']}"
 
 
+def _report_events(
+    store: RunStore, run_id: str, *, expected_sequence: int
+) -> tuple[tuple[dict[str, object], ...], bool]:
+    events: list[dict[str, object]] = []
+    after = 0
+    while after < expected_sequence and len(events) < 10_000:
+        page = store.tail_events(run_id, after_sequence=after, limit=200)
+        if not page:
+            break
+        events.extend(page)
+        after = int(page[-1]["sequence"])
+    complete = after == expected_sequence
+    return tuple(events), complete
+
+
+def _cleanup_evidence(
+    projection: Mapping[str, object],
+    events: tuple[dict[str, object], ...],
+    *,
+    journal_complete: bool,
+) -> tuple[dict[str, object], tuple[str, ...]]:
+    unresolved: dict[tuple[object, object, object], Mapping[str, object]] = {}
+    failures: list[Mapping[str, object]] = []
+    for event in events:
+        event_type = event.get("event_type")
+        payload = event.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        if event_type == "process_started":
+            identity = payload.get("process_identity")
+            if isinstance(identity, Mapping):
+                key = (event.get("node_id"), event.get("attempt_id"), identity.get("pid"))
+                unresolved[key] = event
+        elif event_type == "process_reaped":
+            key = (event.get("node_id"), event.get("attempt_id"), payload.get("pid"))
+            unresolved.pop(key, None)
+        elif event_type == "cleanup_failed":
+            failures.append(event)
+            pid = payload.get("pid")
+            if pid is not None:
+                key = (event.get("node_id"), event.get("attempt_id"), pid)
+                unresolved[key] = event
+
+    nodes = projection.get("nodes")
+    if isinstance(nodes, Mapping):
+        for node_id, node in nodes.items():
+            if not isinstance(node, Mapping):
+                continue
+            for attempt in node.get("attempts", ()):
+                if not isinstance(attempt, Mapping):
+                    continue
+                identity = attempt.get("process_identity")
+                if isinstance(identity, Mapping):
+                    key = (node_id, attempt.get("attempt_id"), identity.get("pid"))
+                    unresolved[key] = attempt
+
+    if failures and not unresolved:
+        unresolved[("cleanup", "unproven", len(failures))] = failures[-1]
+    if not journal_complete:
+        unresolved[("journal", "incomplete", None)] = {}
+    refs = tuple(_event_ref(event) for event in failures[-3:])
+    return {
+        "owned_processes_live": len(unresolved),
+        "owned_processes_unreaped": len(unresolved),
+        "cleanup_failures": len(failures),
+        "journal_complete": journal_complete,
+    }, refs
+
+
+def _showcase_staging_present(home: Path) -> bool:
+    staging = home / "workflow" / "showcase" / "staging"
+    if not staging.is_dir():
+        return False
+    for child in staging.iterdir():
+        marker = child / "owner.json"
+        if not child.is_dir() or not marker.is_file():
+            continue
+        try:
+            owner = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(owner, Mapping) and owner.get("owner") == "workflow-showcase":
+            return True
+    return False
+
+
 def build_showcase_report(run_id: str, *, hermes_home: str | Path) -> ShowcaseReport:
     store, _ = _store(hermes_home)
     projection = store.load_run(run_id)
@@ -407,8 +492,16 @@ def build_showcase_report(run_id: str, *, hermes_home: str | Path) -> ShowcaseRe
     if not isinstance(metadata, Mapping) or not metadata.get("showcase_id"):
         raise ShowcaseCatalogError("run is not an authenticated showcase run")
     scenario = load_showcase_catalog()[str(metadata["showcase_id"])]
-    events = store.tail_events(run_id, limit=200)
+    events, journal_complete = _report_events(
+        store, run_id, expected_sequence=int(projection["event_sequence"])
+    )
     run_directory = store.run_directory(run_id)
+    cleanup, cleanup_failure_refs = _cleanup_evidence(
+        projection, events, journal_complete=journal_complete
+    )
+    cleanup["staging_present"] = _showcase_staging_present(
+        Path(hermes_home).expanduser().resolve()
+    )
     interactions = tuple(
         {"type": str(node["pending_interaction"].get("type", "interaction")), "node_id": node_id, "interaction_id": str(node["pending_interaction"].get("interaction_id", ""))}
         for node_id, node in projection["nodes"].items()
@@ -475,9 +568,12 @@ def build_showcase_report(run_id: str, *, hermes_home: str | Path) -> ShowcaseRe
             elif node.get("state") == "skipped":
                 outcome, reason = "skipped", "mode_not_selected"
         elif capability == "process-cleanup":
-            started, reaped = by_type.get("process_started", []), by_type.get("process_reaped", [])
-            if len(reaped) >= len(started):
+            reaped = by_type.get("process_reaped", [])
+            if cleanup["owned_processes_unreaped"] == 0 and not cleanup["cleanup_failures"]:
                 outcome, reason, refs = "passed", "all_owned_processes_reaped", tuple(_event_ref(e) for e in reaped[-3:]) or ("run:process:none",)
+            else:
+                reason = "owned_process_cleanup_unproven"
+                refs = cleanup_failure_refs or ("run:process:unreaped",)
         elif scenario.requires_ai:
             outcome, reason = "skipped", "optional_ai_evidence_not_available"
         elif scenario.id == "scheduling":
@@ -488,7 +584,7 @@ def build_showcase_report(run_id: str, *, hermes_home: str | Path) -> ShowcaseRe
         bundle_digest=str(metadata["bundle_digest"]), run_id=run_id,
         definition_digest=str(projection["definition_digest"]), terminal_outcome=str(projection["status"]),
         claims=tuple(claims), interactions=interactions, artifacts=tuple(verified_artifacts),
-        cleanup={"owned_processes_live": 0, "staging_present": False},
+        cleanup=cleanup,
         suggested_next=("approve", "reject") if projection["status"] == "paused" else ("status", "cleanup"),
     )
 
