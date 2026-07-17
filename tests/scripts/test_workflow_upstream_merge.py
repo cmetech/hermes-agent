@@ -17,6 +17,12 @@ ROOT = Path(__file__).parents[2]
 REHEARSAL = ROOT / "scripts/test_workflow_upstream_merge.sh"
 
 
+def test_rehearsal_runs_brand_generator_from_the_worktree() -> None:
+    source = REHEARSAL.read_text()
+
+    assert '(cd "$worktree" && node scripts/brand/generate.mjs' in source
+
+
 def test_synthetic_overlap_classes_cover_continue_and_stop_cases(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     baseline = _git(repo, "rev-parse", "HEAD")

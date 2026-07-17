@@ -164,7 +164,8 @@ for ref in "${BRAND_REFS[@]}"; do
   record_command "merge-tested-base-into-$slug" "passed" "$started"
 
   started="$(now_ms)"
-  node "$worktree/scripts/brand/generate.mjs" "$slug" --write >"$REPORT_DIR/$slug-brand.log" 2>&1
+  (cd "$worktree" && node scripts/brand/generate.mjs "$slug" --write) \
+    >"$REPORT_DIR/$slug-brand.log" 2>&1
   record_command "generate-$slug-overlay" "passed" "$started"
   if ! git -C "$worktree" diff --quiet; then
     git -C "$worktree" add -A
