@@ -1,0 +1,311 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import shutil
+import time
+
+import pytest
+
+from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.executors.base import NodeExecutionContext
+from plugins.workflow.executors.script import ScriptExecutor
+from plugins.workflow.models import WorkflowNode, freeze_value
+from plugins.workflow.resources import ResourceResolver, VariableContext
+from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.schema import load_workflow
+from plugins.workflow.store import RunStore
+from tools.managed_process import TerminationPolicy
+
+
+def test_named_script_prefers_exact_package_resource_before_runtime_suffix(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "package"
+    scripts = package / "scripts"
+    scripts.mkdir(parents=True)
+    exact = scripts / "diagnose"
+    exact.write_text("print('exact')\n", encoding="utf-8")
+    (scripts / "diagnose.py").write_text("print('suffix')\n", encoding="utf-8")
+
+    resource = ResourceResolver(package).script("diagnose", runtime="uv")
+
+    assert resource.path == exact.resolve()
+    assert resource.runtime == "uv"
+
+
+@pytest.mark.parametrize(
+    ("name", "runtime", "message"),
+    [
+        ("../escape", "uv", "contained script name"),
+        ("diagnose.js", "uv", "requires a Python script"),
+        ("diagnose.py", "bun", "requires a JavaScript or TypeScript script"),
+        ("diagnose", "node", "runtime must be bun or uv"),
+    ],
+)
+def test_named_script_rejects_traversal_and_runtime_extension_mismatch(
+    tmp_path: Path, name: str, runtime: str, message: str
+) -> None:
+    scripts = tmp_path / "package" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "diagnose.js").write_text("console.log('js')\n", encoding="utf-8")
+    (scripts / "diagnose.py").write_text("print('py')\n", encoding="utf-8")
+
+    with pytest.raises((ValueError, FileNotFoundError), match=message):
+        ResourceResolver(tmp_path / "package").script(name, runtime=runtime)
+
+
+def test_named_script_does_not_follow_symlink_outside_package(tmp_path: Path) -> None:
+    package = tmp_path / "package"
+    scripts = package / "scripts"
+    scripts.mkdir(parents=True)
+    outside = tmp_path / "outside.py"
+    outside.write_text("print('outside')\n", encoding="utf-8")
+    (scripts / "diagnose.py").symlink_to(outside)
+
+    with pytest.raises(FileNotFoundError, match="missing"):
+        ResourceResolver(package).script("diagnose", runtime="uv")
+
+
+def _context(
+    tmp_path: Path,
+    *,
+    runtime: str,
+    script: str,
+    deps: tuple[str, ...] = (),
+    timeout_seconds: float = 3,
+    variable_context: VariableContext | None = None,
+    termination_policy: TerminationPolicy | None = None,
+) -> NodeExecutionContext:
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(exist_ok=True)
+    node = WorkflowNode(
+        id="script",
+        node_type="script",
+        value=script,
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({"runtime": runtime, "deps": deps}),
+    )
+    return NodeExecutionContext(
+        run_id="run-1",
+        run_directory=run_directory,
+        node=node,
+        attempt_id="attempt-1",
+        timeout_seconds=timeout_seconds,
+        variable_context=variable_context,
+        **(
+            {"termination_policy": termination_policy}
+            if termination_policy is not None
+            else {}
+        ),
+    )
+
+
+def test_uv_dependencies_are_distinct_argv_without_shell_interpolation(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "must-not-exist"
+    dependency = f"demo; touch {marker}"
+    wrapper = tmp_path / "fake-uv"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    context = _context(
+        tmp_path,
+        runtime="uv",
+        script="print('never')\n",
+        deps=(dependency,),
+    )
+
+    result = ScriptExecutor(runtime_locator=lambda _runtime: str(wrapper)).execute(
+        context
+    )
+
+    assert result.status == "succeeded"
+    output = context.run_directory / result.artifacts[0].relative_path
+    assert json.loads(output.read_text()) == [
+        "run",
+        "--no-project",
+        "--with",
+        dependency,
+        "python",
+        "-c",
+        "print('never')\n",
+    ]
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+def test_extensionless_named_uv_script_runs_as_python_outside_a_project(
+    tmp_path: Path,
+) -> None:
+    scripts = tmp_path / "run" / "scripts"
+    scripts.mkdir(parents=True)
+    script = scripts / "extensionless"
+    script.write_text("print('extensionless-ok')\n", encoding="utf-8")
+    context = _context(tmp_path, runtime="uv", script="extensionless")
+
+    result = ScriptExecutor().execute(context)
+
+    assert result.status == "succeeded"
+    output = context.run_directory / result.artifacts[0].relative_path
+    assert output.read_text() == "extensionless-ok"
+
+
+@pytest.mark.parametrize(
+    ("runtime", "source"),
+    [
+        (
+            "uv",
+            "import json,sys; print(json.dumps({'ok': True})); "
+            "print('diagnostic', file=sys.stderr)\n",
+        ),
+        (
+            "bun",
+            "console.log(JSON.stringify({ok:true})); console.error('diagnostic');\n",
+        ),
+    ],
+)
+def test_inline_script_captures_json_stdout_and_diagnostic_stderr(
+    tmp_path: Path, runtime: str, source: str
+) -> None:
+    if shutil.which(runtime) is None:
+        pytest.skip(f"{runtime} is not installed")
+    context = _context(tmp_path, runtime=runtime, script=source)
+
+    result = ScriptExecutor().execute(context)
+
+    assert result.status == "succeeded"
+    assert [artifact.media_type for artifact in result.artifacts] == [
+        "application/json",
+        "text/plain",
+    ]
+    output = context.run_directory / result.artifacts[0].relative_path
+    stderr = context.run_directory / result.artifacts[1].relative_path
+    assert json.loads(output.read_text()) == {"ok": True}
+    assert stderr.read_text().strip() == "diagnostic"
+
+
+def test_missing_script_runtime_is_a_typed_failure(tmp_path: Path) -> None:
+    result = ScriptExecutor(runtime_locator=lambda _runtime: None).execute(
+        _context(tmp_path, runtime="uv", script="print('no runtime')\n")
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "runtime_missing"
+    assert "uv" in result.error_message
+
+
+def test_named_script_receives_sanitized_workflow_variable_environment(
+    tmp_path: Path,
+) -> None:
+    scripts = tmp_path / "run" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "environment.py").write_text(
+        "import json,os\n"
+        "print(json.dumps({'arguments': os.environ['ARGUMENTS'], "
+        "'workflow': os.environ['WORKFLOW_ID']}))\n",
+        encoding="utf-8",
+    )
+    context = _context(
+        tmp_path,
+        runtime="uv",
+        script="environment",
+        variable_context=VariableContext(
+            arguments="safe evidence", workflow_id="run-1"
+        ),
+    )
+
+    result = ScriptExecutor().execute(context)
+
+    output = context.run_directory / result.artifacts[0].relative_path
+    assert result.status == "succeeded"
+    assert json.loads(output.read_text()) == {
+        "arguments": "safe evidence",
+        "workflow": "run-1",
+    }
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+def test_script_timeout_reaps_spawned_descendant(tmp_path: Path) -> None:
+    source = (
+        "import subprocess,sys,time\n"
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])\n"
+        "print(child.pid, flush=True)\n"
+        "time.sleep(30)\n"
+    )
+    context = _context(
+        tmp_path,
+        runtime="uv",
+        script=source,
+        timeout_seconds=0.2,
+        termination_policy=TerminationPolicy(
+            cooperative_grace_seconds=0,
+            term_grace_seconds=0.2,
+            kill_grace_seconds=0.2,
+            wait_timeout_seconds=0.2,
+        ),
+    )
+
+    result = ScriptExecutor().execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "timeout"
+    output = context.run_directory / result.artifacts[0].relative_path
+    child_pid = int(output.read_text())
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        try:
+            import psutil
+
+            child = psutil.Process(child_pid)
+            if not child.is_running() or child.status() == psutil.STATUS_ZOMBIE:
+                break
+        except psutil.NoSuchProcess:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail(f"script descendant {child_pid} survived timeout cleanup")
+
+
+def test_scheduler_executes_snapshotted_named_script(
+    tmp_path: Path, workflow_writer
+) -> None:
+    package_root = tmp_path / "package"
+    scripts = package_root / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "summarize.py").write_text(
+        "import json; print(json.dumps({'status':'ok'}))\n", encoding="utf-8"
+    )
+    package = load_workflow(
+        workflow_writer(
+            package_root / "workflows",
+            name="script-e2e",
+            nodes=[{"id": "summarize", "script": "summarize", "runtime": "uv"}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="script-e2e",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+
+    result = RunScheduler(store).advance(admitted.run_id)
+
+    assert result["status"] == "succeeded"
+    artifact = result["artifacts"][0]
+    output = store.run_directory(admitted.run_id) / artifact["relative_path"]
+    assert json.loads(output.read_text()) == {"status": "ok"}

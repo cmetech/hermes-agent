@@ -38,6 +38,7 @@ function assertManifestSourcePath(rel, kind) {
     plugin: /^plugins\/[^/]+$/,
     mcpLocal: /^mcp\/[^/]+$/,
     workflow: /^workflows\/[^/]+$/,
+    workflowPackage: /^capabilities\/workflow-packages\/[A-Za-z0-9][A-Za-z0-9._-]*$/,
     mcpServers: /^mcp\/[^/]+\.ya?ml$/i,
   }
   if (!patterns[kind]?.test(rel)) {
@@ -50,6 +51,7 @@ function assertManagedDestination(rel) {
   assertStrictRelativePath(rel, 'managed destination')
   const allowed = /^skills\/ericsson\/[^/]+$/.test(rel)
     || /^plugins\/[^/]+$/.test(rel)
+    || /^capabilities\/workflow-packages\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(rel)
     || /^capabilities\/workflows\/[^/]+$/.test(rel)
     || /^capabilities\/[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$/i.test(rel)
   if (!allowed) throw new Error(`unsafe managed destination: ${rel}`)
@@ -81,15 +83,24 @@ function mcpDestinationFromManifest(manifest, { includeLegacyFile = true } = {})
 function sourceDestinationPairs(manifest) {
   const pairs = [
     ...(manifest.skills || []).map(rel => [assertManifestSourcePath(rel, 'skill'), rel]),
-    ...(manifest.plugins || []).map(rel => [assertManifestSourcePath(rel, 'plugin'), rel]),
+    ...(manifest.plugins || [])
+      .filter(rel => rel !== 'plugins/workflow')
+      .map(rel => [assertManifestSourcePath(rel, 'plugin'), rel]),
     ...(manifest.mcpLocal || []).map(rel => [
       assertManifestSourcePath(rel, 'mcpLocal'),
       path.posix.join('plugins', path.posix.basename(rel)),
     ]),
-    ...(manifest.workflows || []).map(rel => [
-      assertManifestSourcePath(rel, 'workflow'),
-      path.posix.join('capabilities/workflows', path.posix.basename(rel)),
-    ]),
+    ...(manifest.workflowPackages || []).map(entry => {
+      if (!entry || Object.keys(entry).sort().join(',') !== 'digestManifest,path') {
+        throw new Error('workflowPackages entries require digestManifest and path')
+      }
+      const source = assertManifestSourcePath(entry.path, 'workflowPackage')
+      assertStrictRelativePath(entry.digestManifest, 'workflow digest manifest')
+      if (entry.digestManifest !== `${source}/digests.json`) {
+        throw new Error('workflow digest manifest must be inside its package root')
+      }
+      return [source, source]
+    }),
   ]
   const sourcesByDestination = new Map()
   for (const [source, destination] of pairs) {
@@ -113,6 +124,7 @@ export function managedDestinations(manifest, { includeLegacyMcpFile = true } = 
     destinations.push(rel)
   }
   for (const rel of manifest.plugins || []) {
+    if (rel === 'plugins/workflow') continue
     assertManagedDestination(rel)
     destinations.push(rel)
   }
@@ -126,6 +138,17 @@ export function managedDestinations(manifest, { includeLegacyMcpFile = true } = 
       throw new Error(`unsafe manifest source path: ${rel}`)
     }
     destinations.push(path.posix.join('capabilities/workflows', path.posix.basename(rel)))
+  }
+  for (const entry of manifest.workflowPackages || []) {
+    if (!entry || Object.keys(entry).sort().join(',') !== 'digestManifest,path') {
+      throw new Error('workflowPackages entries require digestManifest and path')
+    }
+    const destination = assertManifestSourcePath(entry.path, 'workflowPackage')
+    assertStrictRelativePath(entry.digestManifest, 'workflow digest manifest')
+    if (entry.digestManifest !== `${destination}/digests.json`) {
+      throw new Error('workflow digest manifest must be inside its package root')
+    }
+    destinations.push(destination)
   }
   const mcpDestination = mcpDestinationFromManifest(manifest, {
     includeLegacyFile: includeLegacyMcpFile,
@@ -745,7 +768,15 @@ function validateJournal(raw, destRoot, currentExpected, expectedMcpDestination)
 
 function removeLivePath(destRoot, entry) {
   assertNoSymlinkComponents(destRoot, entry.rel, 'transaction destination')
-  fs.rmSync(path.join(destRoot, entry.rel), { recursive: true, force: true })
+  const target = path.join(destRoot, entry.rel)
+  fs.rmSync(target, { recursive: true, force: true })
+  if (entry.rel.startsWith('capabilities/workflow-packages/')) {
+    const packageParent = path.dirname(target)
+    if (lstatIfPresent(packageParent)?.isDirectory()
+      && fs.readdirSync(packageParent).length === 0) {
+      fs.rmdirSync(packageParent)
+    }
+  }
 }
 
 function cleanupTransaction(destRoot, journal) {
@@ -838,9 +869,7 @@ function stageSnapshot({
     const vendored = {
       ...manifest,
       vendoredFrom: sourceCommit,
-      workflows: (manifest.workflows || []).map(rel => (
-        path.posix.join('capabilities/workflows', path.posix.basename(rel))
-      )),
+      workflowPackages: manifest.workflowPackages || [],
     }
     if (mcpDestination) vendored.mcpServersFile = path.posix.basename(mcpDestination)
     else delete vendored.mcpServersFile
@@ -973,7 +1002,7 @@ function publishTransaction({ destRoot, staged, current, faultInjector }) {
   }
 }
 
-// mcpLocal dirs land under plugins/<basename>; skills/plugins/workflows keep their relative path.
+// mcpLocal dirs land under plugins/<basename>; complete workflow package roots stay intact.
 export function vendor({ sourceDir, destRoot, sourceCommit, faultInjector = () => {} }) {
   const lock = acquireVendorLock(destRoot, faultInjector)
   try {

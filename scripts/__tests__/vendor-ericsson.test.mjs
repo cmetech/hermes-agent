@@ -40,10 +40,14 @@ function tmpSource(manifestOverrides = {}) {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'ecsrc-'))
   const manifest = {
     name: 'ericsson', version: '0.2.0',
-    skills: ['skills/ericsson/workflow-orchestrator'],
-    plugins: ['plugins/ericsson-jira'],
+    skills: ['skills/ericsson/opportunity-visuals'],
+    plugins: ['plugins/workflow', 'plugins/ericsson-jira'],
     mcpServers: 'mcp/mcp-servers.yaml', mcpLocal: ['mcp/outlook-mcp'],
-    workflows: ['workflows/w.yml'], personas: [],
+    workflowPackages: [{
+      path: 'capabilities/workflow-packages/ericsson',
+      digestManifest: 'capabilities/workflow-packages/ericsson/digests.json',
+    }],
+    personas: [],
     env: [{ key: 'JIRA_PAT', description: 'x', category: 'tool', password: true }],
     ...manifestOverrides,
   }
@@ -55,7 +59,10 @@ function tmpSource(manifestOverrides = {}) {
   }
   for (const rel of manifest.mcpLocal || []) write(d, `${rel}/run_server.py`, '# srv')
   if (manifest.mcpServers) write(d, manifest.mcpServers, 'mcp_servers:\n  outlook: {}\n')
-  for (const rel of manifest.workflows || []) write(d, rel, `name: ${path.basename(rel)}\n`)
+  for (const entry of manifest.workflowPackages || []) {
+    write(d, `${entry.path}/workflows/w.yaml`, 'name: w\ndescription: fixture\nnodes:\n  - id: start\n    bash: "true"\n')
+    write(d, entry.digestManifest, JSON.stringify({ schemaVersion: 1, packages: { w: '0'.repeat(64) } }))
+  }
   write(d, 'tests/should_not_copy.py', 'x')       // repo-only, must be stripped
   return d
 }
@@ -177,7 +184,8 @@ test('vendor maps manifest paths into the hermes-agent tree', () => {
   const src = tmpSource()
   const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'ecdst-'))
   vendor({ sourceDir: src, destRoot: dst, sourceCommit: 'abc1234' })
-  assert.ok(fs.existsSync(path.join(dst, 'skills/ericsson/workflow-orchestrator/SKILL.md')))
+  assert.ok(fs.existsSync(path.join(dst, 'skills/ericsson/opportunity-visuals/SKILL.md')))
+  assert.ok(!fs.existsSync(path.join(dst, 'plugins/workflow')))
   assert.ok(fs.existsSync(path.join(dst, 'plugins/ericsson-jira/plugin.yaml')))
   assert.ok(fs.existsSync(path.join(dst, 'plugins/outlook-mcp/run_server.py')))    // mcpLocal -> plugins/
   const man = JSON.parse(fs.readFileSync(path.join(dst, 'capabilities/ericsson.json'), 'utf8'))
@@ -186,10 +194,10 @@ test('vendor maps manifest paths into the hermes-agent tree', () => {
   assert.ok(!fs.existsSync(path.join(dst, 'tests/should_not_copy.py')))            // stripped
   assert.deepEqual(readInventory(dst), [
     'capabilities/mcp-servers.yaml',
-    'capabilities/workflows/w.yml',
+    'capabilities/workflow-packages/ericsson',
     'plugins/ericsson-jira',
     'plugins/outlook-mcp',
-    'skills/ericsson/workflow-orchestrator',
+    'skills/ericsson/opportunity-visuals',
   ])
 })
 
@@ -200,8 +208,13 @@ test('managedDestinations returns sorted unique destination paths', () => {
     mcpLocal: ['mcp/outlook-mcp', 'mcp/outlook-mcp'],
     mcpServers: 'mcp/mcp-servers.yaml',
     workflows: ['workflows/z.yml', 'workflows/z.yml', 'workflows/a.yml'],
+    workflowPackages: [{
+      path: 'capabilities/workflow-packages/ericsson',
+      digestManifest: 'capabilities/workflow-packages/ericsson/digests.json',
+    }],
   }), [
     'capabilities/mcp-servers.yaml',
+    'capabilities/workflow-packages/ericsson',
     'capabilities/workflows/a.yml',
     'capabilities/workflows/z.yml',
     'plugins/a',
@@ -349,7 +362,7 @@ test('vendor rejects a source manifest reached through a symlinked ancestor', ()
 })
 
 test('vendor rejects a symlinked destination ancestor instead of escaping the destination root', () => {
-  const src = tmpSource({ skills: [], workflows: [], mcpLocal: [] })
+  const src = tmpSource({ skills: [], workflowPackages: [], mcpLocal: [] })
   const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'ecdst-'))
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'ecoutside-'))
   fs.symlinkSync(outside, path.join(dst, 'plugins'), process.platform === 'win32' ? 'junction' : 'dir')
@@ -411,8 +424,8 @@ test('vendor exactly replaces every retained managed destination', () => {
   vendor({ sourceDir: src, destRoot: dst, sourceCommit: '2'.repeat(40) })
 
   assert.deepEqual(
-    treeSnapshot(path.join(dst, 'skills/ericsson/workflow-orchestrator')),
-    treeSnapshot(path.join(src, 'skills/ericsson/workflow-orchestrator')),
+    treeSnapshot(path.join(dst, 'skills/ericsson/opportunity-visuals')),
+    treeSnapshot(path.join(src, 'skills/ericsson/opportunity-visuals')),
   )
   assert.deepEqual(
     treeSnapshot(path.join(dst, 'plugins/ericsson-jira')),
@@ -422,9 +435,9 @@ test('vendor exactly replaces every retained managed destination', () => {
     treeSnapshot(path.join(dst, 'plugins/outlook-mcp')),
     treeSnapshot(path.join(src, 'mcp/outlook-mcp')),
   )
-  assert.equal(
-    fs.readFileSync(path.join(dst, 'capabilities/workflows/w.yml'), 'utf8'),
-    fs.readFileSync(path.join(src, 'workflows/w.yml'), 'utf8'),
+  assert.deepEqual(
+    treeSnapshot(path.join(dst, 'capabilities/workflow-packages/ericsson')),
+    treeSnapshot(path.join(src, 'capabilities/workflow-packages/ericsson')),
   )
   assert.equal(
     fs.readFileSync(path.join(dst, 'capabilities/mcp-servers.yaml'), 'utf8'),
@@ -684,10 +697,10 @@ test('destination lock rejects a concurrent vendor and preserves one coherent sn
       '2'.repeat(40),
     )
     for (const rel of [
-      'skills/ericsson/workflow-orchestrator/SKILL.md',
+      'skills/ericsson/opportunity-visuals/SKILL.md',
       'plugins/ericsson-jira/plugin.yaml',
       'plugins/outlook-mcp/run_server.py',
-      'capabilities/workflows/w.yml',
+      'capabilities/workflow-packages/ericsson/workflows/w.yaml',
       'capabilities/mcp-servers.yaml',
       'capabilities/ericsson-vendored-paths.json',
     ]) assert.ok(fs.existsSync(path.join(dst, rel)), rel)
@@ -718,7 +731,7 @@ test('vendor recovers an authenticated stale lock and preserves lock lookalikes'
     fs.readFileSync(path.join(dst, '.ericsson-vendor-lock-user-notes/readme.txt'), 'utf8'),
     'must survive\n',
   )
-  assert.ok(fs.existsSync(path.join(dst, 'skills/ericsson/workflow-orchestrator/SKILL.md')))
+  assert.ok(fs.existsSync(path.join(dst, 'skills/ericsson/opportunity-visuals/SKILL.md')))
 })
 
 test('vendor recovers when a dead stale-lock reclaimer crashed after publishing its claim', async () => {
@@ -819,8 +832,8 @@ test('cleanup failure after manifest-last completion preserves a coherent snapsh
   }), /completed.*cleanup|cleanup.*completed/i)
   assert.equal(injected, true)
   assert.deepEqual(
-    treeSnapshot(path.join(dst, 'skills/ericsson/workflow-orchestrator')),
-    treeSnapshot(path.join(src, 'skills/ericsson/workflow-orchestrator')),
+    treeSnapshot(path.join(dst, 'skills/ericsson/opportunity-visuals')),
+    treeSnapshot(path.join(src, 'skills/ericsson/opportunity-visuals')),
   )
   assert.equal(
     JSON.parse(fs.readFileSync(path.join(dst, 'capabilities/ericsson.json'), 'utf8')).vendoredFrom,
@@ -924,10 +937,10 @@ test('command-line vendoring records the full exact source commit', () => {
 
 test('command-line vendoring rejects dirty tracked, staged, and untracked source state without mutation', () => {
   const cases = {
-    'dirty tracked': src => write(src, 'skills/ericsson/workflow-orchestrator/SKILL.md', 'dirty tracked\n'),
+    'dirty tracked': src => write(src, 'skills/ericsson/opportunity-visuals/SKILL.md', 'dirty tracked\n'),
     staged: src => {
-      write(src, 'skills/ericsson/workflow-orchestrator/SKILL.md', 'dirty staged\n')
-      execFileSync('git', ['add', 'skills/ericsson/workflow-orchestrator/SKILL.md'], { cwd: src })
+      write(src, 'skills/ericsson/opportunity-visuals/SKILL.md', 'dirty staged\n')
+      execFileSync('git', ['add', 'skills/ericsson/opportunity-visuals/SKILL.md'], { cwd: src })
     },
     untracked: src => write(src, 'untracked.txt', 'untracked\n'),
   }

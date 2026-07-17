@@ -1,0 +1,8 @@
+name: minimal
+description: Minimal portable workflow
+nodes:
+  - id: inspect
+    bash: "printf 'ok'"
+  - id: summarize
+    prompt: "Summarize $inspect.output"
+    depends_on: [inspect]

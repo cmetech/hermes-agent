@@ -1,0 +1,46 @@
+name: laptop-diagnostic
+description: Offline diagnostic tour using sanitized fictional laptop evidence
+nodes:
+  - {id: analyze-cpu, script: analyze-snapshot, runtime: uv}
+  - {id: analyze-memory, script: analyze-snapshot, runtime: uv}
+  - {id: analyze-storage, script: analyze-snapshot, runtime: uv}
+  - {id: analyze-network, script: analyze-snapshot, runtime: uv}
+  - {id: analyze-startup, script: analyze-snapshot, runtime: uv}
+  - id: render-report
+    script: render-report
+    runtime: uv
+    depends_on: [analyze-cpu, analyze-memory, analyze-storage, analyze-network, analyze-startup]
+  - id: high-severity
+    script: render-report
+    runtime: uv
+    depends_on: [render-report]
+    when: "$render-report.output.severity == 'high'"
+  - id: normal-severity
+    script: render-report
+    runtime: uv
+    depends_on: [render-report]
+    when: "$render-report.output.severity != 'high'"
+  - id: interpret
+    command: interpret-report
+    context: fresh
+    depends_on: [render-report]
+    when: "$render-report.output.ai_requested == 'true'"
+    output_format:
+      type: object
+      required: [summary, simulated]
+      properties:
+        summary: {type: string}
+        simulated: {type: boolean}
+  - id: review-plan
+    approval:
+      message: Review the fictional diagnostic report before finalizing a proposed plan. No remediation will run.
+      capture_response: true
+      on_reject:
+        prompt: "Record a deterministic cautious revision from this feedback: $REJECTION_REASON"
+        max_attempts: 1
+    depends_on: [high-severity, normal-severity]
+    trigger_rule: none_failed_min_one_success
+  - id: finalize-plan
+    script: render-report
+    runtime: uv
+    depends_on: [review-plan]

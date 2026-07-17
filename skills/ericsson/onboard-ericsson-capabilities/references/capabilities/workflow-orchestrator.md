@@ -10,16 +10,16 @@ maturity: available
 recommendation_eligible: true
 source_flows: []
 implementation:
-  skills: [skills/ericsson/workflow-orchestrator]
-  plugins: []
+  skills: [skills/productivity/workflow]
+  plugins: [plugins/workflow]
   mcp_servers: []
   workflows: []
   tools: []
 platforms: [macos, linux, windows]
 configuration: []
-reads: [workflow YAML, workflow inputs, node outputs and state through workflow control]
-writes: [unique workflow run state and declared node outputs, workflow-specific approved side effects]
-artifacts: [workflow state, declared node output files, optional Kanban mirror]
+reads: [portable workflow packages, immutable inputs, sanitized RunStore status and events]
+writes: [durable workflow runs and declared artifacts, explicitly approved side effects]
+artifacts: [RunStore events, immutable inputs, declared output artifacts]
 demonstrations: [synthetic-offline]
 troubleshooting: [failed node, interrupted side effect, stalled run, changed workflow, rejected or cancelled run]
 ---
@@ -47,8 +47,8 @@ again for inputs already recorded in the run.
 
 ## Reads and writes
 
-The controller reads YAML and run state and alone writes `state.json`. External
-effects belong to marked workflow nodes and follow their explicit approval gates.
+The workflow plugin owns RunStore state and events. External effects belong to
+declared outward-action nodes and follow their explicit approval gates.
 
 ## Readiness
 
@@ -62,10 +62,10 @@ expected states and artifact destination before starting.
 
 ## Artifacts
 
-Inspect state and declared outputs in the unique run directory. Use control commands,
-never direct edits, to understand failures, exclusions, warnings, and completion.
+Use `hermes workflow status|events --json` and declared artifact references. Never
+read or edit raw RunStore files to understand failures, warnings, or completion.
 
 ## Troubleshooting
 
 Report failed, interrupted, in-progress, stalled, rejected, and cancelled distinctly.
-Resume through the controller; reconcile uncertain side effects before forced rerun.
+Resume through `hermes workflow`; reconcile uncertain side effects before retry.

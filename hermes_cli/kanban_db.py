@@ -86,6 +86,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -1086,6 +1087,94 @@ class Event:
     payload: Optional[dict]
     created_at: int
     run_id: Optional[int] = None
+
+
+class UnsetType(Enum):
+    TOKEN = "unset"
+
+
+UNSET = UnsetType.TOKEN
+
+
+@dataclass(frozen=True)
+class TaskMutationPrecondition:
+    expected_status: str | UnsetType = UNSET
+    expected_current_run_id: int | None | UnsetType = UNSET
+    expected_event_id: int | UnsetType = UNSET
+
+
+@dataclass(frozen=True)
+class TaskMutationSnapshot:
+    task_id: str
+    status: str
+    current_run_id: int | None
+    latest_event_id: int
+
+
+class TaskMutationConflict(RuntimeError):
+    def __init__(self, current: TaskMutationSnapshot):
+        self.current = current
+        super().__init__(f"stale mutation for {current.task_id}")
+
+
+def _check_mutation_precondition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    precondition: TaskMutationPrecondition | None,
+) -> TaskMutationSnapshot | None:
+    """Validate a mutation CAS after the caller has acquired write_txn."""
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    latest = int(conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?", (task_id,)
+    ).fetchone()[0])
+    snapshot = TaskMutationSnapshot(
+        task_id=task_id,
+        status=str(row["status"]),
+        current_run_id=(int(row["current_run_id"]) if row["current_run_id"] is not None else None),
+        latest_event_id=latest,
+    )
+    if precondition is None:
+        return snapshot
+    stale = (
+        (precondition.expected_status is not UNSET and precondition.expected_status != snapshot.status)
+        or (
+            precondition.expected_current_run_id is not UNSET
+            and precondition.expected_current_run_id != snapshot.current_run_id
+        )
+        or (
+            precondition.expected_event_id is not UNSET
+            and precondition.expected_event_id != snapshot.latest_event_id
+        )
+    )
+    if stale:
+        raise TaskMutationConflict(snapshot)
+    return snapshot
+
+
+def _with_expected_run(
+    precondition: TaskMutationPrecondition | None,
+    expected_run_id: int | None,
+) -> TaskMutationPrecondition | None:
+    """Preserve the legacy expected_run_id argument without ambiguity."""
+    if expected_run_id is None:
+        return precondition
+    if (
+        precondition is not None
+        and precondition.expected_current_run_id is not UNSET
+        and precondition.expected_current_run_id != expected_run_id
+    ):
+        raise ValueError("expected_run_id conflicts with mutation precondition")
+    if precondition is None:
+        return TaskMutationPrecondition(expected_current_run_id=expected_run_id)
+    return TaskMutationPrecondition(
+        expected_status=precondition.expected_status,
+        expected_current_run_id=expected_run_id,
+        expected_event_id=precondition.expected_event_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2773,7 +2862,13 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def assign_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    *,
+    precondition: TaskMutationPrecondition | None = None,
+) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
@@ -2781,6 +2876,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
+        _check_mutation_precondition(conn, task_id, precondition)
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -2804,6 +2900,76 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
         _append_event(conn, task_id, "assigned", {"assignee": profile})
         return True
+
+
+def set_task_status(
+    conn: sqlite3.Connection,
+    task_id: str,
+    new_status: str,
+    *,
+    precondition: TaskMutationPrecondition | None = None,
+) -> bool:
+    """Set an operator-managed state with dependency and run invariants.
+
+    ``running`` remains claim-only and cannot be reached through this API.
+    """
+    if new_status not in VALID_STATUSES:
+        raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+    if new_status == "running":
+        raise ValueError("running is claim-only; use claim_task")
+    with write_txn(conn):
+        previous = _check_mutation_precondition(conn, task_id, precondition)
+        if previous is None:
+            return False
+        if new_status == "ready":
+            undone_parent = conn.execute(
+                "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+                "WHERE l.child_id=? AND p.status!='done' LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if undone_parent:
+                return False
+        reopening_parent = (
+            previous.status in {"done", "archived"}
+            and new_status not in {"done", "archived"}
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL WHERE id=?",
+            (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = None
+        if previous.status == "running" and previous.current_run_id is not None:
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                summary=f"status changed to {new_status} (operator)",
+            )
+        _append_event(conn, task_id, "status", {"status": new_status}, run_id=run_id)
+        if reopening_parent:
+            for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id=? ORDER BY child_id",
+                (task_id,),
+            ).fetchall():
+                child_id = str(row["child_id"])
+                demoted = conn.execute(
+                    "UPDATE tasks SET status='todo' WHERE id=? AND status='ready'",
+                    (child_id,),
+                )
+                if demoted.rowcount == 1:
+                    _append_event(
+                        conn,
+                        child_id,
+                        "status",
+                        {"status": "todo", "reason": "parent_reopened", "parent": task_id},
+                    )
+    if new_status in {"done", "ready"}:
+        recompute_ready(conn)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -2920,7 +3086,12 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    precondition: TaskMutationPrecondition | None = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -2928,6 +3099,7 @@ def add_comment(
         raise ValueError("comment author is required")
     now = int(time.time())
     with write_txn(conn):
+        _check_mutation_precondition(conn, task_id, precondition)
         if not conn.execute(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
@@ -3749,6 +3921,7 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    precondition: TaskMutationPrecondition | None = None,
 ) -> bool:
     """Operator-driven reclaim: release the claim and reset to ``ready``.
 
@@ -3761,20 +3934,18 @@ def reclaim_task(
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
     """
-    row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if not row:
-        return False
-    if row["status"] != "running" and row["claim_lock"] is None:
-        # Nothing to reclaim — already ready / blocked / done.
-        return False
-    prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
-    )
     with write_txn(conn):
+        snapshot = _check_mutation_precondition(conn, task_id, precondition)
+        if snapshot is None:
+            return False
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row["status"] != "running" and row["claim_lock"] is None:
+            return False
+        prev_lock = row["claim_lock"]
+        worker_pid = row["worker_pid"]
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
@@ -3791,17 +3962,27 @@ def reclaim_task(
                 f"manual_reclaim: {reason}" if reason
                 else f"manual_reclaim lock={prev_lock}"
             ),
-            metadata=termination,
         )
         payload = {
             "manual": True,
             "reason": reason,
             "prev_lock": prev_lock,
+            "termination_pending": bool(worker_pid),
         }
-        payload.update(termination)
         _append_event(
             conn, task_id, "reclaimed",
             payload,
+            run_id=run_id,
+        )
+    termination = _terminate_reclaimed_worker(
+        worker_pid, prev_lock, signal_fn=signal_fn,
+    )
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "reclaim_termination",
+            termination,
             run_id=run_id,
         )
     # Operator intervention — they've looked at the task, so the
@@ -3984,6 +4165,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    precondition: TaskMutationPrecondition | None = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4014,6 +4196,7 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    precondition = _with_expected_run(precondition, expected_run_id)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4043,6 +4226,7 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
+        _check_mutation_precondition(conn, task_id, precondition)
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4545,6 +4729,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    precondition: TaskMutationPrecondition | None = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -4577,9 +4762,11 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    precondition = _with_expected_run(precondition, expected_run_id)
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
+        _check_mutation_precondition(conn, task_id, precondition)
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -4824,7 +5011,12 @@ def promote_task(
     return True, None
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    precondition: TaskMutationPrecondition | None = None,
+) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -4836,6 +5028,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        _check_mutation_precondition(conn, task_id, precondition)
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -5204,8 +5397,14 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    precondition: TaskMutationPrecondition | None = None,
+) -> bool:
     with write_txn(conn):
+        _check_mutation_precondition(conn, task_id, precondition)
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -5591,6 +5790,7 @@ def schedule_task(
     *,
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    precondition: TaskMutationPrecondition | None = None,
 ) -> bool:
     """Park a task in ``scheduled`` so it is waiting on time, not human input.
 
@@ -5598,7 +5798,9 @@ def schedule_task(
     human action, or automation can later call ``unblock_task`` to re-gate them
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
+    precondition = _with_expected_run(precondition, expected_run_id)
     with write_txn(conn):
+        _check_mutation_precondition(conn, task_id, precondition)
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks

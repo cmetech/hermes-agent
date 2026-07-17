@@ -99,6 +99,80 @@ export interface MemoryProviderOAuthStatus {
   state: 'connected' | 'error' | 'idle' | 'pending'
 }
 
+export interface WorkflowProgress {
+  completed_nodes: number
+  kind: 'graph'
+  total_nodes: number
+}
+
+export interface WorkflowRunSnapshot {
+  admission_disposition?: string
+  artifacts?: unknown[]
+  blocked_by_run_id?: null | string
+  concurrency_key?: string
+  current_nodes?: string[]
+  health: string
+  next_actions: string[]
+  pending_interaction?: null | Record<string, unknown>
+  progress: WorkflowProgress
+  queue_position?: null | number
+  run_id: string
+  state_version: number
+  status: string
+  updated_at: string
+  workflow: string
+  workflow_version?: string
+  [key: string]: unknown
+}
+
+export interface WorkflowRunPage {
+  next_cursor: null | string
+  runs: WorkflowRunSnapshot[]
+  schema_version: number
+}
+
+export interface WorkflowAttentionPage {
+  items: Array<Record<string, unknown>>
+  next_cursor: null | string
+  schema_version: number
+}
+
+export interface WorkflowEventPage {
+  cursor_reset: boolean
+  events: Array<Record<string, unknown>>
+  next_cursor: number
+  schema_version: number
+}
+
+export interface KanbanTaskSnapshot {
+  assignee?: null | string
+  current_run_id?: null | number
+  id: string
+  priority: number
+  status: string
+  tenant?: null | string
+  title: string
+  [key: string]: unknown
+}
+
+export interface KanbanTaskPage {
+  board: string
+  next_cursor: null | string
+  schema_version: number
+  tasks: KanbanTaskSnapshot[]
+}
+
+export interface KanbanBoardSummary {
+  assignees: string[]
+  board: string
+  column_counts: Record<string, number>
+  diagnostics_count: number
+  latest_event_id: number
+  oldest_event_id: number
+  schema_version: number
+  tenants: string[]
+}
+
 export interface EnvVarInfo {
   advanced: boolean
   category: string

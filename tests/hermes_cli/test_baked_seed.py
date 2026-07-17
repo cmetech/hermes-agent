@@ -2,14 +2,37 @@ import json, sys
 from pathlib import Path
 import pytest
 from hermes_cli import capability_staging as cs
+from plugins.workflow.schema import load_workflow
+from plugins.workflow.trust import WorkflowTrustStore, compute_package_digest
 
 @pytest.fixture
 def fake_repo(tmp_path, monkeypatch):
     # a fake hermes-agent repo root with vendored capability content
-    root = tmp_path / "repo"; (root / "capabilities/workflows").mkdir(parents=True)
+    root = tmp_path / "repo"
+    package = root / "capabilities/workflow-packages/ericsson"
+    (package / "workflows").mkdir(parents=True)
+    (package / "commands").mkdir()
+    workflow = package / "workflows/w.yaml"
+    workflow.write_text(
+        "name: w\ndescription: baked package\nnodes:\n"
+        "  - id: collect\n    command: collect\n"
+    )
+    (package / "commands/collect.md").write_text("Collect baked data.\n")
+    digest = compute_package_digest(load_workflow(workflow)).sha256
+    (package / "digests.json").write_text(json.dumps({
+        "schemaVersion": 1,
+        "packages": {"w": digest},
+    }))
     (root / "capabilities/ericsson.json").write_text(json.dumps({
         "name": "ericsson", "mcpServersFile": "mcp-servers.yaml",
-        "workflows": ["capabilities/workflows/w.yml"]}))
+        "plugins": ["plugins/workflow"],
+        "workflowPackages": [{
+            "path": "capabilities/workflow-packages/ericsson",
+            "digestManifest": "capabilities/workflow-packages/ericsson/digests.json",
+        }]}))
+    (root / "capabilities/ericsson-vendored-paths.json").write_text(
+        json.dumps(["capabilities/workflow-packages/ericsson"])
+    )
     (root / "capabilities/mcp-servers.yaml").write_text(
         "mcp_servers:\n"
         "  outlook:\n"
@@ -21,7 +44,7 @@ def fake_repo(tmp_path, monkeypatch):
         "    headers:\n"
         "      Authorization: \"Bearer ${GLEAN_API_TOKEN}\"\n"
     )
-    (root / "capabilities/workflows/w.yml").write_text("name: w\n")
+    (root / "plugins/workflow").mkdir(parents=True)
     monkeypatch.setattr(cs, "_repo_root", lambda: root)
     monkeypatch.setattr("hermes_cli.plugins.get_bundled_plugins_dir", lambda: root / "plugins")
     return root
@@ -34,7 +57,7 @@ def fake_config(monkeypatch):
     monkeypatch.setattr(c, "save_config", lambda cfg, **k: store.__setitem__("cfg", cfg))
     return store
 
-def test_seed_mcp_and_workflows(tmp_path, fake_repo, fake_config):
+def test_seed_mcp_and_workflow_packages(tmp_path, fake_repo, fake_config):
     home = tmp_path / "home"; home.mkdir()
     cs.seed_baked_capabilities(home)
     cfg = fake_config["cfg"]
@@ -42,7 +65,12 @@ def test_seed_mcp_and_workflows(tmp_path, fake_repo, fake_config):
     glean = cfg["mcp_servers"]["glean"]
     assert glean["enabled"] is False
     assert glean["url"] == "https://default.example.test/mcp"
-    assert (home / "workflows/w.yml").exists()
+    workflow = home / "workflows/ericsson/workflows/w.yaml"
+    assert workflow.exists()
+    assert (home / "workflows/ericsson/commands/collect.md").exists()
+    digest = compute_package_digest(load_workflow(workflow)).sha256
+    assert WorkflowTrustStore(home).check(digest) == "trusted"
+    assert "workflow" in cfg["plugins"]["enabled"]
 
 def test_seed_never_clobbers_user_mcp(tmp_path, fake_repo, fake_config):
     fake_config["cfg"] = {"mcp_servers": {"outlook": {"command": "mine"}}}

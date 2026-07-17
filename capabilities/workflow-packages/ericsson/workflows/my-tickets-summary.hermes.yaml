@@ -1,0 +1,13 @@
+delivery_defaults:
+  inputs:
+    delivery:
+      kind: text
+      required: false
+      max_bytes: 4096
+required_services: [ericsson-jira, outlook]
+required_secrets: [JIRA_BASE_URL, JIRA_PAT]
+outward_action_nodes: [send]
+outward_action_policy: approval_required
+overlap_policy: queue
+execution_environment: trusted_local
+

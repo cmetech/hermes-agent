@@ -1497,7 +1497,9 @@ export const ja = defineLocale({
       'new-session': '新しいセッション',
       skills: 'スキルとツール',
       messaging: 'メッセージング',
-      artifacts: 'アーティファクト'
+      artifacts: 'アーティファクト',
+      workflows: 'ワークフロー',
+      kanban: 'カンバン'
     },
     searchAria: 'セッションを検索',
     searchPlaceholder: 'セッションを検索…',
@@ -1608,6 +1610,33 @@ export const ja = defineLocale({
       ageHour: '時間',
       ageMin: '分'
     }
+  },
+
+  operations: {
+    workflows: 'ワークフロー',
+    kanban: 'カンバン',
+    needsAttention: '対応が必要',
+    status: '状態',
+    health: '健全性',
+    graphProgress: 'グラフ進捗',
+    completionEstimate: '完了予測',
+    estimateUnavailable: '予測できません',
+    nextActions: '次の操作',
+    artifacts: '検証済み成果物',
+    definition: '定義ダイジェスト',
+    retryAt: '次の再試行',
+    timeline: 'タイムラインイベント',
+    trigger: 'トリガー',
+    waitingFor: '待機対象',
+    approve: '承認',
+    reject: '拒否',
+    cancel: 'キャンセル',
+    resume: '再開',
+    retry: '再試行',
+    abandon: '破棄',
+    workflowUnavailable: 'Workflow プラグインが無効です。hermes plugins enable workflow を実行してください。',
+    kanbanUnavailable: 'Kanban プラグインが無効です。hermes plugins enable kanban を実行してください。',
+    physicalBoard: board => `マシン共有の物理ボード: ${board}`
   },
 
   composer: {

@@ -7,19 +7,52 @@ new to the project and need to understand the distribution model.
 
 ## TL;DR
 
-- OTTO releases are built by **CI in a separate, releases-only repo: [`cmetech/otto`](https://github.com/cmetech/otto)** (public).
-- CI checks out the **source** from `cmetech/hermes-agent`@`otto`, builds the Windows + macOS installers, and publishes them as **GitHub Release assets** on `cmetech/otto`.
+- OTTO and LOOP24 releases are built by **CI in separate, releases-only repos:** [`cmetech/otto`](https://github.com/cmetech/otto) and [`cmetech/loop24`](https://github.com/cmetech/loop24).
+- Each release workflow checks out its branded source branch from `cmetech/hermes-agent`, builds the Windows + macOS installers, and publishes them as GitHub Release assets in the matching releases repo.
+- **Never create a product release or product-version tag in `cmetech/hermes-agent`.** It is the source repository, not the distribution repository. Its inherited PyPI, Vercel, and Docker release workflows are not the OTTO/LOOP24 desktop pipeline.
 - A user downloads the installer, runs it, and on **first launch** the app clones the source and builds itself locally (see "The bootstrap model" below).
 - Self-update = `git pull` + rebuild. There is **no** `electron-updater` (yet).
 
 ---
 
-## The two repositories
+## Release safety invariant
+
+The release flow used for `v1.1.6` and later paired branded releases is:
+
+1. Finish and test shared work on neutral `base`.
+2. Discover every brand from `brands/*.json`; do not hardcode only OTTO.
+3. Merge the exact tested `base` commit into each brand branch, run
+   `scripts/brand/generate.mjs <brand> --write`, and pass the generator,
+   brand, workflow-merge, and build gates.
+4. Push `base`, `otto`, and `loop24` forward-only.
+5. Dispatch each brand's existing `release.yml` in its releases-only repo at
+   the same version and prerelease state.
+6. Monitor both runs and verify each release body names the expected source
+   commit and each release contains the full Windows/macOS asset set.
+
+| Brand | Source ref | Releases repo | Stamp branch | Artifact prefix |
+|---|---|---|---|---|
+| OTTO | `cmetech/hermes-agent@otto` | `cmetech/otto` | `otto` | `OTTO-` |
+| LOOP24 | `cmetech/hermes-agent@loop24` | `cmetech/loop24` | `loop24` | `LOOP24-` |
+
+Do not substitute any of these actions:
+
+- Do not tag or publish `cmetech/hermes-agent` as the product release.
+- Do not run its `Publish to PyPI` workflow for a branded desktop release.
+- Do not treat a Vercel or Docker workflow triggered from that source repo as
+  evidence that either branded installer was built.
+- Do not build one brand and call the paired delivery complete unless the user
+  explicitly excluded the other brand.
+- Do not create a new installer script. The release repositories' existing
+  downloader scripts select the installers produced by `release.yml`.
+
+## The source and release repositories
 
 | Repo | What it holds | Who writes to it |
 |---|---|---|
-| **`cmetech/hermes-agent`** @ `otto` branch | **All source code.** `main` tracks upstream Hermes; **our work lives on `otto`.** | Developers |
+| **`cmetech/hermes-agent`** | **All source code.** Shared work lands on neutral `base`; generated overlays live on `otto` and `loop24`. It is not a product-release repository. | Developers |
 | **`cmetech/otto`** | **Releases only:** the release workflow, install/download scripts, README. The built installers live in this repo's **GitHub Releases**. No source. | CI (and maintainers) |
+| **`cmetech/loop24`** | LOOP24 equivalent of `cmetech/otto`; its workflow checks out the `loop24` source branch and publishes `LOOP24-*` installers. | CI (and maintainers) |
 
 Why split them? Three reasons:
 1. **Clean public front door** — the releases repo is where users go to download; source churn stays out of it.
@@ -83,14 +116,30 @@ Workflow: **`cmetech/otto/.github/workflows/release.yml`**
   5. `cd apps/desktop && npm run dist:win` / `dist:mac`
   6. upload `apps/desktop/release/OTTO-*` to a GitHub Release on `cmetech/otto` (tag `v<version>`)
 
-### To cut a release
+### To cut a paired branded release
 ```bash
-# from anywhere with gh + access to cmetech/otto
+# First prove the pushed source refs are the exact gated commits.
+git fetch origin base otto loop24
+git merge-base --is-ancestor origin/base origin/otto
+git merge-base --is-ancestor origin/base origin/loop24
+
+# Use the same version and prerelease state for every brand. The version input
+# has no leading "v"; release.yml creates the v<version> tag.
 gh workflow run release.yml -R cmetech/otto \
-  -f ref=otto -f version=0.1.0 -f prerelease=true
-gh run watch -R cmetech/otto   # follow progress
+  -f ref=otto -f stamp_branch=otto -f version=2.0.0 -f prerelease=false
+gh workflow run release.yml -R cmetech/loop24 \
+  -f ref=loop24 -f stamp_branch=loop24 -f version=2.0.0 -f prerelease=false
+
+# Capture the two run URLs/IDs returned by GitHub, then monitor each exact run.
+gh run watch <otto-run-id> -R cmetech/otto --exit-status
+gh run watch <loop24-run-id> -R cmetech/loop24 --exit-status
+
+# Verify the releases and their stamped source commits/assets.
+gh release view v2.0.0 -R cmetech/otto
+gh release view v2.0.0 -R cmetech/loop24
 ```
-The artifacts land at `https://github.com/cmetech/otto/releases`.
+The artifacts land in the two brand release repositories, never in
+`cmetech/hermes-agent`.
 
 ---
 

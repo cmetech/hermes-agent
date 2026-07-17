@@ -1,0 +1,13 @@
+name: inbox-digest
+description: Digest recent unread Outlook email using explicit invocation arguments
+nodes:
+  - id: collect
+    command: collect-inbox
+    context: fresh
+    allowed_tools: [message_list, message_read, Write]
+  - id: summarize
+    command: summarize-inbox
+    depends_on: [collect]
+    context: fresh
+    allowed_tools: [Read, Write]
+

@@ -1,0 +1,45 @@
+name: ai-extensions
+description: Explicitly opt-in AI worker and extension tour
+persist_sessions: true
+nodes:
+  - id: inspect
+    command: inspect-evidence
+    context: fresh
+    persist_session: true
+    skills: [ascii-art]
+    mcp: echo.yaml
+    hooks:
+      SessionStart:
+        - response: {continue: true, systemMessage: Extension tour started}
+    agents:
+      reviewer:
+        description: Review the fictional result
+        prompt: Review the fictional evidence without network access.
+        maxTurns: 2
+    output_format:
+      type: object
+      required: [summary, simulated]
+      properties:
+        summary: {type: string}
+        simulated: {type: boolean}
+  - id: continue
+    command: inspect-evidence
+    depends_on: [inspect]
+    context: shared
+    persist_session: true
+    skills: [ascii-art]
+    mcp: echo.yaml
+    hooks:
+      SessionStart:
+        - response: {continue: true, systemMessage: Extension tour continued}
+    agents:
+      reviewer:
+        description: Review the fictional result
+        prompt: Review the fictional evidence without network access.
+        maxTurns: 2
+    output_format:
+      type: object
+      required: [summary, simulated]
+      properties:
+        summary: {type: string}
+        simulated: {type: boolean}

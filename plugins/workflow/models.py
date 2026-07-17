@@ -1,0 +1,321 @@
+"""Immutable public contracts for portable workflow packages."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Mapping
+
+
+def freeze_value(value: Any) -> Any:
+    """Recursively freeze parsed YAML without changing scalar values."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({
+            str(key): freeze_value(item) for key, item in value.items()
+        })
+    if isinstance(value, list | tuple):
+        return tuple(freeze_value(item) for item in value)
+    if isinstance(value, set | frozenset):
+        return frozenset(freeze_value(item) for item in value)
+    return value
+
+
+@dataclass(frozen=True)
+class ValidationIssue:
+    path: str
+    code: str
+    message: str
+    severity: str = "error"
+    blocking: bool = True
+    source_line: int | None = None
+
+
+class WorkflowValidationError(ValueError):
+    """Raised when a portable package cannot be normalized safely."""
+
+    def __init__(
+        self,
+        issues: ValidationIssue | tuple[ValidationIssue, ...] | list[ValidationIssue],
+    ):
+        if isinstance(issues, ValidationIssue):
+            normalized = (issues,)
+        else:
+            normalized = tuple(issues)
+        self.issues = normalized
+        super().__init__("; ".join(issue.message for issue in normalized))
+
+
+@dataclass(frozen=True)
+class WorkflowNode:
+    id: str
+    node_type: str
+    value: Any
+    depends_on: tuple[str, ...]
+    source_index: int
+    source_line: int | None
+    options: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class WorkflowDefinition:
+    name: str
+    description: str
+    nodes: tuple[WorkflowNode, ...]
+    options: Mapping[str, Any]
+    source_path: Path
+
+
+@dataclass(frozen=True)
+class WorkflowPackage:
+    definition: WorkflowDefinition
+    root: Path
+    workflow_path: Path
+    sidecar_path: Path | None
+    sidecar: Mapping[str, Any]
+    source: str
+    precedence: int
+    validation_issues: tuple[ValidationIssue, ...] = ()
+
+
+@dataclass(frozen=True)
+class ApprovalDecision:
+    """Durable result of a compare-and-set workflow interaction decision."""
+
+    run_id: str
+    node_id: str
+    decision: str
+    outcome: str
+    interaction_id: str
+    state_version: int
+
+
+def _bounded_seconds(value: float, name: str) -> float:
+    result = float(value)
+    if not math.isfinite(result) or result <= 0:
+        raise ValueError(f"{name} must be positive and finite")
+    return result
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """One combined workflow/provider retry budget."""
+
+    max_attempts: int = 5
+    delay_ms: int = 1000
+    on_error: str = "transient"
+
+    def __post_init__(self) -> None:
+        if isinstance(self.max_attempts, bool) or not 1 <= self.max_attempts <= 5:
+            raise ValueError("max_attempts must be between 1 and 5")
+        if isinstance(self.delay_ms, bool) or not 1000 <= self.delay_ms <= 60_000:
+            raise ValueError("delay_ms must be between 1000 and 60000")
+        if self.on_error not in {"transient", "all"}:
+            raise ValueError("on_error must be transient or all")
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any] | None,
+        *,
+        default_max_attempts: int = 5,
+    ) -> "RetryPolicy":
+        options = value or {}
+        return cls(
+            max_attempts=int(options.get("max_attempts", default_max_attempts)),
+            delay_ms=int(options.get("delay_ms", 1000)),
+            on_error=str(options.get("on_error", "transient")),
+        )
+
+
+@dataclass
+class DeadlineBudget:
+    """Absolute monotonic deadlines shared by a node and its descendants."""
+
+    wall_deadline: float
+    idle_seconds: float
+    provider_seconds: float
+    last_semantic_progress: float
+    last_heartbeat: float
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        now: float,
+        wall_seconds: float,
+        idle_seconds: float,
+        provider_seconds: float,
+    ) -> "DeadlineBudget":
+        wall = _bounded_seconds(wall_seconds, "wall_seconds")
+        idle = _bounded_seconds(idle_seconds, "idle_seconds")
+        provider = _bounded_seconds(provider_seconds, "provider_seconds")
+        if not math.isfinite(float(now)):
+            raise ValueError("now must be finite")
+        return cls(float(now) + wall, idle, provider, float(now), float(now))
+
+    def child(
+        self,
+        *,
+        now: float,
+        requested_wall_seconds: float,
+        workflow_cap_seconds: float,
+        idle_seconds: float,
+        provider_seconds: float,
+    ) -> "DeadlineBudget":
+        requested = _bounded_seconds(requested_wall_seconds, "requested_wall_seconds")
+        cap = _bounded_seconds(workflow_cap_seconds, "workflow_cap_seconds")
+        idle = min(self.idle_seconds, _bounded_seconds(idle_seconds, "idle_seconds"))
+        provider = min(
+            self.provider_seconds,
+            _bounded_seconds(provider_seconds, "provider_seconds"),
+        )
+        wall_deadline = min(
+            self.wall_deadline, float(now) + requested, float(now) + cap
+        )
+        if wall_deadline <= now:
+            raise ValueError("parent deadline is exhausted")
+        return DeadlineBudget(wall_deadline, idle, provider, float(now), float(now))
+
+    def remaining_wall(self, now: float) -> float:
+        return max(0.0, self.wall_deadline - float(now))
+
+    def provider_deadline(self, *, now: float) -> float:
+        return min(self.wall_deadline, float(now) + self.provider_seconds)
+
+    def semantic_progress(self, now: float) -> None:
+        self.last_semantic_progress = float(now)
+
+    def heartbeat(self, now: float) -> None:
+        self.last_heartbeat = float(now)
+
+    def idle_expired(self, now: float) -> bool:
+        return float(now) - self.last_semantic_progress >= self.idle_seconds
+
+    def wall_expired(self, now: float) -> bool:
+        return float(now) >= self.wall_deadline
+
+
+@dataclass(frozen=True)
+class WorkflowRuntimeConfig:
+    """Resolved profile lifecycle limits, optionally tightened by a sidecar."""
+
+    max_parallel_nodes: int = 4
+    max_total_workers: int = 4
+    max_executing_runs: int = 4
+    max_queued_runs: int = 100
+    max_paused_runs: int = 100
+    max_nonterminal_runs: int = 200
+    max_start_requests_per_minute: int = 60
+    ai_idle_timeout_seconds: float = 300.0
+    ai_wall_timeout_seconds: float = 1800.0
+    provider_request_timeout_seconds: float = 300.0
+    subprocess_timeout_seconds: float = 120.0
+    heartbeat_seconds: float = 5.0
+    lease_seconds: float = 30.0
+    cooperative_shutdown_seconds: float = 5.0
+    term_grace_seconds: float = 5.0
+    kill_reap_grace_seconds: float = 2.0
+    combined_retries: int = 5
+    process_tree_rss_bytes: int = 2048 * 1024 * 1024
+    process_tree_cpu_seconds: float = 900.0
+    max_descendants: int = 32
+
+    def __post_init__(self) -> None:
+        integer_bounds = {
+            "max_parallel_nodes": (1, 64),
+            "max_total_workers": (1, 256),
+            "max_executing_runs": (1, 256),
+            "max_queued_runs": (1, 100_000),
+            "max_paused_runs": (1, 100_000),
+            "max_nonterminal_runs": (1, 200_000),
+            "max_start_requests_per_minute": (1, 100_000),
+            "combined_retries": (1, 5),
+            "process_tree_rss_bytes": (16 * 1024 * 1024, 1024**4),
+            "max_descendants": (0, 4096),
+        }
+        for name, (minimum, maximum) in integer_bounds.items():
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not minimum <= value <= maximum
+            ):
+                raise ValueError(f"{name} must be between {minimum} and {maximum}")
+        for name in (
+            "ai_idle_timeout_seconds",
+            "ai_wall_timeout_seconds",
+            "provider_request_timeout_seconds",
+            "subprocess_timeout_seconds",
+            "heartbeat_seconds",
+            "lease_seconds",
+            "cooperative_shutdown_seconds",
+            "term_grace_seconds",
+            "kill_reap_grace_seconds",
+            "process_tree_cpu_seconds",
+        ):
+            _bounded_seconds(getattr(self, name), name)
+        if self.heartbeat_seconds >= self.lease_seconds:
+            raise ValueError("heartbeat_seconds must be shorter than lease_seconds")
+        if self.ai_idle_timeout_seconds > self.ai_wall_timeout_seconds:
+            raise ValueError("AI idle timeout cannot exceed AI wall timeout")
+        if self.provider_request_timeout_seconds > self.ai_wall_timeout_seconds:
+            raise ValueError("provider timeout cannot exceed AI wall timeout")
+
+    @classmethod
+    def from_mapping(
+        cls,
+        profile: Mapping[str, Any] | None = None,
+        *,
+        sidecar_limits: Mapping[str, Any] | None = None,
+        sidecar_resources: Mapping[str, Any] | None = None,
+    ) -> "WorkflowRuntimeConfig":
+        values = dict(profile or {})
+        resource_names = {
+            "process_tree_rss_bytes",
+            "process_tree_cpu_seconds",
+            "max_descendants",
+        }
+        resources = values.pop("resource_limits", {})
+        if isinstance(resources, Mapping):
+            unknown_resources = set(resources) - resource_names
+            if unknown_resources:
+                raise ValueError(
+                    f"unknown workflow resource limit: {sorted(unknown_resources)[0]}"
+                )
+            values.update({
+                name: resources[name] for name in resource_names if name in resources
+            })
+        elif resources:
+            raise ValueError("resource_limits must contain a mapping")
+        known = set(cls.__dataclass_fields__)
+        unknown = set(values) - known
+        if unknown:
+            raise ValueError(f"unknown workflow lifecycle limit: {sorted(unknown)[0]}")
+        resolved = cls(**values)
+        tightened = dict(values)
+        sidecar = dict(sidecar_limits or {})
+        sidecar_resources = dict(sidecar_resources or {})
+        unknown_sidecar_resources = set(sidecar_resources) - resource_names
+        if unknown_sidecar_resources:
+            raise ValueError(
+                "unknown workflow resource limit: "
+                f"{sorted(unknown_sidecar_resources)[0]}"
+            )
+        sidecar.update({
+            name: sidecar_resources[name]
+            for name in resource_names
+            if name in sidecar_resources
+        })
+        for name, value in sidecar.items():
+            if name not in known:
+                raise ValueError(f"unknown workflow lifecycle limit: {name}")
+            current = getattr(resolved, name)
+            if isinstance(current, int) and not isinstance(current, bool):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(f"{name} must be an integer")
+            elif isinstance(value, bool) or not isinstance(value, int | float):
+                raise ValueError(f"{name} must be a number")
+            tightened[name] = min(current, value)
+        return cls(**tightened)

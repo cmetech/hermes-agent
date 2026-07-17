@@ -1,0 +1,228 @@
+schema_version: 1
+feature: workflow-orchestration
+coverage:
+  base_commit: c2c02e1e12ae645f2741ab930fcc2c49486b46c1
+  excluded_commits:
+  - commit: d654f6a74b431287060e3591a85bd7a0652b6cff
+    reason: Separate user-requested v2.0.0-alpha.1 release preparation.
+  - commit: 27c9b59a0d6887f433450feac56b97d905930e43
+    reason: Separate user-requested v2.0.0 stable release preparation.
+upstream_changes:
+- id: managed-process-tree
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - tools/managed_process.py
+  - tools/process_registry.py
+  owned_symbols:
+  - ProcessIdentity
+  - TerminationPolicy
+  - ProcessResourceLimits
+  - ManagedProcessTree
+  tests:
+  - tests/tools/test_managed_process.py
+  - tests/tools/test_process_registry.py
+  expected_commit_subject: 'fix(tools): verify managed process cleanup'
+  upstream_candidate: true
+  merge_guidance: Reconcile process identity, aggregate resource enforcement,
+    process-tree termination, escalation, and wait/reap behavior before replaying
+    the extraction.
+  removal_condition: Remove when Hermes upstream exposes an equivalent generic managed-process-tree
+    primitive used by ProcessRegistry.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: plugin-agent-runner
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - tools/registry.py
+  - hermes_cli/plugins.py
+  owned_symbols:
+  - PluginAgentRunRequest
+  - PluginAgentRunResult
+  - PluginAgentRunner
+  - _exchange_worker
+  - ToolRegistry.scoped_names
+  - PluginContext.agent
+  tests:
+  - tests/agent/test_plugin_agent.py
+  - tests/tools/test_registry.py
+  expected_commit_subject: 'feat(workflow): enforce per-node agent resources'
+  upstream_candidate: true
+  merge_guidance: Reconcile ToolRegistry generation/dispatch behavior, PluginContext
+    facade construction, caller-driven worker cancellation/lifeline cleanup, and
+    aggregate worker-tree resource limits before replaying this commit. Preserve
+    the bounded per-call provider-attempt override, configurable cooperative/TERM/KILL
+    termination policy, semantic-progress framing that excludes stderr, and the
+    exact-digest one-shot approval grant, node-local hook/MCP inputs, and bounded
+    synchronous inline-agent dispatcher so a workflow scheduler can remain the
+    sole retry and lifecycle authority without granting a different action or
+    exposing process-global resources.
+  removal_condition: Remove when Hermes upstream exposes a trusted-plugin agent runner
+    with isolated name-scoped registry execution.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: kanban-mutation-preconditions
+  change_class: kanban-persistence-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/kanban_db.py
+  - tests/hermes_cli/test_kanban_mutation_preconditions.py
+  owned_symbols:
+  - TaskMutationPrecondition
+  - TaskMutationConflict
+  - set_task_status
+  tests:
+  - tests/hermes_cli/test_kanban_mutation_preconditions.py
+  - tests/hermes_cli/test_kanban_db.py
+  - tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py
+  - tests/hermes_cli/test_kanban_dispatch_lock.py
+  expected_commit_subject: 'feat(kanban): add mutation preconditions'
+  upstream_candidate: true
+  merge_guidance: Preserve same-transaction optional compare-and-set checks,
+    the claim-only running transition, dependency gating, exact-run closure,
+    and signal-after-commit reclaim behavior while reconciling upstream Kanban
+    lifecycle changes.
+  removal_condition: Remove when Hermes upstream provides equivalent generic
+    task mutation preconditions and stale-worker-safe reclaim behavior.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: kanban-desktop-rest
+  change_class: kanban-rest-adapter
+  owner: workflow-orchestration
+  files:
+  - plugins/kanban/dashboard/plugin_api.py
+  - tests/plugins/test_kanban_dashboard_plugin.py
+  owned_symbols:
+  - board_summary
+  - task_page
+  - event_page
+  - _mutation_precondition
+  tests:
+  - tests/plugins/test_kanban_dashboard_plugin.py
+  expected_commit_subject: 'feat(kanban): harden desktop board api'
+  upstream_candidate: true
+  merge_guidance: Reconcile bounded board/task/event pagination and optional
+    mutation precondition translation without replacing Kanban persistence or
+    weakening existing dashboard authentication.
+  removal_condition: Remove when Hermes upstream exposes equivalent bounded
+    Kanban REST deltas and compare-and-set mutation responses.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-kanban-operations
+  change_class: desktop-composition-generic
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/routes.ts
+  - apps/desktop/src/app/desktop-controller.tsx
+  - apps/desktop/src/app/chat/sidebar/index.tsx
+  - apps/desktop/src/app/types.ts
+  - apps/desktop/src/app/routes.test.ts
+  - apps/desktop/src/app/workflows/adapter.ts
+  - apps/desktop/src/app/workflows/adapter.test.ts
+  - apps/desktop/src/app/workflows/attention-inbox.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/run-inspector.tsx
+  - apps/desktop/src/app/workflows/store.ts
+  - apps/desktop/src/app/kanban/adapter.ts
+  - apps/desktop/src/app/kanban/adapter.test.ts
+  - apps/desktop/src/app/kanban/index.tsx
+  - apps/desktop/src/app/kanban/index.test.tsx
+  - apps/desktop/src/app/kanban/store.ts
+  - apps/desktop/src/app/kanban/task-inspector.tsx
+  - apps/desktop/src/components/activity-board/activity-board.tsx
+  - apps/desktop/src/components/activity-board/activity-board.test.tsx
+  - apps/desktop/src/components/activity-board/types.ts
+  - apps/desktop/src/components/activity-board/virtual-card-column.tsx
+  - apps/desktop/src/hermes.ts
+  - apps/desktop/src/types/hermes.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  owned_symbols:
+  - WORKFLOWS_ROUTE
+  - KANBAN_ROUTE
+  - WorkflowsView
+  - KanbanView
+  tests:
+  - apps/desktop/src/app/routes.test.ts
+  - apps/desktop/src/app/workflows/adapter.test.ts
+  - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
+  - apps/desktop/src/app/kanban/adapter.test.ts
+  - apps/desktop/src/app/kanban/kanban-operations.e2e.test.tsx
+  - apps/desktop/src/components/activity-board/activity-board.test.tsx
+  - apps/desktop/src/components/activity-board/activity-board.performance.test.tsx
+  expected_commit_subject: 'feat(desktop): integrate workflow operations navigation'
+  upstream_candidate: true
+  merge_guidance: Preserve separate Workflow and Kanban lifecycle authorities,
+    durable non-overlay routes, profile-scoped REST calls, extension-safe chat,
+    and complete locale/navigation composition while reconciling upstream shell
+    changes.
+  removal_condition: Remove when Hermes upstream provides equivalent native
+    Workflow and Kanban operations pages over the same generic APIs.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: capability-workflow-package-staging
+  change_class: capability-staging-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/capability_staging.py
+  - tests/hermes_cli/test_capability_staging.py
+  - tests/hermes_cli/test_baked_seed.py
+  owned_symbols:
+  - _stage_workflow_package
+  - _verified_workflow_package
+  tests:
+  - tests/hermes_cli/test_capability_staging.py
+  - tests/hermes_cli/test_baked_seed.py
+  expected_commit_subject: 'feat(ericsson): ship portable workflow packages'
+  upstream_candidate: true
+  merge_guidance: Preserve atomic complete-package replacement, contained
+    symlink-free source validation, distribution-owned digest verification,
+    digest-bound trusted_distribution provenance, rollback before publication,
+    and generic plugin-enable configuration while reconciling capability startup.
+  removal_condition: Remove when Hermes upstream stages authenticated complete
+    workflow package roots with equivalent digest-bound distribution trust.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-distribution
+  change_class: packaging-generic
+  owner: workflow-orchestration
+  files:
+  - pyproject.toml
+  - MANIFEST.in
+  - tests/test_packaging_metadata.py
+  owned_symbols:
+  - workflow/showcases/**/*
+  - recursive-include plugins/workflow/showcases *
+  - skills/productivity/workflow-showcase
+  tests:
+  - tests/test_packaging_metadata.py
+  - tests/plugins/workflow/test_showcase_distribution_e2e.py
+  expected_commit_subject: 'feat(workflow): add offline guided showcase suite'
+  upstream_candidate: true
+  merge_guidance: Preserve narrow wheel and sdist inclusion of the authenticated
+    workflow showcase bundle without broadening arbitrary plugin package data.
+  removal_condition: Remove when Hermes upstream ships equivalent authenticated
+    workflow showcase package-data coverage.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-native-portability-ci
+  change_class: ci-generic
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  owned_symbols:
+  - workflow-portability
+  tests:
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
+  - tests/plugins/workflow/test_showcase_distribution_e2e.py
+  - tests/plugins/workflow/test_fault_injection.py
+  - tests/plugins/workflow/test_security_boundaries.py
+  - tests/plugins/workflow/test_process_lifecycle_soak.py
+  expected_commit_subject: 'test(workflow): enforce production and merge gates'
+  upstream_candidate: true
+  merge_guidance: Preserve the credential-free Linux, macOS, and Windows matrix
+    and its installed-showcase and process-lifecycle assertions while reconciling
+    upstream CI orchestration changes.
+  removal_condition: Remove when upstream CI provides equivalent native
+    all-platform portable-workflow and installed-showcase coverage.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

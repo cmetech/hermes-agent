@@ -1,0 +1,6 @@
+name: workflow
+version: 0.1.0
+description: Portable workflow discovery, validation, trust, and orchestration
+author: CMETech
+kind: standalone
+provides_tools: []

@@ -15,7 +15,7 @@
       "exclude": ["heartmula","himalaya","manim-video","openhue","p5js","polymarket","segment-anything-model","songsee","songwriting-and-ai-music","touchdesigner-mcp","weights-and-biases","youtube-content","yuanbao"],
       "rename": { "hermes-agent": "Co-worker", "hermes-agent-skill-authoring": "Co-worker skill authoring" },
       "disabledByDefault": ["gateway-toolcall-parity"],
-      "managed": ["gateway-toolcall-parity","onboard-ericsson-capabilities","opportunity-visuals","workflow-builder","workflow-orchestrator"]
+      "managed": ["gateway-toolcall-parity","onboard-ericsson-capabilities","opportunity-visuals"]
     },
     "tools": { "excludeToolsets": ["homeassistant","spotify"], "disabledByDefault": [] },
     "channels": { "allow": ["telegram","slack","whatsapp","whatsapp_cloud","email","sms","api_server","webhook","msgraph_webhook","teams","discord"] }

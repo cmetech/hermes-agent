@@ -1,0 +1,8 @@
+name: builder-minimal
+description: Minimal deterministic on-demand package
+nodes:
+  - id: collect
+    bash: "printf 'portable evidence'"
+  - id: report
+    bash: "printf 'report complete'"
+    depends_on: [collect]

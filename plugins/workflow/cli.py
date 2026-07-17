@@ -1,0 +1,1580 @@
+"""Side-effect-free operator CLI for portable workflow packages."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import sys
+from collections import Counter
+from dataclasses import asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import AbstractSet, Iterable, Mapping
+
+import yaml
+
+from hermes_constants import get_hermes_home
+from plugins.workflow.compat import (
+    ARCHON_TOOL_ALIASES,
+    CompatibilityFinding,
+    CompatibilityLevel,
+    CompatibilityReport,
+    DoctorReport,
+    InputRequirement,
+    assess_compatibility,
+)
+from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.discovery import discover_workflows
+from plugins.workflow.models import (
+    ValidationIssue,
+    WorkflowPackage,
+    WorkflowRuntimeConfig,
+    WorkflowValidationError,
+)
+from plugins.workflow.schema import load_workflow, validate_package
+from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.sessions import NodeSessionRegistry
+from plugins.workflow.store import RunStore, StorageQuotaError
+from plugins.workflow.topology import project_topology
+from plugins.workflow.trust import (
+    WorkflowTrustError,
+    WorkflowTrustStore,
+    build_risk_summary,
+    compute_package_digest,
+)
+from tools.managed_process import ProcessResourceLimits
+
+
+def _compat_dict(report: CompatibilityReport) -> dict[str, object]:
+    return {
+        "level": report.level.value,
+        "blocking_count": len(report.blocking_findings),
+    }
+
+
+def workflow_trigger_idempotency_key(
+    schedule_id: str, scheduled_utc_fire_instant: datetime
+) -> str:
+    """Return the stable source key for one logical cron delivery."""
+    if not schedule_id:
+        raise ValueError("schedule_id must not be empty")
+    if scheduled_utc_fire_instant.tzinfo is None:
+        raise ValueError("scheduled fire instant must be timezone-aware")
+    instant = scheduled_utc_fire_instant.astimezone(timezone.utc).isoformat(
+        timespec="microseconds"
+    )
+    material = f"{schedule_id}\0{instant}".encode()
+    return "cron:" + hashlib.sha256(material).hexdigest()
+
+
+def _catalog_summary(
+    package: WorkflowPackage, report: CompatibilityReport
+) -> dict[str, object]:
+    topology = project_topology(package.definition)
+    return {
+        "action": "list",
+        "workflow": package.definition.name,
+        "name": package.definition.name,
+        "description": package.definition.description,
+        "source": package.source,
+        "precedence": package.precedence,
+        "compatibility": _compat_dict(report),
+        "runnable": report.runnable,
+        "topology_text": topology.text,
+        "topology_mermaid": topology.mermaid,
+        "topology_warnings": list(topology.warnings),
+        "requirements": {},
+        "approvals": [],
+        "schedules": [],
+        "warnings": [],
+        "next_actions": ["show", "doctor"] if report.runnable else ["doctor"],
+    }
+
+
+def build_catalog(
+    packages: Iterable[WorkflowPackage],
+    *,
+    available_tools: AbstractSet[str] | None = None,
+    available_services: AbstractSet[str] | None = None,
+    provider_capabilities: Mapping[str, AbstractSet[str]] | None = None,
+    isolated_workdir: bool = False,
+    mcp_available: bool = False,
+) -> tuple[dict[str, object], ...]:
+    entries = []
+    for package in packages:
+        report = assess_compatibility(
+            package,
+            available_tools=available_tools,
+            available_services=available_services,
+            provider_capabilities=provider_capabilities,
+            isolated_workdir=isolated_workdir,
+            mcp_available=mcp_available,
+        )
+        entries.append(_catalog_summary(package, report))
+    return tuple(sorted(entries, key=lambda entry: str(entry["name"])))
+
+
+def _command_resource(package: WorkflowPackage, name: str) -> Path | None:
+    base = package.root / "commands" / name
+    for candidate in (base, base.with_suffix(".md")):
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(package.root.resolve(strict=True))
+        except (OSError, ValueError):
+            continue
+        if not candidate.is_symlink():
+            return resolved
+    return None
+
+
+def _argument_hints(package: WorkflowPackage) -> dict[str, str]:
+    hints: dict[str, str] = {}
+    for node in package.definition.nodes:
+        if node.node_type != "command":
+            continue
+        resource = _command_resource(package, str(node.value))
+        if resource is None:
+            continue
+        try:
+            text = resource.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        if not text.startswith("---\n"):
+            continue
+        before, marker, _ = text.partition("\n---\n")
+        if not marker:
+            continue
+        try:
+            frontmatter = yaml.safe_load(before[4:]) or {}
+        except yaml.YAMLError:
+            continue
+        hint = (
+            frontmatter.get("argument-hint") if isinstance(frontmatter, dict) else None
+        )
+        if isinstance(hint, str) and hint.strip():
+            hints[node.id] = hint.strip()[:200]
+    return dict(sorted(hints.items()))
+
+
+def _related_cron(
+    name: str, cron_jobs: Iterable[Mapping[str, object]]
+) -> list[dict[str, object]]:
+    pattern = re.compile(
+        rf"(?:^|\s)hermes\s+workflow\s+run\s+{re.escape(name)}(?:\s|$)"
+    )
+    related: list[dict[str, object]] = []
+    for job in cron_jobs:
+        bodies = (job.get("prompt"), job.get("command"))
+        if not any(isinstance(body, str) and pattern.search(body) for body in bodies):
+            continue
+        related.append({
+            "id": job.get("id"),
+            "enabled": bool(job.get("enabled", True)),
+            "schedule": job.get("schedule_display"),
+            "next_run_at": job.get("next_run_at"),
+            "state": job.get("state"),
+        })
+    return sorted(related, key=lambda entry: str(entry["id"]))
+
+
+def show_package(
+    package: WorkflowPackage,
+    *,
+    available_tools: AbstractSet[str] | None = None,
+    available_services: AbstractSet[str] | None = None,
+    provider_capabilities: Mapping[str, AbstractSet[str]] | None = None,
+    isolated_workdir: bool = False,
+    mcp_available: bool = False,
+    cron_jobs: Iterable[Mapping[str, object]] = (),
+) -> dict[str, object]:
+    report = assess_compatibility(
+        package,
+        available_tools=available_tools,
+        available_services=available_services,
+        provider_capabilities=provider_capabilities,
+        isolated_workdir=isolated_workdir,
+        mcp_available=mcp_available,
+    )
+    result = _catalog_summary(package, report)
+    topology = project_topology(package.definition)
+    node_counts = Counter(node.node_type for node in package.definition.nodes)
+    requested_tools = {
+        ARCHON_TOOL_ALIASES.get(str(tool), str(tool))
+        for node in package.definition.nodes
+        for field in ("allowed_tools", "denied_tools")
+        for tool in node.options.get(field, ())
+    }
+    requested_skills = {
+        str(skill)
+        for node in package.definition.nodes
+        for skill in node.options.get("skills", ())
+    }
+    requested_mcp = {
+        str(reference)
+        for node in package.definition.nodes
+        for reference in (
+            (node.options.get("mcp"),)
+            if isinstance(node.options.get("mcp"), str)
+            else node.options.get("mcp", ())
+        )
+        if isinstance(reference, str)
+    }
+    providers = {
+        str(provider)
+        for provider in [
+            package.definition.options.get("provider"),
+            *(node.options.get("provider") for node in package.definition.nodes),
+        ]
+        if isinstance(provider, str) and provider
+    }
+    runtimes = {
+        str(node.options["runtime"])
+        for node in package.definition.nodes
+        if node.node_type == "script" and "runtime" in node.options
+    }
+    result.update({
+        "action": "show",
+        "argument_hints": _argument_hints(package),
+        "topology_text": topology.text,
+        "topology_mermaid": topology.mermaid,
+        "topology_warnings": list(topology.warnings),
+        "node_type_counts": dict(sorted(node_counts.items())),
+        "approval_nodes": [
+            node.id for node in package.definition.nodes if node.node_type == "approval"
+        ],
+        "outward_action_nodes": list(package.sidecar.get("outward_action_nodes", ())),
+        "required_tools": sorted(requested_tools),
+        "required_skills": sorted(requested_skills),
+        "required_mcp": sorted(requested_mcp),
+        "required_providers": sorted(providers),
+        "required_runtimes": sorted(runtimes),
+        "related_cron_schedules": _related_cron(package.definition.name, cron_jobs),
+        "blocking_findings": [
+            {
+                "path": finding.path,
+                "level": finding.level.value,
+                "message": finding.message,
+            }
+            for finding in report.blocking_findings
+        ],
+    })
+    result["requirements"] = {
+        "tools": result["required_tools"],
+        "skills": result["required_skills"],
+        "mcp": result["required_mcp"],
+        "providers": result["required_providers"],
+        "runtimes": result["required_runtimes"],
+        "arguments": result["argument_hints"],
+    }
+    result["approvals"] = {
+        "nodes": result["approval_nodes"],
+        "outward_actions": result["outward_action_nodes"],
+    }
+    result["schedules"] = result["related_cron_schedules"]
+    result["warnings"] = [item["message"] for item in result["blocking_findings"]]
+    result["next_actions"] = ["run"] if report.runnable else ["doctor"]
+    return result
+
+
+def _json_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--json", action="store_true", help="Emit stable JSON output")
+
+
+def register_cli(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument("--workdir", default=os.getcwd(), help=argparse.SUPPRESS)
+    subparser.add_argument(
+        "--hermes-home", default=str(get_hermes_home()), help=argparse.SUPPRESS
+    )
+    actions = subparser.add_subparsers(dest="workflow_action")
+
+    list_parser = actions.add_parser(
+        "list", aliases=["ls"], help="List discovered workflows"
+    )
+    _json_flag(list_parser)
+
+    show_parser = actions.add_parser(
+        "show", help="Show a redacted workflow catalog entry"
+    )
+    show_parser.add_argument("name")
+    show_parser.add_argument(
+        "--topology", choices=("text", "mermaid", "both"), default=None
+    )
+    _json_flag(show_parser)
+
+    validate_parser = actions.add_parser("validate", help="Validate a workflow package")
+    validate_parser.add_argument("name")
+    _json_flag(validate_parser)
+
+    doctor_parser = actions.add_parser(
+        "doctor", help="Inspect compatibility and execution risk"
+    )
+    doctor_parser.add_argument("name")
+    doctor_parser.add_argument("--compat-report", action="store_true")
+    _json_flag(doctor_parser)
+
+    trust_parser = actions.add_parser("trust", help="Trust the current package digest")
+    trust_parser.add_argument("name")
+    trust_parser.add_argument("--digest", required=True)
+    _json_flag(trust_parser)
+
+    untrust_parser = actions.add_parser("untrust", help="Revoke package trust")
+    untrust_parser.add_argument("name")
+    _json_flag(untrust_parser)
+
+    run_parser = actions.add_parser("run", help="Start a durable workflow run")
+    run_parser.add_argument("name")
+    run_parser.add_argument("--arguments", default="")
+    run_parser.add_argument("--idempotency-key")
+    run_parser.add_argument("--concurrency-key")
+    run_parser.add_argument("--no-wait", action="store_true")
+    _json_flag(run_parser)
+
+    runs_parser = actions.add_parser("runs", help="List active and recent runs")
+    runs_parser.add_argument("--workflow")
+    runs_parser.add_argument("--status")
+    runs_parser.add_argument("--limit", type=int, default=100)
+    _json_flag(runs_parser)
+
+    status_parser = actions.add_parser("status", help="Inspect a durable run")
+    status_parser.add_argument("run_id", nargs="?")
+    _json_flag(status_parser)
+
+    events_parser = actions.add_parser("events", help="Show sanitized run events")
+    events_parser.add_argument("run_id")
+    events_parser.add_argument("--tail", type=int, default=50)
+    _json_flag(events_parser)
+
+    approve_parser = actions.add_parser(
+        "approve", help="Approve a paused workflow gate"
+    )
+    approve_parser.add_argument("run_id")
+    approve_parser.add_argument("--comment", default="")
+    approve_parser.add_argument("--continue", dest="continue_run", action="store_true")
+    _json_flag(approve_parser)
+
+    reject_parser = actions.add_parser("reject", help="Reject a paused workflow gate")
+    reject_parser.add_argument("run_id")
+    reject_parser.add_argument("--reason", default="")
+    reject_parser.add_argument("--continue", dest="continue_run", action="store_true")
+    _json_flag(reject_parser)
+
+    input_parser = actions.add_parser(
+        "provide-input", help="Provide bounded input to a paused workflow loop"
+    )
+    input_parser.add_argument("run_id")
+    input_parser.add_argument("interaction_id")
+    input_parser.add_argument("value")
+    input_parser.add_argument("--expected-version", type=int, required=True)
+    input_parser.add_argument("--continue", dest="continue_run", action="store_true")
+    _json_flag(input_parser)
+
+    retry_parser = actions.add_parser("retry", help="Retry one failed workflow node")
+    retry_parser.add_argument("run_id")
+    retry_parser.add_argument("node_id", nargs="?")
+    retry_parser.add_argument("--expected-version", type=int)
+    retry_parser.add_argument("--continue", dest="continue_run", action="store_true")
+    _json_flag(retry_parser)
+
+    reconcile_parser = actions.add_parser(
+        "reconcile", help="Resolve an unknown outward-action outcome"
+    )
+    reconcile_parser.add_argument("run_id")
+    reconcile_parser.add_argument(
+        "outcome",
+        choices=("confirmed-succeeded", "confirmed-failed", "safe-to-retry"),
+    )
+    reconcile_parser.add_argument("--interaction-id")
+    reconcile_parser.add_argument("--expected-version", type=int)
+    reconcile_parser.add_argument("--continue", dest="continue_run", action="store_true")
+    _json_flag(reconcile_parser)
+
+    for action, help_text in (
+        ("resume", "Resume an interrupted workflow run"),
+        ("cancel", "Cancel a workflow run"),
+        ("abandon", "Abandon a stopped workflow run"),
+    ):
+        parser = actions.add_parser(action, help=help_text)
+        parser.add_argument("run_id")
+        _json_flag(parser)
+
+    cleanup_parser = actions.add_parser("cleanup", help="Clean retained terminal runs")
+    cleanup_parser.add_argument("--older-than", default="7d")
+    cleanup_parser.add_argument("--dry-run", action="store_true")
+    _json_flag(cleanup_parser)
+
+    reset_parser = actions.add_parser(
+        "reset-sessions", help="Reset persistent workflow node sessions"
+    )
+    reset_parser.add_argument("name")
+    reset_parser.add_argument("--scope")
+    reset_parser.add_argument("--node")
+    reset_parser.add_argument("--yes", action="store_true")
+    _json_flag(reset_parser)
+
+    showcase_parser = actions.add_parser(
+        "showcase", help="Run digest-verified guided workflow demonstrations"
+    )
+    showcase_actions = showcase_parser.add_subparsers(dest="showcase_action")
+    showcase_list = showcase_actions.add_parser("list", help="List safe showcases")
+    _json_flag(showcase_list)
+    for action in ("describe", "preflight"):
+        parser = showcase_actions.add_parser(action)
+        parser.add_argument("showcase_id")
+        _json_flag(parser)
+    showcase_run = showcase_actions.add_parser("run")
+    showcase_run.add_argument("showcase_id")
+    showcase_run.add_argument("--symptom")
+    showcase_run.add_argument("--confirmation-token")
+    showcase_run.add_argument("--schedule-at")
+    showcase_run.add_argument("--idempotency-key")
+    showcase_run.add_argument("--no-wait", action="store_true")
+    _json_flag(showcase_run)
+    showcase_status = showcase_actions.add_parser("status")
+    showcase_status.add_argument("run_id")
+    _json_flag(showcase_status)
+    showcase_report = showcase_actions.add_parser("report")
+    showcase_report.add_argument("run_id")
+    _json_flag(showcase_report)
+    showcase_reset = showcase_actions.add_parser("reset")
+    showcase_reset.add_argument("showcase_id")
+    _json_flag(showcase_reset)
+    showcase_cleanup = showcase_actions.add_parser("cleanup")
+    showcase_cleanup.add_argument("--older-than-days", type=int, default=7)
+    showcase_cleanup.add_argument("--execute", action="store_true")
+    _json_flag(showcase_cleanup)
+
+    subparser.set_defaults(func=workflow_command)
+
+
+def _discover(args: argparse.Namespace) -> tuple[WorkflowPackage, ...]:
+    return discover_workflows(
+        Path(args.workdir),
+        Path(args.hermes_home),
+        Path.home(),
+    )
+
+
+def _resolve(args: argparse.Namespace, name: str) -> WorkflowPackage:
+    candidate = Path(name).expanduser()
+    if candidate.is_file():
+        return load_workflow(candidate)
+    packages = _discover(args)
+    for package in packages:
+        if package.definition.name == name:
+            return package
+    raise WorkflowValidationError(
+        ValidationIssue(
+            path="name",
+            code="workflow_not_found",
+            message=f"workflow not found: {name}",
+        )
+    )
+
+
+def _cron_jobs() -> Iterable[Mapping[str, object]]:
+    try:
+        from cron.jobs import list_jobs
+
+        return list_jobs(include_disabled=True)
+    except Exception:
+        return ()
+
+
+def _emit(payload: object, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2))
+    elif isinstance(payload, str):
+        print(payload)
+    else:
+        print(payload)
+
+
+def _cmd_list(args: argparse.Namespace) -> int:
+    entries = build_catalog(_discover(args))
+    if args.json:
+        _emit(entries, as_json=True)
+        return 0
+    if not entries:
+        print("No portable workflows discovered.")
+        return 0
+    for entry in entries:
+        print(
+            f"{entry['name']}\t{entry['compatibility']['level']}\t"
+            f"{'runnable' if entry['runnable'] else 'blocked'}\t"
+            f"{entry['source']}:{entry['precedence']}\t{entry['description']}"
+        )
+    return 0
+
+
+def _cmd_show(args: argparse.Namespace) -> int:
+    if args.json and args.topology is not None:
+        print(
+            "--topology cannot be combined with --json; JSON show always includes both projections",
+            file=sys.stderr,
+        )
+        return 2
+    detail = show_package(_resolve(args, args.name), cron_jobs=_cron_jobs())
+    if args.json:
+        _emit(detail, as_json=True)
+        return 0
+    print(f"Workflow: {detail['name']}")
+    print(f"Description: {detail['description']}")
+    print(f"Source: {detail['source']} (precedence {detail['precedence']})")
+    print(f"Compatibility: {detail['compatibility']['level']}")
+    selector = args.topology or "text"
+    if selector in {"text", "both"}:
+        print(f"Topology: {detail['topology_text']}")
+    if selector in {"mermaid", "both"}:
+        if detail["topology_mermaid"] is None:
+            print(
+                "Mermaid topology unavailable: "
+                + ", ".join(detail["topology_warnings"])
+            )
+        else:
+            print("Topology (Mermaid):")
+            print("```mermaid")
+            print(detail["topology_mermaid"])
+            print("```")
+    return 0
+
+
+def _cmd_validate(args: argparse.Namespace) -> int:
+    package = _resolve(args, args.name)
+    issues = validate_package(package)
+    payload = {
+        "name": package.definition.name,
+        "valid": not any(issue.blocking for issue in issues),
+        "issues": [
+            {
+                "path": issue.path,
+                "code": issue.code,
+                "message": issue.message,
+                "severity": issue.severity,
+                "blocking": issue.blocking,
+                "source_line": issue.source_line,
+            }
+            for issue in issues
+        ],
+    }
+    if args.json:
+        _emit(payload, as_json=True)
+    else:
+        print(
+            f"{package.definition.name}: {'valid' if payload['valid'] else 'invalid'}"
+        )
+        for issue in payload["issues"]:
+            print(f"- {issue['severity']}: {issue['path']}: {issue['message']}")
+    return 0 if payload["valid"] else 1
+
+
+_MCP_ENV_REFERENCE = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)"
+)
+_INPUT_KINDS = frozenset({"text", "file", "directory", "json"})
+_CONCURRENCY_POLICIES = frozenset({"queue", "allow", "forbid"})
+
+
+def _doctor_finding(
+    *,
+    code: str,
+    path: str,
+    message: str,
+    blocking: bool = False,
+    level: CompatibilityLevel = CompatibilityLevel.MAPPED,
+) -> CompatibilityFinding:
+    return CompatibilityFinding(
+        path=path,
+        level=level,
+        message=message,
+        blocking=blocking,
+        code=code,
+    )
+
+
+def _compatibility_code(finding: CompatibilityFinding) -> str:
+    message = finding.message.lower()
+    if "unknown archon tool alias" in message:
+        return "unknown_tool_alias"
+    if "mapped hermes tool is unavailable" in message:
+        return "unavailable_tool"
+    if ".hooks." in finding.path:
+        return "hook_unsupported" if finding.blocking else "hook_mapped"
+    if "provider" in message and "does not advertise" in message:
+        return "provider_field_unsupported"
+    if finding.path.endswith("persist_session") or finding.path == "persist_sessions":
+        return "persistent_session_fingerprint"
+    if finding.path.endswith(".mcp"):
+        return "mcp_isolation"
+    if finding.path.endswith(".skills"):
+        return "skill_snapshot"
+    if finding.path.endswith(".agents"):
+        return "inline_agent_bounds"
+    if finding.path.endswith("output_format"):
+        return "output_schema_enforcement"
+    if finding.path.startswith("requires["):
+        return "required_service"
+    if finding.path.startswith("worktree"):
+        return "worktree_requirement"
+    return finding.code
+
+
+def _coded_compatibility_findings(
+    report: CompatibilityReport,
+) -> list[CompatibilityFinding]:
+    return [
+        CompatibilityFinding(
+            path=finding.path,
+            level=finding.level,
+            message=finding.message,
+            blocking=finding.blocking,
+            code=_compatibility_code(finding),
+        )
+        for finding in report.findings
+    ]
+
+
+def _input_requirements(
+    package: WorkflowPackage, findings: list[CompatibilityFinding]
+) -> tuple[InputRequirement, ...]:
+    delivery = package.sidecar.get("delivery_defaults", {})
+    if delivery is None:
+        return ()
+    if not isinstance(delivery, Mapping):
+        findings.append(
+            _doctor_finding(
+                code="invalid_input_requirements",
+                path="sidecar.delivery_defaults",
+                message="delivery_defaults must contain a mapping",
+                blocking=True,
+                level=CompatibilityLevel.UNSUPPORTED,
+            )
+        )
+        return ()
+    raw_inputs = delivery.get("inputs", {})
+    if not isinstance(raw_inputs, Mapping):
+        findings.append(
+            _doctor_finding(
+                code="invalid_input_requirements",
+                path="sidecar.delivery_defaults.inputs",
+                message="delivery default inputs must contain a mapping",
+                blocking=True,
+                level=CompatibilityLevel.UNSUPPORTED,
+            )
+        )
+        return ()
+    requirements: list[InputRequirement] = []
+    for name, raw in sorted(raw_inputs.items(), key=lambda item: str(item[0])):
+        path = f"sidecar.delivery_defaults.inputs.{name}"
+        if not isinstance(name, str) or not name or not isinstance(raw, Mapping):
+            findings.append(
+                _doctor_finding(
+                    code="invalid_input_requirements",
+                    path=path,
+                    message="input requirements must be named mappings",
+                    blocking=True,
+                    level=CompatibilityLevel.UNSUPPORTED,
+                )
+            )
+            continue
+        kind = raw.get("kind", "text")
+        required = raw.get("required", True)
+        max_bytes = raw.get("max_bytes")
+        valid = (
+            kind in _INPUT_KINDS
+            and isinstance(required, bool)
+            and (
+                max_bytes is None
+                or (
+                    isinstance(max_bytes, int)
+                    and not isinstance(max_bytes, bool)
+                    and max_bytes > 0
+                )
+            )
+        )
+        if not valid:
+            findings.append(
+                _doctor_finding(
+                    code="invalid_input_requirements",
+                    path=path,
+                    message="input kind, required flag, or byte ceiling is invalid",
+                    blocking=True,
+                    level=CompatibilityLevel.UNSUPPORTED,
+                )
+            )
+            continue
+        requirements.append(
+            InputRequirement(
+                name=name,
+                kind=kind,
+                required=required,
+                max_bytes=max_bytes,
+            )
+        )
+        findings.append(
+            _doctor_finding(
+                code="immutable_input_snapshot",
+                path=path,
+                message=(
+                    f"{kind} input {name} is validated, size-bounded, and copied "
+                    "into the immutable run snapshot before admission"
+                ),
+            )
+        )
+    return tuple(requirements)
+
+
+def _mcp_environment_names(package: WorkflowPackage) -> tuple[str, ...]:
+    names: set[str] = set()
+    digest = compute_package_digest(package)
+    for relative in digest.covered_relative_paths:
+        if not relative.startswith("mcp/"):
+            continue
+        path = package.root / relative
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        for match in _MCP_ENV_REFERENCE.finditer(text):
+            names.add(match.group(1) or match.group(2))
+    return tuple(sorted(names))
+
+
+def _doctor_compatibility_level(
+    findings: Iterable[CompatibilityFinding],
+) -> CompatibilityLevel:
+    materialized = tuple(findings)
+    if any(
+        finding.level is CompatibilityLevel.UNSUPPORTED for finding in materialized
+    ):
+        return CompatibilityLevel.UNSUPPORTED
+    if materialized:
+        return CompatibilityLevel.MAPPED
+    return CompatibilityLevel.PORTABLE
+
+
+def doctor_package(
+    package: WorkflowPackage,
+    *,
+    hermes_home: str | Path,
+    available_tools: AbstractSet[str] | None = None,
+    available_services: AbstractSet[str] | None = None,
+    provider_capabilities: Mapping[str, AbstractSet[str]] | None = None,
+    available_skills: AbstractSet[str] | None = None,
+    available_runtimes: AbstractSet[str] | None = None,
+    isolated_workdir: bool = False,
+    mcp_available: bool = False,
+    environment: Mapping[str, str] | None = None,
+    runtime_config: WorkflowRuntimeConfig | None = None,
+) -> DoctorReport:
+    """Inspect a package without starting a provider, worker, or MCP server."""
+    compatibility = assess_compatibility(
+        package,
+        available_tools=available_tools,
+        available_services=available_services,
+        provider_capabilities=provider_capabilities,
+        isolated_workdir=isolated_workdir,
+        mcp_available=mcp_available,
+    )
+    findings = _coded_compatibility_findings(compatibility)
+    risk = build_risk_summary(package, compatibility)
+    package_digest = compute_package_digest(package)
+    covered = package_digest.covered_relative_paths
+    commands = tuple(path for path in covered if path.startswith("commands/"))
+    scripts = tuple(path for path in covered if path.startswith("scripts/"))
+    mcp_servers = tuple(path for path in covered if path.startswith("mcp/"))
+    skills = tuple(sorted(set(risk.requested_skills)))
+
+    requirements = _input_requirements(package, findings)
+    runtimes = (
+        frozenset(
+            runtime for runtime in ("bun", "uv") if shutil.which(runtime) is not None
+        )
+        if available_runtimes is None
+        else frozenset(available_runtimes)
+    )
+    for index, node in enumerate(package.definition.nodes):
+        if node.node_type == "script":
+            runtime = str(node.options.get("runtime", ""))
+            if runtime not in runtimes:
+                findings.append(
+                    _doctor_finding(
+                        code="missing_runtime",
+                        path=f"nodes[{index}].runtime",
+                        message=f"required script runtime is unavailable: {runtime}",
+                        blocking=True,
+                        level=CompatibilityLevel.UNSUPPORTED,
+                    )
+                )
+        if node.options.get("agents") and not any(
+            finding.path == f"nodes[{index}].agents" for finding in findings
+        ):
+            findings.append(
+                _doctor_finding(
+                    code="inline_agent_bounds",
+                    path=f"nodes[{index}].agents",
+                    message="inline agents inherit bounded workflow worker and deadline ceilings",
+                )
+            )
+
+    if available_skills is not None:
+        for skill in skills:
+            if skill not in available_skills:
+                findings.append(
+                    _doctor_finding(
+                        code="missing_skill",
+                        path="skills",
+                        message=f"required skill is unavailable: {skill}",
+                        blocking=True,
+                        level=CompatibilityLevel.UNSUPPORTED,
+                    )
+                )
+
+    required_services = package.sidecar.get("required_services", ())
+    if not isinstance(required_services, tuple | list) or any(
+        not isinstance(service, str) or not service for service in required_services
+    ):
+        findings.append(
+            _doctor_finding(
+                code="invalid_required_services",
+                path="sidecar.required_services",
+                message="required_services must contain configured service names",
+                blocking=True,
+                level=CompatibilityLevel.UNSUPPORTED,
+            )
+        )
+    else:
+        for service in required_services:
+            missing = available_services is not None and service not in available_services
+            findings.append(
+                _doctor_finding(
+                    code="missing_service" if missing else "configured_service_preflight",
+                    path=f"sidecar.required_services.{service}",
+                    message=(
+                        f"required configured service is unavailable: {service}"
+                        if missing
+                        else f"configured service is checked before execution: {service}"
+                    ),
+                    blocking=missing,
+                    level=(
+                        CompatibilityLevel.UNSUPPORTED
+                        if missing
+                        else CompatibilityLevel.MAPPED
+                    ),
+                )
+            )
+
+    visible_environment = os.environ if environment is None else environment
+    for name in _mcp_environment_names(package):
+        if not visible_environment.get(name):
+            findings.append(
+                _doctor_finding(
+                    code="missing_mcp_variable",
+                    path=f"mcp.environment.{name}",
+                    message=f"required MCP variable is not configured: {name}",
+                    blocking=True,
+                    level=CompatibilityLevel.UNSUPPORTED,
+                )
+            )
+    for name in risk.required_secret_names:
+        if not visible_environment.get(name):
+            findings.append(
+                _doctor_finding(
+                    code="missing_credential",
+                    path=f"required_secrets.{name}",
+                    message=f"required credential is not configured: {name}",
+                    blocking=True,
+                    level=CompatibilityLevel.UNSUPPORTED,
+                )
+            )
+
+    policy = str(package.sidecar.get("overlap_policy") or "queue")
+    if policy not in _CONCURRENCY_POLICIES:
+        findings.append(
+            _doctor_finding(
+                code="invalid_overlap_policy",
+                path="sidecar.overlap_policy",
+                message=f"unsupported overlap policy: {policy}",
+                blocking=True,
+                level=CompatibilityLevel.UNSUPPORTED,
+            )
+        )
+        policy = "queue"
+    findings.append(
+        _doctor_finding(
+            code=f"overlap_{policy}",
+            path="sidecar.overlap_policy",
+            message=f"matching concurrent invocations use the {policy} policy",
+        )
+    )
+
+    base_runtime = runtime_config or _runtime_config(hermes_home)
+    limits = package.sidecar.get("limits", {})
+    resources = package.sidecar.get("resource_limits", {})
+    if not isinstance(limits, Mapping) or not isinstance(resources, Mapping):
+        findings.append(
+            _doctor_finding(
+                code="invalid_resource_ceiling",
+                path="sidecar.limits",
+                message="workflow limits and resource_limits must be mappings",
+                blocking=True,
+                level=CompatibilityLevel.UNSUPPORTED,
+            )
+        )
+        effective_runtime = base_runtime
+    else:
+        effective_runtime = WorkflowRuntimeConfig.from_mapping(
+            asdict(base_runtime),
+            sidecar_limits=limits,
+            sidecar_resources=resources,
+        )
+    capacity = {
+        name: getattr(effective_runtime, name)
+        for name in (
+            "max_parallel_nodes",
+            "max_total_workers",
+            "max_executing_runs",
+            "max_queued_runs",
+            "max_paused_runs",
+            "max_nonterminal_runs",
+            "max_start_requests_per_minute",
+            "process_tree_rss_bytes",
+            "process_tree_cpu_seconds",
+            "max_descendants",
+        )
+    }
+    findings.append(
+        _doctor_finding(
+            code="effective_admission_capacity",
+            path="runtime.limits",
+            message="effective admission and resource ceilings: "
+            + json.dumps(capacity, sort_keys=True, separators=(",", ":")),
+        )
+    )
+    findings.append(
+        _doctor_finding(
+            code="executable_resources_digest_bound",
+            path="package.digest",
+            message="package digest covers executable resources: "
+            + ", ".join(covered),
+        )
+    )
+    findings.append(
+        _doctor_finding(
+            code=(
+                "isolated_execution_required"
+                if risk.execution_environment == "isolated_backend_required"
+                else "trusted_local_execution"
+            ),
+            path="sidecar.execution_environment",
+            message=(
+                "execution requires an isolated backend with advertised containment"
+                if risk.execution_environment == "isolated_backend_required"
+                else "trusted package may execute on the configured local backend"
+            ),
+        )
+    )
+
+    trust_state = WorkflowTrustStore(hermes_home).check(
+        package_digest.sha256, risk_digest=risk.risk_digest
+    )
+    return DoctorReport(
+        package=str(package.root),
+        workflow=package.definition.name,
+        runnable=not any(finding.blocking for finding in findings),
+        package_digest=package_digest.sha256,
+        trust_state=trust_state,
+        risk_summary=risk,
+        input_requirements=requirements,
+        concurrency_policy=policy,
+        findings=tuple(findings),
+        resolved_commands=commands,
+        resolved_scripts=scripts,
+        resolved_mcp_servers=mcp_servers,
+        resolved_skills=skills,
+    )
+
+
+def _doctor_payload(
+    package: WorkflowPackage,
+    *,
+    hermes_home: str | Path,
+    compat_report: bool,
+) -> dict[str, object]:
+    report = doctor_package(package, hermes_home=hermes_home)
+    payload = report.to_dict()
+    payload.update({
+        "name": package.definition.name,
+        "compatibility": _doctor_compatibility_level(report.findings).value,
+        "remediation": (
+            "Resolve blocking compatibility findings, then rerun doctor and trust the current digest."
+            if any(finding.blocking for finding in report.findings)
+            else "Review this risk summary, then trust the exact package digest before local execution."
+        ),
+    })
+    if compat_report:
+        payload["compatibility_findings"] = [
+            {
+                "path": finding.path,
+                "level": finding.level.value,
+                "message": finding.message,
+                "blocking": finding.blocking,
+                "code": finding.code,
+            }
+            for finding in report.findings
+        ]
+    return payload
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    payload = _doctor_payload(
+        _resolve(args, args.name),
+        hermes_home=args.hermes_home,
+        compat_report=args.compat_report,
+    )
+    if args.json:
+        _emit(payload, as_json=True)
+    else:
+        print(f"Workflow: {payload['name']}")
+        print(f"Package digest: {payload['package_digest']}")
+        print(f"Risk digest: {payload['risk_digest']}")
+        print(f"Compatibility: {payload['compatibility']}")
+        print(
+            "Execution environment: "
+            f"{payload['risk_summary']['execution_environment']}"
+        )
+        print(f"Remediation: {payload['remediation']}")
+    return 0
+
+
+def _cmd_trust(args: argparse.Namespace) -> int:
+    package = _resolve(args, args.name)
+    before = compute_package_digest(package)
+    if args.digest != before.sha256:
+        print(
+            "supplied digest does not match the current package digest", file=sys.stderr
+        )
+        return 1
+    compatibility = assess_compatibility(package)
+    risk = build_risk_summary(package, compatibility)
+    fresh_package = load_workflow(
+        package.workflow_path,
+        source=package.source,
+        precedence=package.precedence,
+    )
+    fresh_risk = build_risk_summary(fresh_package, assess_compatibility(fresh_package))
+    after = compute_package_digest(fresh_package)
+    if (
+        before != after
+        or risk.package_digest != after.sha256
+        or risk.risk_digest != fresh_risk.risk_digest
+    ):
+        print(
+            "package changed while trust was being recorded; rerun doctor",
+            file=sys.stderr,
+        )
+        return 1
+    WorkflowTrustStore(args.hermes_home).trust(
+        after.sha256,
+        actor="local-user",
+        risk_digest=fresh_risk.risk_digest,
+    )
+    payload = {
+        "name": package.definition.name,
+        "package_digest": after.sha256,
+        "status": "trusted",
+    }
+    if args.json:
+        _emit(payload, as_json=True)
+    else:
+        print(f"Trusted {payload['name']} at digest {payload['package_digest']}")
+    return 0
+
+
+def _cmd_untrust(args: argparse.Namespace) -> int:
+    package = _resolve(args, args.name)
+    digest = compute_package_digest(package)
+    revoked = WorkflowTrustStore(args.hermes_home).revoke(digest.sha256)
+    payload = {
+        "name": package.definition.name,
+        "package_digest": digest.sha256,
+        "status": "untrusted",
+        "revoked": revoked,
+    }
+    if args.json:
+        _emit(payload, as_json=True)
+    else:
+        print(
+            f"Trust revoked for {payload['name']}"
+            if revoked
+            else f"{payload['name']} was not trusted"
+        )
+    return 0
+
+
+def _runtime_config(
+    hermes_home: str | Path,
+    *,
+    sidecar: Mapping[str, object] | None = None,
+) -> WorkflowRuntimeConfig:
+    path = Path(hermes_home) / "config.yaml"
+    raw: object = {}
+    if path.is_file():
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("config.yaml must contain a mapping")
+    plugins = raw.get("plugins", {})
+    if not isinstance(plugins, Mapping):
+        raise ValueError("config.yaml plugins section must contain a mapping")
+    entries = plugins.get("entries", {})
+    if not isinstance(entries, Mapping):
+        raise ValueError("config.yaml plugin entries must contain a mapping")
+    entry = entries.get("workflow", {})
+    if not isinstance(entry, Mapping):
+        raise ValueError("workflow plugin entry must contain a mapping")
+    workflow = entry.get("runtime", {})
+    if not isinstance(workflow, Mapping):
+        raise ValueError("workflow plugin runtime config must contain a mapping")
+    policy = sidecar or {}
+    limits = policy.get("limits", {}) if isinstance(policy, Mapping) else {}
+    resources = policy.get("resource_limits", {}) if isinstance(policy, Mapping) else {}
+    if not isinstance(limits, Mapping) or not isinstance(resources, Mapping):
+        raise ValueError("workflow sidecar limits must contain mappings")
+    return WorkflowRuntimeConfig.from_mapping(
+        workflow,
+        sidecar_limits=limits,
+        sidecar_resources=resources,
+    )
+
+
+def _store(
+    args: argparse.Namespace, runtime: WorkflowRuntimeConfig | None = None
+) -> RunStore:
+    config = runtime or _runtime_config(args.hermes_home)
+    return RunStore(
+        args.hermes_home,
+        max_executing_runs=config.max_executing_runs,
+        max_queued_runs=config.max_queued_runs,
+        max_paused_runs=config.max_paused_runs,
+        max_nonterminal_runs=config.max_nonterminal_runs,
+        max_start_requests_per_minute=config.max_start_requests_per_minute,
+        max_total_workers=config.max_total_workers,
+    )
+
+
+def _scheduler(
+    store: RunStore,
+    config: WorkflowRuntimeConfig,
+    *,
+    agent_runner=None,
+    profile_name: str = "default",
+) -> RunScheduler:
+    return RunScheduler(
+        store,
+        agent_runner=agent_runner,
+        profile_name=profile_name,
+        max_parallel_nodes=config.max_parallel_nodes,
+        heartbeat_seconds=config.heartbeat_seconds,
+        lease_seconds=config.lease_seconds,
+        ai_idle_timeout_seconds=config.ai_idle_timeout_seconds,
+        ai_wall_timeout_seconds=config.ai_wall_timeout_seconds,
+        provider_request_timeout_seconds=config.provider_request_timeout_seconds,
+        subprocess_timeout_seconds=config.subprocess_timeout_seconds,
+        default_max_attempts=config.combined_retries,
+        cooperative_shutdown_seconds=config.cooperative_shutdown_seconds,
+        term_grace_seconds=config.term_grace_seconds,
+        kill_reap_grace_seconds=config.kill_reap_grace_seconds,
+        resource_limits=ProcessResourceLimits(
+            max_rss_bytes=config.process_tree_rss_bytes,
+            max_cpu_seconds=config.process_tree_cpu_seconds,
+            max_descendants=config.max_descendants,
+        ),
+    )
+
+
+def _cmd_run(
+    args: argparse.Namespace, *, agent_runner=None, profile_name="default"
+) -> int:
+    package = _resolve(args, args.name)
+    runtime = _runtime_config(args.hermes_home, sidecar=package.sidecar)
+    digest = compute_package_digest(package)
+    if WorkflowTrustStore(args.hermes_home).check(digest.sha256) != "trusted":
+        print(
+            "workflow package is not trusted; run doctor and trust its exact digest",
+            file=sys.stderr,
+        )
+        return 1
+    store = _store(args, runtime)
+    prepared = store.prepare_run_snapshot(
+        package, values={"arguments": args.arguments} if args.arguments else None
+    )
+    request = RunAdmissionRequest(
+        workflow_name=package.definition.name,
+        definition_digest=prepared.definition_digest,
+        policy_digest=prepared.policy_digest,
+        input_manifest_digest=prepared.input_manifest_digest,
+        trigger_source="cli",
+        idempotency_key=args.idempotency_key or secrets.token_urlsafe(24),
+        concurrency_key=args.concurrency_key
+        or str(package.sidecar.get("concurrency_key") or package.definition.name),
+        concurrency_policy=str(package.sidecar.get("overlap_policy") or "queue"),
+    )
+    admitted = store.start_run(request, immutable_snapshot=prepared)
+    if admitted.run_id is None:
+        payload = {
+            "action": "run",
+            "admission_disposition": admitted.disposition,
+            "reason_code": admitted.reason_code,
+            "run_id": None,
+        }
+        _emit(payload, as_json=args.json)
+        return 1
+    if admitted.disposition == "created" and not args.no_wait:
+        _scheduler(
+            store,
+            runtime,
+            agent_runner=agent_runner,
+            profile_name=profile_name,
+        ).advance(admitted.run_id)
+    payload = store.get_run_status(admitted.run_id)
+    payload["action"] = "run"
+    payload["admission_disposition"] = admitted.disposition
+    _emit(payload, as_json=args.json)
+    return 0 if payload["status"] in {"queued", "running", "succeeded"} else 1
+
+
+def _cmd_runs(args: argparse.Namespace) -> int:
+    payload = _store(args).list_runs(
+        workflow=args.workflow, status=args.status, limit=args.limit
+    )
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    store = _store(args)
+    payload = store.get_run_status(args.run_id) if args.run_id else store.list_runs()
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _cmd_events(args: argparse.Namespace) -> int:
+    payload = _store(args).tail_events(args.run_id, limit=args.tail)
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _cmd_approval_decision(
+    args: argparse.Namespace,
+    *,
+    decision: str,
+    agent_runner=None,
+    profile_name="default",
+) -> int:
+    runtime = _runtime_config(args.hermes_home)
+    store = _store(args, runtime)
+    if decision == "approved":
+        result = store.approve_run(args.run_id, comment=args.comment, channel="cli")
+    else:
+        result = store.reject_run(args.run_id, reason=args.reason, channel="cli")
+    if result.outcome == "applied" and args.continue_run:
+        _scheduler(
+            store,
+            runtime,
+            agent_runner=agent_runner,
+            profile_name=profile_name,
+        ).advance(args.run_id)
+    payload = asdict(result)
+    payload["action"] = "approve" if decision == "approved" else "reject"
+    payload["run_status"] = store.get_run_status(args.run_id)["status"]
+    _emit(payload, as_json=args.json)
+    return 0 if result.outcome == "applied" else 3
+
+
+def _cmd_resume(
+    args: argparse.Namespace, *, agent_runner=None, profile_name="default"
+) -> int:
+    runtime = _runtime_config(args.hermes_home)
+    store = _store(args, runtime)
+    store.resume_run(args.run_id)
+    _scheduler(
+        store,
+        runtime,
+        agent_runner=agent_runner,
+        profile_name=profile_name,
+    ).advance(args.run_id)
+    _emit(store.get_run_status(args.run_id), as_json=args.json)
+    return 0
+
+
+def _continue_if_requested(args, store, runtime, *, agent_runner, profile_name):
+    if args.continue_run:
+        _scheduler(
+            store,
+            runtime,
+            agent_runner=agent_runner,
+            profile_name=profile_name,
+        ).advance(args.run_id)
+
+
+def _cmd_provide_input(
+    args: argparse.Namespace, *, agent_runner=None, profile_name="default"
+) -> int:
+    runtime = _runtime_config(args.hermes_home)
+    store = _store(args, runtime)
+    current = store.get_run_status(args.run_id)
+    pending = current.get("pending_interaction")
+    if isinstance(pending, Mapping):
+        actual = pending.get("interaction_id") or pending.get("action_digest")
+        if actual is not None and actual != args.interaction_id:
+            raise ValueError("interaction ID does not match the pending input")
+    store.provide_loop_input(
+        args.run_id,
+        args.value,
+        expected_state_version=args.expected_version,
+    )
+    _continue_if_requested(
+        args, store, runtime, agent_runner=agent_runner, profile_name=profile_name
+    )
+    payload = store.get_run_status(args.run_id)
+    payload["action"] = "provide-input"
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _cmd_retry(
+    args: argparse.Namespace, *, agent_runner=None, profile_name="default"
+) -> int:
+    runtime = _runtime_config(args.hermes_home)
+    store = _store(args, runtime)
+    store.retry_run(
+        args.run_id,
+        node_id=args.node_id,
+        expected_state_version=args.expected_version,
+    )
+    _continue_if_requested(
+        args, store, runtime, agent_runner=agent_runner, profile_name=profile_name
+    )
+    payload = store.get_run_status(args.run_id)
+    payload["action"] = "retry"
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _cmd_reconcile(
+    args: argparse.Namespace, *, agent_runner=None, profile_name="default"
+) -> int:
+    runtime = _runtime_config(args.hermes_home)
+    store = _store(args, runtime)
+    store.reconcile_run(
+        args.run_id,
+        args.outcome,
+        expected_state_version=args.expected_version,
+        interaction_id=args.interaction_id,
+    )
+    _continue_if_requested(
+        args, store, runtime, agent_runner=agent_runner, profile_name=profile_name
+    )
+    payload = store.get_run_status(args.run_id)
+    payload["action"] = "reconcile"
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _cmd_cancel(args: argparse.Namespace) -> int:
+    store = _store(args)
+    store.cancel_run(args.run_id)
+    _emit(store.get_run_status(args.run_id), as_json=args.json)
+    return 0
+
+
+def _cmd_abandon(args: argparse.Namespace) -> int:
+    store = _store(args)
+    store.abandon_run(args.run_id)
+    _emit(store.get_run_status(args.run_id), as_json=args.json)
+    return 0
+
+
+def _duration(value: str):
+    from datetime import timedelta
+
+    match = re.fullmatch(r"(\d+)([dhm])", value)
+    if not match:
+        raise ValueError("--older-than must be a duration such as 7d, 12h, or 30m")
+    amount = int(match.group(1))
+    return {
+        "d": timedelta(days=amount),
+        "h": timedelta(hours=amount),
+        "m": timedelta(minutes=amount),
+    }[match.group(2)]
+
+
+def _cmd_cleanup(args: argparse.Namespace) -> int:
+    payload = _store(args).cleanup_runs(
+        older_than=_duration(args.older_than), dry_run=args.dry_run
+    )
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _cmd_reset_sessions(args: argparse.Namespace) -> int:
+    if args.scope is None and not args.yes:
+        print("cross-scope reset requires --yes", file=sys.stderr)
+        return 1
+    removed = NodeSessionRegistry(args.hermes_home).reset(
+        args.name, scope=args.scope, node_id=args.node
+    )
+    _emit(
+        {
+            "action": "reset-sessions",
+            "workflow": args.name,
+            "scope": args.scope,
+            "node": args.node,
+            "removed": removed,
+        },
+        as_json=args.json,
+    )
+    return 0
+
+
+def _cmd_showcase(args: argparse.Namespace) -> int:
+    from plugins.workflow.showcase import (
+        build_showcase_report,
+        cleanup_showcases,
+        load_showcase_catalog,
+        preflight_showcase,
+        report_to_dict,
+        reset_showcase,
+        run_showcase,
+    )
+
+    action = getattr(args, "showcase_action", None)
+    if action == "list":
+        payload = [asdict(item) for item in load_showcase_catalog().values()]
+    elif action == "describe":
+        payload = asdict(load_showcase_catalog()[args.showcase_id])
+    elif action == "preflight":
+        payload = preflight_showcase(args.showcase_id, hermes_home=args.hermes_home)
+    elif action == "run":
+        payload = run_showcase(
+            args.showcase_id,
+            hermes_home=args.hermes_home,
+            symptom=args.symptom,
+            confirmation_token=args.confirmation_token,
+            schedule_at=args.schedule_at,
+            no_wait=args.no_wait,
+            idempotency_key=args.idempotency_key,
+        )
+    elif action == "status":
+        payload = _store(args).get_run_status(args.run_id)
+    elif action == "report":
+        payload = report_to_dict(
+            build_showcase_report(args.run_id, hermes_home=args.hermes_home)
+        )
+    elif action == "reset":
+        payload = reset_showcase(args.showcase_id, hermes_home=args.hermes_home)
+    elif action == "cleanup":
+        payload = cleanup_showcases(
+            hermes_home=args.hermes_home,
+            dry_run=not args.execute,
+            older_than_days=args.older_than_days,
+        )
+    else:
+        print(
+            "Usage: hermes workflow showcase {list|describe|preflight|run|status|report|reset|cleanup}",
+            file=sys.stderr,
+        )
+        return 2
+    _emit(payload, as_json=args.json)
+    if isinstance(payload, Mapping) and payload.get("reason_code"):
+        return 3 if payload.get("status") in {"skipped", "input_required"} else 1
+    return 0
+
+
+def workflow_command(
+    args: argparse.Namespace, *, agent_runner=None, profile_name="default"
+) -> int:
+    action = getattr(args, "workflow_action", None)
+    if not action:
+        print(
+            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|cleanup|reset-sessions|showcase}",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        if action in {"list", "ls"}:
+            return _cmd_list(args)
+        if action == "show":
+            return _cmd_show(args)
+        if action == "validate":
+            return _cmd_validate(args)
+        if action == "doctor":
+            return _cmd_doctor(args)
+        if action == "trust":
+            return _cmd_trust(args)
+        if action == "untrust":
+            return _cmd_untrust(args)
+        if action == "run":
+            return _cmd_run(args, agent_runner=agent_runner, profile_name=profile_name)
+        if action == "runs":
+            return _cmd_runs(args)
+        if action == "status":
+            return _cmd_status(args)
+        if action == "events":
+            return _cmd_events(args)
+        if action == "approve":
+            return _cmd_approval_decision(
+                args,
+                decision="approved",
+                agent_runner=agent_runner,
+                profile_name=profile_name,
+            )
+        if action == "reject":
+            return _cmd_approval_decision(
+                args,
+                decision="rejected",
+                agent_runner=agent_runner,
+                profile_name=profile_name,
+            )
+        if action == "provide-input":
+            return _cmd_provide_input(
+                args, agent_runner=agent_runner, profile_name=profile_name
+            )
+        if action == "resume":
+            return _cmd_resume(
+                args, agent_runner=agent_runner, profile_name=profile_name
+            )
+        if action == "retry":
+            return _cmd_retry(
+                args, agent_runner=agent_runner, profile_name=profile_name
+            )
+        if action == "reconcile":
+            return _cmd_reconcile(
+                args, agent_runner=agent_runner, profile_name=profile_name
+            )
+        if action == "cancel":
+            return _cmd_cancel(args)
+        if action == "abandon":
+            return _cmd_abandon(args)
+        if action == "cleanup":
+            return _cmd_cleanup(args)
+        if action == "reset-sessions":
+            return _cmd_reset_sessions(args)
+        if action == "showcase":
+            return _cmd_showcase(args)
+        print(f"Unknown workflow action: {action}", file=sys.stderr)
+        return 2
+    except (
+        KeyError,
+        OSError,
+        StorageQuotaError,
+        ValueError,
+        WorkflowTrustError,
+        WorkflowValidationError,
+    ) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
