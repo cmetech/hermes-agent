@@ -17,6 +17,7 @@ class RunAdmissionRequest:
     idempotency_key: str
     concurrency_key: str
     concurrency_policy: Literal["queue", "allow", "forbid"] = "queue"
+    operator_scope: str | None = None
 
 
 @dataclass(frozen=True)

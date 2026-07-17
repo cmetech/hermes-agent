@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+import threading
+
+import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.schema import load_workflow
@@ -90,3 +95,177 @@ def test_overlap_policies_queue_forbid_and_allow(tmp_path, workflow_writer):
     assert queued.blocked_by_run_id == first.run_id
     assert forbidden == forbidden.__class__(None, "rejected", "overlap_forbidden")
     assert allowed.disposition == "created"
+
+
+def test_start_rate_and_queue_capacity_reject_before_worker_allocation(
+    tmp_path, workflow_writer
+):
+    rate_store = RunStore(tmp_path / "rate-home", max_start_requests_per_minute=1)
+    prepared = _prepared(rate_store, workflow_writer, tmp_path, name="rate-demo")
+    snapshots = [rate_store.clone_prepared_snapshot(prepared) for _ in range(2)]
+    assert (
+        rate_store.start_run(
+            _request(prepared, key="one", policy="allow", name="rate-demo"),
+            immutable_snapshot=snapshots[0],
+        ).disposition
+        == "created"
+    )
+    rejected = rate_store.start_run(
+        _request(prepared, key="two", policy="allow", name="rate-demo"),
+        immutable_snapshot=snapshots[1],
+    )
+    assert rejected.reason_code == "start_rate_capacity"
+    assert not snapshots[1].staging_directory.exists()
+
+    queue_store = RunStore(tmp_path / "queue-home", max_queued_runs=1)
+    queued_prepared = _prepared(
+        queue_store, workflow_writer, tmp_path, name="queue-demo"
+    )
+    queued_snapshots = [
+        queue_store.clone_prepared_snapshot(queued_prepared) for _ in range(3)
+    ]
+    queue_store.start_run(
+        _request(queued_prepared, key="one", name="queue-demo"),
+        immutable_snapshot=queued_snapshots[0],
+    )
+    assert (
+        queue_store.start_run(
+            _request(queued_prepared, key="two", name="queue-demo"),
+            immutable_snapshot=queued_snapshots[1],
+        ).disposition
+        == "queued"
+    )
+    rejected = queue_store.start_run(
+        _request(queued_prepared, key="three", name="queue-demo"),
+        immutable_snapshot=queued_snapshots[2],
+    )
+    assert rejected.reason_code == "queued_capacity"
+    assert not queued_snapshots[2].staging_directory.exists()
+
+
+def test_start_racing_shutdown_is_discoverable_or_rejected_before_publish(
+    tmp_path, workflow_writer
+):
+    store = RunStore(tmp_path / "home")
+    prepared = _prepared(store, workflow_writer, tmp_path)
+    barrier = threading.Barrier(2)
+
+    def start():
+        barrier.wait()
+        return store.start_run(_request(prepared), immutable_snapshot=prepared)
+
+    def shutdown():
+        barrier.wait()
+        store.close_admission()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        start_future = pool.submit(start)
+        shutdown_future = pool.submit(shutdown)
+        result = start_future.result()
+        shutdown_future.result()
+
+    if result.disposition == "created":
+        assert store.get_run_status(result.run_id)["status"] == "running"
+    else:
+        assert result.reason_code == "admission_closed"
+        assert store.list_runs() == ()
+        assert not prepared.staging_directory.exists()
+
+
+def test_restart_releases_crashed_reservation_and_allows_one_retry(
+    tmp_path, workflow_writer, monkeypatch
+):
+    store = RunStore(tmp_path / "home")
+    prepared = _prepared(store, workflow_writer, tmp_path)
+    retry_snapshot = store.clone_prepared_snapshot(prepared)
+    request = _request(prepared)
+
+    def crash_before_publication(*_args, **_kwargs):
+        raise RuntimeError("simulated crash before queue publication")
+
+    monkeypatch.setattr(store, "_publish_reserved_run", crash_before_publication)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        store.start_run(request, immutable_snapshot=prepared)
+
+    restarted = RunStore(tmp_path / "home")
+    events = restarted.list_admission_events()
+    result = restarted.start_run(request, immutable_snapshot=retry_snapshot)
+
+    assert events[-1]["event_type"] == "admission_reservation_released"
+    assert events[-1]["reason_code"] == "incomplete_publication"
+    assert result.disposition == "created"
+    assert len(restarted.list_runs()) == 1
+
+
+def test_restart_finishes_publication_when_projection_was_durable(
+    tmp_path, workflow_writer, monkeypatch
+):
+    store = RunStore(tmp_path / "home")
+    prepared = _prepared(store, workflow_writer, tmp_path)
+    duplicate_snapshot = store.clone_prepared_snapshot(prepared)
+    request = _request(prepared)
+
+    def crash_after_projection(*_args, **_kwargs):
+        raise RuntimeError("simulated crash after durable projection")
+
+    monkeypatch.setattr(store, "_mark_reservation_published", crash_after_projection)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        store.start_run(request, immutable_snapshot=prepared)
+
+    restarted = RunStore(tmp_path / "home")
+    existing = restarted.start_run(request, immutable_snapshot=duplicate_snapshot)
+
+    assert existing.disposition == "existing"
+    assert len(restarted.list_runs()) == 1
+    assert restarted.list_admission_events()[-1]["event_type"] == (
+        "admission_reservation_recovered"
+    )
+
+
+def test_restart_releases_projection_without_complete_initial_event(
+    tmp_path, workflow_writer, monkeypatch
+):
+    store = RunStore(tmp_path / "home")
+    prepared = _prepared(store, workflow_writer, tmp_path)
+
+    def crash_with_partial_files(**kwargs):
+        run_directory = kwargs["run_directory"]
+        run_directory.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(kwargs["snapshot"].staging_directory, run_directory)
+        (run_directory / "run.json").write_text(
+            json.dumps({
+                "run_id": kwargs["run_id"],
+                "status": kwargs["status"],
+                "event_sequence": 1,
+            })
+        )
+        (run_directory / "events.jsonl").touch()
+        raise RuntimeError("simulated crash during initial event")
+
+    monkeypatch.setattr(store, "_publish_reserved_run", crash_with_partial_files)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        store.start_run(_request(prepared), immutable_snapshot=prepared)
+
+    restarted = RunStore(tmp_path / "home")
+
+    assert restarted.list_runs() == ()
+    assert restarted.list_admission_events()[-1]["event_type"] == (
+        "admission_reservation_released"
+    )
+
+
+def test_restart_removes_snapshot_owned_by_dead_preparer(
+    tmp_path, workflow_writer, monkeypatch
+):
+    store = RunStore(tmp_path / "home")
+    prepared = _prepared(store, workflow_writer, tmp_path)
+    monkeypatch.setattr(
+        RunStore, "_snapshot_owner_alive", staticmethod(lambda _pid: False)
+    )
+
+    restarted = RunStore(tmp_path / "home")
+
+    assert not prepared.staging_directory.exists()
+    assert restarted.list_admission_events()[-1]["event_type"] == (
+        "orphan_snapshot_removed"
+    )

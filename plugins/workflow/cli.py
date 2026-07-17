@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import sys
 from collections import Counter
 from pathlib import Path
@@ -19,6 +20,7 @@ from plugins.workflow.compat import (
     CompatibilityReport,
     assess_compatibility,
 )
+from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.discovery import discover_workflows
 from plugins.workflow.models import (
     ValidationIssue,
@@ -26,6 +28,8 @@ from plugins.workflow.models import (
     WorkflowValidationError,
 )
 from plugins.workflow.schema import load_workflow, validate_package
+from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.store import RunStore, StorageQuotaError
 from plugins.workflow.topology import project_topology
 from plugins.workflow.trust import (
     WorkflowTrustError,
@@ -269,6 +273,43 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     untrust_parser.add_argument("name")
     _json_flag(untrust_parser)
 
+    run_parser = actions.add_parser("run", help="Start a durable workflow run")
+    run_parser.add_argument("name")
+    run_parser.add_argument("--arguments", default="")
+    run_parser.add_argument("--idempotency-key")
+    run_parser.add_argument("--concurrency-key")
+    run_parser.add_argument("--no-wait", action="store_true")
+    _json_flag(run_parser)
+
+    runs_parser = actions.add_parser("runs", help="List active and recent runs")
+    runs_parser.add_argument("--workflow")
+    runs_parser.add_argument("--status")
+    runs_parser.add_argument("--limit", type=int, default=100)
+    _json_flag(runs_parser)
+
+    status_parser = actions.add_parser("status", help="Inspect a durable run")
+    status_parser.add_argument("run_id", nargs="?")
+    _json_flag(status_parser)
+
+    events_parser = actions.add_parser("events", help="Show sanitized run events")
+    events_parser.add_argument("run_id")
+    events_parser.add_argument("--tail", type=int, default=50)
+    _json_flag(events_parser)
+
+    for action, help_text in (
+        ("resume", "Resume an interrupted workflow run"),
+        ("cancel", "Cancel a workflow run"),
+        ("abandon", "Abandon a stopped workflow run"),
+    ):
+        parser = actions.add_parser(action, help=help_text)
+        parser.add_argument("run_id")
+        _json_flag(parser)
+
+    cleanup_parser = actions.add_parser("cleanup", help="Clean retained terminal runs")
+    cleanup_parser.add_argument("--older-than", default="7d")
+    cleanup_parser.add_argument("--dry-run", action="store_true")
+    _json_flag(cleanup_parser)
+
     subparser.set_defaults(func=workflow_command)
 
 
@@ -503,11 +544,123 @@ def _cmd_untrust(args: argparse.Namespace) -> int:
     return 0
 
 
+def _store(args: argparse.Namespace) -> RunStore:
+    return RunStore(args.hermes_home)
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    package = _resolve(args, args.name)
+    digest = compute_package_digest(package)
+    if WorkflowTrustStore(args.hermes_home).check(digest.sha256) != "trusted":
+        print(
+            "workflow package is not trusted; run doctor and trust its exact digest",
+            file=sys.stderr,
+        )
+        return 1
+    store = _store(args)
+    prepared = store.prepare_run_snapshot(
+        package, values={"arguments": args.arguments} if args.arguments else None
+    )
+    request = RunAdmissionRequest(
+        workflow_name=package.definition.name,
+        definition_digest=prepared.definition_digest,
+        policy_digest=prepared.policy_digest,
+        input_manifest_digest=prepared.input_manifest_digest,
+        trigger_source="cli",
+        idempotency_key=args.idempotency_key or secrets.token_urlsafe(24),
+        concurrency_key=args.concurrency_key
+        or str(package.sidecar.get("concurrency_key") or package.definition.name),
+        concurrency_policy=str(package.sidecar.get("overlap_policy") or "queue"),
+    )
+    admitted = store.start_run(request, immutable_snapshot=prepared)
+    if admitted.run_id is None:
+        payload = {
+            "action": "run",
+            "admission_disposition": admitted.disposition,
+            "reason_code": admitted.reason_code,
+            "run_id": None,
+        }
+        _emit(payload, as_json=args.json)
+        return 1
+    if admitted.disposition == "created" and not args.no_wait:
+        RunScheduler(store).advance(admitted.run_id)
+    payload = store.get_run_status(admitted.run_id)
+    payload["action"] = "run"
+    payload["admission_disposition"] = admitted.disposition
+    _emit(payload, as_json=args.json)
+    return 0 if payload["status"] in {"queued", "running", "succeeded"} else 1
+
+
+def _cmd_runs(args: argparse.Namespace) -> int:
+    payload = _store(args).list_runs(
+        workflow=args.workflow, status=args.status, limit=args.limit
+    )
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    store = _store(args)
+    payload = store.get_run_status(args.run_id) if args.run_id else store.list_runs()
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _cmd_events(args: argparse.Namespace) -> int:
+    payload = _store(args).tail_events(args.run_id, limit=args.tail)
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    store = _store(args)
+    store.resume_run(args.run_id)
+    RunScheduler(store).advance(args.run_id)
+    _emit(store.get_run_status(args.run_id), as_json=args.json)
+    return 0
+
+
+def _cmd_cancel(args: argparse.Namespace) -> int:
+    store = _store(args)
+    store.cancel_run(args.run_id)
+    _emit(store.get_run_status(args.run_id), as_json=args.json)
+    return 0
+
+
+def _cmd_abandon(args: argparse.Namespace) -> int:
+    store = _store(args)
+    store.abandon_run(args.run_id)
+    _emit(store.get_run_status(args.run_id), as_json=args.json)
+    return 0
+
+
+def _duration(value: str):
+    from datetime import timedelta
+
+    match = re.fullmatch(r"(\d+)([dhm])", value)
+    if not match:
+        raise ValueError("--older-than must be a duration such as 7d, 12h, or 30m")
+    amount = int(match.group(1))
+    return {
+        "d": timedelta(days=amount),
+        "h": timedelta(hours=amount),
+        "m": timedelta(minutes=amount),
+    }[match.group(2)]
+
+
+def _cmd_cleanup(args: argparse.Namespace) -> int:
+    payload = _store(args).cleanup_runs(
+        older_than=_duration(args.older_than), dry_run=args.dry_run
+    )
+    _emit(payload, as_json=args.json)
+    return 0
+
+
 def workflow_command(args: argparse.Namespace) -> int:
     action = getattr(args, "workflow_action", None)
     if not action:
         print(
-            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust}",
+            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust|run|runs|status|events|resume|cancel|abandon|cleanup}",
             file=sys.stderr,
         )
         return 2
@@ -524,8 +677,31 @@ def workflow_command(args: argparse.Namespace) -> int:
             return _cmd_trust(args)
         if action == "untrust":
             return _cmd_untrust(args)
+        if action == "run":
+            return _cmd_run(args)
+        if action == "runs":
+            return _cmd_runs(args)
+        if action == "status":
+            return _cmd_status(args)
+        if action == "events":
+            return _cmd_events(args)
+        if action == "resume":
+            return _cmd_resume(args)
+        if action == "cancel":
+            return _cmd_cancel(args)
+        if action == "abandon":
+            return _cmd_abandon(args)
+        if action == "cleanup":
+            return _cmd_cleanup(args)
         print(f"Unknown workflow action: {action}", file=sys.stderr)
         return 2
-    except (OSError, WorkflowTrustError, WorkflowValidationError) as exc:
+    except (
+        KeyError,
+        OSError,
+        StorageQuotaError,
+        ValueError,
+        WorkflowTrustError,
+        WorkflowValidationError,
+    ) as exc:
         print(str(exc), file=sys.stderr)
         return 1

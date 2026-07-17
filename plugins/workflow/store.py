@@ -16,8 +16,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Mapping
 
-import yaml
-
 from plugins.workflow.admission import (
     PreparedRunSnapshot,
     RunAdmissionRequest,
@@ -29,6 +27,10 @@ from plugins.workflow.trust import compute_package_digest
 
 
 class InputSnapshotError(ValueError):
+    pass
+
+
+class StorageQuotaError(RuntimeError):
     pass
 
 
@@ -59,6 +61,26 @@ def _utc_now() -> str:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _sanitize(value: object, *, key: str = "") -> object:
+    lowered = key.lower()
+    if any(
+        marker in lowered
+        for marker in ("secret", "password", "token", "api_key", "authorization")
+    ):
+        return "[REDACTED]"
+    if isinstance(value, Mapping):
+        return {
+            str(child): _sanitize(item, key=str(child)) for child, item in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return [_sanitize(item) for item in value[:100]]
+    if isinstance(value, str):
+        return value[:2000]
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    return str(value)[:2000]
 
 
 def _atomic_json(path: Path, value: object) -> None:
@@ -93,14 +115,20 @@ class RunStore:
         max_nonterminal_runs: int = 200,
         max_start_requests_per_minute: int = 60,
         max_total_workers: int = 4,
+        max_run_bytes: int = 512 * 1024 * 1024,
+        max_profile_bytes: int = 2 * 1024 * 1024 * 1024,
     ) -> None:
         self.hermes_home = Path(hermes_home).resolve()
         self.root = self.hermes_home / "workflows"
         self.runs_root = self.root / "runs"
         self.staging_root = self.root / ".staging"
         self.quarantine_root = self.root / ".quarantine"
+        self.locks_root = self.root / ".locks"
         self.database = self.root / "admission.sqlite3"
+        self.admission_lock = self.root / ".admission.lock"
         self.max_input_bytes = max_input_bytes
+        self.max_run_bytes = max_run_bytes
+        self.max_profile_bytes = max_profile_bytes
         self.limits = {
             "executing": max_executing_runs,
             "queued": max_queued_runs,
@@ -110,6 +138,8 @@ class RunStore:
             "workers": max_total_workers,
         }
         self._init_lock = threading.Lock()
+        self._admission_gate = threading.RLock()
+        self._admission_open = True
         self._initialized = False
         self._initialize()
 
@@ -120,6 +150,7 @@ class RunStore:
             self.runs_root.mkdir(parents=True, exist_ok=True)
             self.staging_root.mkdir(parents=True, exist_ok=True)
             self.quarantine_root.mkdir(parents=True, exist_ok=True)
+            self.locks_root.mkdir(parents=True, exist_ok=True)
             with self._connect() as connection:
                 connection.executescript(
                     """
@@ -138,13 +169,239 @@ class RunStore:
                         run_directory TEXT NOT NULL,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
+                        admission_state TEXT NOT NULL DEFAULT 'published',
+                        desired_status TEXT,
+                        staging_directory TEXT,
+                        operator_scope_digest TEXT,
                         UNIQUE(trigger_source, workflow_name, idempotency_digest)
                     );
                     CREATE INDEX IF NOT EXISTS runs_concurrency
                     ON runs(workflow_name, concurrency_key, status);
+                    CREATE TABLE IF NOT EXISTS admission_events (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        run_id TEXT,
+                        reason_code TEXT,
+                        payload_json TEXT NOT NULL DEFAULT '{}'
+                    );
                     """
                 )
+                columns = {
+                    row["name"] for row in connection.execute("PRAGMA table_info(runs)")
+                }
+                migrations = {
+                    "admission_state": (
+                        "ALTER TABLE runs ADD COLUMN admission_state TEXT "
+                        "NOT NULL DEFAULT 'published'"
+                    ),
+                    "desired_status": (
+                        "ALTER TABLE runs ADD COLUMN desired_status TEXT"
+                    ),
+                    "staging_directory": (
+                        "ALTER TABLE runs ADD COLUMN staging_directory TEXT"
+                    ),
+                    "operator_scope_digest": (
+                        "ALTER TABLE runs ADD COLUMN operator_scope_digest TEXT"
+                    ),
+                }
+                for name, statement in migrations.items():
+                    if name not in columns:
+                        connection.execute(statement)
+            with workflow_lock(self.admission_lock):
+                self._reconcile_admission()
             self._initialized = True
+
+    @staticmethod
+    def _snapshot_owner_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    @staticmethod
+    def _write_snapshot_owner(directory: Path) -> None:
+        _atomic_json(
+            directory / ".snapshot-owner.json",
+            {"pid": os.getpid(), "created_at": _utc_now()},
+        )
+
+    @staticmethod
+    def _record_admission_event(
+        connection: sqlite3.Connection,
+        event_type: str,
+        *,
+        run_id: str | None = None,
+        reason_code: str | None = None,
+        payload: Mapping[str, object] | None = None,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO admission_events "
+            "(timestamp, event_type, run_id, reason_code, payload_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                _utc_now(),
+                event_type,
+                run_id,
+                reason_code,
+                json.dumps(_sanitize(dict(payload or {})), sort_keys=True),
+            ),
+        )
+        connection.execute(
+            "DELETE FROM admission_events WHERE sequence IN ("
+            "SELECT sequence FROM admission_events ORDER BY sequence DESC "
+            "LIMIT -1 OFFSET 1000)"
+        )
+
+    def _reconcile_admission(self) -> None:
+        """Converge interrupted publication without inferring run success."""
+        with self._connect() as connection:
+            reservations = connection.execute(
+                "SELECT * FROM runs WHERE admission_state='reserved' "
+                "ORDER BY created_at, run_id"
+            ).fetchall()
+            reserved_staging = {
+                str(Path(row["staging_directory"]).resolve())
+                for row in reservations
+                if row["staging_directory"]
+            }
+            for row in reservations:
+                run_directory = Path(row["run_directory"])
+                projection_path = run_directory / "run.json"
+                events_path = run_directory / "events.jsonl"
+                projection = None
+                initial_event = None
+                try:
+                    projection = json.loads(projection_path.read_text(encoding="utf-8"))
+                except (FileNotFoundError, json.JSONDecodeError, OSError):
+                    pass
+                try:
+                    event_lines = [
+                        line
+                        for line in events_path.read_text(encoding="utf-8").splitlines()
+                        if line.strip()
+                    ]
+                    if len(event_lines) == 1:
+                        initial_event = json.loads(event_lines[0])
+                except (FileNotFoundError, json.JSONDecodeError, OSError):
+                    pass
+                if (
+                    isinstance(projection, dict)
+                    and projection.get("run_id") == row["run_id"]
+                    and projection.get("event_sequence") == 1
+                    and isinstance(initial_event, dict)
+                    and initial_event.get("run_id") == row["run_id"]
+                    and initial_event.get("sequence") == 1
+                    and initial_event.get("event_type") == "run_admitted"
+                ):
+                    desired_status = row["desired_status"] or projection["status"]
+                    connection.execute(
+                        "UPDATE runs SET admission_state='published', status=?, "
+                        "desired_status=NULL, staging_directory=NULL, updated_at=? "
+                        "WHERE run_id=? AND admission_state='reserved'",
+                        (desired_status, _utc_now(), row["run_id"]),
+                    )
+                    self._record_admission_event(
+                        connection,
+                        "admission_reservation_recovered",
+                        run_id=row["run_id"],
+                    )
+                    continue
+                staging = (
+                    Path(row["staging_directory"]) if row["staging_directory"] else None
+                )
+                if run_directory.exists():
+                    quarantine = self.quarantine_root / (
+                        f"incomplete-{row['run_id']}-{uuid.uuid4().hex}"
+                    )
+                    os.replace(run_directory, quarantine)
+                    shutil.rmtree(quarantine, ignore_errors=True)
+                if staging is not None:
+                    shutil.rmtree(staging, ignore_errors=True)
+                connection.execute("DELETE FROM runs WHERE run_id=?", (row["run_id"],))
+                self._record_admission_event(
+                    connection,
+                    "admission_reservation_released",
+                    run_id=row["run_id"],
+                    reason_code="incomplete_publication",
+                )
+
+            known_directories = {
+                str(Path(row["run_directory"]).resolve())
+                for row in connection.execute(
+                    "SELECT run_directory FROM runs WHERE admission_state='published'"
+                )
+            }
+            for workflow_directory in self.runs_root.iterdir():
+                if not workflow_directory.is_dir():
+                    continue
+                for run_directory in workflow_directory.iterdir():
+                    if not run_directory.is_dir():
+                        continue
+                    if str(run_directory.resolve()) in known_directories:
+                        continue
+                    quarantine = self.quarantine_root / (
+                        f"orphan-{run_directory.name}-{uuid.uuid4().hex}"
+                    )
+                    os.replace(run_directory, quarantine)
+                    shutil.rmtree(quarantine, ignore_errors=True)
+                    self._record_admission_event(
+                        connection,
+                        "orphan_run_removed",
+                        run_id=run_directory.name,
+                        reason_code="missing_admission_reservation",
+                    )
+
+            for staging in self.staging_root.iterdir():
+                if not staging.is_dir() or str(staging.resolve()) in reserved_staging:
+                    continue
+                marker = staging / ".snapshot-owner.json"
+                try:
+                    owner = json.loads(marker.read_text(encoding="utf-8"))
+                    owner_alive = self._snapshot_owner_alive(int(owner["pid"]))
+                    created_at = datetime.fromisoformat(str(owner["created_at"]))
+                    snapshot_fresh = (
+                        datetime.now(timezone.utc) - created_at
+                    ) < timedelta(hours=1)
+                except (FileNotFoundError, KeyError, TypeError, ValueError, OSError):
+                    owner_alive = False
+                    snapshot_fresh = False
+                if owner_alive and snapshot_fresh:
+                    continue
+                shutil.rmtree(staging, ignore_errors=True)
+                self._record_admission_event(
+                    connection,
+                    "orphan_snapshot_removed",
+                    reason_code="snapshot_owner_exited",
+                )
+
+    def list_admission_events(
+        self, *, limit: int = 100
+    ) -> tuple[dict[str, object], ...]:
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT sequence, timestamp, event_type, run_id, reason_code, "
+                "payload_json FROM admission_events ORDER BY sequence LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return tuple(
+            {
+                "sequence": row["sequence"],
+                "timestamp": row["timestamp"],
+                "event_type": row["event_type"],
+                "run_id": row["run_id"],
+                "reason_code": row["reason_code"],
+                "payload": json.loads(row["payload_json"]),
+            }
+            for row in rows
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database, timeout=5.0, isolation_level=None)
@@ -161,7 +418,9 @@ class RunStore:
         policy_digest: str,
         input_manifest_digest: str,
     ) -> PreparedRunSnapshot:
+        self._ensure_free_disk()
         staging = Path(tempfile.mkdtemp(prefix="run-", dir=self.staging_root))
+        self._write_snapshot_owner(staging)
         return PreparedRunSnapshot(
             staging, definition_digest, policy_digest, input_manifest_digest, 0
         )
@@ -171,15 +430,40 @@ class RunStore:
         package: WorkflowPackage,
         *,
         inputs: Mapping[str, str | Path] | None = None,
+        values: Mapping[str, str] | None = None,
     ) -> PreparedRunSnapshot:
+        self._ensure_free_disk()
         staging = Path(tempfile.mkdtemp(prefix="run-", dir=self.staging_root))
         try:
+            self._write_snapshot_owner(staging)
+            package_digest = compute_package_digest(package)
             definition_data = package.workflow_path.read_bytes()
             (staging / "definition.yaml").write_bytes(definition_data)
             policy_data = b"{}\n"
             if package.sidecar_path is not None:
                 policy_data = package.sidecar_path.read_bytes()
                 (staging / "policy.yaml").write_bytes(policy_data)
+            workflow_relative = (
+                package.workflow_path
+                .resolve()
+                .relative_to(package.root.resolve())
+                .as_posix()
+            )
+            sidecar_relative = (
+                package.sidecar_path
+                .resolve()
+                .relative_to(package.root.resolve())
+                .as_posix()
+                if package.sidecar_path is not None
+                else None
+            )
+            for relative in package_digest.covered_relative_paths:
+                if relative in {workflow_relative, sidecar_relative}:
+                    continue
+                source = package.root / relative
+                target = staging / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source.read_bytes())
             input_manifest: dict[str, dict[str, object]] = {}
             input_digests: dict[str, str] = {}
             input_root = staging / "inputs"
@@ -201,8 +485,13 @@ class RunStore:
                     raise InputSnapshotError(
                         f"input exceeds {self.max_input_bytes} bytes: {source}"
                     )
-                data = source.read_bytes()
-                after = source.stat()
+                try:
+                    data = source.read_bytes()
+                    after = source.stat()
+                except OSError as exc:
+                    raise InputSnapshotError(
+                        f"input is unreadable: {source}: {exc}"
+                    ) from exc
                 if (before.st_size, before.st_mtime_ns) != (
                     after.st_size,
                     after.st_mtime_ns,
@@ -221,6 +510,25 @@ class RunStore:
                     or "application/octet-stream",
                     "sha256": digest,
                 }
+            for name, value in sorted((values or {}).items()):
+                if name in input_manifest or not name or "/" in name or "\\" in name:
+                    raise InputSnapshotError(f"invalid or duplicate input name: {name}")
+                data = value.encode("utf-8")
+                if len(data) > self.max_input_bytes:
+                    raise InputSnapshotError(
+                        f"input exceeds {self.max_input_bytes} bytes: {name}"
+                    )
+                input_root.mkdir(exist_ok=True)
+                target = input_root / f"{name}.txt"
+                target.write_bytes(data)
+                digest = _sha256(data)
+                input_digests[name] = digest
+                input_manifest[name] = {
+                    "relative_path": target.relative_to(staging).as_posix(),
+                    "size_bytes": len(data),
+                    "media_type": "text/plain",
+                    "sha256": digest,
+                }
             manifest_data = json.dumps(
                 input_manifest, sort_keys=True, separators=(",", ":")
             ).encode()
@@ -235,14 +543,19 @@ class RunStore:
                 }
                 for node in package.definition.nodes
             )
+            reserved_bytes = sum(
+                path.stat().st_size for path in staging.rglob("*") if path.is_file()
+            )
+            if reserved_bytes > self.max_run_bytes:
+                raise StorageQuotaError(
+                    f"run_storage_quota exceeded: {reserved_bytes} > {self.max_run_bytes}"
+                )
             return PreparedRunSnapshot(
                 staging_directory=staging,
-                definition_digest=compute_package_digest(package).sha256,
+                definition_digest=package_digest.sha256,
                 policy_digest=_sha256(policy_data),
                 input_manifest_digest=_sha256(manifest_data),
-                reserved_bytes=sum(
-                    path.stat().st_size for path in staging.rglob("*") if path.is_file()
-                ),
+                reserved_bytes=reserved_bytes,
                 workflow_name=package.definition.name,
                 nodes=nodes,
                 input_digests=input_digests,
@@ -251,12 +564,21 @@ class RunStore:
             shutil.rmtree(staging, ignore_errors=True)
             raise
 
+    def _ensure_free_disk(self) -> None:
+        usage = shutil.disk_usage(self.root)
+        watermark = max(1024**3, min(5 * 1024**3, int(usage.total * 0.05)))
+        if usage.free < watermark:
+            raise StorageQuotaError(
+                f"free_disk_watermark not met: {usage.free} < {watermark}"
+            )
+
     def clone_prepared_snapshot(
         self, snapshot: PreparedRunSnapshot
     ) -> PreparedRunSnapshot:
         target = Path(tempfile.mkdtemp(prefix="run-", dir=self.staging_root))
         shutil.rmtree(target)
         shutil.copytree(snapshot.staging_directory, target)
+        self._write_snapshot_owner(target)
         return PreparedRunSnapshot(
             target,
             snapshot.definition_digest,
@@ -270,6 +592,14 @@ class RunStore:
         )
 
     @staticmethod
+    def _scope_digest(operator_scope: str | None) -> str | None:
+        if operator_scope is None:
+            return None
+        if not operator_scope:
+            raise ValueError("operator_scope must not be empty")
+        return _sha256(operator_scope.encode())
+
+    @staticmethod
     def _start_digest(request: RunAdmissionRequest) -> str:
         material = json.dumps(
             {
@@ -279,13 +609,35 @@ class RunStore:
                 "inputs": request.input_manifest_digest,
                 "trigger": request.trigger_source,
                 "concurrency": request.concurrency_key,
+                "operator_scope_digest": RunStore._scope_digest(request.operator_scope),
             },
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
         return _sha256(material)
 
+    def close_admission(self) -> None:
+        """Atomically prevent this coordinator from publishing another run."""
+        with self._admission_gate:
+            self._admission_open = False
+
     def start_run(
+        self,
+        request: RunAdmissionRequest,
+        *,
+        immutable_snapshot: PreparedRunSnapshot,
+    ) -> RunAdmissionResult:
+        with self._admission_gate:
+            if not self._admission_open:
+                shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
+                return RunAdmissionResult(None, "rejected", "admission_closed")
+            with workflow_lock(self.admission_lock):
+                self._reconcile_admission()
+                return self._start_run_locked(
+                    request, immutable_snapshot=immutable_snapshot
+                )
+
+    def _start_run_locked(
         self,
         request: RunAdmissionRequest,
         *,
@@ -312,6 +664,7 @@ class RunStore:
             shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
             raise ValueError("snapshot digests do not match admission request")
         key_digest = _sha256(request.idempotency_key.encode())
+        operator_scope_digest = self._scope_digest(request.operator_scope)
         start_digest = self._start_digest(request)
         connection = self._connect()
         try:
@@ -326,6 +679,14 @@ class RunStore:
                 if existing["start_digest"] == start_digest:
                     return RunAdmissionResult(existing["run_id"], "existing")
                 return RunAdmissionResult(None, "rejected", "idempotency_conflict")
+            cutoff = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+            recent_starts = connection.execute(
+                "SELECT COUNT(*) FROM runs WHERE created_at>=?", (cutoff,)
+            ).fetchone()[0]
+            if recent_starts >= self.limits["rate"]:
+                connection.rollback()
+                shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
+                return RunAdmissionResult(None, "rejected", "start_rate_capacity")
             counts = {
                 row["status"]: row["count"]
                 for row in connection.execute(
@@ -337,6 +698,18 @@ class RunStore:
                 connection.rollback()
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
                 return RunAdmissionResult(None, "rejected", "nonterminal_capacity")
+            profile_bytes = sum(
+                path.stat().st_size
+                for path in self.runs_root.rglob("*")
+                if path.is_file()
+            )
+            if (
+                profile_bytes + immutable_snapshot.reserved_bytes
+                > self.max_profile_bytes
+            ):
+                connection.rollback()
+                shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
+                return RunAdmissionResult(None, "rejected", "profile_storage_quota")
             active = connection.execute(
                 "SELECT run_id FROM runs WHERE workflow_name=? AND concurrency_key=? AND status IN ('running','waiting_retry','paused','interrupted') ORDER BY created_at, run_id LIMIT 1",
                 (request.workflow_name, request.concurrency_key),
@@ -369,54 +742,15 @@ class RunStore:
             run_id = uuid.uuid4().hex
             run_directory = self.runs_root / request.workflow_name / run_id
             run_directory.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(immutable_snapshot.staging_directory, run_directory)
             now = _utc_now()
-            projection = {
-                "schema_version": 1,
-                "run_id": run_id,
-                "workflow": request.workflow_name,
-                "workflow_version": immutable_snapshot.workflow_version,
-                "definition_digest": request.definition_digest,
-                "policy_digest": request.policy_digest,
-                "input_manifest_digest": request.input_manifest_digest,
-                "trigger": request.trigger_source,
-                "idempotency_key_digest": key_digest,
-                "concurrency_key": request.concurrency_key,
-                "admission_disposition": disposition,
-                "queue_position": queue_position,
-                "blocked_by_run_id": blocked_by,
-                "state_version": 1,
-                "event_sequence": 1,
-                "status": status,
-                "started_at": now if status == "running" else None,
-                "created_at": now,
-                "updated_at": now,
-                "last_semantic_progress_at": None,
-                "nodes": {
-                    str(node["id"]): dict(node) for node in immutable_snapshot.nodes
-                },
-                "artifacts": [],
-                "warnings": [],
-                "last_error": None,
-                "pending_interaction": None,
-            }
-            event = {
-                "schema_version": 1,
-                "sequence": 1,
-                "timestamp": now,
-                "run_id": run_id,
-                "node_id": None,
-                "attempt_id": None,
-                "event_type": "run_admitted",
-                "payload": {"disposition": disposition, "status": status},
-            }
-            _atomic_json(run_directory / "run.json", projection)
-            with (run_directory / "events.jsonl").open("w", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, sort_keys=True) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
             connection.execute(
-                "INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO runs ("
+                "run_id, workflow_name, trigger_source, idempotency_digest, "
+                "start_digest, concurrency_key, concurrency_policy, disposition, "
+                "status, queue_position, blocked_by_run_id, run_directory, "
+                "created_at, updated_at, admission_state, desired_status, "
+                "staging_directory, operator_scope_digest) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     run_id,
                     request.workflow_name,
@@ -426,15 +760,33 @@ class RunStore:
                     request.concurrency_key,
                     request.concurrency_policy,
                     disposition,
-                    status,
+                    "admitting",
                     queue_position,
                     blocked_by,
                     str(run_directory),
                     now,
                     now,
+                    "reserved",
+                    status,
+                    str(immutable_snapshot.staging_directory),
+                    operator_scope_digest,
                 ),
             )
             connection.commit()
+            self._publish_reserved_run(
+                run_id=run_id,
+                run_directory=run_directory,
+                request=request,
+                snapshot=immutable_snapshot,
+                key_digest=key_digest,
+                operator_scope_digest=operator_scope_digest,
+                disposition=disposition,
+                status=status,
+                queue_position=queue_position,
+                blocked_by=blocked_by,
+                created_at=now,
+            )
+            self._mark_reservation_published(run_id, status=status)
             return RunAdmissionResult(
                 run_id, disposition, None, queue_position, blocked_by
             )
@@ -444,19 +796,154 @@ class RunStore:
         finally:
             connection.close()
 
-    def run_directory(self, run_id: str) -> Path:
+    def _publish_reserved_run(
+        self,
+        *,
+        run_id: str,
+        run_directory: Path,
+        request: RunAdmissionRequest,
+        snapshot: PreparedRunSnapshot,
+        key_digest: str,
+        operator_scope_digest: str | None,
+        disposition: str,
+        status: str,
+        queue_position: int | None,
+        blocked_by: str | None,
+        created_at: str,
+    ) -> None:
+        (snapshot.staging_directory / ".snapshot-owner.json").unlink(missing_ok=True)
+        os.replace(snapshot.staging_directory, run_directory)
+        (run_directory / ".lock").touch(exist_ok=True)
+        now = created_at
+        projection = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "workflow": request.workflow_name,
+            "workflow_version": snapshot.workflow_version,
+            "definition_digest": request.definition_digest,
+            "policy_digest": request.policy_digest,
+            "input_manifest_digest": request.input_manifest_digest,
+            "trigger": request.trigger_source,
+            "idempotency_key_digest": key_digest,
+            "operator_scope_digest": operator_scope_digest,
+            "concurrency_key": request.concurrency_key,
+            "admission_disposition": disposition,
+            "queue_position": queue_position,
+            "blocked_by_run_id": blocked_by,
+            "state_version": 1,
+            "event_sequence": 1,
+            "status": status,
+            "started_at": now if status == "running" else None,
+            "created_at": now,
+            "updated_at": now,
+            "last_semantic_progress_at": None,
+            "nodes": {str(node["id"]): dict(node) for node in snapshot.nodes},
+            "artifacts": [],
+            "warnings": [],
+            "last_error": None,
+            "pending_interaction": None,
+        }
+        event = {
+            "schema_version": 1,
+            "sequence": 1,
+            "timestamp": now,
+            "run_id": run_id,
+            "node_id": None,
+            "attempt_id": None,
+            "event_type": "run_admitted",
+            "payload": {"disposition": disposition, "status": status},
+        }
+        _atomic_json(run_directory / "run.json", projection)
+        with (run_directory / "events.jsonl").open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _mark_reservation_published(self, run_id: str, *, status: str) -> None:
+        with self._connect() as connection:
+            updated = connection.execute(
+                "UPDATE runs SET admission_state='published', status=?, "
+                "desired_status=NULL, staging_directory=NULL, updated_at=? "
+                "WHERE run_id=? AND admission_state='reserved'",
+                (status, _utc_now(), run_id),
+            ).rowcount
+        if updated != 1:
+            raise RuntimeError(f"admission reservation is not active: {run_id}")
+
+    def run_directory(self, run_id: str, *, operator_scope: str | None = None) -> Path:
+        scope_digest = self._scope_digest(operator_scope)
+        scope_clause = (
+            " AND operator_scope_digest=?" if operator_scope is not None else ""
+        )
+        values: tuple[object, ...] = (
+            (run_id, scope_digest) if operator_scope is not None else (run_id,)
+        )
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT run_directory FROM runs WHERE run_id=?", (run_id,)
+                "SELECT run_directory FROM runs "
+                f"WHERE run_id=? AND admission_state='published'{scope_clause}",
+                values,
             ).fetchone()
         if row is None:
             raise KeyError(run_id)
         return Path(row["run_directory"])
 
-    def load_run(self, run_id: str) -> dict[str, object]:
-        path = self.run_directory(run_id) / "run.json"
-        with workflow_lock(path.parent / ".lock"):
-            return json.loads(path.read_text(encoding="utf-8"))
+    def _run_lock_path(self, run_id: str) -> Path:
+        return self.locks_root / f"{run_id}.lock"
+
+    def load_run(
+        self, run_id: str, *, operator_scope: str | None = None
+    ) -> dict[str, object]:
+        path = self.run_directory(run_id, operator_scope=operator_scope) / "run.json"
+        with workflow_lock(self._run_lock_path(run_id)):
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError as exc:
+                raise KeyError(run_id) from exc
+
+    def try_promote_run(self, run_id: str) -> bool:
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT workflow_name, concurrency_key, status FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None or row["status"] != "queued":
+                    connection.rollback()
+                    return bool(row and row["status"] == "running")
+                active = connection.execute(
+                    "SELECT 1 FROM runs WHERE run_id<>? AND workflow_name=? AND concurrency_key=? AND status IN ('running','waiting_retry','paused','interrupted') LIMIT 1",
+                    (run_id, row["workflow_name"], row["concurrency_key"]),
+                ).fetchone()
+                running = connection.execute(
+                    "SELECT COUNT(*) FROM runs WHERE status='running'"
+                ).fetchone()[0]
+                if active or running >= min(
+                    self.limits["executing"], self.limits["workers"]
+                ):
+                    connection.rollback()
+                    return False
+                projection = json.loads((directory / "run.json").read_text())
+                now = _utc_now()
+                projection["status"] = "running"
+                projection["started_at"] = now
+                projection["queue_position"] = None
+                projection["blocked_by_run_id"] = None
+                self._append_locked(directory, projection, "run_promoted")
+                connection.execute(
+                    "UPDATE runs SET status='running', queue_position=NULL, blocked_by_run_id=NULL, updated_at=? WHERE run_id=?",
+                    (projection["updated_at"], run_id),
+                )
+                connection.commit()
+                return True
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
 
     def append_event(
         self,
@@ -469,7 +956,7 @@ class RunStore:
         projection_updates: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         directory = self.run_directory(run_id)
-        with workflow_lock(directory / ".lock"):
+        with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
             sequence = int(projection["event_sequence"]) + 1
             now = _utc_now()
@@ -481,7 +968,7 @@ class RunStore:
                 "node_id": node_id,
                 "attempt_id": attempt_id,
                 "event_type": event_type,
-                "payload": dict(payload or {}),
+                "payload": _sanitize(dict(payload or {})),
             }
             with (directory / "events.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, sort_keys=True) + "\n")
@@ -497,20 +984,26 @@ class RunStore:
             return event
 
     def tail_events(
-        self, run_id: str, *, after_sequence: int = 0, limit: int = 100
+        self,
+        run_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+        operator_scope: str | None = None,
     ) -> tuple[dict[str, object], ...]:
         if not 1 <= limit <= 200:
             raise ValueError("limit must be between 1 and 200")
-        directory = self.run_directory(run_id)
-        with workflow_lock(directory / ".lock"):
+        directory = self.run_directory(run_id, operator_scope=operator_scope)
+        with workflow_lock(self._run_lock_path(run_id)):
             events = [
                 json.loads(line)
                 for line in (directory / "events.jsonl").read_text().splitlines()
                 if line.strip()
             ]
-        return tuple(
+        selected = tuple(
             event for event in events if int(event["sequence"]) > after_sequence
         )[:limit]
+        return tuple(_sanitize(event) for event in selected)
 
     def list_runs(
         self,
@@ -518,10 +1011,11 @@ class RunStore:
         workflow: str | None = None,
         status: str | None = None,
         limit: int = 100,
+        operator_scope: str | None = None,
     ) -> tuple[dict[str, object], ...]:
         if not 1 <= limit <= 200:
             raise ValueError("limit must be between 1 and 200")
-        clauses = []
+        clauses = ["admission_state='published'"]
         values: list[object] = []
         if workflow:
             clauses.append("workflow_name=?")
@@ -529,16 +1023,24 @@ class RunStore:
         if status:
             clauses.append("status=?")
             values.append(status)
+        if operator_scope is not None:
+            clauses.append("operator_scope_digest=?")
+            values.append(self._scope_digest(operator_scope))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._connect() as connection:
             rows = connection.execute(
                 f"SELECT run_id FROM runs{where} ORDER BY created_at DESC, run_id DESC LIMIT ?",
                 (*values, limit),
             ).fetchall()
-        return tuple(self.get_run_status(row["run_id"]) for row in rows)
+        return tuple(
+            self.get_run_status(row["run_id"], operator_scope=operator_scope)
+            for row in rows
+        )
 
-    def get_run_status(self, run_id: str) -> dict[str, object]:
-        run = self.load_run(run_id)
+    def get_run_status(
+        self, run_id: str, *, operator_scope: str | None = None
+    ) -> dict[str, object]:
+        run = self.load_run(run_id, operator_scope=operator_scope)
         nodes = run.get("nodes", {})
         node_values = list(nodes.values()) if isinstance(nodes, dict) else []
         completed = sum(
@@ -598,7 +1100,7 @@ class RunStore:
         lease_seconds: float = 30.0,
     ) -> NodeClaim | None:
         directory = self.run_directory(run_id)
-        with workflow_lock(directory / ".lock"):
+        with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"].get(node_id)
             if not node or node["state"] != "ready":
@@ -634,10 +1136,307 @@ class RunStore:
             _atomic_json(directory / "run.json", projection)
             return NodeClaim(run_id, node_id, attempt_id, owner_id, expires)
 
+    def mark_node_started(self, claim: NodeClaim) -> None:
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(self._run_lock_path(claim.run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection["nodes"][claim.node_id]
+            active = node.get("claim", {})
+            if active.get("attempt_id") != claim.attempt_id:
+                raise RuntimeError("stale node claim")
+            node["state"] = "running"
+            node["attempts"][-1]["state"] = "running"
+            self._append_locked(
+                directory,
+                projection,
+                "node_started",
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+            )
+
+    def complete_node(
+        self,
+        claim: NodeClaim,
+        *,
+        status: str,
+        artifacts: Iterable[ArtifactRef] = (),
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        if status not in {"succeeded", "failed", "cancelled", "interrupted"}:
+            raise ValueError(f"invalid terminal node state: {status}")
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(self._run_lock_path(claim.run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection["nodes"][claim.node_id]
+            active = node.get("claim", {})
+            if active.get("attempt_id") != claim.attempt_id:
+                raise RuntimeError("stale node completion")
+            if (
+                projection["status"] in {"cancelled", "abandoned"}
+                and status != "cancelled"
+            ):
+                raise RuntimeError("stale completion for terminal run")
+            node["state"] = status
+            node.pop("claim", None)
+            node["attempts"][-1].update({
+                "state": status,
+                "error_code": error_code,
+                "error_message": error_message,
+            })
+            refs = []
+            for artifact in artifacts:
+                entry = {
+                    "node_id": claim.node_id,
+                    "attempt_id": claim.attempt_id,
+                    "relative_path": artifact.relative_path,
+                    "media_type": artifact.media_type,
+                    "size_bytes": artifact.size_bytes,
+                    "sha256": artifact.sha256,
+                }
+                refs.append(entry)
+                projection["artifacts"].append(entry)
+            self._append_locked(
+                directory,
+                projection,
+                f"node_{status}",
+                {"artifacts": refs, "error_code": error_code},
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+            )
+            if status == "succeeded":
+                for candidate in projection["nodes"].values():
+                    if candidate["state"] != "pending":
+                        continue
+                    if all(
+                        projection["nodes"][dependency]["state"] == "succeeded"
+                        for dependency in candidate["depends_on"]
+                    ):
+                        candidate["state"] = "ready"
+            states = {candidate["state"] for candidate in projection["nodes"].values()}
+            terminal = None
+            if states <= {"succeeded", "skipped"}:
+                terminal = "succeeded"
+            elif status == "failed":
+                terminal = "failed"
+                projection["last_error"] = {
+                    "code": error_code or "node_failed",
+                    "message": error_message or "node execution failed",
+                    "node_id": claim.node_id,
+                }
+            if terminal:
+                projection["status"] = terminal
+                self._append_locked(directory, projection, f"run_{terminal}")
+                with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                        (terminal, projection["updated_at"], claim.run_id),
+                    )
+            else:
+                _atomic_json(directory / "run.json", projection)
+
+    def _append_locked(
+        self,
+        directory: Path,
+        projection: dict[str, object],
+        event_type: str,
+        payload: Mapping[str, object] | None = None,
+        *,
+        node_id: str | None = None,
+        attempt_id: str | None = None,
+    ) -> None:
+        sequence = int(projection["event_sequence"]) + 1
+        now = _utc_now()
+        event = {
+            "schema_version": 1,
+            "sequence": sequence,
+            "timestamp": now,
+            "run_id": projection["run_id"],
+            "node_id": node_id,
+            "attempt_id": attempt_id,
+            "event_type": event_type,
+            "payload": dict(payload or {}),
+        }
+        with (directory / "events.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        projection["event_sequence"] = sequence
+        projection["state_version"] = int(projection["state_version"]) + 1
+        projection["updated_at"] = now
+        _atomic_json(directory / "run.json", projection)
+
+    def release_or_expire_claim(self, claim: NodeClaim) -> bool:
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(self._run_lock_path(claim.run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection["nodes"].get(claim.node_id)
+            if not node or node.get("claim", {}).get("attempt_id") != claim.attempt_id:
+                return False
+            node["state"] = "interrupted"
+            node.pop("claim", None)
+            projection["status"] = "interrupted"
+            self._append_locked(
+                directory,
+                projection,
+                "node_interrupted",
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+            )
+            return True
+
+    def cancel_run(
+        self, run_id: str, *, operator_scope: str | None = None
+    ) -> dict[str, object]:
+        return self._set_terminal(
+            run_id,
+            "cancelled",
+            {"cancelled", "already_terminal"},
+            operator_scope=operator_scope,
+        )
+
+    def resume_run(
+        self, run_id: str, *, operator_scope: str | None = None
+    ) -> dict[str, object]:
+        directory = self.run_directory(run_id, operator_scope=operator_scope)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection["status"] not in {"failed", "interrupted"}:
+                return projection
+            for node in projection["nodes"].values():
+                if node["state"] == "succeeded":
+                    continue
+                node.pop("claim", None)
+                node["state"] = (
+                    "ready"
+                    if all(
+                        projection["nodes"][dependency]["state"] == "succeeded"
+                        for dependency in node["depends_on"]
+                    )
+                    else "pending"
+                )
+            projection["status"] = "running"
+            projection["last_error"] = None
+            self._append_locked(directory, projection, "run_resumed")
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status='running', updated_at=? WHERE run_id=?",
+                    (projection["updated_at"], run_id),
+                )
+            return projection
+
+    def abandon_run(
+        self, run_id: str, *, operator_scope: str | None = None
+    ) -> dict[str, object]:
+        projection = self.load_run(run_id, operator_scope=operator_scope)
+        if projection["status"] not in {"interrupted", "failed", "paused"}:
+            raise ValueError(
+                "only interrupted, failed, or paused runs may be abandoned"
+            )
+        return self._set_terminal(
+            run_id,
+            "abandoned",
+            {"abandoned"},
+            operator_scope=operator_scope,
+        )
+
+    def _set_terminal(
+        self,
+        run_id: str,
+        target: str,
+        outcomes: set[str],
+        *,
+        operator_scope: str | None = None,
+    ) -> dict[str, object]:
+        del outcomes
+        directory = self.run_directory(run_id, operator_scope=operator_scope)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection["status"] in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "abandoned",
+            }:
+                return projection
+            projection["status"] = target
+            for node in projection["nodes"].values():
+                if node["state"] not in {"succeeded", "failed", "skipped"}:
+                    node["state"] = target if target == "cancelled" else "interrupted"
+            self._append_locked(directory, projection, f"run_{target}")
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                    (target, projection["updated_at"], run_id),
+                )
+            return projection
+
+    def cleanup_runs(
+        self,
+        *,
+        older_than: timedelta = timedelta(days=7),
+        dry_run: bool = True,
+        operator_scope: str | None = None,
+    ) -> dict[str, object]:
+        cutoff = datetime.now(timezone.utc) - older_than
+        scope_clause = (
+            " AND operator_scope_digest=?" if operator_scope is not None else ""
+        )
+        values: tuple[object, ...] = (
+            (self._scope_digest(operator_scope),) if operator_scope is not None else ()
+        )
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id, run_directory, status, updated_at FROM runs "
+                f"WHERE admission_state='published'{scope_clause} "
+                "ORDER BY updated_at, run_id",
+                values,
+            ).fetchall()
+        candidates = [
+            row
+            for row in rows
+            if row["status"] in {"succeeded", "failed", "cancelled", "abandoned"}
+            and datetime.fromisoformat(row["updated_at"]) <= cutoff
+        ]
+        files_total = sum(
+            1
+            for row in candidates
+            for path in Path(row["run_directory"]).rglob("*")
+            if path.is_file()
+        )
+        bytes_total = sum(
+            path.stat().st_size
+            for row in candidates
+            for path in Path(row["run_directory"]).rglob("*")
+            if path.is_file()
+        )
+        if not dry_run:
+            for row in candidates:
+                source = Path(row["run_directory"])
+                with workflow_lock(self._run_lock_path(row["run_id"])):
+                    if not source.exists():
+                        continue
+                    quarantine = (
+                        self.quarantine_root / f"{row['run_id']}-{uuid.uuid4().hex}"
+                    )
+                    os.replace(source, quarantine)
+                shutil.rmtree(quarantine, ignore_errors=True)
+                with self._connect() as connection:
+                    connection.execute(
+                        "DELETE FROM runs WHERE run_id=?", (row["run_id"],)
+                    )
+        return {
+            "dry_run": dry_run,
+            "run_ids": [row["run_id"] for row in candidates],
+            "files": files_total,
+            "bytes": bytes_total,
+        }
+
 
 __all__ = [
     "ArtifactRef",
     "InputSnapshotError",
     "NodeClaim",
     "RunStore",
+    "StorageQuotaError",
 ]

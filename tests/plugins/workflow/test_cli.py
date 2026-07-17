@@ -209,3 +209,50 @@ def test_trust_rejects_package_mutation_during_admission(
     assert args.func(args) == 1
     assert "changed while trust was being recorded" in capsys.readouterr().err
     assert WorkflowTrustStore(profile).check(original.sha256) == "untrusted"
+
+
+def test_run_status_events_and_runs_use_the_durable_store(
+    workflow_writer, tmp_path, capsys
+):
+    workdir = tmp_path / "repo"
+    path = _write(workflow_writer, workdir)
+    profile = tmp_path / "profile"
+    package = load_workflow(path)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(profile).trust(
+        digest.sha256, actor="test", risk_digest=risk.risk_digest
+    )
+    parser = _parser()
+    common = ["--workdir", str(workdir), "--hermes-home", str(profile)]
+
+    args = parser.parse_args([
+        *common,
+        "run",
+        "sample",
+        "--idempotency-key",
+        "message-1",
+        "--json",
+    ])
+    assert args.func(args) == 0
+    run = json.loads(capsys.readouterr().out)
+    assert run["status"] == "succeeded"
+
+    args = parser.parse_args([*common, "status", run["run_id"], "--json"])
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["run_id"] == run["run_id"]
+
+    args = parser.parse_args([
+        *common,
+        "events",
+        run["run_id"],
+        "--tail",
+        "2",
+        "--json",
+    ])
+    assert args.func(args) == 0
+    assert len(json.loads(capsys.readouterr().out)) == 2
+
+    args = parser.parse_args([*common, "runs", "--status", "succeeded", "--json"])
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)[0]["run_id"] == run["run_id"]

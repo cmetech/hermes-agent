@@ -1,0 +1,190 @@
+from __future__ import annotations
+
+import threading
+import time
+
+from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.schema import load_workflow
+from plugins.workflow.store import RunStore
+
+
+def _start(store, package, *, key="e2e"):
+    prepared = store.prepare_run_snapshot(package)
+    return store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=key,
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+
+
+def test_two_dependent_bash_nodes_execute_and_persist_artifacts(
+    tmp_path, workflow_writer
+):
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="bash-dag",
+            nodes=[
+                {"id": "first", "bash": "printf first"},
+                {
+                    "id": "second",
+                    "bash": "printf second",
+                    "depends_on": ["first"],
+                },
+            ],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    admitted = _start(store, package)
+
+    result = RunScheduler(store).advance(admitted.run_id)
+
+    assert result["status"] == "succeeded"
+    assert [result["nodes"][node]["state"] for node in ("first", "second")] == [
+        "succeeded",
+        "succeeded",
+    ]
+    artifacts = {artifact["node_id"]: artifact for artifact in result["artifacts"]}
+    assert (
+        store.run_directory(admitted.run_id) / artifacts["first"]["relative_path"]
+    ).read_text() == "first"
+    assert (
+        store.run_directory(admitted.run_id) / artifacts["second"]["relative_path"]
+    ).read_text() == "second"
+    event_types = [event["event_type"] for event in store.tail_events(admitted.run_id)]
+    assert event_types == [
+        "run_admitted",
+        "node_claimed",
+        "node_started",
+        "node_succeeded",
+        "node_claimed",
+        "node_started",
+        "node_succeeded",
+        "run_succeeded",
+    ]
+
+
+def test_resume_does_not_rerun_completed_node(tmp_path, workflow_writer):
+    marker = tmp_path / "marker.txt"
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="resume-dag",
+            nodes=[
+                {
+                    "id": "first",
+                    "bash": f"printf x >> {marker}; printf first",
+                },
+                {"id": "second", "bash": "printf second", "depends_on": ["first"]},
+            ],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    admitted = _start(store, package)
+    scheduler = RunScheduler(store)
+
+    scheduler.advance(admitted.run_id, max_nodes=1)
+    assert marker.read_text() == "x"
+    scheduler.advance(admitted.run_id)
+
+    assert marker.read_text() == "x"
+    assert store.load_run(admitted.run_id)["status"] == "succeeded"
+
+
+def test_timeout_terminates_the_bash_process_tree(tmp_path, workflow_writer):
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="timeout-dag",
+            nodes=[{"id": "wait", "bash": "sleep 2 &", "timeout": 0.1}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    admitted = _start(store, package)
+
+    result = RunScheduler(store).advance(admitted.run_id)
+
+    assert result["status"] == "failed"
+    assert result["last_error"]["code"] == "timeout"
+
+
+def test_output_limit_caps_persisted_stdout(tmp_path, workflow_writer):
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="bounded-output",
+            nodes=[
+                {
+                    "id": "noisy",
+                    "bash": (
+                        "i=0; while [ $i -lt 200000 ]; do "
+                        "printf 1234567890; i=$((i+1)); done"
+                    ),
+                }
+            ],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    admitted = _start(store, package)
+
+    result = RunScheduler(store).advance(admitted.run_id)
+
+    assert result["status"] == "failed"
+    assert result["last_error"]["code"] == "output_limit"
+    assert (
+        sum(artifact["size_bytes"] for artifact in result["artifacts"]) <= 1024 * 1024
+    )
+
+
+def test_cancel_stops_a_running_bash_process(tmp_path, workflow_writer):
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="cancel-dag",
+            nodes=[{"id": "wait", "bash": "sleep 5 & wait"}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    admitted = _start(store, package)
+    thread = threading.Thread(
+        target=RunScheduler(store).advance, args=(admitted.run_id,)
+    )
+    thread.start()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if store.load_run(admitted.run_id)["nodes"]["wait"]["state"] == "running":
+            break
+        time.sleep(0.01)
+
+    store.cancel_run(admitted.run_id)
+    thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert store.load_run(admitted.run_id)["status"] == "cancelled"
+
+
+def test_queued_run_promotes_after_blocking_run_finishes(tmp_path, workflow_writer):
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="queued-dag",
+            nodes=[{"id": "only", "bash": "printf queued"}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    first = _start(store, package, key="first")
+    second = _start(store, package, key="second")
+    assert second.disposition == "queued"
+
+    RunScheduler(store).advance(first.run_id)
+    result = RunScheduler(store).advance(second.run_id)
+
+    assert result["status"] == "succeeded"
