@@ -1375,6 +1375,21 @@ export interface Translations {
     }
   }
 
+  operations: {
+    workflows: string
+    kanban: string
+    needsAttention: string
+    status: string
+    health: string
+    graphProgress: string
+    completionEstimate: string
+    estimateUnavailable: string
+    nextActions: string
+    workflowUnavailable: string
+    kanbanUnavailable: string
+    physicalBoard: (board: string) => string
+  }
+
   composer: {
     message: string
     wakingProfile: (profile: string) => string

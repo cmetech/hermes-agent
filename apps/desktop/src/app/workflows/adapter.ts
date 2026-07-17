@@ -10,19 +10,28 @@ const COLUMNS = [
 ] as const
 
 function columnId(run: WorkflowRunSnapshot): (typeof COLUMNS)[number][0] {
-  if (run.status === 'queued') return 'queued'
-  if (run.status === 'paused') return 'attention'
-  if (run.status === 'succeeded') return 'completed'
-  if (['failed', 'cancelled', 'abandoned', 'interrupted'].includes(run.status)) return 'stopped'
+  if (run.status === 'queued') {return 'queued'}
+
+  if (run.status === 'paused') {return 'attention'}
+
+  if (run.status === 'succeeded') {return 'completed'}
+
+  if (['failed', 'cancelled', 'abandoned', 'interrupted'].includes(run.status)) {return 'stopped'}
+
   return 'active'
 }
 
 function health(run: WorkflowRunSnapshot) {
-  if (run.status === 'paused') return 'attention' as const
-  if (run.status === 'failed') return 'failed' as const
-  if (['succeeded', 'cancelled', 'abandoned'].includes(run.status)) return 'terminal' as const
-  if (run.health.includes('wait')) return 'waiting' as const
-  if (run.health.includes('stale')) return 'stale' as const
+  if (run.status === 'paused') {return 'attention' as const}
+
+  if (run.status === 'failed') {return 'failed' as const}
+
+  if (['succeeded', 'cancelled', 'abandoned'].includes(run.status)) {return 'terminal' as const}
+
+  if (run.health.includes('wait')) {return 'waiting' as const}
+
+  if (run.health.includes('stale')) {return 'stale' as const}
+
   return 'healthy' as const
 }
 
@@ -32,6 +41,7 @@ export function workflowBoardModel(
 ): ActivityBoardModel {
   const columns: ActivityBoardColumn[] = COLUMNS.map(([id, label]) => {
     const selected = runs.filter(run => columnId(run) === id)
+
     return {
       cards: selected.map(run => ({
         ariaDescription: `${run.workflow}, ${run.status}`,
@@ -48,6 +58,7 @@ export function workflowBoardModel(
       nextCursor: null
     }
   })
+
   return {
     columns,
     revision: runs.map(run => `${run.run_id}:${run.state_version}`).join('|'),

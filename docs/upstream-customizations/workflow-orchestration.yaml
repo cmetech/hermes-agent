@@ -100,3 +100,37 @@ upstream_changes:
   removal_condition: Remove when Hermes upstream exposes equivalent bounded
     Kanban REST deltas and compare-and-set mutation responses.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-kanban-operations
+  change_class: desktop-composition-generic
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/routes.ts
+  - apps/desktop/src/app/desktop-controller.tsx
+  - apps/desktop/src/app/chat/sidebar/index.tsx
+  - apps/desktop/src/app/types.ts
+  - apps/desktop/src/hermes.ts
+  - apps/desktop/src/types/hermes.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  owned_symbols:
+  - WORKFLOWS_ROUTE
+  - KANBAN_ROUTE
+  - WorkflowsView
+  - KanbanView
+  tests:
+  - apps/desktop/src/app/routes.test.ts
+  - apps/desktop/src/app/workflows/adapter.test.ts
+  - apps/desktop/src/app/kanban/adapter.test.ts
+  - apps/desktop/src/components/activity-board/activity-board.test.tsx
+  expected_commit_subject: 'feat(desktop): integrate workflow operations navigation'
+  upstream_candidate: true
+  merge_guidance: Preserve separate Workflow and Kanban lifecycle authorities,
+    durable non-overlay routes, profile-scoped REST calls, extension-safe chat,
+    and complete locale/navigation composition while reconciling upstream shell
+    changes.
+  removal_condition: Remove when Hermes upstream provides equivalent native
+    Workflow and Kanban operations pages over the same generic APIs.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

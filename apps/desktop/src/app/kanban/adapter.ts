@@ -34,6 +34,7 @@ export function kanbanBoardModel(
     label: COLUMN_LABELS[id] ?? id,
     nextCursor: null
   }))
+
   return {
     columns,
     revision: `${summary.latest_event_id}`,

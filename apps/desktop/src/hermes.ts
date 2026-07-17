@@ -19,6 +19,8 @@ import type {
   EnvVarInfo,
   HermesConfig,
   HermesConfigRecord,
+  KanbanBoardSummary,
+  KanbanTaskPage,
   LogsResponse,
   McpCatalogResponse,
   McpServerSummary,
@@ -58,9 +60,7 @@ import type {
   WorkflowAttentionPage,
   WorkflowEventPage,
   WorkflowRunPage,
-  WorkflowRunSnapshot,
-  KanbanBoardSummary,
-  KanbanTaskPage
+  WorkflowRunSnapshot
 } from '@/types/hermes'
 
 // Desktop startup fires a burst of read-only data calls (config, profiles,
@@ -228,6 +228,7 @@ export async function listSessions(
 
 export function listWorkflowRuns(cursor?: string): Promise<WorkflowRunPage> {
   const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''
+
   return window.hermesDesktop.api<WorkflowRunPage>({
     path: `/api/plugins/workflow/runs${query}`,
     ...profileScoped()
@@ -278,8 +279,11 @@ export function getKanbanBoardSummary(board: string): Promise<KanbanBoardSummary
 
 export function listKanbanTasks(board: string, status?: string, cursor?: string): Promise<KanbanTaskPage> {
   const query = new URLSearchParams({ board })
-  if (status) query.set('status', status)
-  if (cursor) query.set('cursor', cursor)
+
+  if (status) {query.set('status', status)}
+
+  if (cursor) {query.set('cursor', cursor)}
+
   return window.hermesDesktop.api<KanbanTaskPage>({
     path: `/api/plugins/kanban/tasks?${query.toString()}`,
     ...profileScoped()

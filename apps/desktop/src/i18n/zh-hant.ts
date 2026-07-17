@@ -1449,7 +1449,9 @@ export const zhHant = defineLocale({
       'new-session': '新工作階段',
       skills: '技能與工具',
       messaging: '訊息平台',
-      artifacts: '成品'
+      artifacts: '成品',
+      workflows: '工作流程',
+      kanban: '看板'
     },
     searchAria: '搜尋工作階段',
     searchPlaceholder: '搜尋工作階段…',
@@ -1557,6 +1559,21 @@ export const zhHant = defineLocale({
       ageHour: '時',
       ageMin: '分'
     }
+  },
+
+  operations: {
+    workflows: '工作流程',
+    kanban: '看板',
+    needsAttention: '需要處理',
+    status: '狀態',
+    health: '健康狀態',
+    graphProgress: '圖形進度',
+    completionEstimate: '完成時間估計',
+    estimateUnavailable: '無法估計',
+    nextActions: '後續操作',
+    workflowUnavailable: 'Workflow 外掛無法使用。請執行 hermes plugins enable workflow。',
+    kanbanUnavailable: 'Kanban 外掛無法使用。請執行 hermes plugins enable kanban。',
+    physicalBoard: board => `機器共用實體看板：${board}`
   },
 
   composer: {

@@ -15,6 +15,7 @@ it('keeps physical Kanban task states separate from workflow runs', () => {
     schema_version: 1,
     tenants: []
   }
+
   const model = kanbanBoardModel(summary, [{ id: 't_1', priority: 1, status: 'ready', title: 'Task' }])
   expect(model.source).toBe('kanban')
   expect(model.columns[0]!.cards[0]!.id).toBe('t_1')

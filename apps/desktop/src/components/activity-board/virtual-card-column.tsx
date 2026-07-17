@@ -13,12 +13,14 @@ interface VirtualCardColumnProps {
 
 export function VirtualCardColumn({ column, onLoadMore, onOpenCard }: VirtualCardColumnProps) {
   const parent = useRef<HTMLDivElement>(null)
+
   const virtual = useVirtualizer({
     count: column.cards.length,
     estimateSize: () => 82,
     getScrollElement: () => parent.current,
     overscan: 8
   })
+
   const rows = column.cards.length > 50 ? virtual.getVirtualItems() : column.cards.map((_, index) => ({ index }))
 
   return (
@@ -33,8 +35,10 @@ export function VirtualCardColumn({ column, onLoadMore, onOpenCard }: VirtualCar
         >
           {rows.map(row => {
             const card = column.cards[row.index]
-            if (!card) return null
+
+            if (!card) {return null}
             const virtualRow = 'start' in row ? row : null
+
             return (
               <button
                 aria-label={card.ariaDescription}
