@@ -299,6 +299,24 @@ upstream_changes:
   removal_condition: Remove when Hermes upstream ships equivalent authenticated
     workflow showcase package-data coverage.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-test-gate
+  change_class: release-gate-generic
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/package.json
+  owned_symbols:
+  - test
+  - test:workflow-ui
+  tests:
+  - tests/test_desktop_workflow_test_gate.py
+  expected_commit_subject: 'test(desktop): define workflow production gate'
+  upstream_candidate: true
+  merge_guidance: Preserve one default npm test entry point that runs the real
+    workflow/Kanban renderer contract and the existing Electron platform suite
+    without mixing Electron node tests into a jsdom process.
+  removal_condition: Remove when upstream Desktop provides an equivalent default
+    split-environment production test entry point.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: customization-checker-completeness
   change_class: release-gate-generic
   owner: workflow-orchestration
