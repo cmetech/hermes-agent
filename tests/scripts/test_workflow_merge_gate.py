@@ -19,6 +19,13 @@ def test_merge_gate_references_only_existing_invariant_tests() -> None:
     assert not [path for path in sorted(referenced) if not (ROOT / path).is_file()]
 
 
+def test_merge_gate_shares_workspace_root_dependencies_with_temp_worktrees() -> None:
+    source = GATE.read_text()
+
+    assert 'ln -s "$SHARED_ROOT/node_modules" node_modules' in source
+    assert '[[ -d node_modules ]]' in source
+
+
 def test_merge_gate_rejects_invalid_phase_and_unknown_brand() -> None:
     invalid = subprocess.run([GATE, "--phase", "invalid"], cwd=ROOT, text=True, capture_output=True)
     assert invalid.returncode == 2

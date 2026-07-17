@@ -60,9 +60,16 @@ if [[ "$PHASE" == "base" ]]; then
       tests/test_packaging_metadata.py
     SHARED_GIT_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
     SHARED_ROOT="$(dirname "$SHARED_GIT_DIR")"
+    if [[ ! -d node_modules && -d "$SHARED_ROOT/node_modules" ]]; then
+      ln -s "$SHARED_ROOT/node_modules" node_modules
+    fi
     if [[ ! -d apps/desktop/node_modules && -d "$SHARED_ROOT/apps/desktop/node_modules" ]]; then
       ln -s "$SHARED_ROOT/apps/desktop/node_modules" apps/desktop/node_modules
     fi
+    [[ -d node_modules ]] || {
+      echo "workspace dependencies are required for the base merge gate" >&2
+      exit 1
+    }
     [[ -d apps/desktop/node_modules ]] || {
       echo "desktop dependencies are required for the base merge gate" >&2
       exit 1
