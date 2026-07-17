@@ -30,6 +30,7 @@ from tools.managed_process import (
 _PROTOCOL_VERSION = 1
 _MAX_REQUEST_BYTES = 1_000_000
 _MAX_FRAME_BYTES = 4_000_000
+_MAX_QUEUED_FRAMES = 8
 _MAX_PROMPT_CHARS = 500_000
 _MAX_POLICY_NAMES = 256
 
@@ -297,12 +298,32 @@ def _request_payload(plugin_id: str, request: PluginAgentRunRequest) -> dict[str
     }
 
 
-def _read_stream(stream, events: queue.Queue, label: str) -> None:
+def _read_stream(
+    stream,
+    events: queue.Queue,
+    label: str,
+    *,
+    stopped: threading.Event,
+) -> None:
     try:
-        for line in iter(stream.readline, ""):
-            events.put((label, line))
+        while not stopped.is_set():
+            line = stream.readline(_MAX_FRAME_BYTES + 1)
+            if line == "":
+                break
+            while not stopped.is_set():
+                try:
+                    events.put((label, line), timeout=0.05)
+                    break
+                except queue.Full:
+                    continue
+    except (OSError, ValueError):
+        pass
     finally:
-        events.put((f"{label}_eof", ""))
+        if not stopped.is_set():
+            try:
+                events.put((f"{label}_eof", ""), timeout=0.05)
+            except queue.Full:
+                pass
 
 
 def _exchange_worker(
@@ -341,12 +362,19 @@ def _exchange_worker(
     assert tree.process.stdin is not None
     assert tree.process.stdout is not None
     assert tree.process.stderr is not None
-    events: queue.Queue = queue.Queue()
+    events: queue.Queue = queue.Queue(maxsize=_MAX_QUEUED_FRAMES)
+    stopped = threading.Event()
     stdout_reader = threading.Thread(
-        target=_read_stream, args=(tree.process.stdout, events, "stdout"), daemon=True
+        target=_read_stream,
+        args=(tree.process.stdout, events, "stdout"),
+        kwargs={"stopped": stopped},
+        daemon=True,
     )
     stderr_reader = threading.Thread(
-        target=_read_stream, args=(tree.process.stderr, events, "stderr"), daemon=True
+        target=_read_stream,
+        args=(tree.process.stderr, events, "stderr"),
+        kwargs={"stopped": stopped},
+        daemon=True,
     )
     stdout_reader.start()
     stderr_reader.start()
@@ -401,11 +429,14 @@ def _exchange_worker(
                 raise RuntimeError("plugin-agent emitted an unknown frame type")
             last_activity = time.monotonic()
     finally:
+        stopped.set()
         try:
             tree.process.stdin.close()
         except Exception:
             pass
         tree.close()
+        stdout_reader.join(timeout=1.0)
+        stderr_reader.join(timeout=1.0)
 
 
 class PluginAgentRunner:

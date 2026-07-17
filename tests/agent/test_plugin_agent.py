@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import queue
 import sys
 import threading
 import time
@@ -21,7 +22,9 @@ from agent.plugin_agent import (
     PluginAgentRunner,
     _PluginAgentCancelled,
     _PluginAgentResourceExceeded,
+    _MAX_FRAME_BYTES,
     _exchange_worker,
+    _read_stream,
 )
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from tools.managed_process import ProcessResourceLimits, TerminationPolicy
@@ -35,6 +38,36 @@ def _register(registry: ToolRegistry, name: str) -> None:
         schema={"name": name, "description": name, "parameters": {"type": "object"}},
         handler=lambda args: name,
     )
+
+
+def test_worker_stream_reader_is_bounded_and_stoppable_under_backpressure() -> None:
+    class FloodStream:
+        def __init__(self) -> None:
+            self.read_sizes: list[int] = []
+
+        def readline(self, size: int = -1) -> str:
+            self.read_sizes.append(size)
+            return "frame\n"
+
+    stream = FloodStream()
+    events: queue.Queue = queue.Queue(maxsize=1)
+    stopped = threading.Event()
+    reader = threading.Thread(
+        target=_read_stream,
+        args=(stream, events, "stdout"),
+        kwargs={"stopped": stopped},
+    )
+    reader.start()
+    deadline = time.monotonic() + 1
+    while len(stream.read_sizes) < 2 and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    stopped.set()
+    reader.join(timeout=1)
+
+    assert not reader.is_alive()
+    assert stream.read_sizes
+    assert set(stream.read_sizes) == {_MAX_FRAME_BYTES + 1}
 
 
 def test_allowed_and_denied_tools_are_enforced_before_first_call() -> None:
