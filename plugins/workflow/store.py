@@ -25,7 +25,7 @@ from plugins.workflow.admission import (
     RunAdmissionResult,
 )
 from plugins.workflow.locks import workflow_lock
-from plugins.workflow.models import WorkflowPackage
+from plugins.workflow.models import ApprovalDecision, WorkflowPackage
 from plugins.workflow.trust import compute_package_digest
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
@@ -1744,9 +1744,14 @@ class RunStore:
                 "pending_interaction",
                 "retry_consumed",
                 "loop_state",
+                "approval_generation",
+                "approval_rework_attempts",
+                "approval_rework",
             ):
                 if field in safe_metadata:
                     node[field] = safe_metadata[field]
+            if status == "paused" and "approval_generation" in safe_metadata:
+                node.pop("approval_rework", None)
             for warning in safe_metadata.get("warnings", []):
                 if isinstance(warning, str) and warning not in projection["warnings"]:
                     projection["warnings"].append(warning)
@@ -2567,6 +2572,258 @@ class RunStore:
                     (projection["updated_at"], run_id),
                 )
             return projection
+
+    @staticmethod
+    def _interaction_identity(node: Mapping[str, object]) -> str | None:
+        pending = node.get("pending_interaction")
+        if not isinstance(pending, Mapping):
+            return None
+        value = pending.get("interaction_id") or pending.get("action_digest")
+        return str(value) if isinstance(value, str) and value else None
+
+    def _already_decided(
+        self,
+        projection: Mapping[str, object],
+        interaction_id: str | None,
+    ) -> ApprovalDecision | None:
+        for node_id, raw_node in projection["nodes"].items():
+            if not isinstance(raw_node, Mapping):
+                continue
+            recorded = raw_node.get("approval_last_decision")
+            if not isinstance(recorded, Mapping):
+                continue
+            recorded_id = recorded.get("interaction_id")
+            if interaction_id is not None and recorded_id != interaction_id:
+                continue
+            return ApprovalDecision(
+                run_id=str(projection["run_id"]),
+                node_id=str(node_id),
+                decision=str(recorded["decision"]),
+                outcome="already_decided",
+                interaction_id=str(recorded_id),
+                state_version=int(projection["state_version"]),
+            )
+        return None
+
+    def approve_run(
+        self,
+        run_id: str,
+        *,
+        comment: str = "",
+        expected_state_version: int | None = None,
+        interaction_id: str | None = None,
+        actor: str | None = None,
+        channel: str | None = None,
+        operator_scope: str | None = None,
+    ) -> ApprovalDecision:
+        return self._decide_run(
+            run_id,
+            decision="approved",
+            response=comment,
+            expected_state_version=expected_state_version,
+            interaction_id=interaction_id,
+            actor=actor,
+            channel=channel,
+            operator_scope=operator_scope,
+        )
+
+    def reject_run(
+        self,
+        run_id: str,
+        *,
+        reason: str = "",
+        expected_state_version: int | None = None,
+        interaction_id: str | None = None,
+        actor: str | None = None,
+        channel: str | None = None,
+        operator_scope: str | None = None,
+    ) -> ApprovalDecision:
+        return self._decide_run(
+            run_id,
+            decision="rejected",
+            response=reason,
+            expected_state_version=expected_state_version,
+            interaction_id=interaction_id,
+            actor=actor,
+            channel=channel,
+            operator_scope=operator_scope,
+        )
+
+    def _decide_run(
+        self,
+        run_id: str,
+        *,
+        decision: str,
+        response: str,
+        expected_state_version: int | None,
+        interaction_id: str | None,
+        actor: str | None,
+        channel: str | None,
+        operator_scope: str | None,
+    ) -> ApprovalDecision:
+        if decision not in {"approved", "rejected"}:
+            raise ValueError("approval decision is invalid")
+        if not isinstance(response, str):
+            raise TypeError("approval response must be text")
+        if len(response.encode("utf-8")) > min(self.max_input_bytes, 64 * 1024):
+            raise InputSnapshotError("approval response exceeds the configured limit")
+        directory = self.run_directory(run_id, operator_scope=operator_scope)
+        from plugins.workflow.schema import load_workflow
+
+        package = load_workflow(directory / "definition.yaml")
+        definitions = {node.id: node for node in package.definition.nodes}
+        with (
+            workflow_lock(self.admission_lock),
+            workflow_lock(self._run_lock_path(run_id)),
+        ):
+            projection = json.loads((directory / "run.json").read_text())
+            duplicate = self._already_decided(projection, interaction_id)
+            if expected_state_version is not None and (
+                int(projection["state_version"]) != expected_state_version
+            ):
+                if duplicate is not None:
+                    return duplicate
+                raise RuntimeError("stale approval decision")
+            candidates = [
+                (node_id, node)
+                for node_id, node in projection["nodes"].items()
+                if node.get("state") == "paused"
+                and self._interaction_identity(node) is not None
+                and (
+                    interaction_id is None
+                    or self._interaction_identity(node) == interaction_id
+                )
+            ]
+            if len(candidates) != 1:
+                if duplicate is not None:
+                    return duplicate
+                raise ValueError(
+                    "run does not have exactly one matching pending interaction"
+                )
+            node_id, node = candidates[0]
+            resolved_id = self._interaction_identity(node)
+            assert resolved_id is not None
+            pending = node["pending_interaction"]
+            pending_type = str(pending.get("type") or pending.get("kind") or "")
+            safe_response = (_sanitize_diagnostic(response.strip()) or "")[:64_000]
+            record = {
+                "decision": decision,
+                "interaction_id": resolved_id,
+            }
+            node["approval_last_decision"] = record
+            node.pop("pending_interaction", None)
+            event_payload: dict[str, object] = {
+                "decision": decision,
+                "interaction_id": resolved_id,
+            }
+            if actor:
+                event_payload["actor"] = _sanitize_diagnostic(actor)
+            if channel:
+                event_payload["channel"] = _sanitize_diagnostic(channel)
+
+            terminal = False
+            if decision == "approved":
+                if pending_type == "workflow_approval":
+                    definition = definitions[node_id]
+                    approval = definition.value
+                    if bool(approval.get("capture_response")):
+                        relative = Path("nodes") / node_id / "approval" / "output.txt"
+                        encoded = safe_response.encode("utf-8")
+                        _atomic_text(directory / relative, safe_response)
+                        artifact = {
+                            "node_id": node_id,
+                            "attempt_id": None,
+                            "relative_path": relative.as_posix(),
+                            "media_type": "text/plain",
+                            "size_bytes": len(encoded),
+                            "sha256": _sha256(encoded),
+                        }
+                        projection["artifacts"].append(artifact)
+                        event_payload["artifact"] = artifact
+                    node["state"] = "succeeded"
+                    if node.get("attempts"):
+                        node["attempts"][-1]["state"] = "succeeded"
+                elif pending_type == "approval":
+                    node["state"] = "ready"
+                    node["action_grant"] = resolved_id
+                else:
+                    raise ValueError("pending interaction is not approvable")
+                projection["status"] = "running"
+            else:
+                definition = definitions[node_id]
+                approval = (
+                    definition.value if definition.node_type == "approval" else {}
+                )
+                on_reject = (
+                    approval.get("on_reject") if isinstance(approval, Mapping) else None
+                )
+                attempts = int(node.get("approval_rework_attempts", 0))
+                maximum = (
+                    int(on_reject.get("max_attempts", 3))
+                    if isinstance(on_reject, Mapping)
+                    else 0
+                )
+                if pending_type == "workflow_approval" and attempts < maximum:
+                    node["state"] = "ready"
+                    node["approval_rework"] = {"reason": safe_response}
+                    projection["status"] = "running"
+                else:
+                    terminal = True
+                    projection["status"] = "cancelled"
+                    projection["desired_status"] = None
+                    for candidate in projection["nodes"].values():
+                        if candidate["state"] not in {"succeeded", "failed", "skipped"}:
+                            candidate.pop("claim", None)
+                            candidate["state"] = "cancelled"
+
+            self._append_locked(
+                directory,
+                projection,
+                f"interaction_{decision}",
+                event_payload,
+                node_id=node_id,
+            )
+            if terminal:
+                self._append_locked(directory, projection, "run_cancelled")
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status=?, desired_status=NULL, updated_at=? WHERE run_id=?",
+                    (projection["status"], projection["updated_at"], run_id),
+                )
+                if terminal:
+                    connection.execute(
+                        "DELETE FROM worker_claims WHERE run_id=?", (run_id,)
+                    )
+            return ApprovalDecision(
+                run_id=run_id,
+                node_id=node_id,
+                decision=decision,
+                outcome="applied",
+                interaction_id=resolved_id,
+                state_version=int(projection["state_version"]),
+            )
+
+    def consume_action_grant(self, claim: NodeClaim) -> str | None:
+        """Remove one exact worker grant durably before spawning the worker."""
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(self._run_lock_path(claim.run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection["nodes"][claim.node_id]
+            active = node.get("claim", {})
+            if active.get("attempt_id") != claim.attempt_id:
+                raise RuntimeError("stale action grant consumer")
+            digest = node.pop("action_grant", None)
+            if digest is None:
+                return None
+            self._append_locked(
+                directory,
+                projection,
+                "action_grant_consumed",
+                {"grant_consumed": True},
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+            )
+            return str(digest)
 
     def provide_loop_input(
         self,

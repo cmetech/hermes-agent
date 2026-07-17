@@ -79,6 +79,18 @@ class WorkflowPackage:
     validation_issues: tuple[ValidationIssue, ...] = ()
 
 
+@dataclass(frozen=True)
+class ApprovalDecision:
+    """Durable result of a compare-and-set workflow interaction decision."""
+
+    run_id: str
+    node_id: str
+    decision: str
+    outcome: str
+    interaction_id: str
+    state_version: int
+
+
 def _bounded_seconds(value: float, name: str) -> float:
     result = float(value)
     if not math.isfinite(result) or result <= 0:

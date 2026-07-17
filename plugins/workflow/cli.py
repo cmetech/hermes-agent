@@ -9,6 +9,7 @@ import re
 import secrets
 import sys
 from collections import Counter
+from dataclasses import asdict
 from pathlib import Path
 from typing import AbstractSet, Iterable, Mapping
 
@@ -298,6 +299,20 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     events_parser.add_argument("run_id")
     events_parser.add_argument("--tail", type=int, default=50)
     _json_flag(events_parser)
+
+    approve_parser = actions.add_parser(
+        "approve", help="Approve a paused workflow gate"
+    )
+    approve_parser.add_argument("run_id")
+    approve_parser.add_argument("--comment", default="")
+    approve_parser.add_argument("--continue", dest="continue_run", action="store_true")
+    _json_flag(approve_parser)
+
+    reject_parser = actions.add_parser("reject", help="Reject a paused workflow gate")
+    reject_parser.add_argument("run_id")
+    reject_parser.add_argument("--reason", default="")
+    reject_parser.add_argument("--continue", dest="continue_run", action="store_true")
+    _json_flag(reject_parser)
 
     for action, help_text in (
         ("resume", "Resume an interrupted workflow run"),
@@ -708,6 +723,33 @@ def _cmd_events(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_approval_decision(
+    args: argparse.Namespace,
+    *,
+    decision: str,
+    agent_runner=None,
+    profile_name="default",
+) -> int:
+    runtime = _runtime_config(args.hermes_home)
+    store = _store(args, runtime)
+    if decision == "approved":
+        result = store.approve_run(args.run_id, comment=args.comment, channel="cli")
+    else:
+        result = store.reject_run(args.run_id, reason=args.reason, channel="cli")
+    if result.outcome == "applied" and args.continue_run:
+        _scheduler(
+            store,
+            runtime,
+            agent_runner=agent_runner,
+            profile_name=profile_name,
+        ).advance(args.run_id)
+    payload = asdict(result)
+    payload["action"] = "approve" if decision == "approved" else "reject"
+    payload["run_status"] = store.get_run_status(args.run_id)["status"]
+    _emit(payload, as_json=args.json)
+    return 0 if result.outcome == "applied" else 3
+
+
 def _cmd_resume(
     args: argparse.Namespace, *, agent_runner=None, profile_name="default"
 ) -> int:
@@ -786,7 +828,7 @@ def workflow_command(
     action = getattr(args, "workflow_action", None)
     if not action:
         print(
-            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust|run|runs|status|events|resume|cancel|abandon|cleanup}",
+            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|resume|cancel|abandon|cleanup}",
             file=sys.stderr,
         )
         return 2
@@ -811,6 +853,20 @@ def workflow_command(
             return _cmd_status(args)
         if action == "events":
             return _cmd_events(args)
+        if action == "approve":
+            return _cmd_approval_decision(
+                args,
+                decision="approved",
+                agent_runner=agent_runner,
+                profile_name=profile_name,
+            )
+        if action == "reject":
+            return _cmd_approval_decision(
+                args,
+                decision="rejected",
+                agent_runner=agent_runner,
+                profile_name=profile_name,
+            )
         if action == "resume":
             return _cmd_resume(
                 args, agent_runner=agent_runner, profile_name=profile_name

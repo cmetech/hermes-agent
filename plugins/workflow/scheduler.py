@@ -19,6 +19,7 @@ import uuid
 from typing import Callable, Iterable, Mapping
 
 from plugins.workflow.executors.ai import AgentNodeExecutor
+from plugins.workflow.executors.approval import ApprovalExecutor
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
 from plugins.workflow.executors.bash import BashExecutor
 from plugins.workflow.executors.cancel import CancelExecutor
@@ -274,6 +275,7 @@ class RunScheduler:
             "bash": BashExecutor(),
             "script": ScriptExecutor(),
             "cancel": CancelExecutor(),
+            "approval": ApprovalExecutor(agent_runner),
         }
         if agent_runner is not None:
             registry = session_registry or NodeSessionRegistry(store.hermes_home)
@@ -449,6 +451,11 @@ class RunScheduler:
                         ),
                     )
                     return
+                node_state = dict(projection["nodes"][node.id])
+                approved_action_digest = self.store.consume_action_grant(claim)
+                node_state.pop("action_grant", None)
+                if approved_action_digest is not None:
+                    node_state["approved_action_digest"] = approved_action_digest
                 timeout = self._node_timeout(node)
                 heartbeat_stop = threading.Event()
 
@@ -523,7 +530,7 @@ class RunScheduler:
                                 }
                                 for dependency in node.depends_on
                             },
-                            node_state=projection["nodes"][node.id],
+                            node_state=node_state,
                             operator_scope=str(
                                 projection.get("operator_scope_digest") or "local"
                             ),

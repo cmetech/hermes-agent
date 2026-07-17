@@ -195,6 +195,11 @@ class AgentNodeExecutor:
                 allowed_tools=tuple(node.options.get("allowed_tools", ())) or None,
                 denied_tools=tuple(node.options.get("denied_tools", ())),
                 skills=(),
+                approved_action_digest=(
+                    str(context.node_state["approved_action_digest"])
+                    if context.node_state.get("approved_action_digest")
+                    else None
+                ),
                 workdir=context.run_directory,
                 max_iterations=90,
                 max_api_attempts=context.max_provider_attempts,
