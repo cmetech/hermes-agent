@@ -114,6 +114,29 @@ def test_identity_guard_refuses_recycled_pid(monkeypatch) -> None:
     assert signalled == []
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group contract")
+def test_posix_group_permission_failure_is_not_reported_as_cleaned(monkeypatch) -> None:
+    tree = ManagedProcessTree.__new__(ManagedProcessTree)
+    tree.identity = ProcessIdentity(pid=43210, start_time=None, group_id=43210)
+    tree.policy = TerminationPolicy(
+        term_grace_seconds=0.01,
+        kill_grace_seconds=0.01,
+        wait_timeout_seconds=0.01,
+    )
+    monkeypatch.setattr(os, "getpgrp", lambda: 1)
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda group_id, sig: (
+            None
+            if sig == 0
+            else (_ for _ in ()).throw(PermissionError(group_id))
+        ),
+    )
+
+    assert tree._terminate_owned_posix_group() is False
+
+
 def test_windows_existing_tree_uses_taskkill_and_closes_handle(monkeypatch) -> None:
     import tools.managed_process as managed
 

@@ -238,7 +238,11 @@ class ManagedProcessTree:
                         kill_grace_seconds=self.policy.kill_grace_seconds,
                     )
                 else:
-                    self._terminate_owned_posix_group()
+                    if not self._terminate_owned_posix_group():
+                        raise RuntimeError(
+                            f"owned process group {self.identity.group_id} was not "
+                            "cleaned within the bounded termination policy"
+                        )
                 return self._reap()
 
             # A PIPE-backed stdin is the coordinator lifeline used by isolated
@@ -293,7 +297,11 @@ class ManagedProcessTree:
                         self.process.pid,
                     )
             if not _IS_WINDOWS:
-                self._terminate_owned_posix_group()
+                if not self._terminate_owned_posix_group():
+                    raise RuntimeError(
+                        f"owned process group {self.identity.group_id} was not "
+                        "cleaned within the bounded termination policy"
+                    )
             result = self._reap()
             if not self._reaped:
                 raise RuntimeError(
@@ -306,7 +314,7 @@ class ManagedProcessTree:
         """Terminate group members that outlived the direct owned child."""
         group_id = self.identity.group_id
         if group_id is None or group_id <= 0 or group_id == os.getpgrp():
-            return False
+            return True
 
         def group_alive() -> bool:
             try:
@@ -318,13 +326,13 @@ class ManagedProcessTree:
             return True
 
         if not group_alive():
-            return False
+            return True
         try:
             os.killpg(group_id, signal.SIGTERM)
         except ProcessLookupError:
-            return False
-        except PermissionError:
             return True
+        except PermissionError:
+            return False
         deadline = time.monotonic() + self.policy.term_grace_seconds
         while group_alive() and time.monotonic() < deadline:
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
@@ -466,7 +474,7 @@ class ManagedProcessTree:
             deadline = time.monotonic() + kill_grace_seconds
             while time.monotonic() < deadline and any(alive(proc) for proc in targets):
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-        return sent
+        return sent and not any(alive(proc) for proc in targets)
 
 
 __all__ = ["ManagedProcessTree", "ProcessIdentity", "TerminationPolicy"]
