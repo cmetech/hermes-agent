@@ -54,12 +54,16 @@ class PluginAgentRunRequest:
     skills: tuple[str, ...] = ()
     workdir: Path | None = None
     max_iterations: int = 90
+    max_api_attempts: int = 3
     idle_timeout_seconds: float = 300.0
     wall_timeout_seconds: float = 1800.0
     provider_request_timeout_seconds: float = 300.0
     max_process_tree_rss_bytes: int = 2048 * 1024 * 1024
     max_process_tree_cpu_seconds: float = 900.0
     max_descendants: int = 32
+    cooperative_shutdown_seconds: float = 5.0
+    term_grace_seconds: float = 5.0
+    kill_reap_grace_seconds: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -112,6 +116,12 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         or request.max_iterations <= 0
     ):
         raise ValueError("max_iterations must be a positive integer")
+    if (
+        not isinstance(request.max_api_attempts, int)
+        or isinstance(request.max_api_attempts, bool)
+        or not 1 <= request.max_api_attempts <= 5
+    ):
+        raise ValueError("max API attempts must be between 1 and 5")
     for label, value in (("provider", request.provider), ("model", request.model)):
         if value is not None and (not isinstance(value, str) or not value.strip()):
             raise ValueError(f"{label} must be a non-empty string or None")
@@ -131,6 +141,18 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         raise ValueError("idle timeout cannot exceed wall timeout")
     if request.provider_request_timeout_seconds > request.wall_timeout_seconds:
         raise ValueError("provider request timeout cannot exceed wall timeout")
+    for label, value in (
+        ("cooperative shutdown", request.cooperative_shutdown_seconds),
+        ("TERM grace", request.term_grace_seconds),
+        ("KILL/reap grace", request.kill_reap_grace_seconds),
+    ):
+        if (
+            not isinstance(value, int | float)
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{label} must be finite and positive")
     try:
         ProcessResourceLimits(
             max_rss_bytes=request.max_process_tree_rss_bytes,
@@ -198,6 +220,7 @@ def _exchange_worker(
     worker_argv: list[str] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
     resource_limits: ProcessResourceLimits | None = None,
+    termination_policy: TerminationPolicy | None = None,
 ) -> dict[str, Any]:
     encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     if len(encoded.encode("utf-8")) > _MAX_REQUEST_BYTES:
@@ -205,10 +228,11 @@ def _exchange_worker(
 
     tree = ManagedProcessTree.spawn(
         worker_argv or [sys.executable, "-m", "agent.plugin_agent_worker"],
-        policy=TerminationPolicy(
-            cooperative_grace_seconds=0.2,
-            term_grace_seconds=1.0,
-            kill_grace_seconds=1.0,
+        policy=termination_policy
+        or TerminationPolicy(
+            cooperative_grace_seconds=5.0,
+            term_grace_seconds=5.0,
+            kill_grace_seconds=2.0,
             wait_timeout_seconds=2.0,
         ),
         cwd=str(workdir) if workdir else None,
@@ -266,13 +290,11 @@ def _exchange_worker(
                 continue
             if label == "stderr":
                 stderr_tail = (stderr_tail + line)[-_MAX_FRAME_BYTES:]
-                last_activity = time.monotonic()
                 continue
             if label != "stdout":
                 continue
             if len(line.encode("utf-8")) > _MAX_FRAME_BYTES:
                 raise RuntimeError("plugin-agent response frame is too large")
-            last_activity = time.monotonic()
             try:
                 frame = json.loads(line)
             except json.JSONDecodeError as exc:
@@ -283,6 +305,7 @@ def _exchange_worker(
                 return frame
             if frame.get("type") not in {"progress", "interaction"}:
                 raise RuntimeError("plugin-agent emitted an unknown frame type")
+            last_activity = time.monotonic()
     finally:
         try:
             tree.process.stdin.close()
@@ -334,6 +357,12 @@ class PluginAgentRunner:
                     max_rss_bytes=request.max_process_tree_rss_bytes,
                     max_cpu_seconds=request.max_process_tree_cpu_seconds,
                     max_descendants=request.max_descendants,
+                ),
+                termination_policy=TerminationPolicy(
+                    cooperative_grace_seconds=request.cooperative_shutdown_seconds,
+                    term_grace_seconds=request.term_grace_seconds,
+                    kill_grace_seconds=request.kill_reap_grace_seconds,
+                    wait_timeout_seconds=request.kill_reap_grace_seconds,
                 ),
             )
             result = frame.get("result")

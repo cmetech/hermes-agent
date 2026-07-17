@@ -45,7 +45,10 @@ upstream_changes:
   upstream_candidate: true
   merge_guidance: Reconcile ToolRegistry generation/dispatch behavior, PluginContext
     facade construction, caller-driven worker cancellation/lifeline cleanup, and
-    aggregate worker-tree resource limits before replaying this commit.
+    aggregate worker-tree resource limits before replaying this commit. Preserve
+    the bounded per-call provider-attempt override, configurable cooperative/TERM/KILL
+    termination policy, and semantic-progress framing that excludes stderr so a
+    workflow scheduler can remain the sole retry and lifecycle authority.
   removal_condition: Remove when Hermes upstream exposes a trusted-plugin agent runner
     with isolated name-scoped registry execution.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

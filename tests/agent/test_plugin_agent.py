@@ -22,7 +22,7 @@ from agent.plugin_agent import (
     _exchange_worker,
 )
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
-from tools.managed_process import ProcessResourceLimits
+from tools.managed_process import ProcessResourceLimits, TerminationPolicy
 from tools.registry import ToolRegistry
 
 
@@ -163,6 +163,11 @@ def test_plugin_runner_returns_usage_without_exposing_credentials(monkeypatch) -
         (PluginAgentRunRequest(prompt=""), "prompt"),
         (PluginAgentRunRequest(prompt="x", max_iterations=0), "max_iterations"),
         (PluginAgentRunRequest(prompt="x", max_iterations=1.5), "max_iterations"),
+        (PluginAgentRunRequest(prompt="x", max_api_attempts=0), "API attempts"),
+        (
+            PluginAgentRunRequest(prompt="x", cooperative_shutdown_seconds=0),
+            "cooperative shutdown",
+        ),
         (PluginAgentRunRequest(prompt="x", idle_timeout_seconds=0), "idle"),
         (PluginAgentRunRequest(prompt="x", idle_timeout_seconds=float("nan")), "idle"),
         (PluginAgentRunRequest(prompt="x", wall_timeout_seconds=float("inf")), "wall"),
@@ -332,6 +337,7 @@ def test_worker_installs_fail_closed_dangerous_approval(monkeypatch) -> None:
             self.session_cache_write_tokens = 0
 
         def run_conversation(self, prompt, conversation_history=None):
+            assert self._api_max_retries == 2
             callback = _get_approval_callback()
             assert callback is not None
             assert callback("rm -rf /tmp/example", "dangerous") == "deny"
@@ -349,7 +355,11 @@ def test_worker_installs_fail_closed_dangerous_approval(monkeypatch) -> None:
     result = worker._run({
         "plugin_id": "test-plugin",
         "request": dataclasses.asdict(
-            PluginAgentRunRequest(prompt="attempt dangerous command", allowed_tools=())
+            PluginAgentRunRequest(
+                prompt="attempt dangerous command",
+                allowed_tools=(),
+                max_api_attempts=2,
+            )
         ),
     })
 
@@ -476,3 +486,28 @@ def test_worker_stderr_is_never_exposed_to_plugin() -> None:
         )
 
     assert secret not in str(exc_info.value)
+
+
+@pytest.mark.live_system_guard_bypass
+def test_worker_stderr_does_not_reset_semantic_idle_deadline() -> None:
+    code = (
+        "import sys,time;sys.stdin.readline();"
+        "\nwhile True:"
+        "\n sys.stderr.write('diagnostic\\n');sys.stderr.flush();time.sleep(0.03)"
+    )
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="idle timeout"):
+        _exchange_worker(
+            {"protocol_version": 1, "type": "run"},
+            workdir=None,
+            idle_timeout_seconds=0.2,
+            wall_timeout_seconds=2,
+            worker_argv=[sys.executable, "-c", code],
+            termination_policy=TerminationPolicy(
+                cooperative_grace_seconds=0.05,
+                term_grace_seconds=0.1,
+                kill_grace_seconds=0.2,
+                wait_timeout_seconds=0.2,
+            ),
+        )
+    assert time.monotonic() - started < 1

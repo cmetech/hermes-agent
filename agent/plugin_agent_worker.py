@@ -202,6 +202,7 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 session_db=session_db,
                 clarify_callback=clarify,
             )
+            agent._api_max_retries = request.max_api_attempts
             _active_agent = agent
             if _cancel_event.is_set():
                 agent._interrupt_requested = True
