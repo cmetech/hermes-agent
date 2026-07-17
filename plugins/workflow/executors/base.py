@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import time
 from typing import Any, Callable, Mapping, Protocol
 
-from plugins.workflow.models import WorkflowNode
+from plugins.workflow.models import DeadlineBudget, WorkflowNode
 from plugins.workflow.store import ArtifactRef
+from tools.managed_process import ProcessResourceLimits, TerminationPolicy
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,21 @@ class NodeExecutionContext:
         default_factory=dict
     )
     operator_scope: str = "local"
+    resource_limits: ProcessResourceLimits = field(
+        default_factory=ProcessResourceLimits
+    )
+    deadline_budget: DeadlineBudget | None = None
+    max_provider_attempts: int = 5
+    cancellation_reason: Callable[[], str | None] | None = None
+    monotonic: Callable[[], float] = time.monotonic
+    termination_policy: TerminationPolicy = field(
+        default_factory=lambda: TerminationPolicy(
+            cooperative_grace_seconds=5,
+            term_grace_seconds=5,
+            kill_grace_seconds=2,
+            wait_timeout_seconds=2,
+        )
+    )
 
 
 @dataclass(frozen=True)

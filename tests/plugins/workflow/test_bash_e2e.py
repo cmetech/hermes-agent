@@ -65,6 +65,7 @@ def test_two_dependent_bash_nodes_execute_and_persist_artifacts(
         "node_claimed",
         "node_started",
         "node_succeeded",
+        "node_ready",
         "node_claimed",
         "node_started",
         "node_succeeded",
@@ -104,7 +105,14 @@ def test_timeout_terminates_the_bash_process_tree(tmp_path, workflow_writer):
         workflow_writer(
             tmp_path / "package",
             name="timeout-dag",
-            nodes=[{"id": "wait", "bash": "sleep 2 &", "timeout": 0.1}],
+            nodes=[
+                {
+                    "id": "wait",
+                    "bash": "sleep 2 &",
+                    "timeout": 0.1,
+                    "retry": {"max_attempts": 1},
+                }
+            ],
         )
     )
     store = RunStore(tmp_path / "home")
@@ -154,9 +162,13 @@ def test_cancel_stops_a_running_bash_process(tmp_path, workflow_writer):
     )
     store = RunStore(tmp_path / "home")
     admitted = _start(store, package)
-    thread = threading.Thread(
-        target=RunScheduler(store).advance, args=(admitted.run_id,)
+    scheduler = RunScheduler(
+        store,
+        cooperative_shutdown_seconds=0.1,
+        term_grace_seconds=0.5,
+        kill_reap_grace_seconds=0.5,
     )
+    thread = threading.Thread(target=scheduler.advance, args=(admitted.run_id,))
     thread.start()
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:

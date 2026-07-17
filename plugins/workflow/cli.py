@@ -25,6 +25,7 @@ from plugins.workflow.discovery import discover_workflows
 from plugins.workflow.models import (
     ValidationIssue,
     WorkflowPackage,
+    WorkflowRuntimeConfig,
     WorkflowValidationError,
 )
 from plugins.workflow.schema import load_workflow, validate_package
@@ -38,6 +39,7 @@ from plugins.workflow.trust import (
     build_risk_summary,
     compute_package_digest,
 )
+from tools.managed_process import ProcessResourceLimits
 
 
 def _compat_dict(report: CompatibilityReport) -> dict[str, object]:
@@ -554,14 +556,91 @@ def _cmd_untrust(args: argparse.Namespace) -> int:
     return 0
 
 
-def _store(args: argparse.Namespace) -> RunStore:
-    return RunStore(args.hermes_home)
+def _runtime_config(
+    hermes_home: str | Path,
+    *,
+    sidecar: Mapping[str, object] | None = None,
+) -> WorkflowRuntimeConfig:
+    path = Path(hermes_home) / "config.yaml"
+    raw: object = {}
+    if path.is_file():
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("config.yaml must contain a mapping")
+    plugins = raw.get("plugins", {})
+    if not isinstance(plugins, Mapping):
+        raise ValueError("config.yaml plugins section must contain a mapping")
+    entries = plugins.get("entries", {})
+    if not isinstance(entries, Mapping):
+        raise ValueError("config.yaml plugin entries must contain a mapping")
+    entry = entries.get("workflow", {})
+    if not isinstance(entry, Mapping):
+        raise ValueError("workflow plugin entry must contain a mapping")
+    workflow = entry.get("runtime", {})
+    if not isinstance(workflow, Mapping):
+        raise ValueError("workflow plugin runtime config must contain a mapping")
+    policy = sidecar or {}
+    limits = policy.get("limits", {}) if isinstance(policy, Mapping) else {}
+    resources = policy.get("resource_limits", {}) if isinstance(policy, Mapping) else {}
+    if not isinstance(limits, Mapping) or not isinstance(resources, Mapping):
+        raise ValueError("workflow sidecar limits must contain mappings")
+    return WorkflowRuntimeConfig.from_mapping(
+        workflow,
+        sidecar_limits=limits,
+        sidecar_resources=resources,
+    )
+
+
+def _store(
+    args: argparse.Namespace, runtime: WorkflowRuntimeConfig | None = None
+) -> RunStore:
+    config = runtime or _runtime_config(args.hermes_home)
+    return RunStore(
+        args.hermes_home,
+        max_executing_runs=config.max_executing_runs,
+        max_queued_runs=config.max_queued_runs,
+        max_paused_runs=config.max_paused_runs,
+        max_nonterminal_runs=config.max_nonterminal_runs,
+        max_start_requests_per_minute=config.max_start_requests_per_minute,
+        max_total_workers=config.max_total_workers,
+    )
+
+
+def _scheduler(
+    store: RunStore,
+    config: WorkflowRuntimeConfig,
+    *,
+    agent_runner=None,
+    profile_name: str = "default",
+) -> RunScheduler:
+    return RunScheduler(
+        store,
+        agent_runner=agent_runner,
+        profile_name=profile_name,
+        max_parallel_nodes=config.max_parallel_nodes,
+        heartbeat_seconds=config.heartbeat_seconds,
+        lease_seconds=config.lease_seconds,
+        ai_idle_timeout_seconds=config.ai_idle_timeout_seconds,
+        ai_wall_timeout_seconds=config.ai_wall_timeout_seconds,
+        provider_request_timeout_seconds=config.provider_request_timeout_seconds,
+        subprocess_timeout_seconds=config.subprocess_timeout_seconds,
+        default_max_attempts=config.combined_retries,
+        cooperative_shutdown_seconds=config.cooperative_shutdown_seconds,
+        term_grace_seconds=config.term_grace_seconds,
+        kill_reap_grace_seconds=config.kill_reap_grace_seconds,
+        resource_limits=ProcessResourceLimits(
+            max_rss_bytes=config.process_tree_rss_bytes,
+            max_cpu_seconds=config.process_tree_cpu_seconds,
+            max_descendants=config.max_descendants,
+        ),
+    )
 
 
 def _cmd_run(
     args: argparse.Namespace, *, agent_runner=None, profile_name="default"
 ) -> int:
     package = _resolve(args, args.name)
+    runtime = _runtime_config(args.hermes_home, sidecar=package.sidecar)
     digest = compute_package_digest(package)
     if WorkflowTrustStore(args.hermes_home).check(digest.sha256) != "trusted":
         print(
@@ -569,7 +648,7 @@ def _cmd_run(
             file=sys.stderr,
         )
         return 1
-    store = _store(args)
+    store = _store(args, runtime)
     prepared = store.prepare_run_snapshot(
         package, values={"arguments": args.arguments} if args.arguments else None
     )
@@ -595,8 +674,11 @@ def _cmd_run(
         _emit(payload, as_json=args.json)
         return 1
     if admitted.disposition == "created" and not args.no_wait:
-        RunScheduler(
-            store, agent_runner=agent_runner, profile_name=profile_name
+        _scheduler(
+            store,
+            runtime,
+            agent_runner=agent_runner,
+            profile_name=profile_name,
         ).advance(admitted.run_id)
     payload = store.get_run_status(admitted.run_id)
     payload["action"] = "run"
@@ -629,11 +711,15 @@ def _cmd_events(args: argparse.Namespace) -> int:
 def _cmd_resume(
     args: argparse.Namespace, *, agent_runner=None, profile_name="default"
 ) -> int:
-    store = _store(args)
+    runtime = _runtime_config(args.hermes_home)
+    store = _store(args, runtime)
     store.resume_run(args.run_id)
-    RunScheduler(store, agent_runner=agent_runner, profile_name=profile_name).advance(
-        args.run_id
-    )
+    _scheduler(
+        store,
+        runtime,
+        agent_runner=agent_runner,
+        profile_name=profile_name,
+    ).advance(args.run_id)
     _emit(store.get_run_status(args.run_id), as_json=args.json)
     return 0
 

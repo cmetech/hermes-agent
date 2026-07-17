@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from plugins import workflow as workflow_plugin
-from plugins.workflow.cli import register_cli
+from plugins.workflow.cli import _runtime_config, register_cli
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
 from plugins.workflow.trust import build_risk_summary, compute_package_digest
@@ -45,6 +45,24 @@ def test_plugin_registers_only_one_cli_command():
     workflow_plugin.register(ctx)
     assert len(ctx.calls) == 1
     assert ctx.calls[0]["name"] == "workflow"
+
+
+def test_runtime_limits_load_from_plugin_entry_without_new_root_config(tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "config.yaml").write_text(
+        "plugins:\n"
+        "  entries:\n"
+        "    workflow:\n"
+        "      runtime:\n"
+        "        max_parallel_nodes: 2\n"
+        "        max_total_workers: 3\n"
+    )
+
+    config = _runtime_config(profile)
+
+    assert config.max_parallel_nodes == 2
+    assert config.max_total_workers == 3
 
 
 def test_cli_module_has_no_agent_provider_network_or_mcp_runtime_imports():

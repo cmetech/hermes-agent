@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections import deque
 from collections.abc import Mapping
+import math
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -126,7 +127,8 @@ _SAFE_NAME = re.compile(r"^[^\s/\\]+$")
 _WHEN_REFERENCE = re.compile(r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*", re.UNICODE)
 _WHEN_CLAUSE = (
     r"\$[\w.:-]+\.output(?:\.[\w.-]+)*\s*"
-    r"(?:==|!=|<=|>=|<|>)\s*(?:'[^']*'|\"[^\"]*\")"
+    r"(?:==|!=|<=|>=|<|>)\s*"
+    r"(?:'[^']*'|\"[^\"]*\"|-?(?:\d+(?:\.\d*)?|\.\d+))"
 )
 _WHEN_EXPRESSION = re.compile(
     rf"^\s*{_WHEN_CLAUSE}(?:\s*(?:&&|\|\|)\s*{_WHEN_CLAUSE})*\s*$",
@@ -176,6 +178,8 @@ def _string(value: Any, path: str, *, allow_empty: bool = False) -> str:
 def _positive_number(value: Any, path: str, *, allow_zero: bool = False) -> None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         _fail(path, "expected_number", f"{path} must be a number")
+    if not math.isfinite(float(value)):
+        _fail(path, "invalid_bound", f"{path} must be finite")
     if value < 0 or (not allow_zero and value == 0):
         _fail(
             path,

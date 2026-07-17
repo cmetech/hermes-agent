@@ -167,6 +167,23 @@ class AgentNodeExecutor:
                         )
 
         try:
+            wall_timeout = (
+                context.deadline_budget.remaining_wall(context.monotonic())
+                if context.deadline_budget is not None
+                else float(context.timeout_seconds)
+            )
+            idle_timeout = min(
+                context.deadline_budget.idle_seconds
+                if context.deadline_budget is not None
+                else float(node.options.get("idle_timeout", 300)),
+                wall_timeout,
+            )
+            provider_timeout = min(
+                context.deadline_budget.provider_seconds
+                if context.deadline_budget is not None
+                else 300.0,
+                wall_timeout,
+            )
             request = PluginAgentRunRequest(
                 prompt=self._prompt(context),
                 provider=node.options.get("provider")
@@ -180,12 +197,30 @@ class AgentNodeExecutor:
                 skills=(),
                 workdir=context.run_directory,
                 max_iterations=90,
-                idle_timeout_seconds=float(node.options.get("idle_timeout", 300)),
-                wall_timeout_seconds=1800,
-                provider_request_timeout_seconds=300,
+                max_api_attempts=context.max_provider_attempts,
+                idle_timeout_seconds=idle_timeout,
+                wall_timeout_seconds=wall_timeout,
+                provider_request_timeout_seconds=provider_timeout,
+                max_process_tree_rss_bytes=context.resource_limits.max_rss_bytes,
+                max_process_tree_cpu_seconds=context.resource_limits.max_cpu_seconds,
+                max_descendants=context.resource_limits.max_descendants,
+                cooperative_shutdown_seconds=(
+                    context.termination_policy.cooperative_grace_seconds
+                ),
+                term_grace_seconds=context.termination_policy.term_grace_seconds,
+                kill_reap_grace_seconds=context.termination_policy.kill_grace_seconds,
             )
-            result = self.agent_runner.run(request)
-        except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+            result = self.agent_runner.run(
+                request,
+                is_cancelled=context.is_cancelled,
+            )
+        except PermissionError as exc:
+            return self._failure("authorization", str(exc))
+        except OSError as exc:
+            return self._failure("network_error", str(exc))
+        except ValueError as exc:
+            return self._failure("validation", str(exc))
+        except RuntimeError as exc:
             return self._failure("agent_execution_failed", str(exc))
 
         metadata: dict[str, object] = {
@@ -197,16 +232,69 @@ class AgentNodeExecutor:
             "cache_fingerprint": fingerprint,
             "warnings": warnings,
         }
+        provider_attempts = result.audit.get("provider_attempts")
+        if isinstance(provider_attempts, int) and not isinstance(
+            provider_attempts, bool
+        ):
+            metadata["provider_attempts"] = max(0, provider_attempts)
         if result.status == "paused":
             metadata["pending_interaction"] = dict(result.pending_interaction or {})
             return NodeExecutionResult("paused", metadata=metadata)
         if result.status == "cancelled":
-            return NodeExecutionResult("cancelled", metadata=metadata)
+            reason = (
+                context.cancellation_reason()
+                if context.cancellation_reason is not None
+                else "cancelled"
+            )
+            return NodeExecutionResult(
+                "interrupted" if reason == "shutdown" else "cancelled",
+                error_code=reason or "cancelled",
+                metadata=metadata,
+            )
         if result.status != "completed":
+            failure_kind = str(result.audit.get("failure_kind", "")).lower()
+            if (
+                "unknown_side_effect" in failure_kind
+                or "outcome_unknown" in failure_kind
+            ):
+                error_code = "unknown_side_effect"
+            elif "timeout" in failure_kind or "stall" in failure_kind:
+                error_code = "provider_timeout"
+            elif "resource_limit" in failure_kind:
+                error_code = "resource_limit"
+            elif "rate" in failure_kind and "limit" in failure_kind:
+                error_code = "rate_limit"
+            elif "credit" in failure_kind:
+                error_code = "credit_exhausted"
+            elif "authentic" in failure_kind:
+                error_code = "authentication"
+            elif "permission" in failure_kind or "authoriz" in failure_kind:
+                error_code = "authorization"
+            elif "value" in failure_kind or "validation" in failure_kind:
+                error_code = "validation"
+            elif any(part in failure_kind for part in ("network", "connection", "eof")):
+                error_code = "network_disconnect"
+            else:
+                error_code = "agent_failed"
+            if (
+                error_code
+                in {
+                    "provider_timeout",
+                    "rate_limit",
+                    "network_disconnect",
+                }
+                and "provider_attempts" not in metadata
+            ):
+                # The host loop does not currently expose its exact retry
+                # counter. Charge the full granted retry allowance so the
+                # workflow and provider layers can never multiply attempts.
+                metadata["provider_attempts"] = max(
+                    0, context.max_provider_attempts - 1
+                )
             return NodeExecutionResult(
                 "failed",
                 (),
-                "agent_failed",
+                error_code,
                 "isolated agent execution failed",
                 metadata,
             )

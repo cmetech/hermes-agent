@@ -6,11 +6,14 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
 import threading
+import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,6 +37,10 @@ class StorageQuotaError(RuntimeError):
     pass
 
 
+class JournalRecoveryError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class NodeClaim:
     run_id: str
@@ -53,6 +60,34 @@ class ArtifactRef:
 
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
+_PROJECTION_STATUSES = {
+    "queued",
+    "running",
+    "waiting_retry",
+    "paused",
+    "interrupted",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "abandoned",
+}
+_NODE_STATES = {
+    "pending",
+    "ready",
+    "claimed",
+    "running",
+    "waiting_retry",
+    "paused",
+    "interrupted",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "skipped",
+}
+_SECRET_DIAGNOSTIC = re.compile(
+    r"(?i)(?:bearer\s+|(?:api[_ -]?key|token|password|secret)\s*[:=]\s*)"
+    r"[^\s,;]+|\bsk-[A-Za-z0-9_-]{8,}\b"
+)
 
 
 def _utc_now() -> str:
@@ -61,6 +96,21 @@ def _utc_now() -> str:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _projection_digest(projection: Mapping[str, object]) -> str:
+    encoded = json.dumps(
+        projection, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return _sha256(encoded)
+
+
+def _recovery_fields(projection: Mapping[str, object]) -> dict[str, object]:
+    snapshot = json.loads(json.dumps(projection, sort_keys=True, ensure_ascii=False))
+    return {
+        "projection": snapshot,
+        "projection_sha256": _projection_digest(snapshot),
+    }
 
 
 def _sanitize(value: object, *, key: str = "") -> object:
@@ -81,6 +131,12 @@ def _sanitize(value: object, *, key: str = "") -> object:
     if value is None or isinstance(value, bool | int | float):
         return value
     return str(value)[:2000]
+
+
+def _sanitize_diagnostic(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return _SECRET_DIAGNOSTIC.sub("[REDACTED]", value)[:2000]
 
 
 def _atomic_json(path: Path, value: object) -> None:
@@ -117,6 +173,7 @@ class RunStore:
         max_total_workers: int = 4,
         max_run_bytes: int = 512 * 1024 * 1024,
         max_profile_bytes: int = 2 * 1024 * 1024 * 1024,
+        max_journal_bytes: int | None = None,
     ) -> None:
         self.hermes_home = Path(hermes_home).resolve()
         self.root = self.hermes_home / "workflows"
@@ -129,6 +186,11 @@ class RunStore:
         self.max_input_bytes = max_input_bytes
         self.max_run_bytes = max_run_bytes
         self.max_profile_bytes = max_profile_bytes
+        self.max_journal_bytes = (
+            max_journal_bytes
+            if max_journal_bytes is not None
+            else max(1, max_run_bytes // 2)
+        )
         self.limits = {
             "executing": max_executing_runs,
             "queued": max_queued_runs,
@@ -185,6 +247,16 @@ class RunStore:
                         reason_code TEXT,
                         payload_json TEXT NOT NULL DEFAULT '{}'
                     );
+                    CREATE TABLE IF NOT EXISTS worker_claims (
+                        attempt_id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL,
+                        node_id TEXT NOT NULL,
+                        owner_id TEXT NOT NULL,
+                        lease_expires_at TEXT NOT NULL,
+                        UNIQUE(run_id, node_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS worker_claims_lease
+                    ON worker_claims(lease_expires_at);
                     """
                 )
                 columns = {
@@ -210,6 +282,7 @@ class RunStore:
                         connection.execute(statement)
             with workflow_lock(self.admission_lock):
                 self._reconcile_admission()
+                self._reconcile_worker_claims()
             self._initialized = True
 
     @staticmethod
@@ -402,6 +475,57 @@ class RunStore:
             }
             for row in rows
         )
+
+    def _reconcile_worker_claims(self) -> None:
+        """Converge the capacity ledger with durable run projections."""
+        active: dict[str, tuple[str, str, str, str]] = {}
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id, run_directory FROM runs "
+                "WHERE admission_state='published' AND status IN "
+                "('running','waiting_retry','paused','interrupted')"
+            ).fetchall()
+        for row in rows:
+            try:
+                projection = json.loads(
+                    (Path(row["run_directory"]) / "run.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+            except (OSError, json.JSONDecodeError):
+                continue
+            for node_id, node in projection.get("nodes", {}).items():
+                claim = node.get("claim") if isinstance(node, dict) else None
+                if not isinstance(claim, dict):
+                    continue
+                attempt_id = str(claim.get("attempt_id", ""))
+                if attempt_id:
+                    active[attempt_id] = (
+                        row["run_id"],
+                        str(node_id),
+                        str(claim.get("owner_id", "recovered")),
+                        str(claim.get("lease_expires_at", _utc_now())),
+                    )
+        with self._connect() as connection:
+            if active:
+                placeholders = ",".join("?" for _ in active)
+                connection.execute(
+                    f"DELETE FROM worker_claims WHERE attempt_id NOT IN ({placeholders})",
+                    tuple(active),
+                )
+            else:
+                connection.execute("DELETE FROM worker_claims")
+            for attempt_id, values in active.items():
+                connection.execute(
+                    "INSERT INTO worker_claims "
+                    "(attempt_id, run_id, node_id, owner_id, lease_expires_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(attempt_id) DO UPDATE SET "
+                    "run_id=excluded.run_id, node_id=excluded.node_id, "
+                    "owner_id=excluded.owner_id, "
+                    "lease_expires_at=excluded.lease_expires_at",
+                    (attempt_id, *values),
+                )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database, timeout=5.0, isolation_level=None)
@@ -600,6 +724,47 @@ class RunStore:
                 f"free_disk_watermark not met: {usage.free} < {watermark}"
             )
 
+    @staticmethod
+    def _directory_bytes(directory: Path) -> int:
+        return sum(
+            path.stat().st_size for path in directory.rglob("*") if path.is_file()
+        )
+
+    def _ensure_run_capacity(
+        self,
+        directory: Path,
+        projection: Mapping[str, object],
+        *,
+        journal_reserve_bytes: int = 0,
+    ) -> None:
+        """Reserve enough durable space before allocating a worker."""
+        projection_bytes = len(
+            json.dumps(projection, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        )
+        node_count = len(projection.get("nodes", {}))
+        # One attempt can claim/start/complete, update run state, and resolve a
+        # full downstream ready layer. Heartbeats are compact deltas.
+        event_reserve = (node_count + 8) * (
+            projection_bytes + 2048
+        ) + journal_reserve_bytes
+        journal_bytes = (directory / "events.jsonl").stat().st_size
+        if journal_bytes + event_reserve > self.max_journal_bytes:
+            raise StorageQuotaError(
+                "event_journal_quota would be exceeded before worker allocation"
+            )
+        run_bytes = self._directory_bytes(directory)
+        output_reserve = 1024 * 1024
+        required = event_reserve + output_reserve
+        if run_bytes + required > self.max_run_bytes:
+            raise StorageQuotaError(
+                "run_storage_quota would be exceeded before worker allocation"
+            )
+        profile_bytes = self._directory_bytes(self.runs_root)
+        if profile_bytes + required > self.max_profile_bytes:
+            raise StorageQuotaError(
+                "profile_storage_quota would be exceeded before worker allocation"
+            )
+
     def clone_prepared_snapshot(
         self, snapshot: PreparedRunSnapshot
     ) -> PreparedRunSnapshot:
@@ -766,9 +931,7 @@ class RunStore:
                 disposition = "queued"
                 blocked_by = active["run_id"]
                 queue_position = counts.get("queued", 0) + 1
-            elif counts.get("running", 0) >= min(
-                self.limits["executing"], self.limits["workers"]
-            ):
+            elif counts.get("running", 0) >= self.limits["executing"]:
                 connection.rollback()
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
                 return RunAdmissionResult(None, "rejected", "executing_capacity")
@@ -885,6 +1048,7 @@ class RunStore:
             "attempt_id": None,
             "event_type": "run_admitted",
             "payload": {"disposition": disposition, "status": status},
+            **_recovery_fields(projection),
         }
         _atomic_json(run_directory / "run.json", projection)
         with (run_directory / "events.jsonl").open("w", encoding="utf-8") as handle:
@@ -927,12 +1091,185 @@ class RunStore:
     def load_run(
         self, run_id: str, *, operator_scope: str | None = None
     ) -> dict[str, object]:
-        path = self.run_directory(run_id, operator_scope=operator_scope) / "run.json"
+        directory = self.run_directory(run_id, operator_scope=operator_scope)
+        path = directory / "run.json"
         with workflow_lock(self._run_lock_path(run_id)):
+            # Cleanup first atomically moves a run out of the published tree,
+            # then removes its database row after deleting the quarantine copy.
+            # A reader may have resolved the row before that move.  Treat the
+            # vanished directory as removal instead of trying to rebuild it.
+            if not directory.is_dir():
+                raise KeyError(run_id)
             try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except FileNotFoundError as exc:
-                raise KeyError(run_id) from exc
+                projection = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                projection = None
+            except (json.JSONDecodeError, OSError):
+                projection = None
+            if self._valid_projection(projection, run_id=run_id):
+                journal_current = self._journal_matches_projection(
+                    directory, projection=projection, run_id=run_id
+                )
+                if journal_current:
+                    return projection
+            if path.exists():
+                quarantine = directory / f"run.json.corrupt-{uuid.uuid4().hex}"
+                os.replace(path, quarantine)
+            rebuilt = self._rebuild_projection(directory, run_id=run_id)
+            _atomic_json(path, rebuilt)
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                    (rebuilt["status"], rebuilt["updated_at"], run_id),
+                )
+            return rebuilt
+
+    def _journal_matches_projection(
+        self,
+        directory: Path,
+        *,
+        projection: Mapping[str, object],
+        run_id: str,
+    ) -> bool:
+        """Validate the durable journal head without replaying on every read."""
+        try:
+            lines = (
+                (directory / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            )
+        except OSError as exc:
+            raise JournalRecoveryError(f"journal unavailable: {exc}") from exc
+        populated = [
+            (number, line) for number, line in enumerate(lines, 1) if line.strip()
+        ]
+        if not populated:
+            raise JournalRecoveryError("journal contains no events")
+        line_number, line = populated[-1]
+        try:
+            latest = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise JournalRecoveryError(
+                f"malformed journal event at line {line_number}"
+            ) from exc
+        if latest.get("run_id") != run_id:
+            raise JournalRecoveryError("journal run identity mismatch")
+        if latest["sequence"] < projection["event_sequence"]:
+            raise JournalRecoveryError("projection is ahead of its journal")
+        if latest["sequence"] > projection["event_sequence"]:
+            return False
+        if "projection_sha256" in latest:
+            snapshot = latest.get("projection")
+            if snapshot is not None:
+                if not self._valid_projection(snapshot, run_id=run_id):
+                    raise JournalRecoveryError("journal head has no valid projection")
+                if latest["projection_sha256"] != _projection_digest(snapshot):
+                    raise JournalRecoveryError("journal projection digest mismatch")
+            return latest.get("projection_sha256") == _projection_digest(projection)
+        return True
+
+    @staticmethod
+    def _valid_projection(value: object, *, run_id: str) -> bool:
+        if not isinstance(value, dict) or value.get("run_id") != run_id:
+            return False
+        if value.get("status") not in _PROJECTION_STATUSES:
+            return False
+        for field in ("event_sequence", "state_version"):
+            if (
+                isinstance(value.get(field), bool)
+                or not isinstance(value.get(field), int)
+                or value[field] < 1
+            ):
+                return False
+        if not isinstance(value.get("artifacts"), list) or not isinstance(
+            value.get("warnings"), list
+        ):
+            return False
+        nodes = value.get("nodes")
+        if not isinstance(nodes, dict) or not nodes:
+            return False
+        for node_id, node in nodes.items():
+            if (
+                not isinstance(node_id, str)
+                or not isinstance(node, dict)
+                or node.get("id") != node_id
+                or node.get("state") not in _NODE_STATES
+                or not isinstance(node.get("depends_on"), list)
+                or not isinstance(node.get("attempts"), list)
+            ):
+                return False
+            claim = node.get("claim")
+            if claim is not None and (
+                not isinstance(claim, dict)
+                or not isinstance(claim.get("attempt_id"), str)
+                or not isinstance(claim.get("lease_expires_at"), str)
+            ):
+                return False
+        return True
+
+    def _rebuild_projection(self, directory: Path, *, run_id: str) -> dict[str, object]:
+        latest = None
+        expected_sequence = 1
+        try:
+            lines = (
+                (directory / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            )
+        except OSError as exc:
+            raise JournalRecoveryError(f"journal unavailable: {exc}") from exc
+        for line_number, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise JournalRecoveryError(
+                    f"malformed journal event at line {line_number}"
+                ) from exc
+            if event.get("sequence") != expected_sequence:
+                raise JournalRecoveryError(
+                    f"journal sequence gap: expected {expected_sequence}, "
+                    f"received {event.get('sequence')}"
+                )
+            if event.get("run_id") != run_id:
+                raise JournalRecoveryError("journal run identity mismatch")
+            snapshot = event.get("projection")
+            checksum = event.get("projection_sha256")
+            if self._valid_projection(snapshot, run_id=run_id):
+                if snapshot["event_sequence"] != expected_sequence:
+                    raise JournalRecoveryError("journal projection sequence mismatch")
+                if checksum != _projection_digest(snapshot):
+                    raise JournalRecoveryError("journal projection digest mismatch")
+                latest = snapshot
+            elif event.get("event_type") == "node_heartbeat" and latest is not None:
+                node = latest["nodes"].get(event.get("node_id"))
+                claim = node.get("claim") if isinstance(node, dict) else None
+                if not isinstance(claim, dict) or claim.get("attempt_id") != event.get(
+                    "attempt_id"
+                ):
+                    raise JournalRecoveryError("heartbeat claim identity mismatch")
+                payload = event.get("payload")
+                if not isinstance(payload, dict):
+                    raise JournalRecoveryError("heartbeat payload is malformed")
+                required = {
+                    "heartbeat_at",
+                    "heartbeat_monotonic",
+                    "lease_expires_at",
+                    "lease_seconds",
+                }
+                if not required <= payload.keys():
+                    raise JournalRecoveryError("heartbeat payload is incomplete")
+                claim.update({key: payload[key] for key in required})
+                latest["event_sequence"] = expected_sequence
+                latest["state_version"] = int(latest["state_version"]) + 1
+                latest["updated_at"] = event.get("timestamp")
+                if checksum != _projection_digest(latest):
+                    raise JournalRecoveryError("journal projection digest mismatch")
+            else:
+                raise JournalRecoveryError(
+                    f"journal event {expected_sequence} has no valid recovery data"
+                )
+            expected_sequence += 1
+        if latest is None:
+            raise JournalRecoveryError("journal contains no recoverable projection")
+        return latest
 
     def try_promote_run(self, run_id: str) -> bool:
         directory = self.run_directory(run_id)
@@ -954,9 +1291,7 @@ class RunStore:
                 running = connection.execute(
                     "SELECT COUNT(*) FROM runs WHERE status='running'"
                 ).fetchone()[0]
-                if active or running >= min(
-                    self.limits["executing"], self.limits["workers"]
-                ):
+                if active or running >= self.limits["executing"]:
                     connection.rollback()
                     return False
                 projection = json.loads((directory / "run.json").read_text())
@@ -987,34 +1322,24 @@ class RunStore:
         node_id: str | None = None,
         attempt_id: str | None = None,
         projection_updates: Mapping[str, object] | None = None,
+        lock_timeout_seconds: float = 5.0,
     ) -> dict[str, object]:
         directory = self.run_directory(run_id)
-        with workflow_lock(self._run_lock_path(run_id)):
+        with workflow_lock(
+            self._run_lock_path(run_id), timeout_seconds=lock_timeout_seconds
+        ):
             projection = json.loads((directory / "run.json").read_text())
-            sequence = int(projection["event_sequence"]) + 1
-            now = _utc_now()
-            event = {
-                "schema_version": 1,
-                "sequence": sequence,
-                "timestamp": now,
-                "run_id": run_id,
-                "node_id": node_id,
-                "attempt_id": attempt_id,
-                "event_type": event_type,
-                "payload": _sanitize(dict(payload or {})),
-            }
-            with (directory / "events.jsonl").open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, sort_keys=True) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            projection["event_sequence"] = sequence
-            projection["state_version"] = int(projection["state_version"]) + 1
-            projection["updated_at"] = now
             if event_type == "semantic_progress":
-                projection["last_semantic_progress_at"] = now
+                projection["last_semantic_progress_at"] = _utc_now()
             projection.update(dict(projection_updates or {}))
-            _atomic_json(directory / "run.json", projection)
-            return event
+            return self._append_locked(
+                directory,
+                projection,
+                event_type,
+                payload,
+                node_id=node_id,
+                attempt_id=attempt_id,
+            )
 
     def tail_events(
         self,
@@ -1036,7 +1361,13 @@ class RunStore:
         selected = tuple(
             event for event in events if int(event["sequence"]) > after_sequence
         )[:limit]
-        return tuple(_sanitize(event) for event in selected)
+        public_events = []
+        for event in selected:
+            event = dict(event)
+            event.pop("projection", None)
+            event.pop("projection_sha256", None)
+            public_events.append(_sanitize(event))
+        return tuple(public_events)
 
     def list_runs(
         self,
@@ -1082,6 +1413,13 @@ class RunStore:
             if isinstance(node, dict)
         )
         status = str(run["status"])
+        retry_times = [
+            node["next_attempt_at"]
+            for node in node_values
+            if isinstance(node, dict)
+            and node.get("state") == "waiting_retry"
+            and isinstance(node.get("next_attempt_at"), str)
+        ]
         health = (
             "terminal"
             if status in {"succeeded", "failed", "cancelled", "abandoned"}
@@ -1112,7 +1450,7 @@ class RunStore:
                 for node in node_values
                 if isinstance(node, dict)
             ),
-            "next_retry_at": None,
+            "next_retry_at": min(retry_times) if retry_times else None,
             "next_actions": self._next_actions(status),
         }
 
@@ -1131,43 +1469,82 @@ class RunStore:
         owner_id: str,
         *,
         lease_seconds: float = 30.0,
+        now: datetime | None = None,
+        monotonic_now: float | None = None,
+        journal_reserve_bytes: int = 0,
     ) -> NodeClaim | None:
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        self._ensure_free_disk()
         directory = self.run_directory(run_id)
-        with workflow_lock(self._run_lock_path(run_id)):
-            projection = json.loads((directory / "run.json").read_text())
-            node = projection["nodes"].get(node_id)
-            if not node or node["state"] != "ready":
-                return None
-            attempt_id = uuid.uuid4().hex
-            expires = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
-            node["state"] = "claimed"
-            node["claim"] = {
-                "owner_id": owner_id,
-                "attempt_id": attempt_id,
-                "lease_expires_at": expires.isoformat(),
-            }
-            node["attempts"].append({"attempt_id": attempt_id, "state": "claimed"})
-            sequence = int(projection["event_sequence"]) + 1
-            now = _utc_now()
-            event = {
-                "schema_version": 1,
-                "sequence": sequence,
-                "timestamp": now,
-                "run_id": run_id,
-                "node_id": node_id,
-                "attempt_id": attempt_id,
-                "event_type": "node_claimed",
-                "payload": {"owner_id": owner_id},
-            }
-            with (directory / "events.jsonl").open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, sort_keys=True) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            projection["event_sequence"] = sequence
-            projection["state_version"] += 1
-            projection["updated_at"] = now
-            _atomic_json(directory / "run.json", projection)
-            return NodeClaim(run_id, node_id, attempt_id, owner_id, expires)
+        with workflow_lock(self.admission_lock):
+            with workflow_lock(self._run_lock_path(run_id)):
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection["nodes"].get(node_id)
+                if not node or node["state"] != "ready":
+                    return None
+                self._ensure_run_capacity(
+                    directory,
+                    projection,
+                    journal_reserve_bytes=journal_reserve_bytes,
+                )
+                connection = self._connect()
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    active_workers = connection.execute(
+                        "SELECT COUNT(*) FROM worker_claims"
+                    ).fetchone()[0]
+                    if active_workers >= self.limits["workers"]:
+                        connection.rollback()
+                        return None
+                    attempt_id = uuid.uuid4().hex
+                    instant = now or datetime.now(timezone.utc)
+                    monotonic_instant = (
+                        float(monotonic_now)
+                        if monotonic_now is not None
+                        else time.monotonic()
+                    )
+                    expires = instant + timedelta(seconds=lease_seconds)
+                    connection.execute(
+                        "INSERT INTO worker_claims "
+                        "(attempt_id, run_id, node_id, owner_id, lease_expires_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (attempt_id, run_id, node_id, owner_id, expires.isoformat()),
+                    )
+                    node["state"] = "claimed"
+                    node["claim"] = {
+                        "owner_id": owner_id,
+                        "attempt_id": attempt_id,
+                        "lease_expires_at": expires.isoformat(),
+                        "heartbeat_at": instant.isoformat(),
+                        "heartbeat_monotonic": monotonic_instant,
+                        "lease_seconds": float(lease_seconds),
+                    }
+                    node["attempts"].append({
+                        "attempt_id": attempt_id,
+                        "state": "claimed",
+                    })
+                    self._append_locked(
+                        directory,
+                        projection,
+                        "node_claimed",
+                        {"owner_id": owner_id},
+                        node_id=node_id,
+                        attempt_id=attempt_id,
+                    )
+                    connection.commit()
+                    return NodeClaim(run_id, node_id, attempt_id, owner_id, expires)
+                except BaseException:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.close()
+
+    def _release_worker_claim(self, attempt_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM worker_claims WHERE attempt_id=?", (attempt_id,)
+            )
 
     def mark_node_started(self, claim: NodeClaim) -> None:
         directory = self.run_directory(claim.run_id)
@@ -1206,7 +1583,10 @@ class RunStore:
         }:
             raise ValueError(f"invalid node completion state: {status}")
         directory = self.run_directory(claim.run_id)
-        with workflow_lock(self._run_lock_path(claim.run_id)):
+        capacity_guard = (
+            workflow_lock(self.admission_lock) if status == "paused" else nullcontext()
+        )
+        with capacity_guard, workflow_lock(self._run_lock_path(claim.run_id)):
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
@@ -1217,12 +1597,28 @@ class RunStore:
                 and status != "cancelled"
             ):
                 raise RuntimeError("stale completion for terminal run")
+            if status == "paused":
+                with self._connect() as connection:
+                    paused = connection.execute(
+                        "SELECT COUNT(*) FROM runs WHERE status='paused' AND run_id<>?",
+                        (claim.run_id,),
+                    ).fetchone()[0]
+                if paused >= self.limits["paused"]:
+                    status = "failed"
+                    error_code = "paused_capacity"
+                    error_message = "profile paused-run capacity is exhausted"
+                    metadata = {
+                        key: value
+                        for key, value in dict(metadata or {}).items()
+                        if key != "pending_interaction"
+                    }
             node["state"] = status
             node.pop("claim", None)
+            safe_error_message = _sanitize_diagnostic(error_message)
             node["attempts"][-1].update({
                 "state": status,
                 "error_code": error_code,
-                "error_message": error_message,
+                "error_message": safe_error_message,
             })
             safe_metadata = dict(_sanitize(dict(metadata or {})))
             safe_metadata.pop("output", None)
@@ -1234,6 +1630,7 @@ class RunStore:
                 "model",
                 "usage",
                 "pending_interaction",
+                "retry_consumed",
             ):
                 if field in safe_metadata:
                     node[field] = safe_metadata[field]
@@ -1264,28 +1661,24 @@ class RunStore:
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
             )
-            if status == "succeeded":
-                for candidate in projection["nodes"].values():
-                    if candidate["state"] != "pending":
-                        continue
-                    if all(
-                        projection["nodes"][dependency]["state"] == "succeeded"
-                        for dependency in candidate["depends_on"]
-                    ):
-                        candidate["state"] = "ready"
             states = {candidate["state"] for candidate in projection["nodes"].values()}
             terminal = None
-            if states <= {"succeeded", "skipped"}:
-                terminal = "succeeded"
-            elif status == "failed":
-                terminal = "failed"
+            if status == "failed":
                 projection["last_error"] = {
                     "code": error_code or "node_failed",
-                    "message": error_message or "node execution failed",
+                    "message": safe_error_message or "node execution failed",
                     "node_id": claim.node_id,
                 }
-            elif status in {"cancelled", "interrupted", "paused"}:
+            if status in {"cancelled", "interrupted", "paused"}:
                 terminal = status
+            elif states and states <= {
+                "succeeded",
+                "failed",
+                "skipped",
+                "cancelled",
+                "interrupted",
+            }:
+                terminal = "failed" if "failed" in states else "succeeded"
             if terminal:
                 projection["status"] = terminal
                 self._append_locked(directory, projection, f"run_{terminal}")
@@ -1295,7 +1688,21 @@ class RunStore:
                         (terminal, projection["updated_at"], claim.run_id),
                     )
             else:
+                if "waiting_retry" in states and not states & {
+                    "ready",
+                    "claimed",
+                    "running",
+                }:
+                    projection["status"] = "waiting_retry"
+                    self._append_locked(directory, projection, "run_retry_waiting")
+                    with self._connect() as connection:
+                        connection.execute(
+                            "UPDATE runs SET status='waiting_retry', updated_at=? "
+                            "WHERE run_id=?",
+                            (projection["updated_at"], claim.run_id),
+                        )
                 _atomic_json(directory / "run.json", projection)
+            self._release_worker_claim(claim.attempt_id)
 
     def _append_locked(
         self,
@@ -1306,9 +1713,18 @@ class RunStore:
         *,
         node_id: str | None = None,
         attempt_id: str | None = None,
-    ) -> None:
+        compact_recovery: bool = False,
+    ) -> dict[str, object]:
         sequence = int(projection["event_sequence"]) + 1
         now = _utc_now()
+        projection["event_sequence"] = sequence
+        projection["state_version"] = int(projection["state_version"]) + 1
+        projection["updated_at"] = now
+        recovery = {"projection_sha256": _projection_digest(projection)}
+        if not compact_recovery:
+            recovery["projection"] = json.loads(
+                json.dumps(projection, sort_keys=True, ensure_ascii=False)
+            )
         event = {
             "schema_version": 1,
             "sequence": sequence,
@@ -1317,16 +1733,400 @@ class RunStore:
             "node_id": node_id,
             "attempt_id": attempt_id,
             "event_type": event_type,
-            "payload": dict(payload or {}),
+            "payload": _sanitize(dict(payload or {})),
+            **recovery,
         }
-        with (directory / "events.jsonl").open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True) + "\n")
+        encoded = json.dumps(event, sort_keys=True) + "\n"
+        journal_path = directory / "events.jsonl"
+        if (
+            journal_path.stat().st_size + len(encoded.encode("utf-8"))
+            > self.max_journal_bytes
+        ):
+            raise StorageQuotaError("event_journal_quota exceeded")
+        with journal_path.open("a", encoding="utf-8") as handle:
+            handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
-        projection["event_sequence"] = sequence
-        projection["state_version"] = int(projection["state_version"]) + 1
-        projection["updated_at"] = now
         _atomic_json(directory / "run.json", projection)
+        return event
+
+    def transition_pending_nodes(
+        self,
+        run_id: str,
+        transitions: Mapping[str, tuple[str, str | None]],
+    ) -> tuple[str, ...]:
+        """Compare-and-set dependency-resolved nodes to ready or skipped."""
+        directory = self.run_directory(run_id)
+        changed = []
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection["status"] != "running":
+                return ()
+            for node_id, (state, warning) in transitions.items():
+                if state not in {"ready", "skipped"}:
+                    raise ValueError(f"invalid dependency transition: {state}")
+                node = projection["nodes"].get(node_id)
+                if not node or node["state"] != "pending":
+                    continue
+                node["state"] = state
+                if warning:
+                    node["skip_reason"] = warning
+                    if warning not in projection["warnings"]:
+                        projection["warnings"].append(warning)
+                self._append_locked(
+                    directory,
+                    projection,
+                    f"node_{state}",
+                    {"reason": warning} if warning else None,
+                    node_id=node_id,
+                )
+                changed.append(node_id)
+        return tuple(changed)
+
+    def finalize_if_complete(self, run_id: str) -> bool:
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection["status"] != "running":
+                return False
+            states = {node["state"] for node in projection["nodes"].values()}
+            if states - {
+                "succeeded",
+                "failed",
+                "skipped",
+                "cancelled",
+                "interrupted",
+            }:
+                return False
+            target = "failed" if "failed" in states else "succeeded"
+            projection["status"] = target
+            self._append_locked(directory, projection, f"run_{target}")
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                    (target, projection["updated_at"], run_id),
+                )
+            return True
+
+    def schedule_retry(
+        self,
+        claim: NodeClaim,
+        *,
+        next_attempt_at: datetime,
+        artifacts: Iterable[ArtifactRef] = (),
+        error_code: str | None = None,
+        error_message: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+        consumed_attempts: int = 1,
+    ) -> None:
+        if next_attempt_at.tzinfo is None:
+            raise ValueError("next_attempt_at must be timezone-aware")
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(self._run_lock_path(claim.run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection["nodes"][claim.node_id]
+            if node.get("claim", {}).get("attempt_id") != claim.attempt_id:
+                raise RuntimeError("stale node completion")
+            if projection["status"] in {"cancelled", "abandoned", "interrupted"}:
+                raise RuntimeError("stale completion for terminal run")
+            node.pop("claim", None)
+            node["state"] = "waiting_retry"
+            node["next_attempt_at"] = next_attempt_at.isoformat()
+            node["retry_consumed"] = consumed_attempts
+            safe_error_message = _sanitize_diagnostic(error_message)
+            node["attempts"][-1].update({
+                "state": "failed",
+                "error_code": error_code,
+                "error_message": safe_error_message,
+                "metadata": _sanitize(dict(metadata or {})),
+            })
+            refs = []
+            for artifact in artifacts:
+                entry = {
+                    "node_id": claim.node_id,
+                    "attempt_id": claim.attempt_id,
+                    "relative_path": artifact.relative_path,
+                    "media_type": artifact.media_type,
+                    "size_bytes": artifact.size_bytes,
+                    "sha256": artifact.sha256,
+                }
+                refs.append(entry)
+                projection["artifacts"].append(entry)
+            active_states = {
+                candidate["state"] for candidate in projection["nodes"].values()
+            }
+            projection["status"] = (
+                "running"
+                if active_states & {"ready", "claimed", "running"}
+                else "waiting_retry"
+            )
+            self._append_locked(
+                directory,
+                projection,
+                "node_retry_scheduled",
+                {
+                    "next_attempt_at": next_attempt_at.isoformat(),
+                    "error_code": error_code,
+                    "artifacts": refs,
+                },
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+            )
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                    (projection["status"], projection["updated_at"], claim.run_id),
+                )
+            self._release_worker_claim(claim.attempt_id)
+
+    def wake_due_retries(
+        self, run_id: str, *, now: datetime | None = None
+    ) -> tuple[str, ...]:
+        instant = now or datetime.now(timezone.utc)
+        directory = self.run_directory(run_id)
+        ready = []
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection["status"] not in {"waiting_retry", "running"}:
+                return ()
+            for node_id, node in projection["nodes"].items():
+                if node["state"] != "waiting_retry":
+                    continue
+                due = datetime.fromisoformat(node["next_attempt_at"])
+                if due > instant:
+                    continue
+                node["state"] = "ready"
+                node.pop("next_attempt_at", None)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "node_retry_ready",
+                    node_id=node_id,
+                )
+                ready.append(node_id)
+            if ready:
+                projection["status"] = "running"
+                self._append_locked(directory, projection, "run_retry_resumed")
+                with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE runs SET status='running', updated_at=? WHERE run_id=?",
+                        (projection["updated_at"], run_id),
+                    )
+        return tuple(ready)
+
+    def renew_claim(
+        self,
+        claim: NodeClaim,
+        *,
+        now: datetime | None = None,
+        monotonic_now: float | None = None,
+        lease_seconds: float = 30.0,
+        heartbeat_interval_seconds: float = 5.0,
+    ) -> bool:
+        if lease_seconds <= 0 or heartbeat_interval_seconds <= 0:
+            raise ValueError("lease and heartbeat intervals must be positive")
+        instant = now or datetime.now(timezone.utc)
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(self._run_lock_path(claim.run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection["nodes"].get(claim.node_id)
+            active = node.get("claim", {}) if node else {}
+            if active.get("attempt_id") != claim.attempt_id:
+                return False
+            heartbeat_at = datetime.fromisoformat(active["heartbeat_at"])
+            utc_elapsed = (instant - heartbeat_at).total_seconds()
+            monotonic_instant = (
+                float(monotonic_now) if monotonic_now is not None else time.monotonic()
+            )
+            previous_monotonic = active.get("heartbeat_monotonic")
+            monotonic_elapsed = (
+                monotonic_instant - float(previous_monotonic)
+                if isinstance(previous_monotonic, int | float)
+                else utc_elapsed
+            )
+            active_lease_seconds = float(active.get("lease_seconds", lease_seconds))
+            if (
+                utc_elapsed < 0
+                or monotonic_elapsed < 0
+                or abs(utc_elapsed - monotonic_elapsed) > active_lease_seconds
+                or monotonic_elapsed >= active_lease_seconds
+                or datetime.fromisoformat(active["lease_expires_at"]) <= instant
+            ):
+                return False
+            if utc_elapsed < heartbeat_interval_seconds:
+                return True
+            active["heartbeat_at"] = instant.isoformat()
+            active["heartbeat_monotonic"] = monotonic_instant
+            active["lease_seconds"] = float(lease_seconds)
+            active["lease_expires_at"] = (
+                instant + timedelta(seconds=lease_seconds)
+            ).isoformat()
+            self._append_locked(
+                directory,
+                projection,
+                "node_heartbeat",
+                {
+                    "heartbeat_at": active["heartbeat_at"],
+                    "heartbeat_monotonic": active["heartbeat_monotonic"],
+                    "lease_expires_at": active["lease_expires_at"],
+                    "lease_seconds": active["lease_seconds"],
+                },
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+                compact_recovery=True,
+            )
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE worker_claims SET lease_expires_at=? WHERE attempt_id=?",
+                    (active["lease_expires_at"], claim.attempt_id),
+                )
+            return True
+
+    def expire_stale_claims(
+        self,
+        run_id: str,
+        *,
+        now: datetime | None = None,
+        monotonic_now: float | None = None,
+    ) -> tuple[str, ...]:
+        instant = now or datetime.now(timezone.utc)
+        monotonic_instant = (
+            float(monotonic_now) if monotonic_now is not None else time.monotonic()
+        )
+        directory = self.run_directory(run_id)
+        expired = []
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection["status"] in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "abandoned",
+            }:
+                return ()
+            for node_id, node in projection["nodes"].items():
+                claim = node.get("claim")
+                if not claim:
+                    continue
+                lease_seconds = float(claim.get("lease_seconds", 30.0))
+                heartbeat_utc = datetime.fromisoformat(claim["heartbeat_at"])
+                utc_elapsed = (instant - heartbeat_utc).total_seconds()
+                heartbeat_monotonic = claim.get("heartbeat_monotonic")
+                monotonic_elapsed = (
+                    monotonic_instant - float(heartbeat_monotonic)
+                    if isinstance(heartbeat_monotonic, int | float)
+                    else utc_elapsed
+                )
+                clock_gap = abs(utc_elapsed - monotonic_elapsed) > lease_seconds
+                if (
+                    datetime.fromisoformat(claim["lease_expires_at"]) > instant
+                    and monotonic_elapsed < lease_seconds
+                    and not clock_gap
+                ):
+                    continue
+                attempt_id = claim["attempt_id"]
+                node.pop("claim", None)
+                node["state"] = "interrupted"
+                node["attempts"][-1].update({
+                    "state": "interrupted",
+                    "error_code": "lease_expired",
+                })
+                projection["status"] = "interrupted"
+                self._append_locked(
+                    directory,
+                    projection,
+                    "node_interrupted",
+                    {"reason": "lease_expired"},
+                    node_id=node_id,
+                    attempt_id=attempt_id,
+                )
+                self._release_worker_claim(attempt_id)
+                expired.append(node_id)
+            if expired:
+                self._append_locked(directory, projection, "run_interrupted")
+                with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE runs SET status='interrupted', updated_at=? WHERE run_id=?",
+                        (projection["updated_at"], run_id),
+                    )
+        return tuple(expired)
+
+    def interrupt_active_claims(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+        lock_timeout_seconds: float = 5.0,
+    ) -> tuple[str, ...]:
+        directory = self.run_directory(run_id)
+        interrupted = []
+        with workflow_lock(
+            self._run_lock_path(run_id), timeout_seconds=lock_timeout_seconds
+        ):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection["status"] in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "abandoned",
+                "paused",
+            }:
+                return ()
+            for node_id, node in projection["nodes"].items():
+                claim = node.pop("claim", None)
+                if not claim:
+                    continue
+                node["state"] = "interrupted"
+                node["attempts"][-1].update({
+                    "state": "interrupted",
+                    "error_code": reason,
+                })
+                self._append_locked(
+                    directory,
+                    projection,
+                    "node_interrupted",
+                    {"reason": reason},
+                    node_id=node_id,
+                    attempt_id=claim["attempt_id"],
+                )
+                self._release_worker_claim(claim["attempt_id"])
+                interrupted.append(node_id)
+            if interrupted:
+                projection["status"] = "interrupted"
+                self._append_locked(directory, projection, "run_interrupted")
+                with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE runs SET status='interrupted', updated_at=? WHERE run_id=?",
+                        (projection["updated_at"], run_id),
+                    )
+        return tuple(interrupted)
+
+    def record_cleanup_failed(self, run_id: str, *, reason: str) -> None:
+        with self._connect() as connection:
+            self._record_admission_event(
+                connection,
+                "cleanup_failed",
+                run_id=run_id,
+                reason_code=reason,
+            )
+
+    def interrupt_for_host_pressure(self, run_id: str, *, message: str) -> None:
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection["status"] != "running":
+                return
+            projection["status"] = "interrupted"
+            projection["last_error"] = {
+                "code": "host_pressure",
+                "message": _sanitize_diagnostic(message),
+            }
+            self._append_locked(directory, projection, "host_pressure_refused")
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status='interrupted', updated_at=? WHERE run_id=?",
+                    (projection["updated_at"], run_id),
+                )
 
     def release_or_expire_claim(self, claim: NodeClaim) -> bool:
         directory = self.run_directory(claim.run_id)
@@ -1345,6 +2145,7 @@ class RunStore:
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
             )
+            self._release_worker_claim(claim.attempt_id)
             return True
 
     def cancel_run(
@@ -1361,12 +2162,20 @@ class RunStore:
         self, run_id: str, *, operator_scope: str | None = None
     ) -> dict[str, object]:
         directory = self.run_directory(run_id, operator_scope=operator_scope)
+        from plugins.workflow.schema import load_workflow
+
+        package = load_workflow(directory / "definition.yaml")
+        always_run = {
+            node.id
+            for node in package.definition.nodes
+            if node.options.get("always_run")
+        }
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
             if projection["status"] not in {"failed", "interrupted"}:
                 return projection
-            for node in projection["nodes"].values():
-                if node["state"] == "succeeded":
+            for node_id, node in projection["nodes"].items():
+                if node["state"] == "succeeded" and node_id not in always_run:
                     continue
                 node.pop("claim", None)
                 node["state"] = (
@@ -1424,12 +2233,21 @@ class RunStore:
             projection["status"] = target
             for node in projection["nodes"].values():
                 if node["state"] not in {"succeeded", "failed", "skipped"}:
+                    claim = node.pop("claim", None)
                     node["state"] = target if target == "cancelled" else "interrupted"
+                    if claim and node.get("attempts"):
+                        node["attempts"][-1].update({
+                            "state": node["state"],
+                            "error_code": target,
+                        })
             self._append_locked(directory, projection, f"run_{target}")
             with self._connect() as connection:
                 connection.execute(
                     "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
                     (target, projection["updated_at"], run_id),
+                )
+                connection.execute(
+                    "DELETE FROM worker_claims WHERE run_id=?", (run_id,)
                 )
             return projection
 

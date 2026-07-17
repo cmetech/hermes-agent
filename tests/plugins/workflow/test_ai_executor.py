@@ -5,7 +5,7 @@ from pathlib import Path
 from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext
-from plugins.workflow.models import WorkflowNode, freeze_value
+from plugins.workflow.models import DeadlineBudget, WorkflowNode, freeze_value
 from plugins.workflow.resources import VariableContext
 
 
@@ -14,7 +14,7 @@ class FakeAgentRunner:
         self.requests = []
         self.responses = list(responses)
 
-    def run(self, request):
+    def run(self, request, **_kwargs):
         self.requests.append(request)
         output = self.responses.pop(0)
         return PluginAgentRunResult(
@@ -172,3 +172,83 @@ def test_shared_context_rejects_ambiguous_or_cache_incompatible_join(tmp_path):
     assert mismatch.error_code == "context_incompatible"
     assert "fresh" in mismatch.error_message
     assert runner.requests == []
+
+
+def test_resource_failure_is_typed_and_never_hidden_as_agent_failure(tmp_path):
+    class ResourceRunner:
+        def run(self, request, **_kwargs):
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="",
+                provider=request.provider or "fake",
+                model=request.model or "fake",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit={
+                    "failure_kind": "resource_limit",
+                    "resource_code": "rss_limit",
+                },
+            )
+
+    result = AgentNodeExecutor(ResourceRunner()).execute(
+        _context(tmp_path, _node("bounded", "work"))
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "resource_limit"
+
+
+def test_ai_request_receives_remaining_absolute_deadline_and_retry_budget(tmp_path):
+    runner = FakeAgentRunner("done")
+    budget = DeadlineBudget.create(
+        now=10,
+        wall_seconds=20,
+        idle_seconds=8,
+        provider_seconds=6,
+    )
+
+    result = AgentNodeExecutor(runner).execute(
+        _context(
+            tmp_path,
+            _node("bounded", "work"),
+            deadline_budget=budget,
+            monotonic=lambda: 14,
+            max_provider_attempts=2,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert runner.requests[0].wall_timeout_seconds == 16
+    assert runner.requests[0].idle_timeout_seconds == 8
+    assert runner.requests[0].provider_request_timeout_seconds == 6
+    assert runner.requests[0].max_api_attempts == 2
+    assert runner.requests[0].cooperative_shutdown_seconds == 5
+    assert runner.requests[0].term_grace_seconds == 5
+    assert runner.requests[0].kill_reap_grace_seconds == 2
+
+
+def test_provider_failure_charges_granted_internal_retry_allowance(tmp_path):
+    class TimeoutRunner:
+        def run(self, request, **_kwargs):
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="",
+                provider=request.provider or "fake",
+                model=request.model or "fake",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit={"failure_kind": "provider_timeout"},
+            )
+
+    result = AgentNodeExecutor(TimeoutRunner()).execute(
+        _context(
+            tmp_path,
+            _node("timeout", "work"),
+            max_provider_attempts=1,
+        )
+    )
+
+    assert result.error_code == "provider_timeout"
+    assert result.metadata["provider_attempts"] == 0

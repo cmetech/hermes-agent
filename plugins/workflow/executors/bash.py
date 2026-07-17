@@ -11,7 +11,7 @@ from pathlib import Path
 
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
 from plugins.workflow.store import ArtifactRef
-from tools.managed_process import ManagedProcessTree, TerminationPolicy
+from tools.managed_process import ManagedProcessTree
 
 
 def _artifact(path: Path, run_directory: Path, media_type: str) -> ArtifactRef:
@@ -53,15 +53,11 @@ class BashExecutor:
             "HERMES_WORKFLOW_RUN_DIR": str(context.run_directory),
             "ARTIFACTS_DIR": str(artifacts_dir),
         })
-        policy = TerminationPolicy(
-            cooperative_grace_seconds=0,
-            term_grace_seconds=1,
-            kill_grace_seconds=1,
-            wait_timeout_seconds=2,
-        )
-        started = time.monotonic()
+        policy = context.termination_policy
+        started = context.monotonic()
         timed_out = False
         cancelled = False
+        resource_violation = None
         if context.max_output_bytes <= 0:
             raise ValueError("max_output_bytes must be positive")
         remaining_output = context.max_output_bytes
@@ -83,6 +79,10 @@ class BashExecutor:
                                 output_limited.set()
                         if accepted:
                             output.write(chunk[:accepted])
+                            if context.deadline_budget is not None:
+                                context.deadline_budget.semantic_progress(
+                                    context.monotonic()
+                                )
             except (OSError, ValueError):
                 output_limited.set()
             finally:
@@ -125,13 +125,23 @@ class BashExecutor:
                     cancelled = True
                     tree.terminate("workflow run cancelled")
                     break
-                if time.monotonic() - started >= context.timeout_seconds:
+                if (
+                    context.deadline_budget is not None
+                    and context.deadline_budget.wall_expired(context.monotonic())
+                ) or context.monotonic() - started >= context.timeout_seconds:
                     timed_out = True
                     tree.terminate("workflow node timeout")
                     break
                 if output_limited.is_set():
                     tree.terminate("workflow output limit")
                     break
+                if tree.process.poll() is None:
+                    resource_violation = tree.resource_violation(
+                        context.resource_limits
+                    )
+                    if resource_violation is not None:
+                        tree.terminate("workflow resource limit")
+                        break
                 time.sleep(0.01)
         finally:
             tree.close()
@@ -149,7 +159,16 @@ class BashExecutor:
                 _artifact(stderr_path, context.run_directory, "text/plain")
             )
         if cancelled:
-            return NodeExecutionResult("cancelled", tuple(artifacts))
+            reason = (
+                context.cancellation_reason()
+                if context.cancellation_reason is not None
+                else "cancelled"
+            )
+            return NodeExecutionResult(
+                "interrupted" if reason == "shutdown" else "cancelled",
+                tuple(artifacts),
+                reason or "cancelled",
+            )
         if timed_out:
             return NodeExecutionResult(
                 "failed", tuple(artifacts), "timeout", "bash node exceeded its timeout"
@@ -160,6 +179,14 @@ class BashExecutor:
                 tuple(artifacts),
                 "output_limit",
                 "bash node exceeded its output limit",
+            )
+        if resource_violation is not None:
+            return NodeExecutionResult(
+                "failed",
+                tuple(artifacts),
+                "resource_limit",
+                f"bash node exceeded {resource_violation}",
+                {"resource_code": resource_violation},
             )
         if returncode != 0:
             return NodeExecutionResult(

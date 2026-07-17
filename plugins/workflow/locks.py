@@ -42,7 +42,8 @@ def workflow_lock(path: Path, *, timeout_seconds: float = 5.0):
     path.parent.mkdir(parents=True, exist_ok=True)
     key = str(path.resolve())
     lock = _process_lock(path)
-    if not lock.acquire(timeout=timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    if not lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
         raise WorkflowLockTimeout(f"timed out acquiring workflow lock: {path}")
     depths = getattr(_local, "depths", {})
     depth = depths.get(key, 0)
@@ -57,7 +58,6 @@ def workflow_lock(path: Path, *, timeout_seconds: float = 5.0):
                 if handle.tell() == 0:
                     handle.write(b"\0")
                     handle.flush()
-            deadline = time.monotonic() + timeout_seconds
             while True:
                 try:
                     if fcntl is not None:

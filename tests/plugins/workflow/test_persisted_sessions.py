@@ -53,7 +53,7 @@ def test_persisted_session_resumes_across_runs_but_explicit_fresh_wins(
         def __init__(self):
             self.requests = []
 
-        def run(self, request):
+        def run(self, request, **_kwargs):
             self.requests.append(request)
             return PluginAgentRunResult(
                 final_response="ok",

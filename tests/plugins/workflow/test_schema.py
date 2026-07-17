@@ -322,3 +322,11 @@ def test_condition_must_reference_an_upstream_node(workflow_writer, tmp_path):
     )
     with pytest.raises(WorkflowValidationError, match="not upstream"):
         load_workflow(path)
+
+
+@pytest.mark.parametrize("field", ["timeout", "idle_timeout"])
+def test_rejects_non_finite_execution_deadlines(workflow_writer, tmp_path, field):
+    node = {"id": "a", "bash": "true", field: float("inf")}
+    path = workflow_writer(tmp_path / field, nodes=[node])
+    with pytest.raises(WorkflowValidationError, match="finite"):
+        load_workflow(path)
