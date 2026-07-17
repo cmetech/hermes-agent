@@ -18,6 +18,7 @@ class RunAdmissionRequest:
     concurrency_key: str
     concurrency_policy: Literal["queue", "allow", "forbid"] = "queue"
     operator_scope: str | None = None
+    run_metadata: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True)

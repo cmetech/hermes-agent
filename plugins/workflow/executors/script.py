@@ -32,6 +32,27 @@ def _artifact(path: Path, run_directory: Path, media_type: str) -> ArtifactRef:
     )
 
 
+def _artifact_media_type(path: Path) -> str:
+    return {
+        ".json": "application/json",
+        ".md": "text/markdown",
+        ".txt": "text/plain",
+    }.get(path.suffix.lower(), "application/octet-stream")
+
+
+def _artifact_snapshot(root: Path) -> dict[str, str]:
+    snapshot: dict[str, str] = {}
+    if not root.is_dir():
+        return snapshot
+    for path in root.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        snapshot[path.relative_to(root).as_posix()] = hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+    return snapshot
+
+
 class ScriptExecutor:
     def __init__(
         self, *, runtime_locator: Callable[[str], str | None] = shutil.which
@@ -96,6 +117,7 @@ class ScriptExecutor:
         stderr_path = attempt / "stderr.txt"
         artifacts_dir = context.run_directory / "artifacts"
         artifacts_dir.mkdir(exist_ok=True)
+        artifacts_before = _artifact_snapshot(artifacts_dir)
         try:
             argv, warnings = self._argv(context, runtime_path)
         except (FileNotFoundError, OSError, ValueError) as exc:
@@ -111,6 +133,7 @@ class ScriptExecutor:
         allowed_env.update({
             "HERMES_WORKFLOW_RUN_ID": context.run_id,
             "HERMES_WORKFLOW_RUN_DIR": str(context.run_directory),
+            "HERMES_WORKFLOW_NODE_ID": context.node.id,
             "ARTIFACTS_DIR": str(artifacts_dir),
         })
         variables = context.variable_context
@@ -201,6 +224,32 @@ class ScriptExecutor:
         if stderr_path.stat().st_size:
             artifacts.append(
                 _artifact(stderr_path, context.run_directory, "text/plain")
+            )
+        generated_bytes = 0
+        for path in sorted(artifacts_dir.rglob("*")):
+            if path.is_symlink():
+                return NodeExecutionResult(
+                    "failed",
+                    tuple(artifacts),
+                    "artifact_symlink",
+                    "script created a symlink in the artifacts directory",
+                )
+            if not path.is_file():
+                continue
+            relative = path.relative_to(artifacts_dir).as_posix()
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if artifacts_before.get(relative) == digest:
+                continue
+            generated_bytes += path.stat().st_size
+            if generated_bytes > context.max_artifact_bytes:
+                return NodeExecutionResult(
+                    "failed",
+                    tuple(artifacts),
+                    "artifact_limit",
+                    "script artifacts exceed the configured byte ceiling",
+                )
+            artifacts.append(
+                _artifact(path, context.run_directory, _artifact_media_type(path))
             )
         metadata = {"warnings": warnings} if warnings else {}
         if cleanup_error is not None:

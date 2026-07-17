@@ -174,3 +174,24 @@ upstream_changes:
   removal_condition: Remove when Hermes upstream stages authenticated complete
     workflow package roots with equivalent digest-bound distribution trust.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-distribution
+  change_class: packaging-generic
+  owner: workflow-orchestration
+  files:
+  - pyproject.toml
+  - MANIFEST.in
+  - tests/test_packaging_metadata.py
+  owned_symbols:
+  - workflow/showcases/**/*
+  - recursive-include plugins/workflow/showcases *
+  - skills/productivity/workflow-showcase
+  tests:
+  - tests/test_packaging_metadata.py
+  - tests/plugins/workflow/test_showcase_distribution_e2e.py
+  expected_commit_subject: 'feat(workflow): add offline guided showcase suite'
+  upstream_candidate: true
+  merge_guidance: Preserve narrow wheel and sdist inclusion of the authenticated
+    workflow showcase bundle without broadening arbitrary plugin package data.
+  removal_condition: Remove when Hermes upstream ships equivalent authenticated
+    workflow showcase package-data coverage.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

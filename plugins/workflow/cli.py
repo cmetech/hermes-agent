@@ -416,6 +416,38 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     reset_parser.add_argument("--yes", action="store_true")
     _json_flag(reset_parser)
 
+    showcase_parser = actions.add_parser(
+        "showcase", help="Run digest-verified guided workflow demonstrations"
+    )
+    showcase_actions = showcase_parser.add_subparsers(dest="showcase_action")
+    showcase_list = showcase_actions.add_parser("list", help="List safe showcases")
+    _json_flag(showcase_list)
+    for action in ("describe", "preflight"):
+        parser = showcase_actions.add_parser(action)
+        parser.add_argument("showcase_id")
+        _json_flag(parser)
+    showcase_run = showcase_actions.add_parser("run")
+    showcase_run.add_argument("showcase_id")
+    showcase_run.add_argument("--symptom")
+    showcase_run.add_argument("--confirmation-token")
+    showcase_run.add_argument("--schedule-at")
+    showcase_run.add_argument("--idempotency-key")
+    showcase_run.add_argument("--no-wait", action="store_true")
+    _json_flag(showcase_run)
+    showcase_status = showcase_actions.add_parser("status")
+    showcase_status.add_argument("run_id")
+    _json_flag(showcase_status)
+    showcase_report = showcase_actions.add_parser("report")
+    showcase_report.add_argument("run_id")
+    _json_flag(showcase_report)
+    showcase_reset = showcase_actions.add_parser("reset")
+    showcase_reset.add_argument("showcase_id")
+    _json_flag(showcase_reset)
+    showcase_cleanup = showcase_actions.add_parser("cleanup")
+    showcase_cleanup.add_argument("--older-than-days", type=int, default=7)
+    showcase_cleanup.add_argument("--execute", action="store_true")
+    _json_flag(showcase_cleanup)
+
     subparser.set_defaults(func=workflow_command)
 
 
@@ -1409,13 +1441,67 @@ def _cmd_reset_sessions(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_showcase(args: argparse.Namespace) -> int:
+    from plugins.workflow.showcase import (
+        build_showcase_report,
+        cleanup_showcases,
+        load_showcase_catalog,
+        preflight_showcase,
+        report_to_dict,
+        reset_showcase,
+        run_showcase,
+    )
+
+    action = getattr(args, "showcase_action", None)
+    if action == "list":
+        payload = [asdict(item) for item in load_showcase_catalog().values()]
+    elif action == "describe":
+        payload = asdict(load_showcase_catalog()[args.showcase_id])
+    elif action == "preflight":
+        payload = preflight_showcase(args.showcase_id, hermes_home=args.hermes_home)
+    elif action == "run":
+        payload = run_showcase(
+            args.showcase_id,
+            hermes_home=args.hermes_home,
+            symptom=args.symptom,
+            confirmation_token=args.confirmation_token,
+            schedule_at=args.schedule_at,
+            no_wait=args.no_wait,
+            idempotency_key=args.idempotency_key,
+        )
+    elif action == "status":
+        payload = _store(args).get_run_status(args.run_id)
+    elif action == "report":
+        payload = report_to_dict(
+            build_showcase_report(args.run_id, hermes_home=args.hermes_home)
+        )
+    elif action == "reset":
+        payload = reset_showcase(args.showcase_id, hermes_home=args.hermes_home)
+    elif action == "cleanup":
+        payload = cleanup_showcases(
+            hermes_home=args.hermes_home,
+            dry_run=not args.execute,
+            older_than_days=args.older_than_days,
+        )
+    else:
+        print(
+            "Usage: hermes workflow showcase {list|describe|preflight|run|status|report|reset|cleanup}",
+            file=sys.stderr,
+        )
+        return 2
+    _emit(payload, as_json=args.json)
+    if isinstance(payload, Mapping) and payload.get("reason_code"):
+        return 3 if payload.get("status") in {"skipped", "input_required"} else 1
+    return 0
+
+
 def workflow_command(
     args: argparse.Namespace, *, agent_runner=None, profile_name="default"
 ) -> int:
     action = getattr(args, "workflow_action", None)
     if not action:
         print(
-            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|cleanup|reset-sessions}",
+            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|cleanup|reset-sessions|showcase}",
             file=sys.stderr,
         )
         return 2
@@ -1478,6 +1564,8 @@ def workflow_command(
             return _cmd_cleanup(args)
         if action == "reset-sessions":
             return _cmd_reset_sessions(args)
+        if action == "showcase":
+            return _cmd_showcase(args)
         print(f"Unknown workflow action: {action}", file=sys.stderr)
         return 2
     except (

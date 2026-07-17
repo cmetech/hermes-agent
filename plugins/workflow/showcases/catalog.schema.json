@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-agent.dev/schemas/workflow-showcase-catalog-v1.json",
+  "title": "Hermes workflow showcase catalog",
+  "type": "object",
+  "required": ["schema_version", "bundle_version", "scenarios"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "bundle_version": {"type": "string", "minLength": 1},
+    "scenarios": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/scenario"}}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "scenario": {
+      "type": "object",
+      "required": ["id", "display_name", "purpose", "bundle_version", "package_version", "workflow_path", "interaction_mode", "offline", "requires_ai", "requires_network", "safety_class", "supported_platforms", "expected_checkpoints", "expected_terminal_outcomes", "expected_artifacts", "capability_claims", "limits", "cleanup_ownership"],
+      "properties": {"id": {"type": "string", "pattern": "^[a-z0-9-]+$"}, "workflow_path": {"type": "string"}},
+      "additionalProperties": true
+    }
+  }
+}

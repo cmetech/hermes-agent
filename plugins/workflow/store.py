@@ -853,6 +853,7 @@ class RunStore:
                 "trigger": request.trigger_source,
                 "concurrency": request.concurrency_key,
                 "operator_scope_digest": RunStore._scope_digest(request.operator_scope),
+                "run_metadata": dict(sorted((request.run_metadata or {}).items())),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -888,6 +889,16 @@ class RunStore:
     ) -> RunAdmissionResult:
         if not request.idempotency_key:
             raise ValueError("idempotency_key must not be empty")
+        metadata = dict(request.run_metadata or {})
+        if any(
+            not isinstance(key, str)
+            or not key
+            or len(key) > 64
+            or not isinstance(value, str)
+            or len(value) > 512
+            for key, value in metadata.items()
+        ):
+            raise ValueError("run_metadata must contain bounded string pairs")
         if (
             request.workflow_name != immutable_snapshot.workflow_name
             and immutable_snapshot.workflow_name
@@ -1067,6 +1078,7 @@ class RunStore:
             "trigger": request.trigger_source,
             "idempotency_key_digest": key_digest,
             "operator_scope_digest": operator_scope_digest,
+            "run_metadata": dict(sorted((request.run_metadata or {}).items())),
             "concurrency_key": request.concurrency_key,
             "admission_disposition": disposition,
             "queue_position": queue_position,
@@ -3156,6 +3168,7 @@ class RunStore:
         older_than: timedelta = timedelta(days=7),
         dry_run: bool = True,
         operator_scope: str | None = None,
+        required_metadata: Mapping[str, str | None] | None = None,
     ) -> dict[str, object]:
         cutoff = datetime.now(timezone.utc) - older_than
         scope_clause = (
@@ -3177,6 +3190,14 @@ class RunStore:
             if row["status"] in {"succeeded", "failed", "cancelled", "abandoned"}
             and datetime.fromisoformat(row["updated_at"]) <= cutoff
         ]
+        if required_metadata:
+            candidates = [
+                row
+                for row in candidates
+                if self._run_has_metadata(
+                    Path(row["run_directory"]), required_metadata
+                )
+            ]
         files_total = sum(
             1
             for row in candidates
@@ -3210,6 +3231,22 @@ class RunStore:
             "files": files_total,
             "bytes": bytes_total,
         }
+
+    @staticmethod
+    def _run_has_metadata(
+        directory: Path, expected: Mapping[str, str | None]
+    ) -> bool:
+        try:
+            projection = json.loads((directory / "run.json").read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        metadata = projection.get("run_metadata")
+        if not isinstance(metadata, Mapping):
+            return False
+        return all(
+            key in metadata and (value is None or metadata.get(key) == value)
+            for key, value in expected.items()
+        )
 
 
 __all__ = [

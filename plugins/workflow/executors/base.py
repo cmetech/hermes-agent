@@ -25,6 +25,7 @@ class NodeExecutionContext:
     attempt_id: str
     timeout_seconds: float = 120.0
     max_output_bytes: int = 1024 * 1024
+    max_artifact_bytes: int = 16 * 1024 * 1024
     is_cancelled: Callable[[], bool] | None = None
     workflow_name: str = ""
     workflow_options: Mapping[str, Any] = field(default_factory=dict)

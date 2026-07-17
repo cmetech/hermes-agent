@@ -334,6 +334,11 @@ locales = ["locales/*.yaml"]
 # entry; tests/test_packaging_metadata.py enforces an entry per optional-mcps/<name>.
 "optional-mcps/linear" = ["optional-mcps/linear/manifest.yaml"]
 "optional-mcps/n8n" = ["optional-mcps/n8n/manifest.yaml"]
+# Keep the showcase skill available to wheel-based downstream packagers. The
+# normal installer still seeds the repository's top-level skills tree.
+"skills/productivity/workflow-showcase" = ["skills/productivity/workflow-showcase/SKILL.md"]
+"skills/productivity/workflow-showcase/workflows" = ["skills/productivity/workflow-showcase/workflows/*.md"]
+"skills/productivity/workflow-showcase/references" = ["skills/productivity/workflow-showcase/references/*.md"]
 
 [tool.setuptools.package-data]
 hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]
@@ -351,6 +356,8 @@ plugins = [
   "**/plugin.yaml",
   "**/plugin.yml",
   "**/README.md",
+  # Authenticated, read-only workflow showcase catalog and package resources.
+  "workflow/showcases/**/*",
 ]
 
 [tool.setuptools.packages.find]
