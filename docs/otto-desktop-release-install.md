@@ -122,13 +122,16 @@ Workflow: **`cmetech/otto/.github/workflows/release.yml`**
 git fetch origin base otto loop24
 git merge-base --is-ancestor origin/base origin/otto
 git merge-base --is-ancestor origin/base origin/loop24
+OTTO_SHA=$(git rev-parse origin/otto)
+LOOP24_SHA=$(git rev-parse origin/loop24)
 
 # Use the same version and prerelease state for every brand. The version input
-# has no leading "v"; release.yml creates the v<version> tag.
+# has no leading "v"; release.yml creates the v<version> tag. Pass the exact
+# gated source SHA, as the v1.1.6 releases did, never a moving branch name.
 gh workflow run release.yml -R cmetech/otto \
-  -f ref=otto -f stamp_branch=otto -f version=2.0.0 -f prerelease=false
+  -f ref="$OTTO_SHA" -f stamp_branch=otto -f version=2.0.0 -f prerelease=false
 gh workflow run release.yml -R cmetech/loop24 \
-  -f ref=loop24 -f stamp_branch=loop24 -f version=2.0.0 -f prerelease=false
+  -f ref="$LOOP24_SHA" -f stamp_branch=loop24 -f version=2.0.0 -f prerelease=false
 
 # Capture the two run URLs/IDs returned by GitHub, then monitor each exact run.
 gh run watch <otto-run-id> -R cmetech/otto --exit-status
