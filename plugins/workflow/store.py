@@ -464,6 +464,25 @@ class RunStore:
                 target = staging / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(source.read_bytes())
+            node_skill_digests: dict[str, str] = {}
+            for node in package.definition.nodes:
+                skills = tuple(node.options.get("skills", ()))
+                if not skills:
+                    continue
+                from agent.skill_commands import build_preloaded_skills_prompt
+
+                skill_text, _loaded, missing = build_preloaded_skills_prompt(
+                    list(skills), task_id=None
+                )
+                if missing:
+                    raise InputSnapshotError(
+                        f"workflow node {node.id} references missing skills: "
+                        + ", ".join(missing)
+                    )
+                target = staging / "node-skills" / f"{node.id}.md"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(skill_text, encoding="utf-8")
+                node_skill_digests[node.id] = _sha256(skill_text.encode())
             input_manifest: dict[str, dict[str, object]] = {}
             input_digests: dict[str, str] = {}
             input_root = staging / "inputs"
@@ -533,6 +552,15 @@ class RunStore:
                 input_manifest, sort_keys=True, separators=(",", ":")
             ).encode()
             (staging / "inputs.json").write_bytes(manifest_data)
+            snapshot_manifest = json.dumps(
+                {
+                    "inputs_sha256": _sha256(manifest_data),
+                    "node_skills": node_skill_digests,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            (staging / "resources.json").write_bytes(snapshot_manifest)
             nodes = tuple(
                 {
                     "id": node.id,
@@ -554,7 +582,7 @@ class RunStore:
                 staging_directory=staging,
                 definition_digest=package_digest.sha256,
                 policy_digest=_sha256(policy_data),
-                input_manifest_digest=_sha256(manifest_data),
+                input_manifest_digest=_sha256(snapshot_manifest),
                 reserved_bytes=reserved_bytes,
                 workflow_name=package.definition.name,
                 nodes=nodes,
@@ -575,10 +603,15 @@ class RunStore:
     def clone_prepared_snapshot(
         self, snapshot: PreparedRunSnapshot
     ) -> PreparedRunSnapshot:
-        target = Path(tempfile.mkdtemp(prefix="run-", dir=self.staging_root))
-        shutil.rmtree(target)
-        shutil.copytree(snapshot.staging_directory, target)
-        self._write_snapshot_owner(target)
+        with workflow_lock(self.admission_lock):
+            target = Path(tempfile.mkdtemp(prefix="run-", dir=self.staging_root))
+            self._write_snapshot_owner(target)
+        shutil.copytree(
+            snapshot.staging_directory,
+            target,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns(".snapshot-owner.json"),
+        )
         return PreparedRunSnapshot(
             target,
             snapshot.definition_digest,
@@ -1162,9 +1195,16 @@ class RunStore:
         artifacts: Iterable[ArtifactRef] = (),
         error_code: str | None = None,
         error_message: str | None = None,
+        metadata: Mapping[str, object] | None = None,
     ) -> None:
-        if status not in {"succeeded", "failed", "cancelled", "interrupted"}:
-            raise ValueError(f"invalid terminal node state: {status}")
+        if status not in {
+            "succeeded",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "paused",
+        }:
+            raise ValueError(f"invalid node completion state: {status}")
         directory = self.run_directory(claim.run_id)
         with workflow_lock(self._run_lock_path(claim.run_id)):
             projection = json.loads((directory / "run.json").read_text())
@@ -1184,6 +1224,22 @@ class RunStore:
                 "error_code": error_code,
                 "error_message": error_message,
             })
+            safe_metadata = dict(_sanitize(dict(metadata or {})))
+            safe_metadata.pop("output", None)
+            node["attempts"][-1]["metadata"] = safe_metadata
+            for field in (
+                "session_id",
+                "cache_fingerprint",
+                "provider",
+                "model",
+                "usage",
+                "pending_interaction",
+            ):
+                if field in safe_metadata:
+                    node[field] = safe_metadata[field]
+            for warning in safe_metadata.get("warnings", []):
+                if isinstance(warning, str) and warning not in projection["warnings"]:
+                    projection["warnings"].append(warning)
             refs = []
             for artifact in artifacts:
                 entry = {
@@ -1200,7 +1256,11 @@ class RunStore:
                 directory,
                 projection,
                 f"node_{status}",
-                {"artifacts": refs, "error_code": error_code},
+                {
+                    "artifacts": refs,
+                    "error_code": error_code,
+                    "metadata": safe_metadata,
+                },
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
             )
@@ -1224,6 +1284,8 @@ class RunStore:
                     "message": error_message or "node execution failed",
                     "node_id": claim.node_id,
                 }
+            elif status in {"cancelled", "interrupted", "paused"}:
+                terminal = status
             if terminal:
                 projection["status"] = terminal
                 self._append_locked(directory, projection, f"run_{terminal}")

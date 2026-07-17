@@ -29,6 +29,7 @@ from plugins.workflow.models import (
 )
 from plugins.workflow.schema import load_workflow, validate_package
 from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.store import RunStore, StorageQuotaError
 from plugins.workflow.topology import project_topology
 from plugins.workflow.trust import (
@@ -310,6 +311,15 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     cleanup_parser.add_argument("--dry-run", action="store_true")
     _json_flag(cleanup_parser)
 
+    reset_parser = actions.add_parser(
+        "reset-sessions", help="Reset persistent workflow node sessions"
+    )
+    reset_parser.add_argument("name")
+    reset_parser.add_argument("--scope")
+    reset_parser.add_argument("--node")
+    reset_parser.add_argument("--yes", action="store_true")
+    _json_flag(reset_parser)
+
     subparser.set_defaults(func=workflow_command)
 
 
@@ -548,7 +558,9 @@ def _store(args: argparse.Namespace) -> RunStore:
     return RunStore(args.hermes_home)
 
 
-def _cmd_run(args: argparse.Namespace) -> int:
+def _cmd_run(
+    args: argparse.Namespace, *, agent_runner=None, profile_name="default"
+) -> int:
     package = _resolve(args, args.name)
     digest = compute_package_digest(package)
     if WorkflowTrustStore(args.hermes_home).check(digest.sha256) != "trusted":
@@ -583,7 +595,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         _emit(payload, as_json=args.json)
         return 1
     if admitted.disposition == "created" and not args.no_wait:
-        RunScheduler(store).advance(admitted.run_id)
+        RunScheduler(
+            store, agent_runner=agent_runner, profile_name=profile_name
+        ).advance(admitted.run_id)
     payload = store.get_run_status(admitted.run_id)
     payload["action"] = "run"
     payload["admission_disposition"] = admitted.disposition
@@ -612,10 +626,14 @@ def _cmd_events(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_resume(args: argparse.Namespace) -> int:
+def _cmd_resume(
+    args: argparse.Namespace, *, agent_runner=None, profile_name="default"
+) -> int:
     store = _store(args)
     store.resume_run(args.run_id)
-    RunScheduler(store).advance(args.run_id)
+    RunScheduler(store, agent_runner=agent_runner, profile_name=profile_name).advance(
+        args.run_id
+    )
     _emit(store.get_run_status(args.run_id), as_json=args.json)
     return 0
 
@@ -656,7 +674,29 @@ def _cmd_cleanup(args: argparse.Namespace) -> int:
     return 0
 
 
-def workflow_command(args: argparse.Namespace) -> int:
+def _cmd_reset_sessions(args: argparse.Namespace) -> int:
+    if args.scope is None and not args.yes:
+        print("cross-scope reset requires --yes", file=sys.stderr)
+        return 1
+    removed = NodeSessionRegistry(args.hermes_home).reset(
+        args.name, scope=args.scope, node_id=args.node
+    )
+    _emit(
+        {
+            "action": "reset-sessions",
+            "workflow": args.name,
+            "scope": args.scope,
+            "node": args.node,
+            "removed": removed,
+        },
+        as_json=args.json,
+    )
+    return 0
+
+
+def workflow_command(
+    args: argparse.Namespace, *, agent_runner=None, profile_name="default"
+) -> int:
     action = getattr(args, "workflow_action", None)
     if not action:
         print(
@@ -678,7 +718,7 @@ def workflow_command(args: argparse.Namespace) -> int:
         if action == "untrust":
             return _cmd_untrust(args)
         if action == "run":
-            return _cmd_run(args)
+            return _cmd_run(args, agent_runner=agent_runner, profile_name=profile_name)
         if action == "runs":
             return _cmd_runs(args)
         if action == "status":
@@ -686,13 +726,17 @@ def workflow_command(args: argparse.Namespace) -> int:
         if action == "events":
             return _cmd_events(args)
         if action == "resume":
-            return _cmd_resume(args)
+            return _cmd_resume(
+                args, agent_runner=agent_runner, profile_name=profile_name
+            )
         if action == "cancel":
             return _cmd_cancel(args)
         if action == "abandon":
             return _cmd_abandon(args)
         if action == "cleanup":
             return _cmd_cleanup(args)
+        if action == "reset-sessions":
+            return _cmd_reset_sessions(args)
         print(f"Unknown workflow action: {action}", file=sys.stderr)
         return 2
     except (

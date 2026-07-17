@@ -10,10 +10,17 @@ from __future__ import annotations
 def register(ctx) -> None:
     from plugins.workflow.cli import register_cli, workflow_command
 
+    def handler(args):
+        return workflow_command(
+            args,
+            agent_runner=ctx.agent,
+            profile_name=ctx.profile_name,
+        )
+
     ctx.register_cli_command(
         name="workflow",
         help="Inspect and operate portable workflows",
         setup_fn=register_cli,
-        handler_fn=workflow_command,
+        handler_fn=handler,
         description="Discover, validate, inspect, trust, and operate portable workflows.",
     )

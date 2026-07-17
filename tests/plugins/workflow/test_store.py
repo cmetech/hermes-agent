@@ -59,6 +59,27 @@ def test_prepare_snapshot_copies_digest_covered_package_resources(
     ).read_text() == "portable command"
 
 
+def test_prepare_snapshot_materializes_selected_skill_instructions(
+    tmp_path, workflow_writer, monkeypatch
+):
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            nodes=[{"id": "analyze", "prompt": "Analyze", "skills": ["reports"]}],
+        )
+    )
+    monkeypatch.setattr(
+        "agent.skill_commands.build_preloaded_skills_prompt",
+        lambda names, task_id=None: ("SNAPSHOTTED SKILL", names, []),
+    )
+
+    prepared = RunStore(tmp_path / "home").prepare_run_snapshot(package)
+
+    assert (
+        prepared.staging_directory / "node-skills" / "analyze.md"
+    ).read_text() == "SNAPSHOTTED SKILL"
+
+
 def test_prepare_snapshot_rejects_symlink_and_oversized_input(
     tmp_path, workflow_writer
 ):

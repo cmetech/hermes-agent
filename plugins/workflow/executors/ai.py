@@ -1,0 +1,253 @@
+"""Command and prompt execution through the isolated host agent facade."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from typing import Mapping
+
+from agent.plugin_agent import PluginAgentRunRequest
+from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
+from plugins.workflow.resources import ResourceResolver, VariableContext
+from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
+from plugins.workflow.store import ArtifactRef
+
+
+def _thaw(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        return [_thaw(item) for item in value]
+    return value
+
+
+def _artifact(path: Path, run_directory: Path) -> ArtifactRef:
+    data = path.read_bytes()
+    return ArtifactRef(
+        relative_path=path.relative_to(run_directory).as_posix(),
+        media_type="application/json" if path.suffix == ".json" else "text/plain",
+        size_bytes=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+
+
+class AgentNodeExecutor:
+    def __init__(
+        self,
+        agent_runner,
+        *,
+        session_registry: NodeSessionRegistry | None = None,
+        profile_name: str = "default",
+    ) -> None:
+        self.agent_runner = agent_runner
+        self.session_registry = session_registry
+        self.profile_name = profile_name
+
+    def _fingerprint(self, context: NodeExecutionContext) -> str:
+        node = context.node
+        workflow = context.workflow_options
+        material = {
+            "provider": node.options.get("provider") or workflow.get("provider"),
+            "model": node.options.get("model") or workflow.get("model"),
+            "allowed_tools": list(node.options.get("allowed_tools", ())),
+            "denied_tools": list(node.options.get("denied_tools", ())),
+            "mcp": node.options.get("mcp"),
+            "profile": self.profile_name,
+            "reasoning": {
+                key: node.options.get(key, workflow.get(key))
+                for key in (
+                    "effort",
+                    "thinking",
+                    "systemPrompt",
+                    "fallbackModel",
+                    "betas",
+                    "sandbox",
+                )
+            },
+        }
+        encoded = json.dumps(
+            material, sort_keys=True, separators=(",", ":"), default=str
+        )
+        return hashlib.sha256(encoded.encode()).hexdigest()
+
+    @staticmethod
+    def _failure(code: str, message: str) -> NodeExecutionResult:
+        return NodeExecutionResult("failed", (), code, message)
+
+    def _prompt(self, context: NodeExecutionContext) -> str:
+        node = context.node
+        if node.node_type == "command":
+            template = (
+                ResourceResolver(context.run_directory).command(str(node.value)).body
+            )
+        else:
+            template = str(node.value)
+        variables = context.variable_context
+        if not isinstance(variables, VariableContext):
+            variables = VariableContext(workflow_id=context.run_id)
+        prompt = variables.render_prompt(template)
+        skill_path = context.run_directory / "node-skills" / f"{node.id}.md"
+        if node.options.get("skills"):
+            if not skill_path.is_file():
+                raise ValueError(f"snapshotted skills are missing for node {node.id}")
+            skill_text = skill_path.read_text(encoding="utf-8")
+            prompt = f"{skill_text}\n\n{prompt}"
+        return prompt
+
+    def execute(self, context: NodeExecutionContext) -> NodeExecutionResult:
+        node = context.node
+        if node.node_type not in {"command", "prompt"}:
+            return self._failure("unsupported_ai_node", node.node_type)
+        fingerprint = self._fingerprint(context)
+        explicit_context = node.options.get("context")
+        context_mode = "fresh"
+        session_id = None
+        warnings: list[str] = []
+        registry_key = None
+        expected_generation = 0
+
+        if explicit_context == "shared":
+            predecessors = [
+                context.predecessor_results.get(dependency)
+                for dependency in node.depends_on
+                if context.predecessor_results.get(dependency) is not None
+            ]
+            if len(predecessors) != 1:
+                return self._failure(
+                    "context_ambiguous",
+                    "shared context requires exactly one completed predecessor; use fresh",
+                )
+            predecessor = predecessors[0]
+            if predecessor.get("cache_fingerprint") != fingerprint:
+                return self._failure(
+                    "context_incompatible",
+                    "shared context cache fingerprint changed; use fresh context",
+                )
+            session_id = str(predecessor.get("session_id") or "")
+            if not session_id:
+                return self._failure(
+                    "context_missing_session",
+                    "shared predecessor has no resumable session; use fresh context",
+                )
+            context_mode = "shared"
+        else:
+            persist = bool(
+                node.options.get(
+                    "persist_session",
+                    context.workflow_options.get("persist_sessions", False),
+                )
+            )
+            if (
+                persist
+                and explicit_context != "fresh"
+                and self.session_registry is not None
+            ):
+                provider = str(
+                    node.options.get("provider")
+                    or context.workflow_options.get("provider")
+                    or "default"
+                )
+                registry_key = NodeSessionKey(
+                    context.workflow_name,
+                    node.id,
+                    context.operator_scope,
+                    provider,
+                    self.profile_name,
+                )
+                record = self.session_registry.get(registry_key)
+                if record is not None:
+                    expected_generation = record.generation
+                    if record.cache_fingerprint == fingerprint:
+                        context_mode = "shared"
+                        session_id = record.session_id
+                    else:
+                        warnings.append(
+                            "stale persistent session replaced after cache change"
+                        )
+
+        try:
+            request = PluginAgentRunRequest(
+                prompt=self._prompt(context),
+                provider=node.options.get("provider")
+                or context.workflow_options.get("provider"),
+                model=node.options.get("model")
+                or context.workflow_options.get("model"),
+                context_mode=context_mode,
+                session_id=session_id,
+                allowed_tools=tuple(node.options.get("allowed_tools", ())) or None,
+                denied_tools=tuple(node.options.get("denied_tools", ())),
+                skills=(),
+                workdir=context.run_directory,
+                max_iterations=90,
+                idle_timeout_seconds=float(node.options.get("idle_timeout", 300)),
+                wall_timeout_seconds=1800,
+                provider_request_timeout_seconds=300,
+            )
+            result = self.agent_runner.run(request)
+        except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+            return self._failure("agent_execution_failed", str(exc))
+
+        metadata: dict[str, object] = {
+            "session_id": result.session_id,
+            "provider": result.provider,
+            "model": result.model,
+            "usage": dict(result.usage),
+            "audit": dict(result.audit),
+            "cache_fingerprint": fingerprint,
+            "warnings": warnings,
+        }
+        if result.status == "paused":
+            metadata["pending_interaction"] = dict(result.pending_interaction or {})
+            return NodeExecutionResult("paused", metadata=metadata)
+        if result.status == "cancelled":
+            return NodeExecutionResult("cancelled", metadata=metadata)
+        if result.status != "completed":
+            return NodeExecutionResult(
+                "failed",
+                (),
+                "agent_failed",
+                "isolated agent execution failed",
+                metadata,
+            )
+
+        output = result.final_response
+        schema = node.options.get("output_format")
+        extension = ".txt"
+        if schema is not None:
+            try:
+                value = json.loads(output)
+            except json.JSONDecodeError as exc:
+                return self._failure("structured_output_invalid", str(exc))
+            try:
+                import jsonschema
+            except ImportError:
+                return self._failure(
+                    "structured_output_unavailable",
+                    "jsonschema is required; install the Hermes mcp or all extra",
+                )
+            try:
+                jsonschema.validate(value, _thaw(schema))
+            except (jsonschema.SchemaError, jsonschema.ValidationError) as exc:
+                return self._failure("structured_output_invalid", exc.message)
+            extension = ".json"
+
+        attempt = context.run_directory / "nodes" / node.id / context.attempt_id
+        attempt.mkdir(parents=True, exist_ok=False)
+        output_path = attempt / f"output{extension}"
+        output_path.write_text(output, encoding="utf-8")
+        artifact = _artifact(output_path, context.run_directory)
+        metadata["output"] = output
+        if registry_key is not None and self.session_registry is not None:
+            updated = self.session_registry.compare_and_set(
+                registry_key,
+                expected_generation,
+                result.session_id,
+                fingerprint,
+            )
+            if not updated:
+                warnings.append("newer persistent session retained")
+        return NodeExecutionResult("succeeded", (artifact,), metadata=metadata)
+
+
+__all__ = ["AgentNodeExecutor"]

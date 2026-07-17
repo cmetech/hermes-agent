@@ -10,6 +10,7 @@ import pytest
 from plugins import workflow as workflow_plugin
 from plugins.workflow.cli import register_cli
 from plugins.workflow.schema import load_workflow
+from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
 from plugins.workflow.trust import build_risk_summary, compute_package_digest
 from plugins.workflow.trust import WorkflowPackageDigest, WorkflowTrustStore
 from plugins.workflow.compat import assess_compatibility
@@ -256,3 +257,20 @@ def test_run_status_events_and_runs_use_the_durable_store(
     args = parser.parse_args([*common, "runs", "--status", "succeeded", "--json"])
     assert args.func(args) == 0
     assert json.loads(capsys.readouterr().out)[0]["run_id"] == run["run_id"]
+
+
+def test_reset_sessions_requires_confirmation_for_cross_scope_reset(tmp_path, capsys):
+    profile = tmp_path / "profile"
+    registry = NodeSessionRegistry(profile)
+    key = NodeSessionKey("sample", "analyze", "scope-a", "provider", "default")
+    registry.compare_and_set(key, 0, "session", "fingerprint")
+    parser = _parser()
+    common = ["--hermes-home", str(profile), "reset-sessions", "sample"]
+
+    args = parser.parse_args([*common, "--json"])
+    assert args.func(args) == 1
+    assert "--yes" in capsys.readouterr().err
+
+    args = parser.parse_args([*common, "--scope", "scope-a", "--json"])
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["removed"] == 1
