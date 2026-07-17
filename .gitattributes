@@ -8,3 +8,9 @@ web/package-lock.json linguist-generated=true
 Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
+
+# Authenticated workflow resources are hashed byte-for-byte. Git for Windows
+# must never rewrite their LF bytes to CRLF or a clean managed checkout will
+# fail distribution digest verification before capability defaults are seeded.
+capabilities/workflow-packages/** text eol=lf
+plugins/workflow/showcases/** text eol=lf

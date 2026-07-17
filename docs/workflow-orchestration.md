@@ -36,6 +36,8 @@ hermes workflow trust my-workflow --digest <exact-package-sha256> --json
 
 Trust belongs to the active profile and exact executable-resource digest. Editing YAML, a sidecar, command, script, MCP definition, or another covered resource revokes it. Package metadata cannot declare itself trusted. A digest-trusted package may use the local Hermes environment subject to ordinary hardline and approval policy. An untrusted package requires an already configured backend advertising the complete isolation contract; otherwise execution fails closed. CPU, memory, timeout, process, and storage ceilings are availability controls, not a security sandbox.
 
+Distribution-owned workflow packages and showcase bundles are authenticated byte-for-byte. Their repository paths are pinned to LF in `.gitattributes`, and the managed Windows installer disables `core.autocrlf` before the initial checkout. Preserve both controls: checkout-time CRLF conversion changes the authenticated bytes and intentionally makes capability staging fail closed.
+
 At admission, Hermes snapshots the resolved definition, sidecar policy, command resources, and input manifest into the run directory. Workers read that immutable snapshot. Later source edits affect only later admissions; resume and recovery never silently switch definitions or inputs.
 
 ## Start and inspect runs

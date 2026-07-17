@@ -2,7 +2,7 @@
   "name": "loop24",
   "productName": "LOOP24",
   "private": true,
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Native desktop shell for LOOP24.",
   "author": "cmetech",
   "type": "module",
