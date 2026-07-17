@@ -14,6 +14,29 @@ coverage:
   - commit: cbc8b8dbceb084d43b4443fba2e737780ecf706b
     reason: Separate user-requested v2.0.2 release preparation.
 upstream_changes:
+- id: gateway-live-completion-eligibility
+  change_class: model-selection-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/model_eligibility.py
+  - apps/desktop/src/lib/model-eligibility.ts
+  owned_symbols:
+  - evaluate_model_eligibility
+  - evaluateModelEligibility
+  tests:
+  - tests/hermes_cli/test_model_eligibility.py
+  - tests/hermes_cli/test_web_server.py
+  - apps/desktop/src/lib/model-eligibility.test.ts
+  - apps/desktop/src/app/settings/model-settings.test.tsx
+  expected_commit_subject: 'fix(models): preserve live MoA selections'
+  upstream_candidate: true
+  merge_guidance: Preserve the exact live-model join and allow unknown completion
+    metadata only after catalog readiness, explicit selection, and live-model
+    membership are proven. Keep explicit unsupported completion and every
+    unknown/unsupported tools or vision requirement fail-closed.
+  removal_condition: Remove when upstream treats an explicit live provider model
+    as sufficient completion evidence while retaining richer capability gates.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: managed-process-tree
   change_class: agent-core-generic
   owner: workflow-orchestration

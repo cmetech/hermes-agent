@@ -145,6 +145,13 @@ def evaluate_model_eligibility(
         state = states.get(capability, "unknown")
         if state == "supported":
             continue
+        # Reaching this loop already proves the catalog is ready and the
+        # explicit model is present in the provider's live /models response.
+        # That is sufficient evidence that it can perform completion even
+        # when the additive capability catalog has not described it yet.
+        # Keep every richer capability (tools/vision) fail-closed.
+        if capability == "completion" and state == "unknown":
+            continue
         normalized_state = "unsupported" if state == "unsupported" else "unknown"
         label = _CAPABILITY_LABELS[capability]
         message = (
