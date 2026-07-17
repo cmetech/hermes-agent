@@ -142,3 +142,39 @@ def test_diff_coverage_enforces_expected_commit_boundary(tmp_path: Path) -> None
     (repo / "core.py").write_text("class Owned:\n    value = 2\n")
     _git(repo, "commit", "-am", "feat: owned")
     validate_diff_coverage(data, repo, f"{baseline}..HEAD")
+
+
+def test_manifest_coverage_scope_excludes_pre_feature_and_named_release_commits(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    root = _git(repo, "rev-parse", "HEAD")
+    (repo / "preexisting_fork.py").write_text("fork = True\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "pre-existing fork customization")
+    feature_base = _git(repo, "rev-parse", "HEAD")
+    (repo / "release_only.py").write_text("version = 'alpha'\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "separate alpha release")
+    excluded = _git(repo, "rev-parse", "HEAD")
+    (repo / "core.py").write_text("class Owned:\n    value = 1\n")
+    _git(repo, "commit", "-am", "feat: owned")
+
+    manifest = _manifest(repo, root)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["coverage"] = {
+        "base_commit": feature_base,
+        "excluded_commits": [
+            {"commit": excluded, "reason": "separate user-requested alpha release"}
+        ],
+    }
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    data = load_and_validate_manifest(manifest, repo)
+
+    validate_diff_coverage(data, repo, f"{root}..HEAD")
+
+    (repo / "unledgered_feature.py").write_text("value = 1\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feature scope leak")
+    with pytest.raises(ValueError, match="unledgered_feature.py"):
+        validate_diff_coverage(data, repo, f"{root}..HEAD")

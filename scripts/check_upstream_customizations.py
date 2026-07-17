@@ -53,6 +53,31 @@ def load_and_validate_manifest(
     entries = data.get("upstream_changes")
     if not isinstance(entries, list) or not entries:
         raise ValueError("manifest upstream_changes must be a non-empty list")
+    coverage = data.get("coverage")
+    if coverage is not None:
+        if not isinstance(coverage, dict):
+            raise ValueError("manifest coverage must be a mapping")
+        base_commit = coverage.get("base_commit")
+        if not isinstance(base_commit, str) or not _HEX40.fullmatch(base_commit):
+            raise ValueError("coverage.base_commit must be exact 40-hex")
+        exclusions = coverage.get("excluded_commits", [])
+        if not isinstance(exclusions, list):
+            raise ValueError("coverage.excluded_commits must be a list")
+        excluded_shas: set[str] = set()
+        for exclusion in exclusions:
+            if not isinstance(exclusion, dict):
+                raise ValueError("every excluded commit must be a mapping")
+            sha = exclusion.get("commit")
+            reason = exclusion.get("reason")
+            if not isinstance(sha, str) or not _HEX40.fullmatch(sha):
+                raise ValueError("excluded commit must be exact 40-hex")
+            if sha in excluded_shas:
+                raise ValueError(f"duplicate excluded commit: {sha}")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError(f"excluded commit {sha} must have a non-empty reason")
+            excluded_shas.add(sha)
+        if check_git:
+            _validate_coverage_commits(coverage, repo, "HEAD")
     ids: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict):
@@ -110,18 +135,84 @@ def _changed_paths(repo: Path, diff_range: str) -> list[tuple[str, list[str]]]:
     return rows
 
 
+def _range_right(diff_range: str) -> str:
+    if "..." in diff_range:
+        return diff_range.split("...", 1)[1]
+    if ".." in diff_range:
+        return diff_range.split("..", 1)[1]
+    return diff_range
+
+
+def _validate_coverage_commits(
+    coverage: dict[str, Any], repo: Path, right: str
+) -> list[str]:
+    base = coverage["base_commit"]
+    for label, commit in (("coverage base", base), ("coverage range tip", right)):
+        proc = subprocess.run(
+            ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+            cwd=repo,
+            capture_output=True,
+        )
+        if proc.returncode:
+            raise ValueError(f"{label} is not a local commit: {commit}")
+    if subprocess.run(
+        ["git", "merge-base", "--is-ancestor", base, right],
+        cwd=repo,
+        capture_output=True,
+    ).returncode:
+        raise ValueError("coverage.base_commit is not an ancestor of the range tip")
+    commits = _git(repo, "rev-list", "--reverse", f"{base}..{right}").splitlines()
+    in_range = set(commits)
+    excluded = {item["commit"] for item in coverage.get("excluded_commits", [])}
+    outside = excluded - in_range
+    if outside:
+        raise ValueError(
+            "excluded commits are outside the coverage range: "
+            + ", ".join(sorted(outside))
+        )
+    return [commit for commit in commits if commit not in excluded]
+
+
+def _coverage_changes(
+    data: dict[str, Any], repo: Path, diff_range: str
+) -> tuple[list[tuple[str, list[str]]], list[str]] | None:
+    coverage = data.get("coverage")
+    if coverage is None:
+        return None
+    commits = _validate_coverage_commits(coverage, repo, _range_right(diff_range))
+    changes: list[tuple[str, list[str]]] = []
+    for commit in commits:
+        changes.extend(_changed_paths(repo, f"{commit}^..{commit}"))
+    return changes, commits
+
+
 def validate_diff_coverage(data: dict[str, Any], repo: Path, diff_range: str) -> None:
     covered = {
-        path for entry in data["upstream_changes"] for path in entry["files"]
+        path
+        for entry in data["upstream_changes"]
+        for field in ("files", "tests")
+        for path in entry[field]
     }
     ignored_prefixes = (
-        "docs/upstream-customizations/", "tests/", "scripts/",
+        "docs/", "tests/", "scripts/",
         "plugins/", "skills/", "optional-skills/", "capabilities/", "brands/",
     )
+    scoped = _coverage_changes(data, repo, diff_range)
+    changes = scoped[0] if scoped is not None else _changed_paths(repo, diff_range)
     missing: set[str] = set()
-    for _status, paths in _changed_paths(repo, diff_range):
+    for _status, paths in changes:
         for path in paths:
-            if path in covered or path.startswith(ignored_prefixes):
+            name = Path(path).name
+            is_colocated_test = (
+                "/__tests__/" in f"/{path}"
+                or ".test." in name
+                or ".spec." in name
+            )
+            if (
+                path in covered
+                or path.startswith(ignored_prefixes)
+                or is_colocated_test
+            ):
                 continue
             missing.add(path)
     if missing:
@@ -129,7 +220,7 @@ def validate_diff_coverage(data: dict[str, Any], repo: Path, diff_range: str) ->
             "upstream-owned files missing from customization ledger: "
             + ", ".join(sorted(missing))
         )
-    changed = {path for _status, paths in _changed_paths(repo, diff_range) for path in paths}
+    changed = {path for _status, paths in changes for path in paths}
     dirty = {
         line[3:] for line in _git(repo, "status", "--porcelain").splitlines()
         if len(line) > 3
@@ -140,14 +231,26 @@ def validate_diff_coverage(data: dict[str, Any], repo: Path, diff_range: str) ->
             # A planned boundary may be validated before its commit; the exact
             # subject becomes mandatory as soon as the files are clean.
             continue
-        subjects = _git(
-            repo,
-            "log",
-            "--format=%s",
-            diff_range,
-            "--",
-            *sorted(touched),
-        ).splitlines()
+        if scoped is None:
+            subjects = _git(
+                repo,
+                "log",
+                "--format=%s",
+                diff_range,
+                "--",
+                *sorted(touched),
+            ).splitlines()
+        else:
+            subjects = [
+                _git(repo, "show", "-s", "--format=%s", commit).strip()
+                for commit in scoped[1]
+                if set(
+                    path
+                    for _status, paths in _changed_paths(repo, f"{commit}^..{commit}")
+                    for path in paths
+                )
+                & touched
+            ]
         expected = entry["expected_commit_subject"]
         if expected not in subjects:
             raise ValueError(

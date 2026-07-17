@@ -1,5 +1,10 @@
 schema_version: 1
 feature: workflow-orchestration
+coverage:
+  base_commit: c2c02e1e12ae645f2741ab930fcc2c49486b46c1
+  excluded_commits:
+  - commit: d654f6a74b431287060e3591a85bd7a0652b6cff
+    reason: Separate user-requested v2.0.0-alpha.1 release preparation.
 upstream_changes:
 - id: managed-process-tree
   change_class: agent-core-generic
