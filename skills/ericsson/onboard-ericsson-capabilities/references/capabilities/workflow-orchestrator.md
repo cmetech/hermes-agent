@@ -62,10 +62,10 @@ expected states and artifact destination before starting.
 
 ## Artifacts
 
-Use `hermes workflow status|events --json` and declared artifact references. Never
+Use `PRODUCT_CLI workflow status|events --json` and declared artifact references. Never
 read or edit raw RunStore files to understand failures, warnings, or completion.
 
 ## Troubleshooting
 
 Report failed, interrupted, in-progress, stalled, rejected, and cancelled distinctly.
-Resume through `hermes workflow`; reconcile uncertain side effects before retry.
+Resume through `PRODUCT_CLI workflow`; reconcile uncertain side effects before retry.

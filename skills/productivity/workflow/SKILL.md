@@ -10,12 +10,18 @@ metadata:
 
 # Portable workflow operator
 
-Use `hermes workflow` as the only workflow control plane. Never edit the run
+Before any command, resolve `PRODUCT_CLI` once from the active product. Read
+`$HERMES_HOME/brand.json` when available and use its `slug` as the executable
+name: LOOP24 uses `loop24`, OTTO uses `otto`, and a neutral Hermes Agent install
+without a brand descriptor uses `hermes`. Replace `PRODUCT_CLI` in every command
+template; do not execute it literally or use another product's executable.
+
+Use `PRODUCT_CLI workflow` as the only workflow control plane. Never edit the run
 store, session registry, snapshots, event journal, or graph order directly.
 This is an edge capability: do not add a model tool or alter the system prompt.
 
 If the command is unavailable, tell the user to run
-`hermes plugins enable workflow`; do not emulate the runtime with shell scripts.
+`PRODUCT_CLI plugins enable workflow`; do not emulate the runtime with shell scripts.
 
 ## Scope and identity
 
@@ -32,7 +38,7 @@ forbid overlap policy; explain the resulting queue/overlap/refusal first.
 
 ## Read before acting
 
-Use JSON for every command. Use `hermes workflow list --json` for catalog
+Use JSON for every command. Use `PRODUCT_CLI workflow list --json` for catalog
 questions, `show NAME --json` for description, requirements, approvals,
 schedules, risk, and topology, and `runs`, `status`, or `events --tail 50` for
 execution questions. Explain truthful graph progress, current nodes, elapsed
@@ -67,7 +73,7 @@ providers/network/outward actions, execution environment, and resource limits.
 Ask for confirmation when selection is ambiguous or outward impact requires it.
 Never start work and then request a mandatory input.
 
-Use `hermes workflow run NAME --arguments ... --idempotency-key KEY --json`.
+Use `PRODUCT_CLI workflow run NAME --arguments ... --idempotency-key KEY --json`.
 For background work, report the run ID and how notifications/continuation work;
 do not hold a worker while queued, backing off, or awaiting the user.
 
@@ -97,5 +103,5 @@ rejection response is bounded workflow data and may trigger only the declared
 bounded rework path. Cancellation never implies an outward action was undone.
 
 Use dry-run cleanup first. Reset sessions only through
-`hermes workflow reset-sessions`; name the workflow, scope, and node, and obtain
+`PRODUCT_CLI workflow reset-sessions`; name the workflow, scope, and node, and obtain
 explicit confirmation for cross-scope removal.

@@ -19,9 +19,9 @@ def test_gateway_workflow_invocations_preserve_arguments(monkeypatch):
         message = build_skill_invocation_message("/workflow", instruction)
         assert message is not None
         assert instruction in message
-        assert "hermes workflow" in message
+        assert "PRODUCT_CLI workflow" in message
 
 
 def test_disabled_plugin_guidance_is_actionable():
     text = SKILL.read_text(encoding="utf-8")
-    assert "hermes plugins enable workflow" in text
+    assert "PRODUCT_CLI plugins enable workflow" in text

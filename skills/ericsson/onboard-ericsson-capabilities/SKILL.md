@@ -25,6 +25,12 @@ Skills, Tools & Keys, MCP, or diagnostics to the existing `hermes-agent` skill.
 
 ## Prerequisites
 
+Before any command, resolve `PRODUCT_CLI` once from the active product. Read
+`$HERMES_HOME/brand.json` when available and use its `slug` as the executable
+name: LOOP24 uses `loop24`, OTTO uses `otto`, and a neutral Hermes Agent install
+without a brand descriptor uses `hermes`. Replace `PRODUCT_CLI` in every command
+template; do not execute it literally or use another product's executable.
+
 Start by reading only `references/catalog.json`. It is the compact routing index,
 not evidence of live readiness. Do not load every focused capability entry.
 
