@@ -1868,6 +1868,8 @@ export const zh: Translations = {
     resume: '恢复',
     retry: '重试',
     abandon: '放弃',
+    dataStale: '数据已过期。正在重新连接…',
+    loadMore: '加载更多',
     workflowUnavailable: 'Workflow 插件不可用。请运行 hermes plugins enable workflow。',
     kanbanUnavailable: 'Kanban 插件不可用。请运行 hermes plugins enable kanban。',
     physicalBoard: board => `机器共享物理看板：${board}`

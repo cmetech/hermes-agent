@@ -1693,6 +1693,8 @@ export const en: Translations = {
     resume: 'Resume',
     retry: 'Retry',
     abandon: 'Abandon',
+    dataStale: 'Data is stale. Reconnecting…',
+    loadMore: 'Load more',
     workflowUnavailable: 'Workflow plugin unavailable. Enable it with hermes plugins enable workflow.',
     kanbanUnavailable: 'Kanban plugin unavailable. Enable it with hermes plugins enable kanban.',
     physicalBoard: board => `Machine-shared physical board: ${board}`

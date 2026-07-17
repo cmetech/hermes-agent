@@ -179,6 +179,38 @@ upstream_changes:
   removal_condition: Remove when Hermes upstream provides equivalent native
     Workflow and Kanban operations pages over the same generic APIs.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-stale-recovery
+  change_class: desktop-composition-generic
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/run-inspector.tsx
+  - apps/desktop/src/components/activity-board/activity-board.tsx
+  - apps/desktop/src/components/activity-board/virtual-card-column.tsx
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  owned_symbols:
+  - WorkflowsView
+  - RunInspector
+  - ActivityBoard
+  - VirtualCardColumn
+  tests:
+  - apps/desktop/src/hermes.test.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/components/activity-board/activity-board.test.tsx
+  - apps/desktop/src/components/activity-board/activity-board.performance.test.tsx
+  expected_commit_subject: 'fix(desktop): recover stale workflow operations'
+  upstream_candidate: true
+  merge_guidance: Preserve synchronous duplicate-action suppression, 409 snapshot
+    refetch, stale/disconnected mutation disablement, bounded selected-run polling,
+    cursor-reset replacement, localized reconnect affordances, and bounded first-paint
+    virtualization while reconciling upstream Desktop query and presentation changes.
+  removal_condition: Remove when upstream Desktop provides equivalent compare-and-set
+    workflow action recovery and tested activity-board accessibility at scale.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: capability-workflow-package-staging
   change_class: capability-staging-generic
   owner: workflow-orchestration
