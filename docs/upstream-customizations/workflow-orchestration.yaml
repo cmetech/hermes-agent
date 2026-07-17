@@ -15,7 +15,7 @@ upstream_changes:
   tests:
   - tests/tools/test_managed_process.py
   - tests/tools/test_process_registry.py
-  expected_commit_subject: 'refactor(tools): extract managed process tree'
+  expected_commit_subject: 'fix(tools): verify managed process cleanup'
   upstream_candidate: true
   merge_guidance: Reconcile process identity, aggregate resource enforcement,
     process-tree termination, escalation, and wait/reap behavior before replaying
