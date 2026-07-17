@@ -1,0 +1,211 @@
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+from pathlib import Path
+
+import pytest
+
+from plugins import workflow as workflow_plugin
+from plugins.workflow.cli import register_cli
+from plugins.workflow.schema import load_workflow
+from plugins.workflow.trust import build_risk_summary, compute_package_digest
+from plugins.workflow.trust import WorkflowPackageDigest, WorkflowTrustStore
+from plugins.workflow.compat import assess_compatibility
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    register_cli(parser)
+    return parser
+
+
+def _write(workflow_writer, workdir):
+    return workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="sample",
+        nodes=[{"id": "start", "bash": "printf SECRET_BODY"}],
+    )
+
+
+def test_plugin_registers_only_one_cli_command():
+    class Context:
+        def __init__(self):
+            self.calls = []
+
+        def register_cli_command(self, **kwargs):
+            self.calls.append(kwargs)
+
+        def __getattr__(self, name):
+            raise AssertionError(f"unexpected plugin registration: {name}")
+
+    ctx = Context()
+    workflow_plugin.register(ctx)
+    assert len(ctx.calls) == 1
+    assert ctx.calls[0]["name"] == "workflow"
+
+
+def test_cli_module_has_no_agent_provider_network_or_mcp_runtime_imports():
+    source = (Path(__file__).parents[3] / "plugins" / "workflow" / "cli.py").read_text(
+        encoding="utf-8"
+    )
+    imports = {
+        alias.name.split(".")[0]
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    imports.update(
+        node.module.split(".")[0]
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.ImportFrom) and node.module
+    )
+    assert imports.isdisjoint({"run_agent", "model_tools", "mcp", "requests", "httpx"})
+
+
+def test_list_and_show_json_are_stable_and_redacted(workflow_writer, tmp_path, capsys):
+    workdir = tmp_path / "repo"
+    _write(workflow_writer, workdir)
+    parser = _parser()
+
+    args = parser.parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(tmp_path / "profile"),
+        "list",
+        "--json",
+    ])
+    assert args.func(args) == 0
+    listing = json.loads(capsys.readouterr().out)
+    assert listing[0]["name"] == "sample"
+
+    args = parser.parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(tmp_path / "profile"),
+        "show",
+        "sample",
+        "--json",
+    ])
+    assert args.func(args) == 0
+    detail = json.loads(capsys.readouterr().out)
+    assert detail["topology_text"] == "start"
+    assert detail["topology_mermaid"].startswith("flowchart LR")
+    assert "SECRET_BODY" not in json.dumps(detail)
+
+
+def test_json_show_rejects_only_explicit_topology_selector(
+    workflow_writer, tmp_path, capsys
+):
+    workdir = tmp_path / "repo"
+    _write(workflow_writer, workdir)
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(tmp_path / "profile"),
+        "show",
+        "sample",
+        "--json",
+        "--topology",
+        "mermaid",
+    ])
+    assert args.func(args) == 2
+    assert "--topology cannot be combined with --json" in capsys.readouterr().err
+
+
+def test_human_show_defaults_to_text_topology(workflow_writer, tmp_path, capsys):
+    workdir = tmp_path / "repo"
+    _write(workflow_writer, workdir)
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(tmp_path / "profile"),
+        "show",
+        "sample",
+    ])
+    assert args.topology is None
+    assert args.func(args) == 0
+    output = capsys.readouterr().out
+    assert "Topology: start" in output
+    assert "flowchart LR" not in output
+
+
+def test_validate_doctor_trust_and_untrust(workflow_writer, tmp_path, capsys):
+    workdir = tmp_path / "repo"
+    path = _write(workflow_writer, workdir)
+    profile = tmp_path / "profile"
+    parser = _parser()
+    common = ["--workdir", str(workdir), "--hermes-home", str(profile)]
+
+    args = parser.parse_args([*common, "validate", "sample", "--json"])
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["valid"] is True
+
+    args = parser.parse_args([*common, "doctor", "sample", "--compat-report", "--json"])
+    assert args.func(args) == 0
+    doctor = json.loads(capsys.readouterr().out)
+    assert doctor["package_digest"]
+    assert "SECRET_BODY" not in json.dumps(doctor)
+
+    args = parser.parse_args([
+        *common,
+        "trust",
+        "sample",
+        "--digest",
+        "0" * 64,
+        "--json",
+    ])
+    assert args.func(args) == 1
+    assert "digest does not match" in capsys.readouterr().err
+
+    package = load_workflow(path)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    assert digest.sha256 == risk.package_digest
+    args = parser.parse_args([
+        *common,
+        "trust",
+        "sample",
+        "--digest",
+        digest.sha256,
+        "--json",
+    ])
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "trusted"
+
+    args = parser.parse_args([*common, "untrust", "sample", "--json"])
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "untrusted"
+
+
+def test_trust_rejects_package_mutation_during_admission(
+    workflow_writer, tmp_path, capsys, monkeypatch
+):
+    workdir = tmp_path / "repo"
+    path = _write(workflow_writer, workdir)
+    profile = tmp_path / "profile"
+    original = compute_package_digest(load_workflow(path))
+    mutated = WorkflowPackageDigest("f" * 64, original.covered_relative_paths)
+    calls = iter((original, mutated))
+    monkeypatch.setattr(
+        "plugins.workflow.cli.compute_package_digest", lambda package: next(calls)
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(profile),
+        "trust",
+        "sample",
+        "--digest",
+        original.sha256,
+    ])
+
+    assert args.func(args) == 1
+    assert "changed while trust was being recorded" in capsys.readouterr().err
+    assert WorkflowTrustStore(profile).check(original.sha256) == "untrusted"

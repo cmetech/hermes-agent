@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+import json
+import shutil
+import stat
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+
+from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.models import WorkflowValidationError
+from plugins.workflow.schema import load_workflow
+from plugins.workflow.trust import (
+    WorkflowTrustError,
+    WorkflowTrustStore,
+    build_risk_summary,
+    compute_package_digest,
+    preflight_execution,
+)
+
+
+def _package(workflow_writer, root):
+    (root / "commands").mkdir(parents=True)
+    (root / "commands" / "audit.md").write_text(
+        "---\nargument-hint: <target>\n---\nAudit $ARGUMENTS\n", encoding="utf-8"
+    )
+    (root / "scripts").mkdir()
+    (root / "scripts" / "helper.py").write_text("print('ok')\n", encoding="utf-8")
+    (root / "mcp").mkdir()
+    (root / "mcp" / "echo.yaml").write_text(
+        "command: python\nargs: [servers/echo.py]\nenv: {TOKEN: '${TOKEN}'}\n",
+        encoding="utf-8",
+    )
+    (root / "servers").mkdir()
+    (root / "servers" / "echo.py").write_text("print('echo')\n", encoding="utf-8")
+    path = workflow_writer(
+        root / "workflows",
+        name="risky",
+        filename="risky.yaml",
+        nodes=[
+            {
+                "id": "command",
+                "command": "audit",
+                "allowed_tools": ["Read"],
+                "skills": ["review"],
+            },
+            {"id": "shell", "bash": "printf secret-body", "depends_on": ["command"]},
+            {
+                "id": "script",
+                "script": "helper",
+                "runtime": "uv",
+                "depends_on": ["shell"],
+            },
+            {
+                "id": "agent",
+                "prompt": "SECRET_PROMPT",
+                "mcp": "mcp/echo.yaml",
+                "provider": "claude",
+                "depends_on": ["script"],
+            },
+        ],
+    )
+    path.with_name("risky.hermes.yaml").write_text(
+        "outward_action_nodes: [agent]\nrequired_secrets: [API_TOKEN]\nexecution_environment: isolated_backend_required\n",
+        encoding="utf-8",
+    )
+    return load_workflow(path)
+
+
+def test_digest_covers_yaml_sidecar_and_executable_resources(workflow_writer, tmp_path):
+    package = _package(workflow_writer, tmp_path / "package")
+    original = compute_package_digest(package)
+
+    assert original.covered_relative_paths == (
+        "commands/audit.md",
+        "mcp/echo.yaml",
+        "scripts/helper.py",
+        "servers/echo.py",
+        "workflows/risky.hermes.yaml",
+        "workflows/risky.yaml",
+    )
+    for relative_path in original.covered_relative_paths:
+        clone_root = tmp_path / f"clone-{relative_path.replace('/', '-')}"
+        shutil.copytree(package.root, clone_root)
+        clone = load_workflow(clone_root / "workflows" / "risky.yaml")
+        target = clone_root / relative_path
+        target.write_bytes(target.read_bytes() + b"# mutation\n")
+        assert compute_package_digest(clone).sha256 != original.sha256
+
+
+def test_moving_identical_package_preserves_digest_but_not_profile_trust(
+    workflow_writer, tmp_path
+):
+    package = _package(workflow_writer, tmp_path / "one")
+    digest = compute_package_digest(package)
+    shutil.copytree(package.root, tmp_path / "two")
+    moved = load_workflow(tmp_path / "two" / "workflows" / "risky.yaml")
+
+    assert compute_package_digest(moved) == digest
+    store_a = WorkflowTrustStore(tmp_path / "profile-a")
+    store_b = WorkflowTrustStore(tmp_path / "profile-b")
+    store_a.trust(digest.sha256, actor="user", risk_digest="b" * 64)
+    assert store_a.check(digest.sha256) == "trusted"
+    assert store_a.check(digest.sha256, risk_digest="c" * 64) == "untrusted"
+    assert store_b.check(digest.sha256) == "untrusted"
+
+
+def test_trust_store_is_atomic_restrictive_and_contains_no_secrets(tmp_path):
+    store = WorkflowTrustStore(tmp_path / "profile")
+    store.trust("a" * 64, actor="user", risk_digest="b" * 64)
+
+    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    assert payload["records"]["a" * 64]["actor"] == "user"
+    assert "secret" not in store.path.read_text(encoding="utf-8").lower()
+    assert store.revoke("a" * 64) is True
+    assert store.revoke("a" * 64) is False
+
+
+def test_trust_store_rejects_non_hex_digests(tmp_path):
+    store = WorkflowTrustStore(tmp_path / "profile")
+    with pytest.raises(WorkflowTrustError, match="SHA-256"):
+        store.trust("z" * 64, actor="user", risk_digest="b" * 64)
+
+
+def test_corrupt_store_fails_closed_and_concurrent_updates_remain_valid(tmp_path):
+    store = WorkflowTrustStore(tmp_path / "profile")
+    store.path.parent.mkdir(parents=True)
+    store.path.write_text("not json", encoding="utf-8")
+    assert store.check("a" * 64) == "untrusted"
+    with pytest.raises(WorkflowTrustError, match="corrupt"):
+        store.trust("a" * 64, actor="user", risk_digest="b" * 64)
+
+    store.path.unlink()
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(
+            executor.map(
+                lambda index: store.trust(
+                    f"{index:064x}", actor="user", risk_digest=f"{index + 1:064x}"
+                ),
+                range(16),
+            )
+        )
+    assert len(json.loads(store.path.read_text(encoding="utf-8"))["records"]) == 16
+
+
+def test_digest_rejects_symlink_escape(workflow_writer, tmp_path):
+    package = _package(workflow_writer, tmp_path / "package")
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    command = package.root / "commands" / "audit.md"
+    command.unlink()
+    command.symlink_to(outside)
+
+    with pytest.raises(WorkflowValidationError, match="escape"):
+        compute_package_digest(package)
+
+
+def test_digest_fails_closed_on_unreadable_resource(
+    workflow_writer, tmp_path, monkeypatch
+):
+    package = _package(workflow_writer, tmp_path / "package")
+    original_read_bytes = type(package.workflow_path).read_bytes
+
+    def fail_command(path):
+        if path.name == "audit.md":
+            raise PermissionError("denied")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(type(package.workflow_path), "read_bytes", fail_command)
+    with pytest.raises(WorkflowValidationError, match="unreadable"):
+        compute_package_digest(package)
+
+
+def test_inline_script_metacharacters_do_not_trigger_named_resource_lookup(
+    workflow_writer, tmp_path
+):
+    path = workflow_writer(
+        tmp_path,
+        nodes=[{"id": "inline", "script": "console.log(1)", "runtime": "bun"}],
+    )
+
+    digest = compute_package_digest(load_workflow(path))
+
+    assert digest.covered_relative_paths == ("example.yaml",)
+
+
+def test_trusted_package_defaults_to_local_but_untrusted_package_requires_isolation(
+    workflow_writer, tmp_path
+):
+    package = load_workflow(
+        workflow_writer(tmp_path, nodes=[{"id": "safe", "bash": "true"}])
+    )
+    summary = build_risk_summary(package, assess_compatibility(package))
+
+    assert preflight_execution(summary, trusted=True).mode == "trusted_local"
+    with pytest.raises(WorkflowTrustError, match="isolated backend"):
+        preflight_execution(summary, trusted=False)
+
+
+def test_risk_summary_is_redacted_and_untrusted_local_execution_fails_closed(
+    workflow_writer, tmp_path
+):
+    package = _package(workflow_writer, tmp_path / "package")
+    compatibility = assess_compatibility(
+        package,
+        available_tools={"read_file"},
+        provider_capabilities={"claude": set()},
+        mcp_available=True,
+    )
+    summary = build_risk_summary(package, compatibility)
+    serialized = json.dumps(summary.to_dict(), sort_keys=True)
+
+    assert summary.shell_or_script_nodes == ("shell", "script")
+    assert summary.required_secret_names == ("API_TOKEN",)
+    assert "SECRET_PROMPT" not in serialized
+    assert "secret-body" not in serialized
+    with pytest.raises(WorkflowTrustError, match="isolated backend"):
+        preflight_execution(summary, trusted=False, backend_capabilities=())
+    requirement = preflight_execution(
+        summary,
+        trusted=False,
+        backend_capabilities={
+            "process_isolation",
+            "package_containment",
+            "workdir_containment",
+        },
+    )
+    assert requirement.mode == "isolated_backend_required"
