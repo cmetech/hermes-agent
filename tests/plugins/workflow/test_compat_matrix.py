@@ -128,13 +128,13 @@ def test_provider_specific_controls_require_advertised_capabilities(
 
 def test_archon_alias_table_is_data_driven_and_complete():
     assert ARCHON_TOOL_ALIASES == {
-        "Agent": "delegate_task",
+        "Agent": "workflow_agent",
         "Bash": "terminal",
         "Edit": "patch",
         "Glob": "search_files",
         "Grep": "search_files",
         "Read": "read_file",
-        "Task": "delegate_task",
+        "Task": "workflow_agent",
         "WebFetch": "web_extract",
         "WebSearch": "web_search",
         "Write": "write_file",

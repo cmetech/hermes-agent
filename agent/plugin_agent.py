@@ -7,7 +7,7 @@ contained and cannot alter a long-lived parent conversation.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 import math
 from pathlib import Path
@@ -53,6 +53,15 @@ class PluginAgentRunRequest:
     allowed_tools: tuple[str, ...] | None = None
     denied_tools: tuple[str, ...] = ()
     skills: tuple[str, ...] = ()
+    hooks: tuple[Mapping[str, Any], ...] = ()
+    mcp_servers: Mapping[str, Mapping[str, Any]] | None = None
+    inline_agents: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    reasoning_config: Mapping[str, Any] | None = None
+    fallback_model: str | None = None
+    ephemeral_system_prompt: str | None = None
+    request_overrides: Mapping[str, Any] = field(default_factory=dict)
+    max_budget_usd: float | None = None
+    sandbox_policy: Mapping[str, Any] | None = None
     approved_action_digest: str | None = None
     workdir: Path | None = None
     max_iterations: int = 90
@@ -178,6 +187,77 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         ("skills", request.skills),
     ):
         _validate_name_list(label, values)
+    if not isinstance(request.hooks, tuple) or len(request.hooks) > 128:
+        raise ValueError("hooks must be a tuple with at most 128 entries")
+    for hook in request.hooks:
+        if not isinstance(hook, Mapping):
+            raise ValueError("every hook must be a mapping")
+    try:
+        if len(json.dumps(request.hooks, default=str).encode("utf-8")) > 256_000:
+            raise ValueError("hooks exceed the plugin-agent size limit")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("hooks must be JSON serializable") from exc
+    if request.mcp_servers is not None:
+        if (
+            not isinstance(request.mcp_servers, Mapping)
+            or len(request.mcp_servers) > 32
+        ):
+            raise ValueError("mcp_servers must contain at most 32 server mappings")
+        if any(
+            not isinstance(name, str)
+            or not name.strip()
+            or not isinstance(config, Mapping)
+            for name, config in request.mcp_servers.items()
+        ):
+            raise ValueError("mcp_servers must map non-empty names to mappings")
+        try:
+            encoded_mcp = json.dumps(request.mcp_servers, default=str).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("mcp_servers must be JSON serializable") from exc
+        if len(encoded_mcp) > 256_000:
+            raise ValueError("mcp_servers exceed the plugin-agent size limit")
+    if (
+        not isinstance(request.inline_agents, Mapping)
+        or len(request.inline_agents) > 16
+    ):
+        raise ValueError("inline_agents must contain at most 16 definitions")
+    for agent_id, definition in request.inline_agents.items():
+        if not isinstance(agent_id, str) or not re.fullmatch(
+            r"[a-z0-9]+(?:-[a-z0-9]+)*", agent_id
+        ):
+            raise ValueError("inline agent ids must be kebab-case")
+        if not isinstance(definition, Mapping):
+            raise ValueError(f"inline agent {agent_id} must be a mapping")
+        turns = definition.get("max_iterations", 90)
+        if (
+            isinstance(turns, bool)
+            or not isinstance(turns, int)
+            or not 1 <= turns <= 90
+        ):
+            raise ValueError("inline agent max_iterations must be between 1 and 90")
+    for label, value in (
+        ("reasoning_config", request.reasoning_config),
+        ("request_overrides", request.request_overrides),
+        ("sandbox_policy", request.sandbox_policy),
+    ):
+        if value is not None and not isinstance(value, Mapping):
+            raise ValueError(f"{label} must be a mapping or None")
+    if request.fallback_model is not None and (
+        not isinstance(request.fallback_model, str)
+        or not request.fallback_model.strip()
+    ):
+        raise ValueError("fallback_model must be a non-empty string or None")
+    if request.ephemeral_system_prompt is not None and not isinstance(
+        request.ephemeral_system_prompt, str
+    ):
+        raise ValueError("ephemeral_system_prompt must be text or None")
+    if request.max_budget_usd is not None and (
+        isinstance(request.max_budget_usd, bool)
+        or not isinstance(request.max_budget_usd, int | float)
+        or not math.isfinite(request.max_budget_usd)
+        or request.max_budget_usd <= 0
+    ):
+        raise ValueError("max_budget_usd must be finite and positive")
     if request.workdir is not None:
         path = Path(request.workdir).expanduser()
         if not path.is_dir():

@@ -35,17 +35,31 @@ class CompatibilityReport:
 
 
 ARCHON_TOOL_ALIASES = {
-    "Agent": "delegate_task",
+    "Agent": "workflow_agent",
     "Bash": "terminal",
     "Edit": "patch",
     "Glob": "search_files",
     "Grep": "search_files",
     "Read": "read_file",
-    "Task": "delegate_task",
+    "Task": "workflow_agent",
     "WebFetch": "web_extract",
     "WebSearch": "web_search",
     "Write": "write_file",
 }
+
+
+def resolve_tool_name(name: str) -> str:
+    """Resolve a published Archon alias without guessing unknown aliases."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("tool name must be a non-empty string")
+    normalized = name.strip()
+    target = ARCHON_TOOL_ALIASES.get(normalized)
+    if target is not None:
+        return target
+    if normalized[:1].isupper():
+        raise ValueError(f"unknown Archon tool alias: {normalized}")
+    return normalized
+
 
 _AI_ONLY_FIELDS = frozenset({
     "persist_session",
@@ -93,11 +107,12 @@ UNSUPPORTED_HOOK_EVENTS = frozenset({
     "WorktreeRemove",
 })
 _PROVIDER_FIELDS = {
-    "effort": "reasoning",
-    "thinking": "reasoning",
-    "maxBudgetUsd": "reasoning",
-    "modelReasoningEffort": "reasoning",
-    "webSearchMode": "web_search_mode",
+    "effort": "reasoning_effort",
+    "thinking": "thinking",
+    "maxBudgetUsd": "budget",
+    "modelReasoningEffort": "reasoning_effort",
+    "webSearchMode": "web_execution",
+    "fallbackModel": "fallback_model",
     "betas": "betas",
     "sandbox": "sandbox",
 }
@@ -175,7 +190,7 @@ def assess_compatibility(
             blocking=issue.blocking,
         )
 
-    for field in ("provider", "model", "fallbackModel"):
+    for field in ("provider", "model"):
         if field in options:
             _finding(
                 findings,
@@ -266,9 +281,10 @@ def assess_compatibility(
             )
         for list_field in ("allowed_tools", "denied_tools"):
             for tool_index, requested in enumerate(node_options.get(list_field, ())):
-                target = ARCHON_TOOL_ALIASES.get(requested)
                 path = f"{prefix}.{list_field}[{tool_index}]"
-                if target is None:
+                try:
+                    target = resolve_tool_name(requested)
+                except ValueError:
                     _finding(
                         findings,
                         path,
@@ -276,7 +292,8 @@ def assess_compatibility(
                         f"unknown Archon tool alias: {requested}",
                         blocking=True,
                     )
-                elif tools is not None and target not in tools:
+                    continue
+                if tools is not None and target not in tools:
                     _finding(
                         findings,
                         path,
@@ -317,7 +334,7 @@ def assess_compatibility(
                 CompatibilityLevel.MAPPED,
                 "inline agents map to bounded workflow_agent child workers",
             )
-        for field in ("provider", "model", "fallbackModel"):
+        for field in ("provider", "model"):
             if field in node_options:
                 _finding(
                     findings,
@@ -325,7 +342,14 @@ def assess_compatibility(
                     CompatibilityLevel.MAPPED,
                     f"{field} resolves through Hermes provider profiles",
                 )
-        for field in ("effort", "thinking", "maxBudgetUsd", "betas", "sandbox"):
+        for field in (
+            "effort",
+            "thinking",
+            "maxBudgetUsd",
+            "fallbackModel",
+            "betas",
+            "sandbox",
+        ):
             if field in node_options:
                 _check_provider_field(
                     findings,

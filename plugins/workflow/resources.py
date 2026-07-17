@@ -104,6 +104,53 @@ class ResourceResolver:
                 return ScriptResource(path=resolved, runtime=runtime)
         raise FileNotFoundError(f"script resource is missing: {name}")
 
+    def mcp_servers(self, reference: str) -> dict[str, dict[str, object]]:
+        """Load one contained, snapshotted MCP definition without interpolation."""
+        normalized = reference.replace("\\", "/")
+        relative = PurePosixPath(normalized)
+        if (
+            not reference
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or normalized.startswith("~")
+        ):
+            raise ValueError("MCP definition must be a contained relative resource")
+        candidates = (
+            self.package_root / normalized,
+            self.package_root / "mcp" / normalized,
+            (self.package_root / "mcp" / normalized).with_suffix(".yaml"),
+        )
+        path = None
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(self.package_root)
+            except (FileNotFoundError, OSError, ValueError):
+                continue
+            if not candidate.is_symlink() and resolved.is_file():
+                path = resolved
+                break
+        if path is None:
+            raise FileNotFoundError(f"MCP definition is missing: {reference}")
+        if path.stat().st_size > 256_000:
+            raise ValueError("MCP definition exceeds 256000 bytes")
+        document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if not isinstance(document, dict):
+            raise ValueError("MCP definition must be a mapping")
+        raw_servers = document.get("mcp_servers", document)
+        if "command" in document or "url" in document:
+            raw_servers = {path.stem: document}
+        if not isinstance(raw_servers, dict) or not raw_servers:
+            raise ValueError("MCP definition must contain at least one server")
+        servers: dict[str, dict[str, object]] = {}
+        for name, raw in raw_servers.items():
+            if not isinstance(name, str) or not _COMMAND_NAME.fullmatch(name):
+                raise ValueError(f"invalid MCP server name: {name}")
+            if not isinstance(raw, dict):
+                raise ValueError(f"MCP server {name} must be a mapping")
+            servers[name] = dict(raw)
+        return servers
+
     @staticmethod
     def _parse_command(path: Path) -> CommandResource:
         text = path.read_text(encoding="utf-8")

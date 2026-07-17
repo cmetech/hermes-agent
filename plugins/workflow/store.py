@@ -603,6 +603,7 @@ class RunStore:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(source.read_bytes())
             node_skill_digests: dict[str, str] = {}
+            node_agent_skill_digests: dict[str, str] = {}
             for node in package.definition.nodes:
                 skills = tuple(node.options.get("skills", ()))
                 if not skills:
@@ -621,6 +622,28 @@ class RunStore:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(skill_text, encoding="utf-8")
                 node_skill_digests[node.id] = _sha256(skill_text.encode())
+
+            for node in package.definition.nodes:
+                for agent_id, definition in node.options.get("agents", {}).items():
+                    skills = tuple(definition.get("skills", ()))
+                    if not skills:
+                        continue
+                    from agent.skill_commands import build_preloaded_skills_prompt
+
+                    skill_text, _loaded, missing = build_preloaded_skills_prompt(
+                        list(skills), task_id=None
+                    )
+                    if missing:
+                        raise InputSnapshotError(
+                            f"workflow inline agent {agent_id} references missing skills: "
+                            + ", ".join(missing)
+                        )
+                    target = staging / "node-agent-skills" / node.id / f"{agent_id}.md"
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(skill_text, encoding="utf-8")
+                    node_agent_skill_digests[f"{node.id}/{agent_id}"] = _sha256(
+                        skill_text.encode()
+                    )
             input_manifest: dict[str, dict[str, object]] = {}
             input_digests: dict[str, str] = {}
             input_root = staging / "inputs"
@@ -694,6 +717,7 @@ class RunStore:
                 {
                     "inputs_sha256": _sha256(manifest_data),
                     "node_skills": node_skill_digests,
+                    "node_agent_skills": node_agent_skill_digests,
                 },
                 sort_keys=True,
                 separators=(",", ":"),

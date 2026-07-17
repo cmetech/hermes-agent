@@ -41,15 +41,17 @@ upstream_changes:
   tests:
   - tests/agent/test_plugin_agent.py
   - tests/tools/test_registry.py
-  expected_commit_subject: 'fix(plugins): consume exact approval grants once'
+  expected_commit_subject: 'feat(workflow): enforce per-node agent resources'
   upstream_candidate: true
   merge_guidance: Reconcile ToolRegistry generation/dispatch behavior, PluginContext
     facade construction, caller-driven worker cancellation/lifeline cleanup, and
     aggregate worker-tree resource limits before replaying this commit. Preserve
     the bounded per-call provider-attempt override, configurable cooperative/TERM/KILL
     termination policy, semantic-progress framing that excludes stderr, and the
-    exact-digest one-shot approval grant so a workflow scheduler can remain the
-    sole retry and lifecycle authority without granting a different action.
+    exact-digest one-shot approval grant, node-local hook/MCP inputs, and bounded
+    synchronous inline-agent dispatcher so a workflow scheduler can remain the
+    sole retry and lifecycle authority without granting a different action or
+    exposing process-global resources.
   removal_condition: Remove when Hermes upstream exposes a trusted-plugin agent runner
     with isolated name-scoped registry execution.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

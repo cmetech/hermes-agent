@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Mapping
 
 from agent.plugin_agent import PluginAgentRunRequest
+from plugins.workflow.compat import resolve_tool_name
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
 from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
@@ -94,6 +95,45 @@ class AgentNodeExecutor:
             skill_text = skill_path.read_text(encoding="utf-8")
             prompt = f"{skill_text}\n\n{prompt}"
         return prompt
+
+    @staticmethod
+    def _inline_agents(context: NodeExecutionContext) -> dict[str, dict[str, object]]:
+        definitions: dict[str, dict[str, object]] = {}
+        for agent_id, raw in context.node.options.get("agents", {}).items():
+            allowed = (
+                [resolve_tool_name(name) for name in raw["tools"]]
+                if "tools" in raw
+                else None
+            )
+            denied = [
+                resolve_tool_name(name) for name in raw.get("disallowedTools", ())
+            ]
+            for forbidden in ("delegate_task",):
+                if forbidden not in denied:
+                    denied.append(forbidden)
+            instructions = ""
+            if raw.get("skills"):
+                path = (
+                    context.run_directory
+                    / "node-agent-skills"
+                    / context.node.id
+                    / f"{agent_id}.md"
+                )
+                if not path.is_file():
+                    raise ValueError(
+                        f"snapshotted inline-agent skills are missing for {agent_id}"
+                    )
+                instructions = path.read_text(encoding="utf-8")
+            definitions[str(agent_id)] = {
+                "description": str(raw["description"]),
+                "prompt": str(raw["prompt"]),
+                "model": raw.get("model"),
+                "allowed_tools": allowed,
+                "denied_tools": denied,
+                "instructions": instructions,
+                "max_iterations": min(int(raw.get("maxTurns", 90)), 90),
+            }
+        return definitions
 
     def execute(self, context: NodeExecutionContext) -> NodeExecutionResult:
         node = context.node
@@ -184,6 +224,63 @@ class AgentNodeExecutor:
                 else 300.0,
                 wall_timeout,
             )
+            allowed_tools = (
+                tuple(resolve_tool_name(name) for name in node.options["allowed_tools"])
+                if "allowed_tools" in node.options
+                else None
+            )
+            denied_tools = tuple(
+                resolve_tool_name(name) for name in node.options.get("denied_tools", ())
+            )
+            hooks = tuple(
+                {"event": event, **_thaw(entry)}
+                for event, entries in node.options.get("hooks", {}).items()
+                for entry in entries
+            )
+            mcp_servers = (
+                ResourceResolver(context.run_directory).mcp_servers(
+                    str(node.options["mcp"])
+                )
+                if "mcp" in node.options
+                else None
+            )
+            inline_agents = self._inline_agents(context)
+            denied_set = list(denied_tools)
+            if "delegate_task" not in denied_set:
+                denied_set.append("delegate_task")
+            denied_tools = tuple(denied_set)
+            if (
+                inline_agents
+                and allowed_tools is not None
+                and "workflow_agent" not in allowed_tools
+            ):
+                allowed_tools = (*allowed_tools, "workflow_agent")
+            effort = (
+                node.options.get("effort")
+                or context.workflow_options.get("modelReasoningEffort")
+                or context.workflow_options.get("effort")
+            )
+            thinking = node.options.get("thinking") or context.workflow_options.get(
+                "thinking"
+            )
+            reasoning_config = {
+                key: value
+                for key, value in {
+                    "effort": effort,
+                    "thinking": _thaw(thinking),
+                }.items()
+                if value is not None
+            }
+            fallback_model = node.options.get(
+                "fallbackModel", context.workflow_options.get("fallbackModel")
+            )
+            request_overrides = {}
+            betas = node.options.get("betas", context.workflow_options.get("betas"))
+            web_mode = context.workflow_options.get("webSearchMode")
+            if betas is not None:
+                request_overrides["betas"] = _thaw(betas)
+            if web_mode is not None:
+                request_overrides["web_search_mode"] = web_mode
             request = PluginAgentRunRequest(
                 prompt=self._prompt(context),
                 provider=node.options.get("provider")
@@ -192,9 +289,22 @@ class AgentNodeExecutor:
                 or context.workflow_options.get("model"),
                 context_mode=context_mode,
                 session_id=session_id,
-                allowed_tools=tuple(node.options.get("allowed_tools", ())) or None,
-                denied_tools=tuple(node.options.get("denied_tools", ())),
+                allowed_tools=allowed_tools,
+                denied_tools=denied_tools,
                 skills=(),
+                hooks=hooks,
+                mcp_servers=mcp_servers,
+                inline_agents=inline_agents,
+                reasoning_config=reasoning_config or None,
+                fallback_model=str(fallback_model) if fallback_model else None,
+                ephemeral_system_prompt=node.options.get("systemPrompt"),
+                request_overrides=request_overrides,
+                max_budget_usd=node.options.get(
+                    "maxBudgetUsd", context.workflow_options.get("maxBudgetUsd")
+                ),
+                sandbox_policy=_thaw(
+                    node.options.get("sandbox", context.workflow_options.get("sandbox"))
+                ),
                 approved_action_digest=(
                     str(context.node_state["approved_action_digest"])
                     if context.node_state.get("approved_action_digest")
