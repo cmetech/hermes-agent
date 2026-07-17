@@ -7,7 +7,7 @@ import json
 import re
 import shlex
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Mapping
 
 import yaml
@@ -27,6 +27,12 @@ class CommandResource:
     body: str
     description: str | None = None
     argument_hint: str | None = None
+
+
+@dataclass(frozen=True)
+class ScriptResource:
+    path: Path
+    runtime: str
 
 
 class ResourceResolver:
@@ -58,6 +64,45 @@ class ResourceResolver:
                 continue
             return self._parse_command(resolved)
         raise FileNotFoundError(f"command resource is missing: {name}")
+
+    def script(self, name: str, *, runtime: str) -> ScriptResource:
+        if runtime not in {"bun", "uv"}:
+            raise ValueError("runtime must be bun or uv")
+        normalized = name.replace("\\", "/")
+        relative = PurePosixPath(normalized)
+        if (
+            not name
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or normalized.startswith("~")
+        ):
+            raise ValueError("script must be a contained script name")
+        suffix = relative.suffix.lower()
+        if runtime == "uv" and suffix and suffix != ".py":
+            raise ValueError("uv requires a Python script")
+        if runtime == "bun" and suffix and suffix not in {".js", ".ts"}:
+            raise ValueError("bun requires a JavaScript or TypeScript script")
+        if suffix:
+            names = (normalized,)
+        elif runtime == "uv":
+            names = (normalized, f"{normalized}.py")
+        else:
+            names = (normalized, f"{normalized}.ts", f"{normalized}.js")
+        roots = [self.package_root]
+        if self.global_root is not None:
+            roots.append(self.global_root)
+        for root in roots:
+            for candidate_name in names:
+                candidate = root / "scripts" / candidate_name
+                try:
+                    resolved = candidate.resolve(strict=True)
+                    resolved.relative_to(root / "scripts")
+                except (FileNotFoundError, OSError, ValueError):
+                    continue
+                if candidate.is_symlink() or not resolved.is_file():
+                    continue
+                return ScriptResource(path=resolved, runtime=runtime)
+        raise FileNotFoundError(f"script resource is missing: {name}")
 
     @staticmethod
     def _parse_command(path: Path) -> CommandResource:
@@ -95,6 +140,7 @@ class VariableContext:
     docs_dir: Path | None = None
     context: str = ""
     loop_user_input: str = ""
+    loop_prev_output: str = ""
     rejection_reason: str = ""
     node_outputs: Mapping[str, str] = field(default_factory=dict)
 
@@ -142,9 +188,25 @@ class VariableContext:
             "DOCS_DIR": str(self.docs_dir) if self.docs_dir else "",
             "CONTEXT": self.context,
             "LOOP_USER_INPUT": self.loop_user_input,
+            "LOOP_PREV_OUTPUT": self.loop_prev_output,
             "REJECTION_REASON": self.rejection_reason,
         }
         return values.get(match.group("name"))
+
+    def environment(self) -> dict[str, str]:
+        """Return the non-secret variable environment for named scripts."""
+        return {
+            "ARGUMENTS": self.arguments,
+            "USER_MESSAGE": self.user_message,
+            "ARTIFACTS_DIR": str(self.artifacts_dir) if self.artifacts_dir else "",
+            "WORKFLOW_ID": self.workflow_id,
+            "BASE_BRANCH": self.base_branch,
+            "DOCS_DIR": str(self.docs_dir) if self.docs_dir else "",
+            "CONTEXT": self.context,
+            "LOOP_USER_INPUT": self.loop_user_input,
+            "LOOP_PREV_OUTPUT": self.loop_prev_output,
+            "REJECTION_REASON": self.rejection_reason,
+        }
 
     def render_prompt(self, template: str) -> str:
         def replace(match: re.Match[str]) -> str:
@@ -179,4 +241,9 @@ class VariableContext:
         return _VARIABLE.sub(replace, template)
 
 
-__all__ = ["CommandResource", "ResourceResolver", "VariableContext"]
+__all__ = [
+    "CommandResource",
+    "ResourceResolver",
+    "ScriptResource",
+    "VariableContext",
+]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import json
@@ -20,6 +21,9 @@ from typing import Callable, Iterable, Mapping
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
 from plugins.workflow.executors.bash import BashExecutor
+from plugins.workflow.executors.cancel import CancelExecutor
+from plugins.workflow.executors.loop import LoopExecutor
+from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.locks import WorkflowLockTimeout
 from plugins.workflow.models import DeadlineBudget, RetryPolicy, WorkflowNode
 from plugins.workflow.resources import VariableContext
@@ -266,7 +270,11 @@ class RunScheduler:
         self._activity = threading.Condition()
         self._active_runs: set[str] = set()
         self._active_executions = 0
-        self.executors = {"bash": BashExecutor()}
+        self.executors = {
+            "bash": BashExecutor(),
+            "script": ScriptExecutor(),
+            "cancel": CancelExecutor(),
+        }
         if agent_runner is not None:
             registry = session_registry or NodeSessionRegistry(store.hermes_home)
             ai_executor = AgentNodeExecutor(
@@ -274,7 +282,11 @@ class RunScheduler:
                 session_registry=registry,
                 profile_name=profile_name,
             )
-            self.executors.update({"command": ai_executor, "prompt": ai_executor})
+            self.executors.update({
+                "command": ai_executor,
+                "prompt": ai_executor,
+                "loop": LoopExecutor(agent_runner),
+            })
 
     @staticmethod
     def _read_text(path: Path, *, limit: int = 500_000) -> str:
@@ -330,7 +342,10 @@ class RunScheduler:
         if self._shutdown.is_set():
             return True
         try:
-            return self.store.load_run(run_id)["status"] in {
+            projection = self.store.load_run(run_id)
+            return projection.get("desired_status") == "cancelled" or projection[
+                "status"
+            ] in {
                 "cancelled",
                 "abandoned",
                 "interrupted",
@@ -342,9 +357,12 @@ class RunScheduler:
         if self._shutdown.is_set():
             return "shutdown"
         try:
-            status = self.store.load_run(run_id)["status"]
+            projection = self.store.load_run(run_id)
         except KeyError:
             return "interrupted"
+        if projection.get("desired_status") == "cancelled":
+            return "cancelled"
+        status = projection["status"]
         return status if status in {"cancelled", "abandoned", "interrupted"} else None
 
     def _resolve_graph(self, run_id: str, nodes: Iterable[WorkflowNode]) -> None:
@@ -392,7 +410,7 @@ class RunScheduler:
             node.options.get(
                 "timeout",
                 self.ai_wall_timeout_seconds
-                if node.node_type in {"command", "prompt"}
+                if node.node_type in {"command", "prompt", "loop"}
                 else self.subprocess_timeout_seconds,
             )
         )
@@ -421,6 +439,16 @@ class RunScheduler:
                 )
             else:
                 self.store.mark_node_started(claim)
+                if node.node_type != "cancel" and self._cancelled(run_id):
+                    self._persist_result(
+                        claim,
+                        node,
+                        NodeExecutionResult(
+                            "cancelled",
+                            error_code=self._cancellation_reason(run_id) or "cancelled",
+                        ),
+                    )
+                    return
                 timeout = self._node_timeout(node)
                 heartbeat_stop = threading.Event()
 
@@ -463,6 +491,19 @@ class RunScheduler:
                             self.provider_request_timeout_seconds, timeout
                         ),
                     )
+                    variables = self._variables(
+                        projection, self.store.run_directory(run_id)
+                    )
+                    loop_input = projection["nodes"][node.id].get(
+                        "loop_user_input_artifact"
+                    )
+                    if node.node_type == "loop" and isinstance(loop_input, str):
+                        variables = replace(
+                            variables,
+                            loop_user_input=self._read_text(
+                                self.store.run_directory(run_id) / loop_input
+                            ),
+                        )
                     result = executor.execute(
                         NodeExecutionContext(
                             run_id=run_id,
@@ -473,9 +514,7 @@ class RunScheduler:
                             is_cancelled=lambda: self._cancelled(run_id),
                             workflow_name=package.definition.name,
                             workflow_options=package.definition.options,
-                            variable_context=self._variables(
-                                projection, self.store.run_directory(run_id)
-                            ),
+                            variable_context=variables,
                             predecessor_results={
                                 dependency: {
                                     field: projection["nodes"][dependency][field]
@@ -484,6 +523,7 @@ class RunScheduler:
                                 }
                                 for dependency in node.depends_on
                             },
+                            node_state=projection["nodes"][node.id],
                             operator_scope=str(
                                 projection.get("operator_scope_digest") or "local"
                             ),
@@ -494,6 +534,21 @@ class RunScheduler:
                             max_provider_attempts=1,
                             cancellation_reason=lambda: self._cancellation_reason(
                                 run_id
+                            ),
+                            record_iteration=lambda artifacts, state: (
+                                self.store.record_loop_iteration(
+                                    claim,
+                                    artifacts=artifacts,
+                                    loop_state=state,
+                                )
+                            ),
+                            process_started=lambda identity: (
+                                self.store.record_process_started(claim, identity)
+                            ),
+                            process_stopped=lambda identity, cleaned: (
+                                self.store.record_process_stopped(
+                                    claim, identity, cleaned=cleaned
+                                )
                             ),
                             monotonic=self._monotonic,
                             termination_policy=self.termination_policy,
@@ -520,6 +575,13 @@ class RunScheduler:
     def _persist_result(
         self, claim: NodeClaim, node: WorkflowNode, result: NodeExecutionResult
     ) -> None:
+        if result.status == "failed" and result.error_code == "cleanup_failed":
+            self.store.block_cleanup_failed(
+                claim,
+                artifacts=result.artifacts,
+                error_message=result.error_message,
+            )
+            return
         if result.status != "failed":
             self.store.complete_node(
                 claim,
@@ -555,6 +617,7 @@ class RunScheduler:
             "outcome_unknown",
             "output_limit",
             "resource_limit",
+            "cleanup_failed",
         }
         if (
             policy.on_error == "all"

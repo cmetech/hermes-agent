@@ -60,17 +60,16 @@ def test_two_dependent_bash_nodes_execute_and_persist_artifacts(
         store.run_directory(admitted.run_id) / artifacts["second"]["relative_path"]
     ).read_text() == "second"
     event_types = [event["event_type"] for event in store.tail_events(admitted.run_id)]
-    assert event_types == [
-        "run_admitted",
-        "node_claimed",
-        "node_started",
-        "node_succeeded",
-        "node_ready",
-        "node_claimed",
-        "node_started",
-        "node_succeeded",
-        "run_succeeded",
-    ]
+    assert event_types[0] == "run_admitted"
+    assert event_types[-1] == "run_succeeded"
+    assert event_types.count("node_claimed") == 2
+    assert event_types.count("node_started") == 2
+    assert event_types.count("process_started") == 2
+    assert event_types.count("process_reaped") == 2
+    assert event_types.count("node_succeeded") == 2
+    assert event_types.index("node_ready") < event_types.index(
+        "node_claimed", event_types.index("node_claimed") + 1
+    )
 
 
 def test_resume_does_not_rerun_completed_node(tmp_path, workflow_writer):

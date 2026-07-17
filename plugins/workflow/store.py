@@ -27,6 +27,7 @@ from plugins.workflow.admission import (
 from plugins.workflow.locks import workflow_lock
 from plugins.workflow.models import WorkflowPackage
 from plugins.workflow.trust import compute_package_digest
+from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
 class InputSnapshotError(ValueError):
@@ -146,6 +147,23 @@ def _atomic_json(path: Path, value: object) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(value, handle, sort_keys=True, ensure_ascii=False, indent=2)
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -1488,7 +1506,11 @@ class RunStore:
             with workflow_lock(self._run_lock_path(run_id)):
                 projection = json.loads((directory / "run.json").read_text())
                 node = projection["nodes"].get(node_id)
-                if not node or node["state"] != "ready":
+                if (
+                    projection.get("desired_status") is not None
+                    or not node
+                    or node["state"] != "ready"
+                ):
                     return None
                 self._ensure_run_capacity(
                     directory,
@@ -1557,6 +1579,11 @@ class RunStore:
         directory = self.run_directory(claim.run_id)
         with workflow_lock(self._run_lock_path(claim.run_id)):
             projection = json.loads((directory / "run.json").read_text())
+            if (
+                projection["status"] != "running"
+                or projection.get("desired_status") is not None
+            ):
+                raise RuntimeError("stale node start for terminal run")
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
             if active.get("attempt_id") != claim.attempt_id:
@@ -1570,6 +1597,72 @@ class RunStore:
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
             )
+
+    def record_process_started(
+        self, claim: NodeClaim, identity: ProcessIdentity
+    ) -> bool:
+        """Durably bind an owned process identity to its active node claim."""
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(self._run_lock_path(claim.run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection["nodes"][claim.node_id]
+            active = node.get("claim", {})
+            if (
+                projection["status"] != "running"
+                or projection.get("desired_status") is not None
+                or active.get("attempt_id") != claim.attempt_id
+            ):
+                return False
+            serialized = {
+                "pid": identity.pid,
+                "start_time": identity.start_time,
+                "group_id": identity.group_id,
+            }
+            active["process_identity"] = serialized
+            node["attempts"][-1]["process_identity"] = serialized
+            self._append_locked(
+                directory,
+                projection,
+                "process_started",
+                {"process_identity": serialized},
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+            )
+            return True
+
+    def record_process_stopped(
+        self,
+        claim: NodeClaim,
+        identity: ProcessIdentity,
+        *,
+        cleaned: bool,
+    ) -> bool:
+        """Record cleanup only while the same claim still owns the identity."""
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(self._run_lock_path(claim.run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection["nodes"][claim.node_id]
+            active = node.get("claim", {})
+            serialized = active.get("process_identity")
+            if (
+                active.get("attempt_id") != claim.attempt_id
+                or not isinstance(serialized, dict)
+                or serialized.get("pid") != identity.pid
+            ):
+                return False
+            event_type = "process_reaped" if cleaned else "cleanup_failed"
+            if cleaned:
+                active.pop("process_identity", None)
+                node["attempts"][-1].pop("process_identity", None)
+            self._append_locked(
+                directory,
+                projection,
+                event_type,
+                {"pid": identity.pid, "cleanup_complete": cleaned},
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+            )
+            return True
 
     def complete_node(
         self,
@@ -1601,8 +1694,8 @@ class RunStore:
                 raise RuntimeError("stale node completion")
             if (
                 projection["status"] in {"cancelled", "abandoned"}
-                and status != "cancelled"
-            ):
+                or projection.get("desired_status") == "cancelled"
+            ) and status != "cancelled":
                 raise RuntimeError("stale completion for terminal run")
             if status == "paused":
                 with self._connect() as connection:
@@ -1630,6 +1723,22 @@ class RunStore:
             safe_metadata = dict(_sanitize(dict(metadata or {})))
             safe_metadata.pop("output", None)
             node["attempts"][-1]["metadata"] = safe_metadata
+            if status == "cancelled":
+                for other_id, other in projection["nodes"].items():
+                    if other_id == claim.node_id or other["state"] in {
+                        "succeeded",
+                        "failed",
+                        "skipped",
+                        "cancelled",
+                    }:
+                        continue
+                    other_claim = other.pop("claim", None)
+                    other["state"] = "cancelled"
+                    if other_claim and other.get("attempts"):
+                        other["attempts"][-1].update({
+                            "state": "cancelled",
+                            "error_code": "cancelled",
+                        })
             for field in (
                 "session_id",
                 "cache_fingerprint",
@@ -1638,6 +1747,7 @@ class RunStore:
                 "usage",
                 "pending_interaction",
                 "retry_consumed",
+                "loop_state",
             ):
                 if field in safe_metadata:
                     node[field] = safe_metadata[field]
@@ -1645,6 +1755,11 @@ class RunStore:
                 if isinstance(warning, str) and warning not in projection["warnings"]:
                     projection["warnings"].append(warning)
             refs = []
+            existing_artifacts = {
+                (entry.get("attempt_id"), entry.get("relative_path"))
+                for entry in projection["artifacts"]
+                if isinstance(entry, dict)
+            }
             for artifact in artifacts:
                 entry = {
                     "node_id": claim.node_id,
@@ -1655,7 +1770,8 @@ class RunStore:
                     "sha256": artifact.sha256,
                 }
                 refs.append(entry)
-                projection["artifacts"].append(entry)
+                if (claim.attempt_id, artifact.relative_path) not in existing_artifacts:
+                    projection["artifacts"].append(entry)
             self._append_locked(
                 directory,
                 projection,
@@ -1694,6 +1810,10 @@ class RunStore:
                         "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
                         (terminal, projection["updated_at"], claim.run_id),
                     )
+                    if terminal == "cancelled":
+                        connection.execute(
+                            "DELETE FROM worker_claims WHERE run_id=?", (claim.run_id,)
+                        )
             else:
                 if "waiting_retry" in states and not states & {
                     "ready",
@@ -1710,6 +1830,114 @@ class RunStore:
                         )
                 _atomic_json(directory / "run.json", projection)
             self._release_worker_claim(claim.attempt_id)
+
+    def record_loop_iteration(
+        self,
+        claim: NodeClaim,
+        *,
+        artifacts: Iterable[ArtifactRef],
+        loop_state: Mapping[str, object],
+    ) -> None:
+        """Persist one completed loop iteration before evaluating continuation."""
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(self._run_lock_path(claim.run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection["nodes"][claim.node_id]
+            active = node.get("claim", {})
+            if active.get("attempt_id") != claim.attempt_id:
+                raise RuntimeError("stale loop iteration")
+            safe_state = dict(_sanitize(dict(loop_state)))
+            node["loop_state"] = safe_state
+            existing = {
+                (entry.get("attempt_id"), entry.get("relative_path"))
+                for entry in projection["artifacts"]
+                if isinstance(entry, dict)
+            }
+            refs = []
+            for artifact in artifacts:
+                entry = {
+                    "node_id": claim.node_id,
+                    "attempt_id": claim.attempt_id,
+                    "relative_path": artifact.relative_path,
+                    "media_type": artifact.media_type,
+                    "size_bytes": artifact.size_bytes,
+                    "sha256": artifact.sha256,
+                }
+                refs.append(entry)
+                if (claim.attempt_id, artifact.relative_path) not in existing:
+                    projection["artifacts"].append(entry)
+            self._append_locked(
+                directory,
+                projection,
+                "loop_iteration_completed",
+                {
+                    "iteration": safe_state.get("iteration"),
+                    "artifacts": refs,
+                },
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+            )
+
+    def block_cleanup_failed(
+        self,
+        claim: NodeClaim,
+        *,
+        artifacts: Iterable[ArtifactRef] = (),
+        error_message: str | None = None,
+    ) -> None:
+        """Keep ownership blocked when an executor cannot prove tree cleanup."""
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(self._run_lock_path(claim.run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection["nodes"][claim.node_id]
+            active = node.get("claim", {})
+            if active.get("attempt_id") != claim.attempt_id:
+                raise RuntimeError("stale cleanup failure")
+            projection["desired_status"] = "cleanup_failed"
+            projection["last_error"] = {
+                "code": "cleanup_failed",
+                "message": _sanitize_diagnostic(error_message)
+                or "owned process cleanup did not complete",
+                "node_id": claim.node_id,
+            }
+            existing = {
+                (entry.get("attempt_id"), entry.get("relative_path"))
+                for entry in projection["artifacts"]
+                if isinstance(entry, dict)
+            }
+            refs = []
+            for artifact in artifacts:
+                entry = {
+                    "node_id": claim.node_id,
+                    "attempt_id": claim.attempt_id,
+                    "relative_path": artifact.relative_path,
+                    "media_type": artifact.media_type,
+                    "size_bytes": artifact.size_bytes,
+                    "sha256": artifact.sha256,
+                }
+                refs.append(entry)
+                if (claim.attempt_id, artifact.relative_path) not in existing:
+                    projection["artifacts"].append(entry)
+            self._append_locked(
+                directory,
+                projection,
+                "cleanup_failed",
+                {"artifacts": refs, "cleanup_complete": False},
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+            )
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET desired_status='cleanup_failed', updated_at=? "
+                    "WHERE run_id=?",
+                    (projection["updated_at"], claim.run_id),
+                )
+                self._record_admission_event(
+                    connection,
+                    "cleanup_failed",
+                    run_id=claim.run_id,
+                    reason_code="uninterruptible_process",
+                )
 
     def _append_locked(
         self,
@@ -2004,6 +2232,8 @@ class RunStore:
         expired = []
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
+            if projection.get("desired_status") == "cleanup_failed":
+                return ()
             if projection["status"] in {
                 "succeeded",
                 "failed",
@@ -2158,12 +2388,151 @@ class RunStore:
     def cancel_run(
         self, run_id: str, *, operator_scope: str | None = None
     ) -> dict[str, object]:
-        return self._set_terminal(
-            run_id,
-            "cancelled",
-            {"cancelled", "already_terminal"},
-            operator_scope=operator_scope,
-        )
+        directory = self.run_directory(run_id, operator_scope=operator_scope)
+        recorded: list[tuple[str, str, ProcessIdentity]] = []
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection["status"] in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "abandoned",
+            }:
+                return {**projection, "cancellation_outcome": "already_terminal"}
+            if any(
+                node.get("pending_interaction") == "reconcile"
+                or (
+                    isinstance(node.get("pending_interaction"), dict)
+                    and node["pending_interaction"].get("type") == "reconcile"
+                )
+                for node in projection["nodes"].values()
+            ):
+                self._append_locked(
+                    directory,
+                    projection,
+                    "cancel_reconciliation_required",
+                    {"reason_code": "outcome_unknown"},
+                )
+                return {
+                    **projection,
+                    "cancellation_outcome": "reconciliation_required",
+                }
+            if projection.get("desired_status") != "cancelled":
+                projection["desired_status"] = "cancelled"
+                self._append_locked(directory, projection, "cancel_requested")
+                with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE runs SET desired_status='cancelled', updated_at=? "
+                        "WHERE run_id=?",
+                        (projection["updated_at"], run_id),
+                    )
+            for node_id, node in projection["nodes"].items():
+                claim = node.get("claim")
+                serialized = (
+                    claim.get("process_identity") if isinstance(claim, dict) else None
+                )
+                if not isinstance(serialized, dict):
+                    continue
+                try:
+                    identity = ProcessIdentity(
+                        pid=int(serialized["pid"]),
+                        start_time=(
+                            int(serialized["start_time"])
+                            if serialized.get("start_time") is not None
+                            else None
+                        ),
+                        group_id=(
+                            int(serialized["group_id"])
+                            if serialized.get("group_id") is not None
+                            else None
+                        ),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                recorded.append((node_id, str(claim["attempt_id"]), identity))
+
+        cleanup: list[tuple[str, str, ProcessIdentity, bool]] = []
+        for node_id, attempt_id, identity in recorded:
+            terminated = ManagedProcessTree.terminate_existing(
+                identity,
+                term_grace_seconds=5.0,
+                kill_grace_seconds=2.0,
+            )
+            cleaned = terminated or not identity.is_current()
+            cleanup.append((node_id, attempt_id, identity, cleaned))
+
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            failed_cleanup = []
+            for node_id, attempt_id, identity, cleaned in cleanup:
+                node = projection["nodes"].get(node_id, {})
+                claim = node.get("claim", {})
+                serialized = claim.get("process_identity")
+                if (
+                    claim.get("attempt_id") != attempt_id
+                    or not isinstance(serialized, dict)
+                    or serialized.get("pid") != identity.pid
+                ):
+                    continue
+                if cleaned:
+                    claim.pop("process_identity", None)
+                    if node.get("attempts"):
+                        node["attempts"][-1].pop("process_identity", None)
+                    self._append_locked(
+                        directory,
+                        projection,
+                        "process_reaped",
+                        {"pid": identity.pid, "cleanup_complete": True},
+                        node_id=node_id,
+                        attempt_id=attempt_id,
+                    )
+                else:
+                    failed_cleanup.append((node_id, attempt_id, identity.pid))
+            if failed_cleanup:
+                projection["last_error"] = {
+                    "code": "cleanup_failed",
+                    "message": "owned process cleanup did not complete",
+                }
+                for node_id, attempt_id, pid in failed_cleanup:
+                    self._append_locked(
+                        directory,
+                        projection,
+                        "cleanup_failed",
+                        {"pid": pid, "cleanup_complete": False},
+                        node_id=node_id,
+                        attempt_id=attempt_id,
+                    )
+                with self._connect() as connection:
+                    self._record_admission_event(
+                        connection,
+                        "cleanup_failed",
+                        run_id=run_id,
+                        reason_code="uninterruptible_process",
+                    )
+                return {**projection, "cancellation_outcome": "cleanup_failed"}
+
+            projection["status"] = "cancelled"
+            projection["desired_status"] = None
+            for node in projection["nodes"].values():
+                if node["state"] not in {"succeeded", "failed", "skipped"}:
+                    claim = node.pop("claim", None)
+                    node["state"] = "cancelled"
+                    if claim and node.get("attempts"):
+                        node["attempts"][-1].update({
+                            "state": "cancelled",
+                            "error_code": "cancelled",
+                        })
+            self._append_locked(directory, projection, "run_cancelled")
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status='cancelled', desired_status=NULL, "
+                    "updated_at=? WHERE run_id=?",
+                    (projection["updated_at"], run_id),
+                )
+                connection.execute(
+                    "DELETE FROM worker_claims WHERE run_id=?", (run_id,)
+                )
+            return {**projection, "cancellation_outcome": "cancelled"}
 
     def resume_run(
         self, run_id: str, *, operator_scope: str | None = None
@@ -2196,6 +2565,73 @@ class RunStore:
             projection["status"] = "running"
             projection["last_error"] = None
             self._append_locked(directory, projection, "run_resumed")
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status='running', updated_at=? WHERE run_id=?",
+                    (projection["updated_at"], run_id),
+                )
+            return projection
+
+    def provide_loop_input(
+        self,
+        run_id: str,
+        user_input: str,
+        *,
+        expected_state_version: int,
+        operator_scope: str | None = None,
+    ) -> dict[str, object]:
+        """Compare-and-set one paused interactive loop back to ready."""
+        if not isinstance(user_input, str):
+            raise TypeError("loop input must be text")
+        encoded = user_input.encode("utf-8")
+        if len(encoded) > self.max_input_bytes:
+            raise InputSnapshotError("loop input exceeds the configured input limit")
+        directory = self.run_directory(run_id, operator_scope=operator_scope)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection["state_version"] != expected_state_version:
+                raise RuntimeError("stale loop input decision")
+            if projection["status"] != "paused":
+                raise ValueError("run is not waiting for loop input")
+            candidates = [
+                (node_id, node)
+                for node_id, node in projection["nodes"].items()
+                if node.get("state") == "paused"
+                and isinstance(node.get("pending_interaction"), dict)
+                and node["pending_interaction"].get("type") == "loop_input"
+            ]
+            if len(candidates) != 1:
+                raise ValueError("run does not have exactly one pending loop input")
+            node_id, node = candidates[0]
+            generation = int(node.get("loop_state", {}).get("iteration", 0))
+            relative = (
+                Path("nodes")
+                / node_id
+                / "inputs"
+                / f"after-iteration-{generation:04d}.txt"
+            )
+            path = directory / relative
+            _atomic_text(path, user_input)
+            artifact = {
+                "node_id": node_id,
+                "attempt_id": None,
+                "relative_path": relative.as_posix(),
+                "media_type": "text/plain",
+                "size_bytes": len(encoded),
+                "sha256": _sha256(encoded),
+            }
+            projection["artifacts"].append(artifact)
+            node["state"] = "ready"
+            node.pop("pending_interaction", None)
+            node["loop_user_input_artifact"] = relative.as_posix()
+            projection["status"] = "running"
+            self._append_locked(
+                directory,
+                projection,
+                "loop_input_provided",
+                {"artifact": artifact, "iteration": generation},
+                node_id=node_id,
+            )
             with self._connect() as connection:
                 connection.execute(
                     "UPDATE runs SET status='running', updated_at=? WHERE run_id=?",
@@ -2236,7 +2672,27 @@ class RunStore:
                 "cancelled",
                 "abandoned",
             }:
+                if target == "cancelled":
+                    return {**projection, "cancellation_outcome": "already_terminal"}
                 return projection
+            if target == "cancelled" and any(
+                node.get("pending_interaction") == "reconcile"
+                or (
+                    isinstance(node.get("pending_interaction"), dict)
+                    and node["pending_interaction"].get("type") == "reconcile"
+                )
+                for node in projection["nodes"].values()
+            ):
+                self._append_locked(
+                    directory,
+                    projection,
+                    "cancel_reconciliation_required",
+                    {"reason_code": "outcome_unknown"},
+                )
+                return {
+                    **projection,
+                    "cancellation_outcome": "reconciliation_required",
+                }
             projection["status"] = target
             for node in projection["nodes"].values():
                 if node["state"] not in {"succeeded", "failed", "skipped"}:
@@ -2256,6 +2712,8 @@ class RunStore:
                 connection.execute(
                     "DELETE FROM worker_claims WHERE run_id=?", (run_id,)
                 )
+            if target == "cancelled":
+                return {**projection, "cancellation_outcome": "cancelled"}
             return projection
 
     def cleanup_runs(
