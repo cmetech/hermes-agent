@@ -97,3 +97,23 @@ def test_bash_substitution_quotes_values_and_spills_large_values(tmp_path: Path)
     assert str(spilled[0]) in rendered
     subprocess.run(["/bin/sh", "-c", rendered], cwd=tmp_path, check=True)
     assert not (tmp_path / "injected").exists()
+
+
+def test_bash_substitution_preserves_values_inside_existing_shell_quotes(
+    tmp_path: Path,
+):
+    variables = VariableContext(arguments='a "double" $HOME `date` \\ tail')
+
+    rendered = variables.render_bash(
+        "printf '%s' \"$ARGUMENTS\"",
+        spill_directory=tmp_path / "spill",
+    )
+    completed = subprocess.run(
+        ["/bin/sh", "-c", rendered],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout == variables.arguments

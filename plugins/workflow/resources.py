@@ -21,6 +21,37 @@ _VARIABLE = re.compile(
 )
 
 
+def _shell_quote_context(template: str, end: int) -> str | None:
+    """Return the POSIX quote containing ``end``, ignoring escaped quotes."""
+    quote: str | None = None
+    escaped = False
+    for character in template[:end]:
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            continue
+        if character == "'" and quote != '"':
+            quote = None if quote == "'" else "'"
+        elif character == '"' and quote != "'":
+            quote = None if quote == '"' else '"'
+    return quote
+
+
+def _quote_shell_value(value: str, quote: str | None) -> str:
+    if quote == "'":
+        return value.replace("'", "'\\''")
+    if quote == '"':
+        return (
+            value.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("$", "\\$")
+            .replace("`", "\\`")
+        )
+    return shlex.quote(value)
+
+
 @dataclass(frozen=True)
 class CommandResource:
     path: Path
@@ -282,8 +313,10 @@ class VariableContext:
                 digest = hashlib.sha256(value.encode()).hexdigest()[:16]
                 path = root / f"variable-{digest}.txt"
                 path.write_text(value, encoding="utf-8")
-                return shlex.quote(str(path))
-            return shlex.quote(value)
+                value = str(path)
+            return _quote_shell_value(
+                value, _shell_quote_context(template, match.start())
+            )
 
         return _VARIABLE.sub(replace, template)
 
