@@ -19,6 +19,25 @@ from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 
 
+def test_directory_capacity_scan_tolerates_atomic_temp_rename(
+    tmp_path, monkeypatch
+) -> None:
+    store = RunStore(tmp_path / "home")
+    transient = store.runs_root / ".run.json.transient"
+    transient.write_text("temporary", encoding="utf-8")
+    original_stat = type(transient).stat
+
+    def racing_stat(path, *args, **kwargs):
+        if path == transient:
+            transient.unlink(missing_ok=True)
+            raise FileNotFoundError(path)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(transient), "stat", racing_stat)
+
+    assert store._directory_bytes(store.runs_root) == 0
+
+
 def _start(store, package, key="parallel"):
     prepared = store.prepare_run_snapshot(package)
     return store.start_run(

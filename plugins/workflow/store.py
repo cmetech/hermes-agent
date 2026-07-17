@@ -726,9 +726,16 @@ class RunStore:
 
     @staticmethod
     def _directory_bytes(directory: Path) -> int:
-        return sum(
-            path.stat().st_size for path in directory.rglob("*") if path.is_file()
-        )
+        total = 0
+        for path in directory.rglob("*"):
+            try:
+                if path.is_file():
+                    total += path.stat().st_size
+            except FileNotFoundError:
+                # Atomic projection writes rename their temporary file while a
+                # concurrent capacity scan is walking the run tree.
+                continue
+        return total
 
     def _ensure_run_capacity(
         self,
