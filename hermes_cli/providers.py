@@ -706,6 +706,49 @@ def resolve_custom_provider(
     return None
 
 
+# Plugin ProviderProfile.api_mode → ProviderDef.transport. Unknown/blank modes
+# fall through to the OpenAI-compatible default (matches config-provider branches).
+_API_MODE_TO_TRANSPORT: Dict[str, str] = {
+    "chat_completions": "openai_chat",
+    "anthropic_messages": "anthropic_messages",
+    "responses": "codex_responses",
+}
+
+
+def _provider_def_from_plugin_profile(profile: Any) -> ProviderDef:
+    """Adapt a plugin-registry ``ProviderProfile`` into the ``ProviderDef``
+    return contract used by the config-provider branches, so downstream routing
+    is unchanged.
+
+    Mirrors the ``*_URL`` / ``*_BASE_URL`` split done by the ``hermes_cli.auth``
+    ``PROVIDER_REGISTRY`` auto-merge: the base-URL override var is pulled out of
+    the api-key list and returned as ``base_url_env_var``.
+    """
+    env_vars = tuple(profile.env_vars or ())
+    api_key_vars = tuple(
+        v for v in env_vars
+        if not v.endswith("_BASE_URL") and not v.endswith("_URL")
+    )
+    base_url_var = next(
+        (v for v in env_vars if v.endswith("_BASE_URL") or v.endswith("_URL")),
+        "",
+    )
+    transport = _API_MODE_TO_TRANSPORT.get(
+        getattr(profile, "api_mode", "") or "", "openai_chat"
+    )
+    return ProviderDef(
+        id=profile.name,
+        name=profile.display_name or profile.name,
+        transport=transport,
+        api_key_env_vars=api_key_vars or env_vars,
+        base_url=profile.base_url,
+        base_url_env_var=base_url_var,
+        is_aggregator=False,
+        auth_type=profile.auth_type or "api_key",
+        source="plugin",
+    )
+
+
 def resolve_provider_full(
     name: str,
     user_providers: Optional[Dict[str, Any]] = None,
@@ -773,6 +816,20 @@ def resolve_provider_full(
                 base_url=mdev_info.api,
                 source="models.dev",
             )
+    except Exception:
+        pass
+
+    # 4. Plugin registry (bundled + user ``plugins/model-providers/<name>/``).
+    #    Brand gateway providers (e.g. ``loop24`` / ``otto``) self-register ONLY
+    #    here via ``register_provider()`` and appear in none of the sources
+    #    above; without this fallback the in-chat ``/model`` selector and CLI
+    #    setup raise "Unknown provider '<brand>'". ``get_provider_profile``
+    #    resolves the raw name and profile aliases; try canonical too.
+    try:
+        from providers import get_provider_profile as _get_plugin_profile
+        plugin_profile = _get_plugin_profile(raw) or _get_plugin_profile(canonical)
+        if plugin_profile is not None:
+            return _provider_def_from_plugin_profile(plugin_profile)
     except Exception:
         pass
 
