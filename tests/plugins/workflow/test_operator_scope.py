@@ -5,9 +5,16 @@ from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 
 
-def test_explicit_run_id_does_not_bypass_operator_scope(tmp_path, workflow_writer):
+def test_explicit_run_id_does_not_bypass_operator_scope(tmp_path):
     store = RunStore(tmp_path)
-    package = load_workflow(workflow_writer(tmp_path / "package", name="demo"))
+    package_root = tmp_path / "package"
+    package_root.mkdir()
+    workflow_path = package_root / "demo.yaml"
+    workflow_path.write_text(
+        "version: '1'\nname: demo\ndescription: Scope test\nnodes:\n  - id: start\n    bash: echo ok\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow_path)
     prepared = store.prepare_run_snapshot(package)
     result = store.start_run(RunAdmissionRequest(
         workflow_name="demo",
