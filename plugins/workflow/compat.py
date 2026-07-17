@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import StrEnum
-from typing import AbstractSet, Mapping
+from typing import TYPE_CHECKING, AbstractSet, Literal, Mapping
 
 from plugins.workflow.models import WorkflowPackage
+
+if TYPE_CHECKING:
+    from plugins.workflow.trust import WorkflowRiskSummary
 
 
 class CompatibilityLevel(StrEnum):
@@ -21,6 +24,7 @@ class CompatibilityFinding:
     level: CompatibilityLevel
     message: str
     blocking: bool
+    code: str = "compatibility"
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,35 @@ class CompatibilityReport:
     @property
     def blocking_findings(self) -> tuple[CompatibilityFinding, ...]:
         return tuple(finding for finding in self.findings if finding.blocking)
+
+
+@dataclass(frozen=True)
+class InputRequirement:
+    name: str
+    kind: Literal["text", "file", "directory", "json"]
+    required: bool
+    max_bytes: int | None
+
+
+@dataclass(frozen=True)
+class DoctorReport:
+    package: str
+    workflow: str
+    runnable: bool
+    package_digest: str
+    trust_state: Literal["trusted", "untrusted"]
+    risk_summary: "WorkflowRiskSummary"
+    input_requirements: tuple[InputRequirement, ...]
+    concurrency_policy: Literal["queue", "allow", "forbid"]
+    findings: tuple[CompatibilityFinding, ...]
+    resolved_commands: tuple[str, ...]
+    resolved_scripts: tuple[str, ...]
+    resolved_mcp_servers: tuple[str, ...]
+    resolved_skills: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the stable JSON representation used by the CLI and tests."""
+        return asdict(self)
 
 
 ARCHON_TOOL_ALIASES = {

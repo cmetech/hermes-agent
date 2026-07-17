@@ -1,0 +1,4 @@
+overlap_policy: forbid
+outward_action_nodes: [deliver]
+outward_action_policy: approval_required
+

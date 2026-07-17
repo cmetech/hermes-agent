@@ -1,0 +1,11 @@
+name: builder-scheduled-report
+description: Deterministic scheduled reporting package
+nodes:
+  - id: checkpoint
+    bash: "printf 'scheduled checkpoint'"
+  - id: render
+    command: render-report
+    depends_on: [checkpoint]
+    context: fresh
+    denied_tools: [WebSearch]
+

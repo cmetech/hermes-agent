@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sys
 from collections import Counter
 from dataclasses import asdict
@@ -20,7 +21,11 @@ import yaml
 from hermes_constants import get_hermes_home
 from plugins.workflow.compat import (
     ARCHON_TOOL_ALIASES,
+    CompatibilityFinding,
+    CompatibilityLevel,
     CompatibilityReport,
+    DoctorReport,
+    InputRequirement,
     assess_compatibility,
 )
 from plugins.workflow.admission import RunAdmissionRequest
@@ -535,19 +540,413 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     return 0 if payload["valid"] else 1
 
 
-def _doctor_payload(
-    package: WorkflowPackage, *, compat_report: bool
-) -> dict[str, object]:
-    compatibility = assess_compatibility(package)
+_MCP_ENV_REFERENCE = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)"
+)
+_INPUT_KINDS = frozenset({"text", "file", "directory", "json"})
+_CONCURRENCY_POLICIES = frozenset({"queue", "allow", "forbid"})
+
+
+def _doctor_finding(
+    *,
+    code: str,
+    path: str,
+    message: str,
+    blocking: bool = False,
+    level: CompatibilityLevel = CompatibilityLevel.MAPPED,
+) -> CompatibilityFinding:
+    return CompatibilityFinding(
+        path=path,
+        level=level,
+        message=message,
+        blocking=blocking,
+        code=code,
+    )
+
+
+def _compatibility_code(finding: CompatibilityFinding) -> str:
+    message = finding.message.lower()
+    if "unknown archon tool alias" in message:
+        return "unknown_tool_alias"
+    if "mapped hermes tool is unavailable" in message:
+        return "unavailable_tool"
+    if ".hooks." in finding.path:
+        return "hook_unsupported" if finding.blocking else "hook_mapped"
+    if "provider" in message and "does not advertise" in message:
+        return "provider_field_unsupported"
+    if finding.path.endswith("persist_session") or finding.path == "persist_sessions":
+        return "persistent_session_fingerprint"
+    if finding.path.endswith(".mcp"):
+        return "mcp_isolation"
+    if finding.path.endswith(".skills"):
+        return "skill_snapshot"
+    if finding.path.endswith(".agents"):
+        return "inline_agent_bounds"
+    if finding.path.endswith("output_format"):
+        return "output_schema_enforcement"
+    if finding.path.startswith("requires["):
+        return "required_service"
+    if finding.path.startswith("worktree"):
+        return "worktree_requirement"
+    return finding.code
+
+
+def _coded_compatibility_findings(
+    report: CompatibilityReport,
+) -> list[CompatibilityFinding]:
+    return [
+        CompatibilityFinding(
+            path=finding.path,
+            level=finding.level,
+            message=finding.message,
+            blocking=finding.blocking,
+            code=_compatibility_code(finding),
+        )
+        for finding in report.findings
+    ]
+
+
+def _input_requirements(
+    package: WorkflowPackage, findings: list[CompatibilityFinding]
+) -> tuple[InputRequirement, ...]:
+    delivery = package.sidecar.get("delivery_defaults", {})
+    if delivery is None:
+        return ()
+    if not isinstance(delivery, Mapping):
+        findings.append(
+            _doctor_finding(
+                code="invalid_input_requirements",
+                path="sidecar.delivery_defaults",
+                message="delivery_defaults must contain a mapping",
+                blocking=True,
+                level=CompatibilityLevel.UNSUPPORTED,
+            )
+        )
+        return ()
+    raw_inputs = delivery.get("inputs", {})
+    if not isinstance(raw_inputs, Mapping):
+        findings.append(
+            _doctor_finding(
+                code="invalid_input_requirements",
+                path="sidecar.delivery_defaults.inputs",
+                message="delivery default inputs must contain a mapping",
+                blocking=True,
+                level=CompatibilityLevel.UNSUPPORTED,
+            )
+        )
+        return ()
+    requirements: list[InputRequirement] = []
+    for name, raw in sorted(raw_inputs.items(), key=lambda item: str(item[0])):
+        path = f"sidecar.delivery_defaults.inputs.{name}"
+        if not isinstance(name, str) or not name or not isinstance(raw, Mapping):
+            findings.append(
+                _doctor_finding(
+                    code="invalid_input_requirements",
+                    path=path,
+                    message="input requirements must be named mappings",
+                    blocking=True,
+                    level=CompatibilityLevel.UNSUPPORTED,
+                )
+            )
+            continue
+        kind = raw.get("kind", "text")
+        required = raw.get("required", True)
+        max_bytes = raw.get("max_bytes")
+        valid = (
+            kind in _INPUT_KINDS
+            and isinstance(required, bool)
+            and (
+                max_bytes is None
+                or (
+                    isinstance(max_bytes, int)
+                    and not isinstance(max_bytes, bool)
+                    and max_bytes > 0
+                )
+            )
+        )
+        if not valid:
+            findings.append(
+                _doctor_finding(
+                    code="invalid_input_requirements",
+                    path=path,
+                    message="input kind, required flag, or byte ceiling is invalid",
+                    blocking=True,
+                    level=CompatibilityLevel.UNSUPPORTED,
+                )
+            )
+            continue
+        requirements.append(
+            InputRequirement(
+                name=name,
+                kind=kind,
+                required=required,
+                max_bytes=max_bytes,
+            )
+        )
+        findings.append(
+            _doctor_finding(
+                code="immutable_input_snapshot",
+                path=path,
+                message=(
+                    f"{kind} input {name} is validated, size-bounded, and copied "
+                    "into the immutable run snapshot before admission"
+                ),
+            )
+        )
+    return tuple(requirements)
+
+
+def _mcp_environment_names(package: WorkflowPackage) -> tuple[str, ...]:
+    names: set[str] = set()
+    digest = compute_package_digest(package)
+    for relative in digest.covered_relative_paths:
+        if not relative.startswith("mcp/"):
+            continue
+        path = package.root / relative
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        for match in _MCP_ENV_REFERENCE.finditer(text):
+            names.add(match.group(1) or match.group(2))
+    return tuple(sorted(names))
+
+
+def _doctor_compatibility_level(
+    findings: Iterable[CompatibilityFinding],
+) -> CompatibilityLevel:
+    materialized = tuple(findings)
+    if any(
+        finding.level is CompatibilityLevel.UNSUPPORTED for finding in materialized
+    ):
+        return CompatibilityLevel.UNSUPPORTED
+    if materialized:
+        return CompatibilityLevel.MAPPED
+    return CompatibilityLevel.PORTABLE
+
+
+def doctor_package(
+    package: WorkflowPackage,
+    *,
+    hermes_home: str | Path,
+    available_tools: AbstractSet[str] | None = None,
+    available_services: AbstractSet[str] | None = None,
+    provider_capabilities: Mapping[str, AbstractSet[str]] | None = None,
+    available_skills: AbstractSet[str] | None = None,
+    available_runtimes: AbstractSet[str] | None = None,
+    isolated_workdir: bool = False,
+    mcp_available: bool = False,
+    environment: Mapping[str, str] | None = None,
+    runtime_config: WorkflowRuntimeConfig | None = None,
+) -> DoctorReport:
+    """Inspect a package without starting a provider, worker, or MCP server."""
+    compatibility = assess_compatibility(
+        package,
+        available_tools=available_tools,
+        available_services=available_services,
+        provider_capabilities=provider_capabilities,
+        isolated_workdir=isolated_workdir,
+        mcp_available=mcp_available,
+    )
+    findings = _coded_compatibility_findings(compatibility)
     risk = build_risk_summary(package, compatibility)
-    payload = risk.to_dict()
+    package_digest = compute_package_digest(package)
+    covered = package_digest.covered_relative_paths
+    commands = tuple(path for path in covered if path.startswith("commands/"))
+    scripts = tuple(path for path in covered if path.startswith("scripts/"))
+    mcp_servers = tuple(path for path in covered if path.startswith("mcp/"))
+    skills = tuple(sorted(set(risk.requested_skills)))
+
+    requirements = _input_requirements(package, findings)
+    runtimes = (
+        frozenset(
+            runtime for runtime in ("bun", "uv") if shutil.which(runtime) is not None
+        )
+        if available_runtimes is None
+        else frozenset(available_runtimes)
+    )
+    for index, node in enumerate(package.definition.nodes):
+        if node.node_type == "script":
+            runtime = str(node.options.get("runtime", ""))
+            if runtime not in runtimes:
+                findings.append(
+                    _doctor_finding(
+                        code="missing_runtime",
+                        path=f"nodes[{index}].runtime",
+                        message=f"required script runtime is unavailable: {runtime}",
+                        blocking=True,
+                        level=CompatibilityLevel.UNSUPPORTED,
+                    )
+                )
+        if node.options.get("agents") and not any(
+            finding.path == f"nodes[{index}].agents" for finding in findings
+        ):
+            findings.append(
+                _doctor_finding(
+                    code="inline_agent_bounds",
+                    path=f"nodes[{index}].agents",
+                    message="inline agents inherit bounded workflow worker and deadline ceilings",
+                )
+            )
+
+    if available_skills is not None:
+        for skill in skills:
+            if skill not in available_skills:
+                findings.append(
+                    _doctor_finding(
+                        code="missing_skill",
+                        path="skills",
+                        message=f"required skill is unavailable: {skill}",
+                        blocking=True,
+                        level=CompatibilityLevel.UNSUPPORTED,
+                    )
+                )
+
+    visible_environment = os.environ if environment is None else environment
+    for name in _mcp_environment_names(package):
+        if not visible_environment.get(name):
+            findings.append(
+                _doctor_finding(
+                    code="missing_mcp_variable",
+                    path=f"mcp.environment.{name}",
+                    message=f"required MCP variable is not configured: {name}",
+                    blocking=True,
+                    level=CompatibilityLevel.UNSUPPORTED,
+                )
+            )
+    for name in risk.required_secret_names:
+        if not visible_environment.get(name):
+            findings.append(
+                _doctor_finding(
+                    code="missing_credential",
+                    path=f"required_secrets.{name}",
+                    message=f"required credential is not configured: {name}",
+                    blocking=True,
+                    level=CompatibilityLevel.UNSUPPORTED,
+                )
+            )
+
+    policy = str(package.sidecar.get("overlap_policy") or "queue")
+    if policy not in _CONCURRENCY_POLICIES:
+        findings.append(
+            _doctor_finding(
+                code="invalid_overlap_policy",
+                path="sidecar.overlap_policy",
+                message=f"unsupported overlap policy: {policy}",
+                blocking=True,
+                level=CompatibilityLevel.UNSUPPORTED,
+            )
+        )
+        policy = "queue"
+    findings.append(
+        _doctor_finding(
+            code=f"overlap_{policy}",
+            path="sidecar.overlap_policy",
+            message=f"matching concurrent invocations use the {policy} policy",
+        )
+    )
+
+    base_runtime = runtime_config or _runtime_config(hermes_home)
+    limits = package.sidecar.get("limits", {})
+    resources = package.sidecar.get("resource_limits", {})
+    if not isinstance(limits, Mapping) or not isinstance(resources, Mapping):
+        findings.append(
+            _doctor_finding(
+                code="invalid_resource_ceiling",
+                path="sidecar.limits",
+                message="workflow limits and resource_limits must be mappings",
+                blocking=True,
+                level=CompatibilityLevel.UNSUPPORTED,
+            )
+        )
+        effective_runtime = base_runtime
+    else:
+        effective_runtime = WorkflowRuntimeConfig.from_mapping(
+            asdict(base_runtime),
+            sidecar_limits=limits,
+            sidecar_resources=resources,
+        )
+    capacity = {
+        name: getattr(effective_runtime, name)
+        for name in (
+            "max_parallel_nodes",
+            "max_total_workers",
+            "max_executing_runs",
+            "max_queued_runs",
+            "max_paused_runs",
+            "max_nonterminal_runs",
+            "max_start_requests_per_minute",
+            "process_tree_rss_bytes",
+            "process_tree_cpu_seconds",
+            "max_descendants",
+        )
+    }
+    findings.append(
+        _doctor_finding(
+            code="effective_admission_capacity",
+            path="runtime.limits",
+            message="effective admission and resource ceilings: "
+            + json.dumps(capacity, sort_keys=True, separators=(",", ":")),
+        )
+    )
+    findings.append(
+        _doctor_finding(
+            code="executable_resources_digest_bound",
+            path="package.digest",
+            message="package digest covers executable resources: "
+            + ", ".join(covered),
+        )
+    )
+    findings.append(
+        _doctor_finding(
+            code=(
+                "isolated_execution_required"
+                if risk.execution_environment == "isolated_backend_required"
+                else "trusted_local_execution"
+            ),
+            path="sidecar.execution_environment",
+            message=(
+                "execution requires an isolated backend with advertised containment"
+                if risk.execution_environment == "isolated_backend_required"
+                else "trusted package may execute on the configured local backend"
+            ),
+        )
+    )
+
+    trust_state = WorkflowTrustStore(hermes_home).check(
+        package_digest.sha256, risk_digest=risk.risk_digest
+    )
+    return DoctorReport(
+        package=str(package.root),
+        workflow=package.definition.name,
+        runnable=not any(finding.blocking for finding in findings),
+        package_digest=package_digest.sha256,
+        trust_state=trust_state,
+        risk_summary=risk,
+        input_requirements=requirements,
+        concurrency_policy=policy,
+        findings=tuple(findings),
+        resolved_commands=commands,
+        resolved_scripts=scripts,
+        resolved_mcp_servers=mcp_servers,
+        resolved_skills=skills,
+    )
+
+
+def _doctor_payload(
+    package: WorkflowPackage,
+    *,
+    hermes_home: str | Path,
+    compat_report: bool,
+) -> dict[str, object]:
+    report = doctor_package(package, hermes_home=hermes_home)
+    payload = report.to_dict()
     payload.update({
         "name": package.definition.name,
-        "compatibility": compatibility.level.value,
-        "runnable": compatibility.runnable,
+        "compatibility": _doctor_compatibility_level(report.findings).value,
         "remediation": (
             "Resolve blocking compatibility findings, then rerun doctor and trust the current digest."
-            if compatibility.blocking_findings
+            if any(finding.blocking for finding in report.findings)
             else "Review this risk summary, then trust the exact package digest before local execution."
         ),
     })
@@ -558,15 +957,18 @@ def _doctor_payload(
                 "level": finding.level.value,
                 "message": finding.message,
                 "blocking": finding.blocking,
+                "code": finding.code,
             }
-            for finding in compatibility.findings
+            for finding in report.findings
         ]
     return payload
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     payload = _doctor_payload(
-        _resolve(args, args.name), compat_report=args.compat_report
+        _resolve(args, args.name),
+        hermes_home=args.hermes_home,
+        compat_report=args.compat_report,
     )
     if args.json:
         _emit(payload, as_json=True)
@@ -575,7 +977,10 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(f"Package digest: {payload['package_digest']}")
         print(f"Risk digest: {payload['risk_digest']}")
         print(f"Compatibility: {payload['compatibility']}")
-        print(f"Execution environment: {payload['execution_environment']}")
+        print(
+            "Execution environment: "
+            f"{payload['risk_summary']['execution_environment']}"
+        )
         print(f"Remediation: {payload['remediation']}")
     return 0
 
