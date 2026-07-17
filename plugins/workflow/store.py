@@ -1414,6 +1414,28 @@ class RunStore:
             public_events.append(_sanitize(event))
         return tuple(public_events)
 
+    def events_after(
+        self,
+        run_id: str,
+        *,
+        after: int = 0,
+        limit: int = 200,
+        operator_scope: str | None = None,
+    ) -> dict[str, object]:
+        """Return a bounded monotonic event page for REST/desktop consumers."""
+        events = self.tail_events(
+            run_id,
+            after_sequence=after,
+            limit=max(1, min(int(limit), 200)),
+            operator_scope=operator_scope,
+        )
+        return {
+            "schema_version": 1,
+            "events": events,
+            "next_cursor": int(events[-1]["sequence"]) if events else after,
+            "cursor_reset": False,
+        }
+
     def list_runs(
         self,
         *,
@@ -2411,12 +2433,20 @@ class RunStore:
             return True
 
     def cancel_run(
-        self, run_id: str, *, operator_scope: str | None = None
+        self,
+        run_id: str,
+        *,
+        expected_state_version: int | None = None,
+        operator_scope: str | None = None,
     ) -> dict[str, object]:
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         recorded: list[tuple[str, str, ProcessIdentity]] = []
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
+            if expected_state_version is not None and (
+                int(projection["state_version"]) != expected_state_version
+            ):
+                raise RuntimeError("stale cancellation decision")
             if projection["status"] in {
                 "succeeded",
                 "failed",
@@ -2560,7 +2590,11 @@ class RunStore:
             return {**projection, "cancellation_outcome": "cancelled"}
 
     def resume_run(
-        self, run_id: str, *, operator_scope: str | None = None
+        self,
+        run_id: str,
+        *,
+        expected_state_version: int | None = None,
+        operator_scope: str | None = None,
     ) -> dict[str, object]:
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         from plugins.workflow.schema import load_workflow
@@ -2573,6 +2607,10 @@ class RunStore:
         }
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
+            if expected_state_version is not None and (
+                int(projection["state_version"]) != expected_state_version
+            ):
+                raise RuntimeError("stale resume decision")
             if projection["status"] not in {"failed", "interrupted"}:
                 return projection
             for node_id, node in projection["nodes"].items():
@@ -3026,7 +3064,11 @@ class RunStore:
             return projection
 
     def abandon_run(
-        self, run_id: str, *, operator_scope: str | None = None
+        self,
+        run_id: str,
+        *,
+        expected_state_version: int | None = None,
+        operator_scope: str | None = None,
     ) -> dict[str, object]:
         projection = self.load_run(run_id, operator_scope=operator_scope)
         if projection["status"] not in {"interrupted", "failed", "paused"}:
@@ -3037,6 +3079,7 @@ class RunStore:
             run_id,
             "abandoned",
             {"abandoned"},
+            expected_state_version=expected_state_version,
             operator_scope=operator_scope,
         )
 
@@ -3046,12 +3089,17 @@ class RunStore:
         target: str,
         outcomes: set[str],
         *,
+        expected_state_version: int | None = None,
         operator_scope: str | None = None,
     ) -> dict[str, object]:
         del outcomes
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
+            if expected_state_version is not None and (
+                int(projection["state_version"]) != expected_state_version
+            ):
+                raise RuntimeError("stale terminal transition")
             if projection["status"] in {
                 "succeeded",
                 "failed",
