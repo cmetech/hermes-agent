@@ -54,7 +54,13 @@ import type {
   StatusResponse,
   ToolsetConfig,
   ToolsetInfo,
-  ToolsetModelsResponse
+  ToolsetModelsResponse,
+  WorkflowAttentionPage,
+  WorkflowEventPage,
+  WorkflowRunPage,
+  WorkflowRunSnapshot,
+  KanbanBoardSummary,
+  KanbanTaskPage
 } from '@/types/hermes'
 
 // Desktop startup fires a burst of read-only data calls (config, profiles,
@@ -218,6 +224,66 @@ export async function listSessions(
     sessions: result.sessions.slice(0, limit),
     offset: 0
   }
+}
+
+export function listWorkflowRuns(cursor?: string): Promise<WorkflowRunPage> {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''
+  return window.hermesDesktop.api<WorkflowRunPage>({
+    path: `/api/plugins/workflow/runs${query}`,
+    ...profileScoped()
+  })
+}
+
+export function getWorkflowRun(runId: string): Promise<WorkflowRunSnapshot> {
+  return window.hermesDesktop.api<WorkflowRunSnapshot>({
+    path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}`,
+    ...profileScoped()
+  })
+}
+
+export function listWorkflowAttention(): Promise<WorkflowAttentionPage> {
+  return window.hermesDesktop.api<WorkflowAttentionPage>({
+    path: '/api/plugins/workflow/attention',
+    ...profileScoped()
+  })
+}
+
+export function listWorkflowEvents(runId: string, after = 0): Promise<WorkflowEventPage> {
+  return window.hermesDesktop.api<WorkflowEventPage>({
+    path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/events?after=${after}&wait_seconds=20`,
+    timeoutMs: 25_000,
+    ...profileScoped()
+  })
+}
+
+export function mutateWorkflowRun(
+  runId: string,
+  action: string,
+  body: Record<string, unknown>
+): Promise<WorkflowRunSnapshot> {
+  return window.hermesDesktop.api<WorkflowRunSnapshot>({
+    path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/${encodeURIComponent(action)}`,
+    method: 'POST',
+    body,
+    ...profileScoped()
+  })
+}
+
+export function getKanbanBoardSummary(board: string): Promise<KanbanBoardSummary> {
+  return window.hermesDesktop.api<KanbanBoardSummary>({
+    path: `/api/plugins/kanban/board/summary?board=${encodeURIComponent(board)}`,
+    ...profileScoped()
+  })
+}
+
+export function listKanbanTasks(board: string, status?: string, cursor?: string): Promise<KanbanTaskPage> {
+  const query = new URLSearchParams({ board })
+  if (status) query.set('status', status)
+  if (cursor) query.set('cursor', cursor)
+  return window.hermesDesktop.api<KanbanTaskPage>({
+    path: `/api/plugins/kanban/tasks?${query.toString()}`,
+    ...profileScoped()
+  })
 }
 
 // Unified, read-only session list aggregated across ALL profiles. Served by the
