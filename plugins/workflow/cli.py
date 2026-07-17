@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import secrets
 import sys
 from collections import Counter
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import AbstractSet, Iterable, Mapping
 
@@ -50,16 +52,42 @@ def _compat_dict(report: CompatibilityReport) -> dict[str, object]:
     }
 
 
+def workflow_trigger_idempotency_key(
+    schedule_id: str, scheduled_utc_fire_instant: datetime
+) -> str:
+    """Return the stable source key for one logical cron delivery."""
+    if not schedule_id:
+        raise ValueError("schedule_id must not be empty")
+    if scheduled_utc_fire_instant.tzinfo is None:
+        raise ValueError("scheduled fire instant must be timezone-aware")
+    instant = scheduled_utc_fire_instant.astimezone(timezone.utc).isoformat(
+        timespec="microseconds"
+    )
+    material = f"{schedule_id}\0{instant}".encode()
+    return "cron:" + hashlib.sha256(material).hexdigest()
+
+
 def _catalog_summary(
     package: WorkflowPackage, report: CompatibilityReport
 ) -> dict[str, object]:
+    topology = project_topology(package.definition)
     return {
+        "action": "list",
+        "workflow": package.definition.name,
         "name": package.definition.name,
         "description": package.definition.description,
         "source": package.source,
         "precedence": package.precedence,
         "compatibility": _compat_dict(report),
         "runnable": report.runnable,
+        "topology_text": topology.text,
+        "topology_mermaid": topology.mermaid,
+        "topology_warnings": list(topology.warnings),
+        "requirements": {},
+        "approvals": [],
+        "schedules": [],
+        "warnings": [],
+        "next_actions": ["show", "doctor"] if report.runnable else ["doctor"],
     }
 
 
@@ -205,6 +233,7 @@ def show_package(
         if node.node_type == "script" and "runtime" in node.options
     }
     result.update({
+        "action": "show",
         "argument_hints": _argument_hints(package),
         "topology_text": topology.text,
         "topology_mermaid": topology.mermaid,
@@ -229,6 +258,21 @@ def show_package(
             for finding in report.blocking_findings
         ],
     })
+    result["requirements"] = {
+        "tools": result["required_tools"],
+        "skills": result["required_skills"],
+        "mcp": result["required_mcp"],
+        "providers": result["required_providers"],
+        "runtimes": result["required_runtimes"],
+        "arguments": result["argument_hints"],
+    }
+    result["approvals"] = {
+        "nodes": result["approval_nodes"],
+        "outward_actions": result["outward_action_nodes"],
+    }
+    result["schedules"] = result["related_cron_schedules"]
+    result["warnings"] = [item["message"] for item in result["blocking_findings"]]
+    result["next_actions"] = ["run"] if report.runnable else ["doctor"]
     return result
 
 
@@ -313,6 +357,36 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     reject_parser.add_argument("--reason", default="")
     reject_parser.add_argument("--continue", dest="continue_run", action="store_true")
     _json_flag(reject_parser)
+
+    input_parser = actions.add_parser(
+        "provide-input", help="Provide bounded input to a paused workflow loop"
+    )
+    input_parser.add_argument("run_id")
+    input_parser.add_argument("interaction_id")
+    input_parser.add_argument("value")
+    input_parser.add_argument("--expected-version", type=int, required=True)
+    input_parser.add_argument("--continue", dest="continue_run", action="store_true")
+    _json_flag(input_parser)
+
+    retry_parser = actions.add_parser("retry", help="Retry one failed workflow node")
+    retry_parser.add_argument("run_id")
+    retry_parser.add_argument("node_id", nargs="?")
+    retry_parser.add_argument("--expected-version", type=int)
+    retry_parser.add_argument("--continue", dest="continue_run", action="store_true")
+    _json_flag(retry_parser)
+
+    reconcile_parser = actions.add_parser(
+        "reconcile", help="Resolve an unknown outward-action outcome"
+    )
+    reconcile_parser.add_argument("run_id")
+    reconcile_parser.add_argument(
+        "outcome",
+        choices=("confirmed-succeeded", "confirmed-failed", "safe-to-retry"),
+    )
+    reconcile_parser.add_argument("--interaction-id")
+    reconcile_parser.add_argument("--expected-version", type=int)
+    reconcile_parser.add_argument("--continue", dest="continue_run", action="store_true")
+    _json_flag(reconcile_parser)
 
     for action, help_text in (
         ("resume", "Resume an interrupted workflow run"),
@@ -766,6 +840,80 @@ def _cmd_resume(
     return 0
 
 
+def _continue_if_requested(args, store, runtime, *, agent_runner, profile_name):
+    if args.continue_run:
+        _scheduler(
+            store,
+            runtime,
+            agent_runner=agent_runner,
+            profile_name=profile_name,
+        ).advance(args.run_id)
+
+
+def _cmd_provide_input(
+    args: argparse.Namespace, *, agent_runner=None, profile_name="default"
+) -> int:
+    runtime = _runtime_config(args.hermes_home)
+    store = _store(args, runtime)
+    current = store.get_run_status(args.run_id)
+    pending = current.get("pending_interaction")
+    if isinstance(pending, Mapping):
+        actual = pending.get("interaction_id") or pending.get("action_digest")
+        if actual is not None and actual != args.interaction_id:
+            raise ValueError("interaction ID does not match the pending input")
+    store.provide_loop_input(
+        args.run_id,
+        args.value,
+        expected_state_version=args.expected_version,
+    )
+    _continue_if_requested(
+        args, store, runtime, agent_runner=agent_runner, profile_name=profile_name
+    )
+    payload = store.get_run_status(args.run_id)
+    payload["action"] = "provide-input"
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _cmd_retry(
+    args: argparse.Namespace, *, agent_runner=None, profile_name="default"
+) -> int:
+    runtime = _runtime_config(args.hermes_home)
+    store = _store(args, runtime)
+    store.retry_run(
+        args.run_id,
+        node_id=args.node_id,
+        expected_state_version=args.expected_version,
+    )
+    _continue_if_requested(
+        args, store, runtime, agent_runner=agent_runner, profile_name=profile_name
+    )
+    payload = store.get_run_status(args.run_id)
+    payload["action"] = "retry"
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _cmd_reconcile(
+    args: argparse.Namespace, *, agent_runner=None, profile_name="default"
+) -> int:
+    runtime = _runtime_config(args.hermes_home)
+    store = _store(args, runtime)
+    store.reconcile_run(
+        args.run_id,
+        args.outcome,
+        expected_state_version=args.expected_version,
+        interaction_id=args.interaction_id,
+    )
+    _continue_if_requested(
+        args, store, runtime, agent_runner=agent_runner, profile_name=profile_name
+    )
+    payload = store.get_run_status(args.run_id)
+    payload["action"] = "reconcile"
+    _emit(payload, as_json=args.json)
+    return 0
+
+
 def _cmd_cancel(args: argparse.Namespace) -> int:
     store = _store(args)
     store.cancel_run(args.run_id)
@@ -828,7 +976,7 @@ def workflow_command(
     action = getattr(args, "workflow_action", None)
     if not action:
         print(
-            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|resume|cancel|abandon|cleanup}",
+            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|cleanup|reset-sessions}",
             file=sys.stderr,
         )
         return 2
@@ -867,8 +1015,20 @@ def workflow_command(
                 agent_runner=agent_runner,
                 profile_name=profile_name,
             )
+        if action == "provide-input":
+            return _cmd_provide_input(
+                args, agent_runner=agent_runner, profile_name=profile_name
+            )
         if action == "resume":
             return _cmd_resume(
+                args, agent_runner=agent_runner, profile_name=profile_name
+            )
+        if action == "retry":
+            return _cmd_retry(
+                args, agent_runner=agent_runner, profile_name=profile_name
+            )
+        if action == "reconcile":
+            return _cmd_reconcile(
                 args, agent_runner=agent_runner, profile_name=profile_name
             )
         if action == "cancel":

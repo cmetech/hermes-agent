@@ -2916,6 +2916,115 @@ class RunStore:
                 )
             return projection
 
+    def retry_run(
+        self,
+        run_id: str,
+        *,
+        node_id: str | None = None,
+        expected_state_version: int | None = None,
+        operator_scope: str | None = None,
+    ) -> dict[str, object]:
+        """Explicitly retry one failed/interrupted node with compare-and-set safety."""
+        directory = self.run_directory(run_id, operator_scope=operator_scope)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if expected_state_version is not None and (
+                int(projection["state_version"]) != expected_state_version
+            ):
+                raise RuntimeError("stale retry decision")
+            candidates = [
+                (candidate_id, node)
+                for candidate_id, node in projection["nodes"].items()
+                if (node_id is None or candidate_id == node_id)
+                and node.get("state") in {"failed", "interrupted"}
+                and not isinstance(node.get("pending_interaction"), Mapping)
+            ]
+            if len(candidates) != 1:
+                raise ValueError("retry requires exactly one failed or interrupted node")
+            selected_id, node = candidates[0]
+            node.pop("claim", None)
+            node.pop("next_attempt_at", None)
+            node["state"] = (
+                "ready"
+                if all(
+                    projection["nodes"][dependency]["state"] == "succeeded"
+                    for dependency in node["depends_on"]
+                )
+                else "pending"
+            )
+            projection["status"] = "running"
+            projection["last_error"] = None
+            self._append_locked(
+                directory,
+                projection,
+                "node_retry_requested",
+                {"reason_code": "operator_retry"},
+                node_id=selected_id,
+            )
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status='running', updated_at=? WHERE run_id=?",
+                    (projection["updated_at"], run_id),
+                )
+            return projection
+
+    def reconcile_run(
+        self,
+        run_id: str,
+        outcome: str,
+        *,
+        expected_state_version: int | None = None,
+        interaction_id: str | None = None,
+        operator_scope: str | None = None,
+    ) -> dict[str, object]:
+        """Resolve one unknown-side-effect pause without making an inference."""
+        if outcome not in {"confirmed-succeeded", "confirmed-failed", "safe-to-retry"}:
+            raise ValueError("invalid reconciliation outcome")
+        directory = self.run_directory(run_id, operator_scope=operator_scope)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if expected_state_version is not None and (
+                int(projection["state_version"]) != expected_state_version
+            ):
+                raise RuntimeError("stale reconciliation decision")
+            candidates = []
+            for candidate_id, node in projection["nodes"].items():
+                pending = node.get("pending_interaction")
+                is_reconcile = pending == "reconcile" or (
+                    isinstance(pending, Mapping) and pending.get("type") == "reconcile"
+                )
+                identity = self._interaction_identity(node)
+                if is_reconcile and (interaction_id is None or identity == interaction_id):
+                    candidates.append((candidate_id, node))
+            if len(candidates) != 1:
+                raise ValueError("reconcile requires exactly one matching interaction")
+            selected_id, node = candidates[0]
+            node.pop("pending_interaction", None)
+            if outcome == "confirmed-succeeded":
+                node["state"] = "succeeded"
+                projection["status"] = "running"
+                projection["last_error"] = None
+            elif outcome == "confirmed-failed":
+                node["state"] = "failed"
+                projection["status"] = "failed"
+            else:
+                node["state"] = "ready"
+                projection["status"] = "running"
+                projection["last_error"] = None
+            self._append_locked(
+                directory,
+                projection,
+                "node_reconciled",
+                {"outcome": outcome},
+                node_id=selected_id,
+            )
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                    (projection["status"], projection["updated_at"], run_id),
+                )
+            return projection
+
     def abandon_run(
         self, run_id: str, *, operator_scope: str | None = None
     ) -> dict[str, object]:

@@ -51,12 +51,22 @@ def test_list_catalog_has_stable_summary_without_bodies(workflow_writer, tmp_pat
     assert len(entries) == 1
     entry = entries[0]
     assert set(entry) == {
+        "action",
+        "workflow",
         "name",
         "description",
         "source",
         "precedence",
         "compatibility",
         "runnable",
+        "topology_text",
+        "topology_mermaid",
+        "topology_warnings",
+        "requirements",
+        "approvals",
+        "schedules",
+        "warnings",
+        "next_actions",
     }
     assert entry["name"] == "cataloged"
     serialized = json.dumps(entry, sort_keys=True)
