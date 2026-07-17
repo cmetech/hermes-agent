@@ -2,7 +2,7 @@
   "name": "hermes",
   "productName": "Hermes",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Native desktop shell for Hermes Agent.",
   "author": "cmetech",
   "type": "module",
