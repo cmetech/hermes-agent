@@ -1,10 +1,10 @@
 schema_version: 1
-bundle_version: "2.0.0-alpha.1"
+bundle_version: "2.0.0"
 scenarios:
   - id: laptop-diagnostic
     display_name: Laptop Diagnostic Tour
     purpose: Demonstrate an offline workflow using sanitized fictional laptop evidence.
-    bundle_version: "2.0.0-alpha.1"
+    bundle_version: "2.0.0"
     package_version: "1"
     workflow_path: packages/laptop-diagnostic/workflows/laptop-diagnostic.yaml
     interaction_mode: guided
@@ -22,7 +22,7 @@ scenarios:
   - id: resilience
     display_name: Controlled Resilience Lab
     purpose: Demonstrate bounded retry, timeout, cancellation, and process cleanup.
-    bundle_version: "2.0.0-alpha.1"
+    bundle_version: "2.0.0"
     package_version: "1"
     workflow_path: packages/resilience/workflows/resilience.yaml
     interaction_mode: guided
@@ -40,7 +40,7 @@ scenarios:
   - id: ai-extensions
     display_name: Optional AI and Extensions Tour
     purpose: Demonstrate explicitly authorized AI, skill, hook, inline-agent, and local MCP scope.
-    bundle_version: "2.0.0-alpha.1"
+    bundle_version: "2.0.0"
     package_version: "1"
     workflow_path: packages/ai-extensions/workflows/ai-extensions.yaml
     interaction_mode: consent
@@ -58,7 +58,7 @@ scenarios:
   - id: scheduling
     display_name: Optional Scheduling Tour
     purpose: Create one explicitly confirmed Hermes repeat=1 cron delivery.
-    bundle_version: "2.0.0-alpha.1"
+    bundle_version: "2.0.0"
     package_version: "1"
     workflow_path: packages/scheduling/workflows/scheduled-check.yaml
     interaction_mode: schedule
