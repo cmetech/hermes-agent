@@ -46,6 +46,7 @@ from plugins.workflow.trust import (
     WorkflowTrustStore,
     build_risk_summary,
     compute_package_digest,
+    preflight_execution,
 )
 from tools.managed_process import ProcessResourceLimits
 
@@ -1202,11 +1203,19 @@ def _cmd_run(
     package = _resolve(args, args.name)
     runtime = _runtime_config(args.hermes_home, sidecar=package.sidecar)
     digest = compute_package_digest(package)
-    if WorkflowTrustStore(args.hermes_home).check(digest.sha256) != "trusted":
+    risk = build_risk_summary(package, assess_compatibility(package))
+    if WorkflowTrustStore(args.hermes_home).check(
+        digest.sha256, risk_digest=risk.risk_digest
+    ) != "trusted":
         print(
             "workflow package is not trusted; run doctor and trust its exact digest",
             file=sys.stderr,
         )
+        return 1
+    try:
+        preflight_execution(risk, trusted=True)
+    except WorkflowTrustError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
     store = _store(args, runtime)
     prepared = store.prepare_run_snapshot(
