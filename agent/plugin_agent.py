@@ -12,6 +12,7 @@ import json
 import math
 from pathlib import Path
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -52,6 +53,7 @@ class PluginAgentRunRequest:
     allowed_tools: tuple[str, ...] | None = None
     denied_tools: tuple[str, ...] = ()
     skills: tuple[str, ...] = ()
+    approved_action_digest: str | None = None
     workdir: Path | None = None
     max_iterations: int = 90
     max_api_attempts: int = 3
@@ -80,7 +82,9 @@ class PluginAgentRunResult:
     def __post_init__(self) -> None:
         if self.pending_interaction is not None:
             object.__setattr__(
-                self, "pending_interaction", MappingProxyType(dict(self.pending_interaction))
+                self,
+                "pending_interaction",
+                MappingProxyType(dict(self.pending_interaction)),
             )
         object.__setattr__(self, "usage", MappingProxyType(dict(self.usage)))
         object.__setattr__(self, "audit", MappingProxyType(dict(self.audit)))
@@ -125,6 +129,12 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
     for label, value in (("provider", request.provider), ("model", request.model)):
         if value is not None and (not isinstance(value, str) or not value.strip()):
             raise ValueError(f"{label} must be a non-empty string or None")
+    if request.approved_action_digest is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", request.approved_action_digest
+    ):
+        raise ValueError(
+            "approved action digest must be 64 lowercase hexadecimal characters"
+        )
     for label, value in (
         ("idle_timeout_seconds", request.idle_timeout_seconds),
         ("wall_timeout_seconds", request.wall_timeout_seconds),
@@ -184,7 +194,9 @@ def _agent_override_allowed(plugin_id: str, kind: str, value: str | None) -> boo
             plugin_id, {}
         )
         policy = entry.get("agent") if isinstance(entry, dict) else None
-        if not isinstance(policy, dict) or not policy.get(f"allow_{kind}_override", False):
+        if not isinstance(policy, dict) or not policy.get(
+            f"allow_{kind}_override", False
+        ):
             return False
         allowed = policy.get(f"allowed_{kind}s")
         return not isinstance(allowed, list) or "*" in allowed or value in allowed
@@ -194,7 +206,9 @@ def _agent_override_allowed(plugin_id: str, kind: str, value: str | None) -> boo
 
 def _request_payload(plugin_id: str, request: PluginAgentRunRequest) -> dict[str, Any]:
     body = asdict(request)
-    body["workdir"] = str(Path(request.workdir).expanduser().resolve()) if request.workdir else None
+    body["workdir"] = (
+        str(Path(request.workdir).expanduser().resolve()) if request.workdir else None
+    )
     return {
         "protocol_version": _PROTOCOL_VERSION,
         "type": "run",
@@ -349,7 +363,9 @@ class PluginAgentRunner:
         try:
             frame = _exchange_worker(
                 payload,
-                workdir=Path(request.workdir).expanduser().resolve() if request.workdir else None,
+                workdir=Path(request.workdir).expanduser().resolve()
+                if request.workdir
+                else None,
                 idle_timeout_seconds=request.idle_timeout_seconds,
                 wall_timeout_seconds=request.wall_timeout_seconds,
                 is_cancelled=is_cancelled,

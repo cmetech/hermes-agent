@@ -40,12 +40,16 @@ def _sanitize(value: Any, limit: int = 2000) -> str:
         return text
 
 
-def _interaction(kind: str, payload: dict[str, Any]) -> dict[str, str]:
+def _interaction_descriptor(kind: str, payload: dict[str, Any]) -> dict[str, str]:
     safe = {key: _sanitize(value, 1000) for key, value in payload.items()}
     digest = hashlib.sha256(
         json.dumps([kind, safe], sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    descriptor = {"kind": kind, "action_digest": digest, **safe}
+    return {"kind": kind, "action_digest": digest, **safe}
+
+
+def _interaction(kind: str, payload: dict[str, Any]) -> dict[str, str]:
+    descriptor = _interaction_descriptor(kind, payload)
     _emit("interaction", interaction=descriptor)
     return descriptor
 
@@ -102,6 +106,7 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
     allowed = None if request.allowed_tools is None else set(request.allowed_tools)
     denied = set(request.denied_tools)
     pending: list[dict[str, str]] = []
+    approved_action_consumed = False
     with registry.scoped_names(allowed_names=allowed, denied_names=denied):
         from run_agent import AIAgent
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -144,12 +149,19 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 active._interrupt_requested = True
 
         def approval(command, description, **_kwargs):
-            pause(
-                _interaction(
-                    "approval",
-                    {"command": command, "description": description},
-                )
+            nonlocal approved_action_consumed
+            descriptor = _interaction_descriptor(
+                "approval",
+                {"command": command, "description": description},
             )
+            if (
+                not approved_action_consumed
+                and request.approved_action_digest == descriptor["action_digest"]
+            ):
+                approved_action_consumed = True
+                return "once"
+            _emit("interaction", interaction=descriptor)
+            pause(descriptor)
             return "deny"
 
         def clarify(question, choices=None):
@@ -169,12 +181,19 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             pause(
                 _interaction(
                     "secret",
-                    {"name": name, "prompt": prompt_text, "skill": metadata.get("skill_name", "")},
+                    {
+                        "name": name,
+                        "prompt": prompt_text,
+                        "skill": metadata.get("skill_name", ""),
+                    },
                 )
             )
             return {"success": False, "stored_as": name, "validated": False}
 
-        from tools.terminal_tool import set_approval_callback, set_sudo_password_callback
+        from tools.terminal_tool import (
+            set_approval_callback,
+            set_sudo_password_callback,
+        )
         from tools.skills_tool import set_secret_capture_callback
 
         set_approval_callback(approval)
@@ -207,10 +226,13 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             if _cancel_event.is_set():
                 agent._interrupt_requested = True
             visible = {
-                name for name in registry._tools
+                name
+                for name in registry._tools
                 if (allowed is None or name in allowed) and name not in denied
             }
-            agent.tools = [tool for tool in (agent.tools or []) if _tool_name(tool) in visible]
+            agent.tools = [
+                tool for tool in (agent.tools or []) if _tool_name(tool) in visible
+            ]
             agent.valid_tool_names = {_tool_name(tool) for tool in agent.tools}
             if not agent.valid_tool_names <= visible:
                 raise RuntimeError("agent tool scope verification failed")
@@ -220,16 +242,24 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             usage = {
                 "input_tokens": int(getattr(agent, "session_input_tokens", 0) or 0),
                 "output_tokens": int(getattr(agent, "session_output_tokens", 0) or 0),
-                "cache_read_tokens": int(getattr(agent, "session_cache_read_tokens", 0) or 0),
-                "cache_write_tokens": int(getattr(agent, "session_cache_write_tokens", 0) or 0),
+                "cache_read_tokens": int(
+                    getattr(agent, "session_cache_read_tokens", 0) or 0
+                ),
+                "cache_write_tokens": int(
+                    getattr(agent, "session_cache_write_tokens", 0) or 0
+                ),
             }
             failed = bool(response.get("failed"))
             return {
-                "final_response": _sanitize(response.get("final_response", ""), 500_000),
+                "final_response": _sanitize(
+                    response.get("final_response", ""), 500_000
+                ),
                 "session_id": str(agent.session_id or ""),
                 "provider": str(agent.provider or ""),
                 "model": str(agent.model or ""),
-                "status": "paused" if pending else ("failed" if failed else "completed"),
+                "status": "paused"
+                if pending
+                else ("failed" if failed else "completed"),
                 "pending_interaction": pending[0] if pending else None,
                 "usage": usage,
                 "audit": {
@@ -254,7 +284,10 @@ def main() -> int:
         return 2
     try:
         payload = json.loads(raw)
-        if payload.get("protocol_version") != _PROTOCOL_VERSION or payload.get("type") != "run":
+        if (
+            payload.get("protocol_version") != _PROTOCOL_VERSION
+            or payload.get("type") != "run"
+        ):
             raise ValueError("unsupported plugin-agent protocol frame")
 
         def watch_coordinator() -> None:

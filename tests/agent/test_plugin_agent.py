@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import json
 import os
 from pathlib import Path
 import sys
@@ -47,7 +49,9 @@ def test_allowed_and_denied_tools_are_enforced_before_first_call() -> None:
         assert registry.get_entry("read_file") is not None
         assert registry.get_entry("terminal") is None
         assert registry.get_all_tool_names() == ["read_file"]
-        assert registry.dispatch("terminal", {}) == '{"error": "Unknown tool: terminal"}'
+        assert (
+            registry.dispatch("terminal", {}) == '{"error": "Unknown tool: terminal"}'
+        )
 
     assert registry.get_all_tool_names() == ["read_file", "terminal"]
 
@@ -60,9 +64,7 @@ def test_empty_allowlist_means_no_names_and_deny_is_applied_last() -> None:
         assert registry.get_entry("read_file") is None
         assert registry.get_definitions({"read_file"}) == []
 
-    with registry.scoped_names(
-        allowed_names={"read_file"}, denied_names={"read_file"}
-    ):
+    with registry.scoped_names(allowed_names={"read_file"}, denied_names={"read_file"}):
         assert registry.get_entry("read_file") is None
 
 
@@ -180,12 +182,12 @@ def test_plugin_runner_returns_usage_without_exposing_credentials(monkeypatch) -
             "idle",
         ),
         (
-                PluginAgentRunRequest(
-                    prompt="x",
-                    idle_timeout_seconds=5,
-                    provider_request_timeout_seconds=20,
-                    wall_timeout_seconds=10,
-                ),
+            PluginAgentRunRequest(
+                prompt="x",
+                idle_timeout_seconds=5,
+                provider_request_timeout_seconds=20,
+                wall_timeout_seconds=10,
+            ),
             "provider",
         ),
     ],
@@ -282,7 +284,9 @@ def test_plugin_context_agent_is_lazy_and_bound_to_manifest_key() -> None:
     assert first.plugin_id == "workflow/test-plugin"
 
 
-def test_real_workers_are_process_isolated_and_unknown_tools_fail_before_billing() -> None:
+def test_real_workers_are_process_isolated_and_unknown_tools_fail_before_billing() -> (
+    None
+):
     import model_tools
     from tools.registry import registry
 
@@ -367,6 +371,82 @@ def test_worker_installs_fail_closed_dangerous_approval(monkeypatch) -> None:
     assert result["pending_interaction"]["kind"] == "approval"
     assert "action_digest" in result["pending_interaction"]
     assert "api_key" not in result["audit"]
+
+
+def test_worker_consumes_exact_approval_digest_once(monkeypatch) -> None:
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+    import hermes_state
+    import run_agent
+    from tools.terminal_tool import _get_approval_callback
+
+    command = "rm -rf /tmp/example"
+    description = "dangerous"
+    safe = {"command": command, "description": description}
+    digest = hashlib.sha256(
+        json.dumps(["approval", safe], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    class FakeDB:
+        pass
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.session_id = "worker-session"
+            self.provider = "fake"
+            self.model = "fake"
+            self.tools = []
+            self.valid_tool_names = set()
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+
+        def run_conversation(self, prompt, conversation_history=None):
+            callback = _get_approval_callback()
+            assert callback is not None
+            assert callback(command, description) == "once"
+            assert callback(command, description) == "deny"
+            return {"final_response": "one-shot", "api_calls": 0}
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(hermes_state, "SessionDB", FakeDB)
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **kwargs: {"provider": "fake", "base_url": "", "api_key": "secret"},
+    )
+    emitted = []
+    monkeypatch.setattr(
+        worker, "_emit", lambda kind, **payload: emitted.append((kind, payload))
+    )
+
+    result = worker._run({
+        "plugin_id": "test-plugin",
+        "request": dataclasses.asdict(
+            PluginAgentRunRequest(
+                prompt="attempt dangerous command",
+                allowed_tools=(),
+                approved_action_digest=digest,
+            )
+        ),
+    })
+
+    assert result["status"] == "paused"
+    assert result["pending_interaction"]["action_digest"] == digest
+    assert [kind for kind, _payload in emitted].count("interaction") == 1
+
+
+def test_approval_digest_is_validated_before_worker_start(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "agent.plugin_agent._exchange_worker",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("started")),
+    )
+
+    with pytest.raises(ValueError, match="approved action digest"):
+        PluginAgentRunner("test-plugin").run(
+            PluginAgentRunRequest(prompt="x", approved_action_digest="not-a-digest")
+        )
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX descendant probe")
