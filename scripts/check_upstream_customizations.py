@@ -143,6 +143,26 @@ def _range_right(diff_range: str) -> str:
     return diff_range
 
 
+def _range_base(data: dict[str, Any], repo: Path, diff_range: str) -> str:
+    coverage = data.get("coverage")
+    if isinstance(coverage, dict):
+        return str(coverage["base_commit"])
+    if "..." in diff_range:
+        left, right = diff_range.split("...", 1)
+        return _git(repo, "merge-base", left, right).strip()
+    if ".." in diff_range:
+        return diff_range.split("..", 1)[0]
+    return f"{diff_range}^"
+
+
+def _existed_at(repo: Path, revision: str, path: str) -> bool:
+    return subprocess.run(
+        ["git", "cat-file", "-e", f"{revision}:{path}"],
+        cwd=repo,
+        capture_output=True,
+    ).returncode == 0
+
+
 def _validate_coverage_commits(
     coverage: dict[str, Any], repo: Path, right: str
 ) -> list[str]:
@@ -193,12 +213,13 @@ def validate_diff_coverage(data: dict[str, Any], repo: Path, diff_range: str) ->
         for field in ("files", "tests")
         for path in entry[field]
     }
-    ignored_prefixes = (
-        "docs/", "tests/", "scripts/",
-        "plugins/", "skills/", "optional-skills/", "capabilities/", "brands/",
+    always_ignored_prefixes = (
+        "docs/", "tests/", "skills/", "optional-skills/", "capabilities/", "brands/",
     )
+    additive_prefixes = ("plugins/", "scripts/")
     scoped = _coverage_changes(data, repo, diff_range)
     changes = scoped[0] if scoped is not None else _changed_paths(repo, diff_range)
+    baseline = _range_base(data, repo, diff_range)
     missing: set[str] = set()
     for _status, paths in changes:
         for path in paths:
@@ -210,7 +231,11 @@ def validate_diff_coverage(data: dict[str, Any], repo: Path, diff_range: str) ->
             )
             if (
                 path in covered
-                or path.startswith(ignored_prefixes)
+                or path.startswith(always_ignored_prefixes)
+                or (
+                    path.startswith(additive_prefixes)
+                    and not _existed_at(repo, baseline, path)
+                )
                 or is_colocated_test
             ):
                 continue

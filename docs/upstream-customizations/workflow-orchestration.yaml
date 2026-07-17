@@ -7,6 +7,12 @@ coverage:
     reason: Separate user-requested v2.0.0-alpha.1 release preparation.
   - commit: 27c9b59a0d6887f433450feac56b97d905930e43
     reason: Separate user-requested v2.0.0 stable release preparation.
+  - commit: 6e3d7cbfc36c23a4a17137a2fe13210276e70d76
+    reason: Separate user-requested provider-registry resolution fix.
+  - commit: 3c1eec1d6a14bebc76fd6eb37ea7033504d9f44c
+    reason: Separate user-requested v2.0.1 release preparation.
+  - commit: cbc8b8dbceb084d43b4443fba2e737780ecf706b
+    reason: Separate user-requested v2.0.2 release preparation.
 upstream_changes:
 - id: managed-process-tree
   change_class: agent-core-generic
@@ -233,14 +239,18 @@ upstream_changes:
   owner: workflow-orchestration
   files:
   - hermes_cli/capability_staging.py
+  - scripts/vendor-ericsson.mjs
   - tests/hermes_cli/test_capability_staging.py
   - tests/hermes_cli/test_baked_seed.py
   owned_symbols:
   - _stage_workflow_package
   - _verified_workflow_package
+  - sourceDestinationPairs
+  - managedDestinations
   tests:
   - tests/hermes_cli/test_capability_staging.py
   - tests/hermes_cli/test_baked_seed.py
+  - scripts/__tests__/vendor-ericsson.test.mjs
   expected_commit_subject: 'feat(ericsson): ship portable workflow packages'
   upstream_candidate: true
   merge_guidance: Preserve atomic complete-package replacement, contained
@@ -288,6 +298,25 @@ upstream_changes:
     workflow showcase bundle without broadening arbitrary plugin package data.
   removal_condition: Remove when Hermes upstream ships equivalent authenticated
     workflow showcase package-data coverage.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: customization-checker-completeness
+  change_class: release-gate-generic
+  owner: workflow-orchestration
+  files:
+  - scripts/check_upstream_customizations.py
+  owned_symbols:
+  - validate_diff_coverage
+  - _range_base
+  - _existed_at
+  tests:
+  - tests/scripts/test_check_upstream_customizations.py
+  expected_commit_subject: 'fix(release): enforce existing customization coverage'
+  upstream_candidate: true
+  merge_guidance: Preserve baseline-aware classification so additive plugin and
+    script files remain low-friction while modifications, deletions, or renames
+    of upstream-existing plugin and script files require ledger ownership.
+  removal_condition: Remove when upstream customization tracking distinguishes
+    additive feature roots from existing upstream-owned files equivalently.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-native-portability-ci
   change_class: ci-generic

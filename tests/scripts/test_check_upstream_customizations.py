@@ -87,6 +87,40 @@ def test_diff_coverage_detects_add_delete_and_rename(tmp_path: Path) -> None:
         validate_diff_coverage(data, repo, "HEAD~1..HEAD")
 
 
+def test_diff_coverage_requires_ledger_for_existing_plugin_files(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    plugin = repo / "plugins/kanban/dashboard/plugin_api.py"
+    plugin.parent.mkdir(parents=True)
+    plugin.write_text("value = 1\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "add upstream plugin")
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    data = load_and_validate_manifest(manifest, repo)
+
+    plugin.write_text("value = 2\n")
+    _git(repo, "commit", "-am", "change existing upstream plugin")
+
+    with pytest.raises(ValueError, match="plugins/kanban/dashboard/plugin_api.py"):
+        validate_diff_coverage(data, repo, f"{baseline}..HEAD")
+
+
+def test_diff_coverage_ignores_new_additive_plugin_directory(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    data = load_and_validate_manifest(manifest, repo)
+    plugin = repo / "plugins/new-feature/plugin.py"
+    plugin.parent.mkdir(parents=True)
+    plugin.write_text("value = 1\n")
+    _git(repo, "add", str(plugin.relative_to(repo)))
+    _git(repo, "commit", "-m", "add feature plugin")
+
+    validate_diff_coverage(data, repo, f"{baseline}..HEAD")
+
+
 def test_overlap_classification_distinguishes_file_symbol_and_equivalent(
     tmp_path: Path,
 ) -> None:
