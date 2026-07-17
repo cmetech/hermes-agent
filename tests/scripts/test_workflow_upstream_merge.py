@@ -64,6 +64,11 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
         + "\n"
     )
     (repo / "invariant.txt").write_text("invariant\n")
+    (repo / "unmanaged.txt").write_text("common\n")
+    (repo / "apps/desktop").mkdir(parents=True)
+    (repo / "apps/desktop/package.json").write_text(
+        '{"name":"hermes","version":"1"}\n'
+    )
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "seed")
 
@@ -87,7 +92,13 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
     gate.chmod(0o755)
     generator = repo / "scripts/brand/generate.mjs"
     generator.parent.mkdir()
-    generator.write_text("process.exit(0)\n")
+    generator.write_text(
+        "import fs from 'node:fs';\n"
+        "const path = new URL('../../apps/desktop/package.json', import.meta.url);\n"
+        "const value = JSON.parse(fs.readFileSync(path, 'utf8'));\n"
+        "value.name = process.argv[2];\n"
+        "fs.writeFileSync(path, JSON.stringify(value) + '\\n');\n"
+    )
     (repo / "brands/otto.json").write_text('{"slug":"otto"}\n')
     manifest = repo / "docs/upstream-customizations/workflow-orchestration.yaml"
     manifest.write_text(
@@ -137,9 +148,17 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
     _git(repo, "branch", "otto")
     _git(repo, "checkout", "otto")
     (repo / "brand.txt").write_text("otto\n")
+    (repo / "apps/desktop/package.json").write_text(
+        '{"name":"otto","version":"1"}\n'
+    )
     _git(repo, "add", "brand.txt")
+    _git(repo, "add", "apps/desktop/package.json")
     _git(repo, "commit", "-m", "brand overlay")
     _git(repo, "checkout", "base")
+    (repo / "apps/desktop/package.json").write_text(
+        '{"name":"hermes","version":"2"}\n'
+    )
+    _git(repo, "commit", "-am", "advance neutral desktop package")
     return repo
 
 
@@ -186,6 +205,7 @@ def test_rehearsal_auto_merges_safe_overlap_and_emits_valid_evidence(
     assert evidence["entries"][0]["decision"] == "not-required"
     assert all(command["result"] == "passed" for command in evidence["commands"])
     assert evidence["brands"][0]["contains_tested_base"] is True
+    assert "apps/desktop/package.json" in (report / "otto-merge.log").read_text()
 
 
 @pytest.mark.parametrize("overlap", ["owned-symbol", "upstream-equivalent"])
@@ -213,5 +233,24 @@ def test_failed_invariant_gate_never_advances_or_emits_verified_evidence(
 
     assert result.returncode == 6
     assert "no refs were advanced" in result.stderr
+    assert _git(repo, "show-ref", "--heads") == refs_before
+    assert not (report / "merge-evidence.json").exists()
+
+
+def test_rehearsal_rejects_unapproved_brand_conflicts(tmp_path: Path) -> None:
+    repo = _synthetic_rehearsal_repo(tmp_path, "none")
+    (repo / "unmanaged.txt").write_text("base\n")
+    _git(repo, "commit", "-am", "change unmanaged file on base")
+    _git(repo, "checkout", "otto")
+    (repo / "unmanaged.txt").write_text("brand\n")
+    _git(repo, "commit", "-am", "change unmanaged file on brand")
+    _git(repo, "checkout", "base")
+    refs_before = _git(repo, "show-ref", "--heads")
+    report = tmp_path / "report-unapproved-brand-conflict"
+
+    result = _run_synthetic(repo, report)
+
+    assert result.returncode == 7
+    assert "unapproved conflict unmanaged.txt" in result.stderr
     assert _git(repo, "show-ref", "--heads") == refs_before
     assert not (report / "merge-evidence.json").exists()

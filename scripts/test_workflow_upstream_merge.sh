@@ -136,11 +136,30 @@ for ref in "${BRAND_REFS[@]}"; do
   BRAND_MERGE_STATUS=$?
   set -e
   if [[ $BRAND_MERGE_STATUS -ne 0 ]]; then
-    record_command "merge-tested-base-into-$slug" "failed" "$started"
     git -C "$worktree" diff --name-only --diff-filter=U >"$REPORT_DIR/$slug-conflict-files.txt" || true
-    git -C "$worktree" merge --abort >/dev/null 2>&1 || true
-    echo "brand $slug merge failed; no refs were advanced" >&2
-    exit 7
+    unexpected_conflict=""
+    while IFS= read -r conflict; do
+      [[ -n "$conflict" ]] || continue
+      case "$conflict" in
+        apps/desktop/package.json)
+          # This whole file is generated brand identity, not a ledger-owned
+          # runtime seam. Start from the exact tested neutral file and let the
+          # authoritative brand generator restamp its narrow identity fields.
+          git -C "$worktree" checkout "$TESTED_BASE_SHA" -- "$conflict"
+          git -C "$worktree" add "$conflict"
+          ;;
+        *) unexpected_conflict="$conflict" ;;
+      esac
+    done <"$REPORT_DIR/$slug-conflict-files.txt"
+    if [[ -n "$unexpected_conflict" ]]; then
+      record_command "merge-tested-base-into-$slug" "failed" "$started"
+      git -C "$worktree" merge --abort >/dev/null 2>&1 || true
+      echo "brand $slug merge failed on unapproved conflict $unexpected_conflict; no refs were advanced" >&2
+      exit 7
+    fi
+    git -C "$worktree" -c user.name='Workflow Gate' -c user.email='workflow-gate@localhost' \
+      commit --no-edit >>"$REPORT_DIR/$slug-merge.log" 2>&1
+    echo "reconciled generated brand files from tested base" >>"$REPORT_DIR/$slug-merge.log"
   fi
   record_command "merge-tested-base-into-$slug" "passed" "$started"
 
