@@ -19,7 +19,11 @@ import time
 from types import MappingProxyType
 from typing import Any, Callable, Literal, Mapping
 
-from tools.managed_process import ManagedProcessTree, TerminationPolicy
+from tools.managed_process import (
+    ManagedProcessTree,
+    ProcessResourceLimits,
+    TerminationPolicy,
+)
 
 
 _PROTOCOL_VERSION = 1
@@ -31,6 +35,10 @@ _MAX_POLICY_NAMES = 256
 
 class _PluginAgentCancelled(RuntimeError):
     """Internal control flow for caller-requested worker cancellation."""
+
+
+class _PluginAgentResourceExceeded(RuntimeError):
+    """Internal control flow for bounded worker-tree enforcement."""
 
 
 @dataclass(frozen=True)
@@ -49,6 +57,9 @@ class PluginAgentRunRequest:
     idle_timeout_seconds: float = 300.0
     wall_timeout_seconds: float = 1800.0
     provider_request_timeout_seconds: float = 300.0
+    max_process_tree_rss_bytes: int = 2048 * 1024 * 1024
+    max_process_tree_cpu_seconds: float = 900.0
+    max_descendants: int = 32
 
 
 @dataclass(frozen=True)
@@ -120,6 +131,14 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         raise ValueError("idle timeout cannot exceed wall timeout")
     if request.provider_request_timeout_seconds > request.wall_timeout_seconds:
         raise ValueError("provider request timeout cannot exceed wall timeout")
+    try:
+        ProcessResourceLimits(
+            max_rss_bytes=request.max_process_tree_rss_bytes,
+            max_cpu_seconds=request.max_process_tree_cpu_seconds,
+            max_descendants=request.max_descendants,
+        )
+    except ValueError as exc:
+        raise ValueError(f"plugin-agent resource limits are invalid: {exc}") from exc
     for label, values in (
         ("enabled_toolsets", request.enabled_toolsets),
         ("allowed_tools", request.allowed_tools),
@@ -178,6 +197,7 @@ def _exchange_worker(
     wall_timeout_seconds: float,
     worker_argv: list[str] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    resource_limits: ProcessResourceLimits | None = None,
 ) -> dict[str, Any]:
     encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     if len(encoded.encode("utf-8")) > _MAX_REQUEST_BYTES:
@@ -217,11 +237,15 @@ def _exchange_worker(
 
     started = last_activity = time.monotonic()
     stderr_tail = ""
+    limits = resource_limits or ProcessResourceLimits()
     try:
         while True:
             now = time.monotonic()
             if is_cancelled is not None and is_cancelled():
                 raise _PluginAgentCancelled("plugin-agent run cancelled")
+            violation = tree.resource_violation(limits)
+            if violation is not None:
+                raise _PluginAgentResourceExceeded(violation)
             if now - started >= wall_timeout_seconds:
                 raise TimeoutError("plugin-agent wall timeout")
             if now - last_activity >= idle_timeout_seconds:
@@ -306,6 +330,11 @@ class PluginAgentRunner:
                 idle_timeout_seconds=request.idle_timeout_seconds,
                 wall_timeout_seconds=request.wall_timeout_seconds,
                 is_cancelled=is_cancelled,
+                resource_limits=ProcessResourceLimits(
+                    max_rss_bytes=request.max_process_tree_rss_bytes,
+                    max_cpu_seconds=request.max_process_tree_cpu_seconds,
+                    max_descendants=request.max_descendants,
+                ),
             )
             result = frame.get("result")
             if not isinstance(result, dict):
@@ -333,6 +362,21 @@ class PluginAgentRunner:
                 pending_interaction=None,
                 usage={},
                 audit={"plugin_id": self.plugin_id, "failure_kind": "cancelled"},
+            )
+        except _PluginAgentResourceExceeded as exc:
+            return PluginAgentRunResult(
+                final_response="",
+                session_id=request.session_id or "",
+                provider=request.provider or "",
+                model=request.model or "",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit={
+                    "plugin_id": self.plugin_id,
+                    "failure_kind": "resource_limit",
+                    "resource_code": str(exc),
+                },
             )
 
 

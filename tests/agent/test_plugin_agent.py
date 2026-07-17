@@ -18,9 +18,11 @@ from agent.plugin_agent import (
     PluginAgentRunResult,
     PluginAgentRunner,
     _PluginAgentCancelled,
+    _PluginAgentResourceExceeded,
     _exchange_worker,
 )
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+from tools.managed_process import ProcessResourceLimits
 from tools.registry import ToolRegistry
 
 
@@ -165,6 +167,7 @@ def test_plugin_runner_returns_usage_without_exposing_credentials(monkeypatch) -
         (PluginAgentRunRequest(prompt="x", idle_timeout_seconds=float("nan")), "idle"),
         (PluginAgentRunRequest(prompt="x", wall_timeout_seconds=float("inf")), "wall"),
         (PluginAgentRunRequest(prompt="x", wall_timeout_seconds=-1), "wall"),
+        (PluginAgentRunRequest(prompt="x", max_descendants=-1), "descendants"),
         (
             PluginAgentRunRequest(
                 prompt="x", idle_timeout_seconds=10, wall_timeout_seconds=5
@@ -436,6 +439,25 @@ def test_worker_cancellation_closes_lifeline_and_terminates_descendants(
         time.sleep(0.02)
     else:
         pytest.fail(f"worker descendant {descendant_pid} survived cancellation")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descendant probe")
+@pytest.mark.live_system_guard_bypass
+def test_worker_resource_limit_terminates_descendants(tmp_path: Path) -> None:
+    code = (
+        "import subprocess,sys,time;sys.stdin.readline();"
+        "subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
+        "time.sleep(60)"
+    )
+    with pytest.raises(_PluginAgentResourceExceeded, match="descendant_limit"):
+        _exchange_worker(
+            {"protocol_version": 1, "type": "run"},
+            workdir=tmp_path,
+            idle_timeout_seconds=5,
+            wall_timeout_seconds=10,
+            worker_argv=[sys.executable, "-c", code],
+            resource_limits=ProcessResourceLimits(max_descendants=0),
+        )
 
 
 def test_worker_stderr_is_never_exposed_to_plugin() -> None:
