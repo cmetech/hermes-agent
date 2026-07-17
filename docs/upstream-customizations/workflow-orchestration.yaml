@@ -108,6 +108,24 @@ upstream_changes:
   - apps/desktop/src/app/desktop-controller.tsx
   - apps/desktop/src/app/chat/sidebar/index.tsx
   - apps/desktop/src/app/types.ts
+  - apps/desktop/src/app/routes.test.ts
+  - apps/desktop/src/app/workflows/adapter.ts
+  - apps/desktop/src/app/workflows/adapter.test.ts
+  - apps/desktop/src/app/workflows/attention-inbox.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/run-inspector.tsx
+  - apps/desktop/src/app/workflows/store.ts
+  - apps/desktop/src/app/kanban/adapter.ts
+  - apps/desktop/src/app/kanban/adapter.test.ts
+  - apps/desktop/src/app/kanban/index.tsx
+  - apps/desktop/src/app/kanban/index.test.tsx
+  - apps/desktop/src/app/kanban/store.ts
+  - apps/desktop/src/app/kanban/task-inspector.tsx
+  - apps/desktop/src/components/activity-board/activity-board.tsx
+  - apps/desktop/src/components/activity-board/activity-board.test.tsx
+  - apps/desktop/src/components/activity-board/types.ts
+  - apps/desktop/src/components/activity-board/virtual-card-column.tsx
   - apps/desktop/src/hermes.ts
   - apps/desktop/src/types/hermes.ts
   - apps/desktop/src/i18n/types.ts
