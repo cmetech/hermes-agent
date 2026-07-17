@@ -269,3 +269,24 @@ def test_restart_removes_snapshot_owned_by_dead_preparer(
     assert restarted.list_admission_events()[-1]["event_type"] == (
         "orphan_snapshot_removed"
     )
+
+
+def test_snapshot_owner_probe_uses_cross_platform_pid_helper(monkeypatch) -> None:
+    import gateway.status
+
+    observed = []
+    monkeypatch.setattr(
+        gateway.status,
+        "_pid_exists",
+        lambda pid: observed.append(pid) or True,
+    )
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("os.kill(pid, 0) is unsafe on Windows")
+        ),
+    )
+
+    assert RunStore._snapshot_owner_alive(12345) is True
+    assert observed == [12345]

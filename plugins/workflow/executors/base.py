@@ -119,7 +119,7 @@ def process_tree_active(tree: Any) -> bool:
     if group_id is None or group_id <= 0 or group_id == os.getpgrp():
         return False
     try:
-        os.killpg(group_id, 0)
+        os.killpg(group_id, 0)  # windows-footgun: ok - guarded by os.name above
     except ProcessLookupError:
         return False
     except PermissionError:
