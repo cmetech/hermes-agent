@@ -1,9 +1,15 @@
-import json, sys
+import json
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 import pytest
 from hermes_cli import capability_staging as cs
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.trust import WorkflowTrustStore, compute_package_digest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture
 def fake_repo(tmp_path, monkeypatch):
@@ -71,6 +77,66 @@ def test_seed_mcp_and_workflow_packages(tmp_path, fake_repo, fake_config):
     digest = compute_package_digest(load_workflow(workflow)).sha256
     assert WorkflowTrustStore(home).check(digest) == "trusted"
     assert "workflow" in cfg["plugins"]["enabled"]
+
+
+def test_fresh_windows_checkout_seeds_workflow_and_mcp_defaults(
+    tmp_path, monkeypatch, fake_config
+):
+    """Digest-bound capabilities must survive Git for Windows checkout.
+
+    A managed Windows clone can inherit ``core.autocrlf=true`` from the user.
+    The authenticated workflow package is byte-digested, so checkout-time CRLF
+    conversion makes capability staging fail closed before it enables the
+    workflow plugin or merges the Outlook and Glean defaults.
+    """
+    source = tmp_path / "source"
+    checkout = tmp_path / "checkout"
+    source.mkdir()
+    shutil.copy2(REPO_ROOT / ".gitattributes", source / ".gitattributes")
+    shutil.copytree(REPO_ROOT / "capabilities", source / "capabilities")
+
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.name", "Capability Test"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "config", "core.autocrlf", "true"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "commit", "-qm", "fixture"], check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.autocrlf=true",
+            "clone",
+            "-q",
+            str(source),
+            str(checkout),
+        ],
+        check=True,
+    )
+
+    monkeypatch.setattr(cs, "_repo_root", lambda: checkout)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_bundled_plugins_dir", lambda: checkout / "plugins"
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+
+    cs.seed_baked_capabilities(home)
+
+    cfg = fake_config["cfg"]
+    assert "workflow" in cfg["plugins"]["enabled"]
+    assert {"outlook", "glean"} <= set(cfg["mcp_servers"])
 
 def test_seed_never_clobbers_user_mcp(tmp_path, fake_repo, fake_config):
     fake_config["cfg"] = {"mcp_servers": {"outlook": {"command": "mine"}}}

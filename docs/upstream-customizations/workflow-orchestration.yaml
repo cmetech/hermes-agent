@@ -226,3 +226,26 @@ upstream_changes:
   removal_condition: Remove when upstream CI provides equivalent native
     all-platform portable-workflow and installed-showcase coverage.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: windows-authenticated-resource-checkout
+  change_class: installer-generic
+  owner: workflow-orchestration
+  files:
+  - .gitattributes
+  - scripts/install.ps1
+  - tests/hermes_cli/test_baked_seed.py
+  - tests/test_install_ps1_native_stderr_eap.py
+  owned_symbols:
+  - capabilities/workflow-packages/** text eol=lf
+  - plugins/workflow/showcases/** text eol=lf
+  - core.autocrlf=false clone
+  tests:
+  - tests/hermes_cli/test_baked_seed.py
+  - tests/test_install_ps1_native_stderr_eap.py
+  expected_commit_subject: 'fix(install): preserve authenticated workflow bytes on Windows'
+  upstream_candidate: true
+  merge_guidance: Preserve LF checkout attributes for every byte-digested
+    distribution resource and disable autocrlf before the initial managed
+    Windows clone checkout, not only after cloning.
+  removal_condition: Remove when upstream provides an equivalent byte-stable
+    managed Windows checkout for authenticated distribution resources.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
