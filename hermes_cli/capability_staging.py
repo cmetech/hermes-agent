@@ -95,6 +95,30 @@ def _merge_mcp_server_defaults(
     return changed
 
 
+def _merge_workflow_agent_defaults(config: dict, plugin_names: list[str]) -> bool:
+    """Seed workflow-only agent overrides without replacing operator choices."""
+    if "workflow" not in plugin_names:
+        return False
+    plugins = config.setdefault("plugins", {})
+    if not isinstance(plugins, dict):
+        return False
+    entries = plugins.setdefault("entries", {})
+    if not isinstance(entries, dict):
+        return False
+    workflow = entries.setdefault("workflow", {})
+    if not isinstance(workflow, dict):
+        return False
+    agent = workflow.setdefault("agent", {})
+    if not isinstance(agent, dict):
+        return False
+    changed = False
+    for key in ("allow_provider_override", "allow_model_override"):
+        if key not in agent:
+            agent[key] = True
+            changed = True
+    return changed
+
+
 def resolve_capability_bundle(set_name: str, source_url: str | None,
                               home: Path | str, root: Path | None = None) -> Path | None:
     """Resolve a named capability set to a local checkout directory.
@@ -406,6 +430,7 @@ def stage_bundle(
             if merged != plugins_cfg.get("enabled"):
                 plugins_cfg["enabled"] = merged
                 changed = True
+            changed |= _merge_workflow_agent_defaults(cfg, plugin_names)
 
         if changed:
             config_mod.save_config(cfg)
@@ -542,6 +567,7 @@ def seed_baked_capabilities(home: Path | str, root: Path | None = None) -> None:
                         if merged != plugins_cfg.get("enabled"):
                             plugins_cfg["enabled"] = merged
                             changed = True
+                        changed |= _merge_workflow_agent_defaults(cfg, plugin_names)
                     if changed:
                         config_mod.save_config(cfg)
                 finally:

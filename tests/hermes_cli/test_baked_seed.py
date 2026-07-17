@@ -77,6 +77,10 @@ def test_seed_mcp_and_workflow_packages(tmp_path, fake_repo, fake_config):
     digest = compute_package_digest(load_workflow(workflow)).sha256
     assert WorkflowTrustStore(home).check(digest) == "trusted"
     assert "workflow" in cfg["plugins"]["enabled"]
+    assert cfg["plugins"]["entries"]["workflow"]["agent"] == {
+        "allow_model_override": True,
+        "allow_provider_override": True,
+    }
 
 
 def test_fresh_windows_checkout_seeds_workflow_and_mcp_defaults(

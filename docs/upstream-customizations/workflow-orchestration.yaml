@@ -201,6 +201,24 @@ upstream_changes:
   removal_condition: Remove when Hermes upstream stages authenticated complete
     workflow package roots with equivalent digest-bound distribution trust.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: capability-workflow-agent-policy
+  change_class: capability-staging-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/capability_staging.py
+  owned_symbols:
+  - _merge_workflow_agent_defaults
+  tests:
+  - tests/hermes_cli/test_capability_staging.py
+  - tests/hermes_cli/test_baked_seed.py
+  expected_commit_subject: 'fix(capabilities): seed workflow agent override policy'
+  upstream_candidate: true
+  merge_guidance: Preserve idempotent workflow-only provider/model authorization
+    defaults while retaining explicit operator denials and the single config
+    round-trip used by capability staging.
+  removal_condition: Remove when the bundled workflow plugin has an upstream-owned
+    authorization policy that remains visible to doctor and runtime paths.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-showcase-distribution
   change_class: packaging-generic
   owner: workflow-orchestration
