@@ -86,7 +86,7 @@ def test_each_usage_accepts_exactly_its_supported_requirements(usage, required):
     ],
 )
 @pytest.mark.parametrize("state", ["unsupported", "unknown"])
-def test_required_capability_states_have_stable_distinct_reasons(
+def test_required_capability_states_have_stable_policy(
     usage, missing_capability, state
 ):
     verified = {key: "supported" for key in CAPABILITY_KEYS}
@@ -94,10 +94,34 @@ def test_required_capability_states_have_stable_distinct_reasons(
 
     decision = _evaluate(usage=usage, verified=verified)
 
+    if missing_capability == "completion" and state == "unknown":
+        assert decision.eligible is True
+        assert decision.reason == "eligible"
+        return
+
     assert decision.eligible is False
     assert decision.reason == f"{missing_capability}-{state}"
     assert decision.message
     assert decision.grandfathered is False
+
+
+@pytest.mark.parametrize(
+    "usage",
+    ["main", "fallback", "auxiliary", "vision", "moa-reference", "moa-aggregator"],
+)
+def test_live_explicit_model_accepts_unverified_completion_when_other_requirements_are_supported(
+    usage,
+):
+    verified = {key: "supported" for key in CAPABILITY_KEYS}
+    verified["completion"] = "unknown"
+
+    decision = _evaluate(usage=usage, is_live=True, verified=verified)
+
+    assert decision == ModelEligibility(
+        eligible=True,
+        reason="eligible",
+        message="This model is eligible for the requested assignment.",
+    )
 
 
 def test_main_auto_is_the_sole_automatic_routing_exception():

@@ -265,13 +265,21 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
             raise ValueError("workdir must be an existing directory")
 
 
-def _agent_override_allowed(plugin_id: str, kind: str, value: str | None) -> bool:
+def _agent_override_allowed(
+    plugin_id: str,
+    kind: str,
+    value: str | None,
+    *,
+    config: Mapping[str, Any] | None = None,
+) -> bool:
     if not value:
         return True
     try:
-        from hermes_cli.config import load_config
+        if config is None:
+            from hermes_cli.config import load_config
 
-        entry = (((load_config() or {}).get("plugins") or {}).get("entries") or {}).get(
+            config = load_config() or {}
+        entry = (((config or {}).get("plugins") or {}).get("entries") or {}).get(
             plugin_id, {}
         )
         policy = entry.get("agent") if isinstance(entry, dict) else None

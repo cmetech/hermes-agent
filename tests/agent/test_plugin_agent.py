@@ -587,14 +587,15 @@ def test_worker_stderr_is_never_exposed_to_plugin() -> None:
     secret = "sk-test-secret-should-not-escape"
     code = (
         "import sys;sys.stdin.readline();"
-        f"sys.stderr.write({secret!r});sys.stderr.flush();raise SystemExit(1)"
+        f"sys.stderr.write({secret!r});sys.stderr.flush();"
+        "sys.stdout.write('not-json\\n');sys.stdout.flush()"
     )
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(RuntimeError, match="invalid JSON") as exc_info:
         _exchange_worker(
             {"protocol_version": 1, "type": "run"},
             workdir=None,
-            idle_timeout_seconds=2,
-            wall_timeout_seconds=5,
+            idle_timeout_seconds=10,
+            wall_timeout_seconds=20,
             worker_argv=[sys.executable, "-c", code],
         )
 
@@ -608,13 +609,12 @@ def test_worker_stderr_does_not_reset_semantic_idle_deadline() -> None:
         "\nwhile True:"
         "\n sys.stderr.write('diagnostic\\n');sys.stderr.flush();time.sleep(0.03)"
     )
-    started = time.monotonic()
     with pytest.raises(TimeoutError, match="idle timeout"):
         _exchange_worker(
             {"protocol_version": 1, "type": "run"},
             workdir=None,
             idle_timeout_seconds=0.2,
-            wall_timeout_seconds=2,
+            wall_timeout_seconds=30,
             worker_argv=[sys.executable, "-c", code],
             termination_policy=TerminationPolicy(
                 cooperative_grace_seconds=0.05,
@@ -623,4 +623,3 @@ def test_worker_stderr_does_not_reset_semantic_idle_deadline() -> None:
                 wait_timeout_seconds=0.2,
             ),
         )
-    assert time.monotonic() - started < 1

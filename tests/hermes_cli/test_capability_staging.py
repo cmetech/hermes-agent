@@ -148,6 +148,35 @@ def test_stage_bundle_full(tmp_path, home, fake_config):
     assert "ericsson-jira" in cfg["disabled_toolsets"]
     assert "workflow" in cfg["plugins"]["enabled"]
     assert "ericsson-jira" in cfg["plugins"]["enabled"]
+    assert cfg["plugins"]["entries"]["workflow"]["agent"] == {
+        "allow_model_override": True,
+        "allow_provider_override": True,
+    }
+
+
+def test_stage_bundle_preserves_explicit_workflow_agent_override_denials(
+    tmp_path, home, fake_config
+):
+    store, _ = fake_config
+    store["config"] = {
+        "plugins": {
+            "entries": {
+                "workflow": {
+                    "agent": {
+                        "allow_model_override": False,
+                        "allow_provider_override": False,
+                    }
+                }
+            }
+        }
+    }
+
+    cs.stage_bundle(make_bundle(tmp_path), "ericsson", home)
+
+    assert store["config"]["plugins"]["entries"]["workflow"]["agent"] == {
+        "allow_model_override": False,
+        "allow_provider_override": False,
+    }
 
 
 def test_stage_bundle_never_clobbers_user_mcp(tmp_path, home, fake_config):

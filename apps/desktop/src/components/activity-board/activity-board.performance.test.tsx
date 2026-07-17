@@ -1,20 +1,54 @@
-import { expect, it } from 'vitest'
+// @vitest-environment jsdom
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, beforeAll, expect, it, vi } from 'vitest'
 
-import { workflowBoardModel } from '@/app/workflows/adapter'
-import type { WorkflowRunSnapshot } from '@/types/hermes'
+import { ActivityBoard } from './activity-board'
+import type { ActivityBoardModel } from './types'
 
-it('projects one thousand cards in bounded linear presentation work', () => {
-  const runs: WorkflowRunSnapshot[] = Array.from({ length: 1000 }, (_, index) => ({
-    health: 'healthy', next_actions: ['status'],
-    progress: { completed_nodes: index % 4, kind: 'graph', total_nodes: 4 },
-    run_id: `run-${index}`, state_version: 1, status: index % 2 ? 'running' : 'succeeded',
-    updated_at: '2026-07-17T00:00:00Z', workflow: `Workflow ${index}`
+beforeAll(() => {
+  Object.defineProperty(HTMLElement.prototype, 'getBoundingClientRect', {
+    configurable: true,
+    value: () => ({ bottom: 600, height: 600, left: 0, right: 320, toJSON: () => {}, top: 0, width: 320, x: 0, y: 0 })
+  })
+  globalThis.ResizeObserver = class {
+    private callback: ResizeObserverCallback
+
+    constructor(callback: ResizeObserverCallback) {
+      this.callback = callback
+    }
+
+    disconnect() {}
+    observe(target: Element) {
+      this.callback([{ contentRect: target.getBoundingClientRect(), target } as ResizeObserverEntry], this as unknown as ResizeObserver)
+    }
+    unobserve() {}
+  }
+})
+
+afterEach(cleanup)
+
+it('virtualizes one thousand rendered cards instead of mounting the full column', async () => {
+  const cards = Array.from({ length: 1000 }, (_, index) => ({
+    ariaDescription: `Run ${index}, running`,
+    badges: [],
+    exactState: 'running',
+    health: 'healthy' as const,
+    id: `run-${index}`,
+    title: `Run ${index}`,
+    updatedAt: index
   }))
 
-  const started = performance.now()
-  const model = workflowBoardModel(runs)
-  const elapsed = performance.now() - started
+  const model: ActivityBoardModel = {
+    columns: [{ cards, count: cards.length, id: 'active', label: 'Active', nextCursor: null }],
+    revision: '1000',
+    scopeLabel: 'Workflow',
+    source: 'workflow',
+    stale: false
+  }
 
-  expect(model.columns.reduce((total, column) => total + column.cards.length, 0)).toBe(1000)
-  expect(elapsed).toBeLessThan(1000)
+  render(<ActivityBoard model={model} onLoadMore={vi.fn()} onOpenCard={vi.fn()} />)
+
+  await waitFor(() => expect(screen.getAllByRole('button').length).toBeGreaterThan(0))
+  expect(screen.getAllByRole('button').length).toBeLessThan(100)
+  expect(screen.getByRole('region', { name: 'Active, 1000' })).toBeTruthy()
 })

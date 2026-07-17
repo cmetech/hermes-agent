@@ -332,7 +332,7 @@ def preflight_execution(
     )
     if missing:
         raise WorkflowTrustError(
-            "untrusted workflow requires a configured isolated backend with: "
+            "workflow requires a configured isolated backend with: "
             + ", ".join(missing)
         )
     return ExecutionEnvironmentRequirement(

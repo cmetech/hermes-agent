@@ -931,6 +931,53 @@ class TestWebServerEndpoints:
             {"provider": provider, "model": "completion-supported"}
         ]
 
+    def test_put_moa_accepts_changed_live_reference_with_unverified_completion(
+        self, monkeypatch, _moa_contract_profile
+    ):
+        from hermes_cli import model_eligibility
+        from hermes_cli.config import load_config
+
+        provider = _moa_contract_profile.name
+
+        def validate(selected_provider, model, usage, **kwargs):
+            return model_eligibility.evaluate_model_eligibility(
+                capability_contract=True,
+                catalog_status="ready",
+                model=model,
+                usage=usage,
+                is_live=True,
+                selection_mode="explicit",
+                verified={
+                    "completion": "unknown",
+                    "tools": "supported",
+                    "vision": "supported",
+                    "reasoning": "unknown",
+                },
+                exact_existing_assignment=kwargs["exact_existing_assignment"],
+            )
+
+        monkeypatch.setattr(
+            model_eligibility, "validate_provider_model_selection", validate
+        )
+
+        resp = self.client.put(
+            "/api/model/moa",
+            json={
+                "reference_models": [
+                    {"provider": provider, "model": "live-unverified-completion"}
+                ],
+                "aggregator": {
+                    "provider": "openrouter",
+                    "model": "existing-aggregator",
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        assert load_config()["moa"]["reference_models"] == [
+            {"provider": provider, "model": "live-unverified-completion"}
+        ]
+
     @pytest.mark.parametrize(
         ("reason", "message"),
         [

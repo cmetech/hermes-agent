@@ -9,8 +9,8 @@ from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 
 
-def _start(store, package, *, key="e2e"):
-    prepared = store.prepare_run_snapshot(package)
+def _start(store, package, *, key="e2e", values=None):
+    prepared = store.prepare_run_snapshot(package, values=values)
     return store.start_run(
         RunAdmissionRequest(
             workflow_name=package.definition.name,
@@ -70,6 +70,48 @@ def test_two_dependent_bash_nodes_execute_and_persist_artifacts(
     assert event_types.index("node_ready") < event_types.index(
         "node_claimed", event_types.index("node_claimed") + 1
     )
+
+
+def test_bash_nodes_substitute_arguments_predecessor_output_and_run_id_safely(
+    tmp_path, workflow_writer
+):
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="bash-variables",
+            nodes=[
+                {"id": "first", "bash": "printf '{\"value\":\"node output\"}'"},
+                {
+                    "id": "second",
+                    "bash": (
+                        "printf '<%s>|<%s>|<%s>' "
+                        '"$ARGUMENTS" "$first.output.value" "$WORKFLOW_ID"'
+                    ),
+                    "depends_on": ["first"],
+                },
+            ],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    admitted = _start(
+        store,
+        package,
+        values={"arguments": "$(touch injected) 'quoted'"},
+    )
+
+    result = RunScheduler(store).advance(admitted.run_id)
+
+    assert result["status"] == "succeeded"
+    artifact = next(
+        item
+        for item in result["artifacts"]
+        if item["node_id"] == "second" and "stdout" in item["relative_path"]
+    )
+    output = (store.run_directory(admitted.run_id) / artifact["relative_path"]).read_text()
+    assert output == (
+        "<$(touch injected) 'quoted'>|<node output>|" f"<{admitted.run_id}>"
+    )
+    assert not (store.run_directory(admitted.run_id) / "injected").exists()
 
 
 def test_resume_does_not_rerun_completed_node(tmp_path, workflow_writer):

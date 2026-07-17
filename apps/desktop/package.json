@@ -1,9 +1,9 @@
 {
-  "name": "otto",
-  "productName": "OTTO",
+  "name": "hermes",
+  "productName": "Hermes",
   "private": true,
-  "version": "2.0.2",
-  "description": "Native desktop shell for OTTO.",
+  "version": "2.0.3",
+  "description": "Native desktop shell for Hermes Agent.",
   "author": "cmetech",
   "type": "module",
   "main": "dist/electron-main.mjs",
@@ -11,6 +11,7 @@
     "node": "^20.19.0 || >=22.12.0"
   },
   "scripts": {
+    "test": "npm run test:workflow-ui && npm run test:desktop:platforms",
     "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:electron\"",
     "dev:fake-boot": "cross-env HERMES_DESKTOP_BOOT_FAKE=1 HERMES_DESKTOP_BOOT_FAKE_STEP_MS=650 npm run dev",
     "dev:renderer": "node scripts/assert-root-install.mjs && vite --host 127.0.0.1 --port 5174",
@@ -45,6 +46,7 @@
     "fmt": "prettier --write 'src/**/*.{ts,tsx}' 'electron/**/*.ts' 'vite.config.ts'",
     "fix": "npm run lint:fix && npm run fmt",
     "test:ui": "vitest run --environment jsdom",
+    "test:workflow-ui": "vitest run --environment jsdom src/hermes.test.ts src/components/activity-board/activity-board.test.tsx src/components/activity-board/activity-board.performance.test.tsx src/app/workflows/adapter.test.ts src/app/workflows/index.test.tsx src/app/workflows/workflow-operations.e2e.test.tsx src/app/kanban/adapter.test.ts src/app/kanban/index.test.tsx src/app/kanban/kanban-operations.e2e.test.tsx src/app/routes.test.ts src/i18n/languages.test.ts",
     "preview": "node scripts/assert-root-install.mjs && vite preview --host 127.0.0.1 --port 4174"
   },
   "dependencies": {
@@ -152,19 +154,18 @@
   },
   "build": {
     "electronVersion": "40.10.2",
-    "appId": "io.cmetech.otto",
-    "productName": "OTTO",
-    "executableName": "OTTO",
+    "appId": "com.nousresearch.hermes",
+    "productName": "Hermes",
+    "executableName": "Hermes",
     "protocols": [
       {
-        "name": "OTTO Protocol",
+        "name": "Hermes Protocol",
         "schemes": [
-          "otto",
           "hermes"
         ]
       }
     ],
-    "artifactName": "OTTO-${version}-${os}-${arch}.${ext}",
+    "artifactName": "Hermes-${version}-${os}-${arch}.${ext}",
     "icon": "assets/icon",
     "directories": {
       "output": "release"
@@ -204,11 +205,11 @@
       "entitlements": "electron/entitlements.mac.plist",
       "entitlementsInherit": "electron/entitlements.mac.inherit.plist",
       "extendInfo": {
-        "CFBundleDisplayName": "OTTO",
-        "CFBundleExecutable": "OTTO",
-        "CFBundleName": "OTTO",
-        "NSAudioCaptureUsageDescription": "OTTO uses audio capture for voice conversations.",
-        "NSMicrophoneUsageDescription": "OTTO uses the microphone for voice input and voice conversations."
+        "CFBundleDisplayName": "Hermes",
+        "CFBundleExecutable": "Hermes",
+        "CFBundleName": "Hermes",
+        "NSAudioCaptureUsageDescription": "Hermes uses audio capture for voice conversations.",
+        "NSMicrophoneUsageDescription": "Hermes uses the microphone for voice input and voice conversations."
       },
       "gatekeeperAssess": false,
       "hardenedRuntime": true,
@@ -218,7 +219,7 @@
       ]
     },
     "dmg": {
-      "title": "Install OTTO",
+      "title": "Install Hermes",
       "backgroundColor": "#f5f5f7",
       "iconSize": 96,
       "window": {
@@ -240,7 +241,7 @@
       ]
     },
     "win": {
-      "legalTrademarks": "OTTO",
+      "legalTrademarks": "Hermes",
       "target": [
         "nsis",
         "msi"
@@ -250,7 +251,7 @@
     "linux": {
       "category": "Development",
       "maintainer": "Nous Research <support@nousresearch.com>",
-      "synopsis": "Native desktop shell for OTTO.",
+      "synopsis": "Native desktop shell for Hermes Agent.",
       "target": [
         "AppImage",
         "deb",
@@ -261,8 +262,8 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "perMachine": false,
-      "shortcutName": "OTTO",
-      "uninstallDisplayName": "OTTO",
+      "shortcutName": "Hermes",
+      "uninstallDisplayName": "Hermes",
       "warningsAsErrors": false
     }
   }

@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-agent"
-version = "2.0.2"
+version = "2.0.3"
 description = "The self-improving AI agent — creates skills from experience, improves them during use, and runs anywhere"
 readme = "README.md"
 # Upper bound is load-bearing, not cosmetic. uv resolves the project's
@@ -340,6 +340,14 @@ locales = ["locales/*.yaml"]
 # entry; tests/test_packaging_metadata.py enforces an entry per optional-mcps/<name>.
 "optional-mcps/linear" = ["optional-mcps/linear/manifest.yaml"]
 "optional-mcps/n8n" = ["optional-mcps/n8n/manifest.yaml"]
+# Baked capability descriptors are consumed on every clean startup by
+# hermes_cli.capability_staging.  They must live at the same installation-root
+# paths as a Git checkout so wheel installs can enable their bundled plugins,
+# seed MCP defaults, and authenticate/copy workflow packages.
+capabilities = ["capabilities/*.json", "capabilities/*.yaml"]
+"capabilities/workflow-packages/ericsson" = ["capabilities/workflow-packages/ericsson/*.json"]
+"capabilities/workflow-packages/ericsson/commands" = ["capabilities/workflow-packages/ericsson/commands/*.md"]
+"capabilities/workflow-packages/ericsson/workflows" = ["capabilities/workflow-packages/ericsson/workflows/*.yaml"]
 # Keep the showcase skill available to wheel-based downstream packagers. The
 # normal installer still seeds the repository's top-level skills tree.
 "skills/productivity/workflow-showcase" = ["skills/productivity/workflow-showcase/SKILL.md"]

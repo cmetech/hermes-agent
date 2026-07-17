@@ -1583,6 +1583,8 @@ export const zhHant = defineLocale({
     resume: '繼續',
     retry: '重試',
     abandon: '放棄',
+    dataStale: '資料已過期。正在重新連線…',
+    loadMore: '載入更多',
     workflowUnavailable: 'Workflow 外掛無法使用。請執行 hermes plugins enable workflow。',
     kanbanUnavailable: 'Kanban 外掛無法使用。請執行 hermes plugins enable kanban。',
     physicalBoard: board => `機器共用實體看板：${board}`

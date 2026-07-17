@@ -7,21 +7,29 @@ import type { ActivityBoardCard, ActivityBoardColumn } from './types'
 
 interface VirtualCardColumnProps {
   column: ActivityBoardColumn
+  loadMoreLabel: string
   onLoadMore: (columnId: string, cursor: string) => void
   onOpenCard: (card: ActivityBoardCard) => void
 }
 
-export function VirtualCardColumn({ column, onLoadMore, onOpenCard }: VirtualCardColumnProps) {
+export function VirtualCardColumn({ column, loadMoreLabel, onLoadMore, onOpenCard }: VirtualCardColumnProps) {
   const parent = useRef<HTMLDivElement>(null)
 
   const virtual = useVirtualizer({
     count: column.cards.length,
     estimateSize: () => 82,
     getScrollElement: () => parent.current,
+    initialRect: { height: 600, width: 320 },
     overscan: 8
   })
 
-  const rows = column.cards.length > 50 ? virtual.getVirtualItems() : column.cards.map((_, index) => ({ index }))
+  const virtualRows = virtual.getVirtualItems()
+
+  const rows = column.cards.length > 50
+    ? virtualRows.length > 0
+      ? virtualRows
+      : column.cards.slice(0, 16).map((_, index) => ({ index, start: index * 82 }))
+    : column.cards.map((_, index) => ({ index }))
 
   return (
     <section aria-label={`${column.label}, ${column.count}`} className="min-w-0" data-column={column.id}>
@@ -60,8 +68,8 @@ export function VirtualCardColumn({ column, onLoadMore, onOpenCard }: VirtualCar
           })}
         </div>
         {column.nextCursor && (
-          <Button onClick={() => onLoadMore(column.id, column.nextCursor!)} size="xs" variant="text">
-            Load more
+          <Button className="motion-reduce:transition-none" onClick={() => onLoadMore(column.id, column.nextCursor!)} size="xs" variant="text">
+            {loadMoreLabel}
           </Button>
         )}
       </div>

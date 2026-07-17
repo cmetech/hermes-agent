@@ -2,6 +2,7 @@ import { useI18n } from '@/i18n'
 import type { WorkflowRunSnapshot } from '@/types/hermes'
 
 interface RunInspectorProps {
+  actionsDisabled?: boolean
   events?: Array<Record<string, unknown>>
   onAction?: (action: string) => void
   run: WorkflowRunSnapshot
@@ -9,7 +10,7 @@ interface RunInspectorProps {
 
 const MUTATING_ACTIONS = new Set(['approve', 'reject', 'cancel', 'resume', 'retry', 'abandon'])
 
-export function RunInspector({ events = [], onAction, run }: RunInspectorProps) {
+export function RunInspector({ actionsDisabled = false, events = [], onAction, run }: RunInspectorProps) {
   const { t } = useI18n()
   const copy = t.operations
 
@@ -45,7 +46,13 @@ export function RunInspector({ events = [], onAction, run }: RunInspectorProps) 
       {onAction && (
         <div aria-label={copy.nextActions} className="mt-3 flex flex-wrap gap-2">
           {run.next_actions.filter(action => MUTATING_ACTIONS.has(action)).map(action => (
-            <button className="border border-current/20 px-2 py-1 text-sm" key={action} onClick={() => onAction(action)} type="button">
+            <button
+              className="border border-current/20 px-2 py-1 text-sm disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={actionsDisabled}
+              key={action}
+              onClick={() => onAction(action)}
+              type="button"
+            >
               {copy[action as 'approve' | 'reject' | 'cancel' | 'resume' | 'retry' | 'abandon']}
             </button>
           ))}

@@ -46,6 +46,7 @@ from plugins.workflow.trust import (
     WorkflowTrustStore,
     build_risk_summary,
     compute_package_digest,
+    preflight_execution,
 )
 from tools.managed_process import ProcessResourceLimits
 
@@ -757,6 +758,52 @@ def _doctor_compatibility_level(
     return CompatibilityLevel.PORTABLE
 
 
+def _profile_config(hermes_home: str | Path) -> Mapping[str, object]:
+    path = Path(hermes_home) / "config.yaml"
+    if not path.is_file():
+        return {}
+    try:
+        config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return {}
+    return config if isinstance(config, Mapping) else {}
+
+
+def _provider_override_findings(
+    package: WorkflowPackage,
+    *,
+    hermes_home: str | Path,
+) -> tuple[CompatibilityFinding, ...]:
+    from agent.plugin_agent import _agent_override_allowed
+
+    config = _profile_config(hermes_home)
+    requested: list[tuple[str, str, str]] = []
+    for kind in ("provider", "model"):
+        workflow_value = package.definition.options.get(kind)
+        if isinstance(workflow_value, str) and workflow_value:
+            requested.append((kind, kind, workflow_value))
+    for index, node in enumerate(package.definition.nodes):
+        for kind in ("provider", "model"):
+            value = node.options.get(kind)
+            if isinstance(value, str) and value:
+                requested.append((kind, f"nodes[{index}].{kind}", value))
+    return tuple(
+        _doctor_finding(
+            code=f"{kind}_override_not_authorized",
+            path=path,
+            message=(
+                f"workflow agent {kind} override is disabled in profile config"
+            ),
+            blocking=True,
+            level=CompatibilityLevel.UNSUPPORTED,
+        )
+        for kind, path, value in requested
+        if not _agent_override_allowed(
+            "workflow", kind, value, config=config
+        )
+    )
+
+
 def doctor_package(
     package: WorkflowPackage,
     *,
@@ -781,6 +828,9 @@ def doctor_package(
         mcp_available=mcp_available,
     )
     findings = _coded_compatibility_findings(compatibility)
+    findings.extend(
+        _provider_override_findings(package, hermes_home=hermes_home)
+    )
     risk = build_risk_summary(package, compatibility)
     package_digest = compute_package_digest(package)
     covered = package_digest.covered_relative_paths
@@ -1202,11 +1252,19 @@ def _cmd_run(
     package = _resolve(args, args.name)
     runtime = _runtime_config(args.hermes_home, sidecar=package.sidecar)
     digest = compute_package_digest(package)
-    if WorkflowTrustStore(args.hermes_home).check(digest.sha256) != "trusted":
+    risk = build_risk_summary(package, assess_compatibility(package))
+    if WorkflowTrustStore(args.hermes_home).check(
+        digest.sha256, risk_digest=risk.risk_digest
+    ) != "trusted":
         print(
             "workflow package is not trusted; run doctor and trust its exact digest",
             file=sys.stderr,
         )
+        return 1
+    try:
+        preflight_execution(risk, trusted=True)
+    except WorkflowTrustError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
     store = _store(args, runtime)
     prepared = store.prepare_run_snapshot(
