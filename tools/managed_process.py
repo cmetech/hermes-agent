@@ -276,7 +276,10 @@ class ManagedProcessTree:
                 # still has a waitable handle. This is also the final fallback
                 # when host process enumeration is unavailable.
                 live = ProcessIdentity.capture(self.process.pid)
-                if self.identity.start_time is None or live.start_time == self.identity.start_time:
+                if (
+                    self.identity.start_time is None
+                    or live.start_time == self.identity.start_time
+                ):
                     try:
                         self.process.kill()
                     except (OSError, ProcessLookupError, PermissionError):
@@ -312,13 +315,15 @@ class ManagedProcessTree:
 
     def _terminate_owned_posix_group(self) -> bool:
         """Terminate group members that outlived the direct owned child."""
+        if _IS_WINDOWS:
+            return True
         group_id = self.identity.group_id
         if group_id is None or group_id <= 0 or group_id == os.getpgrp():
             return True
 
         def group_alive() -> bool:
             try:
-                os.killpg(group_id, 0)
+                os.killpg(group_id, 0)  # windows-footgun: ok - POSIX-only method
             except ProcessLookupError:
                 return False
             except PermissionError:
@@ -328,7 +333,9 @@ class ManagedProcessTree:
         if not group_alive():
             return True
         try:
-            os.killpg(group_id, signal.SIGTERM)
+            os.killpg(  # windows-footgun: ok - POSIX-only method
+                group_id, signal.SIGTERM
+            )
         except ProcessLookupError:
             return True
         except PermissionError:
@@ -338,7 +345,7 @@ class ManagedProcessTree:
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         if group_alive():
             try:
-                os.killpg(group_id, signal.SIGKILL)
+                os.killpg(group_id, signal.SIGKILL)  # windows-footgun: ok
             except ProcessLookupError:
                 return True
             except PermissionError:
