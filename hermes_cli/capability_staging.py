@@ -17,6 +17,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Callable
@@ -503,7 +504,18 @@ def stage_brand_capabilities(home: Path | str, root: Path | None = None) -> None
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    source_root = Path(__file__).resolve().parents[1]
+    if (source_root / "capabilities").is_dir():
+        return source_root
+
+    # setuptools ``data-files`` are installed relative to sys.prefix, not
+    # inside site-packages.  Prefer the source-tree layout during development,
+    # then use the wheel/venv prefix so clean packaged installs can seed the
+    # same authenticated capability bytes.
+    packaged_root = Path(sys.prefix).resolve()
+    if (packaged_root / "capabilities").is_dir():
+        return packaged_root
+    return source_root
 
 
 def seed_baked_capabilities(home: Path | str, root: Path | None = None) -> None:

@@ -130,6 +130,18 @@ def test_workflow_showcase_has_narrow_wheel_and_sdist_package_data():
     assert "recursive-include plugins/workflow/showcases *" in manifest
 
 
+def test_baked_capabilities_ship_in_wheel_and_sdist():
+    """Clean packaged installs must be able to seed plugins, MCPs, and workflows."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    data_files = data["tool"]["setuptools"]["data-files"]
+    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+
+    assert "capabilities" in data_files
+    assert "capabilities/workflow-packages/ericsson/commands" in data_files
+    assert "capabilities/workflow-packages/ericsson/workflows" in data_files
+    assert "graft capabilities" in manifest
+
+
 def test_bundled_plugin_manifests_ship_in_both_wheel_and_sdist():
     """Regression test for #34034 / #28149.
 
