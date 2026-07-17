@@ -1731,7 +1731,9 @@ export const zh: Translations = {
       'new-session': '新建会话',
       skills: '技能与工具',
       messaging: '消息平台',
-      artifacts: '产物'
+      artifacts: '产物',
+      workflows: '工作流',
+      kanban: '看板'
     },
     searchAria: '搜索会话',
     searchPlaceholder: '搜索会话…',
@@ -1842,6 +1844,33 @@ export const zh: Translations = {
       ageHour: '时',
       ageMin: '分'
     }
+  },
+
+  operations: {
+    workflows: '工作流',
+    kanban: '看板',
+    needsAttention: '需要处理',
+    status: '状态',
+    health: '健康状态',
+    graphProgress: '图进度',
+    completionEstimate: '完成时间估计',
+    estimateUnavailable: '无法估计',
+    nextActions: '后续操作',
+    artifacts: '已验证产物',
+    definition: '定义摘要',
+    retryAt: '下次重试',
+    timeline: '时间线事件',
+    trigger: '触发器',
+    waitingFor: '等待内容',
+    approve: '批准',
+    reject: '拒绝',
+    cancel: '取消',
+    resume: '恢复',
+    retry: '重试',
+    abandon: '放弃',
+    workflowUnavailable: 'Workflow 插件不可用。请运行 hermes plugins enable workflow。',
+    kanbanUnavailable: 'Kanban 插件不可用。请运行 hermes plugins enable kanban。',
+    physicalBoard: board => `机器共享物理看板：${board}`
   },
 
   composer: {

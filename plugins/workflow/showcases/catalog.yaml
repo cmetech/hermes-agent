@@ -1,0 +1,75 @@
+schema_version: 1
+bundle_version: "2.0.0"
+scenarios:
+  - id: laptop-diagnostic
+    display_name: Laptop Diagnostic Tour
+    purpose: Demonstrate an offline workflow using sanitized fictional laptop evidence.
+    bundle_version: "2.0.0"
+    package_version: "1"
+    workflow_path: packages/laptop-diagnostic/workflows/laptop-diagnostic.yaml
+    interaction_mode: guided
+    offline: true
+    requires_ai: false
+    requires_network: false
+    safety_class: synthetic-read-only
+    supported_platforms: [linux, macos, windows]
+    expected_checkpoints: [parallel-analysis, approval, final-report]
+    expected_terminal_outcomes: [paused, succeeded]
+    expected_artifacts: [diagnostic-report.json, diagnostic-report.md, remediation-plan.md]
+    capability_claims: [immutable-inputs, parallel-fan-in, approval-rework, artifact-verification, no-live-inventory]
+    limits: {wall_seconds: 300, max_parallel_nodes: 4, max_descendants: 8}
+    cleanup_ownership: immutable-run-metadata
+  - id: resilience
+    display_name: Controlled Resilience Lab
+    purpose: Demonstrate bounded retry, timeout, cancellation, and process cleanup.
+    bundle_version: "2.0.0"
+    package_version: "1"
+    workflow_path: packages/resilience/workflows/resilience.yaml
+    interaction_mode: guided
+    offline: true
+    requires_ai: false
+    requires_network: false
+    safety_class: bounded-fault-injection
+    supported_platforms: [linux, macos, windows]
+    expected_checkpoints: [mode-selection, process-reaped]
+    expected_terminal_outcomes: [succeeded, failed, cancelled]
+    expected_artifacts: []
+    capability_claims: [persisted-retry, typed-timeout, process-cleanup]
+    limits: {wall_seconds: 300, max_parallel_nodes: 2, max_descendants: 8}
+    cleanup_ownership: immutable-run-metadata
+  - id: ai-extensions
+    display_name: Optional AI and Extensions Tour
+    purpose: Demonstrate explicitly authorized AI, skill, hook, inline-agent, and local MCP scope.
+    bundle_version: "2.0.0"
+    package_version: "1"
+    workflow_path: packages/ai-extensions/workflows/ai-extensions.yaml
+    interaction_mode: consent
+    offline: false
+    requires_ai: true
+    requires_network: false
+    safety_class: explicit-ai-local-extensions
+    supported_platforms: [linux, macos, windows]
+    expected_checkpoints: [consent, extension-resolution, cleanup]
+    expected_terminal_outcomes: [skipped, succeeded, failed]
+    expected_artifacts: []
+    capability_claims: [explicit-ai-consent, scoped-extensions, persistent-session, local-mcp-cleanup]
+    limits: {wall_seconds: 600, max_parallel_nodes: 1, max_descendants: 8}
+    cleanup_ownership: immutable-run-metadata
+  - id: scheduling
+    display_name: Optional Scheduling Tour
+    purpose: Create one explicitly confirmed Hermes repeat=1 cron delivery.
+    bundle_version: "2.0.0"
+    package_version: "1"
+    workflow_path: packages/scheduling/workflows/scheduled-check.yaml
+    interaction_mode: schedule
+    offline: true
+    requires_ai: false
+    requires_network: false
+    safety_class: explicit-one-shot-schedule
+    supported_platforms: [linux, macos, windows]
+    expected_checkpoints: [consent, schedule-created, one-shot-cleanup]
+    expected_terminal_outcomes: [scheduled, succeeded]
+    expected_artifacts: [scheduled-checkpoint.json]
+    capability_claims: [explicit-schedule-consent, one-shot-ownership, cron-recovery]
+    limits: {wall_seconds: 300, max_parallel_nodes: 1, max_descendants: 2}
+    cleanup_ownership: exact-cron-id-and-nonce

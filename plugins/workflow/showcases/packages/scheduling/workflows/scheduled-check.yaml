@@ -1,0 +1,4 @@
+name: scheduled-check
+description: Opt-in deterministic one-shot scheduling demonstration
+nodes:
+  - {id: checkpoint, script: write-checkpoint, runtime: uv}

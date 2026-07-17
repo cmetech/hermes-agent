@@ -1,0 +1,28 @@
+name: my-tickets-summary
+description: Summarize open Ericsson Jira tickets and optionally send after approval
+nodes:
+  - id: fetch
+    command: fetch-tickets
+    context: fresh
+    allowed_tools: [jira_my_tickets, Write]
+  - id: summarize
+    command: summarize-tickets
+    depends_on: [fetch]
+    context: fresh
+    allowed_tools: [Read, Write]
+  - id: approve-send
+    approval:
+      message: Review the ticket summary artifact before any email is sent.
+      capture_response: true
+      on_reject:
+        prompt: Revise the summary using the bounded reviewer response.
+        max_attempts: 3
+    depends_on: [summarize]
+  - id: send
+    prompt: >-
+      Read the approved ticket summary artifact and use message_send to email it
+      to the explicitly supplied recipient. Send only after the approval grant.
+    depends_on: [approve-send]
+    context: fresh
+    allowed_tools: [Read, message_send]
+

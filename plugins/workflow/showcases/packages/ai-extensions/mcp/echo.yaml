@@ -1,0 +1,3 @@
+command: python
+args: [mcp/echo-server.py]
+env: {}

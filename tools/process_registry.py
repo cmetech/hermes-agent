@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
+from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,7 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    _managed_process: Optional[ManagedProcessTree] = field(default=None, repr=False)
 
 
 class ProcessRegistry:
@@ -456,8 +458,7 @@ class ProcessRegistry:
         if not pid:
             return None
         try:
-            from gateway.status import get_process_start_time
-            return get_process_start_time(pid)
+            return ProcessIdentity.capture(pid).start_time
         except Exception:
             return None
 
@@ -476,11 +477,10 @@ class ProcessRegistry:
         ``/proc``) we degrade to a bare liveness check rather than refusing to
         act, preserving prior best-effort behaviour.
         """
-        if not cls._is_host_pid_alive(pid):
+        if not pid or not cls._is_host_pid_alive(pid):
             return False
-        if expected_start is None:
-            return True
-        return cls._safe_host_start_time(pid) == expected_start
+        identity = ProcessIdentity(pid, expected_start, None)
+        return identity.is_current()
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
         """Update recovered host-PID sessions when the underlying process has exited."""
@@ -510,13 +510,7 @@ class ProcessRegistry:
 
         A zombie is already dead (just unreaped), so there's nothing to SIGKILL.
         """
-        try:
-            import psutil
-            if not proc.is_running():
-                return False
-            return proc.status() != psutil.STATUS_ZOMBIE
-        except Exception:
-            return False
+        return ManagedProcessTree._proc_alive(proc)
 
     @staticmethod
     def _daemon_term_grace_seconds() -> float:
@@ -538,131 +532,16 @@ class ProcessRegistry:
 
     @classmethod
     def _terminate_host_pid(cls, pid: int, expected_start: Optional[int] = None) -> None:
-        """Terminate a host-visible PID and its descendants.
-
-        ``expected_start`` is the kernel start time captured when we spawned the
-        process. When provided, it is re-validated against the live PID before
-        any signal is sent; a mismatch (or a dead PID) means the number was
-        recycled onto an unrelated process and we refuse to touch it, so a stale
-        background-session PID can never tree-kill a browser or other stranger.
-
-        POSIX: walks the process tree with ``psutil`` and SIGTERMs
-        children before the parent so subprocess trees (e.g. Chromium
-        renderers/GPU helpers spawned by an ``agent-browser`` daemon)
-        don't get reparented to init and survive cleanup.  After a bounded
-        grace window (``terminal.daemon_term_grace_seconds``) any tree member
-        that ignored SIGTERM — a daemon stalled in its signal handler — is
-        escalated to SIGKILL so it can't leak indefinitely.  Set the grace to
-        0 to disable escalation (SIGTERM only).
-
-        Windows: shells out to ``taskkill /PID <pid> /T /F``. This is
-        the documented Microsoft primitive for tree-kill and matches the
-        existing convention in ``gateway.status.terminate_pid``.  ``/F`` is
-        already a hard kill, so no separate escalation step is needed.  We
-        can't reuse the POSIX psutil path on Windows because:
-
-          1. Windows doesn't maintain a Unix-style process tree —
-             ``psutil.Process.children(recursive=True)`` walks PPID
-             links that go stale when intermediate processes exit, so
-             enumeration is best-effort and misses orphaned descendants.
-          2. ``psutil.Process.terminate()`` on Windows is
-             ``TerminateProcess()`` which kills only the target handle
-             and is a hard kill — there is no Windows equivalent of a
-             SIGTERM that cascades through a process group. (See the
-             warning in ``gateway/status.py::terminate_pid``: "os.kill
-             with SIGTERM is not equivalent to a tree-killing hard stop"
-             on Windows.) Headless Chromium has no GUI window, so the
-             softer ``taskkill /T`` without ``/F`` won't reach it either.
-
-        ``psutil`` is a hard dependency (see ``pyproject.toml``); the
-        bare-``os.kill`` fallback covers OSError / PermissionError on
-        POSIX and a missing ``taskkill.exe`` on Windows (effectively
-        unreachable on real Windows installs, but cheap insurance).
-        """
-        if expected_start is not None and not cls._host_pid_is_ours(pid, expected_start):
-            # PID was recycled (start time changed) or is gone — never signal a
-            # stranger. A leaked orphan is strictly preferable to killing e.g.
-            # a browser whose session leader reused this dead session's PID.
-            logger.warning(
-                "Refusing to terminate host pid %d: start-time mismatch — "
-                "PID was recycled onto an unrelated process.", pid,
-            )
-            return
-        if _IS_WINDOWS:
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    creationflags=windows_hide_flags(),
-                    stdin=subprocess.DEVNULL,
-                )
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (OSError, ProcessLookupError, PermissionError):
-                    pass
-            return
-
-        import psutil
-        try:
-            parent = psutil.Process(pid)
-        except psutil.NoSuchProcess:
-            return
-        except (OSError, PermissionError):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (OSError, ProcessLookupError, PermissionError):
-                pass
-            return
-
-        # Snapshot the whole tree (children before parent) and SIGTERM each.
-        try:
-            targets = parent.children(recursive=True)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            targets = []
-        targets.append(parent)
-
-        for proc in targets:
-            try:
-                proc.terminate()
-            except psutil.NoSuchProcess:
-                pass
-            except (psutil.AccessDenied, OSError):
-                pass
-
-        # Escalate to SIGKILL for anything that ignored SIGTERM within the
-        # grace window — a daemon stalled in its signal handler would otherwise
-        # leak indefinitely.
-        grace = cls._daemon_term_grace_seconds()
-        if grace <= 0:
-            return
-        # Sleep out the grace window, then independently re-probe every target
-        # and SIGKILL any survivor.  We deliberately do NOT trust
-        # ``psutil.wait_procs``'s gone/alive partition here: it reaps via
-        # ``Process.wait()`` and can mis-partition when a target transitions
-        # through a zombie state or when reaping is racy across a parent/child
-        # tree, which left survivors un-killed.  A direct liveness re-probe is
-        # deterministic.
-        deadline = time.monotonic() + grace
-        while time.monotonic() < deadline:
-            if not any(cls._proc_alive(_p) for _p in targets):
-                break
-            time.sleep(0.05)
-        for proc in targets:
-            try:
-                if not cls._proc_alive(proc):
-                    continue
-                proc.kill()  # SIGKILL on POSIX
-                logger.info(
-                    "Escalated to SIGKILL for pid %d (ignored SIGTERM within "
-                    "%.1fs grace)", proc.pid, grace,
-                )
-            except psutil.NoSuchProcess:
-                pass
-            except (psutil.AccessDenied, OSError):
-                pass
+        """Terminate a host-visible tree through the shared bounded owner."""
+        ManagedProcessTree.terminate_existing(
+            ProcessIdentity(pid=pid, start_time=expected_start, group_id=None),
+            term_grace_seconds=cls._daemon_term_grace_seconds(),
+            is_windows=_IS_WINDOWS,
+            subprocess_run=subprocess.run,
+            os_kill=os.kill,
+            creationflags=windows_hide_flags(),
+            proc_alive=cls._proc_alive,
+        )
 
     # ----- Spawn -----
 
@@ -761,7 +640,7 @@ class ProcessRegistry:
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
-        proc = subprocess.Popen(
+        managed_process = ManagedProcessTree.spawn(
             [user_shell, "-lic", f"set +m; {command}"],
             text=True,
             cwd=session.cwd,
@@ -774,10 +653,12 @@ class ProcessRegistry:
             start_new_session=True,
             **_popen_kwargs,
         )
+        proc = managed_process.process
 
         session.process = proc
         session.pid = proc.pid
-        session.host_start_time = self._safe_host_start_time(session.pid)
+        session.host_start_time = managed_process.identity.start_time
+        session._managed_process = managed_process
 
         try:
             # Start output reader thread
@@ -800,18 +681,7 @@ class ProcessRegistry:
             # descendants spawned via setsid) before re-raising so they do not
             # leak as untracked background processes.
             try:
-                if not _IS_WINDOWS:
-                    try:
-                        kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-                        os.killpg(os.getpgid(proc.pid), kill_signal)  # windows-footgun: ok - guarded by _IS_WINDOWS above
-                    except (ProcessLookupError, PermissionError, OSError):
-                        proc.kill()
-                else:
-                    proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
+                managed_process.terminate("process registry setup failed")
             except Exception:
                 pass
             raise

@@ -1554,7 +1554,9 @@ export const en: Translations = {
       'new-session': 'New session',
       skills: 'Capabilities',
       messaging: 'Messaging',
-      artifacts: 'Artifacts'
+      artifacts: 'Artifacts',
+      workflows: 'Workflows',
+      kanban: 'Kanban'
     },
     searchAria: 'Search sessions',
     searchPlaceholder: 'Search sessions…',
@@ -1667,6 +1669,33 @@ export const en: Translations = {
       ageHour: 'h',
       ageMin: 'm'
     }
+  },
+
+  operations: {
+    workflows: 'Workflows',
+    kanban: 'Kanban',
+    needsAttention: 'Needs attention',
+    status: 'Status',
+    health: 'Health',
+    graphProgress: 'Graph progress',
+    completionEstimate: 'Completion estimate',
+    estimateUnavailable: 'Estimate unavailable',
+    nextActions: 'Next actions',
+    artifacts: 'Verified artifacts',
+    definition: 'Definition digest',
+    retryAt: 'Next retry',
+    timeline: 'Timeline events',
+    trigger: 'Trigger',
+    waitingFor: 'Waiting for',
+    approve: 'Approve',
+    reject: 'Reject',
+    cancel: 'Cancel',
+    resume: 'Resume',
+    retry: 'Retry',
+    abandon: 'Abandon',
+    workflowUnavailable: 'Workflow plugin unavailable. Enable it with hermes plugins enable workflow.',
+    kanbanUnavailable: 'Kanban plugin unavailable. Enable it with hermes plugins enable kanban.',
+    physicalBoard: board => `Machine-shared physical board: ${board}`
   },
 
   composer: {

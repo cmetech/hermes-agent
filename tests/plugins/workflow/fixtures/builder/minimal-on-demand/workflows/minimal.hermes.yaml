@@ -1,0 +1,8 @@
+overlap_policy: queue
+delivery_defaults:
+  inputs:
+    subject:
+      kind: text
+      required: false
+      max_bytes: 4096
+

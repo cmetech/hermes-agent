@@ -1,0 +1,24 @@
+name: resilience
+description: Controlled retry, timeout, and cancellation demonstrations
+nodes:
+  - {id: select-mode, script: fail-once, runtime: uv}
+  - id: retry
+    script: fail-once
+    runtime: uv
+    depends_on: [select-mode]
+    when: "$select-mode.output.mode == 'retry'"
+    retry: {max_attempts: 2, delay_ms: 1000, on_error: all}
+  - id: timeout
+    script: bounded-wait
+    runtime: uv
+    depends_on: [select-mode]
+    when: "$select-mode.output.mode == 'timeout'"
+    timeout: 3
+    retry: {max_attempts: 1, delay_ms: 1000}
+  - id: cancel
+    script: bounded-wait
+    runtime: uv
+    depends_on: [select-mode]
+    when: "$select-mode.output.mode == 'cancel'"
+    timeout: 30
+    retry: {max_attempts: 1, delay_ms: 1000}

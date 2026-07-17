@@ -80,6 +80,47 @@ def test_board_empty(client):
     assert data["latest_event_id"] == 0
 
 
+def test_board_summary_and_bounded_task_pages(client):
+    for index in range(3):
+        client.post(
+            "/api/plugins/kanban/tasks",
+            json={"title": f"Paged {index}", "tenant": "acme", "assignee": "ops"},
+        )
+    summary = client.get("/api/plugins/kanban/board/summary?board=default")
+    assert summary.status_code == 200
+    body = summary.json()
+    assert body["column_counts"]["ready"] == 3
+    assert body["assignees"] == ["ops"]
+    assert "tasks" not in body
+
+    first = client.get("/api/plugins/kanban/tasks?board=default&status=ready&limit=2")
+    assert first.status_code == 200
+    assert len(first.json()["tasks"]) == 2
+    assert first.json()["next_cursor"]
+    second = client.get(
+        "/api/plugins/kanban/tasks?board=default&status=ready&limit=2"
+        f"&cursor={first.json()['next_cursor']}"
+    )
+    assert len(second.json()["tasks"]) == 1
+
+
+def test_patch_stale_precondition_returns_conflict_snapshot(client):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "CAS"}).json()["task"]
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+    latest = detail["events"][-1]["id"]
+    ok = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "todo", "expected_status": "ready", "expected_event_id": latest},
+    )
+    assert ok.status_code == 200
+    stale = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "ready", "expected_status": "ready", "expected_event_id": latest},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "mutation_conflict"
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------

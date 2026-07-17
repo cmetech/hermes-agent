@@ -15,6 +15,7 @@ Import chain (circular-import safe):
 """
 
 import ast
+from contextlib import contextmanager
 import importlib
 import json
 import logging
@@ -228,11 +229,62 @@ class ToolRegistry:
         # against it: a cache entry keyed on the generation is valid for as
         # long as the generation hasn't changed.
         self._generation: int = 0
+        # Process-wide name predicate used only inside isolated workers. A
+        # stack permits identical re-entrant scopes while rejecting concurrent
+        # or nested policy changes that could broaden another caller's view.
+        self._name_scope_stack: list[
+            tuple[Optional[frozenset[str]], frozenset[str]]
+        ] = []
+
+    def _name_visible(self, name: str) -> bool:
+        if not self._name_scope_stack:
+            return True
+        allowed, denied = self._name_scope_stack[-1]
+        return (allowed is None or name in allowed) and name not in denied
+
+    @contextmanager
+    def scoped_names(
+        self,
+        allowed_names=None,
+        denied_names=(),
+    ):
+        """Temporarily constrain every registry read and dispatch by name.
+
+        ``None`` permits all names while an empty allowlist permits none. Deny
+        is always applied last. The scope is process-wide by design and is
+        intended for fresh isolated workers, never a long-lived parent agent.
+        """
+        allowed = None if allowed_names is None else frozenset(allowed_names)
+        denied = frozenset(denied_names)
+        scope = (allowed, denied)
+        with self._lock:
+            if self._name_scope_stack and self._name_scope_stack[-1] != scope:
+                raise RuntimeError("incompatible ToolRegistry name scope is active")
+            self._name_scope_stack.append(scope)
+            self._generation += 1
+        try:
+            yield self
+        finally:
+            with self._lock:
+                if not self._name_scope_stack or self._name_scope_stack[-1] != scope:
+                    raise RuntimeError("ToolRegistry name scope stack was corrupted")
+                self._name_scope_stack.pop()
+                self._generation += 1
 
     def _snapshot_state(self) -> tuple[List[ToolEntry], Dict[str, Callable]]:
         """Return a coherent snapshot of registry entries and toolset checks."""
         with self._lock:
-            return list(self._tools.values()), dict(self._toolset_checks)
+            entries = [
+                entry for entry in self._tools.values()
+                if self._name_visible(entry.name)
+            ]
+            visible_toolsets = {entry.toolset for entry in entries}
+            checks = {
+                name: check
+                for name, check in self._toolset_checks.items()
+                if name in visible_toolsets
+            }
+            return entries, checks
 
     def _snapshot_entries(self) -> List[ToolEntry]:
         """Return a stable snapshot of registered tool entries."""
@@ -265,6 +317,8 @@ class ToolRegistry:
     def get_entry(self, name: str) -> Optional[ToolEntry]:
         """Return a registered tool entry by name, or None."""
         with self._lock:
+            if not self._name_visible(name):
+                return None
             return self._tools.get(name)
 
     def get_registered_toolset_names(self) -> List[str]:

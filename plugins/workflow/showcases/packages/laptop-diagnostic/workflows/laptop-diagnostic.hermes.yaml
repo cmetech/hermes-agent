@@ -1,0 +1,14 @@
+delivery_defaults:
+  inputs:
+    symptom: {kind: text, required: true, max_bytes: 4096}
+    evidence: {kind: file, required: true, max_bytes: 65536}
+overlap_policy: queue
+execution_environment: trusted_local
+limits:
+  max_parallel_nodes: 4
+  max_total_workers: 4
+  ai_wall_timeout_seconds: 300
+  subprocess_timeout_seconds: 300
+resource_limits:
+  max_descendants: 8
+outward_action_nodes: []

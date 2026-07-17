@@ -36,6 +36,7 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import sqlite3
@@ -514,6 +515,120 @@ def get_board(
 # GET /tasks/:id
 # ---------------------------------------------------------------------------
 
+
+def _page_cursor(board: str, position: int) -> str:
+    raw = json.dumps({"v": 1, "board": board, "position": position}, sort_keys=True).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _read_page_cursor(value: str, board: str) -> int:
+    try:
+        raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        payload = json.loads(raw)
+        if payload.get("v") != 1 or payload.get("board") != board:
+            raise ValueError
+        return max(0, int(payload["position"]))
+    except Exception as exc:
+        raise HTTPException(status_code=410, detail={"code": "cursor_reset", "cursor_reset": True}) from exc
+
+
+@router.get("/board/summary")
+def board_summary(board: Optional[str] = Query(None)):
+    resolved = _resolve_board(board) or kanban_db.get_current_board()
+    conn = _conn(board=resolved)
+    try:
+        counts = {status: 0 for status in BOARD_COLUMNS}
+        for row in conn.execute("SELECT status, COUNT(*) AS n FROM tasks WHERE status!='archived' GROUP BY status"):
+            counts[str(row["status"])] = int(row["n"])
+        assignees = [row[0] for row in conn.execute("SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND status!='archived' ORDER BY assignee")]
+        tenants = [row[0] for row in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
+        bounds = conn.execute("SELECT COALESCE(MIN(id),0), COALESCE(MAX(id),0) FROM task_events").fetchone()
+        warning_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE kind IN (?, ?)", _WARNING_EVENT_KINDS
+        ).fetchone()[0]
+        return {
+            "schema_version": 1,
+            "board": resolved,
+            "metadata": kanban_db.read_board_metadata(resolved),
+            "column_counts": counts,
+            "assignees": assignees,
+            "tenants": tenants,
+            "oldest_event_id": int(bounds[0]),
+            "latest_event_id": int(bounds[1]),
+            "diagnostics_count": int(warning_count),
+        }
+    finally:
+        conn.close()
+
+
+@router.get("/tasks")
+def task_page(
+    board: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    tenant: Optional[str] = Query(None),
+    assignee: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    archived: bool = Query(False),
+    limit: int = Query(100, ge=1, le=100),
+    cursor: Optional[str] = Query(None),
+):
+    resolved = _resolve_board(board) or kanban_db.get_current_board()
+    conn = _conn(board=resolved)
+    try:
+        tasks = kanban_db.list_tasks(
+            conn,
+            status=status,
+            tenant=tenant,
+            assignee=assignee,
+            include_archived=archived,
+            order_by="priority",
+        )
+        if search:
+            needle = search.casefold()
+            tasks = [task for task in tasks if needle in f"{task.title}\n{task.body or ''}".casefold()]
+        start = _read_page_cursor(cursor, resolved) if cursor else 0
+        selected = tasks[start : start + limit]
+        next_cursor = _page_cursor(resolved, start + limit) if start + limit < len(tasks) else None
+        summaries = kanban_db.latest_summaries(conn, [task.id for task in selected])
+        return {
+            "schema_version": 1,
+            "board": resolved,
+            "tasks": [_task_dict(task, latest_summary=summaries.get(task.id)) for task in selected],
+            "next_cursor": next_cursor,
+        }
+    finally:
+        conn.close()
+
+
+@router.get("/events")
+def event_page(
+    board: Optional[str] = Query(None),
+    after: int = Query(0, ge=0),
+    limit: int = Query(200, ge=1),
+    wait_seconds: float = Query(0, ge=0),
+):
+    del wait_seconds
+    resolved = _resolve_board(board) or kanban_db.get_current_board()
+    conn = _conn(board=resolved)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM task_events WHERE id>? ORDER BY id ASC LIMIT ?",
+            (after, min(limit, 200)),
+        ).fetchall()
+        events = [_event_dict(kanban_db.Event(
+            id=int(row["id"]), task_id=row["task_id"], kind=row["kind"],
+            payload=json.loads(row["payload"]) if row["payload"] else None,
+            created_at=int(row["created_at"]), run_id=row["run_id"],
+        )) for row in rows]
+        return {
+            "schema_version": 1,
+            "events": events,
+            "next_cursor": events[-1]["id"] if events else after,
+            "cursor_reset": False,
+        }
+    finally:
+        conn.close()
+
 @router.get("/tasks/{task_id}")
 def get_task(
     task_id: str,
@@ -816,6 +931,21 @@ class UpdateTaskBody(BaseModel):
     # complete --summary ... --metadata ...``.
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    expected_status: Optional[str] = None
+    expected_current_run_id: Optional[int] = None
+    expected_event_id: Optional[int] = None
+
+
+def _mutation_precondition(payload: BaseModel) -> kanban_db.TaskMutationPrecondition | None:
+    fields = payload.model_fields_set
+    relevant = {"expected_status", "expected_current_run_id", "expected_event_id"}
+    if not fields.intersection(relevant):
+        return None
+    return kanban_db.TaskMutationPrecondition(
+        expected_status=(payload.expected_status if "expected_status" in fields else kanban_db.UNSET),
+        expected_current_run_id=(payload.expected_current_run_id if "expected_current_run_id" in fields else kanban_db.UNSET),
+        expected_event_id=(payload.expected_event_id if "expected_event_id" in fields else kanban_db.UNSET),
+    )
 
 
 @router.patch("/tasks/{task_id}")
@@ -823,6 +953,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        precondition = _mutation_precondition(payload)
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -831,7 +962,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.assignee is not None:
             try:
                 ok = kanban_db.assign_task(
-                    conn, task_id, payload.assignee or None,
+                    conn, task_id, payload.assignee or None, precondition=precondition,
                 )
             except RuntimeError as e:
                 raise HTTPException(status_code=409, detail=str(e))
@@ -848,28 +979,29 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    precondition=precondition,
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason, precondition=precondition)
             elif s == "scheduled":
-                ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
+                ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason, precondition=precondition)
             elif s == "ready":
                 # Re-open a blocked/scheduled task, or just an explicit status set.
                 current = kanban_db.get_task(conn, task_id)
                 if current and current.status in ("blocked", "scheduled"):
-                    ok = kanban_db.unblock_task(conn, task_id)
+                    ok = kanban_db.unblock_task(conn, task_id, precondition=precondition)
                 else:
                     # Direct status write for drag-drop (todo -> ready etc).
-                    ok = _set_status_direct(conn, task_id, "ready")
+                    ok = kanban_db.set_task_status(conn, task_id, "ready", precondition=precondition)
             elif s == "archived":
-                ok = kanban_db.archive_task(conn, task_id)
+                ok = kanban_db.archive_task(conn, task_id, precondition=precondition)
             elif s == "running":
                 raise HTTPException(
                     status_code=400,
                     detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
                 )
             elif s in ("todo", "triage", "scheduled"):
-                ok = _set_status_direct(conn, task_id, s)
+                ok = kanban_db.set_task_status(conn, task_id, s, precondition=precondition)
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")
             if not ok:
@@ -933,6 +1065,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
+    except kanban_db.TaskMutationConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "mutation_conflict", "current": asdict(exc.current)},
+        ) from exc
     finally:
         conn.close()
 
@@ -977,108 +1114,6 @@ def _parents_blocking_ready(
     ]
 
 
-def _set_status_direct(
-    conn: sqlite3.Connection, task_id: str, new_status: str,
-) -> bool:
-    """Direct status write for drag-drop moves that aren't covered by the
-    structured complete/block/unblock/archive verbs (e.g. todo<->ready,
-    running<->ready). Appends a ``status`` event row for the live feed.
-
-    When this transitions OFF ``running`` to anything other than the
-    terminal verbs above (which own their own run closing), we close the
-    active run with outcome='reclaimed' so attempt history isn't
-    orphaned. ``running -> ready`` via drag-drop is the common case
-    (user yanking a stuck worker back to the queue).
-    """
-    with kanban_db.write_txn(conn):
-        # Snapshot current state so we know whether to close a run.
-        prev = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if prev is None:
-            return False
-
-        # Guard: don't allow promoting to 'ready' unless all parents are done.
-        # Prevents the dispatcher from spawning a child whose upstream work
-        # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
-        if new_status == "ready":
-            parent_statuses = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if parent_statuses and not all(
-                p["status"] == "done" for p in parent_statuses
-            ):
-                return False
-
-        was_running = prev["status"] == "running"
-        reopening_satisfied_parent = (
-            prev["status"] in {"done", "archived"}
-            and new_status not in {"done", "archived"}
-        )
-
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, "
-            "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
-            "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
-            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
-            "WHERE id = ?",
-            (new_status, new_status, new_status, new_status, task_id),
-        )
-        if cur.rowcount != 1:
-            return False
-        run_id = None
-        if was_running and new_status != "running" and prev["current_run_id"]:
-            run_id = kanban_db._end_run(
-                conn, task_id,
-                outcome="reclaimed", status="reclaimed",
-                summary=f"status changed to {new_status} (dashboard/direct)",
-            )
-        conn.execute(
-            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-            "VALUES (?, ?, 'status', ?, ?)",
-            (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
-        )
-        if reopening_satisfied_parent:
-            # A parent leaving done/archived invalidates any direct child that
-            # was sitting in ready solely because that parent used to satisfy
-            # the dependency gate. Demote those children immediately so the
-            # dashboard does not keep advertising stale-ready work.
-            for row in conn.execute(
-                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
-                (task_id,),
-            ).fetchall():
-                child_id = row["child_id"]
-                demoted = conn.execute(
-                    "UPDATE tasks SET status = 'todo' "
-                    "WHERE id = ? AND status = 'ready'",
-                    (child_id,),
-                )
-                if demoted.rowcount == 1:
-                    conn.execute(
-                        "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                        "VALUES (?, 'status', ?, ?)",
-                        (
-                            child_id,
-                            json.dumps(
-                                {
-                                    "status": "todo",
-                                    "reason": "parent_reopened",
-                                    "parent": task_id,
-                                }
-                            ),
-                            int(time.time()),
-                        ),
-                    )
-    # If we re-opened something, children may have gone stale.
-    if new_status in {"done", "ready"}:
-        kanban_db.recompute_ready(conn)
-    return True
-
-
 # ---------------------------------------------------------------------------
 # Comments
 # ---------------------------------------------------------------------------
@@ -1086,6 +1121,9 @@ def _set_status_direct(
 class CommentBody(BaseModel):
     body: str
     author: Optional[str] = "dashboard"
+    expected_status: Optional[str] = None
+    expected_current_run_id: Optional[int] = None
+    expected_event_id: Optional[int] = None
 
 
 @router.post("/tasks/{task_id}/comments")
@@ -1099,8 +1137,14 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         kanban_db.add_comment(
             conn, task_id, author=payload.author or "dashboard", body=payload.body,
+            precondition=_mutation_precondition(payload),
         )
         return {"ok": True}
+    except kanban_db.TaskMutationConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "mutation_conflict", "current": asdict(exc.current)},
+        ) from exc
     finally:
         conn.close()
 
@@ -1199,7 +1243,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         if cur and cur.status in ("blocked", "scheduled"):
                             ok = kanban_db.unblock_task(conn, tid)
                         else:
-                            ok = _set_status_direct(conn, tid, "ready")
+                            ok = kanban_db.set_task_status(conn, tid, "ready")
                     elif s == "running":
                         entry.update(
                             ok=False,
@@ -1213,7 +1257,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     elif s == "scheduled":
                         ok = kanban_db.schedule_task(conn, tid)
                     elif s in {"todo", "triage"}:
-                        ok = _set_status_direct(conn, tid, s)
+                        ok = kanban_db.set_task_status(conn, tid, s)
                     else:
                         entry.update(ok=False, error=f"unknown status {s!r}")
                         results.append(entry)
@@ -1558,6 +1602,9 @@ def terminate_run_endpoint(
 
 class ReclaimBody(BaseModel):
     reason: Optional[str] = None
+    expected_status: Optional[str] = None
+    expected_current_run_id: Optional[int] = None
+    expected_event_id: Optional[int] = None
 
 
 @router.post("/tasks/{task_id}/reclaim")
@@ -1576,7 +1623,12 @@ def reclaim_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
+        ok = kanban_db.reclaim_task(
+            conn,
+            task_id,
+            reason=payload.reason,
+            precondition=_mutation_precondition(payload),
+        )
         if not ok:
             raise HTTPException(
                 status_code=409,
@@ -1586,6 +1638,11 @@ def reclaim_task_endpoint(
                 ),
             )
         return {"ok": True, "task_id": task_id}
+    except kanban_db.TaskMutationConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "mutation_conflict", "current": asdict(exc.current)},
+        ) from exc
     finally:
         conn.close()
 

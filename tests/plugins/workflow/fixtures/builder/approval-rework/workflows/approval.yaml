@@ -1,0 +1,17 @@
+name: builder-approval-rework
+description: Approval package with bounded rejection rework
+nodes:
+  - id: draft
+    bash: "printf 'fictional draft'"
+  - id: approve
+    approval:
+      message: Review the fictional draft before outward delivery.
+      capture_response: true
+      on_reject:
+        prompt: Revise the fictional draft using the bounded rejection response.
+        max_attempts: 2
+    depends_on: [draft]
+  - id: deliver
+    bash: "printf 'simulated delivery only'"
+    depends_on: [approve]
+

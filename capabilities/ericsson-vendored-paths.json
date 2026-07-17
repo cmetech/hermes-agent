@@ -1,12 +1,9 @@
 [
   "capabilities/mcp-servers.yaml",
-  "capabilities/workflows/inbox-digest.yml",
-  "capabilities/workflows/my-tickets-summary.yml",
+  "capabilities/workflow-packages/ericsson",
   "plugins/ericsson-jira",
   "plugins/ericsson-teams",
   "plugins/outlook-mcp",
   "skills/ericsson/onboard-ericsson-capabilities",
-  "skills/ericsson/opportunity-visuals",
-  "skills/ericsson/workflow-builder",
-  "skills/ericsson/workflow-orchestrator"
+  "skills/ericsson/opportunity-visuals"
 ]

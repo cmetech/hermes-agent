@@ -1,0 +1,9 @@
+{
+  "simulated": true,
+  "device": "FICTIONAL-LAPTOP-042",
+  "cpu": {"load_percent": 78, "top_process": "fictional-renderer"},
+  "memory": {"used_percent": 84, "available_mb": 2457},
+  "storage": {"free_percent": 11, "health": "simulated-warning"},
+  "network": {"latency_ms": 42, "packet_loss_percent": 0},
+  "startup": {"seconds": 96, "high_impact_items": 4}
+}
