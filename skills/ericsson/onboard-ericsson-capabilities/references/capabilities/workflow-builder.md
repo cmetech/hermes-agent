@@ -48,7 +48,7 @@ conditions, approvals, inputs, delivery, and slug; known choices are reused.
 ## Reads and writes
 
 It reads the portable schema and visible capabilities. After playback confirmation
-it writes a complete package and runs `hermes workflow doctor PACKAGE --json`.
+it writes a complete package and runs `PRODUCT_CLI workflow doctor PACKAGE --json`.
 
 ## Readiness
 

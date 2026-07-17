@@ -15,6 +15,8 @@ coverage:
     reason: Separate user-requested v2.0.2 release preparation.
   - commit: e3e1e5f552810010fe910ede51ed64d040676ea4
     reason: Separate user-requested v2.0.3 release preparation.
+  - commit: 8b5f733d8a8127f62ab7526d9d70dcaf8574b187
+    reason: Separate user-requested v2.0.4 release preparation.
 upstream_changes:
 - id: gateway-live-completion-eligibility
   change_class: model-selection-generic

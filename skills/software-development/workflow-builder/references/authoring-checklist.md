@@ -18,9 +18,8 @@ Before offering execution or scheduling, verify all of these:
   doctor output, logs, or trust state.
 - Execution environment and resource ceilings cover workers, parallel nodes,
   timeouts, retries, descendants, CPU, memory, and admission capacity.
-- `hermes workflow doctor PACKAGE --json` is runnable without a model, remote
+- `PRODUCT_CLI workflow doctor PACKAGE --json` is runnable without a model, remote
   MCP connection, network call, or provider request.
 - The user reviewed the exact package digest and risk summary before trust.
   The package never writes trust for itself.
 - Run or cron is offered only after the doctor gate is runnable.
-

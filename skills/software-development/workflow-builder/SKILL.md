@@ -11,6 +11,12 @@ metadata:
 
 # Portable workflow builder
 
+Before any command, resolve `PRODUCT_CLI` once from the active product. Read
+`$HERMES_HOME/brand.json` when available and use its `slug` as the executable
+name: LOOP24 uses `loop24`, OTTO uses `otto`, and a neutral Hermes Agent install
+without a brand descriptor uses `hermes`. Replace `PRODUCT_CLI` in every command
+template; do not execute it literally or use another product's executable.
+
 Build a complete neutral package in the Archon-compatible YAML shape while
 keeping execution policy in its Hermes sidecar. Work one decision at a time.
 First ask what outcome is wanted, then inputs, outward effects, execution
@@ -49,7 +55,7 @@ or `forbid` only after explaining bounded overlap or refusal.
 Run:
 
 ```bash
-hermes workflow doctor PATH/TO/workflows/NAME.yaml --json
+PRODUCT_CLI workflow doctor PATH/TO/workflows/NAME.yaml --json
 ```
 
 Never call a model or connect to MCP during doctor. Resolve every blocking
@@ -68,7 +74,7 @@ Only after doctor says the package is runnable and the user has made the trust
 decision may you offer:
 
 ```bash
-hermes workflow run NAME --arguments '...' --idempotency-key KEY --json
+PRODUCT_CLI workflow run NAME --arguments '...' --idempotency-key KEY --json
 ```
 
 or Hermes' existing cron path. Scheduling must use a one-shot `repeat=1` job

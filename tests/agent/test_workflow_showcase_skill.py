@@ -43,3 +43,18 @@ def test_showcase_skill_routes_to_branch_procedures() -> None:
         assert (SKILL / "workflows" / name).is_file()
     assert (SKILL / "references/showcase-contract.md").is_file()
     assert (SKILL / "references/safety-and-interpretation.md").is_file()
+
+
+def test_showcase_skill_resolves_the_active_product_cli_before_execution() -> None:
+    files = sorted(SKILL.rglob("*.md"))
+    text = "\n".join(path.read_text(encoding="utf-8") for path in files)
+    router = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "brand.json" in router
+    assert "loop24" in router
+    assert "otto" in router
+    assert "neutral Hermes Agent" in router
+    assert "PRODUCT_CLI" in router
+    assert "do not execute it literally" in router.lower()
+    assert "`hermes workflow" not in text
+    assert "PRODUCT_CLI workflow showcase" in text
