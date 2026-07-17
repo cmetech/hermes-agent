@@ -2,12 +2,23 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from collections import namedtuple
 
 import pytest
 
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import InputSnapshotError, RunStore, StorageQuotaError
+
+
+def test_store_connection_context_closes_the_database_handle(tmp_path) -> None:
+    store = RunStore(tmp_path / "home")
+
+    with store._connect() as connection:
+        connection.execute("SELECT 1").fetchone()
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        connection.execute("SELECT 1")
 
 
 def test_prepare_snapshot_copies_inputs_immutably(tmp_path, workflow_writer):

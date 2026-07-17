@@ -42,6 +42,16 @@ class JournalRecoveryError(RuntimeError):
     pass
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """Preserve sqlite transaction semantics and release the handle on exit."""
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
+
+
 @dataclass(frozen=True)
 class NodeClaim:
     run_id: str
@@ -542,7 +552,12 @@ class RunStore:
                 )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database, timeout=5.0, isolation_level=None)
+        connection = sqlite3.connect(
+            self.database,
+            timeout=5.0,
+            isolation_level=None,
+            factory=_ClosingConnection,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=5000")
