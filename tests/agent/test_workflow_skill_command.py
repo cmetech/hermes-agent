@@ -46,7 +46,7 @@ def test_workflow_slash_command_loads_as_one_user_message(monkeypatch):
 
     assert message is not None
     assert "run demo" in message
-    assert "hermes workflow" in message
+    assert "PRODUCT_CLI workflow" in message
     assert message.count("run demo") == 1
 
 

@@ -26,7 +26,7 @@ def test_builder_skill_encodes_safe_whole_package_authoring_contract() -> None:
         "approval",
         "fresh",
         "queue",
-        "hermes workflow doctor",
+        "PRODUCT_CLI workflow doctor",
         "package digest",
         "explicit confirmation",
         "Never write trust",
@@ -34,8 +34,8 @@ def test_builder_skill_encodes_safe_whole_package_authoring_contract() -> None:
     ):
         assert requirement.lower() in text.lower()
 
-    doctor_position = text.index("hermes workflow doctor")
-    run_position = text.index("hermes workflow run")
+    doctor_position = text.index("PRODUCT_CLI workflow doctor")
+    run_position = text.index("PRODUCT_CLI workflow run")
     assert doctor_position < run_position
     assert "Ericsson" not in text
 
