@@ -79,3 +79,24 @@ upstream_changes:
   removal_condition: Remove when Hermes upstream provides equivalent generic
     task mutation preconditions and stale-worker-safe reclaim behavior.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: kanban-desktop-rest
+  change_class: kanban-rest-adapter
+  owner: workflow-orchestration
+  files:
+  - plugins/kanban/dashboard/plugin_api.py
+  - tests/plugins/test_kanban_dashboard_plugin.py
+  owned_symbols:
+  - board_summary
+  - task_page
+  - event_page
+  - _mutation_precondition
+  tests:
+  - tests/plugins/test_kanban_dashboard_plugin.py
+  expected_commit_subject: 'feat(kanban): harden desktop board api'
+  upstream_candidate: true
+  merge_guidance: Reconcile bounded board/task/event pagination and optional
+    mutation precondition translation without replacing Kanban persistence or
+    weakening existing dashboard authentication.
+  removal_condition: Remove when Hermes upstream exposes equivalent bounded
+    Kanban REST deltas and compare-and-set mutation responses.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
