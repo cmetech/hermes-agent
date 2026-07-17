@@ -79,6 +79,23 @@ upstream_changes:
   removal_condition: Remove when upstream exposes an equivalent side-effect-free
     plugin-agent override authorization query.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: worker-deadline-gate-determinism
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - tests/agent/test_plugin_agent.py
+  owned_symbols:
+  - test_worker_stderr_is_never_exposed_to_plugin
+  - test_worker_stderr_does_not_reset_semantic_idle_deadline
+  tests:
+  - tests/agent/test_plugin_agent.py
+  expected_commit_subject: 'test(workflow): make worker gate deterministic'
+  upstream_candidate: true
+  merge_guidance: Preserve direct stderr-secrecy and semantic-idle classification
+    assertions without host-speed deadlines or worker-exit races in release gates.
+  removal_condition: Remove when upstream tests these invariants with equivalent
+    deterministic worker frames and classification checks.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: kanban-mutation-preconditions
   change_class: kanban-persistence-generic
   owner: workflow-orchestration
