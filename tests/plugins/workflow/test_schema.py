@@ -180,6 +180,25 @@ def test_rejects_removed_steps_key(workflow_writer, tmp_path):
         load_workflow(path)
 
 
+def test_rejects_legacy_kind_node_with_actionable_conversion(tmp_path):
+    workflow = tmp_path / "legacy.yaml"
+    workflow.write_text(
+        "name: legacy\n"
+        "description: old schema\n"
+        "nodes:\n"
+        "  - id: collect\n"
+        "    kind: prompt\n"
+        "    prompt: Collect evidence\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        load_workflow(workflow)
+
+    assert exc.value.issues[0].code == "legacy_kind_schema"
+    assert "replace `kind: prompt`" in exc.value.issues[0].message
+
+
 @pytest.mark.parametrize(
     ("nodes", "message"),
     [

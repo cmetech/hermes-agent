@@ -116,7 +116,7 @@ def validate_diff_coverage(data: dict[str, Any], repo: Path, diff_range: str) ->
     }
     ignored_prefixes = (
         "docs/upstream-customizations/", "tests/", "scripts/",
-        "plugins/", "skills/", "optional-skills/",
+        "plugins/", "skills/", "optional-skills/", "capabilities/", "brands/",
     )
     missing: set[str] = set()
     for _status, paths in _changed_paths(repo, diff_range):

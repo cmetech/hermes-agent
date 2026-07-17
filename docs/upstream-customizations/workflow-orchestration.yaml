@@ -152,3 +152,25 @@ upstream_changes:
   removal_condition: Remove when Hermes upstream provides equivalent native
     Workflow and Kanban operations pages over the same generic APIs.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: capability-workflow-package-staging
+  change_class: capability-staging-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/capability_staging.py
+  - tests/hermes_cli/test_capability_staging.py
+  - tests/hermes_cli/test_baked_seed.py
+  owned_symbols:
+  - _stage_workflow_package
+  - _verified_workflow_package
+  tests:
+  - tests/hermes_cli/test_capability_staging.py
+  - tests/hermes_cli/test_baked_seed.py
+  expected_commit_subject: 'feat(ericsson): ship portable workflow packages'
+  upstream_candidate: true
+  merge_guidance: Preserve atomic complete-package replacement, contained
+    symlink-free source validation, distribution-owned digest verification,
+    digest-bound trusted_distribution provenance, rollback before publication,
+    and generic plugin-enable configuration while reconciling capability startup.
+  removal_condition: Remove when Hermes upstream stages authenticated complete
+    workflow package roots with equivalent digest-bound distribution trust.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

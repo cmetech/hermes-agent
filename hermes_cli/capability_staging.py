@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import uuid
 from pathlib import Path
+from typing import Callable
 
 from hermes_cli import brand_config
 
@@ -143,10 +144,173 @@ def _copy_tree(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst, dirs_exist_ok=True)
 
 
-def stage_bundle(bundle: Path, set_name: str, home: Path | str) -> bool:
+def _manifest_relative_path(value: object, *, label: str) -> Path:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ValueError(f"invalid {label} path")
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts or path == Path("."):
+        raise ValueError(f"invalid {label} path")
+    return path
+
+
+def _assert_safe_tree(root: Path, relative: Path, *, label: str) -> Path:
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{label} contains a symlink: {relative.as_posix()}")
+    if not current.is_dir():
+        raise ValueError(f"{label} is not a directory: {relative.as_posix()}")
+    for candidate in current.rglob("*"):
+        if candidate.is_symlink():
+            raise ValueError(
+                f"{label} contains a symlink: {candidate.relative_to(root).as_posix()}"
+            )
+        if not candidate.is_file() and not candidate.is_dir():
+            raise ValueError(f"{label} contains an unsupported filesystem entry")
+    return current
+
+
+def _verified_workflow_package(
+    package_root: Path, digest_manifest: Path
+) -> tuple[tuple[str, str], ...]:
+    from plugins.workflow.schema import load_workflow
+    from plugins.workflow.trust import compute_package_digest
+
+    if digest_manifest.is_symlink() or not digest_manifest.is_file():
+        raise ValueError("workflow package digest manifest is missing or unsafe")
+    try:
+        payload = json.loads(digest_manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("workflow package digest manifest is invalid") from exc
+    packages = payload.get("packages") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schemaVersion") != 1
+        or set(payload) != {"schemaVersion", "packages"}
+        or not isinstance(packages, dict)
+        or not packages
+    ):
+        raise ValueError("workflow package digest manifest has an unsupported shape")
+    workflow_root = package_root / "workflows"
+    if not workflow_root.is_dir():
+        raise ValueError("workflow package does not contain workflows")
+    workflow_paths = sorted(
+        path
+        for path in workflow_root.glob("*.yaml")
+        if not path.name.endswith(".hermes.yaml")
+    )
+    if not workflow_paths:
+        raise ValueError("workflow package does not contain portable YAML")
+    verified: list[tuple[str, str]] = []
+    for workflow_path in workflow_paths:
+        package = load_workflow(workflow_path)
+        expected = packages.get(package.definition.name)
+        actual = compute_package_digest(package).sha256
+        if not isinstance(expected, str) or expected != actual:
+            raise ValueError(
+                f"workflow package digest mismatch: {package.definition.name}"
+            )
+        verified.append((package.definition.name, actual))
+    if set(packages) != {name for name, _digest in verified}:
+        raise ValueError("workflow package digest manifest does not match package names")
+    return tuple(verified)
+
+
+def _stage_workflow_package(
+    *,
+    bundle: Path,
+    entry: object,
+    home: Path,
+    trusted_distribution: bool,
+    fault_injector: Callable[[str, Path], None],
+) -> None:
+    if not isinstance(entry, dict) or set(entry) != {"path", "digestManifest"}:
+        raise ValueError("workflowPackages entries require path and digestManifest")
+    source_relative = _manifest_relative_path(
+        entry["path"], label="workflow package"
+    )
+    digest_relative = _manifest_relative_path(
+        entry["digestManifest"], label="workflow digest manifest"
+    )
+    source = _assert_safe_tree(bundle, source_relative, label="workflow package")
+    try:
+        digest_inside = (bundle / digest_relative).relative_to(source)
+    except ValueError as exc:
+        raise ValueError("workflow digest manifest must be inside its package") from exc
+    destination_parent = home / "workflows"
+    destination_parent.mkdir(parents=True, exist_ok=True)
+    destination = destination_parent / source.name
+    transaction = uuid.uuid4().hex
+    staged = destination_parent / f".{source.name}-stage-{transaction}"
+    backup = destination_parent / f".{source.name}-backup-{transaction}"
+    moved_previous = False
+    published = False
+    previously_untrusted: list[str] = []
+    try:
+        shutil.copytree(source, staged)
+        verified = _verified_workflow_package(staged, staged / digest_inside)
+        fault_injector("before-workflow-package-swap", destination)
+        if destination.exists():
+            if destination.is_symlink() or not destination.is_dir():
+                raise ValueError("workflow package destination is unsafe")
+            os.replace(destination, backup)
+            moved_previous = True
+        os.replace(staged, destination)
+        published = True
+        if trusted_distribution:
+            from plugins.workflow.compat import assess_compatibility
+            from plugins.workflow.schema import load_workflow
+            from plugins.workflow.trust import WorkflowTrustStore
+            from plugins.workflow.trust import build_risk_summary
+
+            trust = WorkflowTrustStore(home)
+            published_packages = {
+                package.definition.name: package
+                for path in (destination / "workflows").glob("*.yaml")
+                if not path.name.endswith(".hermes.yaml")
+                for package in (load_workflow(path),)
+            }
+            for name, digest in verified:
+                if trust.check(digest) == "untrusted":
+                    previously_untrusted.append(digest)
+                package = published_packages[name]
+                risk = build_risk_summary(package, assess_compatibility(package))
+                trust.trust(
+                    digest,
+                    actor="trusted_distribution",
+                    risk_digest=risk.risk_digest,
+                )
+        shutil.rmtree(backup, ignore_errors=True)
+    except Exception:
+        if published and destination.exists():
+            shutil.rmtree(destination, ignore_errors=True)
+        if moved_previous and backup.exists():
+            os.replace(backup, destination)
+        if previously_untrusted:
+            from plugins.workflow.trust import WorkflowTrustStore
+
+            trust = WorkflowTrustStore(home)
+            for digest in previously_untrusted:
+                trust.revoke(digest)
+        raise
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
+        if not moved_previous or published:
+            shutil.rmtree(backup, ignore_errors=True)
+
+
+def stage_bundle(
+    bundle: Path,
+    set_name: str,
+    home: Path | str,
+    *,
+    trusted_distribution: bool = False,
+    fault_injector: Callable[[str, Path], None] = lambda _phase, _path: None,
+) -> bool:
     """Stage one resolved bundle into `home` per its sets/<set_name>.json manifest.
 
-    Copies skills/plugins/mcpLocal/workflows, merges missing mcp_servers entries
+    Copies skills/plugins/mcpLocal/workflow packages, merges missing mcp_servers entries
     (resolving ${CAPABILITY_DIR} to <home>/plugins), and seeds disabled-by-default
     + plugins.enabled via ONE config round-trip. Returns True (reserved for
     future partial-failure reporting). Note: a version bump re-runs this staging,
@@ -180,22 +344,23 @@ def stage_bundle(bundle: Path, set_name: str, home: Path | str) -> bool:
                 log.debug("skipping %s entry %r: path traversal", key, rel)
                 continue
             src = bundle / rel
+            if key == "plugins" and p.as_posix() == "plugins/workflow":
+                plugin_names.append("workflow")
+                continue
             if not src.is_dir():
                 continue
             _copy_tree(src, home / "plugins" / src.name)
             if key == "plugins":
                 plugin_names.append(src.name)
 
-    for rel in manifest.get("workflows") or []:
-        p = Path(rel)
-        if p.is_absolute() or ".." in p.parts:
-            log.debug("skipping workflows entry %r: path traversal", rel)
-            continue
-        src = bundle / rel
-        if src.is_file():
-            dst = home / "workflows" / src.name
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
+    for entry in manifest.get("workflowPackages") or []:
+        _stage_workflow_package(
+            bundle=bundle,
+            entry=entry,
+            home=home,
+            trusted_distribution=trusted_distribution,
+            fault_injector=fault_injector,
+        )
 
     # config: mcp merge + disabled-by-default seeding + plugin enable (one round-trip)
     from hermes_cli import config as config_mod
@@ -291,7 +456,12 @@ def stage_brand_capabilities(home: Path | str, root: Path | None = None) -> None
             version = str(manifest.get("version") or "0")
             if staged_sets.get(name, {}).get("version") == version:
                 continue  # already staged at this version — fast no-op
-            if stage_bundle(bundle, name, home):
+            if stage_bundle(
+                bundle,
+                name,
+                home,
+                trusted_distribution=not bool(os.environ.get("OTTO_CAPABILITY_SOURCE")),
+            ):
                 staged_sets[name] = {"version": version}
                 dirty = True
         except Exception:
@@ -331,34 +501,51 @@ def seed_baked_capabilities(home: Path | str, root: Path | None = None) -> None:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            # workflows -> $HERMES_HOME/workflows (if absent)
-            for rel in manifest.get("workflows") or []:
-                src = _repo_root() / rel
-                if src.is_file():
-                    dst = home / "workflows" / src.name
-                    if not dst.exists():
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(src, dst)
+            if not isinstance(manifest, dict):
+                continue
+            for entry in manifest.get("workflowPackages") or []:
+                _stage_workflow_package(
+                    bundle=_repo_root(),
+                    entry=entry,
+                    home=home,
+                    trusted_distribution=True,
+                    fault_injector=lambda _phase, _path: None,
+                )
             # mcp_servers fragment -> config.yaml (merge missing only)
             frag_name = manifest.get("mcpServersFile")
             frag = cap_dir / frag_name if frag_name else None
+            entries = {}
             if frag and frag.is_file():
                 try:
                     entries = (yaml.safe_load(frag.read_text(encoding="utf-8")) or {}).get("mcp_servers") or {}
                 except Exception:
                     entries = {}
-                if entries:
-                    from hermes_cli import config as config_mod
-                    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-                    token = set_hermes_home_override(str(home))
-                    try:
-                        cfg = config_mod.load_config() or {}
+            plugin_names = [
+                Path(rel).name
+                for rel in manifest.get("plugins") or []
+                if isinstance(rel, str) and rel.startswith("plugins/")
+            ]
+            if entries or plugin_names:
+                from hermes_cli import config as config_mod
+                from hermes_cli.brand_config import _union
+                from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+                token = set_hermes_home_override(str(home))
+                try:
+                    cfg = config_mod.load_config() or {}
+                    changed = False
+                    if entries:
                         existing = cfg.setdefault("mcp_servers", {})
-                        changed = _merge_mcp_server_defaults(existing, entries, text_sub)
-                        if changed:
-                            config_mod.save_config(cfg)
-                    finally:
-                        reset_hermes_home_override(token)
+                        changed |= _merge_mcp_server_defaults(existing, entries, text_sub)
+                    if plugin_names:
+                        plugins_cfg = cfg.setdefault("plugins", {})
+                        merged = _union(plugins_cfg.get("enabled"), plugin_names)
+                        if merged != plugins_cfg.get("enabled"):
+                            plugins_cfg["enabled"] = merged
+                            changed = True
+                    if changed:
+                        config_mod.save_config(cfg)
+                finally:
+                    reset_hermes_home_override(token)
     except Exception:
         log.debug("seed_baked_capabilities failed", exc_info=True)
 

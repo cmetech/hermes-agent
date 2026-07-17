@@ -802,6 +802,40 @@ def doctor_package(
                     )
                 )
 
+    required_services = package.sidecar.get("required_services", ())
+    if not isinstance(required_services, tuple | list) or any(
+        not isinstance(service, str) or not service for service in required_services
+    ):
+        findings.append(
+            _doctor_finding(
+                code="invalid_required_services",
+                path="sidecar.required_services",
+                message="required_services must contain configured service names",
+                blocking=True,
+                level=CompatibilityLevel.UNSUPPORTED,
+            )
+        )
+    else:
+        for service in required_services:
+            missing = available_services is not None and service not in available_services
+            findings.append(
+                _doctor_finding(
+                    code="missing_service" if missing else "configured_service_preflight",
+                    path=f"sidecar.required_services.{service}",
+                    message=(
+                        f"required configured service is unavailable: {service}"
+                        if missing
+                        else f"configured service is checked before execution: {service}"
+                    ),
+                    blocking=missing,
+                    level=(
+                        CompatibilityLevel.UNSUPPORTED
+                        if missing
+                        else CompatibilityLevel.MAPPED
+                    ),
+                )
+            )
+
     visible_environment = os.environ if environment is None else environment
     for name in _mcp_environment_names(package):
         if not visible_environment.get(name):

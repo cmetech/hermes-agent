@@ -6,6 +6,11 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import capability_staging as cs
+from plugins.workflow.schema import load_workflow
+from plugins.workflow.trust import (
+    WorkflowTrustStore,
+    compute_package_digest,
+)
 
 
 def _write(p: Path, text: str = "x") -> Path:
@@ -20,18 +25,18 @@ def make_bundle(root: Path, version: str = "0.2.0", requires_env=None) -> Path:
     manifest = {
         "name": "ericsson", "version": version, "description": "t",
         "requiresEnv": requires_env if requires_env is not None else {},
-        "disabledByDefault": {"skills": ["workflow-orchestrator"],
-                               "toolsets": ["ericsson-jira"]},
-        "skills": ["skills/ericsson/workflow-orchestrator"],
-        "plugins": ["plugins/ericsson-jira"],
+        "disabledByDefault": {"skills": [], "toolsets": ["ericsson-jira"]},
+        "skills": [],
+        "plugins": ["plugins/workflow", "plugins/ericsson-jira"],
         "mcpServers": "mcp/mcp-servers.yaml",
         "mcpLocal": ["mcp/outlook-mcp"],
-        "workflows": ["workflows/my-tickets-summary.yml"],
+        "workflowPackages": [{
+            "path": "capabilities/workflow-packages/ericsson",
+            "digestManifest": "capabilities/workflow-packages/ericsson/digests.json",
+        }],
         "personas": [], "env": [],
     }
     _write(b / "sets/ericsson.json", json.dumps(manifest))
-    _write(b / "skills/ericsson/workflow-orchestrator/SKILL.md", "---\nname: workflow-orchestrator\n---\n")
-    _write(b / "skills/ericsson/workflow-orchestrator/scripts/workflow_ctl.py", "# ctl")
     _write(b / "plugins/ericsson-jira/plugin.yaml", "name: ericsson-jira\n")
     _write(b / "plugins/ericsson-jira/__init__.py", "")
     _write(b / "mcp/outlook-mcp/run_server.py", "# server")
@@ -45,7 +50,24 @@ def make_bundle(root: Path, version: str = "0.2.0", requires_env=None) -> Path:
            "    url: https://default.example.test/mcp\n"
            "    headers:\n"
            "      Authorization: \"Bearer ${GLEAN_API_TOKEN}\"\n")
-    _write(b / "workflows/my-tickets-summary.yml", "name: my-tickets-summary\n")
+    package = b / "capabilities/workflow-packages/ericsson"
+    workflow = _write(
+        package / "workflows/my-tickets-summary.yaml",
+        "name: my-tickets-summary\n"
+        "description: Portable ticket summary\n"
+        "nodes:\n"
+        "  - id: collect\n"
+        "    command: collect\n",
+    )
+    _write(package / "commands/collect.md", "Collect fictional tickets.\n")
+    digest = compute_package_digest(load_workflow(workflow)).sha256
+    _write(
+        package / "digests.json",
+        json.dumps({
+            "schemaVersion": 1,
+            "packages": {"my-tickets-summary": digest},
+        }),
+    )
     return b
 
 
@@ -113,16 +135,18 @@ def test_stage_bundle_full(tmp_path, home, fake_config):
     b = make_bundle(tmp_path)
     changed = cs.stage_bundle(b, "ericsson", home)
     assert changed is True
-    assert (home / "skills/ericsson/workflow-orchestrator/SKILL.md").exists()
-    assert (home / "skills/ericsson/workflow-orchestrator/scripts/workflow_ctl.py").exists()
+    assert not (home / "plugins/workflow").exists()
     assert (home / "plugins/ericsson-jira/plugin.yaml").exists()
     assert (home / "plugins/outlook-mcp/run_server.py").exists()
-    assert (home / "workflows/my-tickets-summary.yml").exists()
+    package = home / "workflows/ericsson"
+    assert (package / "workflows/my-tickets-summary.yaml").exists()
+    assert (package / "commands/collect.md").exists()
+    assert (package / "digests.json").exists()
     cfg = store["config"]
     outlook = cfg["mcp_servers"]["outlook"]
     assert outlook["args"][0] == str(home / "plugins") + "/outlook-mcp/run_server.py"
-    assert "workflow-orchestrator" in cfg["skills"]["disabled"]
     assert "ericsson-jira" in cfg["disabled_toolsets"]
+    assert "workflow" in cfg["plugins"]["enabled"]
     assert "ericsson-jira" in cfg["plugins"]["enabled"]
 
 
@@ -183,19 +207,85 @@ def test_stage_brand_capabilities_end_to_end(tmp_path, home, fake_config, monkey
     }))
     _write(fake_root / "brand/active", "otto")
     cs.stage_brand_capabilities(home, root=fake_root)
-    assert (home / "skills/ericsson/workflow-orchestrator/SKILL.md").exists()
+    assert (home / "workflows/ericsson/workflows/my-tickets-summary.yaml").exists()
     stamp = json.loads((home / cs.STAGING_MANIFEST).read_text())
     assert stamp["sets"]["ericsson"]["version"] == "0.2.0"
     # idempotent second run: nothing re-copied (marker: delete a staged file; version match -> skip)
-    (home / "workflows/my-tickets-summary.yml").unlink()
+    staged_workflow = home / "workflows/ericsson/workflows/my-tickets-summary.yaml"
+    staged_workflow.unlink()
     cs.stage_brand_capabilities(home, root=fake_root)
-    assert not (home / "workflows/my-tickets-summary.yml").exists()
+    assert not staged_workflow.exists()
     # version bump -> re-stages
     m = json.loads((b / "sets/ericsson.json").read_text())
     m["version"] = "0.3.0"
     (b / "sets/ericsson.json").write_text(json.dumps(m))
     cs.stage_brand_capabilities(home, root=fake_root)
-    assert (home / "workflows/my-tickets-summary.yml").exists()
+    assert staged_workflow.exists()
+
+
+def test_complete_package_swap_is_atomic_and_distribution_trust_is_digest_bound(
+    tmp_path, home, fake_config
+):
+    bundle = make_bundle(tmp_path)
+    old = home / "workflows/ericsson"
+    _write(old / "workflows/old.yaml", "old package remains usable\n")
+
+    with pytest.raises(RuntimeError, match="before package swap"):
+        cs.stage_bundle(
+            bundle,
+            "ericsson",
+            home,
+            trusted_distribution=True,
+            fault_injector=lambda phase, _path: (
+                (_ for _ in ()).throw(RuntimeError("before package swap"))
+                if phase == "before-workflow-package-swap"
+                else None
+            ),
+        )
+
+    assert (old / "workflows/old.yaml").read_text() == "old package remains usable\n"
+    assert not list((home / "workflows").glob(".ericsson-stage-*"))
+
+    cs.stage_bundle(bundle, "ericsson", home, trusted_distribution=True)
+    workflow = old / "workflows/my-tickets-summary.yaml"
+    package = load_workflow(workflow)
+    digest = compute_package_digest(package).sha256
+    assert WorkflowTrustStore(home).check(digest) == "trusted"
+    trust = json.loads((home / "workflow/trust.json").read_text())
+    assert trust["records"][digest]["actor"] == "trusted_distribution"
+
+
+def test_package_digest_mismatch_preserves_previous_package_and_trust(
+    tmp_path, home, fake_config
+):
+    bundle = make_bundle(tmp_path)
+    cs.stage_bundle(bundle, "ericsson", home, trusted_distribution=True)
+    destination = home / "workflows/ericsson"
+    before = (destination / "workflows/my-tickets-summary.yaml").read_bytes()
+    trust_before = (home / "workflow/trust.json").read_bytes()
+    (bundle / "capabilities/workflow-packages/ericsson/commands/collect.md").write_text(
+        "tampered\n"
+    )
+
+    with pytest.raises(ValueError, match="digest mismatch"):
+        cs.stage_bundle(bundle, "ericsson", home, trusted_distribution=True)
+
+    assert (destination / "workflows/my-tickets-summary.yaml").read_bytes() == before
+    assert (home / "workflow/trust.json").read_bytes() == trust_before
+
+
+def test_direct_user_staging_cannot_claim_distribution_trust(
+    tmp_path, home, fake_config
+):
+    bundle = make_bundle(tmp_path)
+
+    cs.stage_bundle(bundle, "ericsson", home)
+
+    package = load_workflow(
+        home / "workflows/ericsson/workflows/my-tickets-summary.yaml"
+    )
+    digest = compute_package_digest(package).sha256
+    assert WorkflowTrustStore(home).check(digest) == "untrusted"
 
 
 def test_requires_env_gate(tmp_path, home, fake_config, monkeypatch):
@@ -258,6 +348,39 @@ def test_stage_bundle_rejects_absolute_path(tmp_path, home, fake_config):
     cs.stage_bundle(b, "ericsson", home)
     assert not (home / "skills" / "etc").exists()
     assert not (home / "etc").exists()
+
+
+def test_stage_bundle_rejects_workflow_package_traversal(
+    tmp_path, home, fake_config
+):
+    bundle = make_bundle(tmp_path)
+    manifest_path = bundle / "sets/ericsson.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["workflowPackages"][0]["path"] = "../outside"
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="workflow package path"):
+        cs.stage_bundle(bundle, "ericsson", home)
+
+    assert not (home / "workflows/ericsson").exists()
+
+
+def test_stage_bundle_rejects_symlink_inside_workflow_package(
+    tmp_path, home, fake_config
+):
+    bundle = make_bundle(tmp_path)
+    package = bundle / "capabilities/workflow-packages/ericsson"
+    outside = _write(tmp_path / "outside.md", "outside\n")
+    link = package / "commands/escape.md"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    with pytest.raises(ValueError, match="symlink"):
+        cs.stage_bundle(bundle, "ericsson", home)
+
+    assert not (home / "workflows/ericsson").exists()
 
 
 def test_stage_bundle_config_targets_staged_home(tmp_path, monkeypatch):

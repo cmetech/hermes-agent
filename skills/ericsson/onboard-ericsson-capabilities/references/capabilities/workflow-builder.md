@@ -10,8 +10,8 @@ maturity: available
 recommendation_eligible: true
 source_flows: []
 implementation:
-  skills: [skills/ericsson/workflow-builder]
-  plugins: []
+  skills: [skills/software-development/workflow-builder]
+  plugins: [plugins/workflow]
   mcp_servers: []
   workflows: []
   tools: []
@@ -47,8 +47,8 @@ conditions, approvals, inputs, delivery, and slug; known choices are reused.
 
 ## Reads and writes
 
-It reads the schema and visible capabilities. After playback confirmation it writes
-to the chosen `$HERMES_HOME/workflows` destination and validates the YAML.
+It reads the portable schema and visible capabilities. After playback confirmation
+it writes a complete package and runs `hermes workflow doctor PACKAGE --json`.
 
 ## Readiness
 
@@ -62,10 +62,10 @@ do not execute outward actions simply to prove the builder works.
 
 ## Artifacts
 
-Inspect the validated YAML, especially node outputs, approvals, side-effect flags,
-inputs, exclusions, and warnings before selecting run or schedule.
+Inspect the digest-bound package, especially resources, approvals, outward actions,
+immutable inputs, overlap policy, resource ceilings, and warnings before run or cron.
 
 ## Troubleshooting
 
-Remove invented tools and unsupported loops, retries, parallelism, or `on_reject`.
-Fix filename/name and input-reference errors, then revalidate before any rerun.
+Remove invented tools and unsupported fields. Fix every coded doctor finding, then
+rerun doctor and review the new digest before trust, execution, or scheduling.

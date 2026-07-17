@@ -72,6 +72,7 @@ def _package(tmp_path: Path) -> Path:
             {
                 "overlap_policy": "forbid",
                 "required_secrets": ["SERVICE_TOKEN"],
+                "required_services": ["outlook"],
                 "execution_environment": "isolated_backend_required",
                 "delivery_defaults": {
                     "inputs": {
@@ -106,6 +107,7 @@ def test_doctor_reports_resources_trust_inputs_and_capacity_without_remote_calls
         package,
         hermes_home=tmp_path / "home",
         available_tools=frozenset({"read_file"}),
+        available_services=frozenset(),
         available_skills=frozenset({"workflow"}),
         available_runtimes=frozenset(),
         mcp_available=True,
@@ -130,6 +132,7 @@ def test_doctor_reports_resources_trust_inputs_and_capacity_without_remote_calls
         "missing_runtime",
         "missing_mcp_variable",
         "missing_credential",
+        "missing_service",
         "immutable_input_snapshot",
         "overlap_forbid",
         "effective_admission_capacity",

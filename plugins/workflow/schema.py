@@ -600,6 +600,19 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
 def _normalize_node(raw: Any, index: int, lines: dict[str, int]) -> WorkflowNode:
     path = f"nodes[{index}]"
     node = _mapping(raw, path)
+    if "kind" in node:
+        legacy_kind = node.get("kind")
+        replacement = (
+            f"replace `kind: {legacy_kind}` with the `{legacy_kind}: ...` node field"
+            if isinstance(legacy_kind, str) and legacy_kind
+            else "replace the legacy `kind` field with one supported node-type field"
+        )
+        _fail(
+            f"{path}.kind",
+            "legacy_kind_schema",
+            f"legacy workflow node schema is unsupported; {replacement}",
+            line=lines.get("kind"),
+        )
     unknown = sorted(set(node) - COMMON_NODE_FIELDS)
     if unknown:
         _fail(

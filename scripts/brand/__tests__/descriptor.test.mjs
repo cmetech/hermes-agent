@@ -40,10 +40,9 @@ test('withDefaults: curation.channels.allow defaults to [] and passes through', 
   assert.ok(otto.curation.channels.allow.includes('telegram'))
   assert.ok(otto.curation.channels.allow.includes('msgraph_webhook'))
 
-  // A brand descriptor that omits `curation.channels` entirely (loop24 has no
-  // curation block at all) must still normalize to allow: [].
-  const loop24 = loadDescriptor('loop24', { root: ROOT })
-  assert.deepEqual(loop24.curation.channels, { allow: [] })
+  // A descriptor that omits `curation.channels` must still normalize safely.
+  const minimal = withDefaults({ slug: 'minimal' })
+  assert.deepEqual(minimal.curation.channels, { allow: [] })
 })
 
 test('withDefaults normalizes capabilitySources', () => {
