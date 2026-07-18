@@ -9,6 +9,7 @@ from __future__ import annotations
 
 def register(ctx) -> None:
     from plugins.workflow.cli import register_cli, workflow_command
+    from plugins.workflow.coordinator import create_workflow_coordinator
 
     def handler(args):
         return workflow_command(
@@ -23,4 +24,9 @@ def register(ctx) -> None:
         setup_fn=register_cli,
         handler_fn=handler,
         description="Discover, validate, inspect, trust, and operate portable workflows.",
+    )
+    ctx.register_background_service(
+        "coordinator",
+        create_workflow_coordinator,
+        hosts={"web", "gateway"},
     )

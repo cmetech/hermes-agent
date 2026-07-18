@@ -214,6 +214,7 @@ class WorkflowRuntimeConfig:
     subprocess_timeout_seconds: float = 120.0
     heartbeat_seconds: float = 5.0
     lease_seconds: float = 30.0
+    coordinator_web_election_grace_seconds: float = 3.0
     cooperative_shutdown_seconds: float = 5.0
     term_grace_seconds: float = 5.0
     kill_reap_grace_seconds: float = 2.0
@@ -250,6 +251,7 @@ class WorkflowRuntimeConfig:
             "subprocess_timeout_seconds",
             "heartbeat_seconds",
             "lease_seconds",
+            "coordinator_web_election_grace_seconds",
             "cooperative_shutdown_seconds",
             "term_grace_seconds",
             "kill_reap_grace_seconds",

@@ -1278,6 +1278,26 @@ class RunStore:
             raise
         return connection
 
+    @staticmethod
+    def _record_coordinator_wake(
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        reason_code: str,
+    ) -> int:
+        from plugins.workflow.coordinator_store import record_coordinator_wake
+
+        return record_coordinator_wake(
+            connection,
+            run_id=run_id,
+            reason_code=reason_code,
+        )
+
+    def _notify_coordinator(self) -> None:
+        from plugins.workflow.coordinator_store import CoordinatorStore
+
+        CoordinatorStore(self.database).notify_local()
+
     def prepare_empty_snapshot(
         self,
         *,
@@ -1860,8 +1880,15 @@ class RunStore:
                 "WHERE run_id=? AND admission_state='reserved'",
                 (status, _utc_now(), run_id),
             ).rowcount
+            if updated == 1:
+                self._record_coordinator_wake(
+                    connection,
+                    run_id=run_id,
+                    reason_code="run_admitted",
+                )
         if updated != 1:
             raise RuntimeError(f"admission reservation is not active: {run_id}")
+        self._notify_coordinator()
 
     def run_directory(self, run_id: str, *, operator_scope: str | None = None) -> Path:
         scope_digest = self._scope_digest(operator_scope)
@@ -2201,7 +2228,11 @@ class RunStore:
                     "UPDATE runs SET status='running', queue_position=NULL, blocked_by_run_id=NULL, updated_at=? WHERE run_id=?",
                     (projection["updated_at"], run_id),
                 )
+                self._record_coordinator_wake(
+                    connection, run_id=run_id, reason_code="run_promoted"
+                )
                 connection.commit()
+                self._notify_coordinator()
                 return True
             except BaseException:
                 connection.rollback()
@@ -2880,6 +2911,11 @@ class RunStore:
                         "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
                         (terminal, projection["updated_at"], claim.run_id),
                     )
+                    self._record_coordinator_wake(
+                        connection,
+                        run_id=claim.run_id,
+                        reason_code=f"run_{terminal}",
+                    )
                     if terminal == "cancelled":
                         connection.execute(
                             "DELETE FROM worker_claims WHERE run_id=?", (claim.run_id,)
@@ -2898,8 +2934,15 @@ class RunStore:
                             "WHERE run_id=?",
                             (projection["updated_at"], claim.run_id),
                         )
+                        self._record_coordinator_wake(
+                            connection,
+                            run_id=claim.run_id,
+                            reason_code="retry_waiting",
+                        )
                 _atomic_json(directory / "run.json", projection)
             self._release_worker_claim(claim.attempt_id)
+            if terminal or projection["status"] == "waiting_retry":
+                self._notify_coordinator()
 
     def record_loop_iteration(
         self,
@@ -3112,6 +3155,10 @@ class RunStore:
                     "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
                     (target, projection["updated_at"], run_id),
                 )
+                self._record_coordinator_wake(
+                    connection, run_id=run_id, reason_code=f"run_{target}"
+                )
+            self._notify_coordinator()
             return True
 
     def schedule_retry(
@@ -3183,7 +3230,13 @@ class RunStore:
                     "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
                     (projection["status"], projection["updated_at"], claim.run_id),
                 )
+                self._record_coordinator_wake(
+                    connection,
+                    run_id=claim.run_id,
+                    reason_code="retry_scheduled",
+                )
             self._release_worker_claim(claim.attempt_id)
+            self._notify_coordinator()
 
     def wake_due_retries(
         self, run_id: str, *, now: datetime | None = None
@@ -3218,6 +3271,10 @@ class RunStore:
                         "UPDATE runs SET status='running', updated_at=? WHERE run_id=?",
                         (projection["updated_at"], run_id),
                     )
+                    self._record_coordinator_wake(
+                        connection, run_id=run_id, reason_code="retry_due"
+                    )
+                self._notify_coordinator()
         return tuple(ready)
 
     def renew_claim(
@@ -3747,6 +3804,10 @@ class RunStore:
                         "WHERE run_id=?",
                         (projection["updated_at"], run_id),
                     )
+                    self._record_coordinator_wake(
+                        connection, run_id=run_id, reason_code="cancel_requested"
+                    )
+                self._notify_coordinator()
             for node_id, node in projection["nodes"].items():
                 claim = node.get("claim")
                 recovery = node.get("recovery")
@@ -4000,6 +4061,10 @@ class RunStore:
                 connection.execute(
                     "DELETE FROM worker_claims WHERE run_id=?", (run_id,)
                 )
+                self._record_coordinator_wake(
+                    connection, run_id=run_id, reason_code="run_cancelled"
+                )
+            self._notify_coordinator()
             return {**projection, "cancellation_outcome": "cancelled"}
 
     def resume_run(
@@ -4063,6 +4128,10 @@ class RunStore:
                     "UPDATE runs SET status='running', updated_at=? WHERE run_id=?",
                     (projection["updated_at"], run_id),
                 )
+                self._record_coordinator_wake(
+                    connection, run_id=run_id, reason_code="run_resumed"
+                )
+            self._notify_coordinator()
             return projection
 
     @staticmethod
@@ -4286,6 +4355,12 @@ class RunStore:
                     connection.execute(
                         "DELETE FROM worker_claims WHERE run_id=?", (run_id,)
                     )
+                self._record_coordinator_wake(
+                    connection,
+                    run_id=run_id,
+                    reason_code=f"interaction_{decision}",
+                )
+            self._notify_coordinator()
             return ApprovalDecision(
                 run_id=run_id,
                 node_id=node_id,
@@ -4382,6 +4457,10 @@ class RunStore:
                     "UPDATE runs SET status='running', updated_at=? WHERE run_id=?",
                     (projection["updated_at"], run_id),
                 )
+                self._record_coordinator_wake(
+                    connection, run_id=run_id, reason_code="input_provided"
+                )
+            self._notify_coordinator()
             return projection
 
     def retry_run(
@@ -4442,6 +4521,10 @@ class RunStore:
                     "UPDATE runs SET status='running', updated_at=? WHERE run_id=?",
                     (projection["updated_at"], run_id),
                 )
+                self._record_coordinator_wake(
+                    connection, run_id=run_id, reason_code="operator_retry"
+                )
+            self._notify_coordinator()
             return projection
 
     def reconcile_run(
@@ -4528,6 +4611,10 @@ class RunStore:
                     "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
                     (projection["status"], projection["updated_at"], run_id),
                 )
+                self._record_coordinator_wake(
+                    connection, run_id=run_id, reason_code="run_reconciled"
+                )
+            self._notify_coordinator()
             return projection
 
     def abandon_run(
@@ -4618,6 +4705,10 @@ class RunStore:
                 connection.execute(
                     "DELETE FROM worker_claims WHERE run_id=?", (run_id,)
                 )
+                self._record_coordinator_wake(
+                    connection, run_id=run_id, reason_code=f"run_{target}"
+                )
+            self._notify_coordinator()
             if target == "cancelled":
                 return {**projection, "cancellation_outcome": "cancelled"}
             return projection

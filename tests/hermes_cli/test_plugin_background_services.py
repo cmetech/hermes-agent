@@ -399,10 +399,13 @@ def test_reference_factory_is_dormant_before_run(tmp_path) -> None:
         return threads, children, listeners, leases
 
     before = snapshot()
-    service = _BlockingService(threading.Event(), threading.Event())
-    factory = lambda _context: service
-    returned = factory(SimpleNamespace(host_kind="web", host_instance_id="test"))
+    from hermes_cli.plugin_services import BackgroundServiceContext
+    from plugins.workflow.coordinator import create_workflow_coordinator
+
+    returned = create_workflow_coordinator(
+        BackgroundServiceContext(host_kind="web", host_instance_id="test")
+    )
     after = snapshot()
 
-    assert returned is service
+    assert returned.health().code == "registered"
     assert after == before

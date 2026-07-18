@@ -106,6 +106,7 @@ def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
             "cleanup_previews",
             "coordinator_events",
             "coordinator_lease",
+            "coordinator_wakes",
             "repair_events",
             "runs",
             "store_metadata",
@@ -117,7 +118,11 @@ def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
                 "SELECT name FROM sqlite_master WHERE type='index'"
             )
         }
-        assert {"runs_concurrency", "worker_claims_lease"} <= indexes
+        assert {
+            "coordinator_wakes_pending",
+            "runs_concurrency",
+            "worker_claims_lease",
+        } <= indexes
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         migrated = dict(
             connection.execute(

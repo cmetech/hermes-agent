@@ -9,11 +9,14 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+import threading
 from typing import Iterator, Literal
 
 
 CoordinatorHostKind = Literal["web", "gateway"]
 CoordinatorHealthStatus = Literal["healthy", "standby", "unavailable", "degraded"]
+_LOCAL_WAKE_LOCK = threading.Lock()
+_LOCAL_WAKE_CONDITIONS: dict[str, threading.Condition] = {}
 
 
 def _instant(value: datetime, *, name: str) -> datetime:
@@ -105,6 +108,14 @@ class CoordinatorHealth:
     lease: CoordinatorLease | None
 
 
+@dataclass(frozen=True, slots=True)
+class CoordinatorWake:
+    generation: int
+    run_id: str
+    reason_code: str
+    created_at: datetime
+
+
 def install_coordinator_schema(connection: sqlite3.Connection) -> None:
     """Install workflow-owned coordinator tables on an existing store handle."""
     connection.executescript(
@@ -131,7 +142,40 @@ def install_coordinator_schema(connection: sqlite3.Connection) -> None:
             epoch INTEGER NOT NULL,
             payload_json TEXT NOT NULL DEFAULT '{}'
         );
+        CREATE TABLE IF NOT EXISTS coordinator_wakes (
+            generation INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            completed_epoch INTEGER,
+            outcome TEXT
+        );
+        CREATE INDEX IF NOT EXISTS coordinator_wakes_pending
+        ON coordinator_wakes(completed_at, generation);
         """
+    )
+
+
+def record_coordinator_wake(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    reason_code: str,
+    now: datetime | None = None,
+) -> int:
+    """Insert a durable wake using the caller's existing SQLite transaction."""
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("run_id must not be empty")
+    if not isinstance(reason_code, str) or not reason_code or len(reason_code) > 128:
+        raise ValueError("reason_code must be bounded non-empty text")
+    instant = _instant(now or datetime.now(timezone.utc), name="now")
+    return int(
+        connection.execute(
+            "INSERT INTO coordinator_wakes (run_id, reason_code, created_at) "
+            "VALUES (?, ?, ?)",
+            (run_id, reason_code, _encoded(instant)),
+        ).lastrowid
     )
 
 
@@ -148,6 +192,28 @@ class CoordinatorStore:
         ):
             raise ValueError("busy_timeout_seconds must be positive and finite")
         self.busy_timeout_seconds = float(busy_timeout_seconds)
+
+    def _condition(self) -> threading.Condition:
+        key = str(self.database.resolve())
+        with _LOCAL_WAKE_LOCK:
+            return _LOCAL_WAKE_CONDITIONS.setdefault(key, threading.Condition())
+
+    def notify_local(self) -> None:
+        """Wake process-local waiters; durable rows remain the authority."""
+        condition = self._condition()
+        with condition:
+            condition.notify_all()
+
+    def wait_for_local_wake(
+        self, stop_event: threading.Event, *, timeout: float
+    ) -> bool:
+        if timeout <= 0:
+            return False
+        condition = self._condition()
+        with condition:
+            if not stop_event.is_set():
+                return bool(condition.wait(timeout=timeout))
+        return False
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -417,6 +483,96 @@ class CoordinatorStore:
                 raise
         return updated == 1
 
+    def pending_wakes(
+        self,
+        identity: CoordinatorIdentity,
+        *,
+        epoch: int,
+        now: datetime,
+        limit: int = 100,
+    ) -> tuple[CoordinatorWake, ...]:
+        instant = _instant(now, name="now")
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        with self._connect() as connection:
+            owner = connection.execute(
+                "SELECT 1 FROM coordinator_lease WHERE singleton=1 "
+                "AND owner_id=? AND host_kind=? AND host_instance_id=? AND pid=? "
+                "AND process_start_time IS ? AND epoch=? AND lease_expires_at>?",
+                (
+                    identity.owner_id,
+                    identity.host_kind,
+                    identity.host_instance_id,
+                    identity.pid,
+                    identity.process_start_time,
+                    epoch,
+                    _encoded(instant),
+                ),
+            ).fetchone()
+            if owner is None:
+                return ()
+            rows = connection.execute(
+                "SELECT generation, run_id, reason_code, created_at "
+                "FROM coordinator_wakes WHERE completed_at IS NULL "
+                "ORDER BY generation LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return tuple(
+            CoordinatorWake(
+                generation=int(row["generation"]),
+                run_id=str(row["run_id"]),
+                reason_code=str(row["reason_code"]),
+                created_at=_decoded(row["created_at"]),
+            )
+            for row in rows
+        )
+
+    def complete_wake(
+        self,
+        generation: int,
+        identity: CoordinatorIdentity,
+        *,
+        epoch: int,
+        now: datetime,
+        outcome: str,
+    ) -> bool:
+        instant = _instant(now, name="now")
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            raise ValueError("generation must be an integer")
+        if not isinstance(outcome, str) or not outcome or len(outcome) > 128:
+            raise ValueError("outcome must be bounded non-empty text")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                owner = connection.execute(
+                    "SELECT 1 FROM coordinator_lease WHERE singleton=1 "
+                    "AND owner_id=? AND host_kind=? AND host_instance_id=? "
+                    "AND pid=? AND process_start_time IS ? AND epoch=? "
+                    "AND lease_expires_at>?",
+                    (
+                        identity.owner_id,
+                        identity.host_kind,
+                        identity.host_instance_id,
+                        identity.pid,
+                        identity.process_start_time,
+                        epoch,
+                        _encoded(instant),
+                    ),
+                ).fetchone()
+                updated = 0
+                if owner is not None:
+                    updated = connection.execute(
+                        "UPDATE coordinator_wakes SET completed_at=?, "
+                        "completed_epoch=?, outcome=? "
+                        "WHERE generation=? AND completed_at IS NULL",
+                        (_encoded(instant), epoch, outcome, generation),
+                    ).rowcount
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return updated == 1
+
 
 __all__ = [
     "CoordinatorAcquisition",
@@ -426,5 +582,7 @@ __all__ = [
     "CoordinatorIdentity",
     "CoordinatorLease",
     "CoordinatorStore",
+    "CoordinatorWake",
     "install_coordinator_schema",
+    "record_coordinator_wake",
 ]
