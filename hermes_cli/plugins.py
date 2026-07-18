@@ -38,18 +38,30 @@ import importlib.metadata
 import importlib.util
 import inspect
 import logging
+import math
 import os
 import sys
 import threading
+import time
 import types
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Collection, Dict, List, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
+from hermes_cli.plugin_services import (
+    BACKGROUND_SERVICE_NAME_PATTERN,
+    BackgroundServiceFactory,
+    BackgroundServiceHost,
+    BackgroundServiceHostKind,
+    BackgroundServiceRegistration,
+    BackgroundServiceReloadBlocked,
+    VALID_BACKGROUND_SERVICE_HOSTS,
+)
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -322,6 +334,7 @@ class LoadedPlugin:
     hooks_registered: List[str] = field(default_factory=list)
     middleware_registered: List[str] = field(default_factory=list)
     commands_registered: List[str] = field(default_factory=list)
+    background_services_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
     # True for a bundled platform plugin recorded as a deferred (not-yet-
@@ -395,6 +408,23 @@ class PluginContext:
             return get_active_profile_name()
         except Exception:
             return "default"
+
+    # -- host-owned background services ------------------------------------
+
+    def register_background_service(
+        self,
+        name: str,
+        factory: BackgroundServiceFactory,
+        *,
+        hosts: Collection[BackgroundServiceHostKind],
+    ) -> None:
+        """Register a dormant service factory for selected long-lived hosts."""
+        self._manager._register_background_service(
+            plugin=self.manifest.key or self.manifest.name,
+            name=name,
+            factory=factory,
+            hosts=hosts,
+        )
 
     # -- tool registration --------------------------------------------------
 
@@ -1281,6 +1311,12 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        self._background_services: Dict[str, BackgroundServiceRegistration] = {}
+        self._background_service_hosts: Set[BackgroundServiceHost] = set()
+        self._background_service_lock = threading.RLock()
+        self._background_service_generation = 0
+        self._background_reload_in_progress = False
+        self._background_reload_thread_id: int | None = None
 
     # -----------------------------------------------------------------------
     # Public
@@ -1293,24 +1329,25 @@ class PluginManager:
         changes or newly-added bundled backends become visible in long-lived
         sessions without requiring a full agent restart.
         """
-        if self._discovered and not force:
-            return
-        if env_var_enabled("HERMES_SAFE_MODE"):
-            logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
-            self._discovered = True
-            return
-        if force:
-            self._plugins.clear()
-            self._hooks.clear()
-            self._middleware.clear()
-            self._plugin_tool_names.clear()
-            self._plugin_platform_names.clear()
-            self._cli_commands.clear()
-            self._plugin_commands.clear()
-            self._plugin_skills.clear()
-            self._aux_tasks.clear()
-            self._slack_action_handlers.clear()
-            self._context_engine = None
+        with self._background_service_lock:
+            if (
+                self._background_reload_in_progress
+                and self._background_reload_thread_id != threading.get_ident()
+            ):
+                raise RuntimeError("plugin background service reload is in progress")
+            self._prune_quiescent_background_hosts_locked()
+            if force and self._background_service_hosts:
+                raise RuntimeError(
+                    "cannot force plugin discovery while a hosted generation is active"
+                )
+            if self._discovered and not force:
+                return
+            if force:
+                self._clear_plugin_registries()
+            if env_var_enabled("HERMES_SAFE_MODE"):
+                logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+                self._discovered = True
+                return
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
         # raises so a failed scan is NOT cached as "discovered with an empty
@@ -1323,6 +1360,170 @@ class PluginManager:
         except BaseException:
             self._discovered = False
             raise
+
+    def _clear_plugin_registries(self) -> None:
+        self._plugins.clear()
+        self._hooks.clear()
+        self._middleware.clear()
+        self._plugin_tool_names.clear()
+        self._plugin_platform_names.clear()
+        self._cli_commands.clear()
+        self._plugin_commands.clear()
+        self._plugin_skills.clear()
+        self._aux_tasks.clear()
+        self._slack_action_handlers.clear()
+        self._background_services.clear()
+        self._context_engine = None
+
+    def _register_background_service(
+        self,
+        *,
+        plugin: str,
+        name: str,
+        factory: BackgroundServiceFactory,
+        hosts: Collection[BackgroundServiceHostKind],
+    ) -> None:
+        if not isinstance(name, str) or not BACKGROUND_SERVICE_NAME_PATTERN.fullmatch(
+            name
+        ):
+            raise ValueError(
+                "background service name must match [a-z0-9][a-z0-9._-]*"
+            )
+        if not callable(factory):
+            raise TypeError("background service factory must be callable")
+        if isinstance(hosts, (str, bytes)):
+            raise TypeError("background service hosts must be a collection")
+        host_set = frozenset(hosts)
+        if not host_set:
+            raise ValueError("background service hosts must not be empty")
+        unknown = sorted(set(host_set) - VALID_BACKGROUND_SERVICE_HOSTS)
+        if unknown:
+            raise ValueError(
+                f"unknown background service host: {', '.join(unknown)}"
+            )
+        qualified_name = f"{plugin}:{name}"
+        with self._background_service_lock:
+            if qualified_name in self._background_services:
+                raise ValueError(
+                    f"duplicate background service registration: {qualified_name}"
+                )
+            self._background_services[qualified_name] = BackgroundServiceRegistration(
+                qualified_name=qualified_name,
+                plugin=plugin,
+                name=name,
+                factory=factory,
+                hosts=host_set,
+            )
+
+    def _background_host_quiescent(self, host: BackgroundServiceHost) -> None:
+        with self._background_service_lock:
+            self._background_service_hosts.discard(host)
+
+    def _prune_quiescent_background_hosts_locked(self) -> None:
+        self._background_service_hosts = {
+            host for host in self._background_service_hosts if not host.is_quiescent
+        }
+
+    def _make_background_host_locked(
+        self,
+        host_kind: BackgroundServiceHostKind,
+        *,
+        shutdown_timeout: float,
+    ) -> BackgroundServiceHost:
+        self._background_service_generation += 1
+        host = BackgroundServiceHost(
+            tuple(self._background_services.values()),
+            host_kind=host_kind,
+            host_instance_id=uuid.uuid4().hex,
+            generation=self._background_service_generation,
+            shutdown_timeout=shutdown_timeout,
+            safe_mode=env_var_enabled("HERMES_SAFE_MODE"),
+            on_quiescent=self._background_host_quiescent,
+        )
+        self._background_service_hosts.add(host)
+        return host
+
+    def start_background_services(
+        self,
+        host: BackgroundServiceHostKind,
+        *,
+        shutdown_timeout: float = 10.0,
+    ) -> BackgroundServiceHost:
+        """Bind and start one generic service generation for ``host``."""
+        if host not in VALID_BACKGROUND_SERVICE_HOSTS:
+            raise ValueError(f"unknown background service host: {host}")
+        with self._background_service_lock:
+            self._prune_quiescent_background_hosts_locked()
+            if self._background_reload_in_progress:
+                raise RuntimeError("background service reload is in progress")
+            bound = self._make_background_host_locked(
+                host, shutdown_timeout=shutdown_timeout
+            )
+        bound.start()
+        return bound
+
+    def reload_background_services(
+        self, *, timeout: float = 10.0
+    ) -> tuple[BackgroundServiceHost, ...]:
+        """Reload bound hosts only after every old thread is quiescent."""
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, int | float)
+            or not math.isfinite(float(timeout))
+            or timeout <= 0
+        ):
+            raise ValueError("timeout must be a positive number")
+        with self._background_service_lock:
+            if self._background_reload_in_progress:
+                raise RuntimeError(
+                    "plugin background service reload is already in progress"
+                )
+            self._prune_quiescent_background_hosts_locked()
+            old_hosts = tuple(self._background_service_hosts)
+            host_specs = tuple(
+                (host.host_kind, host.shutdown_timeout) for host in old_hosts
+            )
+            self._background_reload_in_progress = True
+            self._background_reload_thread_id = threading.get_ident()
+
+        deadline = time.monotonic() + timeout
+        for host in old_hosts:
+            host.request_stop()
+        stopped = [host.await_stopped(deadline=deadline) for host in old_hosts]
+        if not all(stopped):
+            with self._background_service_lock:
+                self._background_reload_in_progress = False
+                self._background_reload_thread_id = None
+            raise BackgroundServiceReloadBlocked(
+                "plugin background service reload blocked by stop timeout"
+            )
+
+        replacements: tuple[BackgroundServiceHost, ...] = ()
+        try:
+            with self._background_service_lock:
+                self._clear_plugin_registries()
+                self._discovered = True
+            if env_var_enabled("HERMES_SAFE_MODE"):
+                logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+            else:
+                self._discover_and_load_inner()
+            with self._background_service_lock:
+                replacements = tuple(
+                    self._make_background_host_locked(
+                        host_kind, shutdown_timeout=shutdown_timeout
+                    )
+                    for host_kind, shutdown_timeout in host_specs
+                )
+        except BaseException:
+            self._discovered = False
+            raise
+        finally:
+            with self._background_service_lock:
+                self._background_reload_in_progress = False
+                self._background_reload_thread_id = None
+        for replacement in replacements:
+            replacement.start()
+        return replacements
 
     def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
@@ -1770,6 +1971,8 @@ class PluginManager:
             f"{_NS_PARENT}.{_slug}",
             PluginContext(manifest, self)._tool_override_allowed(""),
         )
+        with self._background_service_lock:
+            _services_before = set(self._background_services)
         try:
             if manifest.source in {"user", "project", "bundled"}:
                 module = self._load_directory_module(manifest)
@@ -1818,6 +2021,10 @@ class PluginManager:
                     c for c in self._plugin_commands
                     if self._plugin_commands[c].get("plugin") == manifest.name
                 ]
+                with self._background_service_lock:
+                    loaded.background_services_registered = sorted(
+                        set(self._background_services) - _services_before
+                    )
                 loaded.enabled = True
                 logger.debug(
                     "  registered: %d tool(s), %d hook(s), %d middleware, %d slash command(s), %d CLI command(s)",
@@ -1832,6 +2039,11 @@ class PluginManager:
                 )
 
         except Exception as exc:
+            with self._background_service_lock:
+                for qualified_name in (
+                    set(self._background_services) - _services_before
+                ):
+                    self._background_services.pop(qualified_name, None)
             loaded.error = str(exc)
             logger.warning(
                 "Failed to load plugin '%s': %s",
@@ -2004,6 +2216,9 @@ class PluginManager:
                     "hooks": len(loaded.hooks_registered),
                     "middleware": len(loaded.middleware_registered),
                     "commands": len(loaded.commands_registered),
+                    "background_services": len(
+                        loaded.background_services_registered
+                    ),
                     "error": loaded.error,
                 }
             )

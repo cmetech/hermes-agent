@@ -499,3 +499,36 @@ upstream_changes:
     migrates pre-attribute checkouts to LF bytes and pins local autocrlf before
     future pulls, with equivalent semantic-tamper rejection coverage.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: plugin-background-service-lifecycle
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/plugin_services.py
+  - hermes_cli/plugins.py
+  - tests/hermes_cli/test_plugin_background_services.py
+  owned_symbols:
+  - BackgroundService
+  - BackgroundServiceContext
+  - BackgroundServiceHealth
+  - BackgroundServiceHost
+  - HostedServiceSnapshot
+  - PluginContext.register_background_service
+  - PluginManager.start_background_services
+  - PluginManager.reload_background_services
+  tests:
+  - tests/hermes_cli/test_plugin_background_services.py
+  - tests/hermes_cli/test_plugins.py
+  - tests/hermes_cli/test_safe_mode.py
+  expected_commit_subject: 'feat(plugins): host background services'
+  upstream_candidate: true
+  merge_guidance: Preserve attributed dormant factories, host filtering,
+    registration rollback, one host-owned blocking run thread, cached bounded
+    health probes, aggregate shutdown, failure isolation, safe-mode factory
+    suppression, and the no-overlap force-reload barrier. The workflow
+    coordinator is the concrete consumer; generic lifecycle code must not
+    receive workflow, agent, prompt, conversation, tool, provider, web, or
+    Gateway authority.
+  removal_condition: Remove when Hermes upstream provides an equivalent or
+    stronger generic plugin service host and the workflow coordinator has
+    migrated to it without weakening quiescence-proven reload.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
