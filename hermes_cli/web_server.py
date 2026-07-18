@@ -181,6 +181,23 @@ async def _lifespan(app: "FastAPI"):
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
 
+    # Web/Desktop is a long-lived generic plugin-service host. Discovery and
+    # host binding happen before readiness, while each plugin factory and
+    # blocking run call stays isolated in its host-owned supervisor thread.
+    # No workflow module or service-specific state crosses this boundary.
+    plugin_service_host = None
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        plugin_manager = get_plugin_manager()
+        plugin_manager.discover_and_load()
+        plugin_service_host = plugin_manager.start_background_services("web")
+    except Exception:
+        _log.exception(
+            "Plugin background services failed to bind; web startup continues"
+        )
+    app.state.plugin_background_services = plugin_service_host
+
     # Fire hermes_cli.gateway import into a background thread so the event
     # loop is not blocked and HERMES_DASHBOARD_READY fires without delay.
     # On a cold Windows install the module chain triggers .pyc compilation
@@ -210,6 +227,12 @@ async def _lifespan(app: "FastAPI"):
     try:
         yield
     finally:
+        if plugin_service_host is not None:
+            stopped = await asyncio.to_thread(plugin_service_host.shutdown)
+            if not stopped:
+                _log.error(
+                    "Plugin background services exceeded the web shutdown deadline"
+                )
         pty_reaper_task.cancel()
         await PTY_REGISTRY.close_all()
         if cron_stop is not None:

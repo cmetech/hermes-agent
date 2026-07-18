@@ -532,3 +532,26 @@ upstream_changes:
     stronger generic plugin service host and the workflow coordinator has
     migrated to it without weakening quiescence-proven reload.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: web-plugin-background-service-host
+  change_class: product-surface-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/web_server.py
+  - tests/hermes_cli/test_web_server_plugin_services.py
+  owned_symbols:
+  - _lifespan plugin background service boundary
+  - app.state.plugin_background_services
+  tests:
+  - tests/hermes_cli/test_web_server_plugin_services.py
+  - tests/hermes_cli/test_web_server_boot_handshake.py
+  expected_commit_subject: 'feat(web): host plugin background services'
+  upstream_candidate: true
+  merge_guidance: Preserve generic plugin discovery and web-host binding before
+    FastAPI readiness, process-local cached lifecycle inspection on app.state,
+    failure isolation from HTTP readiness, and bounded service shutdown before
+    PTY and cron resource teardown. Do not add workflow imports or expose local
+    service health as cross-process workflow authority.
+  removal_condition: Remove when Hermes upstream binds an equivalent generic
+    plugin service host in both dashboard and headless-serve FastAPI lifespan
+    with the same failure and shutdown ordering.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
