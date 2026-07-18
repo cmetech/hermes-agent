@@ -483,15 +483,16 @@ upstream_changes:
   tests:
   - tests/hermes_cli/test_baked_seed.py
   - tests/plugins/workflow/test_showcase_catalog.py
-  expected_commit_subject: 'fix(workflow): repair legacy Windows resource bytes'
+  expected_commit_subject: 'fix(workflow): materialize authenticated bytes out of place'
   upstream_candidate: true
   merge_guidance: Preserve fail-closed byte authentication while recovering only
     tracked CRLF working-tree drift that has no semantic diff from HEAD. Keep
     checkout repair bounded to the exact distribution resource tree; when a
-    successful Git-for-Windows path checkout leaves CRLF bytes intact, force
-    materialization only of that tree's verified tracked index entries. Rerun
-    the original digest verification after repair, and never normalize or
-    accept arbitrary bytes in memory.
+    successful Git-for-Windows in-place checkout leaves CRLF bytes intact,
+    materialize only that tree's verified tracked index entries under a
+    same-volume temporary prefix, validate every output, and atomically replace
+    the corresponding tracked files. Rerun the original digest verification
+    after repair, and never normalize or accept arbitrary bytes in memory.
   removal_condition: Remove when every supported managed Windows updater both
     migrates pre-attribute checkouts to LF bytes and pins local autocrlf before
     future pulls, with equivalent semantic-tamper rejection coverage.
