@@ -1,0 +1,6 @@
+name: migration-fixture
+version: '1'
+description: Pre-amendment migration fixture
+nodes:
+  - id: start
+    bash: "printf 'legacy-evidence\n'"

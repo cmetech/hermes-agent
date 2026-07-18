@@ -280,6 +280,7 @@ def test_cancelled_paused_loop_releases_capacity_without_spawning(
         )
 
 
+@pytest.mark.live_system_guard_bypass
 def test_cancel_running_script_reaps_its_spawned_descendant(
     tmp_path: Path, workflow_writer
 ) -> None:

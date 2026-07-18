@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import hashlib
 import json
 
 import pytest
@@ -10,6 +11,20 @@ from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import JournalRecoveryError, RunStore
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
+
+
+def _reframe(event: dict[str, object]) -> dict[str, object]:
+    material = dict(event)
+    material.pop("frame_sha256", None)
+    event["frame_sha256"] = hashlib.sha256(
+        json.dumps(
+            material,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return event
 
 
 def _run(store, package, *, idempotency_key="crash"):
@@ -352,7 +367,7 @@ def test_journal_gap_blocks_repair_and_preserves_diagnostics(tmp_path, workflow_
         json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()
     ]
     events[0]["sequence"] = 2
-    (run_dir / "events.jsonl").write_text(json.dumps(events[0]) + "\n")
+    (run_dir / "events.jsonl").write_text(json.dumps(_reframe(events[0])) + "\n")
     (run_dir / "run.json").write_text("not-json")
 
     with pytest.raises(JournalRecoveryError, match="sequence gap"):
@@ -367,7 +382,7 @@ def test_journal_digest_mismatch_blocks_repair(tmp_path, workflow_writer):
     run_dir = store.run_directory(admitted.run_id)
     event = json.loads((run_dir / "events.jsonl").read_text())
     event["projection_sha256"] = "0" * 64
-    (run_dir / "events.jsonl").write_text(json.dumps(event) + "\n")
+    (run_dir / "events.jsonl").write_text(json.dumps(_reframe(event)) + "\n")
     (run_dir / "run.json").write_text("not-json")
 
     with pytest.raises(JournalRecoveryError, match="digest mismatch"):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -18,6 +19,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Mapping
+
+import yaml
 
 from plugins.workflow.admission import (
     PreparedRunSnapshot,
@@ -71,6 +74,7 @@ class ArtifactRef:
 
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
+_STORE_SCHEMA_VERSION = 2
 _PROJECTION_STATUSES = {
     "queued",
     "running",
@@ -116,6 +120,26 @@ def _projection_digest(projection: Mapping[str, object]) -> str:
     return _sha256(encoded)
 
 
+def _journal_frame_digest(event: Mapping[str, object]) -> str:
+    material = dict(event)
+    material.pop("frame_sha256", None)
+    encoded = json.dumps(
+        material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return _sha256(encoded)
+
+
+def _encode_journal_frame(event: Mapping[str, object]) -> tuple[dict[str, object], bytes]:
+    framed = dict(event)
+    framed["schema_version"] = 2
+    framed["frame_version"] = 1
+    framed["frame_sha256"] = _journal_frame_digest(framed)
+    encoded = json.dumps(
+        framed, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8") + b"\n"
+    return framed, encoded
+
+
 def _recovery_fields(projection: Mapping[str, object]) -> dict[str, object]:
     snapshot = json.loads(json.dumps(projection, sort_keys=True, ensure_ascii=False))
     return {
@@ -150,22 +174,63 @@ def _sanitize_diagnostic(value: str | None) -> str | None:
     return _SECRET_DIAGNOSTIC.sub("[REDACTED]", value)[:2000]
 
 
-def _atomic_json(path: Path, value: object) -> None:
+def _fsync_directory(directory: Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _replace_with_retry(source: str | Path, target: str | Path) -> None:
+    for attempt in range(5):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.01 * (2**attempt))
+
+
+def _durable_replace(source: str | Path, target: str | Path) -> None:
+    source_path = Path(source)
+    target_path = Path(target)
+    _replace_with_retry(source_path, target_path)
+    _fsync_directory(target_path.parent)
+    if source_path.parent != target_path.parent:
+        _fsync_directory(source_path.parent)
+
+
+def _atomic_bytes(path: Path, value: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, sort_keys=True, ensure_ascii=False, indent=2)
-            handle.write("\n")
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        _durable_replace(temporary, path)
     except BaseException:
         try:
             os.unlink(temporary)
         except OSError:
             pass
         raise
+
+
+def _atomic_json(path: Path, value: object) -> None:
+    encoded = json.dumps(
+        value, sort_keys=True, ensure_ascii=False, indent=2
+    ).encode("utf-8") + b"\n"
+    _atomic_bytes(path, encoded)
 
 
 def _atomic_text(path: Path, value: str) -> None:
@@ -176,13 +241,22 @@ def _atomic_text(path: Path, value: str) -> None:
             handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        _durable_replace(temporary, path)
     except BaseException:
         try:
             os.unlink(temporary)
         except OSError:
             pass
         raise
+
+
+def _file_ends_with_newline(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(-1, os.SEEK_END)
+            return handle.read(1) == b"\n"
+    except OSError:
+        return False
 
 
 class RunStore:
@@ -278,6 +352,13 @@ class RunStore:
 
     def _create_or_migrate_schema(self) -> None:
         with self._connect() as connection:
+            schema_version = int(
+                connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            if schema_version > _STORE_SCHEMA_VERSION:
+                raise sqlite3.DatabaseError(
+                    "admission index schema is newer than this runtime"
+                )
             connection.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS runs (
@@ -299,6 +380,12 @@ class RunStore:
                         desired_status TEXT,
                         staging_directory TEXT,
                         operator_scope_digest TEXT,
+                        projection_schema_version INTEGER NOT NULL DEFAULT 1,
+                        projection_state_version INTEGER,
+                        projection_sha256 TEXT,
+                        journal_sequence INTEGER,
+                        journal_sha256 TEXT,
+                        integrity_verified_at TEXT,
                         UNIQUE(trigger_source, workflow_name, idempotency_digest)
                     );
                     CREATE INDEX IF NOT EXISTS runs_concurrency
@@ -376,6 +463,25 @@ class RunStore:
                     "operator_scope_digest": (
                         "ALTER TABLE runs ADD COLUMN operator_scope_digest TEXT"
                     ),
+                    "projection_schema_version": (
+                        "ALTER TABLE runs ADD COLUMN projection_schema_version "
+                        "INTEGER NOT NULL DEFAULT 1"
+                    ),
+                    "projection_state_version": (
+                        "ALTER TABLE runs ADD COLUMN projection_state_version INTEGER"
+                    ),
+                    "projection_sha256": (
+                        "ALTER TABLE runs ADD COLUMN projection_sha256 TEXT"
+                    ),
+                    "journal_sequence": (
+                        "ALTER TABLE runs ADD COLUMN journal_sequence INTEGER"
+                    ),
+                    "journal_sha256": (
+                        "ALTER TABLE runs ADD COLUMN journal_sha256 TEXT"
+                    ),
+                    "integrity_verified_at": (
+                        "ALTER TABLE runs ADD COLUMN integrity_verified_at TEXT"
+                    ),
             }
             for name, statement in migrations.items():
                 if name not in columns:
@@ -402,12 +508,19 @@ class RunStore:
                 "desired_status",
                 "staging_directory",
                 "operator_scope_digest",
+                "projection_schema_version",
+                "projection_state_version",
+                "projection_sha256",
+                "journal_sequence",
+                "journal_sha256",
+                "integrity_verified_at",
             }
             if not required_columns <= columns:
                 missing = ", ".join(sorted(required_columns - columns))
                 raise sqlite3.DatabaseError(
                     f"admission index schema is incomplete: {missing}"
                 )
+            connection.execute(f"PRAGMA user_version={_STORE_SCHEMA_VERSION}")
 
     def _preserve_damaged_index(self) -> None:
         preserved_root = self.quarantine_root / f"admission-index-{uuid.uuid4().hex}"
@@ -415,7 +528,7 @@ class RunStore:
         for suffix in ("", "-wal", "-shm"):
             source = Path(f"{self.database}{suffix}")
             if source.exists():
-                os.replace(source, preserved_root / source.name)
+                _durable_replace(source, preserved_root / source.name)
 
     def _establish_index_generation(
         self,
@@ -573,19 +686,86 @@ class RunStore:
     def _corroborate_run_evidence(
         self, directory: Path, *, run_id: str
     ) -> tuple[dict[str, object], str | None, str | None]:
+        with workflow_lock(self._run_lock_path(run_id)):
+            return self._corroborate_run_evidence_locked(
+                directory, run_id=run_id
+            )
+
+    def _corroborate_run_evidence_locked(
+        self, directory: Path, *, run_id: str
+    ) -> tuple[dict[str, object], str | None, str | None]:
         projection_path = directory / "run.json"
         journal_path = directory / "events.jsonl"
         projection_bytes = projection_path.read_bytes()
-        journal_bytes = journal_path.read_bytes()
-        projection_sha256 = _sha256(projection_bytes)
-        journal_sha256 = _sha256(journal_bytes)
         projection = json.loads(projection_bytes)
         if not self._valid_projection(projection, run_id=run_id):
             raise JournalRecoveryError("run projection is not valid")
         rebuilt = self._rebuild_projection(directory, run_id=run_id)
         if _projection_digest(projection) != _projection_digest(rebuilt):
             raise JournalRecoveryError("run projection does not match journal head")
+        journal_bytes = journal_path.read_bytes()
+        projection_sha256 = _sha256(projection_bytes)
+        journal_sha256 = _sha256(journal_bytes)
         return projection, projection_sha256, journal_sha256
+
+    @staticmethod
+    def _sync_integrity_index(
+        connection: sqlite3.Connection,
+        *,
+        projection: Mapping[str, object],
+        journal_sha256: str,
+    ) -> None:
+        connection.execute(
+            "UPDATE runs SET projection_schema_version=?, "
+            "projection_state_version=?, projection_sha256=?, "
+            "journal_sequence=?, journal_sha256=?, integrity_verified_at=? "
+            "WHERE run_id=?",
+            (
+                int(projection.get("schema_version", 1)),
+                int(projection["state_version"]),
+                _projection_digest(projection),
+                int(projection["event_sequence"]),
+                journal_sha256,
+                _utc_now(),
+                projection["run_id"],
+            ),
+        )
+
+    def _sync_loaded_integrity(
+        self, directory: Path, projection: Mapping[str, object]
+    ) -> None:
+        journal_sha256 = _sha256((directory / "events.jsonl").read_bytes())
+        expected = (
+            int(projection.get("schema_version", 1)),
+            int(projection["state_version"]),
+            _projection_digest(projection),
+            int(projection["event_sequence"]),
+            journal_sha256,
+        )
+        with self._connect() as connection:
+            current = connection.execute(
+                "SELECT projection_schema_version, projection_state_version, "
+                "projection_sha256, journal_sequence, journal_sha256 "
+                "FROM runs WHERE run_id=?",
+                (projection["run_id"],),
+            ).fetchone()
+        if current is not None and tuple(current) == expected:
+            return
+        try:
+            corroborated, _, journal_sha256 = self._corroborate_run_evidence_locked(
+                directory, run_id=str(projection["run_id"])
+            )
+        except (JournalRecoveryError, OSError, ValueError, json.JSONDecodeError):
+            self._mark_repair_required(
+                "run_evidence_uncorroborated", run_id=str(projection["run_id"])
+            )
+            raise
+        with self._connect() as connection:
+            self._sync_integrity_index(
+                connection,
+                projection=corroborated,
+                journal_sha256=journal_sha256,
+            )
 
     @staticmethod
     def _start_digest_from_projection(projection: Mapping[str, object]) -> str:
@@ -662,7 +842,7 @@ class RunStore:
 
     def _quarantine_evidence(self, source: Path, *, prefix: str) -> Path:
         preserved = self.quarantine_root / f"{prefix}-{uuid.uuid4().hex}"
-        os.replace(source, preserved)
+        _durable_replace(source, preserved)
         return preserved
 
     def _reconcile_admission(self) -> None:
@@ -680,8 +860,10 @@ class RunStore:
             for row in reservations:
                 run_directory = Path(row["run_directory"])
                 try:
-                    projection, _, _ = self._corroborate_run_evidence(
-                        run_directory, run_id=row["run_id"]
+                    projection, _projection_hash, journal_hash = (
+                        self._corroborate_run_evidence(
+                            run_directory, run_id=row["run_id"]
+                        )
                     )
                 except (OSError, ValueError, json.JSONDecodeError, JournalRecoveryError):
                     projection = None
@@ -692,6 +874,11 @@ class RunStore:
                         "desired_status=NULL, staging_directory=NULL, updated_at=? "
                         "WHERE run_id=? AND admission_state='reserved'",
                         (desired_status, _utc_now(), row["run_id"]),
+                    )
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=journal_hash,
                     )
                     self._record_admission_event(
                         connection,
@@ -767,6 +954,11 @@ class RunStore:
                         projection_sha256=projection_hash,
                         journal_sha256=journal_hash,
                     )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=journal_hash,
+                )
 
             for workflow_directory in self.runs_root.iterdir():
                 if not workflow_directory.is_dir():
@@ -787,6 +979,11 @@ class RunStore:
                             connection,
                             directory=run_directory,
                             projection=projection,
+                        )
+                        self._sync_integrity_index(
+                            connection,
+                            projection=projection,
+                            journal_sha256=journal_hash,
                         )
                     except (
                         OSError,
@@ -939,6 +1136,8 @@ class RunStore:
             unresolved = {
                 "orphan_evidence_uncorroborated",
                 "published_evidence_uncorroborated",
+                "run_evidence_uncorroborated",
+                "legacy_effect_policy_uncorroborated",
                 "repair_marker_unreadable",
             }
             if isinstance(reasons, list) and any(
@@ -957,13 +1156,18 @@ class RunStore:
                 indexed_directories = set()
                 for row in rows:
                     directory = Path(row["run_directory"])
-                    projection, _, _ = self._corroborate_run_evidence(
+                    projection, _, journal_sha256 = self._corroborate_run_evidence(
                         directory, run_id=row["run_id"]
                     )
                     if projection["status"] != row["status"]:
                         raise JournalRecoveryError(
                             f"admission status remains inconsistent: {row['run_id']}"
                         )
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=journal_sha256,
+                    )
                     indexed_directories.add(str(directory.resolve()))
                 evidence_directories = {
                     str(run.resolve())
@@ -1571,6 +1775,7 @@ class RunStore:
                 created_at=now,
             )
             self._mark_reservation_published(run_id, status=status)
+            self.load_run(run_id)
             return RunAdmissionResult(
                 run_id, disposition, None, queue_position, blocked_by
             )
@@ -1596,11 +1801,11 @@ class RunStore:
         created_at: str,
     ) -> None:
         (snapshot.staging_directory / ".snapshot-owner.json").unlink(missing_ok=True)
-        os.replace(snapshot.staging_directory, run_directory)
+        _durable_replace(snapshot.staging_directory, run_directory)
         (run_directory / ".lock").touch(exist_ok=True)
         now = created_at
         projection = {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": run_id,
             "workflow": request.workflow_name,
             "workflow_version": snapshot.workflow_version,
@@ -1631,7 +1836,6 @@ class RunStore:
             "pending_interaction": None,
         }
         event = {
-            "schema_version": 1,
             "sequence": 1,
             "timestamp": now,
             "run_id": run_id,
@@ -1641,11 +1845,9 @@ class RunStore:
             "payload": {"disposition": disposition, "status": status},
             **_recovery_fields(projection),
         }
+        _, encoded_event = _encode_journal_frame(event)
         _atomic_json(run_directory / "run.json", projection)
-        with (run_directory / "events.jsonl").open("w", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        _atomic_bytes(run_directory / "events.jsonl", encoded_event)
 
     def _mark_reservation_published(self, run_id: str, *, status: str) -> None:
         with self._connect() as connection:
@@ -1679,6 +1881,114 @@ class RunStore:
     def _run_lock_path(self, run_id: str) -> Path:
         return self.locks_root / f"{run_id}.lock"
 
+    @staticmethod
+    def _validate_journal_frame(event: object, *, line_number: int) -> None:
+        if not isinstance(event, dict):
+            raise JournalRecoveryError(
+                f"journal event at line {line_number} is not an object"
+            )
+        frame_version = event.get("frame_version")
+        if frame_version is None:
+            if event.get("schema_version") != 1:
+                raise JournalRecoveryError(
+                    f"unsupported journal schema at line {line_number}"
+                )
+            return
+        if frame_version != 1 or event.get("schema_version") != 2:
+            raise JournalRecoveryError(
+                f"unsupported journal frame at line {line_number}"
+            )
+        checksum = event.get("frame_sha256")
+        if not isinstance(checksum, str) or len(checksum) != 64:
+            raise JournalRecoveryError(
+                f"journal frame checksum missing at line {line_number}"
+            )
+        if not hmac.compare_digest(checksum, _journal_frame_digest(event)):
+            raise JournalRecoveryError(
+                f"journal frame checksum mismatch at line {line_number}"
+            )
+
+    def _read_journal_events(
+        self,
+        directory: Path,
+        *,
+        recover_torn_tail: bool = True,
+    ) -> list[dict[str, object]]:
+        journal_path = directory / "events.jsonl"
+        try:
+            data = journal_path.read_bytes()
+        except OSError as exc:
+            raise JournalRecoveryError(f"journal unavailable: {exc}") from exc
+        raw_frames = data.splitlines(keepends=True)
+        events: list[dict[str, object]] = []
+        offset = 0
+        for index, raw_frame in enumerate(raw_frames):
+            line_number = index + 1
+            complete = raw_frame.endswith(b"\n")
+            content = raw_frame[:-1] if complete else raw_frame
+            if not content.strip():
+                offset += len(raw_frame)
+                continue
+            try:
+                event = json.loads(content.decode("utf-8"))
+                self._validate_journal_frame(event, line_number=line_number)
+            except (UnicodeDecodeError, json.JSONDecodeError, JournalRecoveryError) as exc:
+                is_torn_tail = index == len(raw_frames) - 1 and not complete
+                if recover_torn_tail and is_torn_tail and events:
+                    preserved = directory / (
+                        f"events.jsonl.torn-{uuid.uuid4().hex}"
+                    )
+                    _atomic_bytes(preserved, data[offset:])
+                    _atomic_bytes(journal_path, data[:offset])
+                    return events
+                if isinstance(exc, JournalRecoveryError):
+                    raise
+                raise JournalRecoveryError(
+                    f"malformed journal event at line {line_number}"
+                ) from exc
+            events.append(event)
+            offset += len(raw_frame)
+        if events and data and not data.endswith(b"\n"):
+            _atomic_bytes(journal_path, data + b"\n")
+        return events
+
+    def _read_journal_tail_event(self, directory: Path) -> dict[str, object]:
+        journal_path = directory / "events.jsonl"
+        try:
+            data = journal_path.read_bytes()
+        except OSError as exc:
+            raise JournalRecoveryError(f"journal unavailable: {exc}") from exc
+        populated: list[tuple[int, int, bytes]] = []
+        offset = 0
+        for line_number, raw_frame in enumerate(
+            data.splitlines(keepends=True), 1
+        ):
+            if raw_frame.rstrip(b"\r\n").strip():
+                populated.append((line_number, offset, raw_frame))
+            offset += len(raw_frame)
+        if not populated:
+            raise JournalRecoveryError("journal contains no events")
+        line_number, frame_offset, raw_frame = populated[-1]
+        complete = raw_frame.endswith(b"\n")
+        content = raw_frame[:-1] if complete else raw_frame
+        try:
+            event = json.loads(content.decode("utf-8"))
+            self._validate_journal_frame(event, line_number=line_number)
+        except (UnicodeDecodeError, json.JSONDecodeError, JournalRecoveryError) as exc:
+            if not complete and len(populated) > 1:
+                preserved = directory / f"events.jsonl.torn-{uuid.uuid4().hex}"
+                _atomic_bytes(preserved, data[frame_offset:])
+                _atomic_bytes(journal_path, data[:frame_offset])
+                return self._read_journal_tail_event(directory)
+            if isinstance(exc, JournalRecoveryError):
+                raise
+            raise JournalRecoveryError(
+                f"malformed journal event at line {line_number}"
+            ) from exc
+        if not complete:
+            _atomic_bytes(journal_path, data + b"\n")
+        return event
+
     def load_run(
         self, run_id: str, *, operator_scope: str | None = None
     ) -> dict[str, object]:
@@ -1698,20 +2008,40 @@ class RunStore:
             except (json.JSONDecodeError, OSError):
                 projection = None
             if self._valid_projection(projection, run_id=run_id):
-                journal_current = self._journal_matches_projection(
-                    directory, projection=projection, run_id=run_id
-                )
+                try:
+                    journal_current = self._journal_matches_projection(
+                        directory, projection=projection, run_id=run_id
+                    )
+                except (JournalRecoveryError, OSError):
+                    self._mark_repair_required(
+                        "run_evidence_uncorroborated", run_id=run_id
+                    )
+                    raise
                 if journal_current:
+                    self._sync_loaded_integrity(directory, projection)
                     return projection
             if path.exists():
                 quarantine = directory / f"run.json.corrupt-{uuid.uuid4().hex}"
-                os.replace(path, quarantine)
-            rebuilt = self._rebuild_projection(directory, run_id=run_id)
+                _durable_replace(path, quarantine)
+            try:
+                rebuilt = self._rebuild_projection(directory, run_id=run_id)
+            except (JournalRecoveryError, OSError, ValueError, json.JSONDecodeError):
+                self._mark_repair_required(
+                    "run_evidence_uncorroborated", run_id=run_id
+                )
+                raise
             _atomic_json(path, rebuilt)
             with self._connect() as connection:
                 connection.execute(
                     "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
                     (rebuilt["status"], rebuilt["updated_at"], run_id),
+                )
+                self._sync_integrity_index(
+                    connection,
+                    projection=rebuilt,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
                 )
             return rebuilt
 
@@ -1723,24 +2053,7 @@ class RunStore:
         run_id: str,
     ) -> bool:
         """Validate the durable journal head without replaying on every read."""
-        try:
-            lines = (
-                (directory / "events.jsonl").read_text(encoding="utf-8").splitlines()
-            )
-        except OSError as exc:
-            raise JournalRecoveryError(f"journal unavailable: {exc}") from exc
-        populated = [
-            (number, line) for number, line in enumerate(lines, 1) if line.strip()
-        ]
-        if not populated:
-            raise JournalRecoveryError("journal contains no events")
-        line_number, line = populated[-1]
-        try:
-            latest = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise JournalRecoveryError(
-                f"malformed journal event at line {line_number}"
-            ) from exc
+        latest = self._read_journal_tail_event(directory)
         if latest.get("run_id") != run_id:
             raise JournalRecoveryError("journal run identity mismatch")
         if latest["sequence"] < projection["event_sequence"]:
@@ -1760,6 +2073,8 @@ class RunStore:
     @staticmethod
     def _valid_projection(value: object, *, run_id: str) -> bool:
         if not isinstance(value, dict) or value.get("run_id") != run_id:
+            return False
+        if value.get("schema_version") not in {1, 2}:
             return False
         if value.get("status") not in _PROJECTION_STATUSES:
             return False
@@ -1799,21 +2114,8 @@ class RunStore:
     def _rebuild_projection(self, directory: Path, *, run_id: str) -> dict[str, object]:
         latest = None
         expected_sequence = 1
-        try:
-            lines = (
-                (directory / "events.jsonl").read_text(encoding="utf-8").splitlines()
-            )
-        except OSError as exc:
-            raise JournalRecoveryError(f"journal unavailable: {exc}") from exc
-        for line_number, line in enumerate(lines, 1):
-            if not line.strip():
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise JournalRecoveryError(
-                    f"malformed journal event at line {line_number}"
-                ) from exc
+        events = self._read_journal_events(directory)
+        for event in events:
             if event.get("sequence") != expected_sequence:
                 raise JournalRecoveryError(
                     f"journal sequence gap: expected {expected_sequence}, "
@@ -1944,11 +2246,7 @@ class RunStore:
             raise ValueError("limit must be between 1 and 200")
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         with workflow_lock(self._run_lock_path(run_id)):
-            events = [
-                json.loads(line)
-                for line in (directory / "events.jsonl").read_text().splitlines()
-                if line.strip()
-            ]
+            events = self._read_journal_events(directory)
         selected = tuple(
             event for event in events if int(event["sequence"]) > after_sequence
         )[:limit]
@@ -1992,27 +2290,66 @@ class RunStore:
     ) -> tuple[dict[str, object], ...]:
         if not 1 <= limit <= 200:
             raise ValueError("limit must be between 1 and 200")
+        storage_degraded = self.storage_health()["status"] != "healthy"
         clauses = ["admission_state='published'"]
         values: list[object] = []
         if workflow:
             clauses.append("workflow_name=?")
             values.append(workflow)
-        if status:
+        if status and not storage_degraded:
             clauses.append("status=?")
             values.append(status)
         if operator_scope is not None:
             clauses.append("operator_scope_digest=?")
             values.append(self._scope_digest(operator_scope))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        query_limit = 200 if storage_degraded else limit
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT run_id FROM runs{where} ORDER BY created_at DESC, run_id DESC LIMIT ?",
-                (*values, limit),
+                "SELECT run_id, workflow_name, status, updated_at FROM runs"
+                f"{where} ORDER BY created_at DESC, run_id DESC LIMIT ?",
+                (*values, query_limit),
             ).fetchall()
-        return tuple(
-            self.get_run_status(row["run_id"], operator_scope=operator_scope)
-            for row in rows
-        )
+        results = []
+        for row in rows:
+            try:
+                result = self.get_run_status(
+                    row["run_id"], operator_scope=operator_scope
+                )
+            except (
+                JournalRecoveryError,
+                OSError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                self._mark_repair_required(
+                    "run_evidence_uncorroborated", run_id=row["run_id"]
+                )
+                result = {
+                    "schema_version": 1,
+                    "action": "status",
+                    "run_id": row["run_id"],
+                    "workflow": row["workflow_name"],
+                    "status": row["status"],
+                    "status_authoritative": False,
+                    "health": "storage_degraded",
+                    "updated_at": row["updated_at"],
+                    "blocking_reason": "storage_repair_required",
+                    "next_actions": [],
+                    "warnings": ["run_evidence_uncorroborated"],
+                }
+            if (
+                status
+                and result["health"] != "storage_degraded"
+                and result["status"] != status
+            ):
+                continue
+            if storage_degraded:
+                result = {**result, "store_health": "repair_required"}
+            results.append(result)
+            if len(results) >= limit:
+                break
+        return tuple(results)
 
     def get_run_status(
         self, run_id: str, *, operator_scope: str | None = None
@@ -2078,6 +2415,42 @@ class RunStore:
             "pending_interaction": pending_interaction,
             "next_actions": self._next_actions(status, pending_interaction),
         }
+
+    def node_effect_classification(
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        projection: Mapping[str, object] | None = None,
+    ) -> str:
+        """Return digest-corroborated effect policy for new and legacy runs."""
+        run = projection or self.load_run(run_id)
+        persisted = run.get("outward_action_nodes")
+        if isinstance(persisted, list):
+            return "outward" if node_id in persisted else "replay_safe"
+        directory = self.run_directory(run_id)
+        policy_path = directory / "policy.yaml"
+        try:
+            policy_bytes = policy_path.read_bytes()
+            expected_digest = str(run["policy_digest"])
+            if not hmac.compare_digest(_sha256(policy_bytes), expected_digest):
+                raise JournalRecoveryError("legacy workflow policy digest mismatch")
+            document = yaml.safe_load(policy_bytes) or {}
+            if not isinstance(document, Mapping):
+                raise JournalRecoveryError("legacy workflow policy is malformed")
+            outward = document.get("outward_action_nodes", [])
+            if not isinstance(outward, list) or any(
+                not isinstance(candidate, str) for candidate in outward
+            ):
+                raise JournalRecoveryError(
+                    "legacy outward-action policy is malformed"
+                )
+        except (OSError, KeyError, yaml.YAMLError, JournalRecoveryError):
+            self._mark_repair_required(
+                "legacy_effect_policy_uncorroborated", run_id=run_id
+            )
+            raise
+        return "outward" if node_id in outward else "replay_safe"
 
     @staticmethod
     def _next_actions(
@@ -2655,7 +3028,6 @@ class RunStore:
                 json.dumps(projection, sort_keys=True, ensure_ascii=False)
             )
         event = {
-            "schema_version": 1,
             "sequence": sequence,
             "timestamp": now,
             "run_id": projection["run_id"],
@@ -2665,14 +3037,16 @@ class RunStore:
             "payload": _sanitize(dict(payload or {})),
             **recovery,
         }
-        encoded = json.dumps(event, sort_keys=True) + "\n"
+        event, encoded = _encode_journal_frame(event)
         journal_path = directory / "events.jsonl"
+        if journal_path.stat().st_size and not _file_ends_with_newline(journal_path):
+            self._read_journal_events(directory)
         if (
-            journal_path.stat().st_size + len(encoded.encode("utf-8"))
+            journal_path.stat().st_size + len(encoded)
             > self.max_journal_bytes
         ):
             raise StorageQuotaError("event_journal_quota exceeded")
-        with journal_path.open("a", encoding="utf-8") as handle:
+        with journal_path.open("ab") as handle:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
@@ -4468,7 +4842,7 @@ class RunStore:
                 for candidate in candidates:
                     source = Path(candidate["run_directory"])
                     destination = quarantine_root / str(candidate["run_id"])
-                    os.replace(source, destination)
+                    _durable_replace(source, destination)
                     moved.append((candidate, destination))
                 connection = self._connect()
                 try:

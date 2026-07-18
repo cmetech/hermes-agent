@@ -730,11 +730,10 @@ class RunScheduler:
                             ),
                             executor_id=by_id[node_id].node_type,
                             owner_epoch=self.owner_id,
-                            effect_classification=(
-                                "outward"
-                                if node_id
-                                in set(projection.get("outward_action_nodes", ()))
-                                else "replay_safe"
+                            effect_classification=self.store.node_effect_classification(
+                                run_id,
+                                node_id,
+                                projection=projection,
                             ),
                         )
                     except StorageQuotaError as exc:
@@ -854,15 +853,10 @@ class RunScheduler:
                                     if node.id == node_id
                                 ),
                                 owner_epoch=self.owner_id,
-                                effect_classification=(
-                                    "outward"
-                                    if node_id
-                                    in set(
-                                        snapshots[run_id].get(
-                                            "outward_action_nodes", ()
-                                        )
-                                    )
-                                    else "replay_safe"
+                                effect_classification=self.store.node_effect_classification(
+                                    run_id,
+                                    node_id,
+                                    projection=snapshots[run_id],
                                 ),
                             )
                         except StorageQuotaError as exc:
