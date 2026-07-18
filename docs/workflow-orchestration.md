@@ -38,6 +38,8 @@ Trust belongs to the active profile and exact executable-resource digest. Editin
 
 Distribution-owned workflow packages and showcase bundles are authenticated byte-for-byte. Their repository paths are pinned to LF in `.gitattributes`, and the managed Windows installer disables `core.autocrlf` before the initial checkout. Preserve both controls: checkout-time CRLF conversion changes the authenticated bytes and intentionally makes capability staging fail closed.
 
+Existing managed Git-for-Windows installs created before those controls may retain CRLF bytes for unchanged authenticated resources after an update. On a digest mismatch, Hermes repairs only a tracked resource tree whose working copy contains CRLF and whose content has no semantic difference from `HEAD` when end-of-line whitespace is ignored, then reruns the original byte-for-byte verification. The repair also pins the managed checkout's local `core.autocrlf=false`. A real edit, untracked package content, non-Git install, or failed checkout is never accepted by this recovery path and continues to fail closed.
+
 Capability startup isolates that package-authentication failure from independent
 configuration migrations. An invalid package is never published or trusted, but
 the bundled workflow plugin activation and missing MCP defaults are still seeded.

@@ -32,6 +32,11 @@ STAGING_SCHEMA_VERSION = 1
 CACHE_SUBDIR = Path("capabilities") / "src"
 GIT_CLONE_TIMEOUT = 60
 GIT_PULL_TIMEOUT = 30
+GIT_REPAIR_TIMEOUT = 15
+_AUTHENTICATED_RESOURCE_ROOTS = (
+    Path("capabilities/workflow-packages"),
+    Path("plugins/workflow/showcases"),
+)
 
 
 def _valid_bundle(path: Path, set_name: str) -> bool:
@@ -46,6 +51,109 @@ def _no_prompt_env() -> dict:
     failing fast.
     """
     return {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+
+
+def repair_authenticated_resource_checkout(resource_root: Path | str) -> bool:
+    """Restore legacy CRLF-only drift in a distribution-owned Git resource tree.
+
+    Older managed Git-for-Windows checkouts can retain CRLF working-tree bytes
+    after LF attributes are added because unchanged paths are not rewritten by
+    a later pull. Repair is deliberately narrow: the tree must be tracked by
+    the current repository, contain CRLF working-tree files, and have no
+    semantic diff from ``HEAD`` when end-of-line whitespace is ignored. Any
+    actual edit, untracked content, Git failure, or non-checkout install remains
+    untouched so the caller's digest verification still fails closed.
+    """
+    try:
+        resource = Path(resource_root).resolve(strict=True)
+        discovered = subprocess.run(
+            ["git", "-C", str(resource), "rev-parse", "--show-toplevel"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=GIT_REPAIR_TIMEOUT,
+            env=_no_prompt_env(),
+        )
+        if discovered.returncode != 0 or not discovered.stdout.strip():
+            return False
+        repo = Path(discovered.stdout.strip()).resolve(strict=True)
+        relative_path = resource.relative_to(repo)
+        if (
+            not resource.is_dir()
+            or not (repo / ".git").exists()
+            or not any(
+                relative_path == allowed or allowed in relative_path.parents
+                for allowed in _AUTHENTICATED_RESOURCE_ROOTS
+            )
+        ):
+            return False
+        relative = relative_path.as_posix()
+
+        git = ["git", "-c", "core.autocrlf=false", "-C", str(repo)]
+        eol = subprocess.run(
+            [*git, "ls-files", "--eol", "--", relative],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=GIT_REPAIR_TIMEOUT,
+            env=_no_prompt_env(),
+        )
+        if eol.returncode != 0 or not any(
+            "w/crlf" in line for line in eol.stdout.splitlines()
+        ):
+            return False
+
+        semantic_diff = subprocess.run(
+            [*git, "diff", "--ignore-space-at-eol", "--quiet", "HEAD", "--", relative],
+            check=False,
+            capture_output=True,
+            timeout=GIT_REPAIR_TIMEOUT,
+            env=_no_prompt_env(),
+        )
+        if semantic_diff.returncode != 0:
+            return False
+
+        configured = subprocess.run(
+            ["git", "-C", str(repo), "config", "core.autocrlf", "false"],
+            check=False,
+            capture_output=True,
+            timeout=GIT_REPAIR_TIMEOUT,
+            env=_no_prompt_env(),
+        )
+        if configured.returncode != 0:
+            return False
+
+        restored = subprocess.run(
+            [*git, "checkout", "HEAD", "--", relative],
+            check=False,
+            capture_output=True,
+            timeout=GIT_REPAIR_TIMEOUT,
+            env=_no_prompt_env(),
+        )
+        if restored.returncode != 0:
+            return False
+
+        verified = subprocess.run(
+            [*git, "ls-files", "--eol", "--", relative],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=GIT_REPAIR_TIMEOUT,
+            env=_no_prompt_env(),
+        )
+        if verified.returncode != 0 or any(
+            "w/crlf" in line for line in verified.stdout.splitlines()
+        ):
+            return False
+
+        return True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        log.debug(
+            "authenticated resource CRLF repair failed for %s",
+            resource_root,
+            exc_info=True,
+        )
+        return False
 
 
 def _resolve_placeholders(obj, replacement: str):
@@ -550,6 +658,24 @@ def seed_baked_capabilities(home: Path | str, root: Path | None = None) -> None:
                         fault_injector=lambda _phase, _path: None,
                     )
                 except Exception:
+                    try:
+                        if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                            repaired = repair_authenticated_resource_checkout(
+                                _repo_root() / entry["path"]
+                            )
+                        else:
+                            repaired = False
+                        if repaired:
+                            _stage_workflow_package(
+                                bundle=_repo_root(),
+                                entry=entry,
+                                home=home,
+                                trusted_distribution=True,
+                                fault_injector=lambda _phase, _path: None,
+                            )
+                            continue
+                    except Exception:
+                        pass
                     # Package authentication fails closed, but plugin activation
                     # and MCP defaults below are independent migrations. In
                     # particular, upgraded Git-for-Windows checkouts can retain
