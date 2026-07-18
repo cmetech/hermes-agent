@@ -354,7 +354,10 @@ cues, reduced motion, and laptop-width layout are release requirements.
 
 Archive is reversible metadata allowed only for terminal runs. Restore returns
 the run to History, not execution. A terminal-card visibility policy controls
-board clutter without altering evidence.
+board clutter without altering evidence. The initial default keeps terminal
+cards on the board for seven days; `plugins.entries.workflow.retention` may
+tune that visibility window. Aging changes only the board projection and never
+invokes cleanup.
 
 Bare cleanup is preview-only. Preview includes candidate IDs, evidence types,
 bytes, index integrity, open readers/claims, notification dependencies, and
@@ -370,8 +373,10 @@ Automatic retention never invokes destructive cleanup.
 ## Notifications
 
 Workflow transitions create transactional outbox rows for approval/input,
-failure, stall, completion when configured, cancellation, and reconciliation
-required. A unique transition/version/destination key prevents duplicates.
+failure, stall, completion, cancellation, and reconciliation required. A unique
+transition/version/destination key prevents duplicates. Destination policy may
+record an external completion delivery as suppressed, but the durable
+transition and in-product history still exist.
 
 The workflow plugin owns outbox leasing, retries, deduplication, receipts,
 dead-letter state, and unresolved-attention semantics. Gateway and Desktop are

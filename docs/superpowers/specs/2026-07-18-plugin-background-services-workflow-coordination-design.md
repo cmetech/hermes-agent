@@ -162,6 +162,14 @@ registrations are rolled back if the plugin's `register()` later fails.
 - sanitized health code/message/heartbeat;
 - bounded failure code/message, with tracebacks restricted to logs.
 
+`BackgroundServiceHost.snapshot()` is the process-local inspection API. Web
+stores the handle on `app.state` for authenticated diagnostics; Gateway stores
+it on `GatewayRunner` and includes state changes in ordinary gateway logs. The
+generic lifecycle does not add a public unauthenticated status endpoint. The
+workflow CLI/UI uses the plugin's durable coordinator heartbeat instead, so a
+different process and a local standby cannot produce a false availability
+claim.
+
 ## Generic lifecycle state machine
 
 ```mermaid
@@ -422,6 +430,29 @@ authoritative run state.
 Thresholds are plugin configuration in `config.yaml`, with safe defaults and
 schema validation. They are not new `HERMES_*` settings.
 
+Initial defaults live under `plugins.entries.workflow.coordinator`:
+
+```yaml
+plugins:
+  entries:
+    workflow:
+      coordinator:
+        heartbeat_seconds: 5
+        lease_seconds: 30
+        periodic_sweep_seconds: 5
+        sweep_max_runs: 100
+        sweep_max_seconds: 2
+        runnable_stall_seconds: 60
+        default_semantic_stall_seconds: 300
+```
+
+Validation requires `lease_seconds` to be at least three heartbeats and bounds
+each value to prevent a configuration from creating a busy loop or unbounded
+sweep. A wake may start a sweep earlier, but never bypass its item/time bounds.
+Approval/input and a persisted future retry are explained waiting states, not
+stalls. A running node uses its stricter declared semantic-idle limit when one
+exists; otherwise the 300-second default applies.
+
 - `healthy`: fresh coordinator and meaningful progress within the applicable
   node/queue threshold.
 - `waiting`: a durable approval, input, retry deadline, or queue position
@@ -466,9 +497,11 @@ Chat notifications use the existing alternation-safe outbound path or a new
 message/session boundary. They never inject a synthetic user message into an
 active agent loop and never mutate the cached system prompt or toolset.
 
-Approval/input, failure, stalled, completion (configurable), cancellation, and
-reconciliation-required transitions are durable. Closing the Workflows tab or
-restarting a host cannot erase them.
+Approval/input, failure, stalled, completion, cancellation, and reconciliation-
+required transitions always create durable outbox/attention facts. Destination
+policy may mark an external completion delivery `suppressed`; it does not omit
+the authoritative transition. Closing the Workflows tab or restarting a host
+cannot erase these facts.
 
 ## Archive, history, retention, and cleanup state machine
 

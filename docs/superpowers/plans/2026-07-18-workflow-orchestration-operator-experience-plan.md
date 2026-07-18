@@ -481,6 +481,7 @@ never becomes execution authority or a second chat surface.
 - Modify: `plugins/workflow/cli.py`
 - Modify: `plugins/workflow/dashboard/plugin_api.py`
 - Modify Desktop workflow files from Phase 7
+- Modify: `docs/workflow-orchestration.md`
 - Modify: `tests/plugins/workflow/test_retention.py`
 - Modify: `tests/plugins/workflow/test_desktop_api.py`
 - Modify Desktop workflow tests
@@ -489,6 +490,9 @@ never becomes execution authority or a second chat surface.
 - [ ] Implement restore to History, not execution.
 - [ ] Define terminal board aging as visibility policy only; evidence remains.
 - [ ] Expose cleanup preview/history and matching explicit execution in CLI/API.
+- [ ] Replace product documentation that teaches bare destructive cleanup or
+  `yes`-style confirmation with the preview/execute contract and config.yaml
+  coordinator settings.
 - [ ] Test changed preview, corrupt index, live reader/claim, uncertain effect,
   pending notification dependency, partial quarantine failure, restore, and
   cleanup retry.
@@ -518,7 +522,8 @@ destructive cleanup have distinct durable semantics.
 - Modify Desktop workflow tests
 
 - [ ] Add transactional outbox rows for approval/input, failure, stalled,
-  configurable completion, cancellation, and reconciliation-required.
+  completion, cancellation, and reconciliation-required; delivery policy may
+  persist suppression but may not omit the authoritative transition.
 - [ ] Deduplicate on transition/state-version/destination and implement leases,
   retry/backoff, receipts, dead-letter, explicit retry, and unresolved attention.
 - [ ] Make coordinator the outbox policy owner; destination adapters only
