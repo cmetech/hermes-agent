@@ -158,7 +158,9 @@ def test_json_show_rejects_only_explicit_topology_selector(
         "mermaid",
     ])
     assert args.func(args) == 2
-    assert "--topology cannot be combined with --json" in capsys.readouterr().err
+    envelope = _json_envelope(capsys)
+    assert envelope["error"]["code"] == "invalid_request"
+    assert "--topology cannot be combined with --json" in envelope["error"]["message"]
 
 
 def test_human_show_defaults_to_text_topology(workflow_writer, tmp_path, capsys):
@@ -249,8 +251,8 @@ def test_validate_doctor_trust_and_untrust(workflow_writer, tmp_path, capsys):
         "0" * 64,
         "--json",
     ])
-    assert args.func(args) == 1
-    assert "digest does not match" in capsys.readouterr().err
+    assert args.func(args) == 2
+    assert _json_envelope(capsys)["error"]["code"] == "digest_mismatch"
 
     package = load_workflow(path)
     digest = compute_package_digest(package)
@@ -295,7 +297,7 @@ def test_trust_rejects_package_mutation_during_admission(
         original.sha256,
     ])
 
-    assert args.func(args) == 1
+    assert args.func(args) == 5
     assert "changed while trust was being recorded" in capsys.readouterr().err
     assert WorkflowTrustStore(profile).check(original.sha256) == "untrusted"
 
@@ -430,8 +432,8 @@ def test_run_refuses_trusted_package_that_requires_an_isolated_backend(
         "--json",
     ])
 
-    assert args.func(args) == 1
-    assert "requires a configured isolated backend" in capsys.readouterr().err
+    assert args.func(args) == 4
+    assert _json_envelope(capsys)["error"]["code"] == "trust_required"
     assert RunStore(profile).list_runs() == ()
 
 
@@ -444,8 +446,8 @@ def test_reset_sessions_requires_confirmation_for_cross_scope_reset(tmp_path, ca
     common = ["--hermes-home", str(profile), "reset-sessions", "sample"]
 
     args = parser.parse_args([*common, "--json"])
-    assert args.func(args) == 1
-    assert "--yes" in capsys.readouterr().err
+    assert args.func(args) == 2
+    assert _json_envelope(capsys)["error"]["code"] == "confirmation_required"
 
     args = parser.parse_args([*common, "--scope", "scope-a", "--json"])
     assert args.func(args) == 0

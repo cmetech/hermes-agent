@@ -558,11 +558,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
 def _cmd_show(args: argparse.Namespace) -> int:
     if args.json and args.topology is not None:
-        print(
+        raise WorkflowCommandError(
+            "invalid_request",
             "--topology cannot be combined with --json; JSON show always includes both projections",
-            file=sys.stderr,
+            exit_code=EXIT_INVOCATION,
         )
-        return 2
     detail = show_package(_resolve(args, args.name), cron_jobs=_cron_jobs())
     if args.json:
         _emit(detail, as_json=True)
@@ -1209,10 +1209,11 @@ def _cmd_trust(args: argparse.Namespace) -> int:
     package = _resolve(args, args.name)
     before = compute_package_digest(package)
     if args.digest != before.sha256:
-        print(
-            "supplied digest does not match the current package digest", file=sys.stderr
+        raise WorkflowCommandError(
+            "digest_mismatch",
+            "supplied digest does not match the current package digest",
+            exit_code=EXIT_INVOCATION,
         )
-        return 1
     compatibility = assess_compatibility(package)
     risk = build_risk_summary(package, compatibility)
     fresh_package = load_workflow(
@@ -1227,11 +1228,12 @@ def _cmd_trust(args: argparse.Namespace) -> int:
         or risk.package_digest != after.sha256
         or risk.risk_digest != fresh_risk.risk_digest
     ):
-        print(
+        raise WorkflowCommandError(
+            "package_changed",
             "package changed while trust was being recorded; rerun doctor",
-            file=sys.stderr,
+            exit_code=EXIT_CONFLICT,
+            retryable=True,
         )
-        return 1
     WorkflowTrustStore(args.hermes_home).trust(
         after.sha256,
         actor="local-user",
@@ -1366,16 +1368,12 @@ def _cmd_run(
     if WorkflowTrustStore(args.hermes_home).check(
         digest.sha256, risk_digest=risk.risk_digest
     ) != "trusted":
-        print(
+        raise WorkflowCommandError(
+            "trust_required",
             "workflow package is not trusted; run doctor and trust its exact digest",
-            file=sys.stderr,
+            exit_code=EXIT_AUTHORIZATION,
         )
-        return 1
-    try:
-        preflight_execution(risk, trusted=True)
-    except WorkflowTrustError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+    preflight_execution(risk, trusted=True)
     store = _store(args, runtime)
     from plugins.workflow.coordinator_store import CoordinatorStore
 
@@ -1710,8 +1708,11 @@ def _cmd_cleanup(args: argparse.Namespace) -> int:
 
 def _cmd_reset_sessions(args: argparse.Namespace) -> int:
     if args.scope is None and not args.yes:
-        print("cross-scope reset requires --yes", file=sys.stderr)
-        return 1
+        raise WorkflowCommandError(
+            "confirmation_required",
+            "cross-scope reset requires --yes",
+            exit_code=EXIT_INVOCATION,
+        )
     removed = NodeSessionRegistry(args.hermes_home).reset(
         args.name, scope=args.scope, node_id=args.node
     )
