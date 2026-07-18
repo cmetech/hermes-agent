@@ -2800,6 +2800,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
+    plugin_background_services = None
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -3111,6 +3112,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Generic plugin services are bound only after Gateway discovery and
+        # adapter readiness. The host owns their threads and bounded shutdown;
+        # Gateway never receives workflow-specific service authority.
+        self.plugin_background_services = None
 
         # scale-to-zero (Phase 0, F13): gateway-scoped "last inbound seen" clock.
         # There is no such clock today (only a per-agent _last_activity_ts), so the
@@ -7252,6 +7257,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self.delivery_router.adapters = self.adapters
         self._wire_teams_pipeline_runtime()
 
+        # Bind generic plugin services only after plugin discovery and the
+        # Gateway's required adapter/runtime resources are ready. Construction
+        # and run failures are isolated by the generic host and must not make
+        # unrelated messaging surfaces unavailable.
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+
+            self.plugin_background_services = (
+                get_plugin_manager().start_background_services("gateway")
+            )
+        except Exception:
+            self.plugin_background_services = None
+            logger.exception(
+                "Plugin background services failed to bind; Gateway will continue"
+            )
+
         self._running = True
         self._update_runtime_status("running")
         
@@ -8126,6 +8147,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+
+            # Quiesce plugin-owned work while Gateway adapters and persistence
+            # are still available. A failed or timed-out service remains
+            # visible through its host snapshot but cannot block unrelated
+            # Gateway teardown.
+            _plugin_services = getattr(self, "plugin_background_services", None)
+            if _plugin_services is not None:
+                try:
+                    _services_stopped = await asyncio.to_thread(
+                        _plugin_services.shutdown
+                    )
+                    if not _services_stopped:
+                        logger.error(
+                            "Plugin background service shutdown exceeded its deadline"
+                        )
+                except Exception:
+                    logger.exception(
+                        "Plugin background service shutdown failed; "
+                        "Gateway teardown will continue"
+                    )
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.

@@ -555,3 +555,29 @@ upstream_changes:
     plugin service host in both dashboard and headless-serve FastAPI lifespan
     with the same failure and shutdown ordering.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: gateway-plugin-background-service-host
+  change_class: product-surface-generic
+  owner: workflow-orchestration
+  files:
+  - gateway/run.py
+  - tests/gateway/test_plugin_background_services.py
+  owned_symbols:
+  - GatewayRunner.plugin_background_services
+  - GatewayRunner.start plugin background service boundary
+  - GatewayRunner.stop plugin background service boundary
+  tests:
+  - tests/gateway/test_plugin_background_services.py
+  - tests/gateway/test_gateway_shutdown.py
+  - tests/gateway/test_startup_restart_race.py
+  expected_commit_subject: 'feat(gateway): host plugin background services'
+  upstream_candidate: true
+  merge_guidance: Preserve generic Gateway-host binding after plugin discovery
+    and required adapter/runtime readiness but before the running status, plus
+    bounded service quiescence while adapters and persistence are still live.
+    Service construction, run, health, and shutdown failures must remain
+    isolated from unrelated Gateway startup and teardown. Do not add workflow
+    imports or treat process-local service health as cross-process authority.
+  removal_condition: Remove when Hermes upstream binds an equivalent generic
+    plugin service host in Gateway with the same readiness, failure-isolation,
+    and pre-resource-teardown shutdown ordering.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
