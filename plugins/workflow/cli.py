@@ -10,6 +10,7 @@ import re
 import secrets
 import shutil
 import sys
+import time
 from collections import Counter
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -1224,9 +1225,15 @@ def _scheduler(
     *,
     agent_runner=None,
     profile_name: str = "default",
+    owner_id: str | None = None,
+    execution_owner_id: str | None = None,
+    execution_owner_epoch: int | None = None,
 ) -> RunScheduler:
     return RunScheduler(
         store,
+        owner_id=owner_id,
+        execution_owner_id=execution_owner_id,
+        execution_owner_epoch=execution_owner_epoch,
         agent_runner=agent_runner,
         profile_name=profile_name,
         max_parallel_nodes=config.max_parallel_nodes,
@@ -1269,6 +1276,21 @@ def _cmd_run(
         print(str(exc), file=sys.stderr)
         return 1
     store = _store(args, runtime)
+    from plugins.workflow.coordinator_store import CoordinatorStore
+
+    coordinator = CoordinatorStore(store.database).health(
+        now=datetime.now(timezone.utc)
+    )
+    execution_mode = (
+        "background"
+        if args.no_wait or coordinator.status == "healthy"
+        else "foreground"
+    )
+    foreground_owner_id = (
+        f"foreground-{os.getpid()}-{secrets.token_hex(16)}"
+        if execution_mode == "foreground"
+        else None
+    )
     prepared = store.prepare_run_snapshot(
         package, values={"arguments": args.arguments} if args.arguments else None
     )
@@ -1282,6 +1304,8 @@ def _cmd_run(
         concurrency_key=args.concurrency_key
         or str(package.sidecar.get("concurrency_key") or package.definition.name),
         concurrency_policy=str(package.sidecar.get("overlap_policy") or "queue"),
+        execution_mode=execution_mode,
+        foreground_owner_id=foreground_owner_id,
     )
     admitted = store.start_run(request, immutable_snapshot=prepared)
     if admitted.run_id is None:
@@ -1293,13 +1317,23 @@ def _cmd_run(
         }
         _emit(payload, as_json=args.json)
         return 1
-    if admitted.disposition == "created" and not args.no_wait:
+    if admitted.disposition == "created" and execution_mode == "foreground":
         _scheduler(
             store,
             runtime,
             agent_runner=agent_runner,
             profile_name=profile_name,
+            owner_id=foreground_owner_id,
+            execution_owner_id=foreground_owner_id,
+            execution_owner_epoch=1,
         ).advance(admitted.run_id)
+    elif (
+        admitted.disposition == "created"
+        and execution_mode == "background"
+        and not args.no_wait
+    ):
+        while store.get_run_status(admitted.run_id)["status"] == "running":
+            time.sleep(0.1)
     payload = store.get_run_status(admitted.run_id)
     payload["action"] = "run"
     payload["admission_disposition"] = admitted.disposition
@@ -1341,13 +1375,14 @@ def _cmd_approval_decision(
         result = store.approve_run(args.run_id, comment=args.comment, channel="cli")
     else:
         result = store.reject_run(args.run_id, reason=args.reason, channel="cli")
-    if result.outcome == "applied" and args.continue_run:
-        _scheduler(
+    if result.outcome == "applied":
+        _continue_if_requested(
+            args,
             store,
             runtime,
             agent_runner=agent_runner,
             profile_name=profile_name,
-        ).advance(args.run_id)
+        )
     payload = asdict(result)
     payload["action"] = "approve" if decision == "approved" else "reject"
     payload["run_status"] = store.get_run_status(args.run_id)["status"]
@@ -1361,24 +1396,53 @@ def _cmd_resume(
     runtime = _runtime_config(args.hermes_home)
     store = _store(args, runtime)
     store.resume_run(args.run_id)
-    _scheduler(
+    _continue_foreground_if_owned(
+        args.run_id,
         store,
         runtime,
         agent_runner=agent_runner,
         profile_name=profile_name,
-    ).advance(args.run_id)
+    )
     _emit(store.get_run_status(args.run_id), as_json=args.json)
     return 0
 
 
 def _continue_if_requested(args, store, runtime, *, agent_runner, profile_name):
     if args.continue_run:
-        _scheduler(
+        _continue_foreground_if_owned(
+            args.run_id,
             store,
             runtime,
             agent_runner=agent_runner,
             profile_name=profile_name,
-        ).advance(args.run_id)
+        )
+
+
+def _continue_foreground_if_owned(
+    run_id,
+    store,
+    runtime,
+    *,
+    agent_runner,
+    profile_name,
+):
+    projection = store.get_run_status(run_id)
+    if projection.get("execution_mode") != "foreground":
+        return
+    from plugins.workflow.coordinator_store import CoordinatorStore
+
+    health = CoordinatorStore(store.database).health(now=datetime.now(timezone.utc))
+    if health.status == "healthy":
+        return
+    _scheduler(
+        store,
+        runtime,
+        agent_runner=agent_runner,
+        profile_name=profile_name,
+        owner_id=projection.get("foreground_owner_id"),
+        execution_owner_id=projection.get("foreground_owner_id"),
+        execution_owner_epoch=projection.get("foreground_epoch"),
+    ).advance(run_id)
 
 
 def _cmd_provide_input(

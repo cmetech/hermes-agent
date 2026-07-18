@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import multiprocessing
 import os
 from pathlib import Path
 import threading
@@ -14,6 +15,7 @@ from plugins.workflow.coordinator_store import (
     CoordinatorStore,
 )
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 from tools.managed_process import ProcessIdentity
@@ -28,6 +30,24 @@ def _identity(name: str, *, host_kind: str = "gateway") -> CoordinatorIdentity:
         pid=process.pid,
         process_start_time=process.start_time,
     )
+
+
+def _hold_coordinator_lease(database: str, ready, release) -> None:
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="child-coordinator",
+        host_kind="gateway",
+        host_instance_id="child-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    acquired = CoordinatorStore(Path(database)).try_acquire(
+        identity,
+        now=datetime.now(timezone.utc),
+        lease_seconds=30,
+    )
+    ready.put(acquired.is_leader)
+    release.wait(5)
 
 
 def test_coordinator_lease_renews_releases_and_fences_stale_epoch(tmp_path) -> None:
@@ -248,19 +268,6 @@ def test_durable_approval_wake_continues_outside_mutating_caller(
         )
     )
     store = RunStore(tmp_path)
-    prepared = store.prepare_run_snapshot(package)
-    admitted = store.start_run(
-        RunAdmissionRequest(
-            workflow_name=package.definition.name,
-            definition_digest=prepared.definition_digest,
-            policy_digest=prepared.policy_digest,
-            input_manifest_digest=prepared.input_manifest_digest,
-            trigger_source="desktop",
-            idempotency_key="approval-wake",
-            concurrency_key=package.definition.name,
-        ),
-        immutable_snapshot=prepared,
-    )
     service = _service(
         tmp_path,
         host_kind="gateway",
@@ -270,6 +277,21 @@ def test_durable_approval_wake_continues_outside_mutating_caller(
     thread = threading.Thread(target=service.run, args=(stop,))
     thread.start()
     try:
+        _wait_until(lambda: service.health().code == "leader")
+        prepared = store.prepare_run_snapshot(package)
+        admitted = store.start_run(
+            RunAdmissionRequest(
+                workflow_name=package.definition.name,
+                definition_digest=prepared.definition_digest,
+                policy_digest=prepared.policy_digest,
+                input_manifest_digest=prepared.input_manifest_digest,
+                trigger_source="desktop",
+                idempotency_key="approval-wake",
+                concurrency_key=package.definition.name,
+                execution_mode="background",
+            ),
+            immutable_snapshot=prepared,
+        )
         _wait_until(lambda: store.get_run_status(admitted.run_id)["status"] == "paused")
         paused = store.get_run_status(admitted.run_id)
         interaction = paused["nodes"]["review"]["pending_interaction"]
@@ -301,3 +323,205 @@ def test_workflow_plugin_registers_one_generic_service_for_both_hosts() -> None:
         create_workflow_coordinator,
         hosts={"web", "gateway"},
     )
+
+
+def test_background_admission_requires_a_fresh_coordinator_without_evidence_leak(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path)
+    package = load_workflow(workflow_writer(tmp_path / "package", name="background"))
+    prepared = store.prepare_run_snapshot(package)
+    request = RunAdmissionRequest(
+        workflow_name="background",
+        definition_digest=prepared.definition_digest,
+        policy_digest=prepared.policy_digest,
+        input_manifest_digest=prepared.input_manifest_digest,
+        trigger_source="api",
+        idempotency_key="background-no-owner",
+        concurrency_key="background",
+        execution_mode="background",
+    )
+
+    rejected = store.start_run(request, immutable_snapshot=prepared)
+
+    assert rejected.reason_code == "coordinator_unavailable"
+    assert rejected.run_id is None
+    assert list(store.runs_root.glob("*/*")) == []
+
+
+def test_foreground_and_background_admission_are_fenced_by_live_leader(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path)
+    coordinator = CoordinatorStore(store.database)
+    now = datetime.now(timezone.utc)
+    identity = _identity("admission-owner")
+    assert coordinator.try_acquire(identity, now=now, lease_seconds=30).is_leader
+    package = load_workflow(workflow_writer(tmp_path / "package", name="arbitration"))
+
+    foreground_snapshot = store.prepare_run_snapshot(package)
+    foreground = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="arbitration",
+            definition_digest=foreground_snapshot.definition_digest,
+            policy_digest=foreground_snapshot.policy_digest,
+            input_manifest_digest=foreground_snapshot.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="foreground-race",
+            concurrency_key="arbitration",
+            execution_mode="foreground",
+            foreground_owner_id="foreground-process",
+        ),
+        immutable_snapshot=foreground_snapshot,
+    )
+    assert foreground.reason_code == "coordinator_active"
+
+    background_snapshot = store.prepare_run_snapshot(package)
+    background = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="arbitration",
+            definition_digest=background_snapshot.definition_digest,
+            policy_digest=background_snapshot.policy_digest,
+            input_manifest_digest=background_snapshot.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="background-owned",
+            concurrency_key="arbitration",
+            execution_mode="background",
+        ),
+        immutable_snapshot=background_snapshot,
+    )
+    assert background.disposition == "created"
+    projection = store.load_run(background.run_id)
+    assert projection["execution_mode"] == "background"
+
+
+def test_foreground_admission_is_fenced_by_coordinator_in_another_process(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="process-arbitration")
+    )
+    context = multiprocessing.get_context("spawn")
+    ready = context.Queue()
+    release = context.Event()
+    child = context.Process(
+        target=_hold_coordinator_lease,
+        args=(str(store.database), ready, release),
+    )
+    child.start()
+    try:
+        assert ready.get(timeout=5) is True
+        prepared = store.prepare_run_snapshot(package)
+        result = store.start_run(
+            RunAdmissionRequest(
+                workflow_name="process-arbitration",
+                definition_digest=prepared.definition_digest,
+                policy_digest=prepared.policy_digest,
+                input_manifest_digest=prepared.input_manifest_digest,
+                trigger_source="cli",
+                idempotency_key="cross-process-foreground",
+                concurrency_key="process-arbitration",
+                execution_mode="foreground",
+                foreground_owner_id="parent-foreground",
+            ),
+            immutable_snapshot=prepared,
+        )
+        assert result.reason_code == "coordinator_active"
+        assert result.run_id is None
+    finally:
+        release.set()
+        child.join(timeout=5)
+        assert child.exitcode == 0
+
+
+def test_foreground_execution_lease_requires_exact_unexpired_fencing_token(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path)
+    package = load_workflow(workflow_writer(tmp_path / "package", name="foreground"))
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="foreground",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="foreground-lease",
+            concurrency_key="foreground",
+            execution_mode="foreground",
+            foreground_owner_id="foreground-owner",
+            foreground_lease_seconds=30,
+        ),
+        immutable_snapshot=prepared,
+    )
+    admitted_at = datetime.fromisoformat(
+        store.load_run(admitted.run_id)["foreground_lease_expires_at"]
+    ) - timedelta(seconds=30)
+
+    assert not store.renew_foreground_execution(
+        admitted.run_id,
+        owner_id="different-owner",
+        epoch=1,
+        now=admitted_at + timedelta(seconds=1),
+        lease_seconds=30,
+    )
+    assert store.renew_foreground_execution(
+        admitted.run_id,
+        owner_id="foreground-owner",
+        epoch=1,
+        now=admitted_at + timedelta(seconds=1),
+        lease_seconds=30,
+    )
+    assert not store.renew_foreground_execution(
+        admitted.run_id,
+        owner_id="foreground-owner",
+        epoch=1,
+        now=admitted_at + timedelta(minutes=2),
+        lease_seconds=30,
+    )
+
+
+def test_scheduler_does_not_claim_after_foreground_execution_lease_expires(
+    tmp_path, workflow_writer
+) -> None:
+    marker = tmp_path / "must-not-run"
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="expired-foreground",
+            nodes=[{"id": "effect", "bash": f"touch {marker}"}],
+        )
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="expired-foreground",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="expired-foreground",
+            concurrency_key="expired-foreground",
+            execution_mode="foreground",
+            foreground_owner_id="expired-owner",
+            foreground_lease_seconds=1,
+        ),
+        immutable_snapshot=prepared,
+    )
+    expired_at = datetime.fromisoformat(
+        store.load_run(admitted.run_id)["foreground_lease_expires_at"]
+    ) + timedelta(seconds=1)
+
+    result = RunScheduler(
+        store,
+        owner_id="expired-owner",
+        execution_owner_id="expired-owner",
+        execution_owner_epoch=1,
+        utcnow=lambda: expired_at,
+    ).advance(admitted.run_id)
+
+    assert result["nodes"]["effect"]["state"] == "ready"
+    assert not marker.exists()

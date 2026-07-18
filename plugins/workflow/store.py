@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import mimetypes
 import os
 import re
@@ -74,7 +75,7 @@ class ArtifactRef:
 
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
-_STORE_SCHEMA_VERSION = 3
+_STORE_SCHEMA_VERSION = 4
 _PROJECTION_STATUSES = {
     "queued",
     "running",
@@ -380,6 +381,10 @@ class RunStore:
                         desired_status TEXT,
                         staging_directory TEXT,
                         operator_scope_digest TEXT,
+                        execution_mode TEXT NOT NULL DEFAULT 'foreground',
+                        foreground_owner_id TEXT,
+                        foreground_lease_expires_at TEXT,
+                        foreground_epoch INTEGER,
                         projection_schema_version INTEGER NOT NULL DEFAULT 1,
                         projection_state_version INTEGER,
                         projection_sha256 TEXT,
@@ -482,6 +487,19 @@ class RunStore:
                     "integrity_verified_at": (
                         "ALTER TABLE runs ADD COLUMN integrity_verified_at TEXT"
                     ),
+                    "execution_mode": (
+                        "ALTER TABLE runs ADD COLUMN execution_mode TEXT "
+                        "NOT NULL DEFAULT 'foreground'"
+                    ),
+                    "foreground_owner_id": (
+                        "ALTER TABLE runs ADD COLUMN foreground_owner_id TEXT"
+                    ),
+                    "foreground_lease_expires_at": (
+                        "ALTER TABLE runs ADD COLUMN foreground_lease_expires_at TEXT"
+                    ),
+                    "foreground_epoch": (
+                        "ALTER TABLE runs ADD COLUMN foreground_epoch INTEGER"
+                    ),
             }
             for name, statement in migrations.items():
                 if name not in columns:
@@ -517,6 +535,10 @@ class RunStore:
                 "journal_sequence",
                 "journal_sha256",
                 "integrity_verified_at",
+                "execution_mode",
+                "foreground_owner_id",
+                "foreground_lease_expires_at",
+                "foreground_epoch",
             }
             if not required_columns <= columns:
                 missing = ", ".join(sorted(required_columns - columns))
@@ -557,10 +579,16 @@ class RunStore:
             ).fetchone()
             generation_existed = row is not None
             if row is None:
-                generation = uuid.uuid4().hex
+                candidate_generation = uuid.uuid4().hex
                 connection.execute(
-                    "INSERT INTO store_metadata (key, value) VALUES ('generation', ?)",
-                    (generation,),
+                    "INSERT OR IGNORE INTO store_metadata (key, value) "
+                    "VALUES ('generation', ?)",
+                    (candidate_generation,),
+                )
+                generation = str(
+                    connection.execute(
+                        "SELECT value FROM store_metadata WHERE key='generation'"
+                    ).fetchone()["value"]
                 )
             else:
                 generation = str(row["value"])
@@ -821,9 +849,10 @@ class RunStore:
             "start_digest, concurrency_key, concurrency_policy, disposition, "
             "status, queue_position, blocked_by_run_id, run_directory, "
             "created_at, updated_at, admission_state, desired_status, "
-            "staging_directory, operator_scope_digest) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "'published', NULL, NULL, ?)",
+            "staging_directory, operator_scope_digest, "
+            "execution_mode, foreground_owner_id, foreground_lease_expires_at, "
+            "foreground_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "'published', NULL, NULL, ?, ?, ?, ?, ?)",
             (
                 projection["run_id"],
                 projection["workflow"],
@@ -840,6 +869,10 @@ class RunStore:
                 projection.get("created_at") or projection["updated_at"],
                 projection["updated_at"],
                 projection.get("operator_scope_digest"),
+                projection.get("execution_mode", "foreground"),
+                projection.get("foreground_owner_id"),
+                projection.get("foreground_lease_expires_at"),
+                projection.get("foreground_epoch"),
             ),
         )
 
@@ -1692,6 +1725,45 @@ class RunStore:
                 if existing["start_digest"] == start_digest:
                     return RunAdmissionResult(existing["run_id"], "existing")
                 return RunAdmissionResult(None, "rejected", "idempotency_conflict")
+            if request.execution_mode not in {"foreground", "background"}:
+                raise ValueError("execution_mode must be foreground or background")
+            admission_now = datetime.now(timezone.utc)
+            fresh_leader = connection.execute(
+                "SELECT 1 FROM coordinator_lease WHERE singleton=1 "
+                "AND lease_expires_at>?",
+                (admission_now.isoformat(),),
+            ).fetchone()
+            if request.execution_mode == "background" and fresh_leader is None:
+                connection.rollback()
+                shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
+                return RunAdmissionResult(
+                    None, "rejected", "coordinator_unavailable"
+                )
+            if request.execution_mode == "foreground" and fresh_leader is not None:
+                connection.rollback()
+                shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
+                return RunAdmissionResult(None, "rejected", "coordinator_active")
+            if (
+                isinstance(request.foreground_lease_seconds, bool)
+                or not isinstance(request.foreground_lease_seconds, int | float)
+                or not math.isfinite(float(request.foreground_lease_seconds))
+                or request.foreground_lease_seconds <= 0
+            ):
+                raise ValueError("foreground_lease_seconds must be positive and finite")
+            foreground_owner_id = None
+            foreground_lease_expires_at = None
+            foreground_epoch = None
+            if request.execution_mode == "foreground":
+                foreground_owner_id = request.foreground_owner_id or (
+                    f"foreground-{os.getpid()}-{uuid.uuid4().hex}"
+                )
+                if len(foreground_owner_id) > 256:
+                    raise ValueError("foreground_owner_id must be bounded text")
+                foreground_lease_expires_at = (
+                    admission_now
+                    + timedelta(seconds=float(request.foreground_lease_seconds))
+                ).isoformat()
+                foreground_epoch = 1
             cutoff = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
             recent_starts = connection.execute(
                 "SELECT COUNT(*) FROM runs WHERE created_at>=?", (cutoff,)
@@ -1760,8 +1832,9 @@ class RunStore:
                 "start_digest, concurrency_key, concurrency_policy, disposition, "
                 "status, queue_position, blocked_by_run_id, run_directory, "
                 "created_at, updated_at, admission_state, desired_status, "
-                "staging_directory, operator_scope_digest) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "staging_directory, operator_scope_digest, execution_mode, "
+                "foreground_owner_id, foreground_lease_expires_at, foreground_epoch) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     run_id,
                     request.workflow_name,
@@ -1781,6 +1854,10 @@ class RunStore:
                     status,
                     str(immutable_snapshot.staging_directory),
                     operator_scope_digest,
+                    request.execution_mode,
+                    foreground_owner_id,
+                    foreground_lease_expires_at,
+                    foreground_epoch,
                 ),
             )
             connection.commit()
@@ -1796,6 +1873,9 @@ class RunStore:
                 queue_position=queue_position,
                 blocked_by=blocked_by,
                 created_at=now,
+                foreground_owner_id=foreground_owner_id,
+                foreground_lease_expires_at=foreground_lease_expires_at,
+                foreground_epoch=foreground_epoch,
             )
             self._mark_reservation_published(run_id, status=status)
             self.load_run(run_id)
@@ -1822,6 +1902,9 @@ class RunStore:
         queue_position: int | None,
         blocked_by: str | None,
         created_at: str,
+        foreground_owner_id: str | None,
+        foreground_lease_expires_at: str | None,
+        foreground_epoch: int | None,
     ) -> None:
         (snapshot.staging_directory / ".snapshot-owner.json").unlink(missing_ok=True)
         _durable_replace(snapshot.staging_directory, run_directory)
@@ -1841,6 +1924,10 @@ class RunStore:
             "run_metadata": dict(sorted((request.run_metadata or {}).items())),
             "concurrency_key": request.concurrency_key,
             "concurrency_policy": request.concurrency_policy,
+            "execution_mode": request.execution_mode,
+            "foreground_owner_id": foreground_owner_id,
+            "foreground_lease_expires_at": foreground_lease_expires_at,
+            "foreground_epoch": foreground_epoch,
             "outward_action_nodes": list(snapshot.outward_action_nodes),
             "admission_disposition": disposition,
             "queue_position": queue_position,
@@ -2384,6 +2471,44 @@ class RunStore:
             if len(results) >= limit:
                 break
         return tuple(results)
+
+    def renew_foreground_execution(
+        self,
+        run_id: str,
+        *,
+        owner_id: str,
+        epoch: int,
+        now: datetime,
+        lease_seconds: float,
+    ) -> bool:
+        """Renew an unexpired foreground execution lease using its fencing token."""
+        if not owner_id or len(owner_id) > 256:
+            raise ValueError("owner_id must be bounded text")
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
+            raise ValueError("epoch must be a positive integer")
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int | float)
+            or not math.isfinite(float(lease_seconds))
+            or lease_seconds <= 0
+        ):
+            raise ValueError("lease_seconds must be positive and finite")
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        current = now.astimezone(timezone.utc).isoformat()
+        expires_at = (
+            now.astimezone(timezone.utc) + timedelta(seconds=float(lease_seconds))
+        ).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE runs SET foreground_lease_expires_at=?, updated_at=? "
+                "WHERE run_id=? AND execution_mode='foreground' "
+                "AND foreground_owner_id=? AND foreground_epoch=? "
+                "AND foreground_lease_expires_at>? "
+                "AND status IN ('queued','running','waiting_retry','paused','interrupted')",
+                (expires_at, current, run_id, owner_id, epoch, current),
+            )
+            return cursor.rowcount == 1
 
     def get_run_status(
         self, run_id: str, *, operator_scope: str | None = None

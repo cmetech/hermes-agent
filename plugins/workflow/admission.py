@@ -17,6 +17,9 @@ class RunAdmissionRequest:
     idempotency_key: str
     concurrency_key: str
     concurrency_policy: Literal["queue", "allow", "forbid"] = "queue"
+    execution_mode: Literal["foreground", "background"] = "foreground"
+    foreground_owner_id: str | None = None
+    foreground_lease_seconds: float = 30.0
     operator_scope: str | None = None
     run_metadata: Mapping[str, str] | None = None
 

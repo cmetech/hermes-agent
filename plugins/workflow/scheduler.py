@@ -195,6 +195,8 @@ class RunScheduler:
         store: RunStore,
         *,
         owner_id: str | None = None,
+        execution_owner_id: str | None = None,
+        execution_owner_epoch: int | None = None,
         agent_runner=None,
         session_registry: NodeSessionRegistry | None = None,
         profile_name: str = "default",
@@ -246,6 +248,12 @@ class RunScheduler:
             raise ValueError("default retry attempts must be between 1 and 5")
         self.store = store
         self.owner_id = owner_id or f"scheduler-{os.getpid()}-{uuid.uuid4().hex}"
+        if (execution_owner_id is None) != (execution_owner_epoch is None):
+            raise ValueError(
+                "execution owner ID and epoch must be provided together"
+            )
+        self.execution_owner_id = execution_owner_id
+        self.execution_owner_epoch = execution_owner_epoch
         self.max_parallel_nodes = min(max_parallel_nodes, store.limits["workers"])
         self.heartbeat_seconds = float(heartbeat_seconds)
         self.lease_seconds = float(lease_seconds)
@@ -289,6 +297,17 @@ class RunScheduler:
                 "prompt": ai_executor,
                 "loop": LoopExecutor(agent_runner),
             })
+
+    def _renew_execution_owner(self, run_id: str) -> bool:
+        if self.execution_owner_id is None:
+            return True
+        return self.store.renew_foreground_execution(
+            run_id,
+            owner_id=self.execution_owner_id,
+            epoch=self.execution_owner_epoch,
+            now=self._utcnow(),
+            lease_seconds=self.lease_seconds,
+        )
 
     @property
     def active_run_count(self) -> int:
@@ -438,6 +457,8 @@ class RunScheduler:
         with self._activity:
             self._active_executions += 1
         try:
+            if not self._renew_execution_owner(run_id):
+                return
             executor = self.executors.get(node.node_type)
             if executor is None:
                 result = NodeExecutionResult(
@@ -464,9 +485,13 @@ class RunScheduler:
                     node_state["approved_action_digest"] = approved_action_digest
                 timeout = self._node_timeout(node)
                 heartbeat_stop = threading.Event()
+                ownership_lost = threading.Event()
 
                 def heartbeat() -> None:
                     while not heartbeat_stop.wait(self.heartbeat_seconds):
+                        if not self._renew_execution_owner(run_id):
+                            ownership_lost.set()
+                            return
                         if not self.store.renew_claim(
                             claim,
                             now=self._utcnow(),
@@ -576,6 +601,8 @@ class RunScheduler:
                 finally:
                     heartbeat_stop.set()
                     heartbeat_thread.join(timeout=self.heartbeat_seconds)
+                if ownership_lost.is_set():
+                    return
             self._persist_result(claim, node, result)
         except RuntimeError as exc:
             if "stale" not in str(exc) and "terminal run" not in str(exc):
@@ -684,6 +711,8 @@ class RunScheduler:
             while not self._shutdown.is_set() and (
                 max_nodes is None or executed < max_nodes
             ):
+                if not self._renew_execution_owner(run_id):
+                    break
                 self.store.expire_stale_claims(
                     run_id,
                     now=self._utcnow(),
@@ -794,6 +823,8 @@ class RunScheduler:
                 snapshots = {}
                 active = []
                 for run_id in run_ids:
+                    if not self._renew_execution_owner(run_id):
+                        continue
                     self.store.expire_stale_claims(
                         run_id,
                         now=self._utcnow(),

@@ -33,13 +33,17 @@ def _write(workflow_writer, workdir):
     )
 
 
-def test_plugin_registers_only_one_cli_command():
+def test_plugin_registers_cli_command_and_background_coordinator():
     class Context:
         def __init__(self):
             self.calls = []
+            self.service_calls = []
 
         def register_cli_command(self, **kwargs):
             self.calls.append(kwargs)
+
+        def register_background_service(self, *args, **kwargs):
+            self.service_calls.append((args, kwargs))
 
         def __getattr__(self, name):
             raise AssertionError(f"unexpected plugin registration: {name}")
@@ -48,6 +52,9 @@ def test_plugin_registers_only_one_cli_command():
     workflow_plugin.register(ctx)
     assert len(ctx.calls) == 1
     assert ctx.calls[0]["name"] == "workflow"
+    assert len(ctx.service_calls) == 1
+    assert ctx.service_calls[0][0][0] == "coordinator"
+    assert ctx.service_calls[0][1]["hosts"] == {"web", "gateway"}
 
 
 def test_runtime_limits_load_from_plugin_entry_without_new_root_config(tmp_path):

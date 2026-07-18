@@ -183,6 +183,7 @@ class WorkflowCoordinatorService:
             str(run["run_id"])
             for run in periodic
             if run.get("status") in {"queued", "running", "waiting_retry"}
+            and run.get("execution_mode") == "background"
             and run.get("run_id") not in run_ids
         )
         progress_at: datetime | None = None
@@ -190,12 +191,16 @@ class WorkflowCoordinatorService:
             outcome = "advanced"
             try:
                 before = run_store.get_run_status(run_id)
-                scheduler.advance(run_id)
-                after = run_store.get_run_status(run_id)
-                if after.get("state_version") != before.get("state_version"):
-                    progress_at = self._utcnow().astimezone(timezone.utc)
+                if before.get("execution_mode") != "background":
+                    after = before
+                    outcome = "foreground_owned"
                 else:
-                    outcome = "no_change"
+                    scheduler.advance(run_id)
+                    after = run_store.get_run_status(run_id)
+                    if after.get("state_version") != before.get("state_version"):
+                        progress_at = self._utcnow().astimezone(timezone.utc)
+                    else:
+                        outcome = "no_change"
             except KeyError:
                 outcome = "run_missing"
             except Exception:
