@@ -142,6 +142,60 @@ def test_fresh_windows_checkout_seeds_workflow_and_mcp_defaults(
     assert "workflow" in cfg["plugins"]["enabled"]
     assert {"outlook", "glean"} <= set(cfg["mcp_servers"])
 
+
+def test_upgrade_with_invalid_workflow_bytes_still_seeds_independent_defaults(
+    tmp_path, fake_repo, fake_config
+):
+    """A failed package verification must not abort unrelated migrations.
+
+    Existing Git-for-Windows installs can retain CRLF bytes for authenticated
+    resources that were unchanged when LF attributes were added. The package
+    must still fail closed, while the separately trusted plugin activation and
+    MCP defaults continue to migrate an existing config.
+    """
+    fake_config["cfg"] = {
+        "plugins": {"enabled": []},
+        "mcp_servers": {},
+    }
+    command = fake_repo / "capabilities/workflow-packages/ericsson/commands/collect.md"
+    command.write_bytes(command.read_bytes().replace(b"\n", b"\r\n"))
+    home = tmp_path / "home"
+    home.mkdir()
+
+    cs.seed_baked_capabilities(home)
+
+    cfg = fake_config["cfg"]
+    assert "workflow" in cfg["plugins"]["enabled"]
+    assert {"outlook", "glean"} <= set(cfg["mcp_servers"])
+    assert not (home / "workflows/ericsson").exists()
+
+
+def test_upgrade_migration_makes_workflow_cli_discoverable(
+    tmp_path, monkeypatch, fake_repo
+):
+    """Exercise the real config-to-plugin-discovery path used before argparse."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled: []\nmcp_servers: {}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    command = fake_repo / "capabilities/workflow-packages/ericsson/commands/collect.md"
+    command.write_bytes(command.read_bytes().replace(b"\n", b"\r\n"))
+
+    cs.seed_baked_capabilities(home)
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_bundled_plugins_dir", lambda: REPO_ROOT / "plugins"
+    )
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    manager.discover_and_load()
+    assert "workflow" in manager._cli_commands
+
+
 def test_seed_never_clobbers_user_mcp(tmp_path, fake_repo, fake_config):
     fake_config["cfg"] = {"mcp_servers": {"outlook": {"command": "mine"}}}
     home = tmp_path / "home"; home.mkdir()

@@ -541,13 +541,24 @@ def seed_baked_capabilities(home: Path | str, root: Path | None = None) -> None:
             if not isinstance(manifest, dict):
                 continue
             for entry in manifest.get("workflowPackages") or []:
-                _stage_workflow_package(
-                    bundle=_repo_root(),
-                    entry=entry,
-                    home=home,
-                    trusted_distribution=True,
-                    fault_injector=lambda _phase, _path: None,
-                )
+                try:
+                    _stage_workflow_package(
+                        bundle=_repo_root(),
+                        entry=entry,
+                        home=home,
+                        trusted_distribution=True,
+                        fault_injector=lambda _phase, _path: None,
+                    )
+                except Exception:
+                    # Package authentication fails closed, but plugin activation
+                    # and MCP defaults below are independent migrations. In
+                    # particular, upgraded Git-for-Windows checkouts can retain
+                    # pre-.gitattributes CRLF bytes for unchanged package files.
+                    log.debug(
+                        "baked workflow package staging failed for %s",
+                        manifest_path,
+                        exc_info=True,
+                    )
             # mcp_servers fragment -> config.yaml (merge missing only)
             frag_name = manifest.get("mcpServersFile")
             frag = cap_dir / frag_name if frag_name else None

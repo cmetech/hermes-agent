@@ -17,6 +17,8 @@ coverage:
     reason: Separate user-requested v2.0.3 release preparation.
   - commit: 8b5f733d8a8127f62ab7526d9d70dcaf8574b187
     reason: Separate user-requested v2.0.4 release preparation.
+  - commit: 25233c88cc37671da769a37c17a322f6dc618dc8
+    reason: Separate user-requested v2.0.5 release preparation.
 upstream_changes:
 - id: gateway-live-completion-eligibility
   change_class: model-selection-generic
@@ -306,6 +308,25 @@ upstream_changes:
     round-trip used by capability staging.
   removal_condition: Remove when the bundled workflow plugin has an upstream-owned
     authorization policy that remains visible to doctor and runtime paths.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: capability-baked-migration-isolation
+  change_class: capability-staging-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/capability_staging.py
+  owned_symbols:
+  - seed_baked_capabilities
+  tests:
+  - tests/hermes_cli/test_baked_seed.py
+  expected_commit_subject: 'fix(capabilities): isolate baked workflow migration failures'
+  upstream_candidate: true
+  merge_guidance: Preserve fail-closed digest verification for each baked workflow
+    package while allowing independent plugin activation and MCP default migrations
+    to continue when one package cannot be authenticated. This is required for
+    updated Git-for-Windows checkouts that retain pre-LF-attribute CRLF bytes.
+  removal_condition: Remove when baked capability startup isolates authenticated
+    package publication from independent config migrations with equivalent upgrade
+    coverage.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-showcase-distribution
   change_class: packaging-generic
