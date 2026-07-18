@@ -47,9 +47,32 @@ Query, platform-native process primitives, GitHub Actions.
   process/middleware boundaries where applicable, and ends with an exact-file
   commit.
 - Preserve the v2.0.9 migration fixture byte-for-byte and migrate only copies.
+- Every task that changes workflow SQLite schema or migration code updates and
+  runs the standing cumulative migration test described below.
 - Stage only the files listed by the task being committed.
 
 ---
+
+## Standing cumulative migration gate
+
+`tests/plugins/workflow/test_schema_migrations.py` owns
+`test_pre_amendment_v209_store_reaches_current_full_schema_idempotently`.
+The test copies the hash-pinned v2.0.9 database and evidence tree, opens it
+through the current `RunStore`/coordinator/outbox schema installers twice, and
+asserts after each open:
+
+- `PRAGMA user_version` is current and `foreign_key_check` and
+  `integrity_check` pass;
+- every current table, column, uniqueness rule, and index required by the task
+  exists, including independently installed coordinator/outbox structures;
+- the second open performs no additional migration and returns the same schema
+  manifest;
+- original journal/artifact bytes and hashes are unchanged; and
+- the legacy run remains readable, idempotently discoverable, and appendable.
+
+Tasks 1, 4, 6, 7, 9, 10, 11, and 14 list this test explicitly because their
+planned storage changes are cumulative. Any other task that introduces a
+schema change must add the same file and gate before implementation proceeds.
 
 ## Dependency and merge policy
 
@@ -84,8 +107,11 @@ blocked items 6, 11, 15, 16, and 17 also remain open.
   `RunStore.cleanup_runs`; the store
   hashes the binding into cleanup-preview state and requires the same binding
   at execution.
-- Session callers receive read/write/delivery only within their verified
-  principal scope. `workflow:read` tokens receive read only;
+- A loopback Desktop/backend request authenticated by Hermes' existing
+  ephemeral local session-token path (`local_admin_authenticated`) receives
+  every capability. A remote hosted session receives read/write/delivery only
+  within its verified principal scope and never receives admin merely because
+  a session exists. `workflow:read` tokens receive read only;
   `workflow:write` receives read/write; `workflow:delivery` receives
   read/delivery for its bound projection scope; `workflow:admin` and
   local-admin authentication receive every capability.
@@ -114,7 +140,10 @@ def test_write_token_cannot_execute_cleanup(real_workflow_app):
 Also prove session scope cannot expand through
 `X-Hermes-Operator-Scope`, a cleanup token minted for principal A fails for
 principal B, a delivery authority cannot lease or acknowledge another bound
-destination, and admin/local-admin succeeds.
+destination, a remote non-admin session/token cannot preview or execute
+cleanup, and the loopback Desktop session can preview and execute it. Extend
+the standing v2.0.9 cumulative migration assertion for authority-bound cleanup
+preview state.
 
 - [ ] **Step 2: Run the tests and verify the bypass**
 
@@ -155,7 +184,9 @@ Call `require("write")` before workflow-state mutations,
 receipts, and `require("admin")` before cleanup preview/execute/history,
 dead-letter repair, or notification pruning. A delivery authority may only
 operate on notifications whose durable destination binding matches its
-verified projection scope.
+verified projection scope. Derive local admin only from the existing loopback
+session-token middleware fact; neither `request.state.session` nor any header
+may mint it.
 Persist `authority_binding_digest` in `cleanup_previews`; validate it before
 candidate comparison or deletion. Do not authorize from client headers.
 
@@ -360,7 +391,9 @@ def test_same_cli_key_from_new_process_joins_existing(tmp_path, workflow_path):
 
 Also test changed inputs conflict, different verified principals do not join,
 return-route rotation does not conflict, and legacy missing-trigger projections
-report `source="unknown"`, `assurance="legacy_unknown"`.
+report `source="unknown"`, `assurance="legacy_unknown"`. Extend the standing
+v2.0.9 cumulative migration assertion to require the new namespace column,
+composite uniqueness rule, recreated indexes, and an idempotent second open.
 
 - [ ] **Step 2: Verify the PID test fails**
 
@@ -430,7 +463,9 @@ def test_showcase_json_no_wait_requires_key(parser, capsys):
 ```
 
 Assert preflight lists `symptom` before execution and trust-store bytes are
-unchanged across a showcase run.
+unchanged across a showcase run. In the same real-store test, execute the
+bundled laptop diagnostic through its terminal result and assert evidence is
+created without a trust-row insert.
 
 - [ ] **Step 2: Run and confirm random-key/trust side effects**
 
@@ -445,7 +480,9 @@ pytest -q tests/plugins/workflow/test_showcase_catalog.py \
 Apply the same key gate as general workflow starts. Build preflight input
 requirements from the package definition/delivery defaults. Replace per-run
 `WorkflowTrustStore.trust` with immutable bundled-distribution verification and
-the real risk digest used by doctor/trust.
+the real risk digest used by doctor/trust. The catalog loader passes verified
+bundled provenance into the ordinary trust decision; it does not bypass risk
+validation or make bundled packages trusted by filename alone.
 
 - [ ] **Step 4: Run showcase and skill behavior tests**
 
@@ -468,12 +505,15 @@ git commit -m "fix(workflow): harden showcase machine starts"
 **Files:**
 
 - Modify: `plugins/workflow/models.py`
+- Create: `plugins/workflow/lease_clock.py`
+- Modify: `plugins/workflow/coordinator_store.py`
 - Modify: `plugins/workflow/coordinator.py`
 - Modify: `plugins/workflow/scheduler.py`
 - Modify: `plugins/workflow/store.py`
 - Modify: `tests/plugins/workflow/test_coordinator.py`
 - Modify: `tests/plugins/workflow/test_coordinator_multiprocess.py`
 - Modify: `tests/plugins/workflow/test_shutdown_recovery.py`
+- Modify: `tests/plugins/workflow/test_schema_migrations.py`
 
 **Interfaces:**
 
@@ -482,25 +522,44 @@ git commit -m "fix(workflow): harden showcase machine starts"
 class ExecutionFence:
     owner_id: str
     owner_epoch: int
+
+@dataclass(frozen=True, slots=True)
+class LeaseClockSample:
+    utc_now: datetime
+    monotonic_now: float
+    boot_id: str
 ```
 
 `NodeClaim` carries the fence. Claim, pre-spawn authorization, heartbeat,
 process-start/stop, loop-iteration, completion, retry scheduling, and
 owner-filtered interruption validate the fence against the fresh
-`coordinator_lease` row while holding `BEGIN IMMEDIATE`.
+`coordinator_lease` row while holding `BEGIN IMMEDIATE`. Coordinator leases
+persist the clock sample. On the same machine/boot, monotonic elapsed time is
+authoritative; a backward or forward wall-clock step cannot extend or
+prematurely expire ownership. A different boot on the same machine proves the
+old process dead. A legacy lease without a boot/monotonic sample fails closed
+for new dispatch until its UTC deadline expires. Profile-local workflow stores
+are not supported as cross-machine shared databases.
 
 - [ ] **Step 1: Add a mid-node takeover multiprocess test**
 
 The test blocks old epoch 1 after it selects an outward node, expires/takes over
 with epoch 2, then releases epoch 1. Assert epoch 1 cannot spawn, complete,
 schedule retry, or interrupt epoch-2 claims, and only epoch 2 creates outward
-effect evidence.
+effect evidence. Inject a backward UTC step with monotonic time past the lease
+and assert takeover; inject a forward UTC step with monotonic time still fresh
+and assert no takeover. A legacy uncorroborated lease must refuse dispatch
+rather than elect an overlapping leader before its UTC deadline. Extend the
+standing v2.0.9 migration test for the lease clock fields and idempotent
+coordinator-schema installation.
 
 - [ ] **Step 2: Verify current stale dispatch and broad interruption**
 
 ```bash
-pytest -q tests/plugins/workflow/test_coordinator_multiprocess.py \
-  tests/plugins/workflow/test_shutdown_recovery.py -k 'epoch or takeover or successor'
+pytest -q tests/plugins/workflow/test_coordinator.py \
+  tests/plugins/workflow/test_coordinator_multiprocess.py \
+  tests/plugins/workflow/test_shutdown_recovery.py \
+  -k 'epoch or takeover or successor or wall_clock or clock_domain'
 ```
 
 Expected: stale dispatch or successor-claim interruption is observed.
@@ -511,7 +570,13 @@ Add `RunStore.assert_execution_fence(connection, fence, now)` and call it inside
 every coordinator-owned state transaction. Check again immediately before
 spawn intent. Change `interrupt_active_claims` to require an exact fence and
 ignore claims from another owner/epoch. Losing leadership sets scheduler stop
-before awaiting sweep shutdown.
+before awaiting sweep shutdown. Implement a plugin-owned cross-platform
+boot-clock provider using the existing pinned `psutil.boot_time()` dependency;
+do not infer elapsed lease time from mutable UTC. Persist boot identity and
+heartbeat monotonic time in `coordinator_lease`, and use one
+`lease_is_fresh` predicate in acquire, renew, health, admission, and fence
+checks. A boot-ID change may expire the old lease because a process cannot
+survive a reboot on the supported profile-local host model.
 
 - [ ] **Step 4: Run coordinator, scheduler, and shutdown tests**
 
@@ -519,17 +584,20 @@ before awaiting sweep shutdown.
 pytest -q tests/plugins/workflow/test_coordinator.py \
   tests/plugins/workflow/test_coordinator_multiprocess.py \
   tests/plugins/workflow/test_scheduler.py \
-  tests/plugins/workflow/test_shutdown_recovery.py
+  tests/plugins/workflow/test_shutdown_recovery.py \
+  tests/plugins/workflow/test_schema_migrations.py
 ```
 
 - [ ] **Step 5: Commit exact files**
 
 ```bash
-git add plugins/workflow/models.py plugins/workflow/coordinator.py \
+git add plugins/workflow/models.py plugins/workflow/lease_clock.py \
+  plugins/workflow/coordinator_store.py plugins/workflow/coordinator.py \
   plugins/workflow/scheduler.py plugins/workflow/store.py \
   tests/plugins/workflow/test_coordinator.py \
   tests/plugins/workflow/test_coordinator_multiprocess.py \
-  tests/plugins/workflow/test_shutdown_recovery.py
+  tests/plugins/workflow/test_shutdown_recovery.py \
+  tests/plugins/workflow/test_schema_migrations.py
 git commit -m "fix(workflow): fence coordinator execution epochs"
 ```
 
@@ -546,6 +614,7 @@ git commit -m "fix(workflow): fence coordinator execution epochs"
 - Modify: `tests/plugins/workflow/test_crash_recovery.py`
 - Modify: `tests/plugins/workflow/test_shutdown_recovery.py`
 - Modify: `tests/plugins/workflow/test_fault_injection.py`
+- Modify: `tests/plugins/workflow/test_schema_migrations.py`
 
 **Interfaces:** A durable `spawn_intent` precedes process creation. Only an
 explicit durable `spawn_failed` proves not-started; an identityless unresolved
@@ -557,7 +626,8 @@ Corroborated load resynchronizes all derived index fields, including status.
 Inject process death after `spawn_intent` but before `process_started`; pause one
 parallel node while another has a live claim and attempt abandon; append a
 terminal journal frame while suppressing the SQLite status update and load it
-again in the same process.
+again in the same process. Run the standing v2.0.9 cumulative migration test
+against any new spawn/recovery storage introduced by the fix.
 
 - [ ] **Step 2: Run and verify unsafe classifications**
 
@@ -581,7 +651,8 @@ execution mode, queue fields, state version, and integrity columns together.
 pytest -q tests/plugins/workflow/test_crash_recovery.py \
   tests/plugins/workflow/test_shutdown_recovery.py \
   tests/plugins/workflow/test_fault_injection.py \
-  tests/plugins/workflow/test_process_lifecycle_soak.py
+  tests/plugins/workflow/test_process_lifecycle_soak.py \
+  tests/plugins/workflow/test_schema_migrations.py
 ```
 
 - [ ] **Step 5: Commit exact files**
@@ -591,7 +662,8 @@ git add plugins/workflow/store.py plugins/workflow/scheduler.py \
   plugins/workflow/executors/bash.py plugins/workflow/executors/script.py \
   tests/plugins/workflow/test_crash_recovery.py \
   tests/plugins/workflow/test_shutdown_recovery.py \
-  tests/plugins/workflow/test_fault_injection.py
+  tests/plugins/workflow/test_fault_injection.py \
+  tests/plugins/workflow/test_schema_migrations.py
 git commit -m "fix(workflow): close executor recovery windows"
 ```
 
@@ -661,6 +733,7 @@ git commit -m "fix(workflow): adopt expired foreground owners"
 - Modify: `tests/plugins/workflow/test_fault_injection.py`
 - Modify: `tests/plugins/workflow/test_loop_executor.py`
 - Modify: `tests/plugins/workflow/test_resources.py`
+- Modify: `tests/plugins/workflow/test_schema_migrations.py`
 
 **Interfaces:** Each claimed attempt owns a reserved terminal/recovery frame
 budget that loop/progress events cannot consume. Worker claims release only
@@ -671,6 +744,8 @@ after terminal state is durably appended and indexed.
 Run a loop until ordinary event quota is exhausted, then complete/fail it.
 Assert one terminal or storage-recovery record is durable, the run is not
 `running` with terminal nodes, and no second worker can claim uncertain work.
+Extend the standing v2.0.9 cumulative migration assertion for terminal-reserve
+and repair-state storage.
 
 - [ ] **Step 2: Verify terminal append currently wedges**
 
@@ -692,7 +767,8 @@ independent SQLite repair table, and refuse replay.
 ```bash
 pytest -q tests/plugins/workflow/test_fault_injection.py \
   tests/plugins/workflow/test_loop_executor.py \
-  tests/plugins/workflow/test_resources.py
+  tests/plugins/workflow/test_resources.py \
+  tests/plugins/workflow/test_schema_migrations.py
 ```
 
 - [ ] **Step 5: Commit exact files**
@@ -701,7 +777,8 @@ pytest -q tests/plugins/workflow/test_fault_injection.py \
 git add plugins/workflow/store.py plugins/workflow/models.py \
   tests/plugins/workflow/test_fault_injection.py \
   tests/plugins/workflow/test_loop_executor.py \
-  tests/plugins/workflow/test_resources.py
+  tests/plugins/workflow/test_resources.py \
+  tests/plugins/workflow/test_schema_migrations.py
 git commit -m "fix(workflow): reserve terminal journal capacity"
 ```
 
@@ -718,6 +795,7 @@ git commit -m "fix(workflow): reserve terminal journal capacity"
 - Modify: `plugins/workflow/store.py`
 - Modify: `tests/plugins/workflow/test_coordinator.py`
 - Modify: `tests/plugins/workflow/test_performance_bounds.py`
+- Modify: `tests/plugins/workflow/test_schema_migrations.py`
 
 **Interfaces:**
 
@@ -733,7 +811,9 @@ git commit -m "fix(workflow): reserve terminal journal capacity"
 Assert run 201 is eventually submitted, one long node does not block another
 run's promotion, idle backoff increases when scans find no actionable work, and
 stalled events occur only at exact 60/300-second boundaries using injected UTC
-and monotonic clocks.
+and monotonic clocks. Reuse Task 6's `LeaseClockSample` for lease and stall
+evaluation, and extend the standing v2.0.9 cumulative migration assertion for
+cursor/progress fields.
 
 - [ ] **Step 2: Verify cursor and threshold failures**
 
@@ -753,7 +833,8 @@ last runnable/semantic progress into a single deduplicated stalled transition.
 - [ ] **Step 4: Run coordinator/performance tests**
 
 Use the Step 2 command without `-k`; expected PASS and each bounded timing
-assertion remains below its stated deadline.
+assertion remains below its stated deadline. Then run
+`tests/plugins/workflow/test_schema_migrations.py` in full.
 
 - [ ] **Step 5: Commit exact files**
 
@@ -761,7 +842,8 @@ assertion remains below its stated deadline.
 git add plugins/workflow/models.py plugins/workflow/coordinator_store.py \
   plugins/workflow/coordinator.py plugins/workflow/scheduler.py \
   plugins/workflow/store.py tests/plugins/workflow/test_coordinator.py \
-  tests/plugins/workflow/test_performance_bounds.py
+  tests/plugins/workflow/test_performance_bounds.py \
+  tests/plugins/workflow/test_schema_migrations.py
 git commit -m "fix(workflow): bound coordinator sweeps and stalls"
 ```
 
@@ -778,6 +860,7 @@ git commit -m "fix(workflow): bound coordinator sweeps and stalls"
 - Modify: `tests/plugins/workflow/test_parallel_scheduler.py`
 - Modify: `tests/plugins/workflow/test_retry.py`
 - Modify: `tests/plugins/workflow/test_approval_races.py`
+- Modify: `tests/plugins/workflow/test_schema_migrations.py`
 
 **Interfaces:** `RunStore.request_runnable(run_id, reason, expected_version)` is
 the only paused/retry/resume/input/reconcile-to-runnable transition. It either
@@ -793,6 +876,8 @@ Resume/approve/provide-input concurrently at `max_executing_runs`; assert the
 limit is never exceeded. Create older/newer queued runs and assert the older is
 promoted first. Assert default paused outward run blocks a duplicate, explicit
 safe release works, waiting retry releases, and uncertain interrupted holds.
+Extend the standing v2.0.9 cumulative migration assertion for FIFO sequence
+and lane/admission state.
 
 - [ ] **Step 2: Verify direct `running` transitions oversubscribe**
 
@@ -815,7 +900,8 @@ methods. Promotion orders by queue sequence, never newest-first list order.
 pytest -q tests/plugins/workflow/test_admission.py \
   tests/plugins/workflow/test_parallel_scheduler.py \
   tests/plugins/workflow/test_retry.py \
-  tests/plugins/workflow/test_approval_races.py
+  tests/plugins/workflow/test_approval_races.py \
+  tests/plugins/workflow/test_schema_migrations.py
 ```
 
 - [ ] **Step 5: Commit exact files**
@@ -825,7 +911,8 @@ git add plugins/workflow/schema.py plugins/workflow/store.py \
   plugins/workflow/actions.py tests/plugins/workflow/test_admission.py \
   tests/plugins/workflow/test_parallel_scheduler.py \
   tests/plugins/workflow/test_retry.py \
-  tests/plugins/workflow/test_approval_races.py
+  tests/plugins/workflow/test_approval_races.py \
+  tests/plugins/workflow/test_schema_migrations.py
 git commit -m "fix(workflow): centralize runnable admission"
 ```
 
@@ -900,6 +987,7 @@ git commit -m "fix(workflow): prove Windows process termination"
 - Modify: `tests/hermes_cli/test_plugin_background_services.py`
 - Modify: `tests/hermes_cli/test_web_server.py`
 - Modify: `tests/gateway/test_plugin_background_services.py`
+- Create: `tests/hermes_cli/test_plugin_provider_hot_reload.py`
 - Modify: `docs/upstream-customizations/workflow-orchestration.yaml`
 
 **Interfaces:** `PluginManager.start_background_services(host_kind)` rejects or
@@ -912,14 +1000,20 @@ configuration reload is host-owned and calls
 Start a wedged service, call start again, and assert no second factory/thread.
 Change provider configuration in a web/gateway host and assert the host either
 quiesces/reloads successfully or returns explicit `plugin_reload_blocked` while
-the old provider and service generation remain usable.
+the old provider and service generation remain usable. In a positive real-path
+case, add a temporary image-generation provider after initial discovery, invoke
+the production host-controller reload, then call
+`tools.image_generation_tool._dispatch_to_plugin_provider` and assert the new
+provider executes without a process restart or tool-side force rescan.
 
 - [ ] **Step 2: Verify overlap and silent provider failure**
 
 ```bash
 pytest -q tests/hermes_cli/test_plugin_background_services.py \
   tests/hermes_cli/test_web_server.py \
-  tests/gateway/test_plugin_background_services.py -k 'same_kind or provider_reload or dormancy'
+  tests/gateway/test_plugin_background_services.py \
+  tests/hermes_cli/test_plugin_provider_hot_reload.py \
+  -k 'same_kind or provider_reload or provider_hot_add or dormancy'
 ```
 
 - [ ] **Step 3: Implement host-owned reload routing**
@@ -929,7 +1023,10 @@ health threads terminate. Remove swallowed forced rescans from tool dispatch;
 configuration mutation schedules a host-controller reload. CLI processes with
 no bound host may still force discovery directly. Strengthen factory dormancy
 to inspect the real workflow lease/database path and prove cached `health()`
-returns within 100 ms without I/O.
+returns within 100 ms without I/O. A successful host reload must atomically
+publish the new plugin/provider registry before callers resume; a blocked
+reload leaves the old registry usable and never reports the new provider as
+active.
 
 - [ ] **Step 4: Run lifecycle host tests**
 
@@ -957,6 +1054,7 @@ git commit -m "fix(plugins): prevent background service overlap"
 - Modify: `tests/plugins/workflow/test_notifications.py`
 - Modify: `tests/plugins/workflow/test_notification_delivery.py`
 - Modify: `tests/plugins/workflow/test_retention.py`
+- Modify: `tests/plugins/workflow/test_schema_migrations.py`
 
 **Interfaces:**
 
@@ -973,7 +1071,9 @@ git commit -m "fix(plugins): prevent background service overlap"
 Fail delivery eight times, retry it through the authenticated API, ack it, and
 assert cleanup is no longer permanently blocked. Insert more than 200 facts and
 assert newest history is visible. Instrument journal/fact reads and assert one
-repair tick respects its page/byte budget.
+repair tick respects its page/byte budget. Extend the standing v2.0.9
+cumulative migration assertion for final outbox/fact/dead-letter indexes and an
+idempotent second schema install.
 
 - [ ] **Step 2: Verify dead letters cannot recover**
 
@@ -992,7 +1092,8 @@ retry, prune, and terminal dead-letter decisions as immutable facts.
 
 - [ ] **Step 4: Run notification/retention tests**
 
-Use the Step 2 command without `-k`; expected PASS.
+Use the Step 2 command without `-k`, then run
+`tests/plugins/workflow/test_schema_migrations.py` in full; expected PASS.
 
 - [ ] **Step 5: Commit exact files**
 
@@ -1001,7 +1102,8 @@ git add plugins/workflow/notifications.py plugins/workflow/store.py \
   plugins/workflow/coordinator.py plugins/workflow/dashboard/plugin_api.py \
   tests/plugins/workflow/test_notifications.py \
   tests/plugins/workflow/test_notification_delivery.py \
-  tests/plugins/workflow/test_retention.py
+  tests/plugins/workflow/test_retention.py \
+  tests/plugins/workflow/test_schema_migrations.py
 git commit -m "fix(workflow): complete notification recovery"
 ```
 
