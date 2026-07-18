@@ -118,6 +118,7 @@ def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
             "worker_claims",
             "workflow_notification_facts",
             "workflow_notification_outbox",
+            "workflow_notification_reconcile_state",
         } <= tables
         indexes = {
             row["name"]

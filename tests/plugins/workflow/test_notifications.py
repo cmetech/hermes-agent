@@ -186,3 +186,48 @@ def test_coordinator_reconciles_journal_outbox_crash_gap(
     facts = outbox.history(run_id=admitted.run_id)
     assert facts[0]["kind"] == "completion"
     assert facts[0]["state"] == "suppressed"
+
+
+def test_journal_reconciliation_pages_and_wraps_without_stranding_old_runs(
+    tmp_path, workflow_writer
+):
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(workflow_writer(tmp_path / "package", name="paged-gap"))
+    run_ids = []
+    for index in range(3):
+        prepared = store.prepare_run_snapshot(package)
+        admitted = store.start_run(
+            RunAdmissionRequest(
+                workflow_name="paged-gap",
+                definition_digest=prepared.definition_digest,
+                policy_digest=prepared.policy_digest,
+                input_manifest_digest=prepared.input_manifest_digest,
+                trigger_source="cli",
+                idempotency_key=f"paged-gap-{index}",
+                concurrency_key=f"paged-gap-{index}",
+            ),
+            immutable_snapshot=prepared,
+        )
+        RunScheduler(store).advance(admitted.run_id)
+        run_ids.append(admitted.run_id)
+
+    outbox = NotificationOutbox(store)
+    with store._connect() as connection:
+        connection.execute("DELETE FROM workflow_notification_facts")
+        connection.execute("DELETE FROM workflow_notification_outbox")
+
+    assert [outbox.reconcile_journal(limit_runs=1) for _ in range(3)] == [1, 1, 1]
+    assert all(outbox.history(run_id=run_id) for run_id in run_ids)
+
+    oldest = run_ids[0]
+    with store._connect() as connection:
+        connection.execute(
+            "DELETE FROM workflow_notification_facts WHERE run_id=?", (oldest,)
+        )
+        connection.execute(
+            "DELETE FROM workflow_notification_outbox WHERE run_id=?", (oldest,)
+        )
+
+    repaired = [outbox.reconcile_journal(limit_runs=1) for _ in range(4)]
+    assert sum(repaired) == 1
+    assert outbox.history(run_id=oldest)

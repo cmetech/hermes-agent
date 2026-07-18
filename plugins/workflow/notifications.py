@@ -62,6 +62,14 @@ def install_notification_schema(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS workflow_notification_fact_run
         ON workflow_notification_facts(run_id, occurred_at);
+        CREATE TABLE IF NOT EXISTS workflow_notification_reconcile_state (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            cursor_created_at TEXT,
+            cursor_run_id TEXT
+        );
+        INSERT OR IGNORE INTO workflow_notification_reconcile_state (
+            singleton, cursor_created_at, cursor_run_id
+        ) VALUES (1, NULL, NULL);
         """
     )
 
@@ -232,13 +240,41 @@ class NotificationOutbox:
 
     def reconcile_journal(self, *, limit_runs: int = 200) -> int:
         """Idempotently repair a crash gap between journal and outbox writes."""
+        if not 1 <= limit_runs <= 1000:
+            raise ValueError("limit_runs must be between 1 and 1000")
         repaired = 0
         with self.store._connect() as connection:
-            rows = connection.execute(
-                "SELECT run_id, run_directory FROM runs "
-                "WHERE admission_state='published' ORDER BY created_at DESC LIMIT ?",
-                (limit_runs,),
-            ).fetchall()
+            cursor = connection.execute(
+                "SELECT cursor_created_at, cursor_run_id FROM "
+                "workflow_notification_reconcile_state WHERE singleton=1"
+            ).fetchone()
+            cursor_created_at = cursor["cursor_created_at"] if cursor else None
+            cursor_run_id = cursor["cursor_run_id"] if cursor else None
+
+            def page(after_created_at: str | None, after_run_id: str | None):
+                if after_created_at is None or after_run_id is None:
+                    return connection.execute(
+                        "SELECT run_id, run_directory, created_at FROM runs "
+                        "WHERE admission_state='published' "
+                        "ORDER BY created_at, run_id LIMIT ?",
+                        (limit_runs,),
+                    ).fetchall()
+                return connection.execute(
+                    "SELECT run_id, run_directory, created_at FROM runs "
+                    "WHERE admission_state='published' AND "
+                    "(created_at>? OR (created_at=? AND run_id>?)) "
+                    "ORDER BY created_at, run_id LIMIT ?",
+                    (
+                        after_created_at,
+                        after_created_at,
+                        after_run_id,
+                        limit_runs,
+                    ),
+                ).fetchall()
+
+            rows = page(cursor_created_at, cursor_run_id)
+            if not rows and cursor_created_at is not None:
+                rows = page(None, None)
             existing = {
                 str(item["transition_key"])
                 for item in connection.execute(
@@ -287,6 +323,14 @@ class NotificationOutbox:
                 )
                 existing.add(transition_key)
                 repaired += 1
+        if rows:
+            last = rows[-1]
+            with self.store._connect() as connection:
+                connection.execute(
+                    "UPDATE workflow_notification_reconcile_state SET "
+                    "cursor_created_at=?, cursor_run_id=? WHERE singleton=1",
+                    (last["created_at"], last["run_id"]),
+                )
         return repaired
 
     def lease(
