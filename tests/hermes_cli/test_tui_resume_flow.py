@@ -403,11 +403,14 @@ def test_termux_ultrafast_version_runs_before_heavy_startup(
     monkeypatch.setenv("TERMUX_VERSION", "1")
     monkeypatch.delenv("HERMES_TERMUX_DISABLE_FAST_CLI", raising=False)
     monkeypatch.setattr(sys, "argv", ["hermes", "--version"])
+    monkeypatch.setattr(
+        "hermes_constants.version_agent_label", lambda: "Co-worker Agent"
+    )
 
     assert main_mod._try_termux_ultrafast_version() is True
 
     out = capsys.readouterr().out
-    assert "Hermes Agent v" in out
+    assert "Co-worker Agent v" in out
     assert "Install directory:" in out
     assert "Python:" in out
     assert "OpenAI SDK:" in out
