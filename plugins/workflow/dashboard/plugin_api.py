@@ -418,6 +418,14 @@ def mutate_run(
                 if result.outcome != "applied":
                     raise RuntimeError("stale rejection decision")
             elif action == "provide-input":
+                pending = current.get("pending_interaction")
+                actual_interaction = (
+                    pending.get("interaction_id")
+                    if isinstance(pending, Mapping)
+                    else None
+                )
+                if actual_interaction != request.interaction_id:
+                    raise ValueError("interaction ID does not match pending input")
                 store.provide_loop_input(
                     run_id,
                     request.value,

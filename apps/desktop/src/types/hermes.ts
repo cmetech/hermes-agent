@@ -105,15 +105,37 @@ export interface WorkflowProgress {
   total_nodes: number
 }
 
+export interface WorkflowProvenance {
+  actor_id?: null | string
+  admitted_at?: string
+  assurance: 'legacy_unknown' | 'local_admin_claim' | 'system_schedule' | 'verified_adapter'
+  claimed_actor?: null | string
+  source: 'api' | 'background_agent' | 'chat' | 'cli' | 'cron' | 'desktop'
+  source_instance?: null | string
+}
+
+export interface WorkflowCoordinatorSnapshot {
+  epoch?: null | number
+  heartbeat_at?: null | string
+  host_kind?: null | string
+  lease_expires_at?: null | string
+  owner_id?: null | string
+  reason_code?: null | string
+  status: string
+}
+
 export interface WorkflowRunSnapshot {
   admission_disposition?: string
   artifacts?: unknown[]
   blocked_by_run_id?: null | string
   concurrency_key?: string
+  coordinator?: WorkflowCoordinatorSnapshot
   current_nodes?: string[]
   health: string
   next_actions: string[]
   pending_interaction?: null | Record<string, unknown>
+  previous_node?: null | string
+  provenance?: WorkflowProvenance
   progress: WorkflowProgress
   queue_position?: null | number
   run_id: string
@@ -123,6 +145,25 @@ export interface WorkflowRunSnapshot {
   workflow: string
   workflow_version?: string
   [key: string]: unknown
+}
+
+export type WorkflowEvidenceKind =
+  | 'artifacts'
+  | 'attempts'
+  | 'cleanup'
+  | 'coordinator'
+  | 'interactions'
+  | 'logs'
+  | 'outputs'
+  | 'recovery'
+  | 'timeline'
+
+export interface WorkflowEvidencePage {
+  items: Array<Record<string, unknown>>
+  kind: WorkflowEvidenceKind
+  next_cursor: number
+  schema_version: number
+  truncated: boolean
 }
 
 export interface WorkflowRunPage {

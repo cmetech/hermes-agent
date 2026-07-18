@@ -59,6 +59,8 @@ import type {
   ToolsetModelsResponse,
   WorkflowAttentionPage,
   WorkflowEventPage,
+  WorkflowEvidenceKind,
+  WorkflowEvidencePage,
   WorkflowRunPage,
   WorkflowRunSnapshot
 } from '@/types/hermes'
@@ -257,6 +259,19 @@ export function listWorkflowEvents(runId: string, after = 0): Promise<WorkflowEv
   })
 }
 
+export function getWorkflowEvidence(
+  runId: string,
+  kind: WorkflowEvidenceKind,
+  after = 0
+): Promise<WorkflowEvidencePage> {
+  const query = new URLSearchParams({ after: String(after), kind })
+
+  return window.hermesDesktop.api<WorkflowEvidencePage>({
+    path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/evidence?${query}`,
+    ...profileScoped()
+  })
+}
+
 export function mutateWorkflowRun(
   runId: string,
   action: string,
@@ -280,9 +295,13 @@ export function getKanbanBoardSummary(board: string): Promise<KanbanBoardSummary
 export function listKanbanTasks(board: string, status?: string, cursor?: string): Promise<KanbanTaskPage> {
   const query = new URLSearchParams({ board })
 
-  if (status) {query.set('status', status)}
+  if (status) {
+    query.set('status', status)
+  }
 
-  if (cursor) {query.set('cursor', cursor)}
+  if (cursor) {
+    query.set('cursor', cursor)
+  }
 
   return window.hermesDesktop.api<KanbanTaskPage>({
     path: `/api/plugins/kanban/tasks?${query.toString()}`,

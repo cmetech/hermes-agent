@@ -1391,6 +1391,26 @@ export interface Translations {
     timeline: string
     trigger: string
     waitingFor: string
+    origin: string
+    assurance: string
+    coordinator: string
+    currentNode: string
+    previousNode: string
+    lastProgress: string
+    failureCause: string
+    overview: string
+    attempts: string
+    logs: string
+    outputs: string
+    recovery: string
+    noEvidence: string
+    provideInput: string
+    inputValue: string
+    reconcile: string
+    reconciliationOutcome: string
+    confirmedSucceeded: string
+    confirmedFailed: string
+    safeToRetry: string
     approve: string
     reject: string
     cancel: string

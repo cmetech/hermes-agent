@@ -4,7 +4,14 @@ import { useMemo, useRef, useState } from 'react'
 
 import { ActivityBoard } from '@/components/activity-board/activity-board'
 import { PageLoader } from '@/components/page-loader'
-import { getApiRequestProfile, getWorkflowRun, listWorkflowAttention, listWorkflowEvents, listWorkflowRuns, mutateWorkflowRun } from '@/hermes'
+import {
+  getApiRequestProfile,
+  getWorkflowRun,
+  listWorkflowAttention,
+  listWorkflowEvents,
+  listWorkflowRuns,
+  mutateWorkflowRun
+} from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { WorkflowEventPage, WorkflowRunPage } from '@/types/hermes'
 
@@ -36,20 +43,20 @@ export function WorkflowsView() {
     initialPageParam: undefined as string | undefined,
     queryFn: ({ pageParam }) => listWorkflowRuns(pageParam as string | undefined),
     queryKey: ['workflow-runs', profile],
-    refetchInterval: () => document.visibilityState === 'visible' ? 20_000 : false
+    refetchInterval: () => (document.visibilityState === 'visible' ? 20_000 : false)
   })
 
   const attention = useQuery({
     queryFn: listWorkflowAttention,
     queryKey: ['workflow-attention', profile],
-    refetchInterval: () => document.visibilityState === 'visible' ? 20_000 : false
+    refetchInterval: () => (document.visibilityState === 'visible' ? 20_000 : false)
   })
 
   const selected = useQuery({
     enabled: Boolean(selectedRunId),
     queryFn: () => getWorkflowRun(selectedRunId!),
     queryKey: ['workflow-run', profile, selectedRunId],
-    refetchInterval: () => document.visibilityState === 'visible' ? 1_000 : false
+    refetchInterval: () => (document.visibilityState === 'visible' ? 20_000 : false)
   })
 
   const eventQueryKey = ['workflow-events', profile, selectedRunId] as const
@@ -60,21 +67,27 @@ export function WorkflowsView() {
       const previous = queryClient.getQueryData<WorkflowEventPage>(eventQueryKey)
       const page = await listWorkflowEvents(selectedRunId!, previous?.next_cursor ?? 0)
 
-      if (!previous || page.cursor_reset) {return page}
+      if (!previous || page.cursor_reset) {
+        return page
+      }
 
       return { ...page, events: [...previous.events, ...page.events].slice(-200) }
     },
     queryKey: eventQueryKey,
-    refetchInterval: () => document.visibilityState === 'visible' ? 1_000 : false
+    refetchInterval: () => (document.visibilityState === 'visible' ? 1_000 : false)
   })
 
   const mutation = useMutation({
-    mutationFn: (action: string) => mutateWorkflowRun(selectedRunId!, action, {
-      expected_version: selected.data?.state_version ?? -1,
-      interaction_id: selected.data?.pending_interaction?.interaction_id
-    }),
+    mutationFn: ({ action, body = {} }: { action: string; body?: Record<string, unknown> }) =>
+      mutateWorkflowRun(selectedRunId!, action, {
+        ...body,
+        expected_version: selected.data?.state_version ?? -1,
+        interaction_id: selected.data?.pending_interaction?.interaction_id
+      }),
     onError: async error => {
-      if (!isConflict(error)) {return}
+      if (!isConflict(error)) {
+        return
+      }
 
       await queryClient.refetchQueries({
         exact: true,
@@ -93,17 +106,22 @@ export function WorkflowsView() {
     }
   })
 
-  const mutateRun = (action: string) => {
-    if (actionInFlight.current) {return}
+  const mutateRun = (action: string, body?: Record<string, unknown>) => {
+    if (actionInFlight.current) {
+      return
+    }
 
     actionInFlight.current = true
     setActionPending(true)
-    mutation.mutate(action, {
-      onSettled: () => {
-        actionInFlight.current = false
-        setActionPending(false)
+    mutation.mutate(
+      { action, body },
+      {
+        onSettled: () => {
+          actionInFlight.current = false
+          setActionPending(false)
+        }
       }
-    })
+    )
   }
 
   const pages = (runs.data?.pages ?? []) as WorkflowRunPage[]
@@ -115,7 +133,9 @@ export function WorkflowsView() {
     [nextCursor, runItems, runs.isError, t.operations.workflows]
   )
 
-  if (runs.isLoading) {return <PageLoader />}
+  if (runs.isLoading) {
+    return <PageLoader />
+  }
 
   if (runs.isError && !runs.data) {
     return <p className={PAGE_INSET_X}>{t.operations.workflowUnavailable}</p>
@@ -125,7 +145,11 @@ export function WorkflowsView() {
     <main className={`min-w-0 overflow-x-hidden py-6 ${PAGE_INSET_X}`}>
       <h1 className="mb-4 text-lg font-medium">{t.operations.workflows}</h1>
       <AttentionInbox items={attention.data?.items ?? []} />
-      <ActivityBoard model={model} onLoadMore={() => void runs.fetchNextPage()} onOpenCard={card => selectWorkflowRun(card.id)} />
+      <ActivityBoard
+        model={model}
+        onLoadMore={() => void runs.fetchNextPage()}
+        onOpenCard={card => selectWorkflowRun(card.id)}
+      />
       {selected.data && (
         <RunInspector
           actionsDisabled={actionPending || mutation.isPending || selected.isError || events.isError}

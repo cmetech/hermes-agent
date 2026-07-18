@@ -2769,6 +2769,14 @@ class RunStore:
             if isinstance(node, dict)
             and node.get("state") in {"ready", "claimed", "running"}
         ]
+        completed_attempts = [
+            (str(attempt["completed_at"]), str(node["id"]))
+            for node in node_values
+            if isinstance(node, dict)
+            for attempt in node.get("attempts", [])
+            if isinstance(attempt, dict)
+            and isinstance(attempt.get("completed_at"), str)
+        ]
         execution_mode = str(run.get("execution_mode", "foreground"))
         coordinator_facts: dict[str, object]
         if execution_mode == "background":
@@ -2870,6 +2878,7 @@ class RunStore:
             "coordinator": coordinator_facts,
             "elapsed_ms": None,
             "current_nodes": current_nodes,
+            "previous_node": max(completed_attempts)[1] if completed_attempts else None,
             "progress": {
                 "kind": "graph",
                 "completed_nodes": completed,
@@ -3058,6 +3067,7 @@ class RunStore:
                 raise RuntimeError("stale node claim")
             node["state"] = "running"
             node["attempts"][-1]["state"] = "running"
+            node["attempts"][-1]["started_at"] = _utc_now()
             self._append_locked(
                 directory,
                 projection,
@@ -3236,6 +3246,7 @@ class RunStore:
                 "state": status,
                 "error_code": error_code,
                 "error_message": safe_error_message,
+                "completed_at": _utc_now(),
             })
             safe_metadata = dict(_sanitize(dict(metadata or {})))
             safe_metadata.pop("output", None)

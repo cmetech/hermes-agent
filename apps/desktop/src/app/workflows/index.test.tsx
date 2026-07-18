@@ -8,6 +8,7 @@ import type { WorkflowRunSnapshot } from '@/types/hermes'
 import { $workflowSelectedRunId } from './store'
 
 const getWorkflowRun = vi.fn()
+const getWorkflowEvidence = vi.fn()
 const listWorkflowAttention = vi.fn()
 const listWorkflowEvents = vi.fn()
 const listWorkflowRuns = vi.fn()
@@ -15,6 +16,7 @@ const mutateWorkflowRun = vi.fn()
 
 vi.mock('@/hermes', () => ({
   getApiRequestProfile: () => 'default',
+  getWorkflowEvidence: (...args: unknown[]) => getWorkflowEvidence(...args),
   getWorkflowRun: (...args: unknown[]) => getWorkflowRun(...args),
   listWorkflowAttention: (...args: unknown[]) => listWorkflowAttention(...args),
   listWorkflowEvents: (...args: unknown[]) => listWorkflowEvents(...args),
@@ -51,21 +53,37 @@ function run(overrides: Partial<WorkflowRunSnapshot> = {}): WorkflowRunSnapshot 
 }
 
 function renderView(client: QueryClient) {
-  return import('./index').then(({ WorkflowsView }) => render(
-    <QueryClientProvider client={client}>
-      <WorkflowsView />
-    </QueryClientProvider>
-  ))
+  return import('./index').then(({ WorkflowsView }) =>
+    render(
+      <QueryClientProvider client={client}>
+        <WorkflowsView />
+      </QueryClientProvider>
+    )
+  )
 }
 
 beforeEach(() => {
-  for (const mock of [getWorkflowRun, listWorkflowAttention, listWorkflowEvents, listWorkflowRuns, mutateWorkflowRun]) {
+  for (const mock of [
+    getWorkflowEvidence,
+    getWorkflowRun,
+    listWorkflowAttention,
+    listWorkflowEvents,
+    listWorkflowRuns,
+    mutateWorkflowRun
+  ]) {
     mock.mockReset()
   }
 
   Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
   $workflowSelectedRunId.set('run-1')
   getWorkflowRun.mockResolvedValue(run())
+  getWorkflowEvidence.mockResolvedValue({
+    items: [],
+    kind: 'attempts',
+    next_cursor: 0,
+    schema_version: 1,
+    truncated: false
+  })
   listWorkflowAttention.mockResolvedValue({ items: [], next_cursor: null, schema_version: 1 })
   listWorkflowEvents.mockResolvedValue({ cursor_reset: false, events: [], next_cursor: 0, schema_version: 1 })
   listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run()], schema_version: 1 })
@@ -82,9 +100,7 @@ describe('WorkflowsView', () => {
     const client = new QueryClient({ defaultOptions: { mutations: { retry: false }, queries: { retry: false } } })
     const mutation = deferred<WorkflowRunSnapshot>()
     const refreshed = deferred<WorkflowRunSnapshot>()
-    getWorkflowRun
-      .mockResolvedValueOnce(run())
-      .mockImplementationOnce(() => refreshed.promise)
+    getWorkflowRun.mockResolvedValueOnce(run()).mockImplementationOnce(() => refreshed.promise)
     mutateWorkflowRun.mockImplementationOnce(() => mutation.promise)
     await renderView(client)
     const approve = await screen.findByRole('button', { name: 'Approve' })
@@ -107,15 +123,20 @@ describe('WorkflowsView', () => {
   it('replaces event history when the backend reports a cursor gap', async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     listWorkflowEvents
-      .mockResolvedValueOnce({ cursor_reset: false, events: [{ sequence: 1 }, { sequence: 2 }], next_cursor: 2, schema_version: 1 })
+      .mockResolvedValueOnce({
+        cursor_reset: false,
+        events: [{ sequence: 1 }, { sequence: 2 }],
+        next_cursor: 2,
+        schema_version: 1
+      })
       .mockResolvedValueOnce({ cursor_reset: true, events: [{ sequence: 10 }], next_cursor: 10, schema_version: 1 })
     await renderView(client)
-    const timeline = await screen.findByText('Timeline events')
-    await waitFor(() => expect(timeline.nextElementSibling?.textContent).toBe('2'))
+    fireEvent.mouseDown(await screen.findByRole('tab', { name: 'Timeline events' }), { button: 0, ctrlKey: false })
+    await waitFor(() => expect(screen.getAllByRole('listitem')).toHaveLength(2))
 
     await client.refetchQueries({ queryKey: ['workflow-events', 'default', 'run-1'] })
 
-    await waitFor(() => expect(timeline.nextElementSibling?.textContent).toBe('1'))
+    await waitFor(() => expect(screen.getAllByRole('listitem')).toHaveLength(1))
   })
 
   it('disables lifecycle actions while the selected snapshot is disconnected', async () => {
@@ -129,5 +150,35 @@ describe('WorkflowsView', () => {
     await waitFor(() => expect((approve as HTMLButtonElement).disabled).toBe(true))
     fireEvent.click(approve)
     expect(mutateWorkflowRun).not.toHaveBeenCalled()
+  })
+
+  it('loads selected evidence on demand and sends bounded input through one mutation', async () => {
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false }, queries: { retry: false } } })
+    getWorkflowRun.mockResolvedValue(run({ next_actions: ['provide-input'] }))
+    getWorkflowEvidence.mockResolvedValue({
+      items: [{ attempt_id: 'attempt-1', state: 'failed' }],
+      kind: 'attempts',
+      next_cursor: 1,
+      schema_version: 1,
+      truncated: false
+    })
+    mutateWorkflowRun.mockResolvedValue(run({ next_actions: ['cancel'], state_version: 2 }))
+    await renderView(client)
+
+    fireEvent.mouseDown(await screen.findByRole('tab', { name: 'Attempts' }), { button: 0, ctrlKey: false })
+    await waitFor(() => expect(getWorkflowEvidence).toHaveBeenCalledWith('run-1', 'attempts'))
+    const attempt = await screen.findByRole('listitem')
+    expect(attempt.textContent).toContain('attempt-1')
+
+    fireEvent.change(screen.getByLabelText('Input value'), { target: { value: 'bounded answer' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Provide input' }))
+
+    await waitFor(() =>
+      expect(mutateWorkflowRun).toHaveBeenCalledWith(
+        'run-1',
+        'provide-input',
+        expect.objectContaining({ expected_version: 1, interaction_id: 'interaction-1', value: 'bounded answer' })
+      )
+    )
   })
 })

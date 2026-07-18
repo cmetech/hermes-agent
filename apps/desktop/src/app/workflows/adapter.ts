@@ -9,28 +9,65 @@ const COLUMNS = [
   ['stopped', 'Failed / stopped']
 ] as const
 
+const ORIGIN_ICONS: Record<string, string> = {
+  api: 'globe',
+  background_agent: 'robot',
+  chat: 'comment-discussion',
+  cli: 'terminal',
+  cron: 'calendar',
+  desktop: 'device-desktop'
+}
+
+const ATTENTION_HEALTH = new Set(['coordinator_unavailable', 'stalled', 'storage_degraded'])
+
 function columnId(run: WorkflowRunSnapshot): (typeof COLUMNS)[number][0] {
-  if (run.status === 'queued') {return 'queued'}
+  if (run.status === 'queued') {
+    return 'queued'
+  }
 
-  if (run.status === 'paused') {return 'attention'}
+  if (run.status === 'paused') {
+    return 'attention'
+  }
 
-  if (run.status === 'succeeded') {return 'completed'}
+  if (ATTENTION_HEALTH.has(run.health)) {
+    return 'attention'
+  }
 
-  if (['failed', 'cancelled', 'abandoned', 'interrupted'].includes(run.status)) {return 'stopped'}
+  if (run.status === 'succeeded') {
+    return 'completed'
+  }
+
+  if (['failed', 'cancelled', 'abandoned', 'interrupted'].includes(run.status)) {
+    return 'stopped'
+  }
 
   return 'active'
 }
 
 function health(run: WorkflowRunSnapshot) {
-  if (run.status === 'paused') {return 'attention' as const}
+  if (run.status === 'paused') {
+    return 'attention' as const
+  }
 
-  if (run.status === 'failed') {return 'failed' as const}
+  if (run.status === 'failed') {
+    return 'failed' as const
+  }
 
-  if (['succeeded', 'cancelled', 'abandoned'].includes(run.status)) {return 'terminal' as const}
+  if (ATTENTION_HEALTH.has(run.health)) {
+    return 'failed' as const
+  }
 
-  if (run.health.includes('wait')) {return 'waiting' as const}
+  if (['succeeded', 'cancelled', 'abandoned'].includes(run.status)) {
+    return 'terminal' as const
+  }
 
-  if (run.health.includes('stale')) {return 'stale' as const}
+  if (run.health.includes('wait')) {
+    return 'waiting' as const
+  }
+
+  if (run.health.includes('stale')) {
+    return 'stale' as const
+  }
 
   return 'healthy' as const
 }
@@ -44,8 +81,30 @@ export function workflowBoardModel(
 
     return {
       cards: selected.map(run => ({
-        ariaDescription: `${run.workflow}, ${run.status}`,
-        badges: [{ label: `${run.progress.completed_nodes}/${run.progress.total_nodes}` }],
+        ariaDescription: [run.workflow, run.status, run.health, run.provenance?.source, run.provenance?.assurance]
+          .filter(Boolean)
+          .join(', '),
+        badges: [
+          ...(run.provenance
+            ? [
+                {
+                  icon: ORIGIN_ICONS[run.provenance.source],
+                  label: run.provenance.source,
+                  tone: 'muted' as const
+                }
+              ]
+            : []),
+          ...(ATTENTION_HEALTH.has(run.health)
+            ? [
+                {
+                  label: run.health.replaceAll('_', ' '),
+                  tone: 'danger' as const
+                }
+              ]
+            : []),
+          ...(run.current_nodes?.[0] ? [{ label: run.current_nodes[0], tone: 'notice' as const }] : []),
+          { label: `${run.progress.completed_nodes}/${run.progress.total_nodes}` }
+        ],
         exactState: run.status,
         health: health(run),
         id: run.run_id,
