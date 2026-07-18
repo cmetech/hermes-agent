@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 import sys
 from pathlib import Path
+import threading
+import time
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import httpx
 
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 from plugins.workflow.showcase import run_showcase
+from plugins.workflow.runtime import (
+    WorkflowApiLimits,
+    WorkflowApiRuntime,
+    WorkflowStoreRegistry,
+)
 
 
 def _module():
@@ -25,6 +35,21 @@ def _module():
 
 def _router():
     return _module().router
+
+
+def _app(router, *, session=None):
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def authenticated(request, call_next):
+        if session is None:
+            request.state.local_admin_authenticated = True
+        else:
+            request.state.session = session
+        return await call_next(request)
+
+    app.include_router(router, prefix="/api/plugins/workflow")
+    return app
 
 
 def _start(store, package, key, *, scope=None):
@@ -51,6 +76,16 @@ def test_hidden_manifest_is_api_only():
     assert (root / "dist/index.js").read_text().strip() == "void 0;"
 
 
+def test_router_rejects_requests_without_verified_authentication() -> None:
+    app = FastAPI()
+    app.include_router(_router(), prefix="/api/plugins/workflow")
+
+    response = TestClient(app).get("/api/plugins/workflow/runs")
+
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "authentication_required"
+
+
 def test_runs_are_bounded_cursor_paginated_and_scope_authorized(
     tmp_path, monkeypatch, workflow_writer
 ):
@@ -60,9 +95,7 @@ def test_runs_are_bounded_cursor_paginated_and_scope_authorized(
     store = RunStore(home)
     first = _start(store, package, "one", scope="alice/conversation")
     _start(store, package, "two", scope="bob/conversation")
-    app = FastAPI()
-    app.include_router(_router(), prefix="/api/plugins/workflow")
-    client = TestClient(app)
+    client = TestClient(_app(_router()))
 
     page = client.get(
         "/api/plugins/workflow/runs?limit=1",
@@ -80,17 +113,19 @@ def test_runs_are_bounded_cursor_paginated_and_scope_authorized(
     assert detail.status_code == 404
 
 
-def test_events_cursor_and_stale_action_conflict(tmp_path, monkeypatch, workflow_writer):
+def test_events_cursor_and_stale_action_conflict(
+    tmp_path, monkeypatch, workflow_writer
+):
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     package = load_workflow(workflow_writer(tmp_path / "package", name="events"))
     store = RunStore(home)
     run = _start(store, package, "one")
-    app = FastAPI()
-    app.include_router(_router(), prefix="/api/plugins/workflow")
-    client = TestClient(app)
+    client = TestClient(_app(_router()))
 
-    events = client.get(f"/api/plugins/workflow/runs/{run.run_id}/events?after=0&limit=999")
+    events = client.get(
+        f"/api/plugins/workflow/runs/{run.run_id}/events?after=0&limit=999"
+    )
     assert events.status_code == 200
     assert len(events.json()["events"]) <= 200
     assert events.json()["next_cursor"] >= 1
@@ -102,65 +137,58 @@ def test_events_cursor_and_stale_action_conflict(tmp_path, monkeypatch, workflow
     assert stale.status_code == 409
     assert stale.json()["detail"]["code"] == "stale_state"
 
-
-def test_events_long_poll_returns_when_a_new_event_arrives(monkeypatch):
-    module = _module()
-
-    class FakeStore:
-        calls = 0
-
-        def get_run_status(self, _run_id, **_kwargs):
-            return {"operator_scope_digest": None}
-
-        def events_after(self, _run_id, *, after, **_kwargs):
-            self.calls += 1
-            events = [] if self.calls < 3 else [{"sequence": after + 1}]
-            return {
-                "schema_version": 1,
-                "events": events,
-                "next_cursor": after if not events else after + 1,
-                "cursor_reset": False,
-            }
-
-    store = FakeStore()
-    monkeypatch.setattr(module, "_store", lambda: store)
-    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
-    app = FastAPI()
-    app.include_router(module.router, prefix="/api/plugins/workflow")
-
-    response = TestClient(app).get(
-        "/api/plugins/workflow/runs/run-1/events?after=7&wait_seconds=1"
+    evidence = client.get(
+        f"/api/plugins/workflow/runs/{run.run_id}/evidence?kind=timeline"
     )
+    assert evidence.status_code == 200
+    assert evidence.json()["kind"] == "timeline"
+    assert evidence.json()["items"][0]["event_type"] == "run_admitted"
+
+
+def test_events_long_poll_returns_when_a_new_event_arrives(
+    tmp_path, monkeypatch, workflow_writer
+):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    module = _module()
+    package = load_workflow(workflow_writer(tmp_path / "package", name="long-poll"))
+    store = RunStore(home)
+    run = _start(store, package, "long-poll")
+
+    def append_event():
+        time.sleep(0.05)
+        store.append_event(run.run_id, "progress", {"step": 1})
+
+    thread = threading.Thread(target=append_event)
+    thread.start()
+    response = TestClient(_app(module.router)).get(
+        f"/api/plugins/workflow/runs/{run.run_id}/events?after=1&wait_seconds=1"
+    )
+    thread.join()
 
     assert response.status_code == 200
-    assert response.json()["events"] == [{"sequence": 8}]
-    assert store.calls == 3
+    assert response.json()["events"][0]["sequence"] == 2
 
 
-def test_attention_includes_real_workflow_approval_interactions(
-    tmp_path, monkeypatch
-):
+def test_attention_includes_real_workflow_approval_interactions(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     started = run_showcase(
         "laptop-diagnostic", hermes_home=home, symptom="fictional attention"
     )
-    app = FastAPI()
-    app.include_router(_router(), prefix="/api/plugins/workflow")
-
-    client = TestClient(app)
+    client = TestClient(_app(_router()))
     response = client.get("/api/plugins/workflow/attention")
 
     assert response.status_code == 200
     item = next(
-        item for item in response.json()["items"]
-        if item["run_id"] == started["run_id"]
+        item for item in response.json()["items"] if item["run_id"] == started["run_id"]
     )
     assert item["interaction"]["type"] == "workflow_approval"
     detail = client.get(f"/api/plugins/workflow/runs/{started['run_id']}").json()
-    assert detail["pending_interaction"]["interaction_id"] == item["interaction"][
-        "interaction_id"
-    ]
+    assert (
+        detail["pending_interaction"]["interaction_id"]
+        == item["interaction"]["interaction_id"]
+    )
     assert detail["pending_interaction"]["node_id"] == item["node_id"]
     assert detail["next_actions"] == [
         "status",
@@ -169,3 +197,85 @@ def test_attention_includes_real_workflow_approval_interactions(
         "reject",
         "cancel",
     ]
+
+
+def test_forged_scope_header_cannot_expand_verified_session(
+    tmp_path, monkeypatch, workflow_writer
+):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = load_workflow(workflow_writer(tmp_path / "package", name="verified"))
+    store = RunStore(home)
+    scope = "dashboard:test:org:user-1"
+    run = _start(store, package, "verified", scope=scope)
+    session = SimpleNamespace(provider="test", org_id="org", user_id="user-1")
+    client = TestClient(_app(_router(), session=session))
+
+    allowed = client.get(f"/api/plugins/workflow/runs/{run.run_id}")
+    forged = client.get(
+        f"/api/plugins/workflow/runs/{run.run_id}",
+        headers={"X-Hermes-Operator-Scope": "dashboard:test:org:user-2"},
+    )
+
+    assert allowed.status_code == 200
+    assert forged.status_code == 403
+    assert forged.json()["detail"]["code"] == "operator_scope_not_authorized"
+
+
+def test_seventeenth_event_wait_is_refused_while_status_remains_responsive(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = load_workflow(workflow_writer(tmp_path / "package", name="capacity"))
+    store = RunStore(home)
+    run = _start(store, package, "capacity")
+    module = _module()
+    app = _app(module.router)
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            path = (
+                f"/api/plugins/workflow/runs/{run.run_id}/events"
+                "?after=1&wait_seconds=0.2"
+            )
+            waits = [asyncio.create_task(client.get(path)) for _ in range(17)]
+            await asyncio.sleep(0.03)
+            status = await client.get(f"/api/plugins/workflow/runs/{run.run_id}")
+            responses = await asyncio.gather(*waits)
+            return status, responses
+
+    status, responses = asyncio.run(exercise())
+
+    assert status.status_code == 200
+    assert sum(response.status_code == 429 for response in responses) == 1
+    refused = next(response for response in responses if response.status_code == 429)
+    assert refused.json()["detail"]["code"] == "event_wait_capacity"
+
+
+def test_repeated_api_reads_initialize_one_store_for_the_profile(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    module = _module()
+    runtime = WorkflowApiRuntime(WorkflowApiLimits())
+    created = []
+
+    def factory(path):
+        created.append(path)
+        return RunStore(path)
+
+    runtime.stores = WorkflowStoreRegistry(max_profiles=8, store_factory=factory)
+    module._RUNTIME = runtime
+    client = TestClient(_app(module.router))
+
+    assert client.get("/api/plugins/workflow/runs").status_code == 200
+    assert client.get("/api/plugins/workflow/runs").status_code == 200
+
+    assert created == [home.resolve()]
+    assert runtime.stores.snapshot()["profiles"] == 1
+    runtime.close()

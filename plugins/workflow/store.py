@@ -5480,6 +5480,29 @@ class RunStore:
             "blocked_reasons": blocked_reasons,
         }
 
+    def cleanup_history(
+        self, run_id: str, *, operator_scope: str | None = None
+    ) -> tuple[dict[str, object], ...]:
+        """Return durable cleanup decisions without exposing filesystem paths."""
+        self.run_directory(run_id, operator_scope=operator_scope)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT sequence, timestamp, files, bytes, outcome, payload_json "
+                "FROM cleanup_history WHERE run_id=? ORDER BY sequence",
+                (run_id,),
+            ).fetchall()
+        return tuple(
+            {
+                "sequence": row["sequence"],
+                "timestamp": row["timestamp"],
+                "files": row["files"],
+                "bytes": row["bytes"],
+                "outcome": row["outcome"],
+                "details": _sanitize(json.loads(row["payload_json"])),
+            }
+            for row in rows
+        )
+
     def _execute_cleanup(self, confirmation_token: str) -> dict[str, object]:
         if self.storage_health()["status"] != "healthy":
             raise RuntimeError("cleanup blocked: storage repair required")

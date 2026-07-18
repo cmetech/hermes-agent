@@ -611,6 +611,7 @@ async def auth_middleware(request: Request, call_next):
                 status_code=401,
                 content={"detail": "Unauthorized"},
             )
+        request.state.local_admin_authenticated = True
     return await call_next(request)
 
 
