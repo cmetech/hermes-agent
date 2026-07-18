@@ -613,15 +613,22 @@ def reset_showcase(showcase_id: str, *, hermes_home: str | Path) -> dict[str, ob
     return {"showcase_id": showcase_id, "owned_schedule": owned_schedule, "removed": False, "requires_explicit_cron_removal": owned_schedule is not None}
 
 
-def cleanup_showcases(*, hermes_home: str | Path, dry_run: bool = True, older_than_days: int = 7) -> dict[str, object]:
+def cleanup_showcases(
+    *,
+    hermes_home: str | Path,
+    execute: bool = False,
+    confirmation_token: str | None = None,
+    older_than_days: int = 7,
+) -> dict[str, object]:
     store, _ = _store(hermes_home)
     tagged = [run["run_id"] for run in store.list_runs(limit=200) if isinstance(run.get("run_metadata"), Mapping) and run["run_metadata"].get("showcase_id")]
     result = store.cleanup_runs(
         older_than=timedelta(days=older_than_days),
-        dry_run=dry_run,
+        execute=execute,
+        confirmation_token=confirmation_token,
         required_metadata={"showcase_id": None},
     )
-    return {**result, "showcase_run_ids": tagged, "dry_run": dry_run}
+    return {**result, "showcase_run_ids": tagged}
 
 
 def report_to_dict(report: ShowcaseReport) -> dict[str, object]:

@@ -405,7 +405,8 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 
     cleanup_parser = actions.add_parser("cleanup", help="Clean retained terminal runs")
     cleanup_parser.add_argument("--older-than", default="7d")
-    cleanup_parser.add_argument("--dry-run", action="store_true")
+    cleanup_parser.add_argument("--execute", action="store_true")
+    cleanup_parser.add_argument("--confirmation-token")
     _json_flag(cleanup_parser)
 
     reset_parser = actions.add_parser(
@@ -447,6 +448,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     showcase_cleanup = showcase_actions.add_parser("cleanup")
     showcase_cleanup.add_argument("--older-than-days", type=int, default=7)
     showcase_cleanup.add_argument("--execute", action="store_true")
+    showcase_cleanup.add_argument("--confirmation-token")
     _json_flag(showcase_cleanup)
 
     subparser.set_defaults(func=workflow_command)
@@ -1473,7 +1475,9 @@ def _duration(value: str):
 
 def _cmd_cleanup(args: argparse.Namespace) -> int:
     payload = _store(args).cleanup_runs(
-        older_than=_duration(args.older_than), dry_run=args.dry_run
+        older_than=_duration(args.older_than),
+        execute=args.execute,
+        confirmation_token=args.confirmation_token,
     )
     _emit(payload, as_json=args.json)
     return 0
@@ -1538,7 +1542,8 @@ def _cmd_showcase(args: argparse.Namespace) -> int:
     elif action == "cleanup":
         payload = cleanup_showcases(
             hermes_home=args.hermes_home,
-            dry_run=not args.execute,
+            execute=args.execute,
+            confirmation_token=args.confirmation_token,
             older_than_days=args.older_than_days,
         )
     else:

@@ -8,7 +8,9 @@ from pathlib import Path
 import pytest
 
 from plugins import workflow as workflow_plugin
+from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import _runtime_config, register_cli
+from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
 from plugins.workflow.store import RunStore
@@ -153,6 +155,51 @@ def test_human_show_defaults_to_text_topology(workflow_writer, tmp_path, capsys)
     output = capsys.readouterr().out
     assert "Topology: start" in output
     assert "flowchart LR" not in output
+
+
+def test_cleanup_cli_is_preview_only_until_exact_token_is_executed(
+    workflow_writer, tmp_path, capsys
+) -> None:
+    profile = tmp_path / "profile"
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="cleanup-cli")
+    )
+    store = RunStore(profile)
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="cleanup-cli",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="cleanup-cli",
+            concurrency_key="cleanup-cli",
+        ),
+        immutable_snapshot=prepared,
+    )
+    RunScheduler(store).advance(admitted.run_id)
+    parser = _parser()
+    common = ["--hermes-home", str(profile), "cleanup", "--older-than", "0d"]
+
+    preview_args = parser.parse_args([*common, "--json"])
+    assert preview_args.func(preview_args) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["execute"] is False
+    assert preview["confirmation_token"]
+    assert store.run_directory(admitted.run_id).is_dir()
+
+    execute_args = parser.parse_args([
+        *common,
+        "--execute",
+        "--confirmation-token",
+        preview["confirmation_token"],
+        "--json",
+    ])
+    assert execute_args.func(execute_args) == 0
+    executed = json.loads(capsys.readouterr().out)
+    assert executed["execute"] is True
+    assert store.list_runs() == ()
 
 
 def test_validate_doctor_trust_and_untrust(workflow_writer, tmp_path, capsys):

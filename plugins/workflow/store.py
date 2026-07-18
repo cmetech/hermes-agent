@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,7 +24,7 @@ from plugins.workflow.admission import (
     RunAdmissionRequest,
     RunAdmissionResult,
 )
-from plugins.workflow.locks import workflow_lock
+from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
 from plugins.workflow.models import ApprovalDecision, WorkflowPackage
 from plugins.workflow.trust import compute_package_digest
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
@@ -335,6 +335,26 @@ class RunStore:
                         preserved_path TEXT,
                         projection_sha256 TEXT,
                         journal_sha256 TEXT,
+                        payload_json TEXT NOT NULL DEFAULT '{}'
+                    );
+                    CREATE TABLE IF NOT EXISTS cleanup_previews (
+                        token_digest TEXT PRIMARY KEY,
+                        created_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        preview_digest TEXT NOT NULL,
+                        candidates_json TEXT NOT NULL,
+                        status TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS cleanup_history (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        token_digest TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        source_path TEXT NOT NULL,
+                        quarantine_path TEXT NOT NULL,
+                        files INTEGER NOT NULL,
+                        bytes INTEGER NOT NULL,
+                        outcome TEXT NOT NULL,
                         payload_json TEXT NOT NULL DEFAULT '{}'
                     );
                     """
@@ -3685,9 +3705,29 @@ class RunStore:
         self,
         *,
         older_than: timedelta = timedelta(days=7),
-        dry_run: bool = True,
+        execute: bool = False,
+        confirmation_token: str | None = None,
         operator_scope: str | None = None,
         required_metadata: Mapping[str, str | None] | None = None,
+    ) -> dict[str, object]:
+        if execute:
+            if not confirmation_token:
+                raise ValueError("cleanup execution requires a confirmation token")
+            return self._execute_cleanup(confirmation_token)
+        if confirmation_token is not None:
+            raise ValueError("confirmation token is valid only with execute")
+        return self._preview_cleanup(
+            older_than=older_than,
+            operator_scope=operator_scope,
+            required_metadata=required_metadata,
+        )
+
+    def _preview_cleanup(
+        self,
+        *,
+        older_than: timedelta,
+        operator_scope: str | None,
+        required_metadata: Mapping[str, str | None] | None,
     ) -> dict[str, object]:
         cutoff = datetime.now(timezone.utc) - older_than
         scope_clause = (
@@ -3703,53 +3743,269 @@ class RunStore:
                 "ORDER BY updated_at, run_id",
                 values,
             ).fetchall()
-        candidates = [
+        rows = [
             row
             for row in rows
             if row["status"] in {"succeeded", "failed", "cancelled", "abandoned"}
             and datetime.fromisoformat(row["updated_at"]) <= cutoff
         ]
         if required_metadata:
-            candidates = [
+            rows = [
                 row
-                for row in candidates
+                for row in rows
                 if self._run_has_metadata(
                     Path(row["run_directory"]), required_metadata
                 )
             ]
-        files_total = sum(
-            1
-            for row in candidates
-            for path in Path(row["run_directory"]).rglob("*")
-            if path.is_file()
+        candidates: list[dict[str, object]] = []
+        for row in rows:
+            try:
+                with workflow_lock(
+                    self._run_lock_path(row["run_id"]), timeout_seconds=0.05
+                ):
+                    candidate = self._cleanup_candidate(row)
+            except WorkflowLockTimeout:
+                candidate = {
+                    "run_id": row["run_id"],
+                    "run_directory": row["run_directory"],
+                    "status": row["status"],
+                    "updated_at": row["updated_at"],
+                    "state_version": None,
+                    "event_sequence": None,
+                    "projection_sha256": None,
+                    "journal_sha256": None,
+                    "files": 0,
+                    "bytes": 0,
+                    "evidence_types": [],
+                    "blocked_reasons": ["active_reader_or_writer"],
+                }
+            candidates.append(candidate)
+        health = self.storage_health()
+        blocked_reasons = (
+            ["storage_repair_required"]
+            if health["status"] != "healthy"
+            else []
         )
-        bytes_total = sum(
-            path.stat().st_size
-            for row in candidates
-            for path in Path(row["run_directory"]).rglob("*")
-            if path.is_file()
+        eligible = bool(candidates) and not blocked_reasons and not any(
+            candidate["blocked_reasons"] for candidate in candidates
         )
-        if not dry_run:
-            for row in candidates:
-                source = Path(row["run_directory"])
-                with workflow_lock(self._run_lock_path(row["run_id"])):
-                    if not source.exists():
-                        continue
-                    quarantine = (
-                        self.quarantine_root / f"{row['run_id']}-{uuid.uuid4().hex}"
-                    )
-                    os.replace(source, quarantine)
-                shutil.rmtree(quarantine, ignore_errors=True)
+        token = uuid.uuid4().hex if eligible else None
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+        candidates_json = json.dumps(candidates, sort_keys=True, separators=(",", ":"))
+        if token is not None:
+            token_digest = _sha256(token.encode())
+            with self._connect() as connection:
+                connection.execute(
+                    "INSERT INTO cleanup_previews ("
+                    "token_digest, created_at, expires_at, preview_digest, "
+                    "candidates_json, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+                    (
+                        token_digest,
+                        _utc_now(),
+                        expires_at.isoformat(),
+                        _sha256(candidates_json.encode()),
+                        candidates_json,
+                    ),
+                )
+        return {
+            "execute": False,
+            "run_ids": [candidate["run_id"] for candidate in candidates],
+            "candidates": candidates,
+            "files": sum(int(candidate["files"]) for candidate in candidates),
+            "bytes": sum(int(candidate["bytes"]) for candidate in candidates),
+            "index_integrity": health["status"],
+            "blocked_reasons": blocked_reasons,
+            "notification_dependencies": {"status": "not_configured", "count": 0},
+            "confirmation_token": token,
+            "confirmation_expires_at": expires_at.isoformat() if token else None,
+        }
+
+    def _cleanup_candidate(self, row: sqlite3.Row) -> dict[str, object]:
+        directory = Path(row["run_directory"])
+        projection_bytes = (directory / "run.json").read_bytes()
+        journal_bytes = (directory / "events.jsonl").read_bytes()
+        projection = json.loads(projection_bytes)
+        if not self._valid_projection(projection, run_id=row["run_id"]):
+            raise JournalRecoveryError("cleanup candidate projection is invalid")
+        paths = [path for path in directory.rglob("*") if path.is_file()]
+        blocked_reasons = []
+        with self._connect() as connection:
+            claims = connection.execute(
+                "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
+                (row["run_id"],),
+            ).fetchone()[0]
+        if claims:
+            blocked_reasons.append("live_worker_claim")
+        if any(
+            node.get("pending_interaction") == "reconcile"
+            or (
+                isinstance(node.get("pending_interaction"), Mapping)
+                and node["pending_interaction"].get("type") == "reconcile"
+            )
+            for node in projection["nodes"].values()
+        ):
+            blocked_reasons.append("reconciliation_required")
+        evidence_types = ["projection", "events"]
+        if any("stdout" in path.name for path in paths):
+            evidence_types.append("stdout")
+        if any("stderr" in path.name for path in paths):
+            evidence_types.append("stderr")
+        if projection.get("artifacts"):
+            evidence_types.append("artifacts")
+        if any(node.get("output") is not None for node in projection["nodes"].values()):
+            evidence_types.append("outputs")
+        return {
+            "run_id": row["run_id"],
+            "run_directory": str(directory),
+            "status": row["status"],
+            "updated_at": row["updated_at"],
+            "state_version": projection["state_version"],
+            "event_sequence": projection["event_sequence"],
+            "projection_sha256": _sha256(projection_bytes),
+            "journal_sha256": _sha256(journal_bytes),
+            "files": len(paths),
+            "bytes": sum(path.stat().st_size for path in paths),
+            "evidence_types": evidence_types,
+            "blocked_reasons": blocked_reasons,
+        }
+
+    def _execute_cleanup(self, confirmation_token: str) -> dict[str, object]:
+        if self.storage_health()["status"] != "healthy":
+            raise RuntimeError("cleanup blocked: storage repair required")
+        token_digest = _sha256(confirmation_token.encode())
+        with self._admission_gate, workflow_lock(self.admission_lock):
+            with self._connect() as connection:
+                preview = connection.execute(
+                    "SELECT * FROM cleanup_previews WHERE token_digest=?",
+                    (token_digest,),
+                ).fetchone()
+            if preview is None or preview["status"] != "pending":
+                raise ValueError("cleanup confirmation token is invalid or already used")
+            if datetime.fromisoformat(preview["expires_at"]) <= datetime.now(timezone.utc):
                 with self._connect() as connection:
                     connection.execute(
-                        "DELETE FROM runs WHERE run_id=?", (row["run_id"],)
+                        "UPDATE cleanup_previews SET status='expired' "
+                        "WHERE token_digest=?",
+                        (token_digest,),
                     )
+                raise ValueError("cleanup confirmation token has expired")
+            candidates = json.loads(preview["candidates_json"])
+            if not isinstance(candidates, list) or not candidates:
+                raise ValueError("cleanup confirmation token has no candidates")
+            with ExitStack() as locks:
+                for candidate in sorted(candidates, key=lambda item: item["run_id"]):
+                    locks.enter_context(
+                        workflow_lock(self._run_lock_path(candidate["run_id"]))
+                    )
+                with self._connect() as connection:
+                    rows = {
+                        row["run_id"]: row
+                        for row in connection.execute(
+                            "SELECT run_id, run_directory, status, updated_at FROM runs "
+                            "WHERE admission_state='published'"
+                        ).fetchall()
+                    }
+                current = []
+                for candidate in candidates:
+                    row = rows.get(candidate["run_id"])
+                    if row is None:
+                        self._invalidate_cleanup_preview(token_digest)
+                        raise RuntimeError("cleanup preview changed: run is no longer indexed")
+                    current.append(self._cleanup_candidate(row))
+                current_json = json.dumps(
+                    current, sort_keys=True, separators=(",", ":")
+                )
+                if _sha256(current_json.encode()) != preview["preview_digest"]:
+                    self._invalidate_cleanup_preview(token_digest)
+                    raise RuntimeError("cleanup preview changed; request a new preview")
+                quarantine_root = self.quarantine_root / "cleanup" / token_digest[:16]
+                quarantine_root.mkdir(parents=True, exist_ok=False)
+                moved: list[tuple[dict[str, object], Path]] = []
+                for candidate in candidates:
+                    source = Path(candidate["run_directory"])
+                    destination = quarantine_root / str(candidate["run_id"])
+                    os.replace(source, destination)
+                    moved.append((candidate, destination))
+                connection = self._connect()
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    for candidate, destination in moved:
+                        connection.execute(
+                            "INSERT INTO cleanup_history ("
+                            "timestamp, token_digest, run_id, source_path, "
+                            "quarantine_path, files, bytes, outcome, payload_json"
+                            ") VALUES (?, ?, ?, ?, ?, ?, ?, 'quarantined', '{}')",
+                            (
+                                _utc_now(),
+                                token_digest,
+                                candidate["run_id"],
+                                candidate["run_directory"],
+                                str(destination),
+                                candidate["files"],
+                                candidate["bytes"],
+                            ),
+                        )
+                        connection.execute(
+                            "DELETE FROM worker_claims WHERE run_id=?",
+                            (candidate["run_id"],),
+                        )
+                        connection.execute(
+                            "DELETE FROM runs WHERE run_id=?",
+                            (candidate["run_id"],),
+                        )
+                    connection.execute(
+                        "UPDATE cleanup_previews SET status='executed' "
+                        "WHERE token_digest=? AND status='pending'",
+                        (token_digest,),
+                    )
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.close()
         return {
-            "dry_run": dry_run,
-            "run_ids": [row["run_id"] for row in candidates],
-            "files": files_total,
-            "bytes": bytes_total,
+            "execute": True,
+            "run_ids": [candidate["run_id"] for candidate in candidates],
+            "files": sum(int(candidate["files"]) for candidate in candidates),
+            "bytes": sum(int(candidate["bytes"]) for candidate in candidates),
+            "quarantine_paths": [str(path) for _, path in moved],
         }
+
+    def _invalidate_cleanup_preview(self, token_digest: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE cleanup_previews SET status='invalidated' WHERE token_digest=?",
+                (token_digest,),
+            )
+
+    def list_cleanup_history(
+        self, *, limit: int = 100
+    ) -> tuple[dict[str, object], ...]:
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT sequence, timestamp, token_digest, run_id, source_path, "
+                "quarantine_path, files, bytes, outcome, payload_json "
+                "FROM cleanup_history ORDER BY sequence LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return tuple(
+            {
+                "sequence": row["sequence"],
+                "timestamp": row["timestamp"],
+                "token_digest": row["token_digest"],
+                "run_id": row["run_id"],
+                "source_path": row["source_path"],
+                "quarantine_path": row["quarantine_path"],
+                "files": row["files"],
+                "bytes": row["bytes"],
+                "outcome": row["outcome"],
+                "payload": json.loads(row["payload_json"]),
+            }
+            for row in rows
+        )
 
     @staticmethod
     def _run_has_metadata(
