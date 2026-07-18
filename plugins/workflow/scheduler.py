@@ -717,6 +717,7 @@ class RunScheduler:
                     run_id,
                     now=self._utcnow(),
                     monotonic_now=self._monotonic(),
+                    current_owner_epoch=self.owner_id,
                 )
                 projection = self.store.load_run(run_id)
                 if projection["status"] == "queued":
@@ -829,6 +830,7 @@ class RunScheduler:
                         run_id,
                         now=self._utcnow(),
                         monotonic_now=self._monotonic(),
+                        current_owner_epoch=self.owner_id,
                     )
                     projection = self.store.load_run(run_id)
                     if projection["status"] == "queued":

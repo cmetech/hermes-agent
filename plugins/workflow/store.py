@@ -3550,6 +3550,7 @@ class RunStore:
         *,
         now: datetime | None = None,
         monotonic_now: float | None = None,
+        current_owner_epoch: str | None = None,
     ) -> tuple[str, ...]:
         instant = now or datetime.now(timezone.utc)
         monotonic_instant = (
@@ -3609,6 +3610,20 @@ class RunStore:
                 )
                 serialized = attempt.get("process_identity")
                 observation = self._observe_process_identity(serialized)
+                if self._reclaim_still_running_claim(
+                    directory,
+                    projection,
+                    node_id=node_id,
+                    node=node,
+                    claim=claim,
+                    attempt=attempt,
+                    observation=observation,
+                    current_owner_epoch=current_owner_epoch,
+                    instant=instant,
+                    monotonic_instant=monotonic_instant,
+                    lease_seconds=lease_seconds,
+                ):
+                    continue
                 node.pop("claim", None)
                 recovery = {
                     "attempt_id": attempt_id,
@@ -3692,6 +3707,95 @@ class RunStore:
                         (projection["status"], projection["updated_at"], run_id),
                     )
         return tuple(expired)
+
+    def _reclaim_still_running_claim(
+        self,
+        directory: Path,
+        projection: dict[str, object],
+        *,
+        node_id: str,
+        node: dict[str, object],
+        claim: dict[str, object],
+        attempt: dict[str, object],
+        observation: str,
+        current_owner_epoch: str | None,
+        instant: datetime,
+        monotonic_instant: float,
+        lease_seconds: float,
+    ) -> bool:
+        """Re-adopt one live attempt without changing its immutable identity."""
+        if (
+            observation != "still_running"
+            or not current_owner_epoch
+            or claim.get("owner_epoch") != current_owner_epoch
+            or attempt.get("owner_epoch") != current_owner_epoch
+            or not node.get("attempts")
+            or node["attempts"][-1] is not attempt
+            or attempt.get("state") not in {"claimed", "running"}
+        ):
+            return False
+        serialized = attempt.get("process_identity")
+        if not isinstance(serialized, Mapping) or serialized.get("start_time") is None:
+            return False
+        prefix = "coordinator:"
+        if not current_owner_epoch.startswith(prefix):
+            return False
+        try:
+            coordinator_owner, epoch_text = current_owner_epoch[len(prefix) :].rsplit(
+                ":", 1
+            )
+            coordinator_epoch = int(epoch_text)
+        except (TypeError, ValueError):
+            return False
+        attempt_id = str(claim.get("attempt_id") or "")
+        if not attempt_id:
+            return False
+        expires_at = (instant + timedelta(seconds=lease_seconds)).isoformat()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            leader = connection.execute(
+                "SELECT 1 FROM coordinator_lease WHERE singleton=1 "
+                "AND owner_id=? AND epoch=? AND lease_expires_at>?",
+                (coordinator_owner, coordinator_epoch, instant.isoformat()),
+            ).fetchone()
+            worker = connection.execute(
+                "SELECT 1 FROM worker_claims WHERE attempt_id=? AND run_id=? "
+                "AND node_id=? AND owner_id=?",
+                (attempt_id, projection["run_id"], node_id, claim.get("owner_id")),
+            ).fetchone()
+            if leader is None or worker is None:
+                connection.rollback()
+                return False
+            claim.update({
+                "heartbeat_at": instant.isoformat(),
+                "heartbeat_monotonic": monotonic_instant,
+                "lease_expires_at": expires_at,
+            })
+            attempt["reclaimed_at"] = instant.isoformat()
+            attempt["reclaim_count"] = int(attempt.get("reclaim_count", 0)) + 1
+            self._append_locked(
+                directory,
+                projection,
+                "node_reclaimed",
+                {
+                    "owner_epoch": current_owner_epoch,
+                    "lease_expires_at": expires_at,
+                },
+                node_id=node_id,
+                attempt_id=attempt_id,
+            )
+            connection.execute(
+                "UPDATE worker_claims SET lease_expires_at=? WHERE attempt_id=?",
+                (expires_at, attempt_id),
+            )
+            connection.commit()
+            return True
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     @staticmethod
     def _observe_process_identity(serialized: object) -> str:

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 
 import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import JournalRecoveryError, RunStore
@@ -112,6 +114,57 @@ def test_expired_outward_attempt_preserves_identity_and_requires_reconciliation(
     stopped = store.load_run(admitted.run_id)["nodes"]["start"]["attempts"][-1]
     assert stopped["process_identity"]["pid"] == identity.pid
     assert stopped["process_stop"]["cleaned"] is True
+
+
+def test_expired_attempt_is_reclaimed_only_by_same_fresh_coordinator_epoch(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(workflow_writer(tmp_path / "package", name="reclaim"))
+    admitted = _run(store, package)
+    coordinator = CoordinatorStore(store.database)
+    now = datetime.now(timezone.utc)
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="reclaim-owner",
+        host_kind="gateway",
+        host_instance_id="reclaim-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    assert leadership.is_leader
+    owner_epoch = f"coordinator:{identity.owner_id}:{leadership.lease.epoch}"
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        owner_epoch,
+        lease_seconds=1,
+        now=now,
+        owner_epoch=owner_epoch,
+        executor_id="bash",
+        effect_classification="outward",
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+    child = ProcessIdentity(pid=999_992, start_time=23456, group_id=999_992)
+    assert store.record_process_started(claim, child)
+    monkeypatch.setattr(ProcessIdentity, "is_current", lambda self: True)
+
+    expired = store.expire_stale_claims(
+        admitted.run_id,
+        now=claim.lease_expires_at + timedelta(seconds=1),
+        current_owner_epoch=owner_epoch,
+    )
+
+    assert expired == ()
+    projection = store.load_run(admitted.run_id)
+    node = projection["nodes"]["start"]
+    assert node["state"] == "running"
+    assert node["claim"]["attempt_id"] == claim.attempt_id
+    assert node["attempts"][-1]["attempt_id"] == claim.attempt_id
+    assert "pending_interaction" not in node
+    assert store.tail_events(admitted.run_id)[-1]["event_type"] == "node_reclaimed"
 
 
 def test_live_replay_safe_attempt_cannot_resume_until_termination_is_proven(
