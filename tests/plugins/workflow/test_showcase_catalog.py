@@ -77,7 +77,7 @@ def test_default_catalog_repairs_crlf_only_managed_checkout(
     assert b"\r\n" not in (bundle / "catalog.yaml").read_bytes()
 
 
-def test_repair_forces_tracked_bytes_when_checkout_is_a_successful_noop(
+def test_repair_materializes_elsewhere_when_in_place_git_restores_are_noops(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     checkout = tmp_path / "checkout"
@@ -105,12 +105,18 @@ def test_repair_forces_tracked_bytes_when_checkout_is_a_successful_noop(
 
     original_run = capability_staging.subprocess.run
 
-    def successful_noop_checkout(command, *args, **kwargs):
+    def successful_noop_in_place_restore(command, *args, **kwargs):
         if command[-4:] == ["checkout", "HEAD", "--", "plugins/workflow/showcases"]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if "checkout-index" in command and not any(
+            item.startswith("--prefix=") for item in command
+        ):
             return subprocess.CompletedProcess(command, 0, "", "")
         return original_run(command, *args, **kwargs)
 
-    monkeypatch.setattr(capability_staging.subprocess, "run", successful_noop_checkout)
+    monkeypatch.setattr(
+        capability_staging.subprocess, "run", successful_noop_in_place_restore
+    )
 
     assert capability_staging.repair_authenticated_resource_checkout(bundle) is True
     assert b"\r\n" not in (bundle / "catalog.yaml").read_bytes()
