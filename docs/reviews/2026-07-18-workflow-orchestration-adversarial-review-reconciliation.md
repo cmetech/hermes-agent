@@ -96,3 +96,32 @@ The review is reconciled by the focused generic-service/coordinator design and
 the amended operator-experience design. Implementation must follow the
 risk-ordered plan. No finding is considered fixed until its full cross-surface
 acceptance criteria pass on the authoritative runtime path.
+
+## Adversarial re-review amendment
+
+The follow-up artifact
+`2026-07-18-workflow-orchestration-operator-experience-adversarial-rereview.md`
+accepted this reconciliation and returned `READY WITH CONDITIONS` for the plan.
+The conditions are incorporated without changing the ten-phase order or the
+17-item release gate:
+
+- generic lifecycle conformance now measures first-party factory dormancy and
+  guarantees cached snapshots cannot block on `health()`;
+- retry wait releases its lane, while pause release is explicit policy and an
+  interrupted outward attempt holds serialization until reconciliation;
+- live matching attempts can be reclaimed after suspend/wake, and idle sweeps
+  back off to 60 seconds;
+- foreground execution has a run-level exclusive owner lease and cannot race a
+  healthy coordinator;
+- exit-code-3 migration and bounded authorized not-found candidates are explicit;
+- provenance distinguishes authenticated/system facts from local-admin claims;
+- Desktop API store reuse and long-poll capacity are assigned to Phase 6;
+- notification coalescing, Desktop lease/ack receipts, and CLI-only posture are
+  normative;
+- retention uses UTC with an injected clock; a committed pre-amendment v2.0.9
+  database/run fixture proves the complete upgrade path on all three platforms.
+
+Gateway election preference is recorded as a non-blocking optimization, not a
+release condition. Implementation remains blocked until explicit maintainer
+authorization; none of these document amendments approves code execution or
+release.

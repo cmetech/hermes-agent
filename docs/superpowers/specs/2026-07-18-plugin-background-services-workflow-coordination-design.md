@@ -1,7 +1,7 @@
 # Generic Plugin Background Services and Workflow Coordination
 
 **Date:** 2026-07-18
-**Status:** Proposed; implementation requires maintainer approval
+**Status:** Re-review conditions incorporated; ready for implementation approval
 **Scope:** Generic Hermes lifecycle hosting plus the workflow plugin's concrete coordinator consumer
 
 ## Decision summary
@@ -148,6 +148,13 @@ consumer uses the host identity only for durable ownership evidence. A factory
 may not start a thread, acquire a durable lease, spawn a process, or open a
 listener before returning its service object.
 
+Python cannot enforce dormancy for arbitrary trusted plugin code, so the
+first-party conformance gate measures it. It snapshots live threads, child
+process identities, open listeners, and the plugin's durable lease rows before
+and immediately after factory invocation; the workflow factory must produce no
+delta. The host still treats the object as untrusted after construction and
+does not infer dormancy merely because the factory returned promptly.
+
 Registration identity is `<plugin-id>:<service-name>`. Names use
 `[a-z0-9][a-z0-9._-]*`; host sets are non-empty; duplicate identities and
 unknown host kinds fail that plugin's registration. Partial service
@@ -169,6 +176,16 @@ generic lifecycle does not add a public unauthenticated status endpoint. The
 workflow CLI/UI uses the plugin's durable coordinator heartbeat instead, so a
 different process and a local standby cannot produce a false availability
 claim.
+
+`snapshot()` never calls plugin code. The host maintains a cached health value
+using one daemon probe thread per service generation, samples after `run()`
+starts and every five seconds, permits at most one outstanding `health()` call,
+and marks the cache `unhealthy/health_timeout` when that call exceeds 100
+milliseconds. It never starts replacement probe threads while one is stuck.
+Shutdown accounts for both the service and probe threads;
+a stuck old-generation health probe is retained as `stop_timeout` and blocks
+reload just like a stuck `run()` thread. Thus a broken `health()` cannot block
+the host request/event loop or create unbounded probe threads.
 
 ## Generic lifecycle state machine
 
@@ -261,6 +278,15 @@ Every host process may construct an instance. The workflow plugin elects one
 leader using its profile-local SQLite authority; generic Hermes does not elect.
 Standbys continue heartbeat observation and election attempts.
 
+As a non-blocking placement optimization, election should use a non-preemptive
+host preference: Gateway attempts an expired or empty lease immediately, while
+web waits `web_election_grace_seconds` (default 3 seconds) before its CAS. A
+healthy web leader is never displaced merely
+because Gateway appears. This biases cold start and takeover toward the usually
+always-on Gateway without moving election policy into base Hermes or delaying
+web-only recovery beyond the bounded grace. Correct single-leader election and
+takeover do not depend on this bias, so it is not a release blocker.
+
 ### Durable ownership record
 
 The workflow store maintains a single coordinator lease with:
@@ -333,9 +359,24 @@ Continuous incoming wakes cannot starve periodic recovery scans.
 
 ## Workflow continuation state machine
 
-Execution-lane ownership is separate from lifecycle status. `paused`,
-`waiting_retry`, and `interrupted` do not retain a lane. A resumed run enters
-the durable runnable queue and competes fairly with already queued work.
+Execution-lane ownership is separate from lifecycle status. `waiting_retry`
+always releases its lane. Under `queue`, a paused run holds its lane by default
+to preserve strict serialization; a digest-bound sidecar may explicitly set
+`pause_lane_policy: release`, in which case later queued work may interleave at
+the human gate. An interrupted run holds its lane whenever any unresolved
+outward-classified attempt exists and releases it only after reconciliation or
+abandon. A replay-safe interrupted run may release immediately. Work that
+regains runnable status after releasing a lane enters the durable fair queue.
+
+The digest-bound Hermes sidecar shape is explicit:
+
+```yaml
+overlap_policy: queue
+pause_lane_policy: hold  # hold (default) | release
+```
+
+`pause_lane_policy` is invalid for `allow`/`forbid`; doctor reports a blocking
+configuration error rather than silently ignoring it.
 
 ```mermaid
 stateDiagram-v2
@@ -344,19 +385,25 @@ stateDiagram-v2
     Admitted --> Runnable: lane available
     Queued --> Runnable: coordinator promotes
     Runnable --> Running: fenced claim dispatched
-    Running --> Paused: approval/input gate
-    Running --> WaitingRetry: retry scheduled
-    Running --> Interrupted: executor/coordinator loss
+    Running --> PausedHoldingLane: gate + default hold policy
+    Running --> PausedReleased: gate + explicit release policy
+    Running --> WaitingRetry: retry scheduled; lane released
+    Running --> InterruptedHoldingLane: unresolved outward attempt
+    Running --> InterruptedReleased: replay-safe interruption
     Running --> ReconciliationRequired: effect outcome uncertain
     Running --> Succeeded
     Running --> Failed
     Running --> Cancelled
-    Paused --> Queued: valid decision/input + lane occupied
-    Paused --> Runnable: valid decision/input + lane free
+    PausedHoldingLane --> Running: valid decision/input
+    PausedHoldingLane --> Failed: terminal rejection
+    PausedReleased --> Queued: valid decision/input + lane occupied
+    PausedReleased --> Runnable: valid decision/input + lane free
+    PausedReleased --> Failed: terminal rejection
     WaitingRetry --> Queued: due + lane occupied
     WaitingRetry --> Runnable: due + lane free
-    Interrupted --> Queued: explicit safe resume + lane occupied
-    Interrupted --> Runnable: explicit safe resume + lane free
+    InterruptedHoldingLane --> ReconciliationRequired: effect unresolved
+    InterruptedReleased --> Queued: explicit safe resume + lane occupied
+    InterruptedReleased --> Runnable: explicit safe resume + lane free
     ReconciliationRequired --> Queued: operator chooses replay + lane occupied
     ReconciliationRequired --> Runnable: operator chooses replay + lane free
     ReconciliationRequired --> Running: operator records external success
@@ -364,9 +411,10 @@ stateDiagram-v2
     Failed --> Runnable: valid retry + lane free
 ```
 
-Terminal/pause/retry/interruption transitions commit a capacity-release wake.
-Duplicate wakes and promotions are idempotent. Queue ordering uses a durable
-sequence, not filesystem enumeration or process arrival timing.
+Terminal and retry-wait transitions commit a capacity-release wake. Pause and
+interruption commit one only when their authoritative lane policy releases the
+lane. Duplicate wakes and promotions are idempotent. Queue ordering uses a
+durable sequence, not filesystem enumeration or process arrival timing.
 
 ## Coordinator-unavailable state machine
 
@@ -395,6 +443,18 @@ When unavailable:
 If a coordinator dies after admission, the run remains durable. Health changes
 to unavailable/stalled according to thresholds, and a later leader recovers it.
 
+Foreground execution uses an explicit run-level `execution_mode=foreground`
+and a renewable foreground-owner lease. It may be admitted only when no fresh
+coordinator leader exists; an explicit foreground request racing a healthy
+leader fails with a typed ownership conflict rather than creating a run. A
+leader elected after foreground admission observes the fresh foreground lease
+but never dispatches any node of that run. After the foreground lease expires,
+the coordinator may adopt the run only through the lease-expiry and
+reconciliation rules below. A background run can transfer to foreground only
+through an explicit CAS action while no leader or live claim exists. This rule
+prevents parallel branches from being split between a CLI process and the
+coordinator.
+
 ## Lease expiry and reconciliation state machine
 
 Attempts record effect classification and executor identity before outward
@@ -410,6 +470,7 @@ stateDiagram-v2
     LeaseExpired --> StillRunning: identity proves same live process
     LeaseExpired --> KnownStopped: identity proves process ended
     LeaseExpired --> OutcomeUncertain: identity unavailable/mismatched
+    StillRunning --> Reclaimed: latest attempt + identity + fencing prove continuity
     StillRunning --> Interrupted: termination confirmed before safe replay
     StillRunning --> ReconciliationRequired: cannot confirm termination/effect
     KnownStopped --> Interrupted: side-effect-free and no success evidence
@@ -418,12 +479,20 @@ stateDiagram-v2
     ReconciliationRequired --> Completed: operator records external success
     ReconciliationRequired --> Failed: operator records external failure
     ReconciliationRequired --> Claimed: explicit replay authorization
+    Reclaimed --> Running: current leader renews same attempt
 ```
 
 Lease expiry never deletes executor identity. Automatic replay is allowed only
 when both termination and replay safety are established. Stale completions are
 retained as attempt evidence even when fencing prevents them from changing the
-authoritative run state.
+authoritative run state. Reclaim is not replay: one transaction verifies the
+same PID/start identity, immutable attempt ID/token, newest-attempt position,
+absence of a successor/terminal result, and the current leader epoch, then
+transfers the monitoring lease while preserving the attempt token. A
+side-effect-free attempt may be reclaimed whenever those facts hold. An
+outward-classified attempt additionally requires intact fencing and continuous
+identity; otherwise it enters reconciliation. This is the suspend/wake path for
+a healthy process that outlives the 30-second lease.
 
 ## Stall and health classification
 
@@ -440,6 +509,9 @@ plugins:
         heartbeat_seconds: 5
         lease_seconds: 30
         periodic_sweep_seconds: 5
+        idle_sweep_max_seconds: 60
+        idle_sweep_backoff_multiplier: 2
+        web_election_grace_seconds: 3
         sweep_max_runs: 100
         sweep_max_seconds: 2
         runnable_stall_seconds: 60
@@ -449,6 +521,12 @@ plugins:
 Validation requires `lease_seconds` to be at least three heartbeats and bounds
 each value to prevent a configuration from creating a busy loop or unbounded
 sweep. A wake may start a sweep earlier, but never bypass its item/time bounds.
+After a sweep finds no nonterminal runs and consumes no wake, recovery cadence
+backs off 5, 10, 20, 40, then 60 seconds. Any durable/local wake or discovered
+nonterminal run immediately resets it to 5 seconds. This keeps the recovery net
+available without a 40 percent idle duty-cycle ceiling on a battery-powered web
+host.
+
 Approval/input and a persisted future retry are explained waiting states, not
 stalls. A running node uses its stricter declared semantic-idle limit when one
 exists; otherwise the 300-second default applies.
@@ -479,6 +557,7 @@ stateDiagram-v2
     Leased --> Pending: retryable failure / lease expiry
     Leased --> DeadLetter: permanent or exhausted failure
     Pending --> Superseded: dedup/transition no longer actionable
+    Pending --> Suppressed: destination policy/coalescing
     Delivered --> Dismissed: user dismisses projection
     DeadLetter --> Pending: explicit retry
 ```
@@ -489,9 +568,18 @@ plugin-owned:
 
 - Gateway delivery runs only where an existing authenticated return route is
   valid and records receipts/failures in the outbox.
-- Desktop reads pending/in-app notifications from the web API; Electron may
-  project an OS-native notification and acknowledge the delivery receipt.
+- Desktop delivery fetch leases rows to a stable Electron client instance for
+  30 seconds. The row becomes `Delivered` only after Electron acknowledges that
+  it projected the notification; renderer failure before acknowledgement lets
+  the lease expire back to `Pending`. Ordinary evidence/list reads do not lease.
 - CLI has no daemon delivery promise; status/outbox remains queryable.
+
+Flapping transitions retain their complete event/outbox history but share a
+per-`(run_id, kind, destination)` 60-second delivery group. For collapsible
+failure/stall/retry kinds, only one external summary is deliverable in that
+window; later rows update its count/latest version and older undelivered rows
+become `Superseded` or `Suppressed` with a coalescing reason. Approval, input,
+reconciliation-required, cancellation, and completion rows remain distinct.
 
 Chat notifications use the existing alternation-safe outbound path or a new
 message/session boundary. They never inject a synthetic user message into an
@@ -502,6 +590,12 @@ required transitions always create durable outbox/attention facts. Destination
 policy may mark an external completion delivery `suppressed`; it does not omit
 the authoritative transition. Closing the Workflows tab or restarting a host
 cannot erase these facts.
+
+On a CLI-only installation with no web, headless-serve, or Gateway host, there
+is neither a coordinator nor a notification delivery owner. Background
+admission is refused, foreground runs may create queryable outbox facts, and no
+external delivery is promised. Cron/background workflows therefore require a
+running Gateway or web/Desktop backend.
 
 ## Archive, history, retention, and cleanup state machine
 
@@ -581,6 +675,8 @@ remain downstream customizations unless they modify an upstream-shared seam.
   deadline;
 - premature return, exception, health exception, and stop timeout produce
   distinct sanitized snapshots;
+- the first-party workflow factory changes no thread/process/listener/lease
+  baseline before `run()`, and a blocking `health()` cannot delay `snapshot()`;
 - a stop timeout prevents registry clearing and replacement factory calls;
 - successful reload starts generation N+1 only after every N thread exits;
 - FastAPI and Gateway lifecycle tests use real threads and real host setup;
@@ -593,8 +689,13 @@ remain downstream customizations unless they modify an upstream-shared seam.
 - a durable wake survives mutation-process exit and host restart;
 - all approve, reject, provide-input, resume, retry, and reconcile transitions
   continue through the coordinator, never the HTTP request;
-- pause/retry/interruption/terminal transitions release a lane and queued work
-  is promoted without duplicate execution;
+- retry/terminal transitions release lanes; pause and interruption obey the
+  explicit serialization/effect-safety policy without duplicate execution;
+- a foreground owner and a live coordinator cannot dispatch the same run, and
+  expired foreground ownership is adopted only through fenced recovery;
+- a matching live process survives suspend/wake through `StillRunning ->
+  Reclaimed` without replay;
+- idle sweeps back off to 60 seconds and reset immediately on a wake;
 - due retry and stranded work recover without a foreground CLI process;
 - background admission is rejected when no healthy leader exists; explicit
   foreground remains possible where supported;
@@ -613,9 +714,17 @@ remain downstream customizations unless they modify an upstream-shared seam.
 - hold SQLite locks through election, heartbeat, mutation, and cleanup deadlines;
 - simulate PID reuse/process-start mismatch and Windows process termination
   limitations;
+- simulate a two-minute suspend gap with the same live newest process and prove
+  fenced reclaim, then repeat with mismatched identity and prove reconciliation;
+- race a foreground owner and elected coordinator in separate processes and
+  prove only one can dispatch any branch of the run;
 - drop notification delivery after lease but before receipt and verify dedup;
+- flap failure/retry transitions and crash Desktop after lease but before ack;
+  prove one coalesced delivery and eventual pending redelivery;
 - force service shutdown timeout and prove no overlapping reload generation;
-- close/reopen Desktop and restart Gateway while unresolved attention persists.
+- close/reopen Desktop and restart Gateway while unresolved attention persists;
+- migrate a copied pre-amendment v2.0.9 database/run fixture through every
+  coordinator, wake, archive, and outbox schema on Linux, macOS, and Windows.
 
 ## Explicit non-goals
 

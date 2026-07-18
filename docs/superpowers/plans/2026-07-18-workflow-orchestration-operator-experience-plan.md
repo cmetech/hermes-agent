@@ -15,8 +15,8 @@ first consumer and owns election, wakes, scheduling, recovery, evidence,
 notifications, and all workflow state. RunStore remains authoritative. REST
 mutations are bounded state+wake commits; the coordinator executes later.
 
-**Status:** Proposed after adversarial review; implementation and release are
-blocked pending maintainer approval.
+**Status:** Adversarial re-review conditions incorporated; ready for explicit
+implementation approval. Implementation and release remain blocked until then.
 
 **Normative designs:**
 
@@ -24,6 +24,7 @@ blocked pending maintainer approval.
 - `docs/superpowers/specs/2026-07-18-plugin-background-services-workflow-coordination-design.md`
 - `docs/superpowers/specs/2026-07-18-workflow-orchestration-operator-experience-design.md`
 - `docs/reviews/2026-07-18-workflow-orchestration-adversarial-review-reconciliation.md`
+- `docs/reviews/2026-07-18-workflow-orchestration-operator-experience-adversarial-rereview.md`
 
 ## Global invariants
 
@@ -117,6 +118,11 @@ long-lived execution owner.
 
 - Modify: `plugins/workflow/store.py`
 - Modify: `plugins/workflow/locks.py`
+- Create: `tests/plugins/workflow/fixtures/store/pre-production-amendment-v2.0.9/admission.db`
+- Create: `tests/plugins/workflow/fixtures/store/pre-production-amendment-v2.0.9/fixture-manifest.json`
+- Create: `tests/plugins/workflow/fixtures/store/pre-production-amendment-v2.0.9/runs/migration-fixture/migration-run/run.json`
+- Create: `tests/plugins/workflow/fixtures/store/pre-production-amendment-v2.0.9/runs/migration-fixture/migration-run/events.jsonl`
+- Create: `tests/plugins/workflow/test_schema_migrations.py`
 - Modify: `tests/plugins/workflow/test_fault_injection.py`
 - Modify: `tests/plugins/workflow/test_run_queries.py`
 - Modify: `tests/plugins/workflow/test_performance_bounds.py`
@@ -128,6 +134,13 @@ long-lived execution owner.
 - [ ] Version/check the SQLite projection and rebuild only from corroborated
   authoritative evidence.
 - [ ] Make list/capacity filters surface storage degradation rather than lie.
+- [ ] Capture an immutable pre-amendment v2.0.9 admission database plus valid
+  run/journal evidence before changing schema. Migrate a copy through every new
+  table/column/index while preserving IDs, events, attempts, evidence hashes,
+  status, and idempotency; never rewrite the committed fixture in place. The
+  manifest records the source commit/product version and hashes. The test
+  harness may relocate only the legacy absolute `run_directory` prefix after
+  copying, and must assert no other pre-migration fact changed.
 
 **Phase 1 verification:**
 
@@ -139,7 +152,8 @@ scripts/run_tests.sh \
   tests/plugins/workflow/test_crash_recovery.py \
   tests/plugins/workflow/test_shutdown_recovery.py \
   tests/plugins/workflow/test_process_lifecycle_soak.py \
-  tests/plugins/workflow/test_run_queries.py -q
+  tests/plugins/workflow/test_run_queries.py \
+  tests/plugins/workflow/test_schema_migrations.py -q
 ```
 
 **Exit:** no evidence-loss path, destructive default, abandoned live executor,
@@ -163,6 +177,13 @@ workflow registration as the immediate consumer but no workflow host imports.
 - [ ] Write conformance tests for host filtering, registration attribution,
   duplicate rejection, partial-registration rollback, factory failure, `run`
   failure/early return, health failure, and sibling isolation.
+- [ ] Add first-party factory-dormancy conformance: snapshot threads, child
+  process identities, open listeners, and durable leases across factory
+  invocation; the workflow factory must produce no delta before `run()`.
+- [ ] Add a blocking `health()` service and prove `snapshot()` returns the
+  cached `health_timeout` result within 100 milliseconds, starts no repeated
+  probes, retains the stuck probe, and blocks replacement reload as
+  `stop_timeout` rather than misreporting `failed`.
 - [ ] Implement the selected `run(stop_event)` protocol, sanitized snapshots,
   one supervisor thread per service, and one aggregate shutdown deadline.
 - [ ] Check safe mode at discovery and host start; invoke zero factories.
@@ -244,6 +265,11 @@ requests and incidental foreground processes.
   compatible takeover.
 - [ ] Persist coordinator identity, PID/start token, host kind, epoch, heartbeat,
   lease, sweep cursor, and last progress in workflow-owned SQLite.
+- [ ] Optional, non-blocking placement optimization: bias empty/expired lease
+  acquisition toward Gateway. Gateway CAS is
+  immediate, web waits the configured three-second grace, and neither host
+  preempts a fresh healthy leader. Test Gateway+web cold start, web-only delay,
+  and takeover without split leadership.
 - [ ] Expose durable `healthy`, `standby`, `unavailable`, `degraded`, and stale-
   heartbeat facts through workflow status/doctor.
 
@@ -262,20 +288,35 @@ requests and incidental foreground processes.
 
 - [ ] Implement cursor/time/item-bounded sweeps with fairness between durable
   wakes and periodic recovery.
-- [ ] Promote queued runs when a run pauses, waits retry, interrupts, completes,
-  fails, cancels, or otherwise safely releases its execution lane.
+- [ ] Always release/promote at persisted retry wait and terminal states. Under
+  `queue`, hold the lane at approval/input by default; allow release only from
+  a digest-bound `pause_lane_policy: release` sidecar and expose interleaving in
+  preflight/doctor. Hold interrupted lanes with unresolved outward attempts;
+  release only replay-safe interruptions or after reconciliation/abandon.
 - [ ] Requeue approved/input/resumed/retried/reconciled work fairly if another
   run owns the lane.
 - [ ] Wake due retries without an in-memory sleep/timer.
 - [ ] Recover stranded running/pending-final-node states and classify stalls by
   meaningful progress, lease, log, and coordinator health.
+- [ ] Add `StillRunning -> Reclaimed`: atomically retain the immutable attempt
+  ID/token while verifying PID/start identity, newest-attempt position, no
+  successor/terminal result, and current leader epoch. Reclaim outward attempts
+  only with intact fencing/continuous identity; otherwise require reconcile.
+- [ ] Back idle recovery sweeps off 5, 10, 20, 40, then 60 seconds after empty
+  work, reset to 5 seconds on any wake/nonterminal discovery, and distinguish a
+  runnable run with an explained queue position (`waiting`) from a runnable run
+  with no owner (`stalled`).
 - [ ] Ensure duplicate wakes/promotions do not duplicate nodes or outward work.
 
 ### 3.4 Admission failure policy
 
 - [ ] Reject background/`--no-wait` admission transactionally when no fresh
   healthy leader exists; create no run directory.
-- [ ] Keep explicit foreground execution available for supported CLI commands.
+- [ ] Permit foreground admission only when no fresh leader exists and atomically
+  record a renewable run-level foreground-owner lease. A leader appearing later
+  must not dispatch that run; expired ownership adopts only through the recovery
+  machine. Add a real two-process foreground+coordinator race proving no node or
+  parallel branch is split between owners.
 - [ ] If the coordinator disappears after admission, preserve the run/evidence,
   report unavailable/stalled health, and recover under a later leader.
 
@@ -292,8 +333,10 @@ scripts/run_tests.sh \
   tests/plugins/workflow/test_operator_e2e.py -q
 ```
 
-**Exit:** host/process restart, every interaction, retry wake, and queued
-promotion continue without foreground ownership; HTTP never executes graph work.
+**Exit:** host/process restart, every interaction, retry wake, and policy-safe
+queued promotion continue without incidental request ownership; explicit
+foreground and coordinator dispatch remain mutually exclusive, and HTTP never
+executes graph work.
 
 ## Phase 4 — CLI and API machine contracts
 
@@ -313,6 +356,13 @@ promotion continue without foreground ownership; HTTP never executes graph work.
 - [ ] Freeze schema-versioned success/error envelopes and exit-code table; add
   parser tests for every command's success, validation, not-found, auth,
   conflict, unavailable, blocking-doctor, action failure, and internal error.
+- [ ] Migrate current approve/reject exit `3`: same-decision reuse becomes `0`,
+  stale/different decision becomes `5`, and `3` becomes not found. Update every
+  shipped skill/example/test and document JSON `schema_version` + `error.code`
+  as the primary machine dispatch contract.
+- [ ] Return at most ten authorized deterministic `error.details.candidates`
+  with safe ID/kind/label for workflow and showcase not-found errors; test no
+  cross-scope candidate leakage.
 - [ ] Catch CAS/runtime errors as typed envelopes without tracebacks on stdout.
 - [ ] Make doctor nonzero on blocking findings and mode-aware.
 - [ ] Fix `events --tail` to return newest N in display order.
@@ -388,6 +438,7 @@ with the real machine contract.
 - Create: `plugins/workflow/provenance.py`
 - Create: `plugins/workflow/evidence.py`
 - Create: `plugins/workflow/sanitize.py`
+- Create: `plugins/workflow/runtime.py`
 - Modify: `plugins/workflow/store.py`
 - Modify: `plugins/workflow/cli.py`
 - Modify: `plugins/workflow/showcase.py`
@@ -396,13 +447,17 @@ with the real machine contract.
   code search; do not add a new core workflow path
 - Create: `tests/plugins/workflow/test_provenance.py`
 - Create: `tests/plugins/workflow/test_evidence_api.py`
+- Create: `tests/plugins/workflow/test_api_runtime.py`
 - Modify: `tests/plugins/workflow/test_operator_scope.py`
 - Modify: `tests/plugins/workflow/test_desktop_api.py`
 - Modify: `tests/plugins/workflow/test_security_boundaries.py`
 
 - [ ] Persist canonical `desktop`, `chat`, `background_agent`, `cron`, `cli`,
-  and `api` source, verified actor, source instance, intent key, and authenticated
-  return route; show legacy absence as `unknown`.
+  and `api` source plus `verified_adapter`, `system_schedule`,
+  `local_admin_claim`, or `legacy_unknown` assurance. REST/direct Gateway actors
+  may be verified and a direct internal scheduler may be `system_schedule`;
+  terminal-spawned chat/background-agent/cron CLI claims must remain visibly
+  local-admin-claimed and never grant authorization or delivery routing.
 - [ ] Trace every production admission writer and add cross-surface tests proving
   none hardcodes `cli` incorrectly.
 - [ ] Define bounded cursor APIs for timeline, interactions, attempts,
@@ -414,6 +469,16 @@ with the real machine contract.
   narrow but never grant authority. Document local CLI admin separately.
 - [ ] Mount real FastAPI auth/lifespan tests for allowed, denied, cross-profile,
   raw-artifact, and forged-header cases.
+- [ ] Replace per-request `RunStore` construction with a bounded profile-keyed,
+  reference-counted `WorkflowStoreRegistry` capped at eight profiles; only zero-
+  reference entries may be evicted. Assert repeated list/detail/event requests
+  initialize one store per profile and profile switching never reuses the wrong
+  store.
+- [ ] Convert event waiting to async admission with a per-process semaphore of
+  16. Excess waits return typed 429 `event_wait_capacity`; admitted waits sleep
+  asynchronously and run brief store reads through a plugin-owned blocking-I/O
+  limiter of four workers, not FastAPI's shared chat threadpool. Test 17
+  concurrent waits while an unrelated chat/status request remains responsive.
 
 **Verification:**
 
@@ -421,6 +486,7 @@ with the real machine contract.
 scripts/run_tests.sh \
   tests/plugins/workflow/test_provenance.py \
   tests/plugins/workflow/test_evidence_api.py \
+  tests/plugins/workflow/test_api_runtime.py \
   tests/plugins/workflow/test_operator_scope.py \
   tests/plugins/workflow/test_desktop_api.py \
   tests/plugins/workflow/test_security_boundaries.py -q
@@ -489,6 +555,9 @@ never becomes execution authority or a second chat surface.
 - [ ] Persist reversible archive metadata/version independently of lifecycle.
 - [ ] Implement restore to History, not execution.
 - [ ] Define terminal board aging as visibility policy only; evidence remains.
+- [ ] Compute the seven-day cutoff in UTC from durable `updated_at` with an
+  injected clock. Test exact-boundary, DST/timezone independence, and that an
+  archived-then-restored run returns to History rather than Active/TerminalBoard.
 - [ ] Expose cleanup preview/history and matching explicit execution in CLI/API.
 - [ ] Replace product documentation that teaches bare destructive cleanup or
   `yes`-style confirmation with the preview/execute contract and config.yaml
@@ -526,6 +595,14 @@ destructive cleanup have distinct durable semantics.
   persist suppression but may not omit the authoritative transition.
 - [ ] Deduplicate on transition/state-version/destination and implement leases,
   retry/backoff, receipts, dead-letter, explicit retry, and unresolved attention.
+- [ ] Coalesce external failure/stall/retry delivery per
+  `(run_id, kind, destination)` over 60 seconds while preserving every durable
+  transition. Assert one summary delivery, latest version/count, and superseded
+  older pending rows; never coalesce distinct human gates, reconciliation,
+  cancellation, or completion.
+- [ ] Make Desktop delivery normative: API read leases to a stable Electron
+  client for 30 seconds; only post-projection Electron acknowledgement marks
+  delivered; renderer crash/no-ack returns the row to pending after lease expiry.
 - [ ] Make coordinator the outbox policy owner; destination adapters only
   project/send and record results.
 - [ ] Preserve pending attention across closed Desktop, Gateway/web restart,
@@ -535,6 +612,9 @@ destructive cleanup have distinct durable semantics.
   assert no synthetic user message or system/tool mutation.
 - [ ] Fault after transport send but before receipt and prove dedup/reconciliation
   prevents uncontrolled duplicate delivery.
+- [ ] Document/test CLI-only posture: no web/Gateway host means no coordinator
+  or delivery owner, background admission is refused, foreground notification
+  facts are query-only, and cron/background workflows require a long-lived host.
 
 **Verification:** notification unit, real RunStore restart, Gateway projection,
 Desktop projection, and message-alternation tests.
@@ -560,6 +640,9 @@ and observable failure state.
 - [ ] Linux, macOS, and native Windows: SQLite election/locks, atomic
   replace/quarantine, process-start identity, termination limitations, journal
   tear, coordinator kill/takeover, host restart, concurrent web+Gateway hosts.
+- [ ] On Linux, macOS, and native Windows, copy the committed pre-amendment
+  v2.0.9 fixture, migrate it through coordinator/wake/archive/outbox schemas,
+  reopen after restart, and verify every original run/evidence/idempotency fact.
 - [ ] Coordinator loss before admission, after admission, after wake commit,
   after claim, during effect, after effect/before result, and during shutdown.
 - [ ] Retry due while no host, interaction while no host, queued promotion after
@@ -598,28 +681,37 @@ Release is blocked until every item is checked in this order:
 3. [ ] Lease expiry preserves executor identity and uncertain outward effects
    require reconciliation.
 4. [ ] Journal/projection recovery survives torn writes and fails closed.
-5. [ ] Generic service lifecycle passes real web/Gateway start, failure,
-   shutdown, safe-mode, and no-overlap reload tests.
-6. [ ] Workflow coordinator election/heartbeat/wake/recovery passes two-process
-   restart and native Windows tests.
-7. [ ] Every interaction, retry, cancellation/lane release, and queued promotion
-   continues durably outside HTTP.
+5. [ ] Generic service lifecycle passes real web/Gateway start, factory-dormancy,
+   non-blocking cached-health, failure, shutdown, safe-mode, and no-overlap
+   reload tests.
+6. [ ] Workflow coordinator election/heartbeat/wake/reclaim/foreground
+   arbitration, idle backoff, and recovery pass two-process restart
+   and native Windows tests.
+7. [ ] Every interaction, retry, policy-authorized lane release, cancellation,
+   and queued promotion continues durably outside HTTP without unsafe gate or
+   outward-effect interleaving.
 8. [ ] Background admission is refused without a healthy coordinator and
    explicit foreground behavior is truthful.
-9. [ ] CLI/API JSON, exits, CAS, doctor, events-tail, next-actions, and
-   deterministic idempotency contracts pass behavioral tests.
+9. [ ] CLI/API JSON, exit-3 migration, bounded not-found candidates, CAS,
+   doctor, events-tail, next-actions, and deterministic idempotency contracts
+   pass behavioral tests.
 10. [ ] Generic/showcase skills use real supported commands, stable identity,
     one mutation at a time, human gates, and no-progress/unavailable handling.
-11. [ ] All trigger sources record authenticated durable provenance.
-12. [ ] Evidence queries, sanitization, retention, and real middleware
-    authorization support every operator claim.
+11. [ ] All trigger sources record durable provenance with truthful assurance;
+    local-admin claims are never represented as authenticated.
+12. [ ] Evidence queries, sanitization, bounded store reuse/long-poll admission,
+    retention, and real middleware authorization support every operator claim
+    without starving chat.
 13. [ ] Desktop board/inspector offers complete evidence and only valid actions;
     mutations remain bounded while work continues asynchronously.
-14. [ ] Archive/history/retention/cleanup semantics are distinct and tested.
-15. [ ] Durable notification outbox, named delivery owners, dedup, retries,
-    closed-surface persistence, and dismissal semantics pass.
-16. [ ] Linux/macOS/native-Windows, surface UAT, restart/fault matrix, packaging,
-    update/install, soak, ledger, prompt-cache, and alternation gates pass.
+14. [ ] Archive/history/retention/cleanup semantics are distinct and UTC/
+    injectable-clock tested.
+15. [ ] Durable notification outbox, named delivery owners, coalescing, Desktop
+    lease/ack receipts, CLI-only posture, retries, closed-surface persistence,
+    and dismissal semantics pass.
+16. [ ] Linux/macOS/native-Windows, pre-amendment schema migration, surface UAT,
+    restart/fault matrix, packaging, update/install, soak, ledger, prompt-cache,
+    and alternation gates pass.
 17. [ ] A fresh adversarial review has no Critical/High release blockers and a
     maintainer explicitly approves implementation for release.
 

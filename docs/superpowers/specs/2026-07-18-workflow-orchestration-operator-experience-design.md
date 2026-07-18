@@ -1,7 +1,7 @@
 # Workflow Orchestration Operator Experience Design
 
 **Date:** 2026-07-18
-**Status:** Amended after adversarial review; proposed for maintainer approval
+**Status:** Re-review conditions incorporated; ready for implementation approval
 **Scope:** Shared workflow operating contract, machine API, evidence, Desktop board/inspector, archive/cleanup, and notifications
 
 ## Summary
@@ -142,6 +142,16 @@ Exit categories are stable and documented:
 `events --tail N` returns the newest N matching events in chronological display
 order. CAS conflicts are expected typed results, not tracebacks.
 
+This is a deliberate migration: current approve/reject code uses exit `3` for
+“decision not applied.” Under schema version 1, idempotent same-decision reuse
+is `0`, a stale/different decision is conflict `5`, and `3` means not found.
+Every shipped skill, example, and test that interpreted the old `3` migrates in
+the same phase. Machines dispatch first on the JSON envelope's
+`schema_version` and `error.code`; the process exit is the coarse transport
+category. Not-found errors include at most ten authorized, deterministically
+ordered `error.details.candidates` containing only identifier, kind, and safe
+display label, for both workflow and showcase namespaces.
+
 ### Idempotency
 
 Every start has `source`, `source_instance`, `intent_key`, and `start_digest`.
@@ -163,7 +173,13 @@ coordinator inside the admission check. It never means “create work and hope a
 host appears.” On failure no run directory is created.
 
 `--foreground` is an explicit execution mode for commands that support local
-execution. It does not silently activate because a coordinator is absent.
+execution and is allowed only when admission proves no fresh coordinator
+leader. Admission atomically records a renewable foreground-owner lease; a
+leader that appears later observes but does not dispatch that run. A foreground
+request racing a live leader returns a typed ownership conflict, and an expired
+foreground lease transfers only through fenced recovery/reconciliation. It does
+not silently activate because a coordinator is absent.
+
 Interaction commands default to mutation plus durable wake; a foreground
 continuation option, where supported, is explicit and cannot be used from REST.
 
@@ -235,20 +251,37 @@ tests alone do not satisfy this contract.
 
 ## Trigger provenance
 
-Provenance is server-recorded and immutable after admission:
+Provenance is store-recorded and immutable after admission, but its assurance
+must match the boundary that supplied it:
 
 - `source`: `desktop`, `chat`, `background_agent`, `cron`, `cli`, or `api`;
-- `source_instance`: authenticated adapter/session/job/client identity;
-- `actor_id`: verified principal or documented local-admin identity;
+- `assurance`: `verified_adapter`, `system_schedule`, `local_admin_claim`, or
+  `legacy_unknown`;
+- `source_instance`: verified adapter/session/job/client identity when the
+  assurance supports one, otherwise a labeled local claim;
+- `actor_id`: verified principal for authenticated boundaries, scheduler
+  identity for `system_schedule`, or the local-admin process identity;
+- `claimed_actor`: optional unverified actor label supplied by a local-admin CLI
+  caller; it never grants authorization;
 - `intent_key`: source-scoped stable semantic request identity;
-- `return_route`: authenticated delivery descriptor stored separately from
-  workflow input and start digest;
+- `return_route`: verified delivery descriptor only for authenticated/system
+  adapters; a local claimed route is labeled unverified, cannot authorize
+  delivery, and is stored separately from workflow input/start digest;
 - `admitted_at`, profile, and package digest.
 
-Adapters supply claims through typed internal APIs, not arbitrary CLI strings.
-The store validates canonical values. UI origin icons are derived from this
-durable record; clients do not invent origin. Legacy runs with absent provenance
-display `unknown`, never `cli` by assumption.
+Desktop REST/API and direct Gateway adapters supply `verified_adapter`
+provenance through typed authenticated APIs. A direct internal scheduler
+adapter supplies `system_schedule`; a cron-driven skill that shells out to the
+CLI remains `local_admin_claim`. Any chat or background-agent skill that spawns
+the CLI through the terminal is likewise inside the CLI local-admin boundary:
+it may record `source=chat` or `background_agent`, but only with
+`assurance=local_admin_claim`; claimed platform actors and routes remain
+visibly unverified and cannot authorize notification delivery. A future per-
+session capability could strengthen that path, but is not a Phase 6
+requirement. The store validates canonical combinations. UI
+origin icons and assurance labels are derived from this durable record; clients
+do not invent verified origin. Legacy runs display `unknown`, never `cli` by
+assumption.
 
 ## Evidence model
 
@@ -347,6 +380,19 @@ Reads use bounded summaries and cursors. One selected-run refresh path replaces
 independent one-second full-journal scans. Hidden pages stop cosmetic polling;
 durable attention/outbox state prevents transition loss.
 
+The plugin API reuses a bounded, profile-keyed workflow store registry instead
+of constructing and reconciling `RunStore` per request. It retains at most eight
+profiles. Entries are acquired by reference-counted lease and only zero-
+reference entries may be evicted. The event wait route is asynchronous, admits
+at most 16 waiters per process, returns typed `event_wait_capacity`/429 with
+retry guidance when full, and performs short store reads through a plugin-owned
+blocking-I/O limiter of four workers rather than occupying FastAPI's shared chat
+threadpool while sleeping. Its 30-second public wait cap remains unchanged.
+
+These bounds live under `plugins.entries.workflow.api` as
+`max_cached_profiles: 8`, `max_event_waiters: 16`, and `store_io_workers: 4`;
+validation prevents zero/unbounded values.
+
 Keyboard operation, focus preservation, status announcements, non-color health
 cues, reduced motion, and laptop-width layout are release requirements.
 
@@ -357,7 +403,9 @@ the run to History, not execution. A terminal-card visibility policy controls
 board clutter without altering evidence. The initial default keeps terminal
 cards on the board for seven days; `plugins.entries.workflow.retention` may
 tune that visibility window. Aging changes only the board projection and never
-invokes cleanup.
+invokes cleanup. The cutoff is computed in UTC from durable `updated_at` using
+an injected clock. Restoring an archived run returns it to History even if its
+terminal timestamp would otherwise fall inside the board window.
 
 Bare cleanup is preview-only. Preview includes candidate IDs, evidence types,
 bytes, index integrity, open readers/claims, notification dependencies, and
@@ -384,13 +432,25 @@ destination projections:
 
 - Gateway sends only through the authenticated stored return route and records
   the transport result.
-- Desktop API exposes pending notifications; Electron may deliver a native OS
-  notification and acknowledge it.
+- Desktop's delivery read leases a row to its stable Electron client instance;
+  only Electron's acknowledgement after projection marks it delivered. A crash
+  before acknowledgement lets the lease expire back to pending.
 - if a projection is closed, unresolved outbox/attention remains durable and
   visible on return.
 
+Flapping failure/stall/retry transitions retain individual durable history but
+coalesce external delivery per run/kind/destination over a 60-second window.
+Only one summary is deliverable; later facts update its count/latest version
+and supersede or suppress older undelivered deliveries. Human gates,
+reconciliation, cancellation, and completion are never collapsed together.
+
 Dismissal acknowledges presentation only. It never approves, cancels,
 archives, or otherwise mutates the run.
+
+A CLI-only installation has no coordinator and no notification delivery owner.
+Background admission is refused, foreground outbox facts are query-only, and
+cron/background execution requires a running Gateway or web/Desktop/headless-
+serve host.
 
 ## Failure policy
 
@@ -408,13 +468,15 @@ archives, or otherwise mutates the run.
 
 ## Acceptance criteria
 
-- all six trigger sources persist truthful provenance and stable identity;
+- all six trigger sources persist truthful provenance, assurance, and stable
+  identity without promoting local-admin claims to authenticated facts;
 - retries of the same semantic start produce one run;
 - every runnable interaction/retry/recovery path records a wake and continues
   under a durable coordinator;
 - Desktop mutations return promptly without executing graph nodes;
-- queued work promotes after pause, retry wait, interruption, terminal state,
-  cancellation, and applicable archive/cleanup release;
+- queued work always promotes after retry wait/terminal release and promotes
+  after pause/interruption only when the serialization/effect policy releases
+  the lane;
 - JSON success/failure envelopes and exit codes are stable across every command;
 - doctor, events tail, CAS conflict, and `next_actions` behavior match the
   documented contract;
@@ -424,8 +486,8 @@ archives, or otherwise mutates the run.
 - skills construct only supported commands, stop at gates, prevent duplicates,
   and handle unavailable/stalled states in behavioral tests;
 - Desktop exposes authoritative evidence and only valid actions;
-- notifications survive closed UI, host restart, delivery retry, and duplicate
-  processing;
+- notifications survive closed UI, host restart, delivery retry, renderer crash
+  before acknowledgement, transition flapping, and duplicate processing;
 - archive/restore are reversible and retention does not delete evidence;
 - Linux, macOS, and native Windows gates cover lifecycle, SQLite, filesystem,
   process identity, recovery, and restart paths;

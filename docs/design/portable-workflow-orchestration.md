@@ -1,6 +1,6 @@
 # Portable Workflow Orchestration Design
 
-**Status:** Design of record amended for production safety; coordinator and operator-experience implementation require review approval
+**Status:** Design of record amended through adversarial re-review; ready for explicit implementation approval
 
 **Date:** 2026-07-16
 
@@ -342,7 +342,14 @@ Natural request or /workflow
 
 Natural-language routing depends on the concise skill description already present in Hermes' stable skill index. Explicit `/workflow ...` is the deterministic escape hatch on CLI, gateway, TUI, and desktop: it loads the full skill as a user message, not a system-prompt mutation. The skill uses machine-readable CLI responses and never edits run files directly.
 
-An approval or clarification ends the worker and durably pauses the run. The user can answer in the same conversation or later with `/workflow approve`, `/workflow reject`, or `/workflow resume`; the next CLI invocation continues the same run without holding the original chat turn or worker. Cron enters at the same skill/CLI boundary, delivers a paused run ID instead of waiting, and resumes only after an explicit later action.
+An approval or clarification ends the worker and durably pauses the run. The
+user can answer in the same conversation or later with `/workflow approve`,
+`/workflow reject`, or `/workflow resume`; that action commits a durable wake
+and the elected coordinator continues outside the original chat/HTTP/CLI turn.
+Explicit foreground continuation is available only under the coordinator-
+unavailable ownership rules. Cron enters at the same skill/CLI boundary,
+delivers a paused run ID instead of waiting, and resumes only after an explicit
+later action.
 
 For authoring, a natural request such as “build a workflow that reviews a ticket and asks before posting” selects `workflow-builder`. That skill inventories the current profile's tools, MCP servers, skills, providers, and runtimes; writes an Archon-shaped package; runs `doctor`; and offers on-demand execution or an existing Hermes cron schedule only after the package is runnable.
 
@@ -526,7 +533,14 @@ expired. Closing only a renderer while its Hermes backend remains alive does
 not stop the workflow. The first milestone does not create an independently
 detached workflow daemon.
 
-After forced termination, laptop power loss, or OS kill, restart reconciliation detects stale leases/process identities, marks attempts `interrupted`, and requires normal resume rules. A suspend/wake or wall-clock jump is detected from the monotonic/UTC heartbeat gap; the coordinator reconciles ownership rather than assuming the attempt succeeded. Unknown external-side-effect outcomes pause for operator reconciliation before retry.
+After forced termination, laptop power loss, or OS kill, restart reconciliation
+detects stale leases/process identities. A proven stopped replay-safe attempt
+becomes `interrupted`; an uncertain outward effect requires reconciliation. A
+suspend/wake or wall-clock jump is detected from the monotonic/UTC heartbeat
+gap. If the same newest process/attempt identity is still live and fencing is
+intact, the current leader reclaims its monitoring lease instead of terminating
+or replaying it. Unknown external-side-effect outcomes pause for operator
+reconciliation before retry.
 
 Retries have one combined attempt budget across provider-level and workflow-level retry layers so nested retries cannot multiply unexpectedly. Fatal authentication, authorization, credit, validation, cancellation, and unknown-side-effect errors do not retry. Transient backoff is persisted and interruptible; a sleeping retry holds neither a worker nor a scheduler slot.
 
@@ -539,10 +553,13 @@ Process-tree resident memory, CPU time where the platform can enforce or measure
 `RunStore.start_run` is the only run-creation path. It atomically records the trigger source, idempotency key, start digest, concurrency key/policy, admission disposition, and run ID before scheduling any node. Chat, `/workflow`, CLI, Desktop, API, and cron all call this contract; none may create a run directory directly. A duplicate delivery returns `existing`, an intentional queued overlap returns `queued`, and a capacity/policy refusal returns a stable non-billable diagnostic. Queued runs are durable state only: they own no agent, process, thread, retry timer, MCP server, or scheduler slot.
 
 The production amendment separates a workflow's lifecycle status from execution-
-lane ownership. A run paused for approval/input, waiting for a persisted retry,
-or safely interrupted owns no execution lane, so a durable coordinator may
-promote queued work. When the waiting run becomes runnable again it enters the
-durable fair queue; it does not bypass another lane owner. Paused/retry/
+lane ownership. Persisted retry wait always releases its lane. Under `queue`, a
+run paused for approval/input holds the lane by default to preserve strict
+serialization; a digest-bound sidecar may explicitly opt into interleaving by
+releasing at gates. A safely interrupted run may release, but an interrupted
+run with an unresolved outward-classified attempt holds the lane until
+reconciliation or abandon. When a released run becomes runnable again it enters
+the durable fair queue; it does not bypass another lane owner. Paused/retry/
 interrupted quotas still bound retained nonterminal state. Duplicate promotion
 and wake processing are idempotent.
 
