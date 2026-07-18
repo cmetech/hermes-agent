@@ -569,6 +569,7 @@ upstream_changes:
   tests:
   - tests/hermes_cli/test_web_server_plugin_services.py
   - tests/hermes_cli/test_web_server_boot_handshake.py
+  - tests/hermes_cli/test_workflow_dashboard_auth.py
   expected_commit_subject: 'feat(web): host plugin background services'
   upstream_candidate: true
   merge_guidance: Preserve generic plugin discovery and web-host binding before
