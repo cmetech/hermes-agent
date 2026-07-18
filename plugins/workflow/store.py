@@ -1012,6 +1012,13 @@ class RunStore:
                 continue
             for node_id, node in projection.get("nodes", {}).items():
                 claim = node.get("claim") if isinstance(node, dict) else None
+                if not isinstance(claim, dict) and isinstance(node, dict):
+                    recovery = node.get("recovery")
+                    if isinstance(recovery, dict) and recovery.get("observation") in {
+                        "still_running",
+                        "outcome_uncertain",
+                    }:
+                        claim = recovery
                 if not isinstance(claim, dict):
                     continue
                 attempt_id = str(claim.get("attempt_id", ""))
@@ -1020,7 +1027,11 @@ class RunStore:
                         row["run_id"],
                         str(node_id),
                         str(claim.get("owner_id", "recovered")),
-                        str(claim.get("lease_expires_at", _utc_now())),
+                        str(
+                            claim.get("lease_expires_at")
+                            or claim.get("lease_expired_at")
+                            or _utc_now()
+                        ),
                     )
         with self._connect() as connection:
             if active:
@@ -1262,6 +1273,10 @@ class RunStore:
                 workflow_name=package.definition.name,
                 nodes=nodes,
                 input_digests=input_digests,
+                outward_action_nodes=tuple(
+                    str(node_id)
+                    for node_id in package.sidecar.get("outward_action_nodes", ())
+                ),
             )
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
@@ -1345,6 +1360,7 @@ class RunStore:
             snapshot.workflow_version,
             snapshot.nodes,
             dict(snapshot.input_digests),
+            snapshot.outward_action_nodes,
         )
 
     @staticmethod
@@ -1597,6 +1613,7 @@ class RunStore:
             "run_metadata": dict(sorted((request.run_metadata or {}).items())),
             "concurrency_key": request.concurrency_key,
             "concurrency_policy": request.concurrency_policy,
+            "outward_action_nodes": list(snapshot.outward_action_nodes),
             "admission_disposition": disposition,
             "queue_position": queue_position,
             "blocked_by_run_id": blocked_by,
@@ -2090,9 +2107,17 @@ class RunStore:
         now: datetime | None = None,
         monotonic_now: float | None = None,
         journal_reserve_bytes: int = 0,
+        executor_id: str = "unknown",
+        owner_epoch: str | None = None,
+        effect_classification: str = "replay_safe",
+        evidence_paths: Iterable[str] | None = None,
     ) -> NodeClaim | None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
+        if effect_classification not in {"replay_safe", "outward"}:
+            raise ValueError("effect_classification must be replay_safe or outward")
+        if not executor_id:
+            raise ValueError("executor_id must not be empty")
         self._ensure_free_disk()
         directory = self.run_directory(run_id)
         with workflow_lock(self.admission_lock):
@@ -2103,6 +2128,12 @@ class RunStore:
                     projection.get("desired_status") is not None
                     or not node
                     or node["state"] != "ready"
+                    or (
+                        isinstance(node.get("recovery"), Mapping)
+                        and node["recovery"].get("observation")
+                        in {"still_running", "outcome_uncertain"}
+                        and not node["recovery"].get("termination_confirmed")
+                    )
                 ):
                     return None
                 self._ensure_run_capacity(
@@ -2127,6 +2158,13 @@ class RunStore:
                         else time.monotonic()
                     )
                     expires = instant + timedelta(seconds=lease_seconds)
+                    resolved_evidence_paths = list(
+                        evidence_paths
+                        or (
+                            f"nodes/{node_id}/{attempt_id}/stdout.txt",
+                            f"nodes/{node_id}/{attempt_id}/stderr.txt",
+                        )
+                    )
                     connection.execute(
                         "INSERT INTO worker_claims "
                         "(attempt_id, run_id, node_id, owner_id, lease_expires_at) "
@@ -2141,10 +2179,19 @@ class RunStore:
                         "heartbeat_at": instant.isoformat(),
                         "heartbeat_monotonic": monotonic_instant,
                         "lease_seconds": float(lease_seconds),
+                        "owner_epoch": owner_epoch or owner_id,
+                        "executor_id": executor_id,
+                        "effect_classification": effect_classification,
                     }
                     node["attempts"].append({
                         "attempt_id": attempt_id,
                         "state": "claimed",
+                        "claimed_at": instant.isoformat(),
+                        "owner_id": owner_id,
+                        "owner_epoch": owner_epoch or owner_id,
+                        "executor_id": executor_id,
+                        "effect_classification": effect_classification,
+                        "evidence_paths": resolved_evidence_paths,
                     })
                     self._append_locked(
                         directory,
@@ -2213,6 +2260,7 @@ class RunStore:
             }
             active["process_identity"] = serialized
             node["attempts"][-1]["process_identity"] = serialized
+            node["attempts"][-1]["process_started_at"] = _utc_now()
             self._append_locked(
                 directory,
                 projection,
@@ -2230,23 +2278,46 @@ class RunStore:
         *,
         cleaned: bool,
     ) -> bool:
-        """Record cleanup only while the same claim still owns the identity."""
+        """Record cleanup against the immutable attempt, including after expiry."""
         directory = self.run_directory(claim.run_id)
         with workflow_lock(self._run_lock_path(claim.run_id)):
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
-            serialized = active.get("process_identity")
+            attempt = next(
+                (
+                    candidate
+                    for candidate in node.get("attempts", [])
+                    if candidate.get("attempt_id") == claim.attempt_id
+                ),
+                None,
+            )
+            if not isinstance(attempt, dict):
+                return False
+            serialized = attempt.get("process_identity")
             if (
-                active.get("attempt_id") != claim.attempt_id
-                or not isinstance(serialized, dict)
+                not isinstance(serialized, dict)
                 or serialized.get("pid") != identity.pid
+                or serialized.get("start_time") != identity.start_time
             ):
                 return False
             event_type = "process_reaped" if cleaned else "cleanup_failed"
-            if cleaned:
+            if active.get("attempt_id") == claim.attempt_id and cleaned:
                 active.pop("process_identity", None)
-                node["attempts"][-1].pop("process_identity", None)
+            attempt["process_stop"] = {
+                "recorded_at": _utc_now(),
+                "cleaned": cleaned,
+                "identity_matched": True,
+            }
+            recovery = node.get("recovery")
+            if (
+                isinstance(recovery, dict)
+                and recovery.get("attempt_id") == claim.attempt_id
+            ):
+                recovery["termination_confirmed"] = cleaned
+                recovery["observation"] = (
+                    "known_stopped" if cleaned else "outcome_uncertain"
+                )
             self._append_locked(
                 directory,
                 projection,
@@ -2255,6 +2326,8 @@ class RunStore:
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
             )
+            if cleaned:
+                self._release_worker_claim(claim.attempt_id)
             return True
 
     def complete_node(
@@ -2284,6 +2357,29 @@ class RunStore:
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
             if active.get("attempt_id") != claim.attempt_id:
+                stale_attempt = next(
+                    (
+                        candidate
+                        for candidate in node.get("attempts", [])
+                        if candidate.get("attempt_id") == claim.attempt_id
+                    ),
+                    None,
+                )
+                if isinstance(stale_attempt, dict):
+                    stale_attempt.setdefault("stale_completions", []).append({
+                        "observed_at": _utc_now(),
+                        "status": status,
+                        "error_code": error_code,
+                        "error_message": _sanitize_diagnostic(error_message),
+                    })
+                    self._append_locked(
+                        directory,
+                        projection,
+                        "stale_node_completion",
+                        {"status": status, "error_code": error_code},
+                        node_id=claim.node_id,
+                        attempt_id=claim.attempt_id,
+                    )
                 raise RuntimeError("stale node completion")
             if (
                 projection["status"] in {"cancelled", "abandoned"}
@@ -2828,6 +2924,7 @@ class RunStore:
         )
         directory = self.run_directory(run_id)
         expired = []
+        reconciliation_required = False
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
             if projection.get("desired_status") == "cleanup_failed":
@@ -2860,31 +2957,145 @@ class RunStore:
                 ):
                     continue
                 attempt_id = claim["attempt_id"]
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == attempt_id
+                    ),
+                    None,
+                )
+                if not isinstance(attempt, dict):
+                    attempt = {"attempt_id": attempt_id, "state": "claimed"}
+                    node.setdefault("attempts", []).append(attempt)
+                effect_classification = str(
+                    attempt.get(
+                        "effect_classification",
+                        claim.get("effect_classification", "replay_safe"),
+                    )
+                )
+                serialized = attempt.get("process_identity")
+                observation = self._observe_process_identity(serialized)
                 node.pop("claim", None)
-                node["state"] = "interrupted"
-                node["attempts"][-1].update({
-                    "state": "interrupted",
-                    "error_code": "lease_expired",
-                })
-                projection["status"] = "interrupted"
+                recovery = {
+                    "attempt_id": attempt_id,
+                    "owner_id": attempt.get("owner_id", claim.get("owner_id")),
+                    "owner_epoch": attempt.get(
+                        "owner_epoch", claim.get("owner_epoch")
+                    ),
+                    "executor_id": attempt.get(
+                        "executor_id", claim.get("executor_id", "unknown")
+                    ),
+                    "effect_classification": effect_classification,
+                    "process_identity": serialized,
+                    "observation": observation,
+                    "lease_expired_at": instant.isoformat(),
+                    "termination_confirmed": observation in {
+                        "known_stopped",
+                        "not_started",
+                    },
+                }
+                node["recovery"] = recovery
+                requires_reconcile = effect_classification == "outward" or (
+                    observation == "outcome_uncertain"
+                )
+                if requires_reconcile:
+                    interaction_id = f"reconcile-{attempt_id}"
+                    node["state"] = "paused"
+                    node["pending_interaction"] = {
+                        "type": "reconcile",
+                        "interaction_id": interaction_id,
+                        "attempt_id": attempt_id,
+                        "reason_code": "lease_expired_outcome_uncertain",
+                    }
+                    attempt.update({
+                        "state": "paused",
+                        "error_code": "reconciliation_required",
+                    })
+                    reconciliation_required = True
+                    event_type = "node_reconciliation_required"
+                else:
+                    node["state"] = "interrupted"
+                    attempt.update({
+                        "state": "interrupted",
+                        "error_code": (
+                            "executor_still_running"
+                            if observation == "still_running"
+                            else "lease_expired"
+                        ),
+                    })
+                    event_type = "node_interrupted"
                 self._append_locked(
                     directory,
                     projection,
-                    "node_interrupted",
-                    {"reason": "lease_expired"},
+                    event_type,
+                    {
+                        "reason": "lease_expired",
+                        "observation": observation,
+                        "effect_classification": effect_classification,
+                    },
                     node_id=node_id,
                     attempt_id=attempt_id,
                 )
-                self._release_worker_claim(attempt_id)
+                if observation in {"known_stopped", "not_started"}:
+                    self._release_worker_claim(attempt_id)
                 expired.append(node_id)
             if expired:
-                self._append_locked(directory, projection, "run_interrupted")
+                projection["status"] = (
+                    "paused" if reconciliation_required else "interrupted"
+                )
+                self._append_locked(
+                    directory,
+                    projection,
+                    (
+                        "run_reconciliation_required"
+                        if reconciliation_required
+                        else "run_interrupted"
+                    ),
+                )
                 with self._connect() as connection:
                     connection.execute(
-                        "UPDATE runs SET status='interrupted', updated_at=? WHERE run_id=?",
-                        (projection["updated_at"], run_id),
+                        "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                        (projection["status"], projection["updated_at"], run_id),
                     )
         return tuple(expired)
+
+    @staticmethod
+    def _observe_process_identity(serialized: object) -> str:
+        if not isinstance(serialized, Mapping):
+            return "not_started"
+        try:
+            identity = ProcessIdentity(
+                pid=int(serialized["pid"]),
+                start_time=(
+                    int(serialized["start_time"])
+                    if serialized.get("start_time") is not None
+                    else None
+                ),
+                group_id=(
+                    int(serialized["group_id"])
+                    if serialized.get("group_id") is not None
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            return "outcome_uncertain"
+        try:
+            if identity.is_current():
+                return (
+                    "still_running"
+                    if identity.start_time is not None
+                    else "outcome_uncertain"
+                )
+            from gateway.status import _pid_exists
+
+            return (
+                "outcome_uncertain"
+                if _pid_exists(identity.pid)
+                else "known_stopped"
+            )
+        except Exception:
+            return "outcome_uncertain"
 
     def interrupt_active_claims(
         self,
@@ -2899,6 +3110,8 @@ class RunStore:
             self._run_lock_path(run_id), timeout_seconds=lock_timeout_seconds
         ):
             projection = json.loads((directory / "run.json").read_text())
+            if projection.get("desired_status") == "cleanup_failed":
+                return ()
             if projection["status"] in {
                 "succeeded",
                 "failed",
@@ -2907,32 +3120,93 @@ class RunStore:
                 "paused",
             }:
                 return ()
+            reconciliation_required = False
             for node_id, node in projection["nodes"].items():
                 claim = node.pop("claim", None)
                 if not claim:
                     continue
-                node["state"] = "interrupted"
-                node["attempts"][-1].update({
-                    "state": "interrupted",
-                    "error_code": reason,
-                })
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == claim["attempt_id"]
+                    ),
+                    node["attempts"][-1],
+                )
+                observation = self._observe_process_identity(
+                    attempt.get("process_identity")
+                )
+                effect_classification = str(
+                    attempt.get("effect_classification", "replay_safe")
+                )
+                node["recovery"] = {
+                    "attempt_id": claim["attempt_id"],
+                    "owner_id": attempt.get("owner_id", claim.get("owner_id")),
+                    "owner_epoch": attempt.get(
+                        "owner_epoch", claim.get("owner_epoch")
+                    ),
+                    "executor_id": attempt.get("executor_id", "unknown"),
+                    "effect_classification": effect_classification,
+                    "process_identity": attempt.get("process_identity"),
+                    "observation": observation,
+                    "interrupted_at": _utc_now(),
+                    "termination_confirmed": observation
+                    in {"known_stopped", "not_started"},
+                }
+                requires_reconcile = effect_classification == "outward" or (
+                    observation == "outcome_uncertain"
+                )
+                if requires_reconcile:
+                    node["state"] = "paused"
+                    node["pending_interaction"] = {
+                        "type": "reconcile",
+                        "interaction_id": f"reconcile-{claim['attempt_id']}",
+                        "attempt_id": claim["attempt_id"],
+                        "reason_code": f"{reason}_outcome_uncertain",
+                    }
+                    attempt.update({
+                        "state": "paused",
+                        "error_code": "reconciliation_required",
+                    })
+                    reconciliation_required = True
+                else:
+                    node["state"] = "interrupted"
+                    attempt.update({
+                        "state": "interrupted",
+                        "error_code": reason,
+                    })
                 self._append_locked(
                     directory,
                     projection,
-                    "node_interrupted",
-                    {"reason": reason},
+                    (
+                        "node_reconciliation_required"
+                        if requires_reconcile
+                        else "node_interrupted"
+                    ),
+                    {"reason": reason, "observation": observation},
                     node_id=node_id,
                     attempt_id=claim["attempt_id"],
                 )
-                self._release_worker_claim(claim["attempt_id"])
+                if observation in {"known_stopped", "not_started"}:
+                    self._release_worker_claim(claim["attempt_id"])
                 interrupted.append(node_id)
             if interrupted:
-                projection["status"] = "interrupted"
-                self._append_locked(directory, projection, "run_interrupted")
+                projection["status"] = (
+                    "paused" if reconciliation_required else "interrupted"
+                )
+                self._append_locked(
+                    directory,
+                    projection,
+                    (
+                        "run_reconciliation_required"
+                        if reconciliation_required
+                        else "run_interrupted"
+                    ),
+                )
                 with self._connect() as connection:
                     connection.execute(
-                        "UPDATE runs SET status='interrupted', updated_at=? WHERE run_id=?",
-                        (projection["updated_at"], run_id),
+                        "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                        (projection["status"], projection["updated_at"], run_id),
                     )
         return tuple(interrupted)
 
@@ -2970,17 +3244,80 @@ class RunStore:
             node = projection["nodes"].get(claim.node_id)
             if not node or node.get("claim", {}).get("attempt_id") != claim.attempt_id:
                 return False
-            node["state"] = "interrupted"
+            active = node["claim"]
+            attempt = next(
+                (
+                    candidate
+                    for candidate in reversed(node.get("attempts", []))
+                    if candidate.get("attempt_id") == claim.attempt_id
+                ),
+                node["attempts"][-1],
+            )
+            observation = self._observe_process_identity(
+                attempt.get("process_identity")
+            )
+            effect_classification = str(
+                attempt.get("effect_classification", "replay_safe")
+            )
             node.pop("claim", None)
-            projection["status"] = "interrupted"
+            node["recovery"] = {
+                "attempt_id": claim.attempt_id,
+                "owner_id": attempt.get("owner_id", active.get("owner_id")),
+                "owner_epoch": attempt.get(
+                    "owner_epoch", active.get("owner_epoch")
+                ),
+                "executor_id": attempt.get("executor_id", "unknown"),
+                "effect_classification": effect_classification,
+                "process_identity": attempt.get("process_identity"),
+                "observation": observation,
+                "interrupted_at": _utc_now(),
+                "termination_confirmed": observation
+                in {"known_stopped", "not_started"},
+            }
+            requires_reconcile = effect_classification == "outward" or (
+                observation == "outcome_uncertain"
+            )
+            if requires_reconcile:
+                node["state"] = "paused"
+                node["pending_interaction"] = {
+                    "type": "reconcile",
+                    "interaction_id": f"reconcile-{claim.attempt_id}",
+                    "attempt_id": claim.attempt_id,
+                    "reason_code": "claim_released_outcome_uncertain",
+                }
+                attempt.update({
+                    "state": "paused",
+                    "error_code": "reconciliation_required",
+                })
+                projection["status"] = "paused"
+                event_type = "node_reconciliation_required"
+            else:
+                node["state"] = "interrupted"
+                attempt.update({
+                    "state": "interrupted",
+                    "error_code": "claim_released",
+                })
+                projection["status"] = "interrupted"
+                event_type = "node_interrupted"
             self._append_locked(
                 directory,
                 projection,
-                "node_interrupted",
+                event_type,
+                {
+                    "reason": "claim_released",
+                    "observation": observation,
+                    "effect_classification": effect_classification,
+                },
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
             )
-            self._release_worker_claim(claim.attempt_id)
+            if observation in {"known_stopped", "not_started"}:
+                self._release_worker_claim(claim.attempt_id)
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                    (projection["status"], projection["updated_at"], claim.run_id),
+                )
             return True
 
     def cancel_run(
@@ -2992,6 +3329,7 @@ class RunStore:
     ) -> dict[str, object]:
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         recorded: list[tuple[str, str, ProcessIdentity]] = []
+        outward_attempts: set[tuple[str, str]] = set()
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
             if expected_state_version is not None and (
@@ -3034,9 +3372,29 @@ class RunStore:
                     )
             for node_id, node in projection["nodes"].items():
                 claim = node.get("claim")
-                serialized = (
-                    claim.get("process_identity") if isinstance(claim, dict) else None
+                recovery = node.get("recovery")
+                ownership = claim if isinstance(claim, dict) else recovery
+                if not isinstance(ownership, dict):
+                    continue
+                attempt_id = str(ownership.get("attempt_id") or "")
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == attempt_id
+                    ),
+                    {},
                 )
+                serialized = ownership.get("process_identity") or attempt.get(
+                    "process_identity"
+                )
+                if isinstance(attempt, Mapping) and attempt.get(
+                    "effect_classification"
+                ) == "outward" and (
+                    attempt.get("state") == "running"
+                    or isinstance(serialized, Mapping)
+                ):
+                    outward_attempts.add((node_id, attempt_id))
                 if not isinstance(serialized, dict):
                     continue
                 try:
@@ -3055,7 +3413,7 @@ class RunStore:
                     )
                 except (KeyError, TypeError, ValueError):
                     continue
-                recorded.append((node_id, str(claim["attempt_id"]), identity))
+                recorded.append((node_id, attempt_id, identity))
 
         cleanup: list[tuple[str, str, ProcessIdentity, bool]] = []
         for node_id, attempt_id, identity in recorded:
@@ -3069,21 +3427,52 @@ class RunStore:
 
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
+            if projection["status"] in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "abandoned",
+            }:
+                return {**projection, "cancellation_outcome": "already_terminal"}
             failed_cleanup = []
             for node_id, attempt_id, identity, cleaned in cleanup:
                 node = projection["nodes"].get(node_id, {})
                 claim = node.get("claim", {})
-                serialized = claim.get("process_identity")
+                recovery = node.get("recovery", {})
+                ownership = (
+                    claim
+                    if claim.get("attempt_id") == attempt_id
+                    else recovery
+                )
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == attempt_id
+                    ),
+                    {},
+                )
+                serialized = ownership.get("process_identity") or attempt.get(
+                    "process_identity"
+                )
                 if (
-                    claim.get("attempt_id") != attempt_id
+                    ownership.get("attempt_id") != attempt_id
                     or not isinstance(serialized, dict)
                     or serialized.get("pid") != identity.pid
+                    or serialized.get("start_time") != identity.start_time
                 ):
                     continue
                 if cleaned:
                     claim.pop("process_identity", None)
-                    if node.get("attempts"):
-                        node["attempts"][-1].pop("process_identity", None)
+                    if isinstance(recovery, dict):
+                        recovery["termination_confirmed"] = True
+                        recovery["observation"] = "known_stopped"
+                    if isinstance(attempt, dict):
+                        attempt["process_stop"] = {
+                            "recorded_at": _utc_now(),
+                            "cleaned": True,
+                            "identity_matched": True,
+                        }
                     self._append_locked(
                         directory,
                         projection,
@@ -3093,6 +3482,12 @@ class RunStore:
                         attempt_id=attempt_id,
                     )
                 else:
+                    if isinstance(attempt, dict):
+                        attempt["process_stop"] = {
+                            "recorded_at": _utc_now(),
+                            "cleaned": False,
+                            "identity_matched": True,
+                        }
                     failed_cleanup.append((node_id, attempt_id, identity.pid))
             if failed_cleanup:
                 projection["last_error"] = {
@@ -3115,6 +3510,95 @@ class RunStore:
                         run_id=run_id,
                         reason_code="uninterruptible_process",
                     )
+
+            reconciliation_nodes = []
+            for node_id, attempt_id in sorted(outward_attempts):
+                node = projection["nodes"].get(node_id)
+                if not isinstance(node, dict):
+                    continue
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == attempt_id
+                    ),
+                    None,
+                )
+                if not isinstance(attempt, dict) or attempt.get("state") in {
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                }:
+                    continue
+                claim = node.get("claim")
+                recovery = node.get("recovery")
+                ownership = (
+                    claim
+                    if isinstance(claim, Mapping)
+                    and claim.get("attempt_id") == attempt_id
+                    else recovery
+                )
+                if not isinstance(ownership, Mapping) or ownership.get(
+                    "attempt_id"
+                ) != attempt_id:
+                    continue
+                process_stop = attempt.get("process_stop")
+                termination_confirmed = bool(
+                    isinstance(process_stop, Mapping) and process_stop.get("cleaned")
+                )
+                node.pop("claim", None)
+                node["recovery"] = {
+                    "attempt_id": attempt_id,
+                    "owner_id": attempt.get("owner_id", ownership.get("owner_id")),
+                    "owner_epoch": attempt.get(
+                        "owner_epoch", ownership.get("owner_epoch")
+                    ),
+                    "executor_id": attempt.get("executor_id", "unknown"),
+                    "effect_classification": "outward",
+                    "process_identity": attempt.get("process_identity"),
+                    "observation": (
+                        "known_stopped"
+                        if termination_confirmed
+                        else "outcome_uncertain"
+                    ),
+                    "termination_confirmed": termination_confirmed,
+                    "cancel_requested_at": _utc_now(),
+                }
+                node["state"] = "paused"
+                node["pending_interaction"] = {
+                    "type": "reconcile",
+                    "interaction_id": f"reconcile-{attempt_id}",
+                    "attempt_id": attempt_id,
+                    "reason_code": "cancelled_outward_outcome_uncertain",
+                }
+                attempt.update({
+                    "state": "paused",
+                    "error_code": "reconciliation_required",
+                })
+                if termination_confirmed:
+                    self._release_worker_claim(attempt_id)
+                reconciliation_nodes.append(node_id)
+            if reconciliation_nodes:
+                projection["status"] = "paused"
+                self._append_locked(
+                    directory,
+                    projection,
+                    "cancel_reconciliation_required",
+                    {
+                        "reason_code": "outward_outcome_unknown",
+                        "node_ids": reconciliation_nodes,
+                    },
+                )
+                with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE runs SET status='paused', updated_at=? WHERE run_id=?",
+                        (projection["updated_at"], run_id),
+                    )
+                return {
+                    **projection,
+                    "cancellation_outcome": "reconciliation_required",
+                }
+            if failed_cleanup:
                 return {**projection, "cancellation_outcome": "cleanup_failed"}
 
             projection["status"] = "cancelled"
@@ -3122,6 +3606,7 @@ class RunStore:
             for node in projection["nodes"].values():
                 if node["state"] not in {"succeeded", "failed", "skipped"}:
                     claim = node.pop("claim", None)
+                    node.pop("recovery", None)
                     node["state"] = "cancelled"
                     if claim and node.get("attempts"):
                         node["attempts"][-1].update({
@@ -3164,10 +3649,27 @@ class RunStore:
                 raise RuntimeError("stale resume decision")
             if projection["status"] not in {"failed", "interrupted"}:
                 return projection
+            for node in projection["nodes"].values():
+                recovery = node.get("recovery")
+                if (
+                    isinstance(recovery, Mapping)
+                    and recovery.get("observation")
+                    in {"still_running", "outcome_uncertain"}
+                    and not recovery.get("termination_confirmed")
+                ):
+                    raise RuntimeError(
+                        "cannot resume while the prior executor is still running "
+                        "or its identity is uncertain"
+                    )
             for node_id, node in projection["nodes"].items():
                 if node["state"] == "succeeded" and node_id not in always_run:
                     continue
                 node.pop("claim", None)
+                recovery = node.get("recovery")
+                if not isinstance(recovery, Mapping) or recovery.get(
+                    "termination_confirmed"
+                ):
+                    node.pop("recovery", None)
                 node["state"] = (
                     "ready"
                     if all(
@@ -3527,9 +4029,17 @@ class RunStore:
                 if (node_id is None or candidate_id == node_id)
                 and node.get("state") in {"failed", "interrupted"}
                 and not isinstance(node.get("pending_interaction"), Mapping)
+                and not (
+                    isinstance(node.get("recovery"), Mapping)
+                    and node["recovery"].get("observation")
+                    in {"still_running", "outcome_uncertain"}
+                    and not node["recovery"].get("termination_confirmed")
+                )
             ]
             if len(candidates) != 1:
-                raise ValueError("retry requires exactly one failed or interrupted node")
+                raise ValueError(
+                    "retry requires exactly one replay-safe failed or interrupted node"
+                )
             selected_id, node = candidates[0]
             node.pop("claim", None)
             node.pop("next_attempt_at", None)
@@ -3588,6 +4098,15 @@ class RunStore:
             if len(candidates) != 1:
                 raise ValueError("reconcile requires exactly one matching interaction")
             selected_id, node = candidates[0]
+            recovery = node.get("recovery")
+            if (
+                outcome == "safe-to-retry"
+                and isinstance(recovery, Mapping)
+                and not recovery.get("termination_confirmed")
+            ):
+                raise RuntimeError(
+                    "cannot authorize replay until prior executor termination is proven"
+                )
             node.pop("pending_interaction", None)
             if outcome == "confirmed-succeeded":
                 node["state"] = "succeeded"
@@ -3600,6 +4119,26 @@ class RunStore:
                 node["state"] = "ready"
                 projection["status"] = "running"
                 projection["last_error"] = None
+            if isinstance(recovery, dict):
+                recovery["reconciled_outcome"] = outcome
+                recovery["reconciled_at"] = _utc_now()
+                attempt_id = recovery.get("attempt_id")
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == attempt_id
+                    ),
+                    None,
+                )
+                if isinstance(attempt, dict):
+                    attempt["reconciliation"] = {
+                        "outcome": outcome,
+                        "recorded_at": recovery["reconciled_at"],
+                    }
+                if recovery.get("termination_confirmed") and attempt_id:
+                    self._release_worker_claim(str(attempt_id))
+                node.pop("recovery", None)
             self._append_locked(
                 directory,
                 projection,
@@ -3621,15 +4160,10 @@ class RunStore:
         expected_state_version: int | None = None,
         operator_scope: str | None = None,
     ) -> dict[str, object]:
-        projection = self.load_run(run_id, operator_scope=operator_scope)
-        if projection["status"] not in {"interrupted", "failed", "paused"}:
-            raise ValueError(
-                "only interrupted, failed, or paused runs may be abandoned"
-            )
         return self._set_terminal(
             run_id,
             "abandoned",
-            {"abandoned"},
+            allowed_from={"interrupted", "failed", "paused"},
             expected_state_version=expected_state_version,
             operator_scope=operator_scope,
         )
@@ -3638,12 +4172,11 @@ class RunStore:
         self,
         run_id: str,
         target: str,
-        outcomes: set[str],
         *,
+        allowed_from: set[str],
         expected_state_version: int | None = None,
         operator_scope: str | None = None,
     ) -> dict[str, object]:
-        del outcomes
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
@@ -3651,12 +4184,23 @@ class RunStore:
                 int(projection["state_version"]) != expected_state_version
             ):
                 raise RuntimeError("stale terminal transition")
-            if projection["status"] in {
-                "succeeded",
-                "failed",
-                "cancelled",
-                "abandoned",
-            }:
+            if projection["status"] not in allowed_from and projection[
+                "status"
+            ] not in {"succeeded", "failed", "cancelled", "abandoned"}:
+                raise ValueError(
+                    "only interrupted, failed, or paused runs may be abandoned"
+                )
+            if any(
+                isinstance(node.get("recovery"), Mapping)
+                and node["recovery"].get("observation")
+                in {"still_running", "outcome_uncertain"}
+                and not node["recovery"].get("termination_confirmed")
+                for node in projection["nodes"].values()
+            ):
+                raise RuntimeError(
+                    "cannot abandon while executor termination is unproven"
+                )
+            if projection["status"] in {"succeeded", "cancelled", "abandoned"}:
                 if target == "cancelled":
                     return {**projection, "cancellation_outcome": "already_terminal"}
                 return projection

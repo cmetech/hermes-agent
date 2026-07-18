@@ -9,9 +9,10 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import JournalRecoveryError, RunStore
+from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
-def _run(store, package):
+def _run(store, package, *, idempotency_key="crash"):
     prepared = store.prepare_run_snapshot(package)
     return store.start_run(
         RunAdmissionRequest(
@@ -20,7 +21,7 @@ def _run(store, package):
             policy_digest=prepared.policy_digest,
             input_manifest_digest=prepared.input_manifest_digest,
             trigger_source="cli",
-            idempotency_key="crash",
+            idempotency_key=idempotency_key,
             concurrency_key=package.definition.name,
         ),
         immutable_snapshot=prepared,
@@ -46,8 +47,254 @@ def test_expired_lease_interrupts_and_stale_completion_cannot_win(
 
     with pytest.raises(RuntimeError, match="stale node completion"):
         store.complete_node(old, status="succeeded")
+    assert store.tail_events(admitted.run_id)[-1]["event_type"] == (
+        "stale_node_completion"
+    )
     store.complete_node(replacement, status="succeeded")
     assert store.load_run(admitted.run_id)["status"] == "succeeded"
+
+
+def test_expired_outward_attempt_preserves_identity_and_requires_reconciliation(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(workflow_writer(tmp_path / "package"))
+    admitted = _run(store, package)
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "owner",
+        lease_seconds=1,
+        executor_id="bash",
+        owner_epoch="leader-7",
+        effect_classification="outward",
+        evidence_paths=("nodes/start/stdout.txt", "nodes/start/stderr.txt"),
+    )
+    assert claim is not None
+    identity = ProcessIdentity(pid=999_991, start_time=12345, group_id=999_991)
+    assert store.record_process_started(claim, identity)
+    monkeypatch.setattr(ProcessIdentity, "is_current", lambda self: True)
+
+    assert store.expire_stale_claims(
+        admitted.run_id, now=claim.lease_expires_at + timedelta(seconds=1)
+    ) == ("start",)
+
+    projection = store.load_run(admitted.run_id)
+    node = projection["nodes"]["start"]
+    attempt = node["attempts"][-1]
+    assert projection["status"] == "paused"
+    assert node["pending_interaction"]["type"] == "reconcile"
+    assert node["recovery"]["observation"] == "still_running"
+    assert attempt["process_identity"]["start_time"] == 12345
+    assert attempt["effect_classification"] == "outward"
+    assert attempt["owner_epoch"] == "leader-7"
+    assert attempt["evidence_paths"] == [
+        "nodes/start/stdout.txt",
+        "nodes/start/stderr.txt",
+    ]
+
+    assert store.record_process_stopped(claim, identity, cleaned=True)
+    stopped = store.load_run(admitted.run_id)["nodes"]["start"]["attempts"][-1]
+    assert stopped["process_identity"]["pid"] == identity.pid
+    assert stopped["process_stop"]["cleaned"] is True
+
+
+def test_live_replay_safe_attempt_cannot_resume_until_termination_is_proven(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(workflow_writer(tmp_path / "package"))
+    admitted = _run(store, package)
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "owner",
+        lease_seconds=1,
+        executor_id="bash",
+        effect_classification="replay_safe",
+    )
+    assert claim is not None
+    identity = ProcessIdentity(pid=999_992, start_time=23456, group_id=999_992)
+    assert store.record_process_started(claim, identity)
+    monkeypatch.setattr(ProcessIdentity, "is_current", lambda self: True)
+    store.expire_stale_claims(
+        admitted.run_id, now=claim.lease_expires_at + timedelta(seconds=1)
+    )
+
+    with pytest.raises(RuntimeError, match="executor is still running"):
+        store.resume_run(admitted.run_id)
+    with pytest.raises(ValueError, match="replay-safe"):
+        store.retry_run(admitted.run_id, node_id="start")
+
+    assert store.record_process_stopped(claim, identity, cleaned=True)
+    resumed = store.resume_run(admitted.run_id)
+    assert resumed["status"] == "running"
+    assert resumed["nodes"]["start"]["state"] == "ready"
+
+
+def test_pid_reuse_is_uncertain_and_never_authorizes_automatic_replay(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(workflow_writer(tmp_path / "package"))
+    admitted = _run(store, package)
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "owner",
+        lease_seconds=1,
+        executor_id="bash",
+        effect_classification="replay_safe",
+    )
+    assert claim is not None
+    original = ProcessIdentity(pid=999_994, start_time=45678, group_id=999_994)
+    assert store.record_process_started(claim, original)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
+    monkeypatch.setattr(
+        ProcessIdentity,
+        "capture",
+        classmethod(
+            lambda cls, pid: ProcessIdentity(
+                pid=pid,
+                start_time=original.start_time + 1,
+                group_id=pid,
+            )
+        ),
+    )
+
+    store.expire_stale_claims(
+        admitted.run_id, now=claim.lease_expires_at + timedelta(seconds=1)
+    )
+
+    projection = store.load_run(admitted.run_id)
+    node = projection["nodes"]["start"]
+    assert projection["status"] == "paused"
+    assert node["recovery"]["observation"] == "outcome_uncertain"
+    assert node["pending_interaction"]["type"] == "reconcile"
+
+
+def test_release_outward_claim_routes_to_reconciliation(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(workflow_writer(tmp_path / "package"))
+    admitted = _run(store, package)
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "owner",
+        executor_id="bash",
+        effect_classification="outward",
+    )
+    assert claim is not None
+
+    assert store.release_or_expire_claim(claim)
+
+    projection = store.load_run(admitted.run_id)
+    node = projection["nodes"]["start"]
+    assert projection["status"] == "paused"
+    assert node["pending_interaction"]["type"] == "reconcile"
+
+
+def test_cancel_after_lease_expiry_terminates_preserved_executor_identity(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(workflow_writer(tmp_path / "package"))
+    admitted = _run(store, package)
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "owner",
+        lease_seconds=1,
+        executor_id="bash",
+    )
+    assert claim is not None
+    identity = ProcessIdentity(pid=999_993, start_time=34567, group_id=999_993)
+    assert store.record_process_started(claim, identity)
+    monkeypatch.setattr(ProcessIdentity, "is_current", lambda self: True)
+    store.expire_stale_claims(
+        admitted.run_id, now=claim.lease_expires_at + timedelta(seconds=1)
+    )
+    terminated = []
+    monkeypatch.setattr(
+        ManagedProcessTree,
+        "terminate_existing",
+        classmethod(
+            lambda cls, candidate, **kwargs: terminated.append(candidate) or True
+        ),
+    )
+
+    result = store.cancel_run(admitted.run_id)
+
+    assert result["cancellation_outcome"] == "cancelled"
+    assert terminated == [identity]
+
+
+def test_abandon_failed_run_is_atomic_and_blocks_live_recovery(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "failed-package",
+            nodes=[{"id": "start", "bash": "false"}],
+        )
+    )
+    admitted = _run(store, package)
+    failed = RunScheduler(store).advance(admitted.run_id)
+    assert failed["status"] == "failed"
+
+    with pytest.raises(RuntimeError, match="stale terminal transition"):
+        store.abandon_run(
+            admitted.run_id,
+            expected_state_version=int(failed["state_version"]) - 1,
+        )
+    abandoned = store.abandon_run(
+        admitted.run_id,
+        expected_state_version=int(failed["state_version"]),
+    )
+    assert abandoned["status"] == "abandoned"
+
+    active = _run(store, package, idempotency_key="live-recovery")
+    claim = store.claim_node(
+        active.run_id,
+        "start",
+        "owner",
+        lease_seconds=1,
+        executor_id="bash",
+    )
+    assert claim is not None
+    identity = ProcessIdentity(pid=999_995, start_time=None, group_id=999_995)
+    assert store.record_process_started(claim, identity)
+    monkeypatch.setattr(ProcessIdentity, "is_current", lambda self: True)
+    store.expire_stale_claims(
+        active.run_id, now=claim.lease_expires_at + timedelta(seconds=1)
+    )
+
+    with pytest.raises(RuntimeError, match="termination is unproven"):
+        store.abandon_run(active.run_id)
+
+
+def test_scheduler_persists_outward_effect_classification_before_execution(
+    tmp_path, workflow_writer
+) -> None:
+    path = workflow_writer(tmp_path / "package", name="outward-metadata")
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "outward_action_nodes: [start]\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(path)
+    store = RunStore(tmp_path / "home")
+    admitted = _run(store, package)
+
+    result = RunScheduler(store).advance(admitted.run_id)
+
+    attempt = result["nodes"]["start"]["attempts"][-1]
+    assert attempt["effect_classification"] == "outward"
+    assert attempt["executor_id"] == "bash"
+    assert attempt["owner_epoch"]
+    assert attempt["evidence_paths"]
 
 
 def test_corrupt_projection_is_quarantined_and_rebuilt_from_checked_journal(

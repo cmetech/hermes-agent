@@ -728,6 +728,14 @@ class RunScheduler:
                             journal_reserve_bytes=self._heartbeat_journal_reserve(
                                 by_id[node_id]
                             ),
+                            executor_id=by_id[node_id].node_type,
+                            owner_epoch=self.owner_id,
+                            effect_classification=(
+                                "outward"
+                                if node_id
+                                in set(projection.get("outward_action_nodes", ()))
+                                else "replay_safe"
+                            ),
                         )
                     except StorageQuotaError as exc:
                         self.store.interrupt_for_host_pressure(run_id, message=str(exc))
@@ -839,6 +847,22 @@ class RunScheduler:
                                         for node in packages[run_id].definition.nodes
                                         if node.id == node_id
                                     )
+                                ),
+                                executor_id=next(
+                                    node.node_type
+                                    for node in packages[run_id].definition.nodes
+                                    if node.id == node_id
+                                ),
+                                owner_epoch=self.owner_id,
+                                effect_classification=(
+                                    "outward"
+                                    if node_id
+                                    in set(
+                                        snapshots[run_id].get(
+                                            "outward_action_nodes", ()
+                                        )
+                                    )
+                                    else "replay_safe"
                                 ),
                             )
                         except StorageQuotaError as exc:

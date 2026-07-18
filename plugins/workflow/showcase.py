@@ -458,7 +458,10 @@ def _cleanup_evidence(
                 if not isinstance(attempt, Mapping):
                     continue
                 identity = attempt.get("process_identity")
-                if isinstance(identity, Mapping):
+                process_stop = attempt.get("process_stop")
+                if isinstance(identity, Mapping) and not (
+                    isinstance(process_stop, Mapping) and process_stop.get("cleaned")
+                ):
                     key = (node_id, attempt.get("attempt_id"), identity.get("pid"))
                     unresolved[key] = attempt
 
