@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import httpx
+from hermes_cli.dashboard_auth.base import TokenPrincipal
 
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.schema import load_workflow
@@ -38,15 +39,20 @@ def _router():
     return _module().router
 
 
-def _app(router, *, session=None):
+def _app(router, *, session=None, token=None, local_admin=None):
     app = FastAPI()
 
     @app.middleware("http")
     async def authenticated(request, call_next):
-        if session is None:
+        if local_admin is True or (
+            session is None and token is None and local_admin is None
+        ):
             request.state.local_admin_authenticated = True
-        else:
+        elif session is not None:
             request.state.session = session
+        elif token is not None:
+            request.state.token_principal = token
+            request.state.token_authenticated = True
         return await call_next(request)
 
     app.include_router(router, prefix="/api/plugins/workflow")
@@ -198,6 +204,61 @@ def test_archive_restore_views_and_explicit_cleanup_api(
     assert history.status_code == 200
     assert history.json()["items"][0]["run_id"] == run.run_id
     assert "source_path" not in str(history.json())
+
+
+def test_remote_session_cannot_mint_admin_through_cleanup_binding_header(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    session = SimpleNamespace(provider="test", org_id="org", user_id="user-1")
+    client = TestClient(_app(_router(), session=session))
+
+    response = client.get(
+        "/api/plugins/workflow/cleanup/preview?older_than=0d",
+        headers={
+            "X-Hermes-Operator-Scope": "dashboard:test:org:user-1:admin"
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "workflow_admin_required"
+
+
+def test_cleanup_binding_minted_for_one_principal_fails_for_another(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    scope = "service:test:admin-a"
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="cleanup-binding")
+    )
+    store = RunStore(home)
+    run = _start(store, package, "cleanup-binding", scope=scope)
+    RunScheduler(store).advance(run.run_id)
+    module = _module()
+    admin_a = TokenPrincipal(
+        principal="admin-a", provider="test", scopes=("workflow:admin",)
+    )
+    admin_b = TokenPrincipal(
+        principal="admin-b", provider="test", scopes=("workflow:admin",)
+    )
+    preview = TestClient(_app(module.router, token=admin_a)).get(
+        "/api/plugins/workflow/cleanup/preview?older_than=0d"
+    )
+    assert preview.status_code == 200
+
+    executed = TestClient(_app(module.router, token=admin_b)).post(
+        "/api/plugins/workflow/cleanup/execute",
+        json={
+            "older_than": "0d",
+            "confirmation_token": preview.json()["confirmation_token"],
+        },
+    )
+
+    assert executed.status_code == 409
+    assert executed.json()["detail"]["code"] == "cleanup_confirmation_invalid"
+    assert store.run_directory(run.run_id).is_dir()
 
 
 def test_events_long_poll_returns_when_a_new_event_arrives(

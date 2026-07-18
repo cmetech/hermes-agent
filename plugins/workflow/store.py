@@ -87,7 +87,10 @@ class ForegroundExecutionLease:
 
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
-_STORE_SCHEMA_VERSION = 5
+_STORE_SCHEMA_VERSION = 6
+# Direct RunStore/CLI access is already the profile-local filesystem admin
+# boundary. Network adapters must always pass their verified authority binding.
+_LOCAL_ADMIN_AUTHORITY_BINDING = "profile-local-runstore-admin"
 _PROJECTION_STATUSES = {
     "queued",
     "running",
@@ -448,7 +451,8 @@ class RunStore:
                         expires_at TEXT NOT NULL,
                         preview_digest TEXT NOT NULL,
                         candidates_json TEXT NOT NULL,
-                        status TEXT NOT NULL
+                        status TEXT NOT NULL,
+                        authority_binding_digest TEXT NOT NULL
                     );
                     CREATE TABLE IF NOT EXISTS cleanup_history (
                         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -520,6 +524,15 @@ class RunStore:
             for name, statement in migrations.items():
                 if name not in columns:
                     connection.execute(statement)
+            cleanup_preview_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(cleanup_previews)")
+            }
+            if "authority_binding_digest" not in cleanup_preview_columns:
+                connection.execute(
+                    "ALTER TABLE cleanup_previews "
+                    "ADD COLUMN authority_binding_digest TEXT"
+                )
             from plugins.workflow.coordinator_store import install_coordinator_schema
             from plugins.workflow.notifications import install_notification_schema
 
@@ -5490,18 +5503,32 @@ class RunStore:
         confirmation_token: str | None = None,
         operator_scope: str | None = None,
         required_metadata: Mapping[str, str | None] | None = None,
+        authority_binding: str = _LOCAL_ADMIN_AUTHORITY_BINDING,
     ) -> dict[str, object]:
+        authority_binding_digest = self._authority_binding_digest(authority_binding)
         if execute:
             if not confirmation_token:
                 raise ValueError("cleanup execution requires a confirmation token")
-            return self._execute_cleanup(confirmation_token)
+            return self._execute_cleanup(
+                confirmation_token,
+                authority_binding_digest=authority_binding_digest,
+            )
         if confirmation_token is not None:
             raise ValueError("confirmation token is valid only with execute")
         return self._preview_cleanup(
             older_than=older_than,
             operator_scope=operator_scope,
             required_metadata=required_metadata,
+            authority_binding_digest=authority_binding_digest,
         )
+
+    @staticmethod
+    def _authority_binding_digest(authority_binding: str) -> str:
+        if not isinstance(authority_binding, str) or not authority_binding:
+            raise ValueError("authority_binding must not be empty")
+        if len(authority_binding.encode("utf-8")) > 4096:
+            raise ValueError("authority_binding is too large")
+        return _sha256(authority_binding.encode("utf-8"))
 
     def _preview_cleanup(
         self,
@@ -5509,6 +5536,7 @@ class RunStore:
         older_than: timedelta,
         operator_scope: str | None,
         required_metadata: Mapping[str, str | None] | None,
+        authority_binding_digest: str,
     ) -> dict[str, object]:
         cutoff = datetime.now(timezone.utc) - older_than
         scope_clause = (
@@ -5580,13 +5608,15 @@ class RunStore:
                 connection.execute(
                     "INSERT INTO cleanup_previews ("
                     "token_digest, created_at, expires_at, preview_digest, "
-                    "candidates_json, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+                    "candidates_json, status, authority_binding_digest) "
+                    "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
                     (
                         token_digest,
                         _utc_now(),
                         expires_at.isoformat(),
                         _sha256(candidates_json.encode()),
                         candidates_json,
+                        authority_binding_digest,
                     ),
                 )
         return {
@@ -5693,7 +5723,12 @@ class RunStore:
             for row in rows
         )
 
-    def _execute_cleanup(self, confirmation_token: str) -> dict[str, object]:
+    def _execute_cleanup(
+        self,
+        confirmation_token: str,
+        *,
+        authority_binding_digest: str,
+    ) -> dict[str, object]:
         if self.storage_health()["status"] != "healthy":
             raise RuntimeError("cleanup blocked: storage repair required")
         token_digest = _sha256(confirmation_token.encode())
@@ -5705,6 +5740,11 @@ class RunStore:
                 ).fetchone()
             if preview is None or preview["status"] != "pending":
                 raise ValueError("cleanup confirmation token is invalid or already used")
+            stored_binding = preview["authority_binding_digest"]
+            if not isinstance(stored_binding, str) or not hmac.compare_digest(
+                stored_binding, authority_binding_digest
+            ):
+                raise ValueError("cleanup confirmation token authority does not match")
             if datetime.fromisoformat(preview["expires_at"]) <= datetime.now(timezone.utc):
                 with self._connect() as connection:
                     connection.execute(

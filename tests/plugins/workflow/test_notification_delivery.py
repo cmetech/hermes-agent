@@ -6,6 +6,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from hermes_cli.dashboard_auth.base import TokenPrincipal
 
 from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.store import RunStore
@@ -21,12 +22,17 @@ def _module():
     return module
 
 
-def _app(router):
+def _app(router, *, scopes=("workflow:admin",), principal="desktop-client"):
     app = FastAPI()
 
     @app.middleware("http")
     async def authenticated(request, call_next):
-        request.state.local_admin_authenticated = True
+        request.state.token_principal = TokenPrincipal(
+            principal=principal,
+            provider="test",
+            scopes=tuple(scopes),
+        )
+        request.state.token_authenticated = True
         return await call_next(request)
 
     app.include_router(router, prefix="/api/plugins/workflow")
@@ -90,3 +96,60 @@ def test_dismissal_records_presentation_only(tmp_path, monkeypatch):
     fact = outbox.pending_attention(run_id="run-dismiss")[0]
     assert fact["state"] == "leased"
     assert fact["dismissed_at"] is not None
+
+
+def test_delivery_scope_can_lease_its_bound_desktop_projection(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    outbox = NotificationOutbox(RunStore(home))
+    notification_id = outbox.record(
+        run_id="run-delivery",
+        kind="approval_required",
+        destination="desktop",
+        transition_version=1,
+        payload={},
+    )
+
+    response = TestClient(
+        _app(_module().router, scopes=("workflow:delivery",))
+    ).get("/api/plugins/workflow/notifications/lease?client_id=electron")
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["notification_id"] == notification_id
+
+
+def test_delivery_scope_cannot_ack_another_bound_destination(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    outbox = NotificationOutbox(RunStore(home))
+    notification_id = outbox.record(
+        run_id="run-gateway",
+        kind="approval_required",
+        destination="gateway:verified-route",
+        transition_version=1,
+        payload={},
+    )
+    assert outbox.lease(
+        destination="gateway:verified-route",
+        owner_id="client-controlled-owner",
+        lease_seconds=30,
+        limit=1,
+    )
+
+    response = TestClient(
+        _app(
+            _module().router,
+            scopes=("workflow:delivery", "workflow:admin"),
+        )
+    ).post(
+        f"/api/plugins/workflow/notifications/{notification_id}/ack",
+        json={"client_id": "client-controlled-owner"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "workflow_delivery_scope_mismatch"
+    assert outbox.history(run_id="run-gateway")[0]["state"] == "leased"

@@ -8,7 +8,7 @@ import sqlite3
 
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.schema import load_workflow
-from plugins.workflow.store import RunStore
+from plugins.workflow.store import RunStore, _STORE_SCHEMA_VERSION
 
 
 FIXTURE = (
@@ -30,7 +30,40 @@ def _assert_fixture_hashes(manifest: dict[str, object]) -> None:
         assert _sha256(FIXTURE / relative_path) == expected
 
 
-def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
+def _schema_manifest(store: RunStore) -> tuple[object, ...]:
+    with store._connect() as connection:
+        objects = connection.execute(
+            "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql "
+            "FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' "
+            "ORDER BY type, name"
+        ).fetchall()
+        manifest = []
+        for row in objects:
+            columns = ()
+            indexes = ()
+            if row["type"] == "table":
+                columns = tuple(
+                    tuple(column)
+                    for column in connection.execute(
+                        f'PRAGMA table_info("{row["name"]}")'
+                    ).fetchall()
+                )
+                indexes = tuple(
+                    tuple(index)
+                    for index in connection.execute(
+                        f'PRAGMA index_list("{row["name"]}")'
+                    ).fetchall()
+                )
+            manifest.append((tuple(row), columns, indexes))
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == (
+            _STORE_SCHEMA_VERSION
+        )
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        return tuple(manifest)
+
+
+def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
     tmp_path: Path,
 ) -> None:
     manifest = json.loads((FIXTURE / "fixture-manifest.json").read_text())
@@ -65,6 +98,7 @@ def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
     }
 
     store = RunStore(home)
+    first_manifest = _schema_manifest(store)
     projection = store.load_run("migration-run")
 
     assert store.storage_health()["status"] == "healthy"
@@ -120,6 +154,11 @@ def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
             "workflow_notification_outbox",
             "workflow_notification_reconcile_state",
         } <= tables
+        cleanup_preview_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(cleanup_previews)")
+        }
+        assert "authority_binding_digest" in cleanup_preview_columns
         indexes = {
             row["name"]
             for row in connection.execute(
@@ -133,7 +172,9 @@ def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
             "workflow_notification_delivery",
             "workflow_notification_fact_run",
         } <= indexes
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == (
+            _STORE_SCHEMA_VERSION
+        )
         migrated = dict(
             connection.execute(
                 "SELECT * FROM runs WHERE run_id='migration-run'"
@@ -150,6 +191,13 @@ def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
     assert len(migrated["journal_sha256"]) == 64
     assert migrated["integrity_verified_at"]
 
+    reopened = RunStore(home)
+    second_manifest = _schema_manifest(reopened)
+    assert second_manifest == first_manifest
+    assert reopened.load_run("migration-run")["event_sequence"] == expected[
+        "event_sequence"
+    ]
+
     retry_package = tmp_path / "retry-package"
     retry_package.mkdir()
     shutil.copy2(
@@ -162,7 +210,7 @@ def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
     )
     package = load_workflow(retry_package / "migration-fixture.yaml")
     prepared = store.prepare_run_snapshot(package)
-    duplicate = store.start_run(
+    duplicate = reopened.start_run(
         RunAdmissionRequest(
             workflow_name="migration-fixture",
             definition_digest=prepared.definition_digest,
@@ -181,7 +229,7 @@ def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
         assert _sha256(workflows / relative) == digest
     _assert_fixture_hashes(manifest)
 
-    store.append_event("migration-run", "migration_probe", {"version": 2})
+    reopened.append_event("migration-run", "migration_probe", {"version": 2})
     migrated_events = [
         json.loads(line)
         for line in (Path(relocated) / "events.jsonl").read_text().splitlines()
@@ -189,7 +237,7 @@ def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
     assert migrated_events[0]["schema_version"] == 1
     assert migrated_events[-1]["schema_version"] == 2
     assert migrated_events[-1]["frame_version"] == 1
-    assert store.load_run("migration-run")["event_sequence"] == (
+    assert reopened.load_run("migration-run")["event_sequence"] == (
         expected["event_sequence"] + 1
     )
 

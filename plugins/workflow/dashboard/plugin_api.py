@@ -66,19 +66,65 @@ async def _router_lifespan(_app):
 router = APIRouter(lifespan=_router_lifespan)
 
 
-@dataclass(frozen=True)
-class _Operator:
+_ALL_WORKFLOW_CAPABILITIES = frozenset({"read", "write", "delivery", "admin"})
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowAuthority:
     principal: str
     scope: str | None
     unrestricted: bool
-    high_trust: bool
+    capabilities: frozenset[str]
+    delivery_destination: str | None = "desktop"
 
     @property
     def cursor_scope(self) -> str:
         return self.scope or self.principal
 
+    @property
+    def authority_binding(self) -> str:
+        return json.dumps(
+            {
+                "principal": self.principal,
+                "scope": self.scope,
+                "unrestricted": self.unrestricted,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
-def _verified_operator(request: Request, requested_scope: str | None) -> _Operator:
+    def require(self, capability: str) -> None:
+        if capability not in self.capabilities:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": f"workflow_{capability}_required"},
+            )
+
+    def require_delivery_destination(self, destination: str) -> None:
+        self.require("delivery")
+        if not self.delivery_destination or destination != self.delivery_destination:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "workflow_delivery_scope_mismatch"},
+            )
+
+
+def _token_capabilities(scopes: tuple[str, ...]) -> frozenset[str]:
+    if "workflow:admin" in scopes:
+        return _ALL_WORKFLOW_CAPABILITIES
+    capabilities: set[str] = set()
+    if "workflow:read" in scopes:
+        capabilities.add("read")
+    if "workflow:write" in scopes:
+        capabilities.update({"read", "write"})
+    if "workflow:delivery" in scopes:
+        capabilities.update({"read", "delivery"})
+    return frozenset(capabilities)
+
+
+def _verified_operator(
+    request: Request, requested_scope: str | None
+) -> WorkflowAuthority:
     session = getattr(request.state, "session", None)
     token = getattr(request.state, "token_principal", None)
     if session is not None:
@@ -94,11 +140,11 @@ def _verified_operator(request: Request, requested_scope: str | None) -> _Operat
                 status_code=403,
                 detail={"code": "operator_scope_not_authorized"},
             )
-        return _Operator(
+        return WorkflowAuthority(
             principal=maximum,
             scope=requested_scope or maximum,
             unrestricted=False,
-            high_trust=True,
+            capabilities=frozenset({"read", "write", "delivery"}),
         )
     if token is not None and getattr(request.state, "token_authenticated", False):
         maximum = (
@@ -106,10 +152,6 @@ def _verified_operator(request: Request, requested_scope: str | None) -> _Operat
             f"{getattr(token, 'principal', 'unknown')}"
         )
         scopes = tuple(getattr(token, "scopes", ()) or ())
-        if "workflow:read" not in scopes and "workflow:admin" not in scopes:
-            raise HTTPException(
-                status_code=403, detail={"code": "workflow_scope_required"}
-            )
         if requested_scope and not (
             requested_scope == maximum or requested_scope.startswith(maximum + ":")
         ):
@@ -117,18 +159,18 @@ def _verified_operator(request: Request, requested_scope: str | None) -> _Operat
                 status_code=403,
                 detail={"code": "operator_scope_not_authorized"},
             )
-        return _Operator(
+        return WorkflowAuthority(
             principal=maximum,
             scope=requested_scope or maximum,
             unrestricted=False,
-            high_trust="workflow:admin" in scopes,
+            capabilities=_token_capabilities(scopes),
         )
     if getattr(request.state, "local_admin_authenticated", False):
-        return _Operator(
+        return WorkflowAuthority(
             principal="profile-local-dashboard",
             scope=requested_scope,
             unrestricted=requested_scope is None,
-            high_trust=True,
+            capabilities=_ALL_WORKFLOW_CAPABILITIES,
         )
     raise HTTPException(status_code=401, detail={"code": "authentication_required"})
 
@@ -177,7 +219,9 @@ def _decode_cursor(value: str, *, kind: str, scope: str) -> dict[str, object]:
         ) from exc
 
 
-def _authorized_runs(store: RunStore, operator: _Operator, *, view: str = "all"):
+def _authorized_runs(
+    store: RunStore, operator: WorkflowAuthority, *, view: str = "all"
+):
     retention = WorkflowRetentionPolicy.from_profile(get_hermes_home())
     return store.list_runs(
         operator_scope=None if operator.unrestricted else operator.scope,
@@ -187,7 +231,7 @@ def _authorized_runs(store: RunStore, operator: _Operator, *, view: str = "all")
     )
 
 
-def _load_authorized(store: RunStore, run_id: str, operator: _Operator):
+def _load_authorized(store: RunStore, run_id: str, operator: WorkflowAuthority):
     try:
         return store.get_run_status(
             run_id,
@@ -213,11 +257,18 @@ def _cleanup_duration(value: str):
     }[match.group(2)]
 
 
-def _require_cleanup_authority(operator: _Operator) -> None:
-    if not operator.high_trust:
+def _notification_destination(store: RunStore, notification_id: str) -> str:
+    with store._connect() as connection:
+        row = connection.execute(
+            "SELECT destination FROM workflow_notification_outbox "
+            "WHERE notification_id=?",
+            (notification_id,),
+        ).fetchone()
+    if row is None:
         raise HTTPException(
-            status_code=403, detail={"code": "workflow_admin_required"}
+            status_code=404, detail={"code": "notification_not_found"}
         )
+    return str(row["destination"])
 
 
 def _public_cleanup_preview(payload: Mapping[str, object]) -> dict[str, object]:
@@ -269,12 +320,13 @@ def cleanup_preview(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request, operator_scope)
-    _require_cleanup_authority(operator)
+    operator.require("admin")
     with _store_lease() as store:
         return _public_cleanup_preview(
             store.cleanup_runs(
                 older_than=_cleanup_duration(older_than),
                 operator_scope=None if operator.unrestricted else operator.scope,
+                authority_binding=operator.authority_binding,
             )
         )
 
@@ -291,12 +343,14 @@ def cleanup_execute(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request_context, operator_scope)
-    _require_cleanup_authority(operator)
+    operator.require("admin")
     _cleanup_duration(request.older_than)
     try:
         with _store_lease() as store:
             result = store.cleanup_runs(
-                execute=True, confirmation_token=request.confirmation_token
+                execute=True,
+                confirmation_token=request.confirmation_token,
+                authority_binding=operator.authority_binding,
             )
     except ValueError as exc:
         raise HTTPException(
@@ -321,7 +375,7 @@ def cleanup_history(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request, operator_scope)
-    _require_cleanup_authority(operator)
+    operator.require("admin")
     with _store_lease() as store:
         rows = store.list_cleanup_history(limit=limit)
     return {
@@ -351,7 +405,7 @@ def lease_notifications(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request, operator_scope)
-    _require_cleanup_authority(operator)
+    operator.require_delivery_destination("desktop")
     with _store_lease() as store:
         items = NotificationOutbox(store).lease(
             destination="desktop",
@@ -375,8 +429,10 @@ def acknowledge_notification(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request_context, operator_scope)
-    _require_cleanup_authority(operator)
     with _store_lease() as store:
+        operator.require_delivery_destination(
+            _notification_destination(store, notification_id)
+        )
         applied = NotificationOutbox(store).ack(
             notification_id, owner_id=request.client_id
         )
@@ -395,8 +451,10 @@ def fail_notification(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request_context, operator_scope)
-    _require_cleanup_authority(operator)
     with _store_lease() as store:
+        operator.require_delivery_destination(
+            _notification_destination(store, notification_id)
+        )
         applied = NotificationOutbox(store).fail(
             notification_id,
             owner_id=request.client_id,
@@ -417,8 +475,10 @@ def dismiss_notification_projection(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request_context, operator_scope)
-    _require_cleanup_authority(operator)
     with _store_lease() as store:
+        operator.require_delivery_destination(
+            _notification_destination(store, notification_id)
+        )
         applied = NotificationOutbox(store).dismiss(
             notification_id, owner_id=request.client_id
         )
@@ -438,6 +498,7 @@ def list_runs(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request, operator_scope)
+    operator.require("read")
     with _store_lease() as store:
         runs = list(_authorized_runs(store, operator, view=view))
     cursor_scope = f"{operator.cursor_scope}:{view}"
@@ -473,6 +534,7 @@ def get_run(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request, operator_scope)
+    operator.require("read")
     with _store_lease() as store:
         return sanitize_projection(_load_authorized(store, run_id, operator))
 
@@ -484,6 +546,7 @@ def attention(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request, operator_scope)
+    operator.require("read")
     items = []
     with _store_lease() as store:
         for run in _authorized_runs(store, operator):
@@ -567,6 +630,7 @@ async def events(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request, operator_scope)
+    operator.require("read")
     runtime = _runtime()
     await _acquire_event_waiter(runtime)
     try:
@@ -600,6 +664,7 @@ def evidence(
     if kind not in EVIDENCE_KINDS:
         raise HTTPException(status_code=400, detail={"code": "evidence_kind_invalid"})
     operator = _verified_operator(request, operator_scope)
+    operator.require("read")
     with _store_lease() as store:
         _load_authorized(store, run_id, operator)
         return EvidenceReader(store).query(
@@ -630,6 +695,7 @@ def mutate_run(
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request_context, operator_scope)
+    operator.require("write")
     scope = None if operator.unrestricted else operator.scope
     with _store_lease() as store:
         current = _load_authorized(store, run_id, operator)
