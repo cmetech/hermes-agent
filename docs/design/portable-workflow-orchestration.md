@@ -1,10 +1,20 @@
 # Portable Workflow Orchestration Design
 
-**Status:** Final design of record; resilience, trusted-package admission, native workflow/Kanban boards, Kanban CAS, offline production showcase, and upstream-merge amendments approved for planning
+**Status:** Design of record amended for production safety; coordinator and operator-experience implementation require review approval
 
 **Date:** 2026-07-16
 
 **Scope:** Hermes/Co-worker only; no Pi framework or legacy OTTO workflow runtime
+
+**2026-07-18 production amendment:** The original foreground-owned scheduling
+model is superseded by
+`docs/superpowers/specs/2026-07-18-plugin-background-services-workflow-coordination-design.md`.
+The workflow plugin now owns a durable coordinator hosted through a minimal
+generic plugin background-service lifecycle in web/Desktop and Gateway. The
+operator contract and risk-ordered delivery sequence are defined in the
+corresponding 2026-07-18 operator-experience design and plan. Earlier language
+that assigns continuation to a request, cron firing, renderer, or incidental
+foreground process is not authoritative.
 
 ## Summary
 
@@ -459,9 +469,26 @@ This adds no Mermaid package to Python, core Hermes, CLI, or TUI. The workflow p
 
 ### 4. Scheduling
 
-Scheduled execution uses Hermes cron rather than a second scheduler. A cron job attaches the `workflow` skill and a self-contained run instruction. Existing cron provider/model/toolset/workdir/delivery fields remain authoritative for the outer job; workflow-level node overrides apply inside the run.
+Scheduled admission uses Hermes cron rather than a second cron subsystem. A
+cron job attaches the `workflow` skill and a self-contained run instruction.
+Existing cron provider/model/toolset/workdir/delivery fields remain
+authoritative for the outer job; workflow-level node overrides apply inside the
+run. Cron records truthful trigger provenance and a stable source-scoped
+idempotency identity, then submits background work only when a fresh workflow
+coordinator is available.
 
-An approval gate ends the current cron firing cleanly after delivering the run ID and review instructions. A later user approval resumes the durable workflow; cron does not wait while holding a worker.
+Execution scheduling, queued promotion, due retries, post-interaction
+continuation, stranded recovery, and stall detection belong to the workflow
+plugin's elected coordinator. Web/Desktop and Gateway host that coordinator
+through the generic plugin lifecycle; neither base host imports workflow code.
+If no healthy coordinator exists, background admission is rejected before a
+run is created. An explicitly supported foreground command remains available
+to a caller that chooses it.
+
+An approval gate ends the current cron firing cleanly after delivering the run
+ID and review instructions. A later user decision commits a durable wake;
+the coordinator resumes the workflow outside the HTTP, chat, or cron request.
+Cron does not wait while holding a worker.
 
 ## Worker Lifecycle, Deadlines, Shutdown, and Resource Exhaustion
 
@@ -489,7 +516,15 @@ spawn requested
 
 The coordinator owns every worker and descendant group. The IPC channel includes a coordinator lifeline: EOF or parent loss causes the worker to cancel its local model/tool work, terminate its descendants, and exit. The coordinator still performs process-tree cleanup, so either side can finish cleanup after the other fails. PID reuse is rejected using the recorded process start identity.
 
-On an owning Hermes CLI, gateway, cron host, or desktop backend shutdown, the runtime stops admitting new nodes, persists a shutdown event, cooperatively cancels active attempts, escalates and reaps their process trees, marks incomplete attempts `interrupted`, releases leases, and exits within a bounded shutdown deadline. Closing only a renderer while its Hermes backend remains alive does not stop the workflow. The first milestone does not create an independently detached workflow daemon.
+On a workflow coordinator host or explicit foreground executor shutdown, the
+runtime stops admitting new nodes, persists a shutdown event, cooperatively
+cancels active attempts, escalates and reaps process trees it can identify,
+marks incomplete attempts `interrupted` or `reconciliation_required`, releases
+safe leases, and exits within a bounded shutdown deadline. A live process or
+uncertain outward effect is never made replayable merely because its lease
+expired. Closing only a renderer while its Hermes backend remains alive does
+not stop the workflow. The first milestone does not create an independently
+detached workflow daemon.
 
 After forced termination, laptop power loss, or OS kill, restart reconciliation detects stale leases/process identities, marks attempts `interrupted`, and requires normal resume rules. A suspend/wake or wall-clock jump is detected from the monotonic/UTC heartbeat gap; the coordinator reconciles ownership rather than assuming the attempt succeeded. Unknown external-side-effect outcomes pause for operator reconciliation before retry.
 
@@ -502,6 +537,14 @@ Process-tree resident memory, CPU time where the platform can enforce or measure
 ### Admission and duplicate-trigger identity
 
 `RunStore.start_run` is the only run-creation path. It atomically records the trigger source, idempotency key, start digest, concurrency key/policy, admission disposition, and run ID before scheduling any node. Chat, `/workflow`, CLI, Desktop, API, and cron all call this contract; none may create a run directory directly. A duplicate delivery returns `existing`, an intentional queued overlap returns `queued`, and a capacity/policy refusal returns a stable non-billable diagnostic. Queued runs are durable state only: they own no agent, process, thread, retry timer, MCP server, or scheduler slot.
+
+The production amendment separates a workflow's lifecycle status from execution-
+lane ownership. A run paused for approval/input, waiting for a persisted retry,
+or safely interrupted owns no execution lane, so a durable coordinator may
+promote queued work. When the waiting run becomes runnable again it enters the
+durable fair queue; it does not bypass another lane owner. Paused/retry/
+interrupted quotas still bound retained nonterminal state. Duplicate promotion
+and wake processing are idempotent.
 
 ### Layout
 
@@ -669,6 +712,26 @@ Rules for this milestone:
 11. The repository exposes a stable checker, focused smoke command, and merge-rehearsal command. The owning skill is `/Users/coreyellis/code/github.com/cmetech/otto_hermes/.claude/skills/otto-upstream-merge/SKILL.md`; it remains outside this repository and is not copied into Hermes.
 
 ### Planned upstream and desktop touch budget
+
+The 2026-07-18 production amendment additionally authorizes the following
+generic lifecycle changes. This is an explicit expansion of the earlier
+three-file agent-core budget, not an implicit workflow exception:
+
+- new `hermes_cli/plugin_services.py`: generic blocking background-service
+  protocol, host supervisor, health snapshots, bounded shutdown, and
+  generation-safe reload;
+- `hermes_cli/plugins.py`: attributed background-service registration and
+  force-reload interlock;
+- `hermes_cli/web_server.py`: generic `web` service hosting in FastAPI lifespan;
+- `gateway/run.py`: generic `gateway` service hosting and shutdown ordering;
+- focused generic lifecycle tests for each boundary.
+
+The concrete workflow registration proves this surface is not speculative.
+None of these files may import workflow modules, `RunScheduler`, or receive an
+`AIAgent`, conversation history, prompts, tools, provider credentials, or model
+context. Each change is separately ledgered with the tests and removal
+condition specified in the focused lifecycle design. An upstream-equivalent
+API removes the local customization after the workflow plugin migrates to it.
 
 The implementation may modify only three existing upstream-owned **agent-core** files without a design amendment:
 
