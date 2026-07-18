@@ -14,6 +14,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from hermes_constants import get_hermes_home
+from plugins.workflow.actions import MUTATION_ACTIONS, mutation_is_valid
 from plugins.workflow.store import RunStore
 
 
@@ -181,6 +182,18 @@ def mutate_run(
 ):
     store = _store()
     current = _load_authorized(store, run_id, operator_scope)
+    if action not in MUTATION_ACTIONS:
+        raise HTTPException(status_code=404, detail={"code": "action_not_found"})
+    if not mutation_is_valid(
+        action,
+        status=str(current["status"]),
+        pending_interaction=current.get("pending_interaction"),
+        health=str(current.get("health") or ""),
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "invalid_transition", "current": _sanitize(current)},
+        )
     if int(current["state_version"]) != request.expected_version:
         raise HTTPException(status_code=409, detail={"code": "stale_state", "current": _sanitize(current)})
     try:
@@ -202,8 +215,6 @@ def mutate_run(
             store.cancel_run(run_id, expected_state_version=request.expected_version, operator_scope=operator_scope)
         elif action == "abandon":
             store.abandon_run(run_id, expected_state_version=request.expected_version, operator_scope=operator_scope)
-        else:
-            raise HTTPException(status_code=404, detail={"code": "action_not_found"})
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail={"code": "stale_state", "current": _sanitize(_load_authorized(store, run_id, operator_scope))}) from exc
     except ValueError as exc:

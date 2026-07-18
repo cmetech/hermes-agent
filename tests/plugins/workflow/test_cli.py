@@ -26,6 +26,20 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _json_result(capsys):
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["schema_version"] == 1
+    assert envelope["ok"] is True
+    assert envelope["error"] is None
+    return envelope["result"]
+
+
+def _json_envelope(capsys):
+    output = capsys.readouterr()
+    assert output.err == ""
+    return json.loads(output.out)
+
+
 def _write(workflow_writer, workdir):
     return workflow_writer(
         workdir / ".hermes" / "workflows",
@@ -108,7 +122,7 @@ def test_list_and_show_json_are_stable_and_redacted(workflow_writer, tmp_path, c
         "--json",
     ])
     assert args.func(args) == 0
-    listing = json.loads(capsys.readouterr().out)
+    listing = _json_result(capsys)
     assert listing[0]["name"] == "sample"
 
     args = parser.parse_args([
@@ -121,7 +135,7 @@ def test_list_and_show_json_are_stable_and_redacted(workflow_writer, tmp_path, c
         "--json",
     ])
     assert args.func(args) == 0
-    detail = json.loads(capsys.readouterr().out)
+    detail = _json_result(capsys)
     assert detail["topology_text"] == "start"
     assert detail["topology_mermaid"].startswith("flowchart LR")
     assert "SECRET_BODY" not in json.dumps(detail)
@@ -192,7 +206,7 @@ def test_cleanup_cli_is_preview_only_until_exact_token_is_executed(
 
     preview_args = parser.parse_args([*common, "--json"])
     assert preview_args.func(preview_args) == 0
-    preview = json.loads(capsys.readouterr().out)
+    preview = _json_result(capsys)
     assert preview["execute"] is False
     assert preview["confirmation_token"]
     assert store.run_directory(admitted.run_id).is_dir()
@@ -205,7 +219,7 @@ def test_cleanup_cli_is_preview_only_until_exact_token_is_executed(
         "--json",
     ])
     assert execute_args.func(execute_args) == 0
-    executed = json.loads(capsys.readouterr().out)
+    executed = _json_result(capsys)
     assert executed["execute"] is True
     assert store.list_runs() == ()
 
@@ -219,11 +233,11 @@ def test_validate_doctor_trust_and_untrust(workflow_writer, tmp_path, capsys):
 
     args = parser.parse_args([*common, "validate", "sample", "--json"])
     assert args.func(args) == 0
-    assert json.loads(capsys.readouterr().out)["valid"] is True
+    assert _json_result(capsys)["valid"] is True
 
     args = parser.parse_args([*common, "doctor", "sample", "--compat-report", "--json"])
     assert args.func(args) == 0
-    doctor = json.loads(capsys.readouterr().out)
+    doctor = _json_result(capsys)
     assert doctor["package_digest"]
     assert "SECRET_BODY" not in json.dumps(doctor)
 
@@ -251,11 +265,11 @@ def test_validate_doctor_trust_and_untrust(workflow_writer, tmp_path, capsys):
         "--json",
     ])
     assert args.func(args) == 0
-    assert json.loads(capsys.readouterr().out)["status"] == "trusted"
+    assert _json_result(capsys)["status"] == "trusted"
 
     args = parser.parse_args([*common, "untrust", "sample", "--json"])
     assert args.func(args) == 0
-    assert json.loads(capsys.readouterr().out)["status"] == "untrusted"
+    assert _json_result(capsys)["status"] == "untrusted"
 
 
 def test_trust_rejects_package_mutation_during_admission(
@@ -307,15 +321,16 @@ def test_run_status_events_and_runs_use_the_durable_store(
         "sample",
         "--idempotency-key",
         "message-1",
+        "--foreground",
         "--json",
     ])
     assert args.func(args) == 0
-    run = json.loads(capsys.readouterr().out)
+    run = _json_result(capsys)
     assert run["status"] == "succeeded"
 
     args = parser.parse_args([*common, "status", run["run_id"], "--json"])
     assert args.func(args) == 0
-    assert json.loads(capsys.readouterr().out)["run_id"] == run["run_id"]
+    assert _json_result(capsys)["run_id"] == run["run_id"]
 
     args = parser.parse_args([
         *common,
@@ -326,11 +341,11 @@ def test_run_status_events_and_runs_use_the_durable_store(
         "--json",
     ])
     assert args.func(args) == 0
-    assert len(json.loads(capsys.readouterr().out)) == 2
+    assert len(_json_result(capsys)) == 2
 
     args = parser.parse_args([*common, "runs", "--status", "succeeded", "--json"])
     assert args.func(args) == 0
-    assert json.loads(capsys.readouterr().out)[0]["run_id"] == run["run_id"]
+    assert _json_result(capsys)[0]["run_id"] == run["run_id"]
 
 
 def test_foreground_cli_releases_at_gate_and_claims_new_epoch_for_continue(
@@ -361,10 +376,11 @@ def test_foreground_cli_releases_at_gate_and_claims_new_epoch_for_continue(
         "foreground-gate",
         "--idempotency-key",
         "foreground-gate",
+        "--foreground",
         "--json",
     ])
     assert start_args.func(start_args) == 1
-    paused = json.loads(capsys.readouterr().out)
+    paused = _json_result(capsys)
     assert paused["status"] == "paused"
     assert datetime.fromisoformat(paused["foreground_lease_expires_at"]) <= datetime.now(
         timezone.utc
@@ -374,11 +390,15 @@ def test_foreground_cli_releases_at_gate_and_claims_new_epoch_for_continue(
         *common,
         "approve",
         paused["run_id"],
+        "--interaction-id",
+        paused["pending_interaction"]["interaction_id"],
+        "--expected-version",
+        str(paused["state_version"]),
         "--continue",
         "--json",
     ])
     assert approve_args.func(approve_args) == 0
-    completed = json.loads(capsys.readouterr().out)
+    completed = _json_result(capsys)
     assert completed["run_status"] == "succeeded"
     projection = RunStore(profile).load_run(paused["run_id"])
     assert projection["foreground_epoch"] == 2
@@ -429,4 +449,140 @@ def test_reset_sessions_requires_confirmation_for_cross_scope_reset(tmp_path, ca
 
     args = parser.parse_args([*common, "--scope", "scope-a", "--json"])
     assert args.func(args) == 0
-    assert json.loads(capsys.readouterr().out)["removed"] == 1
+    assert _json_result(capsys)["removed"] == 1
+
+
+def test_json_failures_use_stable_envelopes_and_exit_categories(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    parser = _parser()
+    common = ["--hermes-home", str(tmp_path / "profile")]
+
+    missing = parser.parse_args([*common, "status", "missing-run", "--json"])
+    assert missing.func(missing) == 3
+    envelope = _json_envelope(capsys)
+    assert envelope["schema_version"] == 1
+    assert envelope["ok"] is False
+    assert envelope["command"] == "workflow status"
+    assert envelope["error"]["code"] == "not_found"
+
+    invalid = parser.parse_args([*common, "events", "missing-run", "--tail", "0", "--json"])
+    assert invalid.func(invalid) == 2
+    assert _json_envelope(capsys)["error"]["code"] == "invalid_request"
+
+    monkeypatch.setattr(
+        "plugins.workflow.cli._cmd_status",
+        lambda _args: (_ for _ in ()).throw(RuntimeError("stale state version")),
+    )
+    conflict = parser.parse_args([*common, "status", "run", "--json"])
+    assert conflict.func(conflict) == 5
+    conflict_envelope = _json_envelope(capsys)
+    assert conflict_envelope["error"]["code"] == "version_conflict"
+    assert conflict_envelope["error"]["retryable"] is True
+
+    monkeypatch.setattr(
+        "plugins.workflow.cli._cmd_status",
+        lambda _args: (_ for _ in ()).throw(TypeError("secret internal detail")),
+    )
+    internal = parser.parse_args([*common, "status", "run", "--json"])
+    assert internal.func(internal) == 70
+    internal_envelope = _json_envelope(capsys)
+    assert internal_envelope["error"]["code"] == "internal_error"
+    assert "secret internal detail" not in json.dumps(internal_envelope)
+
+
+def test_machine_start_requires_stable_key_and_background_owner(
+    workflow_writer, tmp_path, capsys
+) -> None:
+    workdir = tmp_path / "repo"
+    path = _write(workflow_writer, workdir)
+    profile = tmp_path / "profile"
+    package = load_workflow(path)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(profile).trust(
+        digest.sha256, actor="test", risk_digest=risk.risk_digest
+    )
+    parser = _parser()
+    common = ["--workdir", str(workdir), "--hermes-home", str(profile)]
+
+    keyless = parser.parse_args([
+        *common,
+        "run",
+        "sample",
+        "--foreground",
+        "--json",
+    ])
+    assert keyless.func(keyless) == 2
+    assert _json_envelope(capsys)["error"]["code"] == "idempotency_key_required"
+
+    background = parser.parse_args([
+        *common,
+        "run",
+        "sample",
+        "--idempotency-key",
+        "stable-background-key",
+        "--no-wait",
+        "--json",
+    ])
+    assert background.func(background) == 6
+    envelope = _json_envelope(capsys)
+    assert envelope["error"]["code"] == "coordinator_unavailable"
+    assert list(RunStore(profile).runs_root.glob("*/*")) == []
+
+
+def test_not_found_candidates_are_bounded_safe_and_deterministic(
+    workflow_writer, tmp_path, capsys
+) -> None:
+    workdir = tmp_path / "repo"
+    for index in reversed(range(12)):
+        workflow_writer(
+            workdir / ".hermes" / "workflows" / f"package-{index:02d}",
+            name=f"workflow-{index:02d}",
+        )
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(tmp_path / "profile"),
+        "show",
+        "missing",
+        "--json",
+    ])
+
+    assert args.func(args) == 3
+    envelope = _json_envelope(capsys)
+    candidates = envelope["error"]["details"]["candidates"]
+    assert len(candidates) == 10
+    assert candidates == sorted(candidates, key=lambda item: item["id"])
+    assert set(candidates[0]) == {"id", "kind", "label"}
+    assert {candidate["kind"] for candidate in candidates} == {"workflow"}
+
+
+def test_doctor_json_is_nonzero_when_findings_block_local_execution(
+    workflow_writer, tmp_path, capsys
+) -> None:
+    workdir = tmp_path / "repo"
+    path = _write(workflow_writer, workdir)
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "execution_environment: isolated_backend_required\n",
+        encoding="utf-8",
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(tmp_path / "profile"),
+        "doctor",
+        "sample",
+        "--mode",
+        "foreground",
+        "--compat-report",
+        "--json",
+    ])
+
+    assert args.func(args) == 7
+    envelope = _json_envelope(capsys)
+    assert envelope["error"]["code"] == "blocking_doctor_findings"
+    assert envelope["result"]["runnable"] is False
+    assert envelope["result"]["coordinator"]["status"] == "unavailable"

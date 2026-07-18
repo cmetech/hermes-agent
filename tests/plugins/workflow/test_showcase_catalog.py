@@ -224,7 +224,9 @@ def test_showcase_cli_list_and_missing_input_have_stable_exit_categories(
         ["workflow", "--hermes-home", str(tmp_path), "showcase", "list", "--json"]
     )
     assert listed.func(listed) == 0
-    assert len(json.loads(capsys.readouterr().out)) == 4
+    listed_envelope = json.loads(capsys.readouterr().out)
+    assert listed_envelope["ok"] is True
+    assert len(listed_envelope["result"]) == 4
 
     missing = parser.parse_args(
         [
@@ -232,6 +234,8 @@ def test_showcase_cli_list_and_missing_input_have_stable_exit_categories(
             "laptop-diagnostic", "--json",
         ]
     )
-    assert missing.func(missing) == 3
+    assert missing.func(missing) == 2
     payload = json.loads(capsys.readouterr().out)
-    assert payload["reason_code"] == "showcase_input_required"
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "showcase_input_required"
+    assert payload["result"]["reason_code"] == "showcase_input_required"

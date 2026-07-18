@@ -23,6 +23,7 @@ from typing import Iterable, Mapping
 
 import yaml
 
+from plugins.workflow.actions import available_actions
 from plugins.workflow.admission import (
     PreparedRunSnapshot,
     RunAdmissionRequest,
@@ -2408,6 +2409,27 @@ class RunStore:
             "cursor_reset": False,
         }
 
+    def latest_events(
+        self,
+        run_id: str,
+        *,
+        limit: int = 100,
+        operator_scope: str | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        """Return the newest bounded event tail in chronological display order."""
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        directory = self.run_directory(run_id, operator_scope=operator_scope)
+        with workflow_lock(self._run_lock_path(run_id)):
+            selected = self._read_journal_events(directory)[-limit:]
+        public_events = []
+        for event in selected:
+            event = dict(event)
+            event.pop("projection", None)
+            event.pop("projection_sha256", None)
+            public_events.append(_sanitize(event))
+        return tuple(public_events)
+
     def list_runs(
         self,
         *,
@@ -2817,7 +2839,11 @@ class RunStore:
             ),
             "next_retry_at": min(retry_times) if retry_times else None,
             "pending_interaction": pending_interaction,
-            "next_actions": self._next_actions(status, pending_interaction),
+            "next_actions": available_actions(
+                status,
+                pending_interaction,
+                health=health,
+            ),
         }
 
     def node_effect_classification(
@@ -2855,24 +2881,6 @@ class RunStore:
             )
             raise
         return "outward" if node_id in outward else "replay_safe"
-
-    @staticmethod
-    def _next_actions(
-        status: str, pending_interaction: dict[str, object] | None = None
-    ) -> list[str]:
-        if status == "paused" and pending_interaction:
-            interaction_type = pending_interaction.get("type")
-            if interaction_type in {"approval", "workflow_approval"}:
-                return ["status", "events", "approve", "reject", "cancel"]
-            if interaction_type == "loop_input":
-                return ["status", "events", "provide-input", "cancel"]
-            if interaction_type == "reconcile":
-                return ["status", "events", "reconcile", "cancel"]
-        if status in {"running", "queued", "waiting_retry", "paused"}:
-            return ["status", "events", "cancel"]
-        if status in {"failed", "interrupted"}:
-            return ["status", "events", "resume", "abandon"]
-        return ["status", "events", "cleanup"]
 
     def claim_node(
         self,

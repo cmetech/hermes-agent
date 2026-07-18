@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from plugins.workflow.actions import MUTATION_ACTIONS, available_actions, mutation_is_valid
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
@@ -88,3 +89,51 @@ def test_conversation_scope_filters_lists_and_explicit_run_ids(
         store.cancel_run(first.run_id, operator_scope="user-a/conversation-1")["status"]
         == "cancelled"
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "interaction", "health", "expected"),
+    [
+        ("running", None, "healthy", {"cancel"}),
+        ("running", None, "stalled", {"cancel", "resume"}),
+        ("queued", None, "waiting", {"cancel"}),
+        ("waiting_retry", None, "retry_wait", {"cancel"}),
+        (
+            "paused",
+            {"type": "approval"},
+            "user_wait",
+            {"approve", "reject", "cancel"},
+        ),
+        (
+            "paused",
+            {"type": "loop_input"},
+            "user_wait",
+            {"provide-input", "cancel"},
+        ),
+        (
+            "paused",
+            {"type": "reconcile"},
+            "user_wait",
+            {"reconcile", "cancel"},
+        ),
+        ("interrupted", None, "interrupted", {"resume", "retry", "abandon"}),
+        ("failed", None, "terminal", {"resume", "retry", "abandon"}),
+        ("succeeded", None, "terminal", {"cleanup"}),
+    ],
+)
+def test_action_table_advertises_exactly_valid_mutations(
+    status, interaction, health, expected
+) -> None:
+    advertised = available_actions(status, interaction, health=health)
+    advertised_mutations = set(advertised) & MUTATION_ACTIONS
+    assert advertised_mutations == expected
+    assert {
+        action
+        for action in MUTATION_ACTIONS
+        if mutation_is_valid(
+            action,
+            status=status,
+            pending_interaction=interaction,
+            health=health,
+        )
+    } == expected
