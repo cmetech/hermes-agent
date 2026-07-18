@@ -299,6 +299,31 @@ upstream_changes:
   removal_condition: Remove when upstream Desktop provides equivalent compare-and-set
     workflow action recovery and tested activity-board accessibility at scale.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-notification-projection
+  change_class: desktop-composition-generic
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/store/native-notifications.ts
+  - apps/desktop/src/store/workflow-notifications.ts
+  - apps/desktop/src/store/workflow-notifications.test.ts
+  owned_symbols:
+  - projectNativeNotification
+  - deliverWorkflowNotificationsOnce
+  - startWorkflowNotificationDelivery
+  tests:
+  - apps/desktop/src/store/native-notifications.test.ts
+  - apps/desktop/src/store/workflow-notifications.test.ts
+  expected_commit_subject: 'feat(workflow): add retention and durable notifications'
+  upstream_candidate: true
+  merge_guidance: Preserve durable server-owned notification leases, stable
+    Electron client identity, projection-before-ack ordering, and the bounded
+    local projected-receipt cache that retries a lost server acknowledgement
+    without projecting a duplicate OS notification. Desktop preferences and
+    dismissal remain presentation policy and never mutate workflow state.
+  removal_condition: Remove when upstream Desktop provides an equivalent
+    generic durable-notification projection with leased reads, Electron receipt
+    acknowledgement, crash recovery, and send-before-receipt deduplication.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: capability-workflow-package-staging
   change_class: capability-staging-generic
   owner: workflow-orchestration
