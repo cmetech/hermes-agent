@@ -9,6 +9,7 @@ import subprocess
 
 import pytest
 
+from hermes_cli import capability_staging
 from plugins.workflow.showcase import (
     ShowcaseCatalogError,
     load_showcase_catalog,
@@ -73,6 +74,45 @@ def test_default_catalog_repairs_crlf_only_managed_checkout(
     catalog = showcase_module.load_showcase_catalog()
 
     assert "laptop-diagnostic" in catalog
+    assert b"\r\n" not in (bundle / "catalog.yaml").read_bytes()
+
+
+def test_repair_forces_tracked_bytes_when_checkout_is_a_successful_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "checkout"
+    bundle = checkout / "plugins/workflow/showcases"
+    bundle.parent.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / ".gitattributes", checkout / ".gitattributes")
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", bundle)
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.name", "Showcase Test"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-qm", "fixture"], check=True
+    )
+    for path in bundle.rglob("*"):
+        if path.is_file():
+            data = path.read_bytes().replace(b"\r\n", b"\n")
+            path.write_bytes(data.replace(b"\n", b"\r\n"))
+
+    original_run = capability_staging.subprocess.run
+
+    def successful_noop_checkout(command, *args, **kwargs):
+        if command[-4:] == ["checkout", "HEAD", "--", "plugins/workflow/showcases"]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(capability_staging.subprocess, "run", successful_noop_checkout)
+
+    assert capability_staging.repair_authenticated_resource_checkout(bundle) is True
     assert b"\r\n" not in (bundle / "catalog.yaml").read_bytes()
 
 

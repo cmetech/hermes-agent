@@ -485,9 +485,11 @@ upstream_changes:
   upstream_candidate: true
   merge_guidance: Preserve fail-closed byte authentication while recovering only
     tracked CRLF working-tree drift that has no semantic diff from HEAD. Keep
-    checkout repair bounded to the exact distribution resource tree, rerun the
-    original digest verification after repair, and never normalize or accept
-    arbitrary bytes in memory.
+    checkout repair bounded to the exact distribution resource tree; when a
+    successful Git-for-Windows path checkout leaves CRLF bytes intact, force
+    materialization only of that tree's verified tracked index entries. Rerun
+    the original digest verification after repair, and never normalize or
+    accept arbitrary bytes in memory.
   removal_condition: Remove when every supported managed Windows updater both
     migrates pre-attribute checkouts to LF bytes and pins local autocrlf before
     future pulls, with equivalent semantic-tamper rejection coverage.

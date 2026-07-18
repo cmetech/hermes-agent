@@ -141,9 +141,58 @@ def repair_authenticated_resource_checkout(resource_root: Path | str) -> bool:
             timeout=GIT_REPAIR_TIMEOUT,
             env=_no_prompt_env(),
         )
-        if verified.returncode != 0 or any(
-            "w/crlf" in line for line in verified.stdout.splitlines()
-        ):
+        if verified.returncode != 0:
+            return False
+
+        if any("w/crlf" in line for line in verified.stdout.splitlines()):
+            # Git for Windows can report a successful path checkout while
+            # retaining pre-attribute CRLF bytes in a legacy worktree.  Force
+            # materialization of only the already-verified tracked files from
+            # the index, then retain the byte-level postcondition below.
+            tracked = subprocess.run(
+                [*git, "ls-files", "--", relative],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=GIT_REPAIR_TIMEOUT,
+                env=_no_prompt_env(),
+            )
+            paths = tracked.stdout.splitlines()
+            if (
+                tracked.returncode != 0
+                or not paths
+                or any(not path.startswith(f"{relative}/") for path in paths)
+            ):
+                return False
+            materialized = subprocess.run(
+                [
+                    *git,
+                    "checkout-index",
+                    "--force",
+                    "--ignore-skip-worktree-bits",
+                    "--",
+                    *paths,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=GIT_REPAIR_TIMEOUT,
+                env=_no_prompt_env(),
+            )
+            if materialized.returncode != 0:
+                return False
+            verified = subprocess.run(
+                [*git, "ls-files", "--eol", "--", relative],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=GIT_REPAIR_TIMEOUT,
+                env=_no_prompt_env(),
+            )
+            if verified.returncode != 0:
+                return False
+
+        if any("w/crlf" in line for line in verified.stdout.splitlines()):
             return False
 
         return True
