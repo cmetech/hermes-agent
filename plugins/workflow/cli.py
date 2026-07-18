@@ -53,6 +53,7 @@ from plugins.workflow.machine_contract import (
     operator_command_contract,
     success_envelope,
 )
+from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.schema import load_workflow, validate_package
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.sessions import NodeSessionRegistry
@@ -355,6 +356,14 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     run_parser.add_argument("--arguments", default="")
     run_parser.add_argument("--idempotency-key")
     run_parser.add_argument("--concurrency-key")
+    run_parser.add_argument(
+        "--trigger-source",
+        choices=("cli", "chat", "background_agent", "cron"),
+        default="cli",
+        help="Local-admin-claimed origin for this shell admission",
+    )
+    run_parser.add_argument("--source-instance")
+    run_parser.add_argument("--claimed-actor")
     execution = run_parser.add_mutually_exclusive_group()
     execution.add_argument("--no-wait", action="store_true")
     execution.add_argument(
@@ -467,6 +476,13 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     showcase_run.add_argument("--confirmation-token")
     showcase_run.add_argument("--schedule-at")
     showcase_run.add_argument("--idempotency-key")
+    showcase_run.add_argument(
+        "--trigger-source",
+        choices=("cli", "chat", "background_agent", "cron"),
+        default="cli",
+    )
+    showcase_run.add_argument("--source-instance")
+    showcase_run.add_argument("--claimed-actor")
     showcase_run.add_argument("--no-wait", action="store_true")
     _json_flag(showcase_run)
     showcase_status = showcase_actions.add_parser("status")
@@ -1405,18 +1421,25 @@ def _cmd_run(
     prepared = store.prepare_run_snapshot(
         package, values={"arguments": args.arguments} if args.arguments else None
     )
+    intent_key = args.idempotency_key or secrets.token_urlsafe(24)
     request = RunAdmissionRequest(
         workflow_name=package.definition.name,
         definition_digest=prepared.definition_digest,
         policy_digest=prepared.policy_digest,
         input_manifest_digest=prepared.input_manifest_digest,
-        trigger_source="cli",
-        idempotency_key=args.idempotency_key or secrets.token_urlsafe(24),
+        trigger_source=args.trigger_source,
+        idempotency_key=intent_key,
         concurrency_key=args.concurrency_key
         or str(package.sidecar.get("concurrency_key") or package.definition.name),
         concurrency_policy=str(package.sidecar.get("overlap_policy") or "queue"),
         execution_mode=execution_mode,
         foreground_owner_id=foreground_owner_id,
+        provenance=TriggerProvenance.local_admin_claim(
+            source=args.trigger_source,
+            intent_key=intent_key,
+            source_instance=args.source_instance or f"cli:pid:{os.getpid()}",
+            claimed_actor=args.claimed_actor,
+        ),
     )
     admitted = store.start_run(request, immutable_snapshot=prepared)
     if admitted.run_id is None:
@@ -1771,6 +1794,9 @@ def _cmd_showcase(args: argparse.Namespace) -> int:
             schedule_at=args.schedule_at,
             no_wait=args.no_wait,
             idempotency_key=args.idempotency_key,
+            trigger_source=args.trigger_source,
+            source_instance=args.source_instance,
+            claimed_actor=args.claimed_actor,
         )
     elif action == "status":
         payload = _store(args).get_run_status(args.run_id)

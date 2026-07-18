@@ -31,6 +31,10 @@ from plugins.workflow.admission import (
 )
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
 from plugins.workflow.models import ApprovalDecision, WorkflowPackage
+from plugins.workflow.provenance import (
+    TriggerProvenance,
+    legacy_projection_provenance,
+)
 from plugins.workflow.trust import compute_package_digest
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
@@ -83,7 +87,7 @@ class ForegroundExecutionLease:
 
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
-_STORE_SCHEMA_VERSION = 4
+_STORE_SCHEMA_VERSION = 5
 _PROJECTION_STATUSES = {
     "queued",
     "running",
@@ -389,6 +393,7 @@ class RunStore:
                         desired_status TEXT,
                         staging_directory TEXT,
                         operator_scope_digest TEXT,
+                        provenance_json TEXT,
                         execution_mode TEXT NOT NULL DEFAULT 'foreground',
                         foreground_owner_id TEXT,
                         foreground_lease_expires_at TEXT,
@@ -476,6 +481,9 @@ class RunStore:
                     "operator_scope_digest": (
                         "ALTER TABLE runs ADD COLUMN operator_scope_digest TEXT"
                     ),
+                    "provenance_json": (
+                        "ALTER TABLE runs ADD COLUMN provenance_json TEXT"
+                    ),
                     "projection_schema_version": (
                         "ALTER TABLE runs ADD COLUMN projection_schema_version "
                         "INTEGER NOT NULL DEFAULT 1"
@@ -537,6 +545,7 @@ class RunStore:
                 "desired_status",
                 "staging_directory",
                 "operator_scope_digest",
+                "provenance_json",
                 "projection_schema_version",
                 "projection_state_version",
                 "projection_sha256",
@@ -835,6 +844,17 @@ class RunStore:
                 "concurrency": projection["concurrency_key"],
                 "operator_scope_digest": projection.get("operator_scope_digest"),
                 "run_metadata": dict(sorted(metadata.items())),
+                **(
+                    {"provenance": {
+                        key: value
+                        for key, value in projection["provenance"].items()
+                        if key != "admitted_at"
+                    }}
+                    if isinstance(projection.get("provenance"), Mapping)
+                    and projection["provenance"].get("assurance")
+                    != "legacy_unknown"
+                    else {}
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -857,10 +877,10 @@ class RunStore:
             "start_digest, concurrency_key, concurrency_policy, disposition, "
             "status, queue_position, blocked_by_run_id, run_directory, "
             "created_at, updated_at, admission_state, desired_status, "
-            "staging_directory, operator_scope_digest, "
+            "staging_directory, operator_scope_digest, provenance_json, "
             "execution_mode, foreground_owner_id, foreground_lease_expires_at, "
             "foreground_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "'published', NULL, NULL, ?, ?, ?, ?, ?)",
+            "'published', NULL, NULL, ?, ?, ?, ?, ?, ?)",
             (
                 projection["run_id"],
                 projection["workflow"],
@@ -877,6 +897,11 @@ class RunStore:
                 projection.get("created_at") or projection["updated_at"],
                 projection["updated_at"],
                 projection.get("operator_scope_digest"),
+                (
+                    json.dumps(projection["provenance"], sort_keys=True)
+                    if isinstance(projection.get("provenance"), Mapping)
+                    else None
+                ),
                 projection.get("execution_mode", "foreground"),
                 projection.get("foreground_owner_id"),
                 projection.get("foreground_lease_expires_at"),
@@ -1641,8 +1666,7 @@ class RunStore:
 
     @staticmethod
     def _start_digest(request: RunAdmissionRequest) -> str:
-        material = json.dumps(
-            {
+        identity = {
                 "workflow": request.workflow_name,
                 "definition": request.definition_digest,
                 "policy": request.policy_digest,
@@ -1651,7 +1675,11 @@ class RunStore:
                 "concurrency": request.concurrency_key,
                 "operator_scope_digest": RunStore._scope_digest(request.operator_scope),
                 "run_metadata": dict(sorted((request.run_metadata or {}).items())),
-            },
+            }
+        if request.provenance is not None:
+            identity["provenance"] = request.provenance.digest_record()
+        material = json.dumps(
+            identity,
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
@@ -1699,6 +1727,14 @@ class RunStore:
             for key, value in metadata.items()
         ):
             raise ValueError("run_metadata must contain bounded string pairs")
+        provenance = request.provenance or TriggerProvenance.legacy(
+            source=request.trigger_source,
+            intent_key=request.idempotency_key,
+        )
+        if provenance.source != request.trigger_source:
+            raise ValueError("provenance source must match trigger_source")
+        if provenance.intent_key != request.idempotency_key:
+            raise ValueError("provenance intent_key must match idempotency_key")
         if (
             request.workflow_name != immutable_snapshot.workflow_name
             and immutable_snapshot.workflow_name
@@ -1834,15 +1870,16 @@ class RunStore:
             run_directory = self.runs_root / request.workflow_name / run_id
             run_directory.parent.mkdir(parents=True, exist_ok=True)
             now = _utc_now()
+            provenance_record = provenance.durable_record(admitted_at=now)
             connection.execute(
                 "INSERT INTO runs ("
                 "run_id, workflow_name, trigger_source, idempotency_digest, "
                 "start_digest, concurrency_key, concurrency_policy, disposition, "
                 "status, queue_position, blocked_by_run_id, run_directory, "
                 "created_at, updated_at, admission_state, desired_status, "
-                "staging_directory, operator_scope_digest, execution_mode, "
+                "staging_directory, operator_scope_digest, provenance_json, execution_mode, "
                 "foreground_owner_id, foreground_lease_expires_at, foreground_epoch) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     run_id,
                     request.workflow_name,
@@ -1862,6 +1899,7 @@ class RunStore:
                     status,
                     str(immutable_snapshot.staging_directory),
                     operator_scope_digest,
+                    json.dumps(provenance_record, sort_keys=True),
                     request.execution_mode,
                     foreground_owner_id,
                     foreground_lease_expires_at,
@@ -1881,6 +1919,7 @@ class RunStore:
                 queue_position=queue_position,
                 blocked_by=blocked_by,
                 created_at=now,
+                provenance_record=provenance_record,
                 foreground_owner_id=foreground_owner_id,
                 foreground_lease_expires_at=foreground_lease_expires_at,
                 foreground_epoch=foreground_epoch,
@@ -1910,6 +1949,7 @@ class RunStore:
         queue_position: int | None,
         blocked_by: str | None,
         created_at: str,
+        provenance_record: Mapping[str, object],
         foreground_owner_id: str | None,
         foreground_lease_expires_at: str | None,
         foreground_epoch: int | None,
@@ -1927,6 +1967,7 @@ class RunStore:
             "policy_digest": request.policy_digest,
             "input_manifest_digest": request.input_manifest_digest,
             "trigger": request.trigger_source,
+            "provenance": dict(provenance_record),
             "idempotency_key_digest": key_digest,
             "operator_scope_digest": operator_scope_digest,
             "run_metadata": dict(sorted((request.run_metadata or {}).items())),
@@ -2693,6 +2734,8 @@ class RunStore:
         self, run_id: str, *, operator_scope: str | None = None
     ) -> dict[str, object]:
         run = self.load_run(run_id, operator_scope=operator_scope)
+        if not isinstance(run.get("provenance"), Mapping):
+            run["provenance"] = legacy_projection_provenance(run)
         observed_at = datetime.now(timezone.utc)
         nodes = run.get("nodes", {})
         node_values = list(nodes.values()) if isinstance(nodes, dict) else []

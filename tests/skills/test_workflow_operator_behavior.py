@@ -81,6 +81,7 @@ def test_published_contract_constructs_real_commands_without_duplicates(
     values = {
         "workflow_name": "operator-contract",
         "intent_key": "one-semantic-intent",
+        "trigger_source": "chat",
     }
 
     exit_code, started = _invoke(

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Mapping
 
+from plugins.workflow.provenance import TriggerProvenance, TriggerSource
+
 
 @dataclass(frozen=True)
 class RunAdmissionRequest:
@@ -13,7 +15,7 @@ class RunAdmissionRequest:
     definition_digest: str
     policy_digest: str
     input_manifest_digest: str
-    trigger_source: Literal["chat", "desktop", "cli", "api", "cron"]
+    trigger_source: TriggerSource
     idempotency_key: str
     concurrency_key: str
     concurrency_policy: Literal["queue", "allow", "forbid"] = "queue"
@@ -22,6 +24,7 @@ class RunAdmissionRequest:
     foreground_lease_seconds: float = 30.0
     operator_scope: str | None = None
     run_metadata: Mapping[str, str] | None = None
+    provenance: TriggerProvenance | None = None
 
 
 @dataclass(frozen=True)

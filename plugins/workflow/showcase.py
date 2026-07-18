@@ -23,6 +23,7 @@ from cron.jobs import create_job, list_jobs, use_cron_store
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import _runtime_config, _scheduler
 from plugins.workflow.machine_contract import operator_command_contract
+from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import WorkflowTrustStore, compute_package_digest
@@ -349,6 +350,8 @@ def run_showcase(
     showcase_id: str, *, hermes_home: str | Path, symptom: str | None = None,
     confirmation_token: str | None = None, schedule_at: str | None = None,
     no_wait: bool = False, idempotency_key: str | None = None,
+    trigger_source: str = "cli", source_instance: str | None = None,
+    claimed_actor: str | None = None,
 ) -> dict[str, object]:
     scenario = load_showcase_catalog().get(showcase_id)
     if scenario is None:
@@ -377,13 +380,20 @@ def run_showcase(
             shutil.rmtree(fixture_dir, ignore_errors=True)
     package_digest = compute_package_digest(package).sha256
     WorkflowTrustStore(home).trust(package_digest, actor="trusted_distribution", risk_digest=package_digest)
+    intent_key = idempotency_key or secrets.token_urlsafe(24)
     request = RunAdmissionRequest(
         workflow_name=package.definition.name, definition_digest=prepared.definition_digest,
         policy_digest=prepared.policy_digest, input_manifest_digest=prepared.input_manifest_digest,
-        trigger_source="cli", idempotency_key=idempotency_key or secrets.token_urlsafe(24),
+        trigger_source=trigger_source, idempotency_key=intent_key,
         concurrency_key=f"showcase:{scenario.id}",
         concurrency_policy=str(package.sidecar.get("overlap_policy") or "queue"),
         run_metadata={"showcase_id": scenario.id, "showcase_version": scenario.package_version, "bundle_digest": str(preflight["bundle_digest"])},
+        provenance=TriggerProvenance.local_admin_claim(
+            source=trigger_source,
+            intent_key=intent_key,
+            source_instance=source_instance or f"cli:pid:{os.getpid()}",
+            claimed_actor=claimed_actor,
+        ),
     )
     admitted = store.start_run(request, immutable_snapshot=prepared)
     if admitted.run_id is None:
