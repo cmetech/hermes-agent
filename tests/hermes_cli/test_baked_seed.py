@@ -143,6 +143,56 @@ def test_fresh_windows_checkout_seeds_workflow_and_mcp_defaults(
     assert {"outlook", "glean"} <= set(cfg["mcp_servers"])
 
 
+def test_upgrade_repairs_crlf_only_authenticated_workflow_bytes(
+    tmp_path, monkeypatch, fake_config
+):
+    """An existing managed checkout is repaired only from its tracked HEAD bytes."""
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    shutil.copy2(REPO_ROOT / ".gitattributes", checkout / ".gitattributes")
+    shutil.copytree(REPO_ROOT / "capabilities", checkout / "capabilities")
+    (checkout / "plugins/workflow").mkdir(parents=True)
+
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.name", "Capability Test"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-qm", "fixture"], check=True
+    )
+    package_root = checkout / "capabilities/workflow-packages/ericsson"
+    for path in package_root.rglob("*"):
+        if path.is_file():
+            data = path.read_bytes().replace(b"\r\n", b"\n")
+            path.write_bytes(data.replace(b"\n", b"\r\n"))
+
+    monkeypatch.setattr(cs, "_repo_root", lambda: checkout)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_bundled_plugins_dir", lambda: checkout / "plugins"
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+
+    cs.seed_baked_capabilities(home)
+
+    assert (home / "workflows/ericsson/workflows/inbox-digest.yaml").is_file()
+    assert b"\r\n" not in (
+        package_root / "workflows/inbox-digest.yaml"
+    ).read_bytes()
+    assert subprocess.run(
+        ["git", "-C", str(checkout), "config", "--get", "core.autocrlf"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip() == "false"
+
+
 def test_upgrade_with_invalid_workflow_bytes_still_seeds_independent_defaults(
     tmp_path, fake_repo, fake_config
 ):

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import argparse
+from contextlib import contextmanager
 from pathlib import Path
+import shutil
+import subprocess
 
 import pytest
 
@@ -12,6 +15,10 @@ from plugins.workflow.showcase import (
     preflight_showcase,
 )
 from plugins.workflow.cli import register_cli
+import plugins.workflow.showcase as showcase_module
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def test_catalog_has_four_safe_digest_verified_scenarios() -> None:
@@ -29,6 +36,81 @@ def test_catalog_has_four_safe_digest_verified_scenarios() -> None:
     assert catalog["scheduling"].interaction_mode == "schedule"
     assert all(item.package_digest for item in catalog.values())
     assert all("destructive" not in item.safety_class for item in catalog.values())
+
+
+def test_default_catalog_repairs_crlf_only_managed_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "checkout"
+    bundle = checkout / "plugins/workflow/showcases"
+    bundle.parent.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / ".gitattributes", checkout / ".gitattributes")
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", bundle)
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.name", "Showcase Test"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-qm", "fixture"], check=True
+    )
+    for path in bundle.rglob("*"):
+        if path.is_file():
+            data = path.read_bytes().replace(b"\r\n", b"\n")
+            path.write_bytes(data.replace(b"\n", b"\r\n"))
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield bundle
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+
+    catalog = showcase_module.load_showcase_catalog()
+
+    assert "laptop-diagnostic" in catalog
+    assert b"\r\n" not in (bundle / "catalog.yaml").read_bytes()
+
+
+def test_default_catalog_does_not_repair_semantic_tampering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "checkout"
+    bundle = checkout / "plugins/workflow/showcases"
+    bundle.parent.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / ".gitattributes", checkout / ".gitattributes")
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", bundle)
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.name", "Showcase Test"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-qm", "fixture"], check=True
+    )
+    catalog_path = bundle / "catalog.yaml"
+    data = catalog_path.read_bytes().replace(b"\r\n", b"\n")
+    catalog_path.write_bytes(data.replace(b"\n", b"\r\n") + b"tampered: true\r\n")
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield bundle
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+
+    with pytest.raises(ShowcaseCatalogError, match="catalog digest mismatch"):
+        showcase_module.load_showcase_catalog()
+
+    assert catalog_path.read_bytes().endswith(b"tampered: true\r\n")
 
 
 def test_catalog_validation_rejects_traversal_and_destructive_claims(

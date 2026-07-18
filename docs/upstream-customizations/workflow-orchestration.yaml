@@ -21,6 +21,8 @@ coverage:
     reason: Separate user-requested v2.0.5 release preparation.
   - commit: 88c96d2f91a04cc452d6844d107224ca8baa67af
     reason: Separate user-requested v2.0.6 release preparation.
+  - commit: b742782760a319b2c2ede205641387d0cb5333c4
+    reason: Separate user-requested v2.0.7 release preparation.
 upstream_changes:
 - id: brand-aware-version-label
   change_class: branding-generic
@@ -463,4 +465,30 @@ upstream_changes:
     Windows clone checkout, not only after cloning.
   removal_condition: Remove when upstream provides an equivalent byte-stable
     managed Windows checkout for authenticated distribution resources.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: windows-authenticated-resource-upgrade-repair
+  change_class: installer-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/capability_staging.py
+  - plugins/workflow/showcase.py
+  - tests/hermes_cli/test_baked_seed.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  owned_symbols:
+  - repair_authenticated_resource_checkout
+  - seed_baked_capabilities CRLF retry
+  - load_showcase_catalog CRLF retry
+  tests:
+  - tests/hermes_cli/test_baked_seed.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  expected_commit_subject: 'fix(workflow): repair legacy Windows resource bytes'
+  upstream_candidate: true
+  merge_guidance: Preserve fail-closed byte authentication while recovering only
+    tracked CRLF working-tree drift that has no semantic diff from HEAD. Keep
+    checkout repair bounded to the exact distribution resource tree, rerun the
+    original digest verification after repair, and never normalize or accept
+    arbitrary bytes in memory.
+  removal_condition: Remove when every supported managed Windows updater both
+    migrates pre-attribute checkouts to LF bytes and pins local autocrlf before
+    future pulls, with equivalent semantic-tamper rejection coverage.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

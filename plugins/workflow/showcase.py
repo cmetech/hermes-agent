@@ -175,6 +175,13 @@ def load_showcase_catalog(bundle_root: Path | None = None) -> dict[str, Showcase
             raise ShowcaseCatalogError("unsupported showcase digest schema")
         catalog_digest = manifest.get("catalog_sha256")
         if catalog_digest != _sha256((root / "catalog.yaml").read_bytes()):
+            if bundle_root is None:
+                from hermes_cli.capability_staging import (
+                    repair_authenticated_resource_checkout,
+                )
+
+                if repair_authenticated_resource_checkout(root):
+                    return load_showcase_catalog(root)
             raise ShowcaseCatalogError("showcase catalog digest mismatch")
         package_digests = manifest.get("packages")
         if not isinstance(package_digests, Mapping):
