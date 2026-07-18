@@ -165,6 +165,7 @@ jobs:
         run: |
           uv run --no-sync python -m pytest -q \
             tests/plugins/workflow/test_portable_compatibility_e2e.py \
+            tests/plugins/workflow/test_showcase_catalog.py \
             tests/plugins/workflow/test_showcase_distribution_e2e.py \
             tests/plugins/workflow/test_showcase_resilience_e2e.py \
             tests/plugins/workflow/test_fault_injection.py \
