@@ -13,6 +13,8 @@ const listWorkflowAttention = vi.fn()
 const listWorkflowEvents = vi.fn()
 const listWorkflowRuns = vi.fn()
 const mutateWorkflowRun = vi.fn()
+const previewWorkflowCleanup = vi.fn()
+const executeWorkflowCleanup = vi.fn()
 
 vi.mock('@/hermes', () => ({
   getApiRequestProfile: () => 'default',
@@ -21,7 +23,9 @@ vi.mock('@/hermes', () => ({
   listWorkflowAttention: (...args: unknown[]) => listWorkflowAttention(...args),
   listWorkflowEvents: (...args: unknown[]) => listWorkflowEvents(...args),
   listWorkflowRuns: (...args: unknown[]) => listWorkflowRuns(...args),
-  mutateWorkflowRun: (...args: unknown[]) => mutateWorkflowRun(...args)
+  mutateWorkflowRun: (...args: unknown[]) => mutateWorkflowRun(...args),
+  previewWorkflowCleanup: (...args: unknown[]) => previewWorkflowCleanup(...args),
+  executeWorkflowCleanup: (...args: unknown[]) => executeWorkflowCleanup(...args)
 }))
 
 function deferred<T>() {
@@ -69,7 +73,9 @@ beforeEach(() => {
     listWorkflowAttention,
     listWorkflowEvents,
     listWorkflowRuns,
-    mutateWorkflowRun
+    mutateWorkflowRun,
+    previewWorkflowCleanup,
+    executeWorkflowCleanup
   ]) {
     mock.mockReset()
   }
@@ -180,5 +186,31 @@ describe('WorkflowsView', () => {
         expect.objectContaining({ expected_version: 1, interaction_id: 'interaction-1', value: 'bounded answer' })
       )
     )
+  })
+
+  it('separates archive views from explicit preview-token cleanup', async () => {
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false }, queries: { retry: false } } })
+    previewWorkflowCleanup.mockResolvedValue({
+      blocked_reasons: [],
+      bytes: 42,
+      candidates: [
+        { blocked_reasons: [], bytes: 42, evidence_types: ['events'], files: 2, run_id: 'run-1', status: 'succeeded' }
+      ],
+      confirmation_expires_at: '2026-07-18T01:00:00Z',
+      confirmation_token: 'exact-token',
+      execute: false,
+      files: 2,
+      run_ids: ['run-1']
+    })
+    executeWorkflowCleanup.mockResolvedValue({ bytes: 42, execute: true, files: 2, run_ids: ['run-1'] })
+    await renderView(client)
+
+    fireEvent.click(await screen.findByRole('tab', { name: 'Archive' }))
+    await waitFor(() => expect(listWorkflowRuns).toHaveBeenCalledWith(undefined, 'archive'))
+    fireEvent.click(await screen.findByRole('button', { name: 'Inspect cleanup impact' }))
+    await screen.findByText('1 retained runs and 2 evidence files would be quarantined.')
+    fireEvent.click(screen.getByRole('button', { name: 'Execute explicit cleanup' }))
+
+    await waitFor(() => expect(executeWorkflowCleanup).toHaveBeenCalledWith('exact-token', '7d'))
   })
 })

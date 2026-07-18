@@ -176,6 +176,20 @@ def operator_command_contract() -> dict[str, object]:
             "resume": ["resume", "{run_id}", "--json"],
             "cancel": ["cancel", "{run_id}", "--json"],
             "abandon": ["abandon", "{run_id}", "--json"],
+            "archive": [
+                "archive",
+                "{run_id}",
+                "--expected-version",
+                "{state_version}",
+                "--json",
+            ],
+            "restore": [
+                "restore",
+                "{run_id}",
+                "--expected-version",
+                "{state_version}",
+                "--json",
+            ],
             "cleanup_impact": [
                 "cleanup",
                 "--older-than",

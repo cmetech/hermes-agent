@@ -116,6 +116,8 @@ def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
             "runs",
             "store_metadata",
             "worker_claims",
+            "workflow_notification_facts",
+            "workflow_notification_outbox",
         } <= tables
         indexes = {
             row["name"]
@@ -127,6 +129,8 @@ def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
             "coordinator_wakes_pending",
             "runs_concurrency",
             "worker_claims_lease",
+            "workflow_notification_delivery",
+            "workflow_notification_fact_run",
         } <= indexes
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         migrated = dict(

@@ -37,6 +37,7 @@ import {
   unpinSession
 } from '../store/layout'
 import { respondToApprovalAction } from '../store/native-notifications'
+import { startWorkflowNotificationDelivery } from '../store/workflow-notifications'
 import { $paneOpen } from '../store/panes'
 import { setPetActivity } from '../store/pet'
 import { setPetScale } from '../store/pet-gallery'
@@ -186,6 +187,8 @@ export function DesktopController() {
   const busyRef = useRef(false)
   const creatingSessionRef = useRef(false)
   const messagingTranscriptSignatureRef = useRef(new Map<string, string>())
+
+  useEffect(() => startWorkflowNotificationDelivery(), [])
 
   const gatewayState = useStore($gatewayState)
   const activeSessionId = useStore($activeSessionId)

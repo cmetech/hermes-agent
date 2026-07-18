@@ -118,7 +118,7 @@ def test_conversation_scope_filters_lists_and_explicit_run_ids(
         ),
         ("interrupted", None, "interrupted", {"resume", "retry", "abandon"}),
         ("failed", None, "terminal", {"resume", "retry", "abandon"}),
-        ("succeeded", None, "terminal", {"cleanup"}),
+        ("succeeded", None, "terminal", {"archive"}),
     ],
 )
 def test_action_table_advertises_exactly_valid_mutations(
@@ -137,3 +137,13 @@ def test_action_table_advertises_exactly_valid_mutations(
             health=health,
         )
     } == expected
+
+
+def test_archived_terminal_run_advertises_restore_only() -> None:
+    advertised = available_actions(
+        "succeeded", None, health="terminal", archived=True
+    )
+    assert set(advertised) & MUTATION_ACTIONS == {"restore"}
+    assert mutation_is_valid(
+        "restore", status="succeeded", health="terminal", archived=True
+    )

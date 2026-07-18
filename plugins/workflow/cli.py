@@ -377,6 +377,9 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     runs_parser.add_argument("--workflow")
     runs_parser.add_argument("--status")
     runs_parser.add_argument("--limit", type=int, default=100)
+    runs_parser.add_argument(
+        "--view", choices=("all", "board", "history", "archive"), default="all"
+    )
     _json_flag(runs_parser)
 
     status_parser = actions.add_parser("status", help="Inspect a durable run")
@@ -443,6 +446,15 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     ):
         parser = actions.add_parser(action, help=help_text)
         parser.add_argument("run_id")
+        _json_flag(parser)
+
+    for action, help_text in (
+        ("archive", "Reversibly hide terminal run evidence"),
+        ("restore", "Restore archived evidence to history"),
+    ):
+        parser = actions.add_parser(action, help=help_text)
+        parser.add_argument("run_id")
+        parser.add_argument("--expected-version", type=int, required=True)
         _json_flag(parser)
 
     cleanup_parser = actions.add_parser("cleanup", help="Clean retained terminal runs")
@@ -1491,7 +1503,7 @@ def _cmd_run(
 
 def _cmd_runs(args: argparse.Namespace) -> int:
     payload = _store(args).list_runs(
-        workflow=args.workflow, status=args.status, limit=args.limit
+        workflow=args.workflow, status=args.status, limit=args.limit, view=args.view
     )
     _emit(payload, as_json=args.json)
     return 0
@@ -1707,6 +1719,22 @@ def _cmd_abandon(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_archive(args: argparse.Namespace) -> int:
+    payload = _store(args).archive_run(
+        args.run_id, expected_state_version=args.expected_version
+    )
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    payload = _store(args).restore_run(
+        args.run_id, expected_state_version=args.expected_version
+    )
+    _emit(payload, as_json=args.json)
+    return 0
+
+
 def _duration(value: str):
     from datetime import timedelta
 
@@ -1837,7 +1865,7 @@ def workflow_command(
     action = getattr(args, "workflow_action", None)
     if not action:
         print(
-            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|cleanup|reset-sessions|showcase}",
+            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|archive|restore|cleanup|reset-sessions|showcase}",
             file=sys.stderr,
         )
         return 2
@@ -1900,6 +1928,10 @@ def workflow_command(
             return _cmd_cancel(args)
         if action == "abandon":
             return _cmd_abandon(args)
+        if action == "archive":
+            return _cmd_archive(args)
+        if action == "restore":
+            return _cmd_restore(args)
         if action == "cleanup":
             return _cmd_cleanup(args)
         if action == "reset-sessions":

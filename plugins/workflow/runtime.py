@@ -21,6 +21,30 @@ class StoreRegistryCapacityError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class WorkflowRetentionPolicy:
+    terminal_board_days: int = 7
+
+    @classmethod
+    def from_profile(cls, hermes_home: str | Path) -> "WorkflowRetentionPolicy":
+        path = Path(hermes_home) / "config.yaml"
+        if not path.is_file():
+            return cls()
+        document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        try:
+            values = document["plugins"]["entries"]["workflow"]["retention"]
+        except (KeyError, TypeError):
+            values = {}
+        if not isinstance(values, Mapping):
+            raise ValueError("plugins.entries.workflow.retention must be a mapping")
+        days = values.get("terminal_board_days", 7)
+        if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 3650:
+            raise ValueError(
+                "plugins.entries.workflow.retention.terminal_board_days must be 1..3650"
+            )
+        return cls(terminal_board_days=days)
+
+
+@dataclass(frozen=True)
 class WorkflowApiLimits:
     max_cached_profiles: int = 8
     max_event_waiters: int = 16
@@ -145,5 +169,6 @@ __all__ = [
     "StoreRegistryCapacityError",
     "WorkflowApiLimits",
     "WorkflowApiRuntime",
+    "WorkflowRetentionPolicy",
     "WorkflowStoreRegistry",
 ]

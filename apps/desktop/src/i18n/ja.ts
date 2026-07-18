@@ -1614,6 +1614,17 @@ export const ja = defineLocale({
 
   operations: {
     workflows: 'ワークフロー',
+    workflowViews: 'ワークフロー表示',
+    activeBoard: 'アクティブボード',
+    history: '履歴',
+    archive: 'アーカイブ',
+    restore: '履歴に復元',
+    cleanup: '証拠のクリーンアップ',
+    cleanupExplanation: 'クリーンアップは破壊的で、アーカイブとは別です。実行前に正確な影響を確認してください。',
+    inspectCleanupImpact: 'クリーンアップの影響を確認',
+    executeCleanup: '明示的なクリーンアップを実行',
+    cleanupBlocked: '報告された安全条件が解決されるまでクリーンアップはブロックされます。',
+    cleanupImpact: (runs, files) => `${runs} 件の実行と ${files} 件の証拠ファイルが隔離されます。`,
     kanban: 'カンバン',
     needsAttention: '対応が必要',
     status: '状態',

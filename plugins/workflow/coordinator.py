@@ -170,6 +170,9 @@ class WorkflowCoordinatorService:
         epoch: int,
         scheduler,
     ) -> tuple[bool, str | None, datetime | None]:
+        from plugins.workflow.notifications import NotificationOutbox
+
+        NotificationOutbox(run_store).reconcile_journal(limit_runs=200)
         now = self._utcnow().astimezone(timezone.utc)
         wakes = coordinator_store.pending_wakes(
             identity,

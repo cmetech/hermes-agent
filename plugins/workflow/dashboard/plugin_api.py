@@ -10,6 +10,7 @@ import json
 import secrets
 import threading
 import time
+import re
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from typing import Iterator, Mapping
@@ -20,10 +21,12 @@ from pydantic import BaseModel, Field
 from hermes_constants import get_hermes_home
 from plugins.workflow.actions import MUTATION_ACTIONS, mutation_is_valid
 from plugins.workflow.evidence import EVIDENCE_KINDS, EvidenceReader
+from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.runtime import (
     StoreRegistryCapacityError,
     WorkflowApiLimits,
     WorkflowApiRuntime,
+    WorkflowRetentionPolicy,
 )
 from plugins.workflow.sanitize import sanitize_projection
 from plugins.workflow.store import RunStore
@@ -174,10 +177,13 @@ def _decode_cursor(value: str, *, kind: str, scope: str) -> dict[str, object]:
         ) from exc
 
 
-def _authorized_runs(store: RunStore, operator: _Operator):
+def _authorized_runs(store: RunStore, operator: _Operator, *, view: str = "all"):
+    retention = WorkflowRetentionPolicy.from_profile(get_hermes_home())
     return store.list_runs(
         operator_scope=None if operator.unrestricted else operator.scope,
         limit=200,
+        view=view,
+        terminal_board_days=retention.terminal_board_days,
     )
 
 
@@ -191,19 +197,253 @@ def _load_authorized(store: RunStore, run_id: str, operator: _Operator):
         raise HTTPException(status_code=404, detail={"code": "run_not_found"}) from exc
 
 
+def _cleanup_duration(value: str):
+    from datetime import timedelta
+
+    match = re.fullmatch(r"(\d+)([dhm])", value)
+    if not match:
+        raise HTTPException(
+            status_code=422, detail={"code": "cleanup_duration_invalid"}
+        )
+    amount = int(match.group(1))
+    return {
+        "d": timedelta(days=amount),
+        "h": timedelta(hours=amount),
+        "m": timedelta(minutes=amount),
+    }[match.group(2)]
+
+
+def _require_cleanup_authority(operator: _Operator) -> None:
+    if not operator.high_trust:
+        raise HTTPException(
+            status_code=403, detail={"code": "workflow_admin_required"}
+        )
+
+
+def _public_cleanup_preview(payload: Mapping[str, object]) -> dict[str, object]:
+    candidates = []
+    for raw in payload.get("candidates", []):
+        if not isinstance(raw, Mapping):
+            continue
+        candidates.append(
+            {
+                key: raw.get(key)
+                for key in (
+                    "run_id",
+                    "status",
+                    "updated_at",
+                    "state_version",
+                    "event_sequence",
+                    "projection_sha256",
+                    "journal_sha256",
+                    "files",
+                    "bytes",
+                    "evidence_types",
+                    "blocked_reasons",
+                )
+            }
+        )
+    return {
+        "execute": False,
+        "run_ids": payload.get("run_ids", []),
+        "candidates": sanitize_projection(candidates),
+        "files": payload.get("files", 0),
+        "bytes": payload.get("bytes", 0),
+        "index_integrity": payload.get("index_integrity"),
+        "blocked_reasons": payload.get("blocked_reasons", []),
+        "notification_dependencies": sanitize_projection(
+            payload.get("notification_dependencies", {})
+        ),
+        # This one-time capability is intentionally returned only across the
+        # authenticated high-trust boundary. Generic sanitization treats all
+        # token-named fields as secrets and would make execution impossible.
+        "confirmation_token": payload.get("confirmation_token"),
+        "confirmation_expires_at": payload.get("confirmation_expires_at"),
+    }
+
+
+@router.get("/cleanup/preview")
+def cleanup_preview(
+    request: Request,
+    older_than: str = Query("7d"),
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request, operator_scope)
+    _require_cleanup_authority(operator)
+    with _store_lease() as store:
+        return _public_cleanup_preview(
+            store.cleanup_runs(
+                older_than=_cleanup_duration(older_than),
+                operator_scope=None if operator.unrestricted else operator.scope,
+            )
+        )
+
+
+class CleanupExecutionRequest(BaseModel):
+    older_than: str = "7d"
+    confirmation_token: str = Field(..., min_length=1, max_length=256)
+
+
+@router.post("/cleanup/execute")
+def cleanup_execute(
+    request_context: Request,
+    request: CleanupExecutionRequest,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request_context, operator_scope)
+    _require_cleanup_authority(operator)
+    _cleanup_duration(request.older_than)
+    try:
+        with _store_lease() as store:
+            result = store.cleanup_runs(
+                execute=True, confirmation_token=request.confirmation_token
+            )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": "cleanup_confirmation_invalid"}
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": "cleanup_preview_changed"}
+        ) from exc
+    return {
+        "execute": True,
+        "run_ids": result["run_ids"],
+        "files": result["files"],
+        "bytes": result["bytes"],
+    }
+
+
+@router.get("/cleanup/history")
+def cleanup_history(
+    request: Request,
+    limit: int = Query(100, ge=1, le=200),
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request, operator_scope)
+    _require_cleanup_authority(operator)
+    with _store_lease() as store:
+        rows = store.list_cleanup_history(limit=limit)
+    return {
+        "schema_version": 1,
+        "items": sanitize_projection(
+            [
+                {
+                    "sequence": row["sequence"],
+                    "timestamp": row["timestamp"],
+                    "run_id": row["run_id"],
+                    "files": row["files"],
+                    "bytes": row["bytes"],
+                    "outcome": row["outcome"],
+                    "payload": row["payload"],
+                }
+                for row in rows
+            ]
+        ),
+    }
+
+
+@router.get("/notifications/lease")
+def lease_notifications(
+    request: Request,
+    client_id: str = Query(..., min_length=1, max_length=256),
+    limit: int = Query(20, ge=1, le=100),
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request, operator_scope)
+    _require_cleanup_authority(operator)
+    with _store_lease() as store:
+        items = NotificationOutbox(store).lease(
+            destination="desktop",
+            owner_id=client_id,
+            lease_seconds=30,
+            limit=limit,
+        )
+    return {"schema_version": 1, "items": sanitize_projection(items)}
+
+
+class NotificationReceiptRequest(BaseModel):
+    client_id: str = Field(..., min_length=1, max_length=256)
+    error: str = Field("", max_length=512)
+
+
+@router.post("/notifications/{notification_id}/ack")
+def acknowledge_notification(
+    request_context: Request,
+    notification_id: str,
+    request: NotificationReceiptRequest,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request_context, operator_scope)
+    _require_cleanup_authority(operator)
+    with _store_lease() as store:
+        applied = NotificationOutbox(store).ack(
+            notification_id, owner_id=request.client_id
+        )
+    if not applied:
+        raise HTTPException(
+            status_code=409, detail={"code": "notification_lease_not_owned"}
+        )
+    return {"schema_version": 1, "outcome": "delivered"}
+
+
+@router.post("/notifications/{notification_id}/fail")
+def fail_notification(
+    request_context: Request,
+    notification_id: str,
+    request: NotificationReceiptRequest,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request_context, operator_scope)
+    _require_cleanup_authority(operator)
+    with _store_lease() as store:
+        applied = NotificationOutbox(store).fail(
+            notification_id,
+            owner_id=request.client_id,
+            error=request.error or "projection_failed",
+        )
+    if not applied:
+        raise HTTPException(
+            status_code=409, detail={"code": "notification_lease_not_owned"}
+        )
+    return {"schema_version": 1, "outcome": "retry_scheduled"}
+
+
+@router.post("/notifications/{notification_id}/dismiss")
+def dismiss_notification_projection(
+    request_context: Request,
+    notification_id: str,
+    request: NotificationReceiptRequest,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request_context, operator_scope)
+    _require_cleanup_authority(operator)
+    with _store_lease() as store:
+        applied = NotificationOutbox(store).dismiss(
+            notification_id, owner_id=request.client_id
+        )
+    if not applied:
+        raise HTTPException(
+            status_code=409, detail={"code": "notification_lease_not_owned"}
+        )
+    return {"schema_version": 1, "outcome": "presentation_dismissed"}
+
+
 @router.get("/runs")
 def list_runs(
     request: Request,
     limit: int = Query(100, ge=1, le=100),
     cursor: str | None = None,
+    view: str = Query("board", pattern="^(board|history|archive|all)$"),
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request, operator_scope)
     with _store_lease() as store:
-        runs = list(_authorized_runs(store, operator))
+        runs = list(_authorized_runs(store, operator, view=view))
+    cursor_scope = f"{operator.cursor_scope}:{view}"
     start = (
         int(
-            _decode_cursor(cursor, kind="runs", scope=operator.cursor_scope).get(
+            _decode_cursor(cursor, kind="runs", scope=cursor_scope).get(
                 "position", 0
             )
         )
@@ -216,7 +456,7 @@ def list_runs(
         next_cursor = _encode_cursor({
             "v": 1,
             "kind": "runs",
-            "scope": _scope_key(operator.cursor_scope),
+            "scope": _scope_key(cursor_scope),
             "position": start + limit,
         })
     return {
@@ -270,6 +510,25 @@ def attention(
                     "state_version": run["state_version"],
                     "updated_at": run["updated_at"],
                 })
+        for fact in NotificationOutbox(store).pending_attention():
+            try:
+                run = _load_authorized(store, str(fact["run_id"]), operator)
+            except HTTPException:
+                continue
+            items.append(
+                {
+                    "run_id": fact["run_id"],
+                    "workflow": run["workflow"],
+                    "node_id": None,
+                    "interaction": {
+                        "type": "notification",
+                        "kind": fact["kind"],
+                        "notification_id": fact["notification_id"],
+                    },
+                    "state_version": run["state_version"],
+                    "updated_at": fact["updated_at"],
+                }
+            )
     items.sort(
         key=lambda item: (
             str(item["updated_at"]),
@@ -381,6 +640,7 @@ def mutate_run(
             status=str(current["status"]),
             pending_interaction=current.get("pending_interaction"),
             health=str(current.get("health") or ""),
+            archived=bool(current.get("archived_at")),
         ):
             raise HTTPException(
                 status_code=409,
@@ -461,6 +721,18 @@ def mutate_run(
                 )
             elif action == "abandon":
                 store.abandon_run(
+                    run_id,
+                    expected_state_version=request.expected_version,
+                    operator_scope=scope,
+                )
+            elif action == "archive":
+                store.archive_run(
+                    run_id,
+                    expected_state_version=request.expected_version,
+                    operator_scope=scope,
+                )
+            elif action == "restore":
+                store.restore_run(
                     run_id,
                     expected_state_version=request.expected_version,
                     operator_scope=scope,

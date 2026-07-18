@@ -18,6 +18,7 @@ EVIDENCE_KINDS = frozenset({
     "recovery",
     "coordinator",
     "cleanup",
+    "notifications",
 })
 
 
@@ -119,6 +120,10 @@ class EvidenceReader:
             return list(
                 self.store.cleanup_history(run_id, operator_scope=operator_scope)
             )
+        if kind == "notifications":
+            from plugins.workflow.notifications import NotificationOutbox
+
+            return list(NotificationOutbox(self.store).history(run_id=run_id))
         if kind == "logs":
             directory = self.store.run_directory(run_id, operator_scope=operator_scope)
             return self._logs(directory)

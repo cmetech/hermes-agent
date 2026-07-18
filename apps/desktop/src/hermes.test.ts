@@ -12,12 +12,14 @@ import {
   getStatus,
   getWorkflowEvidence,
   getWorkflowRun,
+  executeWorkflowCleanup,
   listAllProfileSessions,
   listSessions,
   listWorkflowAttention,
   listWorkflowEvents,
   listWorkflowRuns,
   mutateWorkflowRun,
+  previewWorkflowCleanup,
   saveMoaModels,
   setApiRequestProfile
 } from './hermes'
@@ -113,10 +115,12 @@ describe('Hermes REST session helpers', () => {
       listWorkflowAttention(),
       listWorkflowEvents('run 1', 7),
       getWorkflowEvidence('run 1', 'attempts'),
+      previewWorkflowCleanup('7d'),
+      executeWorkflowCleanup('exact-token', '7d'),
       mutateWorkflowRun('run 1', 'cancel', { expected_version: 3 })
     ])
 
-    expect(api).toHaveBeenCalledTimes(6)
+    expect(api).toHaveBeenCalledTimes(8)
 
     for (const [request] of api.mock.calls) {
       expect(request).toEqual(expect.objectContaining({ profile: 'remote-profile' }))

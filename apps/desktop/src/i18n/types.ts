@@ -1377,6 +1377,17 @@ export interface Translations {
 
   operations: {
     workflows: string
+    workflowViews: string
+    activeBoard: string
+    history: string
+    archive: string
+    restore: string
+    cleanup: string
+    cleanupExplanation: string
+    inspectCleanupImpact: string
+    executeCleanup: string
+    cleanupBlocked: string
+    cleanupImpact: (runs: number, files: number) => string
     kanban: string
     needsAttention: string
     status: string

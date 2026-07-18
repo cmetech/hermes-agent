@@ -4,16 +4,19 @@ import { useMemo, useRef, useState } from 'react'
 
 import { ActivityBoard } from '@/components/activity-board/activity-board'
 import { PageLoader } from '@/components/page-loader'
+import { Button } from '@/components/ui/button'
 import {
   getApiRequestProfile,
   getWorkflowRun,
+  executeWorkflowCleanup,
   listWorkflowAttention,
   listWorkflowEvents,
   listWorkflowRuns,
-  mutateWorkflowRun
+  mutateWorkflowRun,
+  previewWorkflowCleanup
 } from '@/hermes'
 import { useI18n } from '@/i18n'
-import type { WorkflowEventPage, WorkflowRunPage } from '@/types/hermes'
+import type { WorkflowEventPage, WorkflowRunPage, WorkflowRunView } from '@/types/hermes'
 
 import { PAGE_INSET_X } from '../layout-constants'
 
@@ -37,12 +40,13 @@ export function WorkflowsView() {
   const selectedRunId = useStore($workflowSelectedRunId)
   const actionInFlight = useRef(false)
   const [actionPending, setActionPending] = useState(false)
+  const [view, setView] = useState<WorkflowRunView>('board')
 
   const runs = useInfiniteQuery({
     getNextPageParam: (page: WorkflowRunPage) => page.next_cursor ?? undefined,
     initialPageParam: undefined as string | undefined,
-    queryFn: ({ pageParam }) => listWorkflowRuns(pageParam as string | undefined),
-    queryKey: ['workflow-runs', profile],
+    queryFn: ({ pageParam }) => listWorkflowRuns(pageParam as string | undefined, view),
+    queryKey: ['workflow-runs', profile, view],
     refetchInterval: () => (document.visibilityState === 'visible' ? 20_000 : false)
   })
 
@@ -106,6 +110,15 @@ export function WorkflowsView() {
     }
   })
 
+  const cleanupPreview = useMutation({ mutationFn: () => previewWorkflowCleanup('7d') })
+  const cleanupExecute = useMutation({
+    mutationFn: (token: string) => executeWorkflowCleanup(token, '7d'),
+    onSuccess: () => {
+      cleanupPreview.reset()
+      void queryClient.invalidateQueries({ queryKey: ['workflow-runs', profile] })
+    }
+  })
+
   const mutateRun = (action: string, body?: Record<string, unknown>) => {
     if (actionInFlight.current) {
       return
@@ -144,6 +157,27 @@ export function WorkflowsView() {
   return (
     <main className={`min-w-0 overflow-x-hidden py-6 ${PAGE_INSET_X}`}>
       <h1 className="mb-4 text-lg font-medium">{t.operations.workflows}</h1>
+      <div aria-label={t.operations.workflowViews} className="mb-4 flex gap-2" role="tablist">
+        {(['board', 'history', 'archive'] as const).map(candidate => (
+          <Button
+            aria-selected={view === candidate}
+            key={candidate}
+            onClick={() => {
+              setView(candidate)
+              selectWorkflowRun(null)
+            }}
+            role="tab"
+            size="sm"
+            variant={view === candidate ? 'default' : 'secondary'}
+          >
+            {candidate === 'board'
+              ? t.operations.activeBoard
+              : candidate === 'history'
+                ? t.operations.history
+                : t.operations.archive}
+          </Button>
+        ))}
+      </div>
       <AttentionInbox items={attention.data?.items ?? []} />
       <ActivityBoard
         model={model}
@@ -157,6 +191,39 @@ export function WorkflowsView() {
           onAction={mutateRun}
           run={selected.data}
         />
+      )}
+      {(view === 'history' || view === 'archive') && (
+        <section aria-label={t.operations.cleanup} className="mt-6 border-t border-(--ui-border) pt-4">
+          <h2 className="text-sm font-medium">{t.operations.cleanup}</h2>
+          <p className="mt-1 text-xs text-(--ui-text-secondary)">{t.operations.cleanupExplanation}</p>
+          <Button
+            className="mt-3"
+            disabled={cleanupPreview.isPending || cleanupExecute.isPending}
+            onClick={() => cleanupPreview.mutate()}
+            size="sm"
+            variant="secondary"
+          >
+            {t.operations.inspectCleanupImpact}
+          </Button>
+          {cleanupPreview.data && (
+            <div className="mt-3 text-sm" role="status">
+              <p>{t.operations.cleanupImpact(cleanupPreview.data.run_ids.length, cleanupPreview.data.files)}</p>
+              {cleanupPreview.data.confirmation_token ? (
+                <Button
+                  className="mt-2"
+                  disabled={cleanupExecute.isPending}
+                  onClick={() => cleanupExecute.mutate(cleanupPreview.data!.confirmation_token!)}
+                  size="sm"
+                  variant="destructive"
+                >
+                  {t.operations.executeCleanup}
+                </Button>
+              ) : (
+                <p className="mt-1 text-(--ui-text-secondary)">{t.operations.cleanupBlocked}</p>
+              )}
+            </div>
+          )}
+        </section>
       )}
     </main>
   )

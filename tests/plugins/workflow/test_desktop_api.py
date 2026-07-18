@@ -14,6 +14,7 @@ import httpx
 
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.schema import load_workflow
+from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
 from plugins.workflow.showcase import run_showcase
 from plugins.workflow.runtime import (
@@ -143,6 +144,60 @@ def test_events_cursor_and_stale_action_conflict(
     assert evidence.status_code == 200
     assert evidence.json()["kind"] == "timeline"
     assert evidence.json()["items"][0]["event_type"] == "run_admitted"
+
+
+def test_archive_restore_views_and_explicit_cleanup_api(
+    tmp_path, monkeypatch, workflow_writer
+):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = load_workflow(workflow_writer(tmp_path / "package", name="lifecycle"))
+    store = RunStore(home)
+    run = _start(store, package, "lifecycle")
+    RunScheduler(store).advance(run.run_id)
+    client = TestClient(_app(_router()))
+    current = client.get(f"/api/plugins/workflow/runs/{run.run_id}").json()
+
+    archived = client.post(
+        f"/api/plugins/workflow/runs/{run.run_id}/archive",
+        json={"expected_version": current["state_version"]},
+    )
+    assert archived.status_code == 200
+    assert archived.json()["status"] == "succeeded"
+    assert archived.json()["next_actions"] == ["status", "events", "restore"]
+    assert client.get("/api/plugins/workflow/runs?view=board").json()["runs"] == []
+    assert [
+        item["run_id"]
+        for item in client.get("/api/plugins/workflow/runs?view=archive").json()[
+            "runs"
+        ]
+    ] == [run.run_id]
+
+    restored = client.post(
+        f"/api/plugins/workflow/runs/{run.run_id}/restore",
+        json={"expected_version": archived.json()["state_version"]},
+    )
+    assert restored.status_code == 200
+    assert [
+        item["run_id"]
+        for item in client.get("/api/plugins/workflow/runs?view=history").json()[
+            "runs"
+        ]
+    ] == [run.run_id]
+
+    preview = client.get("/api/plugins/workflow/cleanup/preview?older_than=0d")
+    assert preview.status_code == 200
+    token = preview.json()["confirmation_token"]
+    executed = client.post(
+        "/api/plugins/workflow/cleanup/execute",
+        json={"older_than": "0d", "confirmation_token": token},
+    )
+    assert executed.status_code == 200
+    assert executed.json()["run_ids"] == [run.run_id]
+    history = client.get("/api/plugins/workflow/cleanup/history")
+    assert history.status_code == 200
+    assert history.json()["items"][0]["run_id"] == run.run_id
+    assert "source_path" not in str(history.json())
 
 
 def test_events_long_poll_returns_when_a_new_event_arrives(

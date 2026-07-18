@@ -1563,6 +1563,17 @@ export const zhHant = defineLocale({
 
   operations: {
     workflows: '工作流程',
+    workflowViews: '工作流程檢視',
+    activeBoard: '作用中看板',
+    history: '歷史',
+    archive: '封存',
+    restore: '還原至歷史',
+    cleanup: '證據清理',
+    cleanupExplanation: '清理是破壞性操作，與封存分開。執行前請檢查確切影響。',
+    inspectCleanupImpact: '檢查清理影響',
+    executeCleanup: '執行明確清理',
+    cleanupBlocked: '在解決回報的安全條件之前，清理將被阻擋。',
+    cleanupImpact: (runs, files) => `${runs} 個保留執行和 ${files} 個證據檔案將被隔離。`,
     kanban: '看板',
     needsAttention: '需要處理',
     status: '狀態',

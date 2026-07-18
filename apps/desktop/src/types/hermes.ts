@@ -125,6 +125,8 @@ export interface WorkflowCoordinatorSnapshot {
 }
 
 export interface WorkflowRunSnapshot {
+  archived_at?: null | string
+  archive_version?: number
   admission_disposition?: string
   artifacts?: unknown[]
   blocked_by_run_id?: null | string
@@ -141,10 +143,54 @@ export interface WorkflowRunSnapshot {
   run_id: string
   state_version: number
   status: string
+  restored_to_history?: boolean
   updated_at: string
   workflow: string
   workflow_version?: string
   [key: string]: unknown
+}
+
+export type WorkflowRunView = 'archive' | 'board' | 'history'
+
+export interface WorkflowCleanupCandidate {
+  blocked_reasons: string[]
+  bytes: number
+  evidence_types: string[]
+  files: number
+  run_id: string
+  status: string
+}
+
+export interface WorkflowCleanupPreview {
+  blocked_reasons: string[]
+  bytes: number
+  candidates: WorkflowCleanupCandidate[]
+  confirmation_expires_at: null | string
+  confirmation_token: null | string
+  execute: false
+  files: number
+  run_ids: string[]
+}
+
+export interface WorkflowCleanupResult {
+  bytes: number
+  execute: true
+  files: number
+  run_ids: string[]
+}
+
+export interface WorkflowNotification {
+  coalesced_count: number
+  kind: string
+  notification_id: string
+  payload: Record<string, unknown>
+  run_id: string
+  transition_version: number
+}
+
+export interface WorkflowNotificationPage {
+  items: WorkflowNotification[]
+  schema_version: number
 }
 
 export type WorkflowEvidenceKind =
@@ -154,6 +200,7 @@ export type WorkflowEvidenceKind =
   | 'coordinator'
   | 'interactions'
   | 'logs'
+  | 'notifications'
   | 'outputs'
   | 'recovery'
   | 'timeline'

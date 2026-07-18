@@ -21,13 +21,15 @@ type InspectorTab = 'artifacts' | 'attempts' | 'logs' | 'outputs' | 'overview' |
 
 const MUTATING_ACTIONS = new Set([
   'abandon',
+  'archive',
   'approve',
   'cancel',
   'provide-input',
   'reconcile',
   'reject',
   'resume',
-  'retry'
+  'retry',
+  'restore'
 ])
 
 function asDisplay(value: unknown, fallback: string): string {
@@ -221,7 +223,11 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
                   size="sm"
                   variant={action === 'cancel' || action === 'abandon' ? 'destructive' : 'secondary'}
                 >
-                  {copy[action as 'approve' | 'reject' | 'cancel' | 'resume' | 'retry' | 'abandon']}
+                  {
+                    copy[
+                      action as 'approve' | 'reject' | 'cancel' | 'resume' | 'retry' | 'abandon' | 'archive' | 'restore'
+                    ]
+                  }
                 </Button>
               )
             })}

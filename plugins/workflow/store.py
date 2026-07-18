@@ -521,8 +521,10 @@ class RunStore:
                 if name not in columns:
                     connection.execute(statement)
             from plugins.workflow.coordinator_store import install_coordinator_schema
+            from plugins.workflow.notifications import install_notification_schema
 
             install_coordinator_schema(connection)
+            install_notification_schema(connection)
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(runs)")
             }
@@ -2478,9 +2480,21 @@ class RunStore:
         status: str | None = None,
         limit: int = 100,
         operator_scope: str | None = None,
+        view: str = "all",
+        now: datetime | None = None,
+        terminal_board_days: int = 7,
     ) -> tuple[dict[str, object], ...]:
         if not 1 <= limit <= 200:
             raise ValueError("limit must be between 1 and 200")
+        if view not in {"all", "board", "history", "archive"}:
+            raise ValueError("view must be all, board, history, or archive")
+        if not 1 <= terminal_board_days <= 3650:
+            raise ValueError("terminal_board_days must be between 1 and 3650")
+        observed_at = now or datetime.now(timezone.utc)
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        observed_at = observed_at.astimezone(timezone.utc)
+        terminal_cutoff = observed_at - timedelta(days=terminal_board_days)
         storage_degraded = self.storage_health()["status"] != "healthy"
         clauses = ["admission_state='published'"]
         values: list[object] = []
@@ -2537,10 +2551,112 @@ class RunStore:
                 continue
             if storage_degraded:
                 result = {**result, "store_health": "repair_required"}
+            archived = bool(result.get("archived_at"))
+            restored = bool(result.get("restored_to_history"))
+            terminal = str(result.get("status")) in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "abandoned",
+            }
+            indexed_updated_at = datetime.fromisoformat(row["updated_at"])
+            if indexed_updated_at.tzinfo is None:
+                indexed_updated_at = indexed_updated_at.replace(tzinfo=timezone.utc)
+            indexed_updated_at = indexed_updated_at.astimezone(timezone.utc)
+            if view == "archive" and not archived:
+                continue
+            if view == "history" and not (
+                terminal
+                and not archived
+                and (restored or indexed_updated_at < terminal_cutoff)
+            ):
+                continue
+            if view == "board" and (
+                archived
+                or (
+                    terminal
+                    and (restored or indexed_updated_at < terminal_cutoff)
+                )
+            ):
+                continue
             results.append(result)
             if len(results) >= limit:
                 break
         return tuple(results)
+
+    def archive_run(
+        self,
+        run_id: str,
+        *,
+        expected_state_version: int,
+        operator_scope: str | None = None,
+    ) -> dict[str, object]:
+        """Hide a terminal run without changing execution state or evidence."""
+        directory = self.run_directory(run_id, operator_scope=operator_scope)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if int(projection["state_version"]) != expected_state_version:
+                raise RuntimeError("state version changed")
+            if projection["status"] not in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "abandoned",
+            }:
+                raise ValueError("only terminal runs can be archived")
+            if projection.get("archived_at"):
+                raise ValueError("run is already archived")
+            archived_at = _utc_now()
+            projection["archived_at"] = archived_at
+            projection["restored_to_history"] = False
+            projection["archive_version"] = int(
+                projection.get("archive_version") or 0
+            ) + 1
+            self._append_locked(
+                directory,
+                projection,
+                "run_archived",
+                {"archive_version": projection["archive_version"]},
+            )
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE runs SET updated_at=? WHERE run_id=?",
+                (projection["updated_at"], run_id),
+            )
+        return self.get_run_status(run_id, operator_scope=operator_scope)
+
+    def restore_run(
+        self,
+        run_id: str,
+        *,
+        expected_state_version: int,
+        operator_scope: str | None = None,
+    ) -> dict[str, object]:
+        """Restore archived evidence to History, never to execution or Board."""
+        directory = self.run_directory(run_id, operator_scope=operator_scope)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if int(projection["state_version"]) != expected_state_version:
+                raise RuntimeError("state version changed")
+            if not projection.get("archived_at"):
+                raise ValueError("run is not archived")
+            projection["archived_at"] = None
+            projection["restored_to_history"] = True
+            projection["archive_version"] = int(
+                projection.get("archive_version") or 0
+            ) + 1
+            self._append_locked(
+                directory,
+                projection,
+                "run_restored_to_history",
+                {"archive_version": projection["archive_version"]},
+            )
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE runs SET updated_at=? WHERE run_id=?",
+                (projection["updated_at"], run_id),
+            )
+        return self.get_run_status(run_id, operator_scope=operator_scope)
 
     def claim_foreground_execution(
         self,
@@ -2895,6 +3011,7 @@ class RunStore:
                 status,
                 pending_interaction,
                 health=health,
+                archived=bool(run.get("archived_at")),
             ),
         }
 
@@ -3529,6 +3646,48 @@ class RunStore:
             handle.flush()
             os.fsync(handle.fileno())
         _atomic_json(directory / "run.json", projection)
+        # SQLite and the filesystem journal cannot share one transaction. The
+        # journal is the transition authority; this idempotent outbox write is
+        # reconciled by the coordinator after a crash between the two writes.
+        try:
+            from plugins.workflow.notifications import (
+                NotificationOutbox,
+                notification_kind,
+            )
+
+            kind = notification_kind(event_type, projection)
+            if kind is not None:
+                pending = next(
+                    (
+                        node.get("pending_interaction")
+                        for node in projection.get("nodes", {}).values()
+                        if isinstance(node, Mapping)
+                        and isinstance(node.get("pending_interaction"), Mapping)
+                    ),
+                    None,
+                )
+                NotificationOutbox(self).record(
+                    run_id=str(projection["run_id"]),
+                    kind=kind,
+                    destination="desktop",
+                    transition_version=int(projection["state_version"]),
+                    payload={
+                        "workflow": projection.get("workflow"),
+                        "status": projection.get("status"),
+                        "event_type": event_type,
+                        "node_id": node_id,
+                        "interaction": pending,
+                        "last_error": projection.get("last_error"),
+                    },
+                    delivery_state=(
+                        "pending"
+                        if projection.get("execution_mode") == "background"
+                        else "suppressed"
+                    ),
+                    now=datetime.fromisoformat(now),
+                )
+        except sqlite3.Error:
+            pass
         return event
 
     def transition_pending_nodes(
@@ -5399,6 +5558,7 @@ class RunStore:
                     "files": 0,
                     "bytes": 0,
                     "evidence_types": [],
+                    "notification_dependencies": 0,
                     "blocked_reasons": ["active_reader_or_writer"],
                 }
             candidates.append(candidate)
@@ -5437,7 +5597,18 @@ class RunStore:
             "bytes": sum(int(candidate["bytes"]) for candidate in candidates),
             "index_integrity": health["status"],
             "blocked_reasons": blocked_reasons,
-            "notification_dependencies": {"status": "not_configured", "count": 0},
+            "notification_dependencies": {
+                "status": "pending"
+                if any(
+                    int(candidate.get("notification_dependencies", 0))
+                    for candidate in candidates
+                )
+                else "clear",
+                "count": sum(
+                    int(candidate.get("notification_dependencies", 0))
+                    for candidate in candidates
+                ),
+            },
             "confirmation_token": token,
             "confirmation_expires_at": expires_at.isoformat() if token else None,
         }
@@ -5456,6 +5627,11 @@ class RunStore:
                 "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
                 (row["run_id"],),
             ).fetchone()[0]
+            notification_dependencies = connection.execute(
+                "SELECT COUNT(*) FROM workflow_notification_outbox "
+                "WHERE run_id=? AND state IN ('pending','leased','dead')",
+                (row["run_id"],),
+            ).fetchone()[0]
         if claims:
             blocked_reasons.append("live_worker_claim")
         if any(
@@ -5467,6 +5643,8 @@ class RunStore:
             for node in projection["nodes"].values()
         ):
             blocked_reasons.append("reconciliation_required")
+        if notification_dependencies:
+            blocked_reasons.append("pending_notification_delivery")
         evidence_types = ["projection", "events"]
         if any("stdout" in path.name for path in paths):
             evidence_types.append("stdout")
@@ -5488,6 +5666,7 @@ class RunStore:
             "files": len(paths),
             "bytes": sum(path.stat().st_size for path in paths),
             "evidence_types": evidence_types,
+            "notification_dependencies": int(notification_dependencies),
             "blocked_reasons": blocked_reasons,
         }
 

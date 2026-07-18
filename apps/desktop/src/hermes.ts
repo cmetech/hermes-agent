@@ -58,11 +58,15 @@ import type {
   ToolsetInfo,
   ToolsetModelsResponse,
   WorkflowAttentionPage,
+  WorkflowCleanupPreview,
+  WorkflowCleanupResult,
   WorkflowEventPage,
   WorkflowEvidenceKind,
   WorkflowEvidencePage,
+  WorkflowNotificationPage,
   WorkflowRunPage,
-  WorkflowRunSnapshot
+  WorkflowRunSnapshot,
+  WorkflowRunView
 } from '@/types/hermes'
 
 // Desktop startup fires a burst of read-only data calls (config, profiles,
@@ -228,11 +232,53 @@ export async function listSessions(
   }
 }
 
-export function listWorkflowRuns(cursor?: string): Promise<WorkflowRunPage> {
-  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''
+export function listWorkflowRuns(cursor?: string, view: WorkflowRunView = 'board'): Promise<WorkflowRunPage> {
+  const query = new URLSearchParams({ view })
+  if (cursor) query.set('cursor', cursor)
 
   return window.hermesDesktop.api<WorkflowRunPage>({
-    path: `/api/plugins/workflow/runs${query}`,
+    path: `/api/plugins/workflow/runs?${query.toString()}`,
+    ...profileScoped()
+  })
+}
+
+export function previewWorkflowCleanup(olderThan = '7d'): Promise<WorkflowCleanupPreview> {
+  return window.hermesDesktop.api<WorkflowCleanupPreview>({
+    path: `/api/plugins/workflow/cleanup/preview?older_than=${encodeURIComponent(olderThan)}`,
+    ...profileScoped()
+  })
+}
+
+export function executeWorkflowCleanup(confirmationToken: string, olderThan = '7d'): Promise<WorkflowCleanupResult> {
+  return window.hermesDesktop.api<WorkflowCleanupResult>({
+    body: { confirmation_token: confirmationToken, older_than: olderThan },
+    method: 'POST',
+    path: '/api/plugins/workflow/cleanup/execute',
+    ...profileScoped()
+  })
+}
+
+export function leaseWorkflowNotifications(clientId: string): Promise<WorkflowNotificationPage> {
+  return window.hermesDesktop.api<WorkflowNotificationPage>({
+    path: `/api/plugins/workflow/notifications/lease?client_id=${encodeURIComponent(clientId)}`,
+    ...profileScoped()
+  })
+}
+
+export function acknowledgeWorkflowNotification(notificationId: string, clientId: string): Promise<unknown> {
+  return window.hermesDesktop.api({
+    body: { client_id: clientId },
+    method: 'POST',
+    path: `/api/plugins/workflow/notifications/${encodeURIComponent(notificationId)}/ack`,
+    ...profileScoped()
+  })
+}
+
+export function failWorkflowNotification(notificationId: string, clientId: string, error: string): Promise<unknown> {
+  return window.hermesDesktop.api({
+    body: { client_id: clientId, error },
+    method: 'POST',
+    path: `/api/plugins/workflow/notifications/${encodeURIComponent(notificationId)}/fail`,
     ...profileScoped()
   })
 }

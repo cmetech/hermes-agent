@@ -1848,6 +1848,17 @@ export const zh: Translations = {
 
   operations: {
     workflows: '工作流',
+    workflowViews: '工作流视图',
+    activeBoard: '活动看板',
+    history: '历史',
+    archive: '归档',
+    restore: '恢复到历史',
+    cleanup: '证据清理',
+    cleanupExplanation: '清理是破坏性操作，与归档分开。执行前请检查确切影响。',
+    inspectCleanupImpact: '检查清理影响',
+    executeCleanup: '执行明确清理',
+    cleanupBlocked: '在解决报告的安全条件之前，清理将被阻止。',
+    cleanupImpact: (runs, files) => `${runs} 个保留运行和 ${files} 个证据文件将被隔离。`,
     kanban: '看板',
     needsAttention: '需要处理',
     status: '状态',

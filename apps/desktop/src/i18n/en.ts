@@ -1673,6 +1673,17 @@ export const en: Translations = {
 
   operations: {
     workflows: 'Workflows',
+    workflowViews: 'Workflow views',
+    activeBoard: 'Active board',
+    history: 'History',
+    archive: 'Archive',
+    restore: 'Restore to history',
+    cleanup: 'Evidence cleanup',
+    cleanupExplanation: 'Cleanup is destructive and separate from archive. Inspect the exact impact before execution.',
+    inspectCleanupImpact: 'Inspect cleanup impact',
+    executeCleanup: 'Execute explicit cleanup',
+    cleanupBlocked: 'Cleanup is blocked until the reported safety conditions are resolved.',
+    cleanupImpact: (runs, files) => `${runs} retained runs and ${files} evidence files would be quarantined.`,
     kanban: 'Kanban',
     needsAttention: 'Needs attention',
     status: 'Status',

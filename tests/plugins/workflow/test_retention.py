@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import threading
 
@@ -11,6 +11,113 @@ from plugins.workflow.locks import workflow_lock
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
+from plugins.workflow.notifications import NotificationOutbox
+
+
+def _terminal_run(store, tmp_path, workflow_writer, *, name: str):
+    package = load_workflow(workflow_writer(tmp_path / name, name=name))
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=name,
+            concurrency_key=name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    RunScheduler(store).advance(admitted.run_id)
+    return admitted.run_id
+
+
+def test_archive_is_reversible_visibility_metadata_not_execution_state(
+    tmp_path, workflow_writer
+):
+    store = RunStore(tmp_path / "home")
+    run_id = _terminal_run(store, tmp_path, workflow_writer, name="archive-demo")
+    current = store.get_run_status(run_id)
+
+    archived = store.archive_run(
+        run_id, expected_state_version=current["state_version"]
+    )
+
+    assert archived["status"] == "succeeded"
+    assert archived["archived_at"]
+    assert archived["archive_version"] == 1
+    assert archived["next_actions"] == ["status", "events", "restore"]
+    restored = store.restore_run(
+        run_id, expected_state_version=archived["state_version"]
+    )
+    assert restored["status"] == "succeeded"
+    assert restored["archived_at"] is None
+    assert restored["restored_to_history"] is True
+    assert restored["archive_version"] == 2
+    assert restored["next_actions"] == ["status", "events", "archive"]
+
+
+def test_board_history_archive_views_use_utc_injectable_clock_and_exact_boundary(
+    tmp_path, workflow_writer
+):
+    store = RunStore(tmp_path / "home")
+    boundary_id = _terminal_run(store, tmp_path, workflow_writer, name="boundary")
+    old_id = _terminal_run(store, tmp_path, workflow_writer, name="old")
+    restored_id = _terminal_run(store, tmp_path, workflow_writer, name="restored")
+    archived_id = _terminal_run(store, tmp_path, workflow_writer, name="archived")
+    now = datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc)
+    boundary = now - timedelta(days=7)
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE runs SET updated_at=? WHERE run_id=?",
+            (boundary.isoformat(), boundary_id),
+        )
+        connection.execute(
+            "UPDATE runs SET updated_at=? WHERE run_id=?",
+            ((boundary - timedelta(microseconds=1)).isoformat(), old_id),
+        )
+    restored = store.get_run_status(restored_id)
+    store.archive_run(restored_id, expected_state_version=restored["state_version"])
+    archived = store.get_run_status(restored_id)
+    store.restore_run(restored_id, expected_state_version=archived["state_version"])
+    archived = store.get_run_status(archived_id)
+    store.archive_run(archived_id, expected_state_version=archived["state_version"])
+
+    board = {run["run_id"] for run in store.list_runs(view="board", now=now)}
+    history = {run["run_id"] for run in store.list_runs(view="history", now=now)}
+    archive = {run["run_id"] for run in store.list_runs(view="archive", now=now)}
+
+    assert boundary_id in board
+    assert old_id in history
+    assert restored_id in history and restored_id not in board
+    assert archived_id in archive and archived_id not in board
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.list_runs(view="board", now=datetime(2026, 1, 1))
+
+
+def test_archive_rejects_nonterminal_and_stale_state(tmp_path, workflow_writer):
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(workflow_writer(tmp_path / "active", name="active"))
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="active",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="active",
+            concurrency_key="active",
+        ),
+        immutable_snapshot=prepared,
+    )
+    with pytest.raises(ValueError, match="terminal"):
+        store.archive_run(admitted.run_id, expected_state_version=1)
+
+    run_id = _terminal_run(store, tmp_path, workflow_writer, name="stale-archive")
+    with pytest.raises(RuntimeError, match="state version"):
+        store.archive_run(run_id, expected_state_version=1)
 
 
 def test_cleanup_is_dry_run_then_quarantines_terminal_run(tmp_path, workflow_writer):
@@ -238,3 +345,27 @@ def test_cleanup_preview_blocks_live_claim_and_reconciliation(
         "live_worker_claim",
         "reconciliation_required",
     ]
+
+
+def test_cleanup_preview_blocks_pending_notification_dependency(
+    tmp_path, workflow_writer
+):
+    store = RunStore(tmp_path / "home")
+    run_id = _terminal_run(store, tmp_path, workflow_writer, name="notify-cleanup")
+    # Terminal completion creates this automatically; the explicit record also
+    # makes the dependency contract independent of executor details.
+    NotificationOutbox(store).record(
+        run_id=run_id,
+        kind="completion",
+        destination="desktop",
+        transition_version=999,
+        payload={},
+    )
+
+    preview = store.cleanup_runs(older_than=timedelta(0))
+
+    assert preview["confirmation_token"] is None
+    assert "pending_notification_delivery" in preview["candidates"][0][
+        "blocked_reasons"
+    ]
+    assert preview["notification_dependencies"]["count"] >= 1

@@ -15,7 +15,8 @@ MUTATION_ACTIONS = frozenset({
     "reconcile",
     "cancel",
     "abandon",
-    "cleanup",
+    "archive",
+    "restore",
 })
 
 
@@ -24,6 +25,7 @@ def available_actions(
     pending_interaction: Mapping[str, object] | None = None,
     *,
     health: str | None = None,
+    archived: bool = False,
 ) -> list[str]:
     actions = list(INSPECTION_ACTIONS)
     interaction_type = (
@@ -45,7 +47,7 @@ def available_actions(
     elif status in {"failed", "interrupted"}:
         actions.extend(("resume", "retry", "abandon"))
     else:
-        actions.append("cleanup")
+        actions.append("restore" if archived else "archive")
     return actions
 
 
@@ -55,11 +57,13 @@ def mutation_is_valid(
     status: str,
     pending_interaction: Mapping[str, object] | None = None,
     health: str | None = None,
+    archived: bool = False,
 ) -> bool:
     return action in MUTATION_ACTIONS and action in available_actions(
         status,
         pending_interaction,
         health=health,
+        archived=archived,
     )
 
 
