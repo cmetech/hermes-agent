@@ -104,6 +104,8 @@ def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
             "admission_events",
             "cleanup_history",
             "cleanup_previews",
+            "coordinator_events",
+            "coordinator_lease",
             "repair_events",
             "runs",
             "store_metadata",
@@ -116,7 +118,7 @@ def test_pre_amendment_v209_store_migrates_without_rewriting_evidence(
             )
         }
         assert {"runs_concurrency", "worker_claims_lease"} <= indexes
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         migrated = dict(
             connection.execute(
                 "SELECT * FROM runs WHERE run_id='migration-run'"

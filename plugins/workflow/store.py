@@ -74,7 +74,7 @@ class ArtifactRef:
 
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
-_STORE_SCHEMA_VERSION = 2
+_STORE_SCHEMA_VERSION = 3
 _PROJECTION_STATUSES = {
     "queued",
     "running",
@@ -486,6 +486,9 @@ class RunStore:
             for name, statement in migrations.items():
                 if name not in columns:
                     connection.execute(statement)
+            from plugins.workflow.coordinator_store import install_coordinator_schema
+
+            install_coordinator_schema(connection)
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(runs)")
             }
