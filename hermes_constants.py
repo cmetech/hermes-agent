@@ -65,6 +65,12 @@ def home_dir_basename() -> str:
     return _get_platform_default_hermes_home().name
 
 
+def version_agent_label() -> str:
+    """Return the source-stamped product label used by version output."""
+    identity = home_dir_basename().removeprefix(".").lower()
+    return "Hermes Agent" if identity == "hermes" else "Co-worker Agent"
+
+
 def get_hermes_home() -> Path:
     """Return the Hermes home directory (default: platform-native path).
 

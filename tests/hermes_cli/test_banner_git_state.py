@@ -4,10 +4,12 @@ from unittest.mock import MagicMock, patch
 def test_format_banner_version_label_without_git_state():
     from hermes_cli import banner
 
-    with patch.object(banner, "get_git_banner_state", return_value=None):
+    with patch.object(banner, "get_git_banner_state", return_value=None), patch.object(
+        banner, "version_agent_label", return_value="Co-worker Agent"
+    ):
         value = banner.format_banner_version_label()
 
-    assert value == f"Hermes Agent v{banner.VERSION} ({banner.RELEASE_DATE})"
+    assert value == f"Co-worker Agent v{banner.VERSION} ({banner.RELEASE_DATE})"
 
 
 def test_format_banner_version_label_on_upstream_main():
@@ -31,9 +33,12 @@ def test_format_banner_version_label_with_carried_commits():
         banner,
         "get_git_banner_state",
         return_value={"upstream": "b2f477a3", "local": "af8aad31", "ahead": 3},
-    ):
+    ), patch.object(banner, "version_agent_label", return_value="Co-worker Agent"):
         value = banner.format_banner_version_label()
 
+    assert value.startswith(
+        f"Co-worker Agent v{banner.VERSION} ({banner.RELEASE_DATE})"
+    )
     assert "upstream b2f477a3" in value
     assert "local af8aad31" in value
     assert "+3 carried commits" in value
