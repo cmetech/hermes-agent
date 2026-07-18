@@ -1796,7 +1796,7 @@ class RunStore:
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
                 return RunAdmissionResult(None, "rejected", "profile_storage_quota")
             active = connection.execute(
-                "SELECT run_id FROM runs WHERE workflow_name=? AND concurrency_key=? AND status IN ('running','waiting_retry','paused','interrupted') ORDER BY created_at, run_id LIMIT 1",
+                "SELECT run_id FROM runs WHERE workflow_name=? AND concurrency_key=? AND status IN ('running','paused','interrupted') ORDER BY created_at, run_id LIMIT 1",
                 (request.workflow_name, request.concurrency_key),
             ).fetchone()
             status = "running"
@@ -2295,7 +2295,7 @@ class RunStore:
                     connection.rollback()
                     return bool(row and row["status"] == "running")
                 active = connection.execute(
-                    "SELECT 1 FROM runs WHERE run_id<>? AND workflow_name=? AND concurrency_key=? AND status IN ('running','waiting_retry','paused','interrupted') LIMIT 1",
+                    "SELECT 1 FROM runs WHERE run_id<>? AND workflow_name=? AND concurrency_key=? AND status IN ('running','paused','interrupted') LIMIT 1",
                     (run_id, row["workflow_name"], row["concurrency_key"]),
                 ).fetchone()
                 running = connection.execute(
@@ -3373,6 +3373,80 @@ class RunStore:
             projection = json.loads((directory / "run.json").read_text())
             if projection["status"] not in {"waiting_retry", "running"}:
                 return ()
+            due_nodes = [
+                node
+                for node in projection["nodes"].values()
+                if node["state"] == "waiting_retry"
+                and datetime.fromisoformat(node["next_attempt_at"]) <= instant
+            ]
+            if not due_nodes:
+                return ()
+            if projection["status"] == "waiting_retry":
+                connection = self._connect()
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    row = connection.execute(
+                        "SELECT workflow_name, concurrency_key, concurrency_policy "
+                        "FROM runs WHERE run_id=? AND status='waiting_retry'",
+                        (run_id,),
+                    ).fetchone()
+                    if row is None:
+                        connection.rollback()
+                        return ()
+                    active = None
+                    if row["concurrency_policy"] != "allow":
+                        active = connection.execute(
+                            "SELECT run_id FROM runs WHERE run_id<>? "
+                            "AND workflow_name=? AND concurrency_key=? "
+                            "AND status IN ('running','paused','interrupted') "
+                            "ORDER BY created_at, run_id LIMIT 1",
+                            (run_id, row["workflow_name"], row["concurrency_key"]),
+                        ).fetchone()
+                    running = connection.execute(
+                        "SELECT COUNT(*) FROM runs WHERE status='running'"
+                    ).fetchone()[0]
+                    if active is not None or running >= self.limits["executing"]:
+                        queue_position = (
+                            connection.execute(
+                                "SELECT COUNT(*) FROM runs WHERE status='queued'"
+                            ).fetchone()[0]
+                            + 1
+                        )
+                        projection["status"] = "queued"
+                        projection["queue_position"] = queue_position
+                        projection["blocked_by_run_id"] = (
+                            active["run_id"] if active is not None else None
+                        )
+                        self._append_locked(
+                            directory,
+                            projection,
+                            "run_retry_queued",
+                            {"reason_code": "concurrency_lane_busy"},
+                        )
+                        connection.execute(
+                            "UPDATE runs SET status='queued', queue_position=?, "
+                            "blocked_by_run_id=?, updated_at=? WHERE run_id=?",
+                            (
+                                queue_position,
+                                projection["blocked_by_run_id"],
+                                projection["updated_at"],
+                                run_id,
+                            ),
+                        )
+                        self._record_coordinator_wake(
+                            connection,
+                            run_id=run_id,
+                            reason_code="retry_queued",
+                        )
+                        connection.commit()
+                        self._notify_coordinator()
+                        return ()
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.close()
             for node_id, node in projection["nodes"].items():
                 if node["state"] != "waiting_retry":
                     continue

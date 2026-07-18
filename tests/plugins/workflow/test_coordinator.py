@@ -311,6 +311,63 @@ def test_durable_approval_wake_continues_outside_mutating_caller(
         assert not thread.is_alive()
 
 
+def test_coordinator_promotes_queued_run_after_lane_owner_cancels(
+    tmp_path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="promotion",
+            nodes=[{"id": "gate", "approval": {"message": "Continue?"}}],
+        )
+    )
+    store = RunStore(tmp_path)
+    service = _service(
+        tmp_path,
+        host_kind="gateway",
+        host_instance_id="promotion-owner",
+    )
+    stop = threading.Event()
+    thread = threading.Thread(target=service.run, args=(stop,))
+    thread.start()
+    try:
+        _wait_until(lambda: service.health().code == "leader")
+
+        def admit(key: str):
+            prepared = store.prepare_run_snapshot(package)
+            return store.start_run(
+                RunAdmissionRequest(
+                    workflow_name="promotion",
+                    definition_digest=prepared.definition_digest,
+                    policy_digest=prepared.policy_digest,
+                    input_manifest_digest=prepared.input_manifest_digest,
+                    trigger_source="api",
+                    idempotency_key=key,
+                    concurrency_key="promotion",
+                    execution_mode="background",
+                ),
+                immutable_snapshot=prepared,
+            )
+
+        first = admit("promotion-first")
+        second = admit("promotion-second")
+        assert second.disposition == "queued"
+        _wait_until(lambda: store.get_run_status(first.run_id)["status"] == "paused")
+        assert store.get_run_status(second.run_id)["status"] == "queued"
+
+        store.cancel_run(first.run_id)
+
+        _wait_until(lambda: store.get_run_status(first.run_id)["status"] == "cancelled")
+        _wait_until(lambda: store.get_run_status(second.run_id)["status"] == "paused")
+        promoted = store.get_run_status(second.run_id)
+        assert promoted["queue_position"] is None
+        assert promoted["blocked_by_run_id"] is None
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+
 def test_workflow_plugin_registers_one_generic_service_for_both_hosts() -> None:
     from plugins.workflow import register
     from plugins.workflow.coordinator import create_workflow_coordinator

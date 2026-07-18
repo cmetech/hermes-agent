@@ -10,7 +10,7 @@ from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 
 
-def _start(store, package):
+def _start(store, package, *, key="retry"):
     prepared = store.prepare_run_snapshot(package)
     return store.start_run(
         RunAdmissionRequest(
@@ -19,7 +19,7 @@ def _start(store, package):
             policy_digest=prepared.policy_digest,
             input_manifest_digest=prepared.input_manifest_digest,
             trigger_source="cli",
-            idempotency_key="retry",
+            idempotency_key=key,
             concurrency_key=package.definition.name,
         ),
         immutable_snapshot=prepared,
@@ -84,6 +84,90 @@ def test_transient_failure_waits_without_occupying_capacity_then_retries(
     now += timedelta(seconds=1)
     assert scheduler.advance(admitted.run_id)["status"] == "succeeded"
     assert calls == 2
+
+
+def test_waiting_retry_releases_lane_and_requeues_when_due_lane_is_busy(
+    tmp_path, workflow_writer
+):
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="retry-lane",
+            nodes=[
+                {
+                    "id": "work",
+                    "bash": "true",
+                    "retry": {
+                        "max_attempts": 2,
+                        "delay_ms": 1000,
+                        "on_error": "transient",
+                    },
+                }
+            ],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    first = _start(store, package, key="first")
+    second = _start(store, package, key="second")
+    assert second.disposition == "queued"
+    now = datetime(2026, 7, 17, tzinfo=timezone.utc)
+
+    class FailsOnce:
+        def execute(self, _context):
+            return NodeExecutionResult("failed", error_code="provider_timeout")
+
+    first_scheduler = RunScheduler(store, utcnow=lambda: now, jitter=lambda: 0.5)
+    first_scheduler.executors["bash"] = FailsOnce()
+    assert first_scheduler.advance(first.run_id)["status"] == "waiting_retry"
+
+    assert store.try_promote_run(second.run_id)
+    assert store.get_run_status(second.run_id)["status"] == "running"
+
+    due = now + timedelta(seconds=1)
+    assert store.wake_due_retries(first.run_id, now=due) == ()
+    requeued = store.get_run_status(first.run_id)
+    assert requeued["status"] == "queued"
+    assert requeued["blocked_by_run_id"] == second.run_id
+    assert requeued["nodes"]["work"]["state"] == "waiting_retry"
+
+    assert RunScheduler(store).advance(second.run_id)["status"] == "succeeded"
+    assert store.try_promote_run(first.run_id)
+    assert store.wake_due_retries(first.run_id, now=due) == ("work",)
+
+
+def test_paused_and_interrupted_runs_continue_to_hold_their_lane(
+    tmp_path, workflow_writer
+):
+    paused_package = load_workflow(
+        workflow_writer(
+            tmp_path / "paused-package",
+            name="held-paused-lane",
+            nodes=[{"id": "gate", "approval": {"message": "Hold?"}}],
+        )
+    )
+    paused_store = RunStore(tmp_path / "paused-home")
+    paused = _start(paused_store, paused_package, key="paused")
+    assert RunScheduler(paused_store).advance(paused.run_id)["status"] == "paused"
+    behind_paused = _start(paused_store, paused_package, key="behind-paused")
+    assert behind_paused.disposition == "queued"
+    assert not paused_store.try_promote_run(behind_paused.run_id)
+
+    interrupted_package = load_workflow(
+        workflow_writer(
+            tmp_path / "interrupted-package",
+            name="held-interrupted-lane",
+        )
+    )
+    interrupted_store = RunStore(tmp_path / "interrupted-home")
+    interrupted = _start(interrupted_store, interrupted_package, key="interrupted")
+    interrupted_store.interrupt_for_host_pressure(
+        interrupted.run_id, message="synthetic pressure"
+    )
+    behind_interrupted = _start(
+        interrupted_store, interrupted_package, key="behind-interrupted"
+    )
+    assert behind_interrupted.disposition == "queued"
+    assert not interrupted_store.try_promote_run(behind_interrupted.run_id)
 
 
 def test_fatal_and_unknown_side_effect_failures_are_not_retried(
