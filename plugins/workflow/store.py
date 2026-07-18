@@ -210,6 +210,8 @@ class RunStore:
         self.quarantine_root = self.root / ".quarantine"
         self.locks_root = self.root / ".locks"
         self.database = self.root / "admission.sqlite3"
+        self.authority_marker = self.root / ".admission-authority.json"
+        self.repair_marker = self.root / ".repair-required.json"
         self.admission_lock = self.root / ".admission.lock"
         self.max_input_bytes = max_input_bytes
         self.max_run_bytes = max_run_bytes
@@ -241,8 +243,42 @@ class RunStore:
             self.staging_root.mkdir(parents=True, exist_ok=True)
             self.quarantine_root.mkdir(parents=True, exist_ok=True)
             self.locks_root.mkdir(parents=True, exist_ok=True)
-            with self._connect() as connection:
-                connection.executescript(
+            database_existed = self.database.exists()
+            database_was_empty = database_existed and self.database.stat().st_size == 0
+            evidence_existed = any(
+                path.is_dir()
+                for workflow in self.runs_root.iterdir()
+                if workflow.is_dir()
+                for path in workflow.iterdir()
+            )
+            index_damage = None
+            try:
+                self._create_or_migrate_schema()
+            except sqlite3.DatabaseError:
+                self._preserve_damaged_index()
+                self._create_or_migrate_schema()
+                index_damage = "index_corrupt"
+            generation_damage = self._establish_index_generation(
+                database_existed=database_existed,
+                database_was_empty=database_was_empty,
+                evidence_existed=evidence_existed,
+            )
+            if index_damage or generation_damage:
+                self._mark_repair_required(index_damage or generation_damage)
+                with self._connect() as connection:
+                    self._record_repair_event(
+                        connection,
+                        reason_code=index_damage or generation_damage or "index_unknown",
+                        outcome="index_recreated",
+                    )
+            with workflow_lock(self.admission_lock):
+                self._reconcile_admission()
+                self._reconcile_worker_claims()
+            self._initialized = True
+
+    def _create_or_migrate_schema(self) -> None:
+        with self._connect() as connection:
+            connection.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS runs (
                         run_id TEXT PRIMARY KEY,
@@ -285,12 +321,28 @@ class RunStore:
                     );
                     CREATE INDEX IF NOT EXISTS worker_claims_lease
                     ON worker_claims(lease_expires_at);
+                    CREATE TABLE IF NOT EXISTS store_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS repair_events (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        detected_at TEXT NOT NULL,
+                        reason_code TEXT NOT NULL,
+                        outcome TEXT NOT NULL,
+                        run_id TEXT,
+                        source_path TEXT,
+                        preserved_path TEXT,
+                        projection_sha256 TEXT,
+                        journal_sha256 TEXT,
+                        payload_json TEXT NOT NULL DEFAULT '{}'
+                    );
                     """
                 )
-                columns = {
-                    row["name"] for row in connection.execute("PRAGMA table_info(runs)")
-                }
-                migrations = {
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(runs)")
+            }
+            migrations = {
                     "admission_state": (
                         "ALTER TABLE runs ADD COLUMN admission_state TEXT "
                         "NOT NULL DEFAULT 'published'"
@@ -304,14 +356,157 @@ class RunStore:
                     "operator_scope_digest": (
                         "ALTER TABLE runs ADD COLUMN operator_scope_digest TEXT"
                     ),
-                }
-                for name, statement in migrations.items():
-                    if name not in columns:
-                        connection.execute(statement)
-            with workflow_lock(self.admission_lock):
-                self._reconcile_admission()
-                self._reconcile_worker_claims()
-            self._initialized = True
+            }
+            for name, statement in migrations.items():
+                if name not in columns:
+                    connection.execute(statement)
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(runs)")
+            }
+            required_columns = {
+                "run_id",
+                "workflow_name",
+                "trigger_source",
+                "idempotency_digest",
+                "start_digest",
+                "concurrency_key",
+                "concurrency_policy",
+                "disposition",
+                "status",
+                "queue_position",
+                "blocked_by_run_id",
+                "run_directory",
+                "created_at",
+                "updated_at",
+                "admission_state",
+                "desired_status",
+                "staging_directory",
+                "operator_scope_digest",
+            }
+            if not required_columns <= columns:
+                missing = ", ".join(sorted(required_columns - columns))
+                raise sqlite3.DatabaseError(
+                    f"admission index schema is incomplete: {missing}"
+                )
+
+    def _preserve_damaged_index(self) -> None:
+        preserved_root = self.quarantine_root / f"admission-index-{uuid.uuid4().hex}"
+        preserved_root.mkdir(parents=True, exist_ok=False)
+        for suffix in ("", "-wal", "-shm"):
+            source = Path(f"{self.database}{suffix}")
+            if source.exists():
+                os.replace(source, preserved_root / source.name)
+
+    def _establish_index_generation(
+        self,
+        *,
+        database_existed: bool,
+        database_was_empty: bool,
+        evidence_existed: bool,
+    ) -> str | None:
+        marker = None
+        marker_existed = self.authority_marker.exists()
+        marker_unreadable = False
+        try:
+            candidate = json.loads(self.authority_marker.read_text(encoding="utf-8"))
+            if isinstance(candidate, dict) and isinstance(
+                candidate.get("generation"), str
+            ):
+                marker = candidate
+        except (OSError, json.JSONDecodeError):
+            marker_unreadable = marker_existed
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM store_metadata WHERE key='generation'"
+            ).fetchone()
+            generation_existed = row is not None
+            if row is None:
+                generation = uuid.uuid4().hex
+                connection.execute(
+                    "INSERT INTO store_metadata (key, value) VALUES ('generation', ?)",
+                    (generation,),
+                )
+            else:
+                generation = str(row["value"])
+        if marker is None:
+            _atomic_json(
+                self.authority_marker,
+                {"schema_version": 1, "generation": generation},
+            )
+            if marker_unreadable:
+                return "authority_marker_corrupt"
+            if generation_existed:
+                return "authority_marker_missing"
+            if evidence_existed and not database_existed:
+                return "index_missing"
+            if evidence_existed and database_was_empty:
+                return "index_empty"
+            return None
+        if marker["generation"] != generation:
+            return "index_generation_mismatch"
+        return None
+
+    def _mark_repair_required(
+        self, reason_code: str, *, run_id: str | None = None
+    ) -> None:
+        reasons: list[dict[str, str | None]] = []
+        detected_at = _utc_now()
+        try:
+            existing = json.loads(self.repair_marker.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                detected_at = str(existing.get("detected_at") or detected_at)
+                existing_reasons = existing.get("reasons")
+                if isinstance(existing_reasons, list):
+                    reasons = [
+                        dict(item)
+                        for item in existing_reasons
+                        if isinstance(item, dict)
+                    ]
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            pass
+        reason = {"reason_code": reason_code, "run_id": run_id}
+        if reason not in reasons:
+            reasons.append(reason)
+        _atomic_json(
+            self.repair_marker,
+            {
+                "schema_version": 1,
+                "status": "repair_required",
+                "detected_at": detected_at,
+                "reasons": reasons,
+            },
+        )
+
+    @staticmethod
+    def _record_repair_event(
+        connection: sqlite3.Connection,
+        *,
+        reason_code: str,
+        outcome: str,
+        run_id: str | None = None,
+        source_path: Path | None = None,
+        preserved_path: Path | None = None,
+        projection_sha256: str | None = None,
+        journal_sha256: str | None = None,
+        payload: Mapping[str, object] | None = None,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO repair_events ("
+            "detected_at, reason_code, outcome, run_id, source_path, "
+            "preserved_path, projection_sha256, journal_sha256, payload_json"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                _utc_now(),
+                reason_code,
+                outcome,
+                run_id,
+                str(source_path) if source_path else None,
+                str(preserved_path) if preserved_path else None,
+                projection_sha256,
+                journal_sha256,
+                json.dumps(_sanitize(dict(payload or {})), sort_keys=True),
+            ),
+        )
 
     @staticmethod
     def _snapshot_owner_alive(pid: int) -> bool:
@@ -355,8 +550,103 @@ class RunStore:
             "LIMIT -1 OFFSET 1000)"
         )
 
+    def _corroborate_run_evidence(
+        self, directory: Path, *, run_id: str
+    ) -> tuple[dict[str, object], str | None, str | None]:
+        projection_path = directory / "run.json"
+        journal_path = directory / "events.jsonl"
+        projection_bytes = projection_path.read_bytes()
+        journal_bytes = journal_path.read_bytes()
+        projection_sha256 = _sha256(projection_bytes)
+        journal_sha256 = _sha256(journal_bytes)
+        projection = json.loads(projection_bytes)
+        if not self._valid_projection(projection, run_id=run_id):
+            raise JournalRecoveryError("run projection is not valid")
+        rebuilt = self._rebuild_projection(directory, run_id=run_id)
+        if _projection_digest(projection) != _projection_digest(rebuilt):
+            raise JournalRecoveryError("run projection does not match journal head")
+        return projection, projection_sha256, journal_sha256
+
+    @staticmethod
+    def _start_digest_from_projection(projection: Mapping[str, object]) -> str:
+        required = (
+            "workflow",
+            "definition_digest",
+            "policy_digest",
+            "input_manifest_digest",
+            "trigger",
+            "concurrency_key",
+            "idempotency_key_digest",
+        )
+        if any(not isinstance(projection.get(field), str) for field in required):
+            raise JournalRecoveryError("run projection lacks admission identity")
+        metadata = projection.get("run_metadata") or {}
+        if not isinstance(metadata, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in metadata.items()
+        ):
+            raise JournalRecoveryError("run projection metadata is malformed")
+        material = json.dumps(
+            {
+                "workflow": projection["workflow"],
+                "definition": projection["definition_digest"],
+                "policy": projection["policy_digest"],
+                "inputs": projection["input_manifest_digest"],
+                "trigger": projection["trigger"],
+                "concurrency": projection["concurrency_key"],
+                "operator_scope_digest": projection.get("operator_scope_digest"),
+                "run_metadata": dict(sorted(metadata.items())),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return _sha256(material)
+
+    def _rebuild_admission_row(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        directory: Path,
+        projection: Mapping[str, object],
+    ) -> None:
+        concurrency_policy = projection.get("concurrency_policy", "queue")
+        if concurrency_policy not in {"queue", "allow", "forbid"}:
+            raise JournalRecoveryError("run concurrency policy is invalid")
+        connection.execute(
+            "INSERT INTO runs ("
+            "run_id, workflow_name, trigger_source, idempotency_digest, "
+            "start_digest, concurrency_key, concurrency_policy, disposition, "
+            "status, queue_position, blocked_by_run_id, run_directory, "
+            "created_at, updated_at, admission_state, desired_status, "
+            "staging_directory, operator_scope_digest) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "'published', NULL, NULL, ?)",
+            (
+                projection["run_id"],
+                projection["workflow"],
+                projection["trigger"],
+                projection["idempotency_key_digest"],
+                self._start_digest_from_projection(projection),
+                projection["concurrency_key"],
+                concurrency_policy,
+                projection.get("admission_disposition", "created"),
+                projection["status"],
+                projection.get("queue_position"),
+                projection.get("blocked_by_run_id"),
+                str(directory),
+                projection.get("created_at") or projection["updated_at"],
+                projection["updated_at"],
+                projection.get("operator_scope_digest"),
+            ),
+        )
+
+    def _quarantine_evidence(self, source: Path, *, prefix: str) -> Path:
+        preserved = self.quarantine_root / f"{prefix}-{uuid.uuid4().hex}"
+        os.replace(source, preserved)
+        return preserved
+
     def _reconcile_admission(self) -> None:
-        """Converge interrupted publication without inferring run success."""
+        """Converge admission state while treating run evidence as authority."""
         with self._connect() as connection:
             reservations = connection.execute(
                 "SELECT * FROM runs WHERE admission_state='reserved' "
@@ -369,33 +659,13 @@ class RunStore:
             }
             for row in reservations:
                 run_directory = Path(row["run_directory"])
-                projection_path = run_directory / "run.json"
-                events_path = run_directory / "events.jsonl"
-                projection = None
-                initial_event = None
                 try:
-                    projection = json.loads(projection_path.read_text(encoding="utf-8"))
-                except (FileNotFoundError, json.JSONDecodeError, OSError):
-                    pass
-                try:
-                    event_lines = [
-                        line
-                        for line in events_path.read_text(encoding="utf-8").splitlines()
-                        if line.strip()
-                    ]
-                    if len(event_lines) == 1:
-                        initial_event = json.loads(event_lines[0])
-                except (FileNotFoundError, json.JSONDecodeError, OSError):
-                    pass
-                if (
-                    isinstance(projection, dict)
-                    and projection.get("run_id") == row["run_id"]
-                    and projection.get("event_sequence") == 1
-                    and isinstance(initial_event, dict)
-                    and initial_event.get("run_id") == row["run_id"]
-                    and initial_event.get("sequence") == 1
-                    and initial_event.get("event_type") == "run_admitted"
-                ):
+                    projection, _, _ = self._corroborate_run_evidence(
+                        run_directory, run_id=row["run_id"]
+                    )
+                except (OSError, ValueError, json.JSONDecodeError, JournalRecoveryError):
+                    projection = None
+                if projection is not None and projection["event_sequence"] == 1:
                     desired_status = row["desired_status"] or projection["status"]
                     connection.execute(
                         "UPDATE runs SET admission_state='published', status=?, "
@@ -412,49 +682,138 @@ class RunStore:
                 staging = (
                     Path(row["staging_directory"]) if row["staging_directory"] else None
                 )
+                preserved_paths = []
                 if run_directory.exists():
-                    quarantine = self.quarantine_root / (
-                        f"incomplete-{row['run_id']}-{uuid.uuid4().hex}"
+                    preserved_paths.append(
+                        self._quarantine_evidence(
+                            run_directory, prefix=f"incomplete-{row['run_id']}"
+                        )
                     )
-                    os.replace(run_directory, quarantine)
-                    shutil.rmtree(quarantine, ignore_errors=True)
-                if staging is not None:
-                    shutil.rmtree(staging, ignore_errors=True)
+                if staging is not None and staging.exists():
+                    preserved_paths.append(
+                        self._quarantine_evidence(
+                            staging, prefix=f"staging-{row['run_id']}"
+                        )
+                    )
                 connection.execute("DELETE FROM runs WHERE run_id=?", (row["run_id"],))
                 self._record_admission_event(
                     connection,
                     "admission_reservation_released",
                     run_id=row["run_id"],
                     reason_code="incomplete_publication",
+                    payload={"preserved_paths": [str(path) for path in preserved_paths]},
                 )
 
+            published = connection.execute(
+                "SELECT * FROM runs WHERE admission_state='published'"
+            ).fetchall()
             known_directories = {
-                str(Path(row["run_directory"]).resolve())
-                for row in connection.execute(
-                    "SELECT run_directory FROM runs WHERE admission_state='published'"
-                )
+                str(Path(row["run_directory"]).resolve()) for row in published
             }
+            for row in published:
+                run_directory = Path(row["run_directory"])
+                try:
+                    projection, projection_hash, journal_hash = (
+                        self._corroborate_run_evidence(
+                            run_directory, run_id=row["run_id"]
+                        )
+                    )
+                except (OSError, ValueError, json.JSONDecodeError, JournalRecoveryError):
+                    self._mark_repair_required(
+                        "published_evidence_uncorroborated", run_id=row["run_id"]
+                    )
+                    self._record_repair_event(
+                        connection,
+                        reason_code="published_evidence_uncorroborated",
+                        outcome="evidence_preserved",
+                        run_id=row["run_id"],
+                        source_path=run_directory,
+                    )
+                    continue
+                if row["status"] != projection["status"]:
+                    connection.execute(
+                        "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                        (projection["status"], projection["updated_at"], row["run_id"]),
+                    )
+                    self._mark_repair_required(
+                        "index_status_inconsistent", run_id=row["run_id"]
+                    )
+                    self._record_repair_event(
+                        connection,
+                        reason_code="index_status_inconsistent",
+                        outcome="index_rebuilt",
+                        run_id=row["run_id"],
+                        source_path=run_directory,
+                        projection_sha256=projection_hash,
+                        journal_sha256=journal_hash,
+                    )
+
             for workflow_directory in self.runs_root.iterdir():
                 if not workflow_directory.is_dir():
                     continue
-                for run_directory in workflow_directory.iterdir():
+                for run_directory in tuple(workflow_directory.iterdir()):
                     if not run_directory.is_dir():
                         continue
                     if str(run_directory.resolve()) in known_directories:
                         continue
-                    quarantine = self.quarantine_root / (
-                        f"orphan-{run_directory.name}-{uuid.uuid4().hex}"
-                    )
-                    os.replace(run_directory, quarantine)
-                    shutil.rmtree(quarantine, ignore_errors=True)
-                    self._record_admission_event(
+                    run_id = run_directory.name
+                    try:
+                        projection, projection_hash, journal_hash = (
+                            self._corroborate_run_evidence(
+                                run_directory, run_id=run_id
+                            )
+                        )
+                        self._rebuild_admission_row(
+                            connection,
+                            directory=run_directory,
+                            projection=projection,
+                        )
+                    except (
+                        OSError,
+                        ValueError,
+                        json.JSONDecodeError,
+                        JournalRecoveryError,
+                        sqlite3.IntegrityError,
+                    ):
+                        projection_hash = (
+                            _sha256((run_directory / "run.json").read_bytes())
+                            if (run_directory / "run.json").is_file()
+                            else None
+                        )
+                        journal_hash = (
+                            _sha256((run_directory / "events.jsonl").read_bytes())
+                            if (run_directory / "events.jsonl").is_file()
+                            else None
+                        )
+                        preserved = self._quarantine_evidence(
+                            run_directory, prefix=f"orphan-{run_id}"
+                        )
+                        self._mark_repair_required(
+                            "orphan_evidence_uncorroborated", run_id=run_id
+                        )
+                        self._record_repair_event(
+                            connection,
+                            reason_code="orphan_evidence_uncorroborated",
+                            outcome="evidence_quarantined",
+                            run_id=run_id,
+                            source_path=run_directory,
+                            preserved_path=preserved,
+                            projection_sha256=projection_hash,
+                            journal_sha256=journal_hash,
+                        )
+                        continue
+                    self._mark_repair_required("index_run_missing", run_id=run_id)
+                    self._record_repair_event(
                         connection,
-                        "orphan_run_removed",
-                        run_id=run_directory.name,
-                        reason_code="missing_admission_reservation",
+                        reason_code="index_run_missing",
+                        outcome="index_rebuilt",
+                        run_id=run_id,
+                        source_path=run_directory,
+                        projection_sha256=projection_hash,
+                        journal_sha256=journal_hash,
                     )
 
-            for staging in self.staging_root.iterdir():
+            for staging in tuple(self.staging_root.iterdir()):
                 if not staging.is_dir() or str(staging.resolve()) in reserved_staging:
                     continue
                 marker = staging / ".snapshot-owner.json"
@@ -470,11 +829,14 @@ class RunStore:
                     snapshot_fresh = False
                 if owner_alive and snapshot_fresh:
                     continue
-                shutil.rmtree(staging, ignore_errors=True)
+                preserved = self._quarantine_evidence(
+                    staging, prefix="orphan-snapshot"
+                )
                 self._record_admission_event(
                     connection,
                     "orphan_snapshot_removed",
                     reason_code="snapshot_owner_exited",
+                    payload={"preserved_path": str(preserved)},
                 )
 
     def list_admission_events(
@@ -499,6 +861,116 @@ class RunStore:
             }
             for row in rows
         )
+
+    def storage_health(self) -> dict[str, object]:
+        try:
+            marker = json.loads(self.repair_marker.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"status": "healthy", "reasons": []}
+        except (OSError, json.JSONDecodeError):
+            return {
+                "status": "repair_required",
+                "reasons": [{"reason_code": "repair_marker_unreadable", "run_id": None}],
+            }
+        reasons = marker.get("reasons") if isinstance(marker, dict) else None
+        return {
+            "status": "repair_required",
+            "detected_at": marker.get("detected_at")
+            if isinstance(marker, dict)
+            else None,
+            "reasons": reasons if isinstance(reasons, list) else [],
+        }
+
+    def list_repair_events(
+        self, *, limit: int = 100
+    ) -> tuple[dict[str, object], ...]:
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT sequence, detected_at, reason_code, outcome, run_id, "
+                "source_path, preserved_path, projection_sha256, journal_sha256, "
+                "payload_json FROM repair_events ORDER BY sequence LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return tuple(
+            {
+                "sequence": row["sequence"],
+                "detected_at": row["detected_at"],
+                "reason_code": row["reason_code"],
+                "outcome": row["outcome"],
+                "run_id": row["run_id"],
+                "source_path": row["source_path"],
+                "preserved_path": row["preserved_path"],
+                "projection_sha256": row["projection_sha256"],
+                "journal_sha256": row["journal_sha256"],
+                "payload": json.loads(row["payload_json"]),
+            }
+            for row in rows
+        )
+
+    def repair_storage(self) -> dict[str, object]:
+        """Acknowledge a fully corroborated index rebuild and reopen admission."""
+        with self._admission_gate, workflow_lock(self.admission_lock):
+            health = self.storage_health()
+            if health["status"] == "healthy":
+                return health
+            reasons = health.get("reasons")
+            unresolved = {
+                "orphan_evidence_uncorroborated",
+                "published_evidence_uncorroborated",
+                "repair_marker_unreadable",
+            }
+            if isinstance(reasons, list) and any(
+                isinstance(reason, dict)
+                and reason.get("reason_code") in unresolved
+                for reason in reasons
+            ):
+                raise JournalRecoveryError(
+                    "storage evidence is uncorroborated and requires manual repair"
+                )
+            with self._connect() as connection:
+                rows = connection.execute(
+                    "SELECT run_id, run_directory, status FROM runs "
+                    "WHERE admission_state='published'"
+                ).fetchall()
+                indexed_directories = set()
+                for row in rows:
+                    directory = Path(row["run_directory"])
+                    projection, _, _ = self._corroborate_run_evidence(
+                        directory, run_id=row["run_id"]
+                    )
+                    if projection["status"] != row["status"]:
+                        raise JournalRecoveryError(
+                            f"admission status remains inconsistent: {row['run_id']}"
+                        )
+                    indexed_directories.add(str(directory.resolve()))
+                evidence_directories = {
+                    str(run.resolve())
+                    for workflow in self.runs_root.iterdir()
+                    if workflow.is_dir()
+                    for run in workflow.iterdir()
+                    if run.is_dir()
+                }
+                if evidence_directories != indexed_directories:
+                    raise JournalRecoveryError(
+                        "admission index does not cover every run directory"
+                    )
+                generation = connection.execute(
+                    "SELECT value FROM store_metadata WHERE key='generation'"
+                ).fetchone()["value"]
+                self._record_repair_event(
+                    connection,
+                    reason_code="operator_repair",
+                    outcome="repair_completed",
+                    payload={"run_count": len(rows)},
+                )
+            _atomic_json(
+                self.authority_marker,
+                {"schema_version": 1, "generation": generation},
+            )
+            self.repair_marker.unlink(missing_ok=True)
+            return {"status": "healthy", "reasons": []}
 
     def _reconcile_worker_claims(self) -> None:
         """Converge the capacity ledger with durable run projections."""
@@ -559,9 +1031,13 @@ class RunStore:
             factory=_ClosingConnection,
         )
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA busy_timeout=5000")
-        connection.execute("PRAGMA synchronous=FULL")
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute("PRAGMA synchronous=FULL")
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     def prepare_empty_snapshot(
@@ -904,6 +1380,9 @@ class RunStore:
         *,
         immutable_snapshot: PreparedRunSnapshot,
     ) -> RunAdmissionResult:
+        if self.storage_health()["status"] != "healthy":
+            shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
+            return RunAdmissionResult(None, "rejected", "storage_repair_required")
         if not request.idempotency_key:
             raise ValueError("idempotency_key must not be empty")
         metadata = dict(request.run_metadata or {})
@@ -1097,6 +1576,7 @@ class RunStore:
             "operator_scope_digest": operator_scope_digest,
             "run_metadata": dict(sorted((request.run_metadata or {}).items())),
             "concurrency_key": request.concurrency_key,
+            "concurrency_policy": request.concurrency_policy,
             "admission_disposition": disposition,
             "queue_position": queue_position,
             "blocked_by_run_id": blocked_by,

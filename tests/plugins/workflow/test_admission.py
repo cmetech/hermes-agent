@@ -3,6 +3,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import shutil
+import sqlite3
 import threading
 
 import pytest
@@ -332,3 +334,148 @@ def test_snapshot_owner_probe_uses_cross_platform_pid_helper(monkeypatch) -> Non
 
     assert RunStore._snapshot_owner_alive(12345) is True
     assert observed == [12345]
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing", "empty", "corrupt", "replaced", "partial"]
+)
+def test_damaged_admission_index_preserves_and_recovers_corroborated_run_evidence(
+    tmp_path, workflow_writer, damage
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    prepared = _prepared(store, workflow_writer, tmp_path)
+    admitted = store.start_run(_request(prepared), immutable_snapshot=prepared)
+    run_id = admitted.run_id
+    assert run_id
+    evidence_directory = store.run_directory(run_id)
+    projection_before = (evidence_directory / "run.json").read_bytes()
+    journal_before = (evidence_directory / "events.jsonl").read_bytes()
+
+    if damage == "replaced":
+        replacement = RunStore(tmp_path / "replacement-home")
+        shutil.copyfile(replacement.database, store.database)
+    elif damage == "partial":
+        partial = tmp_path / "partial.sqlite3"
+        with sqlite3.connect(partial) as connection:
+            connection.execute(
+                "CREATE TABLE runs (run_id TEXT PRIMARY KEY, status TEXT NOT NULL)"
+            )
+        shutil.copyfile(partial, store.database)
+    else:
+        store.database.unlink()
+        if damage == "empty":
+            store.database.touch()
+            store.authority_marker.unlink()
+        elif damage == "corrupt":
+            store.database.write_bytes(b"not a sqlite database")
+
+    restarted = RunStore(home)
+
+    assert evidence_directory.is_dir()
+    assert (evidence_directory / "run.json").read_bytes() == projection_before
+    assert (evidence_directory / "events.jsonl").read_bytes() == journal_before
+    assert restarted.load_run(run_id)["status"] == "running"
+    assert restarted.storage_health()["status"] == "repair_required"
+    repair = restarted.list_repair_events()[-1]
+    assert repair["run_id"] == run_id
+    assert repair["outcome"] == "index_rebuilt"
+    assert repair["projection_sha256"]
+    assert repair["journal_sha256"]
+
+    blocked_snapshot = _prepared(
+        restarted, workflow_writer, tmp_path, name="blocked-after-index-damage"
+    )
+    blocked = restarted.start_run(
+        _request(
+            blocked_snapshot,
+            key="blocked-after-index-damage",
+            name="blocked-after-index-damage",
+        ),
+        immutable_snapshot=blocked_snapshot,
+    )
+    assert blocked.reason_code == "storage_repair_required"
+    assert not blocked_snapshot.staging_directory.exists()
+
+    assert restarted.repair_storage()["status"] == "healthy"
+    resumed_snapshot = _prepared(
+        restarted, workflow_writer, tmp_path, name="after-index-repair"
+    )
+    resumed = restarted.start_run(
+        _request(
+            resumed_snapshot,
+            key="after-index-repair",
+            name="after-index-repair",
+        ),
+        immutable_snapshot=resumed_snapshot,
+    )
+    assert resumed.disposition == "created"
+
+
+def test_status_inconsistency_uses_corroborated_evidence_and_requires_repair(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    prepared = _prepared(store, workflow_writer, tmp_path)
+    run_id = store.start_run(_request(prepared), immutable_snapshot=prepared).run_id
+    assert run_id
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE runs SET status='failed' WHERE run_id=?",
+            (run_id,),
+        )
+
+    restarted = RunStore(home)
+
+    assert restarted.get_run_status(run_id)["status"] == "running"
+    assert restarted.storage_health()["status"] == "repair_required"
+    repair = restarted.list_repair_events()[-1]
+    assert repair["reason_code"] == "index_status_inconsistent"
+    assert repair["outcome"] == "index_rebuilt"
+
+
+def test_uncorroborated_orphan_evidence_is_quarantined_without_deletion(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    prepared = _prepared(store, workflow_writer, tmp_path)
+    run_id = store.start_run(_request(prepared), immutable_snapshot=prepared).run_id
+    assert run_id
+    evidence_directory = store.run_directory(run_id)
+    events_path = evidence_directory / "events.jsonl"
+    event = json.loads(events_path.read_text())
+    event["projection_sha256"] = "0" * 64
+    events_path.write_text(json.dumps(event, sort_keys=True) + "\n")
+    store.database.unlink()
+
+    restarted = RunStore(home)
+
+    assert not evidence_directory.exists()
+    preserved = list(restarted.quarantine_root.glob(f"orphan-{run_id}-*"))
+    assert len(preserved) == 1
+    assert (preserved[0] / "run.json").is_file()
+    assert (preserved[0] / "events.jsonl").is_file()
+    assert restarted.storage_health()["status"] == "repair_required"
+    repair = restarted.list_repair_events()[-1]
+    assert repair["run_id"] == run_id
+    assert repair["outcome"] == "evidence_quarantined"
+    assert repair["preserved_path"] == str(preserved[0])
+    with pytest.raises(KeyError):
+        restarted.load_run(run_id)
+
+
+def test_corrupt_index_is_preserved_for_forensics(tmp_path, workflow_writer) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    prepared = _prepared(store, workflow_writer, tmp_path)
+    store.start_run(_request(prepared), immutable_snapshot=prepared)
+    corrupt_bytes = b"not a sqlite database"
+    store.database.write_bytes(corrupt_bytes)
+
+    restarted = RunStore(home)
+
+    preserved = list(restarted.quarantine_root.glob("admission-index-*/admission.sqlite3"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == corrupt_bytes
