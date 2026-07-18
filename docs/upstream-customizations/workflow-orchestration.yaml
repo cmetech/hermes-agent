@@ -20,6 +20,34 @@ coverage:
   - commit: 25233c88cc37671da769a37c17a322f6dc618dc8
     reason: Separate user-requested v2.0.5 release preparation.
 upstream_changes:
+- id: brand-aware-version-label
+  change_class: branding-generic
+  owner: downstream-branding
+  files:
+  - hermes_constants.py
+  - hermes_cli/banner.py
+  - hermes_cli/main.py
+  - tests/hermes_cli/test_version_product_label.py
+  - tests/hermes_cli/test_banner_git_state.py
+  - tests/hermes_cli/test_tui_resume_flow.py
+  owned_symbols:
+  - version_agent_label
+  - format_banner_version_label
+  - _print_fast_version_info
+  tests:
+  - tests/hermes_cli/test_version_product_label.py
+  - tests/hermes_cli/test_banner_git_state.py
+  - tests/hermes_cli/test_tui_resume_flow.py
+  - tests/cli/test_version_command.py
+  - tests/gateway/test_version_command.py
+  expected_commit_subject: 'fix(branding): use co-worker version label'
+  upstream_candidate: true
+  merge_guidance: Preserve neutral Hermes identity while deriving every branded
+    version label from the generator-owned build identity, including the
+    dependency-light Termux fast path.
+  removal_condition: Remove when upstream exposes an equivalent generated
+    product identity consumed by every version-output path.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: gateway-live-completion-eligibility
   change_class: model-selection-generic
   owner: workflow-orchestration
