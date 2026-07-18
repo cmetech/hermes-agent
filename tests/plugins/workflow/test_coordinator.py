@@ -632,6 +632,28 @@ def test_foreground_execution_lease_requires_exact_unexpired_fencing_token(
         now=admitted_at + timedelta(seconds=1),
         lease_seconds=30,
     )
+
+    assert not store.claim_foreground_execution(
+        admitted.run_id,
+        owner_id="replacement-owner",
+        now=admitted_at + timedelta(seconds=2),
+        lease_seconds=30,
+    )
+    assert store.release_foreground_execution(
+        admitted.run_id,
+        owner_id="foreground-owner",
+        epoch=1,
+        now=admitted_at + timedelta(seconds=2),
+    )
+    replacement = store.claim_foreground_execution(
+        admitted.run_id,
+        owner_id="replacement-owner",
+        now=admitted_at + timedelta(seconds=3),
+        lease_seconds=30,
+    )
+    assert replacement is not None
+    assert replacement.owner_id == "replacement-owner"
+    assert replacement.epoch == 2
     assert not store.renew_foreground_execution(
         admitted.run_id,
         owner_id="foreground-owner",

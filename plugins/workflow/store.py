@@ -73,6 +73,13 @@ class ArtifactRef:
     sha256: str
 
 
+@dataclass(frozen=True)
+class ForegroundExecutionLease:
+    owner_id: str
+    epoch: int
+    lease_expires_at: datetime
+
+
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
 _STORE_SCHEMA_VERSION = 4
@@ -2472,6 +2479,156 @@ class RunStore:
                 break
         return tuple(results)
 
+    def claim_foreground_execution(
+        self,
+        run_id: str,
+        *,
+        owner_id: str,
+        now: datetime,
+        lease_seconds: float,
+    ) -> ForegroundExecutionLease | None:
+        """Claim an expired/released safe foreground run under a new epoch."""
+        if not owner_id or len(owner_id) > 256:
+            raise ValueError("owner_id must be bounded text")
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int | float)
+            or not math.isfinite(float(lease_seconds))
+            or lease_seconds <= 0
+        ):
+            raise ValueError("lease_seconds must be positive and finite")
+        instant = now.astimezone(timezone.utc)
+        expires_at = instant + timedelta(seconds=float(lease_seconds))
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection.get("execution_mode") != "foreground":
+                return None
+            if projection.get("status") not in _NONTERMINAL:
+                return None
+            if any(
+                isinstance(node, Mapping)
+                and (
+                    isinstance(node.get("claim"), Mapping)
+                    or (
+                        isinstance(node.get("recovery"), Mapping)
+                        and node["recovery"].get("observation")
+                        in {"still_running", "outcome_uncertain"}
+                        and not node["recovery"].get("termination_confirmed")
+                    )
+                )
+                for node in projection.get("nodes", {}).values()
+            ):
+                return None
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                coordinator = connection.execute(
+                    "SELECT 1 FROM coordinator_lease WHERE singleton=1 "
+                    "AND lease_expires_at>?",
+                    (instant.isoformat(),),
+                ).fetchone()
+                row = connection.execute(
+                    "SELECT foreground_lease_expires_at, foreground_epoch "
+                    "FROM runs WHERE run_id=? AND execution_mode='foreground' "
+                    "AND status IN ('queued','running','waiting_retry','paused','interrupted')",
+                    (run_id,),
+                ).fetchone()
+                if (
+                    coordinator is not None
+                    or row is None
+                    or (
+                        row["foreground_lease_expires_at"] is not None
+                        and datetime.fromisoformat(row["foreground_lease_expires_at"])
+                        > instant
+                    )
+                ):
+                    connection.rollback()
+                    return None
+                epoch = int(row["foreground_epoch"] or 0) + 1
+                projection["foreground_owner_id"] = owner_id
+                projection["foreground_epoch"] = epoch
+                projection["foreground_lease_expires_at"] = expires_at.isoformat()
+                self._append_locked(
+                    directory,
+                    projection,
+                    "foreground_execution_claimed",
+                    {"owner_id": owner_id, "epoch": epoch},
+                )
+                connection.execute(
+                    "UPDATE runs SET foreground_owner_id=?, foreground_epoch=?, "
+                    "foreground_lease_expires_at=?, updated_at=? WHERE run_id=?",
+                    (
+                        owner_id,
+                        epoch,
+                        expires_at.isoformat(),
+                        projection["updated_at"],
+                        run_id,
+                    ),
+                )
+                connection.commit()
+                return ForegroundExecutionLease(owner_id, epoch, expires_at)
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    def release_foreground_execution(
+        self,
+        run_id: str,
+        *,
+        owner_id: str,
+        epoch: int,
+        now: datetime,
+    ) -> bool:
+        """Release an exact foreground fencing token after local quiescence."""
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        instant = now.astimezone(timezone.utc)
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT 1 FROM runs WHERE run_id=? "
+                    "AND execution_mode='foreground' AND foreground_owner_id=? "
+                    "AND foreground_epoch=?",
+                    (run_id, owner_id, epoch),
+                ).fetchone()
+                if row is None:
+                    connection.rollback()
+                    return False
+                projection["foreground_lease_expires_at"] = instant.isoformat()
+                self._append_locked(
+                    directory,
+                    projection,
+                    "foreground_execution_released",
+                    {"owner_id": owner_id, "epoch": epoch},
+                )
+                connection.execute(
+                    "UPDATE runs SET foreground_lease_expires_at=?, updated_at=? "
+                    "WHERE run_id=? AND foreground_owner_id=? AND foreground_epoch=?",
+                    (
+                        instant.isoformat(),
+                        projection["updated_at"],
+                        run_id,
+                        owner_id,
+                        epoch,
+                    ),
+                )
+                connection.commit()
+                return True
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
     def renew_foreground_execution(
         self,
         run_id: str,
@@ -2572,7 +2729,19 @@ class RunStore:
             coordinator_facts = {
                 "status": "not_required",
                 "reason_code": "foreground_execution",
+                "owner_id": run.get("foreground_owner_id"),
+                "epoch": run.get("foreground_epoch"),
+                "lease_expires_at": run.get("foreground_lease_expires_at"),
             }
+        foreground_owner_missing = (
+            execution_mode == "foreground"
+            and status == "running"
+            and (
+                not isinstance(run.get("foreground_lease_expires_at"), str)
+                or datetime.fromisoformat(run["foreground_lease_expires_at"])
+                <= observed_at
+            )
+        )
         stale_claim = any(
             isinstance(node, dict)
             and node.get("state") in {"claimed", "running"}
@@ -2614,6 +2783,9 @@ class RunStore:
             ):
                 health = "coordinator_unavailable"
                 blocking_reason = observed.reason_code
+        elif foreground_owner_missing:
+            health = "stalled"
+            blocking_reason = "foreground_owner_unavailable"
         elif stale_claim:
             health = "stalled"
             blocking_reason = "node_lease_expired"

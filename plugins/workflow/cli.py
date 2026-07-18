@@ -1318,15 +1318,23 @@ def _cmd_run(
         _emit(payload, as_json=args.json)
         return 1
     if admitted.disposition == "created" and execution_mode == "foreground":
-        _scheduler(
-            store,
-            runtime,
-            agent_runner=agent_runner,
-            profile_name=profile_name,
-            owner_id=foreground_owner_id,
-            execution_owner_id=foreground_owner_id,
-            execution_owner_epoch=1,
-        ).advance(admitted.run_id)
+        try:
+            _scheduler(
+                store,
+                runtime,
+                agent_runner=agent_runner,
+                profile_name=profile_name,
+                owner_id=foreground_owner_id,
+                execution_owner_id=foreground_owner_id,
+                execution_owner_epoch=1,
+            ).advance(admitted.run_id)
+        finally:
+            store.release_foreground_execution(
+                admitted.run_id,
+                owner_id=foreground_owner_id,
+                epoch=1,
+                now=datetime.now(timezone.utc),
+            )
     elif (
         admitted.disposition == "created"
         and execution_mode == "background"
@@ -1434,15 +1442,32 @@ def _continue_foreground_if_owned(
     health = CoordinatorStore(store.database).health(now=datetime.now(timezone.utc))
     if health.status == "healthy":
         return
-    _scheduler(
-        store,
-        runtime,
-        agent_runner=agent_runner,
-        profile_name=profile_name,
-        owner_id=projection.get("foreground_owner_id"),
-        execution_owner_id=projection.get("foreground_owner_id"),
-        execution_owner_epoch=projection.get("foreground_epoch"),
-    ).advance(run_id)
+    owner_id = f"foreground-{os.getpid()}-{secrets.token_hex(16)}"
+    lease = store.claim_foreground_execution(
+        run_id,
+        owner_id=owner_id,
+        now=datetime.now(timezone.utc),
+        lease_seconds=runtime.lease_seconds,
+    )
+    if lease is None:
+        return
+    try:
+        _scheduler(
+            store,
+            runtime,
+            agent_runner=agent_runner,
+            profile_name=profile_name,
+            owner_id=lease.owner_id,
+            execution_owner_id=lease.owner_id,
+            execution_owner_epoch=lease.epoch,
+        ).advance(run_id)
+    finally:
+        store.release_foreground_execution(
+            run_id,
+            owner_id=lease.owner_id,
+            epoch=lease.epoch,
+            now=datetime.now(timezone.utc),
+        )
 
 
 def _cmd_provide_input(

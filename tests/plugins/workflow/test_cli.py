@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 
@@ -330,6 +331,57 @@ def test_run_status_events_and_runs_use_the_durable_store(
     args = parser.parse_args([*common, "runs", "--status", "succeeded", "--json"])
     assert args.func(args) == 0
     assert json.loads(capsys.readouterr().out)[0]["run_id"] == run["run_id"]
+
+
+def test_foreground_cli_releases_at_gate_and_claims_new_epoch_for_continue(
+    workflow_writer, tmp_path, capsys
+) -> None:
+    workdir = tmp_path / "repo"
+    path = workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="foreground-gate",
+        nodes=[
+            {"id": "gate", "approval": {"message": "Continue?"}},
+            {"id": "finish", "bash": "true", "depends_on": ["gate"]},
+        ],
+    )
+    profile = tmp_path / "profile"
+    package = load_workflow(path)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(profile).trust(
+        digest.sha256, actor="test", risk_digest=risk.risk_digest
+    )
+    parser = _parser()
+    common = ["--workdir", str(workdir), "--hermes-home", str(profile)]
+
+    start_args = parser.parse_args([
+        *common,
+        "run",
+        "foreground-gate",
+        "--idempotency-key",
+        "foreground-gate",
+        "--json",
+    ])
+    assert start_args.func(start_args) == 1
+    paused = json.loads(capsys.readouterr().out)
+    assert paused["status"] == "paused"
+    assert datetime.fromisoformat(paused["foreground_lease_expires_at"]) <= datetime.now(
+        timezone.utc
+    )
+
+    approve_args = parser.parse_args([
+        *common,
+        "approve",
+        paused["run_id"],
+        "--continue",
+        "--json",
+    ])
+    assert approve_args.func(approve_args) == 0
+    completed = json.loads(capsys.readouterr().out)
+    assert completed["run_status"] == "succeeded"
+    projection = RunStore(profile).load_run(paused["run_id"])
+    assert projection["foreground_epoch"] == 2
 
 
 def test_run_refuses_trusted_package_that_requires_an_isolated_backend(
