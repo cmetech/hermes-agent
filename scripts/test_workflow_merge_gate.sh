@@ -58,6 +58,8 @@ if [[ "$PHASE" == "base" ]]; then
       tests/hermes_cli/test_capability_staging.py \
       tests/hermes_cli/test_baked_seed.py \
       tests/test_packaging_metadata.py
+    "$PYTHON_BIN" -m pytest -q -m integration \
+      tests/plugins/workflow/test_installed_distribution_e2e.py
     SHARED_GIT_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
     SHARED_ROOT="$(dirname "$SHARED_GIT_DIR")"
     if [[ ! -d node_modules && -d "$SHARED_ROOT/node_modules" ]]; then
