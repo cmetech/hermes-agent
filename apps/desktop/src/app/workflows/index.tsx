@@ -6,9 +6,9 @@ import { ActivityBoard } from '@/components/activity-board/activity-board'
 import { PageLoader } from '@/components/page-loader'
 import { Button } from '@/components/ui/button'
 import {
+  executeWorkflowCleanup,
   getApiRequestProfile,
   getWorkflowRun,
-  executeWorkflowCleanup,
   listWorkflowAttention,
   listWorkflowEvents,
   listWorkflowRuns,
@@ -111,6 +111,7 @@ export function WorkflowsView() {
   })
 
   const cleanupPreview = useMutation({ mutationFn: () => previewWorkflowCleanup('7d') })
+
   const cleanupExecute = useMutation({
     mutationFn: (token: string) => executeWorkflowCleanup(token, '7d'),
     onSuccess: () => {

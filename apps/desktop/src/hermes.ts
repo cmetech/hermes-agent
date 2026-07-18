@@ -234,7 +234,8 @@ export async function listSessions(
 
 export function listWorkflowRuns(cursor?: string, view: WorkflowRunView = 'board'): Promise<WorkflowRunPage> {
   const query = new URLSearchParams({ view })
-  if (cursor) query.set('cursor', cursor)
+
+  if (cursor) {query.set('cursor', cursor)}
 
   return window.hermesDesktop.api<WorkflowRunPage>({
     path: `/api/plugins/workflow/runs?${query.toString()}`,

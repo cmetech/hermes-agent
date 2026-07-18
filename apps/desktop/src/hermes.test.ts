@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  executeWorkflowCleanup,
   getApiRequestProfile,
   getCronJobs,
   getGlobalModelInfo,
@@ -12,7 +13,6 @@ import {
   getStatus,
   getWorkflowEvidence,
   getWorkflowRun,
-  executeWorkflowCleanup,
   listAllProfileSessions,
   listSessions,
   listWorkflowAttention,

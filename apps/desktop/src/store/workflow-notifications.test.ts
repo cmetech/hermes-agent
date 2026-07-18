@@ -25,9 +25,11 @@ describe('workflow notification delivery', () => {
 
   it('acknowledges only after Electron projection resolves', async () => {
     let resolveProjection!: (value: 'projected') => void
+
     const pending = new Promise<'projected'>(resolve => {
       resolveProjection = resolve
     })
+
     project.mockReturnValue(pending)
     lease.mockResolvedValue({
       items: [

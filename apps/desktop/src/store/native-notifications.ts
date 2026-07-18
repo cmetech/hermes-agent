@@ -174,6 +174,7 @@ export async function projectNativeNotification(input: NativeNotificationInput):
   if (!window.hermesDesktop?.notify) {
     throw new Error('Electron notification bridge unavailable')
   }
+
   await window.hermesDesktop.notify({
     actions: input.actions,
     body: input.body,
@@ -182,6 +183,7 @@ export async function projectNativeNotification(input: NativeNotificationInput):
     silent: input.silent,
     title: input.title
   })
+
   return 'projected'
 }
 
