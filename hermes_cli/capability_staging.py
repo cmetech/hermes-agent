@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Callable
@@ -164,23 +165,46 @@ def repair_authenticated_resource_checkout(resource_root: Path | str) -> bool:
                 or any(not path.startswith(f"{relative}/") for path in paths)
             ):
                 return False
-            materialized = subprocess.run(
-                [
-                    *git,
-                    "checkout-index",
-                    "--force",
-                    "--ignore-skip-worktree-bits",
-                    "--",
-                    *paths,
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=GIT_REPAIR_TIMEOUT,
-                env=_no_prompt_env(),
-            )
-            if materialized.returncode != 0:
-                return False
+            # A legacy Git-for-Windows index can suppress even a forced
+            # in-place checkout while reporting success. Materializing under a
+            # new prefix bypasses that stat-cache optimization. Keep the
+            # temporary tree on the repository volume, validate every output,
+            # then atomically replace only the tracked paths admitted above.
+            with tempfile.TemporaryDirectory(
+                prefix=".authenticated-resource-", dir=repo
+            ) as staging_dir:
+                staging = Path(staging_dir).resolve(strict=True)
+                prefix = f"{staging}{os.sep}"
+                materialized = subprocess.run(
+                    [
+                        *git,
+                        "checkout-index",
+                        "--force",
+                        "--ignore-skip-worktree-bits",
+                        f"--prefix={prefix}",
+                        "--",
+                        *paths,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=GIT_REPAIR_TIMEOUT,
+                    env=_no_prompt_env(),
+                )
+                if materialized.returncode != 0:
+                    return False
+
+                replacements: list[tuple[Path, Path]] = []
+                for path in paths:
+                    source = (staging / Path(path)).resolve(strict=True)
+                    source.relative_to(staging)
+                    if not source.is_file() or source.is_symlink():
+                        return False
+                    destination = repo / Path(path)
+                    replacements.append((source, destination))
+                for source, destination in replacements:
+                    os.replace(source, destination)
+
             verified = subprocess.run(
                 [*git, "ls-files", "--eol", "--", relative],
                 check=False,
