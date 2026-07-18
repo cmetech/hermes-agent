@@ -21,6 +21,13 @@ def sanitize_text(value: str, *, max_chars: int = 16_384) -> tuple[str, bool]:
     return cleaned[:max_chars], True
 
 
+def sanitize_evidence_bytes(
+    value: bytes, *, max_chars: int = 16_384
+) -> tuple[str, bool]:
+    """Decode and sanitize untrusted evidence through the shared text policy."""
+    return sanitize_text(value.decode("utf-8", errors="replace"), max_chars=max_chars)
+
+
 def sanitize_projection(value: object, *, key: str = "", depth: int = 0) -> object:
     if depth > 12:
         return "[TRUNCATED_DEPTH]"
@@ -47,4 +54,4 @@ def sanitize_projection(value: object, *, key: str = "", depth: int = 0) -> obje
     return sanitize_projection(str(value), key=key, depth=depth + 1)
 
 
-__all__ = ["sanitize_projection", "sanitize_text"]
+__all__ = ["sanitize_evidence_bytes", "sanitize_projection", "sanitize_text"]

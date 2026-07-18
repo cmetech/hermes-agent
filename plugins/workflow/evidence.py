@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 from typing import Mapping
 
-from plugins.workflow.sanitize import sanitize_projection, sanitize_text
+from plugins.workflow.sanitize import sanitize_evidence_bytes, sanitize_projection
 
 
 EVIDENCE_KINDS = frozenset({
@@ -20,6 +22,200 @@ EVIDENCE_KINDS = frozenset({
     "cleanup",
     "notifications",
 })
+
+_LOG_READ_LIMIT = 256 * 1024
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+
+
+class _UnsafeEvidencePath(Exception):
+    """An evidence candidate could not be proven to be a contained regular file."""
+
+
+def _identity(file_stat: os.stat_result) -> tuple[int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        stat.S_IFMT(file_stat.st_mode),
+    )
+
+
+def _is_reparse_point(file_stat: os.stat_result) -> bool:
+    attributes = getattr(file_stat, "st_file_attributes", 0)
+    return bool(attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _absolute_contained_path(root: Path, candidate: Path) -> tuple[Path, Path]:
+    root_absolute = Path(os.path.abspath(root))
+    candidate_absolute = Path(os.path.abspath(candidate))
+    try:
+        relative = candidate_absolute.relative_to(root_absolute)
+    except ValueError as exc:
+        raise _UnsafeEvidencePath from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise _UnsafeEvidencePath
+
+    try:
+        resolved_root = root_absolute.resolve(strict=True)
+        candidate_absolute.resolve(strict=False).relative_to(resolved_root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _UnsafeEvidencePath from exc
+    return root_absolute, relative
+
+
+def _open_flags(*, directory: bool = False) -> int:
+    flags = os.O_RDONLY
+    for name in ("O_CLOEXEC", "O_NOINHERIT", "O_NOFOLLOW"):
+        flags |= getattr(os, name, 0)
+    if directory:
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    else:
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+    return flags
+
+
+def _read_descriptor(file_descriptor: int, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        chunk = os.read(file_descriptor, min(remaining, 64 * 1024))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_posix_contained_file(
+    root: Path, relative: Path, limit: int
+) -> tuple[bytes, int]:
+    descriptors: list[int] = []
+    try:
+        directory_descriptor = os.open(root, _open_flags(directory=True))
+        descriptors.append(directory_descriptor)
+        if not stat.S_ISDIR(os.fstat(directory_descriptor).st_mode):
+            raise _UnsafeEvidencePath
+
+        for component in relative.parts[:-1]:
+            directory_descriptor = os.open(
+                component,
+                _open_flags(directory=True),
+                dir_fd=directory_descriptor,
+            )
+            descriptors.append(directory_descriptor)
+            directory_stat = os.fstat(directory_descriptor)
+            if not stat.S_ISDIR(directory_stat.st_mode) or _is_reparse_point(
+                directory_stat
+            ):
+                raise _UnsafeEvidencePath
+
+        filename = relative.parts[-1]
+        before = os.stat(filename, dir_fd=directory_descriptor, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or _is_reparse_point(before):
+            raise _UnsafeEvidencePath
+
+        file_descriptor = os.open(
+            filename,
+            _open_flags(),
+            dir_fd=directory_descriptor,
+        )
+        descriptors.append(file_descriptor)
+        opened = os.fstat(file_descriptor)
+        after_open = os.stat(
+            filename, dir_fd=directory_descriptor, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _is_reparse_point(opened)
+            or _identity(before) != _identity(opened)
+            or _identity(opened) != _identity(after_open)
+        ):
+            raise _UnsafeEvidencePath
+
+        data = _read_descriptor(file_descriptor, limit)
+        after_read = os.stat(
+            filename, dir_fd=directory_descriptor, follow_symlinks=False
+        )
+        if _identity(opened) != _identity(after_read):
+            raise _UnsafeEvidencePath
+        return data, opened.st_size
+    except (OSError, ValueError) as exc:
+        raise _UnsafeEvidencePath from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _reject_reparse_components(root: Path, relative: Path) -> os.stat_result:
+    current = root
+    root_stat = current.lstat()
+    if not stat.S_ISDIR(root_stat.st_mode) or _is_reparse_point(root_stat):
+        raise _UnsafeEvidencePath
+    for index, component in enumerate(relative.parts):
+        current /= component
+        component_stat = current.lstat()
+        if stat.S_ISLNK(component_stat.st_mode) or _is_reparse_point(component_stat):
+            raise _UnsafeEvidencePath
+        if index < len(relative.parts) - 1 and not stat.S_ISDIR(
+            component_stat.st_mode
+        ):
+            raise _UnsafeEvidencePath
+    return component_stat
+
+
+def _read_fallback_contained_file(
+    root: Path, relative: Path, limit: int
+) -> tuple[bytes, int]:
+    candidate = root / relative
+    file_descriptor: int | None = None
+    try:
+        before = _reject_reparse_components(root, relative)
+        if not stat.S_ISREG(before.st_mode):
+            raise _UnsafeEvidencePath
+        file_descriptor = os.open(candidate, _open_flags())
+        opened = os.fstat(file_descriptor)
+        after_open = _reject_reparse_components(root, relative)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _is_reparse_point(opened)
+            or _identity(before) != _identity(opened)
+            or _identity(opened) != _identity(after_open)
+        ):
+            raise _UnsafeEvidencePath
+        data = _read_descriptor(file_descriptor, limit)
+        after_read = _reject_reparse_components(root, relative)
+        if _identity(opened) != _identity(after_read):
+            raise _UnsafeEvidencePath
+        return data, opened.st_size
+    except (OSError, ValueError) as exc:
+        raise _UnsafeEvidencePath from exc
+    finally:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+
+
+def _read_contained_regular_file(
+    root: Path, candidate: Path, limit: int
+) -> tuple[bytes, int]:
+    """Read a bounded regular file without following untrusted path components."""
+    if limit < 0:
+        raise ValueError("evidence read limit must be non-negative")
+    root_absolute, relative = _absolute_contained_path(root, candidate)
+    descriptor_relative_supported = (
+        os.name != "nt"
+        and hasattr(os, "O_NOFOLLOW")
+        and os.stat in os.supports_dir_fd
+        and os.stat in os.supports_follow_symlinks
+    )
+    if descriptor_relative_supported:
+        return _read_posix_contained_file(root_absolute, relative, limit)
+    return _read_fallback_contained_file(root_absolute, relative, limit)
 
 
 class EvidenceReader:
@@ -54,15 +250,25 @@ class EvidenceReader:
                 "next_cursor": page["next_cursor"],
                 "truncated": len(page["events"]) == limit,
             }
-        items = self._items(run_id, run, kind=kind, operator_scope=operator_scope)
+        warnings: list[str] = []
+        if kind == "logs":
+            directory = self.store.run_directory(
+                run_id, operator_scope=operator_scope
+            )
+            items, warnings = self._logs(directory)
+        else:
+            items = self._items(run_id, run, kind=kind, operator_scope=operator_scope)
         page = items[after : after + limit]
-        return {
+        response = {
             "schema_version": 1,
             "kind": kind,
             "items": sanitize_projection(page),
             "next_cursor": after + len(page),
             "truncated": after + len(page) < len(items),
         }
+        if warnings:
+            response["warnings"] = warnings
+        return response
 
     def _items(self, run_id, run, *, kind, operator_scope):
         nodes = run.get("nodes", {})
@@ -124,30 +330,33 @@ class EvidenceReader:
             from plugins.workflow.notifications import NotificationOutbox
 
             return list(NotificationOutbox(self.store).history(run_id=run_id))
-        if kind == "logs":
-            directory = self.store.run_directory(run_id, operator_scope=operator_scope)
-            return self._logs(directory)
         return []
 
     @staticmethod
-    def _logs(directory: Path) -> list[dict[str, object]]:
+    def _logs(directory: Path) -> tuple[list[dict[str, object]], list[str]]:
         items = []
-        remaining = 256 * 1024
+        warnings: list[str] = []
+        remaining = _LOG_READ_LIMIT
         for path in sorted((directory / "nodes").glob("*/*/std*.txt")):
             if remaining <= 0:
                 break
-            data = path.read_bytes()[:remaining]
+            try:
+                data, size = _read_contained_regular_file(directory, path, remaining)
+            except _UnsafeEvidencePath:
+                if "unsafe_evidence_path" not in warnings:
+                    warnings.append("unsafe_evidence_path")
+                continue
             remaining -= len(data)
-            text, truncated = sanitize_text(data.decode("utf-8", errors="replace"))
+            text, truncated = sanitize_evidence_bytes(data)
             items.append({
                 "node_id": path.parent.parent.name,
                 "attempt_id": path.parent.name,
                 "stream": "stderr" if path.name == "stderr.txt" else "stdout",
                 "text": text,
                 "bytes_returned": len(data),
-                "truncated": truncated or path.stat().st_size > len(data),
+                "truncated": truncated or size > len(data),
             })
-        return items
+        return items, warnings
 
 
-__all__ = ["EVIDENCE_KINDS", "EvidenceReader"]
+__all__ = ["EVIDENCE_KINDS", "EvidenceReader", "_read_contained_regular_file"]
