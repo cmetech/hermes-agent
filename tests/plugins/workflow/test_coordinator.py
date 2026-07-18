@@ -406,6 +406,107 @@ def test_background_admission_requires_a_fresh_coordinator_without_evidence_leak
     assert list(store.runs_root.glob("*/*")) == []
 
 
+def test_background_status_exposes_coordinator_loss_and_structural_stall(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path)
+    coordinator = CoordinatorStore(store.database)
+    now = datetime.now(timezone.utc)
+    identity = _identity("status-owner")
+    acquired = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    package = load_workflow(workflow_writer(tmp_path / "package", name="health"))
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="health",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="health",
+            concurrency_key="health",
+            execution_mode="background",
+        ),
+        immutable_snapshot=prepared,
+    )
+
+    healthy = store.get_run_status(admitted.run_id)
+    assert healthy["health"] == "healthy"
+    assert healthy["coordinator"]["status"] == "healthy"
+    assert healthy["coordinator"]["epoch"] == acquired.lease.epoch
+
+    assert coordinator.release(
+        identity,
+        epoch=acquired.lease.epoch,
+        now=datetime.now(timezone.utc),
+    )
+    unavailable = store.get_run_status(admitted.run_id)
+    assert unavailable["health"] == "coordinator_unavailable"
+    assert unavailable["blocking_reason"] == "coordinator_lease_expired"
+
+    service = _service(
+        tmp_path,
+        host_kind="gateway",
+        host_instance_id="replacement-owner",
+    )
+    stop = threading.Event()
+    thread = threading.Thread(target=service.run, args=(stop,))
+    thread.start()
+    try:
+        _wait_until(lambda: service.health().code == "leader")
+        _wait_until(
+            lambda: store.get_run_status(admitted.run_id)["status"] == "succeeded"
+        )
+        recovered = store.get_run_status(admitted.run_id)
+        assert recovered["health"] == "terminal"
+        assert recovered["coordinator"]["status"] == "healthy"
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+
+def test_running_graph_with_no_current_node_is_reported_stalled(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path)
+    coordinator = CoordinatorStore(store.database)
+    assert coordinator.try_acquire(
+        _identity("stall-owner"),
+        now=datetime.now(timezone.utc),
+        lease_seconds=30,
+    ).is_leader
+    package = load_workflow(workflow_writer(tmp_path / "package", name="stalled"))
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="stalled",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="stalled",
+            concurrency_key="stalled",
+            execution_mode="background",
+        ),
+        immutable_snapshot=prepared,
+    )
+    projection = store.load_run(admitted.run_id)
+    nodes = {key: dict(value) for key, value in projection["nodes"].items()}
+    nodes["start"]["state"] = "succeeded"
+    store.append_event(
+        admitted.run_id,
+        "fault_injected_pending_finalization",
+        projection_updates={"nodes": nodes},
+    )
+
+    status = store.get_run_status(admitted.run_id)
+
+    assert status["status"] == "running"
+    assert status["health"] == "stalled"
+    assert status["blocking_reason"] == "no_runnable_or_owned_node"
+
+
 def test_foreground_and_background_admission_are_fenced_by_live_leader(
     tmp_path, workflow_writer
 ) -> None:

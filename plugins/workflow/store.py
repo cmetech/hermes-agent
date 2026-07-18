@@ -2514,6 +2514,7 @@ class RunStore:
         self, run_id: str, *, operator_scope: str | None = None
     ) -> dict[str, object]:
         run = self.load_run(run_id, operator_scope=operator_scope)
+        observed_at = datetime.now(timezone.utc)
         nodes = run.get("nodes", {})
         node_values = list(nodes.values()) if isinstance(nodes, dict) else []
         completed = sum(
@@ -2540,26 +2541,98 @@ class RunStore:
             ),
             None,
         )
-        health = (
-            "terminal"
-            if status in {"succeeded", "failed", "cancelled", "abandoned"}
-            else "retry_wait"
-            if status == "waiting_retry"
-            else "user_wait"
-            if status == "paused"
-            else "healthy"
+        current_nodes = [
+            node["id"]
+            for node in node_values
+            if isinstance(node, dict)
+            and node.get("state") in {"ready", "claimed", "running"}
+        ]
+        execution_mode = str(run.get("execution_mode", "foreground"))
+        coordinator_facts: dict[str, object]
+        if execution_mode == "background":
+            from plugins.workflow.coordinator_store import CoordinatorStore
+
+            observed = CoordinatorStore(self.database).health(now=observed_at)
+            lease = observed.lease
+            coordinator_facts = {
+                "status": observed.status,
+                "reason_code": observed.reason_code,
+                "owner_id": lease.owner_id if lease else None,
+                "host_kind": lease.host_kind if lease else None,
+                "epoch": lease.epoch if lease else None,
+                "heartbeat_at": (
+                    lease.heartbeat_at.isoformat() if lease is not None else None
+                ),
+                "lease_expires_at": (
+                    lease.lease_expires_at.isoformat() if lease is not None else None
+                ),
+            }
+        else:
+            observed = None
+            coordinator_facts = {
+                "status": "not_required",
+                "reason_code": "foreground_execution",
+            }
+        stale_claim = any(
+            isinstance(node, dict)
+            and node.get("state") in {"claimed", "running"}
+            and (
+                not isinstance(node.get("claim"), Mapping)
+                or not isinstance(node["claim"].get("lease_expires_at"), str)
+                or datetime.fromisoformat(node["claim"]["lease_expires_at"])
+                <= observed_at
+            )
+            for node in node_values
         )
+        blocking_reason = None
+        if status in {"succeeded", "failed", "cancelled", "abandoned"}:
+            health = "terminal"
+        elif status == "paused":
+            health = "user_wait"
+        elif status == "interrupted":
+            health = "interrupted"
+        elif status == "queued":
+            health = "waiting"
+            blocking_reason = (
+                "concurrency_lane_busy"
+                if run.get("blocked_by_run_id")
+                else "execution_capacity"
+            )
+            if observed is not None and observed.status != "healthy" and not run.get(
+                "blocked_by_run_id"
+            ):
+                health = "coordinator_unavailable"
+                blocking_reason = observed.reason_code
+        elif status == "waiting_retry":
+            health = "retry_wait"
+            blocking_reason = "retry_backoff"
+            if (
+                observed is not None
+                and observed.status != "healthy"
+                and retry_times
+                and datetime.fromisoformat(min(retry_times)) <= observed_at
+            ):
+                health = "coordinator_unavailable"
+                blocking_reason = observed.reason_code
+        elif stale_claim:
+            health = "stalled"
+            blocking_reason = "node_lease_expired"
+        elif not current_nodes:
+            health = "stalled"
+            blocking_reason = "no_runnable_or_owned_node"
+        elif observed is not None and observed.status != "healthy":
+            health = "coordinator_unavailable"
+            blocking_reason = observed.reason_code
+        else:
+            health = "healthy"
         return {
             **run,
             "action": "status",
             "health": health,
+            "blocking_reason": blocking_reason,
+            "coordinator": coordinator_facts,
             "elapsed_ms": None,
-            "current_nodes": [
-                node["id"]
-                for node in node_values
-                if isinstance(node, dict)
-                and node.get("state") in {"ready", "claimed", "running"}
-            ],
+            "current_nodes": current_nodes,
             "progress": {
                 "kind": "graph",
                 "completed_nodes": completed,
