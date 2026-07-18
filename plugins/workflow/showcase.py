@@ -22,6 +22,7 @@ from agent.plugin_agent import PluginAgentRunResult
 from cron.jobs import create_job, list_jobs, use_cron_store
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import _runtime_config, _scheduler
+from plugins.workflow.machine_contract import operator_command_contract
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import WorkflowTrustStore, compute_package_digest
@@ -270,6 +271,7 @@ def preflight_showcase(showcase_id: str, *, hermes_home: str | Path) -> dict[str
         "requested_skills": requested_skills, "local_mcp_servers": [f"mcp/{value}" for value in local_mcp],
         "inline_agent_limit": inline_agents, "wall_seconds": scenario.limits["wall_seconds"],
         "side_effects_initialized": False,
+        "command_contract": operator_command_contract(),
     }
 
 

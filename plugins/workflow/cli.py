@@ -50,6 +50,7 @@ from plugins.workflow.machine_contract import (
     MachineError,
     WorkflowCommandError,
     error_envelope,
+    operator_command_contract,
     success_envelope,
 )
 from plugins.workflow.schema import load_workflow, validate_package
@@ -1118,6 +1119,7 @@ def _doctor_payload(
         now=datetime.now(timezone.utc)
     )
     payload["machine_contract_schema_version"] = 1
+    payload["command_contract"] = operator_command_contract()
     payload["supported_execution_modes"] = ["background", "foreground"]
     payload["coordinator"] = {
         "status": coordinator.status,
