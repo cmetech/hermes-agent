@@ -3,10 +3,36 @@
 **Fresh review date:** 2026-07-19
 
 **Reviewed branch:** `feat/workflow-production-remediation` through
-`546279a44db1de83cc3d72fcef5a0e75af39b4b0`
+`ace0024368a36efd2ce6d21d32c19f579df61043`
 
 **Verdict:** **READY FOR MAINTAINER MERGE REVIEW. No Critical or High merge
 blocker remains.**
+
+## Adversarial follow-up correction
+
+The initial fresh-review conclusion at `546279a44` was not the final word. The
+independent remediation-fix review at `aea2d9d95`, preserved in
+`2026-07-19-workflow-orchestration-remediation-fix-adversarial-review.md`,
+reopened one High (NF-H1) and identified NF-M1–NF-M5. That correction is
+accepted rather than obscured.
+
+The six post-review commits close each item with focused red/green evidence:
+
+| Finding | Commit | Post-fix evidence |
+|---|---|---|
+| NF-H1 | `1be33f389` | A real web-leader/Gateway-follower topology delivers and durably acknowledges the Gateway projection from the port-bearing standby. |
+| NF-M1 | `326193c63` | Real read APIs redact the provenance route and mask/hash Gateway transition keys without breaking delivery. |
+| NF-M4 | `e7e9db9b7` | SQLite contention before a durable `sending` row returns retryable; post-send receipt loss still remains outcome-uncertain. |
+| NF-M2 | `883b33ad5` | A stalled foreground scheduler cannot claim after exact owner/epoch adoption in the competing transaction. |
+| NF-M3 | `fefed8eb2` | Promotion and new admission skip older waiters blocked on unrelated held lanes while preserving FIFO among eligible waiters. |
+| NF-M5 | `ace002436` | Gateway reload, provider hot-add, and Gateway delivery suites are mandatory members of the no-argument merge gate. |
+
+The post-fix no-argument gate passed 652 tests with one intentional platform
+skip, the installed-distribution test, 17 Desktop tests, and TypeScript
+compilation. The focused cross-finding selection passed 102 tests, and the
+hash-pinned cumulative v2.0.9 migration test passed separately. The thirteen
+new Low findings remain explicitly backlogged as non-blocking follow-ups; none
+is silently described as fixed.
 
 ## Fresh-review scope and method
 
@@ -37,8 +63,8 @@ bounded persistence-and-wake operations and do not execute workflow tails.
 | H-06/H-07 idempotency/provenance | Closed: volatile PID, actor, source instance, and return route are outside the semantic start identity; stable cross-process retries join. |
 | H-08/H-09 Desktop attention/history | Closed: attention is itemized/actionable and board/history/archive use complete keyset traversal. |
 | H-10/H-02 direct API | Closed: plugin-owned authenticated `POST /runs` is background-only, coordinator-gated, server-derived, and never advances synchronously. |
-| H-11/H-01 Gateway delivery | Closed: authenticated invocation carries a server-minted opaque return-route capability into durable destination-bound delivery. |
-| M-04–M-16 | Closed: bounded cursor sweeps, real stall clocks, centralized lane admission, terminal/recovery reserve, recovery windows, Windows Job Objects, exact interaction binding, showcase key/trust behavior, notification retention/repair, and safe service reload all have current tests. |
+| H-11/H-01 Gateway delivery | Closed after NF-H1: authenticated invocation carries a server-minted opaque return-route capability into durable destination-bound delivery, and a port-bearing standby drains it when a web host owns coordinator leadership. |
+| M-04–M-16 | Closed; NF-M1–NF-M5 also fixed: bounded cursor sweeps, eligible-waiter FIFO, exact foreground claim fencing, retry-safe pre-send storage handling, opaque projections, and mandatory async gate coverage have current tests. |
 | L-01–L-09 | Closed: machine envelopes/failures, legacy provenance, sanitization, bounded registries/caches, Desktop resilience/accessibility, and gate quality were completed in Tasks 17–19. |
 | Prior M-01 | Closed: native Windows, Ubuntu, and macOS workflow portability jobs passed. |
 | Prior M-02 | Closed: clean install plus old/current/old/current rehearsal preserved seven evidence hashes and stable idempotent lookup. |
@@ -52,7 +78,7 @@ sessions do not inherit local-admin capability merely by existing.
 
 ## Fresh verification conclusion
 
-The final no-argument merge gate at `546279a44` passed 635 Python tests with
+The final no-argument merge gate at `ace002436` passed 652 Python tests with
 one platform-conditioned skip, the installed-distribution integration test, 17
 Desktop tests, and TypeScript compilation. Native workflow portability passed
 on Windows, Ubuntu, and macOS. The clean distribution rehearsal passed CLI,

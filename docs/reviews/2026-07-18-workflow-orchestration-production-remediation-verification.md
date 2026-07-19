@@ -8,15 +8,17 @@
 
 **Final runtime commit:** `2b81fd45be40451f12fea90b2f9a5860042a68d3`
 
-**Final code-and-test commit:** `546279a44db1de83cc3d72fcef5a0e75af39b4b0`
+**Final code-and-test commit:** `ace0024368a36efd2ce6d21d32c19f579df61043`
 
 ## Verdict
 
 All nineteen remediation tasks are implemented and independently committed.
 The two Critical, nine High, thirteen Medium, and nine Low findings from the
-adversarial re-review are closed, as are prior release gates M-01, M-02, and
-M-03. The fresh adversarial review reports **no Critical or High merge
-blocker**.
+original adversarial re-review are closed, as are prior release gates M-01,
+M-02, and M-03. A second review at `aea2d9d95` correctly falsified the initial
+completion claim by finding NF-H1 and five Medium follow-ups. NF-H1 and
+NF-M1–NF-M5 are now fixed in six independently verified commits, and the
+post-fix evidence reports **no remaining Critical or High merge blocker**.
 
 This is evidence for maintainer merge review, not an authorization to merge or
 release. Nothing in this remediation execution was merged, tagged, released,
@@ -55,6 +57,12 @@ or deployed.
 | 17 | `c9285a585` | Actionable Desktop attention and complete keyset history/archive traversal |
 | 18 | `7dccde877` | Machine envelopes, typed failures, and bounded resource registries |
 | 19 corrections | `2b81fd45b`, `2214f79bb`, `546279a44` | Migration digest repair, portable merge/native gates, and valid builder provenance |
+| Adversarial follow-up | `1be33f389` | Port-bearing Gateway standbys drain their destination-bound outbox rows without workflow leadership |
+| Adversarial follow-up | `326193c63` | Gateway capabilities remain opaque in run and notification read projections |
+| Adversarial follow-up | `e7e9db9b7` | Pre-send delivery-store contention is retryable while post-send uncertainty remains non-replayable |
+| Adversarial follow-up | `883b33ad5` | Foreground node claims require the exact live owner and epoch in the claim transaction |
+| Adversarial follow-up | `fefed8eb2` | FIFO admission skips predecessors blocked by unrelated held lanes |
+| Adversarial follow-up | `ace002436` | Async reload and Gateway delivery regressions are enforced by the green merge gate |
 
 The corrective commits discovered by Task 19 changed only branch-owned runtime,
 gate, and test files. In particular, the final builder correction replaces the
@@ -64,15 +72,15 @@ vocabulary.
 
 ## Local merge and focused gates
 
-The final no-argument merge gate was run from clean code commit `546279a44`:
+The final no-argument merge gate was rerun from code commit `ace002436`:
 
 ```text
 scripts/test_workflow_merge_gate.sh
-635 passed, 1 skipped in 49.96s
-installed-distribution integration: 1 passed in 4.20s
+652 passed, 1 skipped in 51.27s
+installed-distribution integration: 1 passed in 3.70s
 Desktop: 6 files passed, 17 tests passed
 TypeScript: tsc --noEmit passed
-TESTED_BASE_SHA=546279a44db1de83cc3d72fcef5a0e75af39b4b0
+TESTED_BASE_SHA=ace0024368a36efd2ce6d21d32c19f579df61043
 ```
 
 Additional current-branch results:
@@ -83,6 +91,9 @@ Cross-surface UAT and soak selection: 204 passed, 1 skipped in 66.36s
 Expanded native-contract selection on macOS: 130 passed, 2 skipped in 30.78s
 Native portability corrections: 31 passed, 1 skipped
 Builder/provenance/admission regression selection: 38 passed in 2.55s
+Adversarial follow-up integration selection: 102 passed in 28.67s
+Hash-pinned cumulative v2.0.9 migration: 1 passed in 0.12s
+Async reload/delivery merge-gate selection: 15 passed in 1.02s
 Scoped Task 17 Desktop ESLint: passed with zero errors
 git diff --check: passed
 ```
@@ -114,6 +125,16 @@ then repeated the same result at `546279a44`:
 | Windows | `88202197519` | 127 passed, 5 platform-conditioned skips in 219.50s |
 | Ubuntu | `88202197525` | 130 passed, 2 platform-conditioned skips in 38.29s |
 | macOS | `88202197539` | 130 passed, 2 platform-conditioned skips in 53.68s |
+
+Post-review exact-code run
+[`29692156577`](https://github.com/cmetech/hermes-agent/actions/runs/29692156577)
+repeated the workflow-portability result at `ace002436`:
+
+| Runner | Job | Result |
+|---|---:|---|
+| Windows | `88206687837` | Passed |
+| Ubuntu | `88206687835` | Passed |
+| macOS | `88206687803` | Passed |
 
 That matrix exercises SQLite locking and shadow-table migration, atomic
 replacement, process identity/tree termination, coordinator election and
@@ -229,5 +250,5 @@ claim that the whole unrelated repository baseline is green.
 | M-01 native Linux/macOS/Windows | Passed |
 | M-02 install/update/rollback | Passed with immutable-evidence comparison |
 | M-03 branch-owned no-regression | Passed; unrelated baseline recorded |
-| Fresh adversarial review | No Critical or High merge blocker |
+| Fresh adversarial review | NF-H1 found at `aea2d9d95`; post-fix topology and gate evidence close it with no remaining Critical or High blocker |
 | Merge/tag/release/deploy | Not performed |
