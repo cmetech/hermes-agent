@@ -252,6 +252,18 @@ class WorkflowCoordinatorService:
                 )
         return delivered
 
+    def _drain_gateway_notifications(self, run_store, identity) -> int:
+        """Drain Gateway projections without acquiring workflow leadership."""
+        if self.context.delivery_port is None:
+            return 0
+        from plugins.workflow.notifications import NotificationOutbox
+
+        return self._deliver_gateway_notifications(
+            NotificationOutbox(run_store),
+            self.context.delivery_port,
+            owner_id=f"delivery:{identity.owner_id}",
+        )
+
     def _sweep_once(
         self,
         run_store,
@@ -523,6 +535,8 @@ class WorkflowCoordinatorService:
                         if not leadership_current:
                             leader_epoch = None
                         continue
+
+                    self._drain_gateway_notifications(run_store, identity)
 
                     lease = coordinator_store.observe(now=now)
                     may_contend, web_eligible_at = self._web_may_contend(

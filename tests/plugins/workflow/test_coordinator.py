@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from hermes_cli.plugin_services import BackgroundServiceContext
+from hermes_cli.plugin_invocation import DeliveryReceipt
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import (
     CoordinatorIdentity,
@@ -18,6 +19,8 @@ from plugins.workflow.coordinator_store import (
 )
 from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import ExecutionFence
+from plugins.workflow.notifications import NotificationOutbox
+from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
@@ -394,11 +397,13 @@ def _service(
     host_kind: str,
     host_instance_id: str,
     web_grace_seconds: float = 0.05,
+    delivery_port=None,
 ) -> WorkflowCoordinatorService:
     return WorkflowCoordinatorService(
         BackgroundServiceContext(
             host_kind=host_kind,
             host_instance_id=host_instance_id,
+            delivery_port=delivery_port,
         ),
         hermes_home=home,
         heartbeat_seconds=0.1,
@@ -433,6 +438,90 @@ def test_gateway_leader_and_web_standby_report_cached_health(tmp_path) -> None:
         for thread in threads:
             thread.join(timeout=2)
             assert not thread.is_alive()
+
+
+def test_gateway_standby_delivers_notifications_while_web_holds_leadership(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path)
+    delivered: list[tuple[str, str, str]] = []
+
+    class Port:
+        def deliver(self, capability: str, text: str, key: str) -> DeliveryReceipt:
+            delivered.append((capability, text, key))
+            return DeliveryReceipt(status="delivered", transport_id="message-1")
+
+    web = _service(tmp_path, host_kind="web", host_instance_id="web-leader")
+    gateway = _service(
+        tmp_path,
+        host_kind="gateway",
+        host_instance_id="gateway-standby",
+        delivery_port=Port(),
+    )
+    web_stop = threading.Event()
+    gateway_stop = threading.Event()
+    web_thread = threading.Thread(target=web.run, args=(web_stop,))
+    gateway_thread = threading.Thread(target=gateway.run, args=(gateway_stop,))
+    web_thread.start()
+    try:
+        _wait_until(lambda: web.health().code == "leader")
+        gateway_thread.start()
+        _wait_until(lambda: gateway.health().code == "standby")
+
+        package = load_workflow(
+            workflow_writer(tmp_path / "package", name="standby-delivery")
+        )
+        snapshot = store.prepare_run_snapshot(package)
+        capability = "server-minted-capability"
+        admitted = store.start_run(
+            RunAdmissionRequest(
+                workflow_name=package.definition.name,
+                definition_digest=snapshot.definition_digest,
+                policy_digest=snapshot.policy_digest,
+                input_manifest_digest=snapshot.input_manifest_digest,
+                trigger_source="chat",
+                idempotency_key="standby-delivery",
+                concurrency_key=package.definition.name,
+                execution_mode="background",
+                provenance=TriggerProvenance(
+                    source="chat",
+                    assurance="verified_adapter",
+                    intent_key="standby-delivery",
+                    source_instance="gateway:telegram",
+                    actor_id="gateway:telegram:user-1",
+                    return_route=capability,
+                ),
+            ),
+            immutable_snapshot=snapshot,
+        )
+        outbox = NotificationOutbox(store)
+        outbox.record(
+            run_id=admitted.run_id,
+            kind="completion",
+            destination="desktop",
+            transition_version=99,
+            payload={"workflow": package.definition.name, "status": "succeeded"},
+        )
+
+        _wait_until(lambda: bool(delivered))
+
+        assert web.health().code == "leader"
+        assert gateway.health().code == "standby"
+        assert delivered[0][0] == capability
+        gateway_rows = [
+            row
+            for row in outbox.history(run_id=admitted.run_id)
+            if row["destination"] == "gateway:opaque"
+        ]
+        assert gateway_rows[0]["state"] == "delivered"
+    finally:
+        web_stop.set()
+        gateway_stop.set()
+        CoordinatorStore(store.database).notify_local()
+        web_thread.join(timeout=10)
+        gateway_thread.join(timeout=10)
+        assert not web_thread.is_alive()
+        assert not gateway_thread.is_alive()
 
 
 def test_web_only_host_observes_election_grace_then_becomes_leader(tmp_path) -> None:
