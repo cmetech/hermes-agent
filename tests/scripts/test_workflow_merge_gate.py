@@ -27,6 +27,7 @@ def test_merge_gate_enforces_async_reload_and_delivery_regressions() -> None:
         "tests/gateway/test_plugin_background_services.py",
         "tests/gateway/test_plugin_delivery.py",
         "tests/hermes_cli/test_plugin_provider_hot_reload.py",
+        "tests/scripts/test_workflow_merge_gate.py",
     ):
         assert required_test in source
 

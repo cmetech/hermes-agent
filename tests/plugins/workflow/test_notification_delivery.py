@@ -4,6 +4,7 @@ import importlib.util
 import json
 import shlex
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -436,6 +437,61 @@ def test_verified_gateway_route_is_projected_and_delivered_by_coordinator(
         if item["destination"].startswith("gateway:")
     ]
     assert gateway_history[0]["state"] == "delivered"
+
+
+def test_concurrent_gateway_drainers_honor_outbox_lease(tmp_path) -> None:
+    store = RunStore(tmp_path / "home")
+    outbox_a = NotificationOutbox(store)
+    outbox_b = NotificationOutbox(RunStore(tmp_path / "home"))
+    run_id = "concurrent-drainers"
+    notification_id = outbox_a.record(
+        run_id=run_id,
+        kind="completion",
+        destination="gateway:opaque-capability",
+        transition_version=1,
+        payload={"status": "succeeded"},
+    )
+    leased = threading.Event()
+    release = threading.Event()
+    sender_calls: list[str] = []
+    drained_counts: list[int] = []
+
+    class Port:
+        def deliver(self, route_capability, text, idempotency_key):
+            assert route_capability == "opaque-capability"
+            sender_calls.append(notification_id)
+            leased.set()
+            assert release.wait(timeout=5)
+            return DeliveryReceipt(status="delivered", transport_id="message-1")
+
+    def drain_a() -> None:
+        drained_counts.append(
+            WorkflowCoordinatorService._deliver_gateway_notifications(
+                outbox_a,
+                Port(),
+                owner_id="drainer-a",
+            )
+        )
+
+    thread = threading.Thread(target=drain_a)
+    thread.start()
+    assert leased.wait(timeout=5)
+    drained_counts.append(
+        WorkflowCoordinatorService._deliver_gateway_notifications(
+            outbox_b,
+            Port(),
+            owner_id="drainer-b",
+        )
+    )
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    assert sorted(drained_counts) == [0, 1]
+    assert sender_calls == [notification_id]
+    history = outbox_a.history(run_id=run_id)
+    assert len(history) == 1
+    assert history[0]["state"] == "delivered"
 
 
 def test_read_apis_never_expose_gateway_return_route_capability(
