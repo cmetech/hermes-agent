@@ -174,3 +174,39 @@ tests are green-gated via files already in the CI portability matrix.
    the remediation plan's completion condition, this branch now qualifies for
    maintainer merge review. Merge scope unchanged: PR #3 only;
    `feat/workflow-operator-experience` remains excluded.
+
+## Addendum — NF2-M1 and NF2-L4 closure (reviewed @ `dd5f29e49`)
+
+Commit `2feebb173` was adversarially reviewed directly (single-file change).
+**Both findings are CLOSED; the disposition above is fully discharged and the
+READY verdict stands with no open Medium.**
+
+- **NF2-M1 CLOSED.** The standby drain now runs on a dedicated bounded
+  single-worker pool (`coordinator.py`, `workflow-standby-delivery`), created
+  only when a delivery port exists; the election loop submits a drain only
+  when the previous one has completed and never blocks on it. The new test
+  `test_blocked_standby_delivery_does_not_delay_leadership_takeover` is the
+  exact red scenario: real two-service election, an adapter blocked *inside*
+  `deliver()`, leader stopped, and standby takeover asserted within 1 s while
+  the drain is still provably blocked. Cross-thread store use is safe by
+  construction (`RunStore._connect` opens a per-call SQLite connection, WAL +
+  busy timeout); leader/standby delivery overlap during a transition remains
+  covered by the per-row outbox lease (distinct owner ids) plus the transport
+  idempotency key. Shutdown releases the lease first, then waits for drain
+  quiescence.
+- **NF2-L4 CLOSED.** `test_gateway_retryable_delivery_receipt_requeues_outbox_row`
+  pins the coordinator-level classification: `retryable_failure` returns the
+  row to `pending` with `attempts` incremented, `lease_owner` cleared, and
+  `last_error` recorded — dropping the `fail()` branch now fails the suite.
+- Gate reproduced at `dd5f29e49`: 652 passed / 1 skipped, installed-dist 1,
+  Desktop 17, tsc pass (measured; `test_coordinator.py` is CI-matrix-owned,
+  so the local count is unchanged by design — native totals 132+5 = 137 =
+  135+2 reconcile).
+- Two Info-level notes, not blockers: (i) a drain exception raised at the
+  store level is logged only on the *next* standby submit — a service that
+  becomes leader right after a failing drain leaves it unobserved until it
+  returns to standby (per-notification failures are handled inside the drain
+  and unaffected); (ii) shutdown with a still-hung adapter waits for the
+  in-flight drain (bounded, worst ≈ 20×15 s), which can exceed a host stop
+  timeout and surface as a transient `stop_timeout` — symmetric with the
+  leader's sweep-pool behavior and in the safe direction.
