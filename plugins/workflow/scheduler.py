@@ -332,6 +332,26 @@ class RunScheduler:
             lease_seconds=self.lease_seconds,
         )
 
+    def _foreground_claim_token(
+        self, projection: Mapping[str, object]
+    ) -> tuple[str | None, int | None]:
+        if self.execution_owner_id is not None:
+            return self.execution_owner_id, self.execution_owner_epoch
+        if (
+            self.execution_fence is not None
+            or projection.get("execution_mode") != "foreground"
+        ):
+            return None, None
+        owner_id = projection.get("foreground_owner_id")
+        epoch = projection.get("foreground_epoch")
+        if (
+            not isinstance(owner_id, str)
+            or not owner_id
+            or not isinstance(epoch, int)
+        ):
+            return None, None
+        return owner_id, epoch
+
     def _is_execution_fence_loss(self, exc: RuntimeError) -> bool:
         return self.execution_fence is not None and "execution fence" in str(exc)
 
@@ -750,6 +770,9 @@ class RunScheduler:
         executed = 0
         package = load_workflow(self.store.run_directory(run_id) / "definition.yaml")
         by_id = {node.id: node for node in package.definition.nodes}
+        foreground_owner_id, foreground_owner_epoch = self._foreground_claim_token(
+            self.store.load_run(run_id)
+        )
         with self._activity:
             self._active_runs.add(run_id)
         try:
@@ -812,6 +835,9 @@ class RunScheduler:
                                 projection=projection,
                             ),
                             execution_fence=self.execution_fence,
+                            foreground_owner_id=foreground_owner_id,
+                            foreground_owner_epoch=foreground_owner_epoch,
+                            require_execution_authority=True,
                         )
                     except StorageQuotaError as exc:
                         self.store.interrupt_for_host_pressure(run_id, message=str(exc))
@@ -886,6 +912,10 @@ class RunScheduler:
         run_ids = list(dict.fromkeys(run_ids))
         packages = {
             run_id: load_workflow(self.store.run_directory(run_id) / "definition.yaml")
+            for run_id in run_ids
+        }
+        foreground_tokens = {
+            run_id: self._foreground_claim_token(self.store.load_run(run_id))
             for run_id in run_ids
         }
         with self._activity:
@@ -976,6 +1006,9 @@ class RunScheduler:
                                     projection=snapshots[run_id],
                                 ),
                                 execution_fence=self.execution_fence,
+                                foreground_owner_id=foreground_tokens[run_id][0],
+                                foreground_owner_epoch=foreground_tokens[run_id][1],
+                                require_execution_authority=True,
                             )
                         except StorageQuotaError as exc:
                             self.store.interrupt_for_host_pressure(

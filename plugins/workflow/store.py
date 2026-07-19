@@ -4374,6 +4374,9 @@ class RunStore:
         effect_classification: str = "replay_safe",
         evidence_paths: Iterable[str] | None = None,
         execution_fence: ExecutionFence | None = None,
+        foreground_owner_id: str | None = None,
+        foreground_owner_epoch: int | None = None,
+        require_execution_authority: bool = False,
     ) -> NodeClaim | None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -4381,6 +4384,16 @@ class RunStore:
             raise ValueError("effect_classification must be replay_safe or outward")
         if not executor_id:
             raise ValueError("executor_id must not be empty")
+        if (foreground_owner_id is None) != (foreground_owner_epoch is None):
+            raise ValueError(
+                "foreground owner ID and epoch must be provided together"
+            )
+        if foreground_owner_epoch is not None and (
+            isinstance(foreground_owner_epoch, bool)
+            or not isinstance(foreground_owner_epoch, int)
+            or foreground_owner_epoch <= 0
+        ):
+            raise ValueError("foreground owner epoch must be a positive integer")
         self._ensure_free_disk()
         directory = self.run_directory(run_id)
         with workflow_lock(self.admission_lock):
@@ -4417,8 +4430,35 @@ class RunStore:
                 connection = self._connect()
                 try:
                     connection.execute("BEGIN IMMEDIATE")
+                    instant = now or datetime.now(timezone.utc)
                     if execution_fence is not None:
                         self.assert_execution_fence(connection, execution_fence)
+                    elif require_execution_authority or foreground_owner_id is not None:
+                        execution = connection.execute(
+                            "SELECT execution_mode, foreground_owner_id, "
+                            "foreground_epoch, foreground_lease_expires_at "
+                            "FROM runs WHERE run_id=?",
+                            (run_id,),
+                        ).fetchone()
+                        if execution is None:
+                            connection.rollback()
+                            return None
+                        if execution["execution_mode"] == "foreground":
+                            expires_at = execution["foreground_lease_expires_at"]
+                            if (
+                                foreground_owner_id is None
+                                or execution["foreground_owner_id"]
+                                != foreground_owner_id
+                                or execution["foreground_epoch"]
+                                != foreground_owner_epoch
+                                or not isinstance(expires_at, str)
+                                or datetime.fromisoformat(expires_at) <= instant
+                            ):
+                                connection.rollback()
+                                return None
+                        else:
+                            connection.rollback()
+                            return None
                     active_workers = connection.execute(
                         "SELECT COUNT(*) FROM worker_claims"
                     ).fetchone()[0]
@@ -4426,7 +4466,6 @@ class RunStore:
                         connection.rollback()
                         return None
                     attempt_id = uuid.uuid4().hex
-                    instant = now or datetime.now(timezone.utc)
                     monotonic_instant = (
                         float(monotonic_now)
                         if monotonic_now is not None

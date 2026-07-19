@@ -503,7 +503,13 @@ def test_gateway_standby_delivers_notifications_while_web_holds_leadership(
             payload={"workflow": package.definition.name, "status": "succeeded"},
         )
 
-        _wait_until(lambda: bool(delivered))
+        _wait_until(
+            lambda: any(
+                row["destination"] == "gateway:opaque"
+                and row["state"] == "delivered"
+                for row in outbox.history(run_id=admitted.run_id)
+            )
+        )
 
         assert web.health().code == "leader"
         assert gateway.health().code == "standby"
@@ -1190,5 +1196,70 @@ def test_scheduler_does_not_claim_after_foreground_execution_lease_expires(
         utcnow=lambda: expired_at,
     ).advance(admitted.run_id)
 
+    assert result["nodes"]["effect"]["state"] == "ready"
+    assert not marker.exists()
+
+
+def test_stale_foreground_scheduler_cannot_claim_after_background_adoption(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    marker = tmp_path / "must-not-run-after-adoption"
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="foreground-adoption-race",
+            nodes=[{"id": "effect", "bash": f"touch {marker}"}],
+        )
+    )
+    snapshot = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=snapshot.definition_digest,
+            policy_digest=snapshot.policy_digest,
+            input_manifest_digest=snapshot.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="foreground-adoption-race",
+            concurrency_key=package.definition.name,
+            execution_mode="foreground",
+            foreground_owner_id="stale-foreground-owner",
+            foreground_lease_seconds=1,
+        ),
+        immutable_snapshot=snapshot,
+    )
+    expired_at = datetime.fromisoformat(
+        store.load_run(admitted.run_id)["foreground_lease_expires_at"]
+    ) + timedelta(seconds=1)
+    coordinator = CoordinatorStore(store.database)
+    identity = _identity("foreground-adopter")
+    leadership = coordinator.try_acquire(
+        identity, now=expired_at, lease_seconds=30
+    )
+    assert leadership.is_leader
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    scheduler = RunScheduler(
+        store,
+        owner_id="stale-foreground-owner",
+        execution_owner_id="stale-foreground-owner",
+        execution_owner_epoch=1,
+        utcnow=lambda: expired_at,
+    )
+    adopted = False
+
+    def adopt_after_stale_owner_checked(_run_id: str) -> bool:
+        nonlocal adopted
+        if not adopted:
+            store.adopt_expired_foreground(admitted.run_id, fence, expired_at)
+            adopted = True
+        return True
+
+    monkeypatch.setattr(
+        scheduler, "_renew_execution_owner", adopt_after_stale_owner_checked
+    )
+
+    result = scheduler.advance(admitted.run_id)
+
+    assert adopted is True
     assert result["nodes"]["effect"]["state"] == "ready"
     assert not marker.exists()
