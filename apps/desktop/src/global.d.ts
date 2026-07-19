@@ -72,6 +72,7 @@ declare global {
         set: (name: string | null) => Promise<DesktopActiveProfile>
       }
       api: <T>(request: HermesApiRequest) => Promise<T>
+      apiStructured: <T>(request: HermesApiRequest) => Promise<HermesStructuredApiResponse<T>>
       notify: (payload: HermesNotification) => Promise<boolean>
       requestMicrophoneAccess: () => Promise<boolean>
       readFileDataUrl: (filePath: string) => Promise<string>
@@ -618,6 +619,8 @@ export interface HermesApiRequest {
   // this is only needed for profile-scoped live/settings calls.
   profile?: string | null
 }
+
+export type HermesStructuredApiResponse<T> = { ok: true; value: T } | { body: unknown; ok: false; status: number }
 
 export interface HermesNotification {
   title?: string

@@ -107,6 +107,25 @@ afterEach(() => {
 })
 
 describe('WorkflowsView', () => {
+  it('rejects the catalog navigation view before querying the run-list endpoint', async () => {
+    const module = await import('./index')
+
+    expect(typeof module.loadWorkflowRunPage).toBe('function')
+    await expect(module.loadWorkflowRunPage('workflows')).rejects.toThrow(/does not list workflow runs/i)
+    expect(listWorkflowRuns).not.toHaveBeenCalled()
+  })
+
+  it.each(['board', 'history', 'archive'] as const)(
+    'keeps the %s navigation view on the run-list query seam',
+    async view => {
+      const module = await import('./index')
+
+      await module.loadWorkflowRunPage(view, 'next-page')
+
+      expect(listWorkflowRuns).toHaveBeenCalledWith('next-page', view)
+    }
+  )
+
   it('refetches a stale run after 409 and disables repeat actions until recovery', async () => {
     const client = new QueryClient({ defaultOptions: { mutations: { retry: false }, queries: { retry: false } } })
     const mutation = deferred<WorkflowRunSnapshot>()

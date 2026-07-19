@@ -33,6 +33,14 @@ function isConflict(error: unknown): boolean {
   return error instanceof Error && /^409(?:\D|$)/.test(error.message)
 }
 
+export function loadWorkflowRunPage(view: WorkflowRunView, cursor?: string): Promise<WorkflowRunPage> {
+  if (view === 'workflows') {
+    return Promise.reject(new Error('The workflows catalog view does not list workflow runs.'))
+  }
+
+  return listWorkflowRuns(cursor, view)
+}
+
 export function WorkflowsView() {
   const { t } = useI18n()
   const profile = getApiRequestProfile() ?? 'default'
@@ -52,9 +60,10 @@ export function WorkflowsView() {
   }, [])
 
   const runs = useInfiniteQuery({
+    enabled: view !== 'workflows',
     getNextPageParam: (page: WorkflowRunPage) => page.next_cursor ?? undefined,
     initialPageParam: undefined as string | undefined,
-    queryFn: ({ pageParam }) => listWorkflowRuns(pageParam as string | undefined, view),
+    queryFn: ({ pageParam }) => loadWorkflowRunPage(view, pageParam as string | undefined),
     queryKey: ['workflow-runs', profile, view],
     refetchInterval: () => (isVisible ? 20_000 : false)
   })

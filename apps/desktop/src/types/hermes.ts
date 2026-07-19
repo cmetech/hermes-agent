@@ -124,6 +124,55 @@ export interface WorkflowCoordinatorSnapshot {
   status: string
 }
 
+export interface WorkflowDefinitionInput {
+  name: string
+  required: boolean
+  type: string
+}
+
+export interface WorkflowDefinitionInputSupport {
+  reason: 'flat_inputs' | 'parameterless' | 'unsupported_input_shape' | 'unsupported_input_type'
+  supported: boolean
+}
+
+export interface WorkflowDefinition {
+  description: string
+  inputs: WorkflowDefinitionInput[]
+  name: string
+  precedence: 1 | 2
+  source: 'profile' | 'project'
+  supported_inputs: WorkflowDefinitionInputSupport
+  trust_state: 'trusted' | 'untrusted'
+  version: string
+}
+
+export interface WorkflowDefinitionError {
+  error: 'catalog_capacity' | 'invalid_definition'
+  name: string
+}
+
+export interface WorkflowCatalogPage {
+  items: Array<WorkflowDefinition | WorkflowDefinitionError>
+  truncated: boolean
+}
+
+export interface WorkflowDetail extends WorkflowDefinition {
+  compatibility: Record<string, unknown>
+  coordinator: {
+    healthy: boolean
+    reason: string
+    status: string
+  }
+  definition: Record<string, unknown>
+  risk_summary: Record<string, unknown>
+  topology: {
+    mermaid: null | string
+    omitted?: null | string
+    text: string
+    warnings: string[]
+  }
+}
+
 export interface WorkflowRunSnapshot {
   archived_at?: null | string
   archive_version?: number
@@ -150,7 +199,23 @@ export interface WorkflowRunSnapshot {
   [key: string]: unknown
 }
 
-export type WorkflowRunView = 'archive' | 'board' | 'history'
+export type WorkflowRunView = 'workflows' | 'board' | 'history' | 'archive'
+export type WorkflowRunListView = 'board' | 'history' | 'archive'
+
+export interface WorkflowStartResult {
+  admission_disposition: string
+  blocked_by_run_id: null | string
+  queue_position: null | number
+  run_id: string
+  status: string
+}
+
+export interface WorkflowStartResponse {
+  error: null
+  ok: true
+  result: WorkflowStartResult
+  schema_version: number
+}
 
 export interface WorkflowCleanupCandidate {
   blocked_reasons: string[]

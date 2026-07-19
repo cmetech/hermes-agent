@@ -16,3 +16,10 @@ def test_desktop_default_test_covers_workflow_renderer_and_platform_contracts() 
     assert "test:desktop:platforms" in scripts["test"]
     assert "activity-board.performance.test.tsx" in scripts["test:workflow-ui"]
     assert "app/workflows/index.test.tsx" in scripts["test:workflow-ui"]
+    assert "lib/hermes-api.test.ts" in scripts["test:workflow-ui"]
+    assert "electron/structured-api-channel.test.ts" in scripts[
+        "test:desktop:platforms"
+    ]
+    assert "electron/structured-api-response.test.ts" in scripts[
+        "test:desktop:platforms"
+    ]

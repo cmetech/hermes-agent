@@ -64,9 +64,9 @@ import type {
   WorkflowEvidenceKind,
   WorkflowEvidencePage,
   WorkflowNotificationPage,
+  WorkflowRunListView,
   WorkflowRunPage,
-  WorkflowRunSnapshot,
-  WorkflowRunView
+  WorkflowRunSnapshot
 } from '@/types/hermes'
 
 // Desktop startup fires a burst of read-only data calls (config, profiles,
@@ -232,7 +232,7 @@ export async function listSessions(
   }
 }
 
-export function listWorkflowRuns(cursor?: string, view: WorkflowRunView = 'board'): Promise<WorkflowRunPage> {
+export function listWorkflowRuns(cursor?: string, view: WorkflowRunListView = 'board'): Promise<WorkflowRunPage> {
   const query = new URLSearchParams({ view })
 
   if (cursor) {query.set('cursor', cursor)}

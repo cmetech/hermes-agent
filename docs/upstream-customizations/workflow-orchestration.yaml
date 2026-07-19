@@ -839,3 +839,64 @@ upstream_changes:
     Desktop-versus-token provenance derivation without caller authority or
     admission digest migration.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-catalog-trigger-bridge
+  change_class: desktop-workflow-adapter
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/electron/main.ts
+  - apps/desktop/electron/preload.ts
+  - apps/desktop/electron/structured-api-channel.test.ts
+  - apps/desktop/electron/structured-api-response.ts
+  - apps/desktop/electron/structured-api-response.test.ts
+  - apps/desktop/package.json
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/global.d.ts
+  - apps/desktop/src/hermes.ts
+  - apps/desktop/src/hermes.test.ts
+  - apps/desktop/src/lib/hermes-api.ts
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - apps/desktop/src/types/hermes.ts
+  - tests/test_desktop_workflow_test_gate.py
+  owned_symbols:
+  - hermes:api:structured
+  - apiStructured
+  - collectStructuredJsonResponse
+  - single structured-response collector branch per authenticated transport
+  - HermesStructuredApiResponse
+  - WorkflowApiError
+  - listWorkflowDefinitions
+  - preflightWorkflow
+  - startWorkflowRun
+  - WorkflowDefinition
+  - WorkflowCatalogPage
+  - WorkflowDetail
+  - WorkflowRunView workflows value
+  - WorkflowRunListView
+  - loadWorkflowRunPage
+  tests:
+  - apps/desktop/electron/structured-api-channel.test.ts
+  - apps/desktop/electron/structured-api-response.test.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/hermes.test.ts
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - tests/test_desktop_workflow_test_gate.py
+  expected_commit_subject: 'feat(desktop): Task 4 add workflow catalog bridge'
+  upstream_candidate: true
+  merge_guidance: Preserve the additive structured authenticated IPC channel
+    without changing legacy hermes:api callers or authentication headers. Both
+    local/token and OAuth transports must return structured-clone-safe success
+    and JSON HTTP-failure envelopes only for opted-in requests while transport,
+    timeout, response-stream, HTML, and non-JSON failures still reject. Keep the
+    shared collector as the only structured branch in each transport; legacy
+    response collection must remain free of unreachable structured fallbacks.
+    Keep the
+    navigation-only workflows view outside the server run-list view union and
+    prevent it from reaching the run-list endpoint. Keep workflow error
+    normalization in the renderer with detail before error before HTTP status,
+    require a nonblank idempotency key before sending, and never accept client
+    provenance fields in the run body.
+  removal_condition: Remove when upstream Desktop exposes equivalent typed,
+    profile-aware workflow catalog, detail, and admission wrappers without
+    changing existing REST bridge error semantics.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
