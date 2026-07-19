@@ -865,9 +865,30 @@ class RunStore:
                         f"profile-local:{row['trigger_source']}".encode()
                     )
                 )
+                start_digest = row["start_digest"]
+                try:
+                    projection = json.loads(
+                        (Path(row["run_directory"]) / "run.json").read_text()
+                    )
+                    start_digest = RunStore._start_digest_from_projection(
+                        projection
+                    )
+                except (
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                    JournalRecoveryError,
+                ):
+                    # Preserve the legacy digest when evidence cannot
+                    # corroborate the semantic replacement. That row remains
+                    # conflict-safe instead of turning ambiguity into replay.
+                    pass
                 values = [
                     namespace_digest
                     if name == "idempotency_namespace_digest"
+                    else start_digest
+                    if name == "start_digest"
                     else row[name]
                     for name in target_columns
                 ]

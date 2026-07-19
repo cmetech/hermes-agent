@@ -77,8 +77,15 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
     shutil.copy2(FIXTURE / "admission.db", workflows / "admission.sqlite3")
     shutil.copytree(FIXTURE / "runs", workflows / "runs")
     database = workflows / "admission.sqlite3"
+    legacy_start_digest = hashlib.sha256(
+        b"legacy digest containing volatile provenance"
+    ).hexdigest()
     with sqlite3.connect(database) as connection:
         connection.row_factory = sqlite3.Row
+        connection.execute(
+            "UPDATE runs SET start_digest=? WHERE run_id='migration-run'",
+            (legacy_start_digest,),
+        )
         before = dict(
             connection.execute(
                 "SELECT * FROM runs WHERE run_id='migration-run'"
@@ -239,9 +246,13 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             "SELECT value FROM store_metadata WHERE key='queue_sequence'"
         ).fetchone()
     for key, value in before.items():
-        if key != "run_directory":
+        if key not in {"run_directory", "start_digest"}:
             assert migrated[key] == value
     assert migrated["run_directory"] == relocated
+    assert migrated["start_digest"] == RunStore._start_digest_from_projection(
+        projection
+    )
+    assert migrated["start_digest"] != legacy_start_digest
     assert migrated["projection_schema_version"] == 1
     assert migrated["projection_state_version"] == expected["state_version"]
     assert migrated["status"] == projection["status"]

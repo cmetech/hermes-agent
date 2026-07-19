@@ -8,6 +8,7 @@ import subprocess
 
 ROOT = Path(__file__).parents[2]
 GATE = ROOT / "scripts/test_workflow_merge_gate.sh"
+CI = ROOT / ".github/workflows/ci.yml"
 
 
 def test_merge_gate_references_only_existing_invariant_tests() -> None:
@@ -17,6 +18,22 @@ def test_merge_gate_references_only_existing_invariant_tests() -> None:
 
     assert referenced
     assert not [path for path in sorted(referenced) if not (ROOT / path).is_file()]
+
+
+def test_native_workflow_matrix_covers_every_release_gate() -> None:
+    source = CI.read_text()
+
+    assert "os: [ubuntu-latest, macos-latest, windows-latest]" in source
+    for required_test in (
+        "tests/plugins/workflow/test_idempotency_multiprocess.py",
+        "tests/plugins/workflow/test_coordinator.py",
+        "tests/plugins/workflow/test_coordinator_multiprocess.py",
+        "tests/plugins/workflow/test_schema_migrations.py",
+        "tests/plugins/workflow/test_notification_delivery.py",
+        "tests/plugins/workflow/test_shutdown_recovery.py",
+        "tests/plugins/workflow/test_retention.py",
+    ):
+        assert required_test in source
 
 
 def test_merge_gate_shares_workspace_root_dependencies_with_temp_worktrees() -> None:
@@ -43,7 +60,7 @@ def test_merge_gate_rejects_invalid_phase_and_unknown_brand() -> None:
 def test_base_gate_is_offline_and_reports_exact_tested_sha(monkeypatch) -> None:
     env = dict(**__import__("os").environ)
     env["WORKFLOW_MERGE_GATE_FAST"] = "1"
-    result = subprocess.run([GATE, "--phase", "base"], cwd=ROOT, text=True, capture_output=True, env=env)
+    result = subprocess.run([GATE], cwd=ROOT, text=True, capture_output=True, env=env)
     assert result.returncode == 0, result.stderr
     assert f"TESTED_BASE_SHA={subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()}" in result.stdout
 

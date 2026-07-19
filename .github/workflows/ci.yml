@@ -165,6 +165,13 @@ jobs:
         run: |
           uv run --no-sync python -m pytest -q \
             tests/tools/test_managed_process.py \
+            tests/plugins/workflow/test_idempotency_multiprocess.py \
+            tests/plugins/workflow/test_coordinator.py \
+            tests/plugins/workflow/test_coordinator_multiprocess.py \
+            tests/plugins/workflow/test_schema_migrations.py \
+            tests/plugins/workflow/test_notification_delivery.py \
+            tests/plugins/workflow/test_shutdown_recovery.py \
+            tests/plugins/workflow/test_retention.py \
             tests/plugins/workflow/test_portable_compatibility_e2e.py \
             tests/plugins/workflow/test_showcase_catalog.py \
             tests/plugins/workflow/test_showcase_distribution_e2e.py \

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
-PHASE=""
+PHASE="base"
 BRAND=""
 TESTED_BASE_SHA=""
 
@@ -36,7 +36,15 @@ fi
 
 export OPENROUTER_API_KEY="" OPENAI_API_KEY="" NOUS_API_KEY=""
 export HERMES_OFFLINE=1
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  :
+elif [[ -x "$ROOT/.venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT/.venv/bin/python"
+elif [[ -x "$ROOT/venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT/venv/bin/python"
+else
+  PYTHON_BIN="python3"
+fi
 
 cd "$ROOT"
 "$PYTHON_BIN" "$CHECKER" --manifest "$MANIFEST"

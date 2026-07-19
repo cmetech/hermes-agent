@@ -18,6 +18,14 @@ EXIT_COORDINATOR_UNAVAILABLE = 6
 EXIT_BLOCKING_FINDING = 7
 EXIT_ACTION_FAILED = 8
 EXIT_INTERNAL = 70
+_CONFIRMATION_CAPABILITY_COMMANDS = frozenset(
+    {
+        "workflow cleanup",
+        "workflow showcase cleanup",
+        "workflow showcase preflight",
+        "workflow showcase run",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -138,7 +146,7 @@ def projection_was_truncated(value: object, *, depth: int = 0) -> bool:
 def _sanitize_success_result(command: str, result: object) -> object:
     sanitized = sanitize_projection(result)
     if (
-        command == "workflow cleanup"
+        command in _CONFIRMATION_CAPABILITY_COMMANDS
         and isinstance(result, Mapping)
         and isinstance(sanitized, dict)
         and isinstance(result.get("confirmation_token"), str)
@@ -148,6 +156,18 @@ def _sanitize_success_result(command: str, result: object) -> object:
         sanitized["confirmation_token"] = sanitize_projection(
             result["confirmation_token"]
         )
+    if isinstance(result, Mapping) and isinstance(sanitized, dict):
+        raw_contract = result.get("command_contract")
+        safe_contract = sanitized.get("command_contract")
+        if isinstance(raw_contract, Mapping) and isinstance(safe_contract, dict):
+            raw_exits = raw_contract.get("exit_codes")
+            safe_exits = safe_contract.get("exit_codes")
+            if isinstance(raw_exits, Mapping) and isinstance(safe_exits, dict):
+                authorization_exit = raw_exits.get("authorization")
+                if isinstance(authorization_exit, int) and not isinstance(
+                    authorization_exit, bool
+                ):
+                    safe_exits["authorization"] = authorization_exit
     return sanitized
 
 

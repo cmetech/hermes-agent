@@ -58,6 +58,29 @@ def test_success_envelope_sanitizes_every_machine_payload_and_preserves_cleanup_
         "api_token": "[REDACTED]",
     }
 
+    for command in (
+        "workflow showcase preflight",
+        "workflow showcase run",
+        "workflow showcase cleanup",
+    ):
+        showcase = machine_contract.success_envelope(
+            command,
+            {
+                "confirmation_token": "server-minted-capability",
+                "command_contract": machine_contract.operator_command_contract(),
+            },
+        )
+        assert showcase["result"]["confirmation_token"] == "server-minted-capability"
+        assert (
+            showcase["result"]["command_contract"]
+            == machine_contract.operator_command_contract()
+        )
+
+    untrusted = machine_contract.success_envelope(
+        "workflow list", {"confirmation_token": "unrecognized-secret"}
+    )
+    assert untrusted["result"]["confirmation_token"] == "[REDACTED]"
+
 
 def _write(workflow_writer, workdir):
     return workflow_writer(
