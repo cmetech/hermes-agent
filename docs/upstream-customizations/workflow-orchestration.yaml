@@ -542,7 +542,12 @@ upstream_changes:
   files:
   - hermes_cli/plugin_services.py
   - hermes_cli/plugins.py
+  - tools/tts_tool.py
+  - tools/transcription_tools.py
+  - tools/video_generation_tool.py
+  - tools/image_generation_tool.py
   - tests/hermes_cli/test_plugin_background_services.py
+  - tests/hermes_cli/test_plugin_provider_hot_reload.py
   owned_symbols:
   - BackgroundService
   - BackgroundServiceContext
@@ -552,46 +557,63 @@ upstream_changes:
   - PluginContext.register_background_service
   - PluginManager.start_background_services
   - PluginManager.reload_background_services
+  - PluginManager.has_bound_background_service_host
+  - hosted media-provider dispatch reload boundary
   tests:
   - tests/hermes_cli/test_plugin_background_services.py
   - tests/hermes_cli/test_plugins.py
   - tests/hermes_cli/test_safe_mode.py
-  expected_commit_subject: 'feat(plugins): host background services'
+  - tests/hermes_cli/test_plugin_provider_hot_reload.py
+  - tests/tools/test_image_generation_plugin_dispatch.py
+  - tests/tools/test_transcription_plugin_dispatch.py
+  - tests/tools/test_tts_plugin_dispatch.py
+  - tests/tools/test_video_generation_dispatch.py
+  expected_commit_subject: 'fix(plugins): prevent background service overlap'
   upstream_candidate: true
   merge_guidance: Preserve attributed dormant factories, host filtering,
     registration rollback, one host-owned blocking run thread, cached bounded
     health probes, aggregate shutdown, failure isolation, safe-mode factory
-    suppression, and the no-overlap force-reload barrier. The workflow
+    suppression, one indexed live generation per host kind (including the
+    bind-before-start race), and the no-overlap force-reload barrier. Hosted
+    provider callers wait for host-controlled publication and never force a
+    rescan; unhosted CLI processes retain direct force discovery. The workflow
     coordinator is the concrete consumer; generic lifecycle code must not
     receive workflow, agent, prompt, conversation, tool, provider, web, or
     Gateway authority.
   removal_condition: Remove when Hermes upstream provides an equivalent or
     stronger generic plugin service host and the workflow coordinator has
-    migrated to it without weakening quiescence-proven reload.
+    migrated to it without weakening same-kind exclusion, quiescence-proven
+    reload, or host-owned provider publication.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: web-plugin-background-service-host
   change_class: product-surface-generic
   owner: workflow-orchestration
   files:
   - hermes_cli/web_server.py
+  - tests/hermes_cli/test_web_server.py
   - tests/hermes_cli/test_web_server_plugin_services.py
+  - tests/hermes_cli/test_plugin_provider_hot_reload.py
   owned_symbols:
   - _lifespan plugin background service boundary
   - app.state.plugin_background_services
+  - _reload_plugin_background_services
+  - provider and plugin configuration reload routing
   tests:
   - tests/hermes_cli/test_web_server_plugin_services.py
   - tests/hermes_cli/test_web_server_boot_handshake.py
   - tests/hermes_cli/test_workflow_dashboard_auth.py
-  expected_commit_subject: 'feat(web): host plugin background services'
+  - tests/hermes_cli/test_plugin_provider_hot_reload.py
+  expected_commit_subject: 'fix(plugins): prevent background service overlap'
   upstream_candidate: true
   merge_guidance: Preserve generic plugin discovery and web-host binding before
     FastAPI readiness, process-local cached lifecycle inspection on app.state,
-    failure isolation from HTTP readiness, and bounded service shutdown before
-    PTY and cron resource teardown. Do not add workflow imports or expose local
-    service health as cross-process workflow authority.
+    failure isolation from HTTP readiness, host-controller provider/plugin
+    reload with explicit plugin_reload_blocked rollback, and bounded service
+    shutdown before PTY and cron resource teardown. Do not add workflow imports
+    or expose local service health as cross-process workflow authority.
   removal_condition: Remove when Hermes upstream binds an equivalent generic
     plugin service host in both dashboard and headless-serve FastAPI lifespan
-    with the same failure and shutdown ordering.
+    with the same failure, provider-publication, and shutdown ordering.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: gateway-plugin-background-service-host
   change_class: product-surface-generic
@@ -601,21 +623,23 @@ upstream_changes:
   - tests/gateway/test_plugin_background_services.py
   owned_symbols:
   - GatewayRunner.plugin_background_services
+  - GatewayRunner.reload_plugin_background_services
   - GatewayRunner.start plugin background service boundary
   - GatewayRunner.stop plugin background service boundary
   tests:
   - tests/gateway/test_plugin_background_services.py
   - tests/gateway/test_gateway_shutdown.py
   - tests/gateway/test_startup_restart_race.py
-  expected_commit_subject: 'feat(gateway): host plugin background services'
+  expected_commit_subject: 'fix(plugins): prevent background service overlap'
   upstream_candidate: true
   merge_guidance: Preserve generic Gateway-host binding after plugin discovery
     and required adapter/runtime readiness but before the running status, plus
-    bounded service quiescence while adapters and persistence are still live.
-    Service construction, run, health, and shutdown failures must remain
-    isolated from unrelated Gateway startup and teardown. Do not add workflow
-    imports or treat process-local service health as cross-process authority.
+    host-controller provider publication, and bounded service quiescence while
+    adapters and persistence are still live. Service construction, run, health,
+    reload, and shutdown failures must remain isolated from unrelated Gateway
+    startup and teardown. Do not add workflow imports or treat process-local
+    service health as cross-process authority.
   removal_condition: Remove when Hermes upstream binds an equivalent generic
-    plugin service host in Gateway with the same readiness, failure-isolation,
-    and pre-resource-teardown shutdown ordering.
+    plugin service host in Gateway with the same readiness, provider-publication,
+    failure-isolation, and pre-resource-teardown shutdown ordering.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

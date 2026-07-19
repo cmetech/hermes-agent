@@ -16,6 +16,7 @@ import atexit
 import base64
 import binascii
 import concurrent.futures
+import copy
 import functools
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -168,6 +169,42 @@ def _resolve_restart_drain_timeout() -> float:
     except ImportError:
         from gateway.restart import DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
         return DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+
+
+async def _reload_plugin_background_services(
+    app: "FastAPI", *, timeout: float = 10.0
+) -> dict[str, object]:
+    """Run plugin rediscovery through the Web host lifecycle controller."""
+    current = getattr(app.state, "plugin_background_services", None)
+    if current is None:
+        return {"ok": True}
+    from hermes_cli.plugin_services import BackgroundServiceReloadBlocked
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+    try:
+        replacements = await asyncio.to_thread(
+            manager.reload_background_services, timeout=timeout
+        )
+    except BackgroundServiceReloadBlocked:
+        _log.warning("Plugin provider reload blocked by a live service generation")
+        return {"ok": False, "error": "plugin_reload_blocked"}
+    replacement = next(
+        (host for host in replacements if host.host_kind == "web"), None
+    )
+    if replacement is None:
+        replacement = manager.start_background_services("web")
+    app.state.plugin_background_services = replacement
+    return {"ok": True}
+
+
+async def _reload_plugin_background_services_or_raise(request: Request) -> None:
+    result = await _reload_plugin_background_services(request.app)
+    if not result["ok"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": result["error"]},
+        )
 
 
 @asynccontextmanager
@@ -13982,7 +14019,10 @@ async def select_toolset_model(
 
 @app.put("/api/tools/toolsets/{name}/provider")
 async def select_toolset_provider(
-    name: str, body: ToolsetProviderSelect, profile: Optional[str] = None
+    request: Request,
+    name: str,
+    body: ToolsetProviderSelect,
+    profile: Optional[str] = None,
 ):
     """Persist a provider selection for a toolset (no key prompting).
 
@@ -14003,11 +14043,19 @@ async def select_toolset_provider(
 
     with _profile_scope(body.profile or profile):
         config = load_config()
+        previous_config = copy.deepcopy(config)
         try:
             apply_provider_selection(name, body.provider, config)
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=str(exc).strip('"'))
         save_config(config)
+        reload_result = await _reload_plugin_background_services(request.app)
+        if not reload_result["ok"]:
+            save_config(previous_config)
+            raise HTTPException(
+                status_code=409,
+                detail={"code": reload_result["error"]},
+            )
     return {"ok": True, "name": name, "provider": body.provider}
 
 
@@ -16851,6 +16899,7 @@ async def post_agent_plugin_install(request: Request, body: _AgentPluginInstallB
             status_code=400,
             detail=result.get("error") or "Install failed.",
         )
+    await _reload_plugin_background_services_or_raise(request)
     _get_dashboard_plugins(force_rescan=True)
     # Strip internal paths from the response
     result.pop("after_install_path", None)
@@ -16874,6 +16923,7 @@ async def post_agent_plugin_enable(request: Request, name: str):
     result = dashboard_set_agent_plugin_enabled(name, enabled=True)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Enable failed.")
+    await _reload_plugin_background_services_or_raise(request)
     return result
 
 
@@ -16886,6 +16936,7 @@ async def post_agent_plugin_disable(request: Request, name: str):
     result = dashboard_set_agent_plugin_enabled(name, enabled=False)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Disable failed.")
+    await _reload_plugin_background_services_or_raise(request)
     return result
 
 
@@ -16898,6 +16949,7 @@ async def post_agent_plugin_update(request: Request, name: str):
     result = dashboard_update_user_plugin(name)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Update failed.")
+    await _reload_plugin_background_services_or_raise(request)
     _get_dashboard_plugins(force_rescan=True)
     return result
 
@@ -16911,6 +16963,7 @@ async def delete_agent_plugin(request: Request, name: str):
     result = dashboard_remove_user_plugin(name)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Remove failed.")
+    await _reload_plugin_background_services_or_raise(request)
     _get_dashboard_plugins(force_rescan=True)
     return result
 
@@ -16928,6 +16981,7 @@ async def put_plugin_providers(request: Request, body: _PluginProvidersPutBody):
         _save_context_engine,
         _save_memory_provider,
     )
+    previous_config = copy.deepcopy(load_config())
 
     if body.memory_provider is not None:
         memory_provider = _normalize_memory_provider_name(body.memory_provider)
@@ -16935,6 +16989,11 @@ async def put_plugin_providers(request: Request, body: _PluginProvidersPutBody):
         _save_memory_provider(memory_provider)
     if body.context_engine is not None:
         _save_context_engine(body.context_engine)
+    try:
+        await _reload_plugin_background_services_or_raise(request)
+    except HTTPException:
+        save_config(previous_config)
+        raise
     return {"ok": True}
 
 

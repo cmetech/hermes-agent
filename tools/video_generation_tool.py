@@ -233,9 +233,11 @@ def _resolve_active_provider():
         from agent.video_gen_registry import get_active_provider
         from hermes_cli.plugins import _ensure_plugins_discovered
 
-        _ensure_plugins_discovered()
+        manager = _ensure_plugins_discovered()
         provider = get_active_provider()
-        if provider is None:
+        if provider is None and not bool(
+            getattr(manager, "has_bound_background_service_host", False)
+        ):
             _ensure_plugins_discovered(force=True)
             provider = get_active_provider()
         return provider

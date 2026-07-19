@@ -1312,8 +1312,13 @@ class PluginManager:
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
         self._background_services: Dict[str, BackgroundServiceRegistration] = {}
-        self._background_service_hosts: Set[BackgroundServiceHost] = set()
+        self._background_service_hosts: Dict[
+            BackgroundServiceHostKind, BackgroundServiceHost
+        ] = {}
         self._background_service_lock = threading.RLock()
+        self._background_reload_condition = threading.Condition(
+            self._background_service_lock
+        )
         self._background_service_generation = 0
         self._background_reload_in_progress = False
         self._background_reload_thread_id: int | None = None
@@ -1330,11 +1335,11 @@ class PluginManager:
         sessions without requiring a full agent restart.
         """
         with self._background_service_lock:
-            if (
+            while (
                 self._background_reload_in_progress
                 and self._background_reload_thread_id != threading.get_ident()
             ):
-                raise RuntimeError("plugin background service reload is in progress")
+                self._background_reload_condition.wait()
             self._prune_quiescent_background_hosts_locked()
             if force and self._background_service_hosts:
                 raise RuntimeError(
@@ -1417,12 +1422,22 @@ class PluginManager:
 
     def _background_host_quiescent(self, host: BackgroundServiceHost) -> None:
         with self._background_service_lock:
-            self._background_service_hosts.discard(host)
+            if self._background_service_hosts.get(host.host_kind) is host:
+                self._background_service_hosts.pop(host.host_kind, None)
 
     def _prune_quiescent_background_hosts_locked(self) -> None:
         self._background_service_hosts = {
-            host for host in self._background_service_hosts if not host.is_quiescent
+            host_kind: host
+            for host_kind, host in self._background_service_hosts.items()
+            if not host.is_started or not host.is_quiescent
         }
+
+    @property
+    def has_bound_background_service_host(self) -> bool:
+        """Whether a live host owns provider/service reload in this process."""
+        with self._background_service_lock:
+            self._prune_quiescent_background_hosts_locked()
+            return bool(self._background_service_hosts)
 
     def _make_background_host_locked(
         self,
@@ -1440,7 +1455,7 @@ class PluginManager:
             safe_mode=env_var_enabled("HERMES_SAFE_MODE"),
             on_quiescent=self._background_host_quiescent,
         )
-        self._background_service_hosts.add(host)
+        self._background_service_hosts[host_kind] = host
         return host
 
     def start_background_services(
@@ -1456,7 +1471,8 @@ class PluginManager:
             self._prune_quiescent_background_hosts_locked()
             if self._background_reload_in_progress:
                 raise RuntimeError("background service reload is in progress")
-            bound = self._make_background_host_locked(
+            existing = self._background_service_hosts.get(host)
+            bound = existing or self._make_background_host_locked(
                 host, shutdown_timeout=shutdown_timeout
             )
         bound.start()
@@ -1479,30 +1495,29 @@ class PluginManager:
                     "plugin background service reload is already in progress"
                 )
             self._prune_quiescent_background_hosts_locked()
-            old_hosts = tuple(self._background_service_hosts)
+            old_hosts = tuple(self._background_service_hosts.values())
             host_specs = tuple(
                 (host.host_kind, host.shutdown_timeout) for host in old_hosts
             )
             self._background_reload_in_progress = True
             self._background_reload_thread_id = threading.get_ident()
 
-        deadline = time.monotonic() + timeout
-        for host in old_hosts:
-            host.request_stop()
-        stopped = [host.await_stopped(deadline=deadline) for host in old_hosts]
-        if not all(stopped):
-            with self._background_service_lock:
-                self._background_reload_in_progress = False
-                self._background_reload_thread_id = None
-            raise BackgroundServiceReloadBlocked(
-                "plugin background service reload blocked by stop timeout"
-            )
-
         replacements: tuple[BackgroundServiceHost, ...] = ()
+        registries_cleared = False
         try:
+            deadline = time.monotonic() + timeout
+            for host in old_hosts:
+                host.request_stop()
+            stopped = [host.await_stopped(deadline=deadline) for host in old_hosts]
+            if not all(stopped):
+                raise BackgroundServiceReloadBlocked(
+                    "plugin background service reload blocked by stop timeout"
+                )
+
             with self._background_service_lock:
                 self._clear_plugin_registries()
                 self._discovered = True
+                registries_cleared = True
             if env_var_enabled("HERMES_SAFE_MODE"):
                 logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
             else:
@@ -1515,12 +1530,14 @@ class PluginManager:
                     for host_kind, shutdown_timeout in host_specs
                 )
         except BaseException:
-            self._discovered = False
+            if registries_cleared:
+                self._discovered = False
             raise
         finally:
             with self._background_service_lock:
                 self._background_reload_in_progress = False
                 self._background_reload_thread_id = None
+                self._background_reload_condition.notify_all()
         for replacement in replacements:
             replacement.start()
         return replacements

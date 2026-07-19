@@ -470,6 +470,12 @@ class BackgroundServiceHost:
             for thread in state.threads()
         )
 
+    @property
+    def is_started(self) -> bool:
+        """Return whether this bound generation crossed its idempotent start gate."""
+        with self._start_lock:
+            return self._started
+
 
 __all__ = [
     "BACKGROUND_SERVICE_NAME_PATTERN",

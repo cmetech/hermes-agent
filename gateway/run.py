@@ -2802,6 +2802,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _startup_restore_in_progress: bool = False
     plugin_background_services = None
 
+    async def reload_plugin_background_services(
+        self, *, timeout: float = 10.0
+    ) -> dict[str, object]:
+        """Rediscover plugins through the Gateway-owned lifecycle controller."""
+        from hermes_cli.plugin_services import BackgroundServiceReloadBlocked
+        from hermes_cli.plugins import get_plugin_manager
+
+        manager = get_plugin_manager()
+        try:
+            replacements = await asyncio.to_thread(
+                manager.reload_background_services, timeout=timeout
+            )
+        except BackgroundServiceReloadBlocked:
+            logger.warning(
+                "Gateway plugin provider reload blocked by a live service generation"
+            )
+            return {"ok": False, "error": "plugin_reload_blocked"}
+        replacement = next(
+            (host for host in replacements if host.host_kind == "gateway"), None
+        )
+        if replacement is None:
+            replacement = manager.start_background_services("gateway")
+        self.plugin_background_services = replacement
+        return {"ok": True}
+
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
         self.config = config or load_gateway_config()

@@ -12,6 +12,7 @@ import pytest
 
 from hermes_cli.plugin_services import (
     BackgroundServiceHealth,
+    BackgroundServiceHost,
     BackgroundServiceReloadBlocked,
 )
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -382,12 +383,191 @@ def test_successful_hosted_reload_starts_next_generation_after_quiescence(
     assert replacements[0].shutdown(timeout=1)
 
 
-def test_reference_factory_is_dormant_before_run(tmp_path) -> None:
-    process = psutil.Process()
-    lease_root = tmp_path / "leases"
-    lease_root.mkdir()
+def test_provider_reload_blocks_callers_until_new_registry_is_published(
+    monkeypatch,
+) -> None:
+    manager = PluginManager()
+    old = _BlockingService(threading.Event(), threading.Event())
+    _context(manager, key="atomic-reload").register_background_service(
+        "service", lambda _context: old, hosts={"web"}
+    )
+    host = manager.start_background_services("web")
+    assert old.entered.wait(timeout=1)
+    discovery_entered = threading.Event()
+    release_discovery = threading.Event()
+    caller_returned = threading.Event()
+    replacements: list[tuple] = []
 
-    def snapshot() -> tuple[set[int], set[int], set[tuple[str, int]], set[str]]:
+    def replacement_discovery() -> None:
+        discovery_entered.set()
+        release_discovery.wait()
+        _context(manager, key="atomic-reload").register_background_service(
+            "service",
+            lambda _context: _BlockingService(
+                threading.Event(), threading.Event()
+            ),
+            hosts={"web"},
+        )
+
+    monkeypatch.setattr(manager, "_discover_and_load_inner", replacement_discovery)
+    reload_thread = threading.Thread(
+        target=lambda: replacements.append(
+            manager.reload_background_services(timeout=1)
+        )
+    )
+    reload_thread.start()
+    assert discovery_entered.wait(timeout=1)
+    caller = threading.Thread(
+        target=lambda: (
+            manager.discover_and_load(),
+            caller_returned.set(),
+        )
+    )
+    caller.start()
+    time.sleep(0.05)
+    assert caller_returned.is_set() is False
+
+    release_discovery.set()
+    reload_thread.join(timeout=1)
+    caller.join(timeout=1)
+
+    assert caller_returned.is_set()
+    assert len(replacements) == 1
+    assert replacements[0][0].generation == host.generation + 1
+    assert replacements[0][0].shutdown(timeout=1)
+
+
+def test_provider_reload_control_failure_releases_discovery_waiters() -> None:
+    manager = PluginManager()
+
+    class BrokenHost:
+        host_kind = "web"
+        shutdown_timeout = 1.0
+        is_started = True
+        is_quiescent = False
+
+        def request_stop(self):
+            raise OSError("host control failed")
+
+    manager._background_service_hosts["web"] = BrokenHost()
+
+    with pytest.raises(OSError, match="host control failed"):
+        manager.reload_background_services(timeout=0.1)
+
+    assert manager._background_reload_in_progress is False
+    assert manager._background_reload_thread_id is None
+
+
+def test_same_kind_start_returns_existing_live_generation() -> None:
+    manager = PluginManager()
+    calls = 0
+    service = _BlockingService(threading.Event(), threading.Event())
+
+    def factory(_context):
+        nonlocal calls
+        calls += 1
+        return service
+
+    _context(manager, key="same-kind").register_background_service(
+        "service", factory, hosts={"web"}
+    )
+    first = manager.start_background_services("web")
+    assert service.entered.wait(timeout=1)
+
+    second = manager.start_background_services("web")
+
+    assert second is first
+    assert calls == 1
+    assert first.shutdown(timeout=1)
+
+
+def test_concurrent_same_kind_start_cannot_replace_bound_unstarted_host(
+    monkeypatch,
+) -> None:
+    manager = PluginManager()
+    service = _BlockingService(threading.Event(), threading.Event())
+    _context(manager, key="same-kind-race").register_background_service(
+        "service", lambda _context: service, hosts={"web"}
+    )
+    start_entered = threading.Event()
+    release_start = threading.Event()
+    original_start = BackgroundServiceHost.start
+
+    def delayed_start(host):
+        start_entered.set()
+        release_start.wait()
+        original_start(host)
+
+    monkeypatch.setattr(BackgroundServiceHost, "start", delayed_start)
+    returned: list[BackgroundServiceHost] = []
+    first_thread = threading.Thread(
+        target=lambda: returned.append(manager.start_background_services("web"))
+    )
+    second_thread = threading.Thread(
+        target=lambda: returned.append(manager.start_background_services("web"))
+    )
+    first_thread.start()
+    assert start_entered.wait(timeout=1)
+    second_thread.start()
+    time.sleep(0.05)
+    release_start.set()
+    first_thread.join(timeout=1)
+    second_thread.join(timeout=1)
+
+    assert len(returned) == 2
+    assert returned[0] is returned[1]
+    assert service.entered.wait(timeout=1)
+    assert returned[0].shutdown(timeout=1)
+
+
+def test_same_kind_stop_timeout_never_starts_overlapping_generation() -> None:
+    manager = PluginManager()
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    class WedgedService:
+        def run(self, _stop_event: threading.Event) -> None:
+            entered.set()
+            release.wait()
+
+        def health(self) -> BackgroundServiceHealth:
+            return BackgroundServiceHealth(state="healthy", code="ready")
+
+    def factory(_context):
+        nonlocal calls
+        calls += 1
+        return WedgedService()
+
+    _context(manager, key="same-kind-wedged").register_background_service(
+        "service", factory, hosts={"web"}
+    )
+    first = manager.start_background_services("web")
+    assert entered.wait(timeout=1)
+    assert first.shutdown(timeout=0.05) is False
+
+    second = None
+    try:
+        second = manager.start_background_services("web")
+        assert second is first
+        assert calls == 1
+    finally:
+        release.set()
+        assert first.shutdown(timeout=1)
+        if second is not None and second is not first:
+            assert second.shutdown(timeout=1)
+
+
+def test_reference_factory_and_cached_health_are_dormant_before_run(
+    tmp_path, monkeypatch
+) -> None:
+    process = psutil.Process()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from plugins.workflow.store import RunStore
+
+    store = RunStore(tmp_path)
+
+    def snapshot() -> tuple[set[int], set[int], set[tuple[str, int]], tuple[int, int]]:
         threads = {thread.ident for thread in threading.enumerate() if thread.ident}
         children = {child.pid for child in process.children(recursive=True)}
         listeners = {
@@ -395,8 +575,12 @@ def test_reference_factory_is_dormant_before_run(tmp_path) -> None:
             for connection in process.net_connections(kind="inet")
             if connection.status == psutil.CONN_LISTEN and connection.laddr
         }
-        leases = {path.name for path in lease_root.iterdir()}
-        return threads, children, listeners, leases
+        with store._connect() as connection:
+            durable_rows = (
+                connection.execute("SELECT count(*) FROM coordinator_lease").fetchone()[0],
+                connection.execute("SELECT count(*) FROM coordinator_events").fetchone()[0],
+            )
+        return threads, children, listeners, durable_rows
 
     before = snapshot()
     from hermes_cli.plugin_services import BackgroundServiceContext
@@ -407,5 +591,13 @@ def test_reference_factory_is_dormant_before_run(tmp_path) -> None:
     )
     after = snapshot()
 
-    assert returned.health().code == "registered"
     assert after == before
+    monkeypatch.setattr(
+        "sqlite3.connect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached health must not open SQLite")
+        ),
+    )
+    started = time.monotonic()
+    assert returned.health().code == "registered"
+    assert time.monotonic() - started < 0.1

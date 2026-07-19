@@ -10,7 +10,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import gateway.run as gateway_run
-from hermes_cli.plugin_services import BackgroundServiceHealth
+from hermes_cli.plugin_services import (
+    BackgroundServiceHealth,
+    BackgroundServiceReloadBlocked,
+)
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from tests.gateway.restart_test_helpers import make_restart_runner
 from tests.gateway.test_startup_restart_race import (
@@ -195,3 +198,51 @@ def test_gateway_host_import_graph_is_workflow_agnostic() -> None:
     )
 
     assert not any(module.startswith("plugins.workflow") for module in imports)
+
+
+@pytest.mark.asyncio
+async def test_gateway_provider_reload_runs_in_host_controller(monkeypatch) -> None:
+    manager = PluginManager()
+    old_host = object()
+    replacement = MagicMock(host_kind="gateway")
+    reload_threads: list[int] = []
+
+    def reload_background_services(*, timeout):
+        assert timeout == 10.0
+        reload_threads.append(threading.get_ident())
+        return (replacement,)
+
+    monkeypatch.setattr(
+        manager, "reload_background_services", reload_background_services
+    )
+    monkeypatch.setattr("hermes_cli.plugins._plugin_manager", manager)
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    runner.plugin_background_services = old_host
+    controller_thread = threading.get_ident()
+
+    result = await runner.reload_plugin_background_services()
+
+    assert result == {"ok": True}
+    assert reload_threads and reload_threads[0] != controller_thread
+    assert runner.plugin_background_services is replacement
+
+
+@pytest.mark.asyncio
+async def test_gateway_provider_reload_blocked_keeps_old_generation(
+    monkeypatch,
+) -> None:
+    manager = PluginManager()
+    old_host = object()
+
+    def blocked(*, timeout):
+        raise BackgroundServiceReloadBlocked(f"blocked after {timeout}")
+
+    monkeypatch.setattr(manager, "reload_background_services", blocked)
+    monkeypatch.setattr("hermes_cli.plugins._plugin_manager", manager)
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    runner.plugin_background_services = old_host
+
+    result = await runner.reload_plugin_background_services(timeout=0.1)
+
+    assert result == {"ok": False, "error": "plugin_reload_blocked"}
+    assert runner.plugin_background_services is old_host

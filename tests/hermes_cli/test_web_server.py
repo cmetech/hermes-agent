@@ -842,6 +842,32 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         assert load_config()["memory"]["provider"] == ""
 
+    def test_dashboard_plugin_provider_reload_blocked_restores_config(
+        self, monkeypatch
+    ):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        config.setdefault("context", {})["engine"] = "old-engine"
+        save_config(config)
+
+        async def blocked(_app, *, timeout=10.0):
+            return {"ok": False, "error": "plugin_reload_blocked"}
+
+        monkeypatch.setattr(
+            web_server, "_reload_plugin_background_services", blocked
+        )
+
+        response = self.client.put(
+            "/api/dashboard/plugin-providers",
+            json={"context_engine": "new-engine"},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "plugin_reload_blocked"
+        assert load_config()["context"]["engine"] == "old-engine"
+
     def test_get_moa_models_returns_provider_model_slots(self):
         resp = self.client.get("/api/model/moa")
         assert resp.status_code == 200
@@ -5906,6 +5932,67 @@ class TestNewEndpoints:
         from hermes_cli.config import load_config
         cfg = load_config()
         assert cfg["web"]["backend"] == "firecrawl"
+
+    def test_provider_reload_blocked_restores_previous_config(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        config.setdefault("web", {})["backend"] = "duckduckgo"
+        save_config(config)
+        prior_host = object()
+        web_server.app.state.plugin_background_services = prior_host
+
+        async def blocked(_app, *, timeout=10.0):
+            assert timeout == 10.0
+            return {"ok": False, "error": "plugin_reload_blocked"}
+
+        monkeypatch.setattr(
+            web_server,
+            "_reload_plugin_background_services",
+            blocked,
+            raising=False,
+        )
+        try:
+            response = self.client.put(
+                "/api/tools/toolsets/web/provider",
+                json={"provider": "Firecrawl Self-Hosted"},
+            )
+        finally:
+            del web_server.app.state.plugin_background_services
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "plugin_reload_blocked"
+        assert load_config()["web"]["backend"] == "duckduckgo"
+
+    def test_plugin_enable_schedules_host_owned_provider_reload(self, monkeypatch):
+        import hermes_cli.plugins_cmd as plugins_cmd
+        import hermes_cli.web_server as web_server
+
+        reloads: list[object] = []
+        monkeypatch.setattr(
+            plugins_cmd,
+            "dashboard_set_agent_plugin_enabled",
+            lambda name, *, enabled: {
+                "ok": name == "image_gen/hot-add" and enabled
+            },
+        )
+
+        async def reload_host(app, *, timeout=10.0):
+            assert timeout == 10.0
+            reloads.append(app)
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            web_server, "_reload_plugin_background_services", reload_host
+        )
+
+        response = self.client.post(
+            "/api/dashboard/agent-plugins/image_gen/hot-add/enable"
+        )
+
+        assert response.status_code == 200
+        assert reloads == [web_server.app]
 
     def test_select_toolset_provider_unknown_provider_returns_400(self):
         resp = self.client.put(
