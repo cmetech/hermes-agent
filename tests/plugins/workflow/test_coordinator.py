@@ -530,6 +530,94 @@ def test_gateway_standby_delivers_notifications_while_web_holds_leadership(
         assert not gateway_thread.is_alive()
 
 
+def test_blocked_standby_delivery_does_not_delay_leadership_takeover(
+    tmp_path,
+) -> None:
+    store = RunStore(tmp_path)
+    delivery_started = threading.Event()
+    release_delivery = threading.Event()
+
+    class BlockingPort:
+        def deliver(self, _capability: str, _text: str, _key: str) -> DeliveryReceipt:
+            delivery_started.set()
+            if not release_delivery.wait(timeout=5):
+                raise TimeoutError("test delivery was not released")
+            return DeliveryReceipt(status="delivered", transport_id="message-1")
+
+    web = _service(tmp_path, host_kind="web", host_instance_id="web-leader")
+    gateway = _service(
+        tmp_path,
+        host_kind="gateway",
+        host_instance_id="gateway-standby",
+        delivery_port=BlockingPort(),
+    )
+    web_stop = threading.Event()
+    gateway_stop = threading.Event()
+    web_thread = threading.Thread(target=web.run, args=(web_stop,))
+    gateway_thread = threading.Thread(target=gateway.run, args=(gateway_stop,))
+    web_thread.start()
+    try:
+        _wait_until(lambda: web.health().code == "leader")
+        gateway_thread.start()
+        _wait_until(lambda: gateway.health().code == "standby")
+        NotificationOutbox(store).record(
+            run_id="blocked-standby-delivery",
+            kind="completion",
+            destination="gateway:server-minted-capability",
+            transition_version=1,
+            payload={"status": "succeeded"},
+        )
+        assert delivery_started.wait(timeout=1)
+
+        web_stop.set()
+        CoordinatorStore(store.database).notify_local()
+        web_thread.join(timeout=2)
+        assert not web_thread.is_alive()
+
+        _wait_until(lambda: gateway.health().code == "leader", timeout=1)
+        assert not release_delivery.is_set()
+    finally:
+        release_delivery.set()
+        web_stop.set()
+        gateway_stop.set()
+        CoordinatorStore(store.database).notify_local()
+        web_thread.join(timeout=2)
+        gateway_thread.join(timeout=6)
+        assert not web_thread.is_alive()
+        assert not gateway_thread.is_alive()
+
+
+def test_gateway_retryable_delivery_receipt_requeues_outbox_row(tmp_path) -> None:
+    outbox = NotificationOutbox(RunStore(tmp_path))
+    notification_id = outbox.record(
+        run_id="retryable-gateway-delivery",
+        kind="completion",
+        destination="gateway:server-minted-capability",
+        transition_version=1,
+        payload={"status": "succeeded"},
+    )
+
+    class RetryablePort:
+        def deliver(self, _capability: str, _text: str, _key: str) -> DeliveryReceipt:
+            return DeliveryReceipt(
+                status="retryable_failure", detail="delivery_store_unavailable"
+            )
+
+    assert WorkflowCoordinatorService._deliver_gateway_notifications(
+        outbox,
+        RetryablePort(),
+        owner_id="delivery:gateway-standby",
+    ) == 0
+
+    row = next(
+        item for item in outbox.history() if item["notification_id"] == notification_id
+    )
+    assert row["state"] == "pending"
+    assert row["attempts"] == 1
+    assert row["lease_owner"] is None
+    assert row["last_error"] == "delivery_store_unavailable"
+
+
 def test_web_only_host_observes_election_grace_then_becomes_leader(tmp_path) -> None:
     service = _service(
         tmp_path,

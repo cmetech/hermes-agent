@@ -511,6 +511,15 @@ class WorkflowCoordinatorService:
         coordinator_store: CoordinatorStore | None = None
         leader_epoch: int | None = None
         web_eligible_at: float | None = None
+        delivery_pool = (
+            ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="workflow-standby-delivery",
+            )
+            if self.context.delivery_port is not None
+            else None
+        )
+        delivery_future: Future[int] | None = None
         try:
             while not stop_event.is_set():
                 try:
@@ -536,7 +545,21 @@ class WorkflowCoordinatorService:
                             leader_epoch = None
                         continue
 
-                    self._drain_gateway_notifications(run_store, identity)
+                    if delivery_pool is not None and (
+                        delivery_future is None or delivery_future.done()
+                    ):
+                        if delivery_future is not None:
+                            try:
+                                delivery_future.result()
+                            except Exception:
+                                logger.exception(
+                                    "Workflow standby notification drain failed"
+                                )
+                        delivery_future = delivery_pool.submit(
+                            self._drain_gateway_notifications,
+                            run_store,
+                            identity,
+                        )
 
                     lease = coordinator_store.observe(now=now)
                     may_contend, web_eligible_at = self._web_may_contend(
@@ -611,6 +634,8 @@ class WorkflowCoordinatorService:
                     )
                 except Exception:
                     logger.exception("Workflow coordinator lease release failed")
+            if delivery_pool is not None:
+                delivery_pool.shutdown(wait=True, cancel_futures=True)
 
 
 def create_workflow_coordinator(
