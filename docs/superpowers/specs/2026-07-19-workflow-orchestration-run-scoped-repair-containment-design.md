@@ -1,7 +1,7 @@
 # Workflow Orchestration Run-Scoped Repair Containment Design
 
 **Date:** 2026-07-19
-**Status:** Approved direction, pending written-spec review
+**Status:** Approved
 **Branch:** `feat/workflow-production-remediation`
 
 ## Purpose
@@ -122,11 +122,7 @@ The process-local counter is diagnostic only. Correctness depends solely on the 
 
 `tests/plugins/workflow/test_evidence_api.py` is added to the workflow portability selection in `.github/workflows/ci.yml` and to the exact pinned list in `tests/scripts/test_workflow_merge_gate.py`.
 
-The selection grows by exactly this file; it is not replaced by a wildcard and no existing test is removed. The test's platform branches remain intact:
-
-- POSIX-only `mkfifo` and `O_NOFOLLOW` tests skip on Windows;
-- the native Windows reparse-point test skips on POSIX;
-- every supported matrix OS executes the applicable containment path.
+The selection grows by exactly this file; it is not replaced by a wildcard and no existing test is removed. At the approved HEAD, the file has one platform marker: the native Windows reparse-point test skips on POSIX, while its descriptor/fallback containment tests are platform-neutral. There are no `mkfifo` or `O_NOFOLLOW` skip-marked tests in this file. Every supported matrix OS executes the applicable containment path, and the verification record must use the file's actual markers rather than assuming inverse skips that do not exist.
 
 The final verification record reports each platform's collected/pass/skip arithmetic and reconciles the inverse platform skips. It must not claim matrix coverage based only on a local POSIX run.
 
