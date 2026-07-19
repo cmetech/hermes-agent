@@ -102,7 +102,7 @@ class ForegroundExecutionLease:
 
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
-_STORE_SCHEMA_VERSION = 9
+_STORE_SCHEMA_VERSION = 10
 # Direct RunStore/CLI access is already the profile-local filesystem admin
 # boundary. Network adapters must always pass their verified authority binding.
 _LOCAL_ADMIN_AUTHORITY_BINDING = "profile-local-runstore-admin"
@@ -566,6 +566,13 @@ class RunStore:
                 if name not in columns:
                     connection.execute(statement)
             self._migrate_runs_idempotency_namespace(connection)
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS runs_coordinator_scan "
+                "ON runs(created_at, run_id) "
+                "WHERE admission_state='published' "
+                "AND status IN ('queued','running','waiting_retry') "
+                "AND execution_mode IN ('background','foreground')"
+            )
             cleanup_preview_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(cleanup_previews)")
@@ -2403,6 +2410,7 @@ class RunStore:
         _durable_replace(snapshot.staging_directory, run_directory)
         (run_directory / ".lock").touch(exist_ok=True)
         now = created_at
+        progress_sample = self._lease_clock()
         projection = {
             "schema_version": 2,
             "run_id": run_id,
@@ -2434,6 +2442,12 @@ class RunStore:
             "created_at": now,
             "updated_at": now,
             "last_semantic_progress_at": None,
+            "last_semantic_progress_monotonic": None,
+            "last_semantic_progress_boot_id": None,
+            "last_runnable_progress_at": now,
+            "last_runnable_progress_monotonic": progress_sample.monotonic_now,
+            "last_runnable_progress_boot_id": progress_sample.boot_id,
+            "progress_boot_id": progress_sample.boot_id,
             "nodes": {str(node["id"]): dict(node) for node in snapshot.nodes},
             "artifacts": [],
             "warnings": [],
@@ -2839,7 +2853,11 @@ class RunStore:
         ):
             projection = json.loads((directory / "run.json").read_text())
             if event_type == "semantic_progress":
-                projection["last_semantic_progress_at"] = _utc_now()
+                sample = self._lease_clock()
+                projection["last_semantic_progress_at"] = sample.utc_now.isoformat()
+                projection["last_semantic_progress_monotonic"] = sample.monotonic_now
+                projection["last_semantic_progress_boot_id"] = sample.boot_id
+                projection["progress_boot_id"] = sample.boot_id
             projection.update(dict(projection_updates or {}))
             return self._append_locked(
                 directory,
@@ -2849,6 +2867,46 @@ class RunStore:
                 node_id=node_id,
                 attempt_id=attempt_id,
             )
+
+    def coordinator_candidates(
+        self,
+        *,
+        after: tuple[str, str] | None,
+        limit: int = 100,
+    ) -> tuple[tuple[dict[str, object], ...], tuple[str, str] | None, bool]:
+        """Return one stable keyset page of coordinator-eligible rows."""
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        clauses = [
+            "admission_state='published'",
+            "status IN ('queued','running','waiting_retry')",
+            "execution_mode IN ('background','foreground')",
+        ]
+        values: list[object] = []
+        if after is not None:
+            if (
+                not isinstance(after, tuple)
+                or len(after) != 2
+                or not all(isinstance(value, str) and value for value in after)
+            ):
+                raise ValueError("after must be a created_at/run_id tuple")
+            clauses.append("(created_at>? OR (created_at=? AND run_id>?))")
+            values.extend((after[0], after[0], after[1]))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id, created_at, status, execution_mode FROM runs WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY created_at, run_id LIMIT ?",
+                (*values, limit + 1),
+            ).fetchall()
+        page = rows[:limit]
+        exhausted = len(rows) <= limit
+        cursor = (
+            (str(page[-1]["created_at"]), str(page[-1]["run_id"]))
+            if page
+            else after
+        )
+        return tuple(dict(row) for row in page), cursor, exhausted
 
     def tail_events(
         self,
@@ -3531,7 +3589,7 @@ class RunStore:
         run = self.load_run(run_id, operator_scope=operator_scope)
         if not isinstance(run.get("provenance"), Mapping):
             run["provenance"] = legacy_projection_provenance(run)
-        observed_at = datetime.now(timezone.utc)
+        observed_at = self._lease_clock().utc_now
         nodes = run.get("nodes", {})
         node_values = list(nodes.values()) if isinstance(nodes, dict) else []
         completed = sum(
@@ -3657,9 +3715,9 @@ class RunStore:
         elif stale_claim:
             health = "stalled"
             blocking_reason = "node_lease_expired"
-        elif not current_nodes:
+        elif isinstance(run.get("stall"), Mapping):
             health = "stalled"
-            blocking_reason = "no_runnable_or_owned_node"
+            blocking_reason = str(run["stall"].get("reason_code") or "stalled")
         elif observed is not None and observed.status != "healthy":
             health = "coordinator_unavailable"
             blocking_reason = observed.reason_code
@@ -3694,6 +3752,104 @@ class RunStore:
                 can_resume=blocking_reason != "foreground_owner_unavailable",
             ),
         }
+
+    def record_stall_if_due(
+        self,
+        run_id: str,
+        *,
+        fence: ExecutionFence,
+        now: LeaseClockSample,
+        runnable_stall_seconds: float,
+        semantic_stall_seconds: float,
+    ) -> bool:
+        """Persist one deduplicated threshold-backed stalled transition."""
+        for name, value in (
+            ("runnable_stall_seconds", runnable_stall_seconds),
+            ("semantic_stall_seconds", semantic_stall_seconds),
+        ):
+            if not isinstance(value, int | float) or value <= 0:
+                raise ValueError(f"{name} must be positive")
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            if projection.get("status") != "running" or isinstance(
+                projection.get("stall"), Mapping
+            ):
+                return False
+            node_values = list(projection.get("nodes", {}).values())
+            active = any(
+                isinstance(node, Mapping)
+                and node.get("state") in {"claimed", "running"}
+                for node in node_values
+            )
+            runnable = any(
+                isinstance(node, Mapping)
+                and node.get("state") in {"ready", "claimed", "running"}
+                for node in node_values
+            )
+            reason_code = None
+            threshold = 0.0
+            prefix = "last_runnable_progress"
+            if not runnable:
+                reason_code = "runnable_progress_stalled"
+                threshold = float(runnable_stall_seconds)
+            elif active:
+                reason_code = "semantic_progress_stalled"
+                threshold = float(semantic_stall_seconds)
+                prefix = "last_semantic_progress"
+            if reason_code is None:
+                return False
+            observed_monotonic = projection.get(f"{prefix}_monotonic")
+            observed_boot_id = projection.get(f"{prefix}_boot_id")
+            if observed_boot_id is None:
+                observed_boot_id = projection.get("progress_boot_id")
+            observed_utc = projection.get(f"{prefix}_at") or projection.get(
+                "last_runnable_progress_at"
+            )
+            if (
+                observed_boot_id == now.boot_id
+                and isinstance(observed_monotonic, int | float)
+            ):
+                elapsed = now.monotonic_now - float(observed_monotonic)
+            elif isinstance(observed_utc, str):
+                elapsed = (
+                    now.utc_now - datetime.fromisoformat(observed_utc)
+                ).total_seconds()
+            else:
+                return False
+            if elapsed < threshold:
+                return False
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self.assert_execution_fence(connection, fence, now)
+                projection["stall"] = {
+                    "reason_code": reason_code,
+                    "detected_at": now.utc_now.isoformat(),
+                    "elapsed_seconds": elapsed,
+                }
+                self._append_locked(
+                    directory,
+                    projection,
+                    "run_stalled",
+                    {"reason_code": reason_code, "elapsed_seconds": elapsed},
+                    defer_notification=True,
+                    reserve_connection=connection,
+                )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                connection.commit()
+                return True
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
 
     def node_effect_classification(
         self,
@@ -4712,6 +4868,16 @@ class RunStore:
         terminal_reserve_attempt_id: str | None = None,
         reserve_connection: sqlite3.Connection | None = None,
     ) -> dict[str, object]:
+        if event_type not in {
+            "node_heartbeat",
+            "run_stalled",
+            "evidence_annotation",
+        }:
+            sample = self._lease_clock()
+            projection["last_runnable_progress_at"] = sample.utc_now.isoformat()
+            projection["last_runnable_progress_monotonic"] = sample.monotonic_now
+            projection["last_runnable_progress_boot_id"] = sample.boot_id
+            projection["progress_boot_id"] = sample.boot_id
         sequence = int(projection["event_sequence"]) + 1
         now = _utc_now()
         projection["event_sequence"] = sequence

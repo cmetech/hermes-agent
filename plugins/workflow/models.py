@@ -260,6 +260,8 @@ class WorkflowRuntimeConfig:
     heartbeat_seconds: float = 5.0
     lease_seconds: float = 30.0
     coordinator_web_election_grace_seconds: float = 3.0
+    runnable_stall_seconds: float = 60.0
+    semantic_stall_seconds: float = 300.0
     cooperative_shutdown_seconds: float = 5.0
     term_grace_seconds: float = 5.0
     kill_reap_grace_seconds: float = 2.0
@@ -297,14 +299,16 @@ class WorkflowRuntimeConfig:
             "heartbeat_seconds",
             "lease_seconds",
             "coordinator_web_election_grace_seconds",
+            "runnable_stall_seconds",
+            "semantic_stall_seconds",
             "cooperative_shutdown_seconds",
             "term_grace_seconds",
             "kill_reap_grace_seconds",
             "process_tree_cpu_seconds",
         ):
             _bounded_seconds(getattr(self, name), name)
-        if self.heartbeat_seconds >= self.lease_seconds:
-            raise ValueError("heartbeat_seconds must be shorter than lease_seconds")
+        if self.lease_seconds < 3 * self.heartbeat_seconds:
+            raise ValueError("lease_seconds must be at least three heartbeats")
         if self.ai_idle_timeout_seconds > self.ai_wall_timeout_seconds:
             raise ValueError("AI idle timeout cannot exceed AI wall timeout")
         if self.provider_request_timeout_seconds > self.ai_wall_timeout_seconds:

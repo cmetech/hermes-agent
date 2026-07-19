@@ -285,7 +285,12 @@ class RunScheduler:
         self._shutdown = threading.Event()
         self._activity = threading.Condition()
         self._active_runs: set[str] = set()
+        self._submitted_runs: set[str] = set()
         self._active_executions = 0
+        self._submission_pool = ThreadPoolExecutor(
+            max_workers=self.max_parallel_nodes,
+            thread_name_prefix="workflow-run",
+        )
         self.executors = {
             "bash": BashExecutor(),
             "script": ScriptExecutor(),
@@ -849,6 +854,33 @@ class RunScheduler:
                 self._active_runs.discard(run_id)
                 self._activity.notify_all()
 
+    def submit(self, run_id: str, fence: ExecutionFence) -> bool:
+        """Submit one run without waiting, deduplicated under the exact fence."""
+        if self._shutdown.is_set():
+            return False
+        if self.execution_fence != fence:
+            return False
+        with self._activity:
+            if run_id in self._submitted_runs or run_id in self._active_runs:
+                return False
+            self._submitted_runs.add(run_id)
+
+        def execute() -> None:
+            try:
+                self.advance(run_id)
+            finally:
+                with self._activity:
+                    self._submitted_runs.discard(run_id)
+                    self._activity.notify_all()
+
+        try:
+            self._submission_pool.submit(execute)
+        except RuntimeError:
+            with self._activity:
+                self._submitted_runs.discard(run_id)
+            return False
+        return True
+
     def advance_all(self, run_ids: Iterable[str]):
         """Replenish ready work fairly across runs under one bounded pool."""
         run_ids = list(dict.fromkeys(run_ids))
@@ -1059,6 +1091,7 @@ class RunScheduler:
                 continue
             except WorkflowLockTimeout:
                 self.store.record_cleanup_failed(run_id, reason="shutdown_lock_timeout")
+        self._submission_pool.shutdown(wait=True, cancel_futures=True)
 
 
 __all__ = [

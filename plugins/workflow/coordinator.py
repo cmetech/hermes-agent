@@ -44,6 +44,8 @@ class WorkflowCoordinatorService:
         heartbeat_seconds: float = 5.0,
         lease_seconds: float = 30.0,
         web_election_grace_seconds: float = 3.0,
+        runnable_stall_seconds: float = 60.0,
+        semantic_stall_seconds: float = 300.0,
         sweep_backoff_seconds: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0, 60.0),
         utcnow: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -52,6 +54,8 @@ class WorkflowCoordinatorService:
             ("heartbeat_seconds", heartbeat_seconds),
             ("lease_seconds", lease_seconds),
             ("web_election_grace_seconds", web_election_grace_seconds),
+            ("runnable_stall_seconds", runnable_stall_seconds),
+            ("semantic_stall_seconds", semantic_stall_seconds),
         ):
             if (
                 isinstance(value, bool)
@@ -59,8 +63,8 @@ class WorkflowCoordinatorService:
                 or value <= 0
             ):
                 raise ValueError(f"{name} must be positive")
-        if heartbeat_seconds >= lease_seconds:
-            raise ValueError("heartbeat_seconds must be shorter than lease_seconds")
+        if lease_seconds < 3 * heartbeat_seconds:
+            raise ValueError("lease_seconds must be at least three heartbeats")
         if not sweep_backoff_seconds or any(
             isinstance(value, bool)
             or not isinstance(value, int | float)
@@ -74,6 +78,8 @@ class WorkflowCoordinatorService:
         self.heartbeat_seconds = float(heartbeat_seconds)
         self.lease_seconds = float(lease_seconds)
         self.web_election_grace_seconds = float(web_election_grace_seconds)
+        self.runnable_stall_seconds = float(runnable_stall_seconds)
+        self.semantic_stall_seconds = float(semantic_stall_seconds)
         self.sweep_backoff_seconds = tuple(float(value) for value in sweep_backoff_seconds)
         self._utcnow = utcnow or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic
@@ -144,6 +150,8 @@ class WorkflowCoordinatorService:
         self.web_election_grace_seconds = float(
             runtime.coordinator_web_election_grace_seconds
         )
+        self.runnable_stall_seconds = float(runtime.runnable_stall_seconds)
+        self.semantic_stall_seconds = float(runtime.semantic_stall_seconds)
 
     def _web_may_contend(
         self,
@@ -184,7 +192,8 @@ class WorkflowCoordinatorService:
         identity: CoordinatorIdentity,
         epoch: int,
         scheduler,
-    ) -> tuple[bool, str | None, datetime | None]:
+        cursor: tuple[str, str] | None = None,
+    ) -> tuple[bool, tuple[str, str] | None, datetime | None]:
         from plugins.workflow.notifications import NotificationOutbox
         from plugins.workflow.store import ForegroundExecutionConflict
 
@@ -193,6 +202,7 @@ class WorkflowCoordinatorService:
             connection.execute("BEGIN IMMEDIATE")
             run_store.assert_execution_fence(connection, fence)
             connection.commit()
+        deadline = self._monotonic() + 2.0
         NotificationOutbox(run_store).reconcile_journal(limit_runs=200)
         now = self._utcnow().astimezone(timezone.utc)
         wakes = coordinator_store.pending_wakes(
@@ -201,55 +211,93 @@ class WorkflowCoordinatorService:
             now=now,
             limit=100,
         )
-        run_ids = list(dict.fromkeys(wake.run_id for wake in wakes))
-        periodic = run_store.list_runs(limit=200)
-        run_ids.extend(
-            str(run["run_id"])
-            for run in periodic
-            if run.get("status") in {"queued", "running", "waiting_retry"}
-            and run.get("execution_mode") in {"background", "foreground"}
-            and run.get("run_id") not in run_ids
+        periodic, _page_cursor, page_exhausted = run_store.coordinator_candidates(
+            after=cursor,
+            limit=100,
         )
+        wake_by_run: dict[str, list[object]] = {}
+        for wake in wakes:
+            wake_by_run.setdefault(wake.run_id, []).append(wake)
+        wake_run_ids = list(wake_by_run)
+        periodic_by_run = {str(row["run_id"]): row for row in periodic}
+        ordered_run_ids = wake_run_ids + [
+            run_id for run_id in periodic_by_run if run_id not in wake_by_run
+        ]
+        actionable_work = False
         progress_at: datetime | None = None
-        for run_id in run_ids:
-            outcome = "advanced"
+        processed_runs: set[str] = set()
+        processed_periodic_cursor = cursor
+        for run_id in ordered_run_ids:
+            if self._monotonic() >= deadline:
+                break
+            outcome = "not_actionable"
+            run_actionable = False
             try:
-                before = run_store.get_run_status(run_id)
-                after = before
+                before = run_store.load_run(run_id)
                 if before.get("execution_mode") == "foreground":
                     try:
                         run_store.adopt_expired_foreground(run_id, fence, now)
                     except ForegroundExecutionConflict:
-                        after = before
                         outcome = "foreground_owned"
                     else:
-                        before = run_store.get_run_status(run_id)
-                        after = before
+                        before = run_store.load_run(run_id)
                         outcome = "foreground_adopted"
+                        run_actionable = True
                 if before.get("execution_mode") == "background" and before.get(
                     "status"
                 ) in {"queued", "running", "waiting_retry"}:
-                    scheduler.advance(run_id)
-                    after = run_store.get_run_status(run_id)
-                    if after.get("state_version") != before.get("state_version"):
-                        progress_at = self._utcnow().astimezone(timezone.utc)
-                    else:
-                        outcome = "no_change"
+                    stalled = run_store.record_stall_if_due(
+                        run_id,
+                        fence=fence,
+                        now=self._lease_clock(),
+                        runnable_stall_seconds=self.runnable_stall_seconds,
+                        semantic_stall_seconds=self.semantic_stall_seconds,
+                    )
+                    submitted = scheduler.submit(run_id, fence)
+                    run_actionable = run_actionable or stalled or submitted
+                    if submitted:
+                        outcome = "submitted"
+                    elif stalled:
+                        outcome = "stalled"
+                    elif outcome != "foreground_adopted":
+                        outcome = "already_submitted"
             except KeyError:
                 outcome = "run_missing"
-            except Exception:
-                logger.exception("Workflow coordinator failed to advance run %s", run_id)
+            except RuntimeError as exc:
+                if "execution fence" in str(exc):
+                    raise
+                logger.exception("Workflow coordinator failed run %s", run_id)
                 outcome = "advance_failed"
-            for wake in wakes:
-                if wake.run_id == run_id:
-                    coordinator_store.complete_wake(
-                        wake.generation,
-                        identity,
-                        epoch=epoch,
-                        now=self._utcnow().astimezone(timezone.utc),
-                        outcome=outcome,
-                    )
-        return bool(run_ids), (run_ids[-1] if run_ids else None), progress_at
+            except Exception:
+                logger.exception("Workflow coordinator failed run %s", run_id)
+                outcome = "advance_failed"
+            processed_runs.add(run_id)
+            if run_actionable:
+                actionable_work = True
+                progress_at = self._utcnow().astimezone(timezone.utc)
+            for wake in wake_by_run.get(run_id, ()):
+                coordinator_store.complete_wake(
+                    wake.generation,
+                    identity,
+                    epoch=epoch,
+                    now=self._utcnow().astimezone(timezone.utc),
+                    outcome=outcome,
+                )
+        processed_page = True
+        for row in periodic:
+            if str(row["run_id"]) not in processed_runs:
+                processed_page = False
+                break
+            processed_periodic_cursor = (
+                str(row["created_at"]),
+                str(row["run_id"]),
+            )
+        next_cursor = (
+            None
+            if page_exhausted and processed_page
+            else processed_periodic_cursor
+        )
+        return actionable_work, next_cursor, progress_at
 
     def _lead(
         self,
@@ -269,8 +317,17 @@ class WorkflowCoordinatorService:
         backoff_index = 0
         next_sweep = self._monotonic()
         heartbeat_due = self._monotonic() + self.heartbeat_seconds
-        cursor: str | None = None
-        progress_at: datetime | None = None
+        observed = coordinator_store.observe(
+            now=self._utcnow().astimezone(timezone.utc)
+        )
+        observed_is_current = (
+            observed is not None
+            and observed.matches(identity)
+            and observed.epoch == epoch
+        )
+        cursor = observed.sweep_cursor if observed_is_current else None
+        progress_at = observed.last_progress_at if observed_is_current else None
+        last_sweep_at = observed.last_sweep_at if observed_is_current else None
         leadership_current = True
         try:
             while leadership_current and not stop_event.is_set():
@@ -279,6 +336,7 @@ class WorkflowCoordinatorService:
                     future = None
                     if progress is not None:
                         progress_at = progress
+                    last_sweep_at = self._utcnow().astimezone(timezone.utc)
                     if found:
                         backoff_index = 0
                     else:
@@ -301,6 +359,7 @@ class WorkflowCoordinatorService:
                         lease_seconds=self.lease_seconds,
                         sweep_cursor=cursor,
                         last_progress_at=progress_at,
+                        last_sweep_at=last_sweep_at,
                     )
                     if not leadership_current:
                         self._set_health(
@@ -324,6 +383,7 @@ class WorkflowCoordinatorService:
                         identity,
                         epoch,
                         scheduler,
+                        cursor,
                     )
 
                 wait_for = min(

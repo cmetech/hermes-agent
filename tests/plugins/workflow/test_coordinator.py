@@ -301,13 +301,15 @@ def test_coordinator_lease_renews_releases_and_fences_stale_epoch(tmp_path) -> N
         epoch=1,
         now=now + timedelta(seconds=5),
         lease_seconds=30,
-        sweep_cursor="run-10",
+        sweep_cursor=("2026-07-18T12:00:00+00:00", "run-10"),
         last_progress_at=now + timedelta(seconds=4),
+        last_sweep_at=now + timedelta(seconds=3),
     )
     observed = store.observe(now=now + timedelta(seconds=6))
     assert observed is not None
-    assert observed.sweep_cursor == "run-10"
+    assert observed.sweep_cursor == ("2026-07-18T12:00:00+00:00", "run-10")
     assert observed.last_progress_at == now + timedelta(seconds=4)
+    assert observed.last_sweep_at == now + timedelta(seconds=3)
 
     assert store.release(first, epoch=1, now=now + timedelta(seconds=7))
     takeover = store.try_acquire(
@@ -743,8 +745,164 @@ def test_running_graph_with_no_current_node_is_reported_stalled(
     status = store.get_run_status(admitted.run_id)
 
     assert status["status"] == "running"
-    assert status["health"] == "stalled"
-    assert status["blocking_reason"] == "no_runnable_or_owned_node"
+    assert status["health"] == "healthy"
+    assert status["blocking_reason"] is None
+
+
+def test_runtime_stall_defaults_and_lease_ratio_are_validated() -> None:
+    from plugins.workflow.models import WorkflowRuntimeConfig
+
+    config = WorkflowRuntimeConfig()
+    assert config.runnable_stall_seconds == 60
+    assert config.semantic_stall_seconds == 300
+
+    with pytest.raises(ValueError, match="at least three heartbeats"):
+        WorkflowRuntimeConfig(heartbeat_seconds=5, lease_seconds=14)
+
+
+def test_scheduler_submit_is_nonblocking_deduplicated_and_avoids_head_of_line(
+    tmp_path, monkeypatch
+) -> None:
+    fence = ExecutionFence("leader", 1)
+    scheduler = RunScheduler(
+        RunStore(tmp_path), max_parallel_nodes=2, execution_fence=fence
+    )
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_completed = threading.Event()
+
+    def advance(run_id):
+        if run_id == "long":
+            first_started.set()
+            assert release_first.wait(timeout=2)
+        else:
+            second_completed.set()
+
+    monkeypatch.setattr(scheduler, "advance", advance)
+    started = time.monotonic()
+    assert scheduler.submit("long", fence)
+    assert time.monotonic() - started < 0.05
+    assert first_started.wait(timeout=1)
+    assert not scheduler.submit("long", fence)
+    assert scheduler.submit("short", fence)
+    assert second_completed.wait(timeout=1)
+    release_first.set()
+    scheduler.shutdown(deadline_seconds=2)
+
+
+def test_idle_backoff_uses_actionable_work_not_rows_seen(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path)
+    coordinator = CoordinatorStore(store.database)
+    now = datetime.now(timezone.utc)
+    identity = _identity("idle-scan")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="idle-scan")
+    )
+    prepared = store.prepare_run_snapshot(package)
+    store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="idle-scan",
+            concurrency_key=package.definition.name,
+            execution_mode="background",
+        ),
+        immutable_snapshot=prepared,
+    )
+    scheduler = MagicMock()
+    scheduler.submit.return_value = False
+    service = _service(
+        tmp_path,
+        host_kind="gateway",
+        host_instance_id="idle-scan",
+    )
+
+    actionable, _cursor, _progress = service._sweep_once(
+        store,
+        coordinator,
+        identity,
+        leadership.lease.epoch,
+        scheduler,
+    )
+
+    assert actionable is False
+    scheduler.submit.assert_called_once()
+    scheduler.advance.assert_not_called()
+
+
+def test_sweep_cursor_never_skips_page_prefix_when_wake_consumes_budget(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path)
+    coordinator = CoordinatorStore(store.database)
+    now = datetime.now(timezone.utc)
+    identity = _identity("cursor-prefix")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="cursor-prefix")
+    )
+    admitted = []
+    for index in range(3):
+        prepared = store.prepare_run_snapshot(package)
+        admitted.append(
+            store.start_run(
+                RunAdmissionRequest(
+                    workflow_name=package.definition.name,
+                    definition_digest=prepared.definition_digest,
+                    policy_digest=prepared.policy_digest,
+                    input_manifest_digest=prepared.input_manifest_digest,
+                    trigger_source="api",
+                    idempotency_key=f"cursor-prefix-{index}",
+                    concurrency_key=f"cursor-prefix-{index}",
+                    concurrency_policy="allow",
+                    execution_mode="background",
+                ),
+                immutable_snapshot=prepared,
+            ).run_id
+        )
+    wakes = coordinator.pending_wakes(
+        identity,
+        epoch=leadership.lease.epoch,
+        now=now,
+    )
+    for wake in wakes[:2]:
+        assert coordinator.complete_wake(
+            wake.generation,
+            identity,
+            epoch=leadership.lease.epoch,
+            now=now,
+            outcome="test_setup",
+        )
+    monotonic = MagicMock(side_effect=(0.0, 0.1, 0.2, 2.1))
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(
+            host_kind="gateway",
+            host_instance_id="cursor-prefix",
+        ),
+        hermes_home=tmp_path,
+        monotonic=monotonic,
+    )
+    scheduler = MagicMock()
+    scheduler.submit.return_value = False
+
+    _actionable, cursor, _progress = service._sweep_once(
+        store,
+        coordinator,
+        identity,
+        leadership.lease.epoch,
+        scheduler,
+    )
+
+    assert cursor is None
+    scheduler.submit.assert_called_once_with(
+        admitted[-1], ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    )
 
 
 def test_foreground_and_background_admission_are_fenced_by_live_leader(

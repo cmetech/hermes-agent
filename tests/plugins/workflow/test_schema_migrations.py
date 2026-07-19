@@ -194,6 +194,9 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             "boot_id",
             "heartbeat_monotonic",
             "lease_seconds",
+            "sweep_cursor_created_at",
+            "sweep_cursor_run_id",
+            "last_sweep_at",
         } <= coordinator_lease_columns
         indexes = {
             row["name"]
@@ -205,6 +208,7 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             "attempt_journal_reserves_run",
             "coordinator_wakes_pending",
             "runs_concurrency",
+            "runs_coordinator_scan",
             "worker_claims_lease",
             "workflow_notification_delivery",
             "workflow_notification_fact_run",

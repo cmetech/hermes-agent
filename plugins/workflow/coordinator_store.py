@@ -88,8 +88,9 @@ class CoordinatorLease:
     heartbeat_at: datetime
     lease_expires_at: datetime
     acquired_at: datetime
-    sweep_cursor: str | None
+    sweep_cursor: tuple[str, str] | None
     last_progress_at: datetime | None
+    last_sweep_at: datetime | None
     boot_id: str | None
     heartbeat_monotonic: float | None
     lease_seconds: float | None
@@ -141,7 +142,10 @@ def install_coordinator_schema(connection: sqlite3.Connection) -> None:
             lease_expires_at TEXT NOT NULL,
             acquired_at TEXT NOT NULL,
             sweep_cursor TEXT,
+            sweep_cursor_created_at TEXT,
+            sweep_cursor_run_id TEXT,
             last_progress_at TEXT,
+            last_sweep_at TEXT,
             boot_id TEXT,
             heartbeat_monotonic REAL,
             lease_seconds REAL
@@ -175,6 +179,9 @@ def install_coordinator_schema(connection: sqlite3.Connection) -> None:
         ("boot_id", "TEXT"),
         ("heartbeat_monotonic", "REAL"),
         ("lease_seconds", "REAL"),
+        ("sweep_cursor_created_at", "TEXT"),
+        ("sweep_cursor_run_id", "TEXT"),
+        ("last_sweep_at", "TEXT"),
     ):
         if name not in columns:
             connection.execute(
@@ -292,8 +299,16 @@ class CoordinatorStore:
             heartbeat_at=heartbeat_at,
             lease_expires_at=lease_expires_at,
             acquired_at=acquired_at,
-            sweep_cursor=(str(row["sweep_cursor"]) if row["sweep_cursor"] else None),
+            sweep_cursor=(
+                (
+                    str(row["sweep_cursor_created_at"]),
+                    str(row["sweep_cursor_run_id"]),
+                )
+                if row["sweep_cursor_created_at"] and row["sweep_cursor_run_id"]
+                else None
+            ),
             last_progress_at=_decoded(row["last_progress_at"]),
+            last_sweep_at=_decoded(row["last_sweep_at"]),
             boot_id=(str(row["boot_id"]) if row["boot_id"] is not None else None),
             heartbeat_monotonic=(
                 float(row["heartbeat_monotonic"])
@@ -393,17 +408,20 @@ class CoordinatorStore:
                     epoch = current.epoch + 1
                     sweep_cursor = current.sweep_cursor
                     last_progress_at = current.last_progress_at
+                    last_sweep_at = current.last_sweep_at
                 else:
                     epoch = 1
                     sweep_cursor = None
                     last_progress_at = None
+                    last_sweep_at = None
                 connection.execute(
                     "INSERT INTO coordinator_lease ("
                     "singleton, owner_id, host_kind, host_instance_id, pid, "
                     "process_start_time, epoch, heartbeat_at, lease_expires_at, "
-                    "acquired_at, sweep_cursor, last_progress_at, boot_id, "
+                    "acquired_at, sweep_cursor, sweep_cursor_created_at, "
+                    "sweep_cursor_run_id, last_progress_at, last_sweep_at, boot_id, "
                     "heartbeat_monotonic, lease_seconds) "
-                    "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(singleton) DO UPDATE SET "
                     "owner_id=excluded.owner_id, host_kind=excluded.host_kind, "
                     "host_instance_id=excluded.host_instance_id, pid=excluded.pid, "
@@ -412,7 +430,10 @@ class CoordinatorStore:
                     "lease_expires_at=excluded.lease_expires_at, "
                     "acquired_at=excluded.acquired_at, "
                     "sweep_cursor=excluded.sweep_cursor, "
+                    "sweep_cursor_created_at=excluded.sweep_cursor_created_at, "
+                    "sweep_cursor_run_id=excluded.sweep_cursor_run_id, "
                     "last_progress_at=excluded.last_progress_at, "
+                    "last_sweep_at=excluded.last_sweep_at, "
                     "boot_id=excluded.boot_id, "
                     "heartbeat_monotonic=excluded.heartbeat_monotonic, "
                     "lease_seconds=excluded.lease_seconds",
@@ -426,8 +447,11 @@ class CoordinatorStore:
                         _encoded(instant),
                         _encoded(expires),
                         _encoded(instant),
-                        sweep_cursor,
+                        json.dumps(sweep_cursor) if sweep_cursor else None,
+                        sweep_cursor[0] if sweep_cursor else None,
+                        sweep_cursor[1] if sweep_cursor else None,
                         _encoded(last_progress_at) if last_progress_at else None,
+                        _encoded(last_sweep_at) if last_sweep_at else None,
                         sample.boot_id,
                         sample.monotonic_now,
                         duration,
@@ -462,20 +486,31 @@ class CoordinatorStore:
         epoch: int,
         now: datetime,
         lease_seconds: float,
-        sweep_cursor: str | None = None,
+        sweep_cursor: tuple[str, str] | None = None,
         last_progress_at: datetime | None = None,
+        last_sweep_at: datetime | None = None,
     ) -> bool:
         requested_now = _instant(now, name="now")
         duration = _lease_seconds(lease_seconds)
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
             raise ValueError("epoch must be a positive integer")
         if sweep_cursor is not None and (
-            not isinstance(sweep_cursor, str) or len(sweep_cursor) > 512
+            not isinstance(sweep_cursor, tuple)
+            or len(sweep_cursor) != 2
+            or not all(
+                isinstance(value, str) and value and len(value) <= 512
+                for value in sweep_cursor
+            )
         ):
-            raise ValueError("sweep_cursor must be bounded text")
+            raise ValueError("sweep_cursor must be a bounded tuple")
         progress = (
             _instant(last_progress_at, name="last_progress_at")
             if last_progress_at is not None
+            else None
+        )
+        swept = (
+            _instant(last_sweep_at, name="last_sweep_at")
+            if last_sweep_at is not None
             else None
         )
         with self._connect() as connection:
@@ -496,16 +531,20 @@ class CoordinatorStore:
                 return False
             updated = connection.execute(
                 "UPDATE coordinator_lease SET heartbeat_at=?, lease_expires_at=?, "
-                "sweep_cursor=COALESCE(?, sweep_cursor), "
+                "sweep_cursor=?, sweep_cursor_created_at=?, sweep_cursor_run_id=?, "
                 "last_progress_at=COALESCE(?, last_progress_at), boot_id=?, "
+                "last_sweep_at=COALESCE(?, last_sweep_at), "
                 "heartbeat_monotonic=?, lease_seconds=? "
                 "WHERE singleton=1 AND owner_id=? AND epoch=?",
                 (
                     _encoded(instant),
                     _encoded(instant + timedelta(seconds=duration)),
-                    sweep_cursor,
+                    json.dumps(sweep_cursor) if sweep_cursor else None,
+                    sweep_cursor[0] if sweep_cursor else None,
+                    sweep_cursor[1] if sweep_cursor else None,
                     _encoded(progress) if progress else None,
                     sample.boot_id,
+                    _encoded(swept) if swept else None,
                     sample.monotonic_now,
                     duration,
                     identity.owner_id,
