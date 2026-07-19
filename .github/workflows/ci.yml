@@ -165,6 +165,7 @@ jobs:
         run: |
           uv run --no-sync python -m pytest -q \
             tests/tools/test_managed_process.py \
+            tests/plugins/workflow/test_evidence_api.py \
             tests/plugins/workflow/test_idempotency_multiprocess.py \
             tests/plugins/workflow/test_coordinator.py \
             tests/plugins/workflow/test_coordinator_multiprocess.py \

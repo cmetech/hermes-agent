@@ -37,6 +37,7 @@ def test_native_workflow_matrix_covers_every_release_gate() -> None:
 
     assert "os: [ubuntu-latest, macos-latest, windows-latest]" in source
     for required_test in (
+        "tests/plugins/workflow/test_evidence_api.py",
         "tests/plugins/workflow/test_idempotency_multiprocess.py",
         "tests/plugins/workflow/test_coordinator.py",
         "tests/plugins/workflow/test_coordinator_multiprocess.py",
