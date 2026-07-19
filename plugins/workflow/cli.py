@@ -1816,6 +1816,12 @@ def _cmd_showcase(args: argparse.Namespace) -> int:
     elif action == "preflight":
         payload = preflight_showcase(args.showcase_id, hermes_home=args.hermes_home)
     elif action == "run":
+        if (args.json or args.no_wait) and not args.idempotency_key:
+            raise WorkflowCommandError(
+                "idempotency_key_required",
+                "--idempotency-key is required for JSON and background starts",
+                exit_code=EXIT_INVOCATION,
+            )
         payload = run_showcase(
             args.showcase_id,
             hermes_home=args.hermes_home,

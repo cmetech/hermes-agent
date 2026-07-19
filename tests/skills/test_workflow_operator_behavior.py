@@ -132,6 +132,10 @@ def test_published_contract_constructs_real_commands_without_duplicates(
 def test_showcase_preflight_publishes_the_same_operator_contract(tmp_path) -> None:
     preflight = preflight_showcase("laptop-diagnostic", hermes_home=tmp_path)
     assert preflight["command_contract"] == operator_command_contract()
+    assert [item["name"] for item in preflight["input_requirements"]] == [
+        "evidence",
+        "symptom",
+    ]
 
 
 def test_operator_skills_are_structured_and_defer_syntax_to_runtime() -> None:
