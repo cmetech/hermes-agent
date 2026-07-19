@@ -19,6 +19,7 @@ from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
@@ -883,6 +884,89 @@ def test_attention_is_newest_first(tmp_path, monkeypatch, workflow_writer) -> No
     assert [item["run_id"] for item in response.json()["items"]] == list(
         reversed(run_ids)
     )
+
+
+def test_attention_surfaces_run_scoped_notification_repair_damage(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = RunStore(home)
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="repair-attention")
+    )
+    admitted = _start(store, package, "repair-attention")
+    journal = store.run_directory(admitted.run_id) / "events.jsonl"
+    with journal.open("ab") as stream:
+        stream.write(b'{"sequence":999')
+    assert NotificationOutbox(store).reconcile_journal(limit_runs=1) == 0
+
+    response = TestClient(_app(_router())).get(
+        "/api/plugins/workflow/attention?limit=10"
+    )
+
+    assert response.status_code == 200
+    item = next(
+        item
+        for item in response.json()["items"]
+        if item["run_id"] == admitted.run_id
+    )
+    assert item["kind"] == "stalled"
+    assert item["health"] == "storage_degraded"
+    assert item["cause"] == "notification_reconciliation_unverified"
+    assert "events.jsonl" not in response.text
+
+
+def test_corrupted_run_rejects_mutation_with_typed_error(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = RunStore(home)
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "corrupt-mutation",
+            name="corrupt-mutation",
+            nodes=[{"id": "review", "approval": {"message": "Approve?"}}],
+        )
+    )
+    admitted = _start(store, package, "corrupt-mutation")
+    RunScheduler(store).advance(admitted.run_id)
+    current = store.get_run_status(admitted.run_id)
+    interaction = current["pending_interaction"]
+    assert interaction["type"] == "workflow_approval"
+    run_directory = store.run_directory(admitted.run_id)
+    journal = run_directory / "events.jsonl"
+    frames = journal.read_bytes().splitlines(keepends=True)
+    assert len(frames) > 1
+    corrupted_journal = frames[0] + b"{not-json}\n" + b"".join(frames[1:])
+    journal.write_bytes(corrupted_journal)
+    (run_directory / "run.json").unlink()
+    client = TestClient(_app(_router()), raise_server_exceptions=False)
+
+    response = client.post(
+        f"/api/plugins/workflow/runs/{admitted.run_id}/approve",
+        json={
+            "expected_version": current["state_version"],
+            "interaction_id": interaction["interaction_id"],
+            "comment": "approved",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "run_evidence_uncorroborated"
+    assert journal.read_bytes() == corrupted_journal
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+    assert store._active_run_repair_reasons(admitted.run_id) == (
+        "run_evidence_uncorroborated",
+    )
+    attention = client.get("/api/plugins/workflow/attention?limit=10")
+    item = next(
+        item
+        for item in attention.json()["items"]
+        if item["run_id"] == admitted.run_id
+    )
+    assert item["cause"] == "run_evidence_uncorroborated"
 
 
 def test_attention_cursor_traverses_more_than_100_tied_items_and_is_scope_bound(

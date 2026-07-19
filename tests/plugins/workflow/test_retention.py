@@ -8,15 +8,16 @@ import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.evidence import EvidenceReader
 from plugins.workflow.locks import workflow_lock
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
-from plugins.workflow.store import RunStore
+from plugins.workflow.store import JournalRecoveryError, RunStore
 from plugins.workflow.notifications import NotificationOutbox
 
 
-def _terminal_run(store, tmp_path, workflow_writer, *, name: str):
+def _terminal_run(store, tmp_path, workflow_writer, *, name: str, scope=None):
     package = load_workflow(workflow_writer(tmp_path / name, name=name))
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -28,6 +29,7 @@ def _terminal_run(store, tmp_path, workflow_writer, *, name: str):
             trigger_source="cli",
             idempotency_key=name,
             concurrency_key=name,
+            operator_scope=scope,
         ),
         immutable_snapshot=prepared,
     )
@@ -459,6 +461,151 @@ def test_cleanup_preserves_run_when_notification_corroboration_fails(
         in preview["candidates"][0]["blocked_reasons"]
     )
     assert store.run_directory(run_id).is_dir()
+
+
+def test_run_read_damage_is_contained_while_unrelated_cleanup_and_admission_work(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store = RunStore(tmp_path / "home")
+    damaged = _terminal_run(
+        store, tmp_path, workflow_writer, name="damaged", scope="scope-damaged"
+    )
+    clean = _terminal_run(
+        store, tmp_path, workflow_writer, name="clean", scope="scope-clean"
+    )
+    run_directory = store.run_directory(
+        damaged, operator_scope="scope-damaged"
+    )
+    journal = run_directory / "events.jsonl"
+    projection = run_directory / "run.json"
+    original_journal = journal.read_bytes()
+    original_projection = projection.read_bytes()
+    frames = original_journal.splitlines(keepends=True)
+    assert len(frames) > 1
+    journal.write_bytes(frames[0] + b"{not-json}\n" + b"".join(frames[1:]))
+    projection.unlink()
+    damaged_reads = 0
+    original_corroborate = store._corroborate_run_evidence
+
+    def traced_corroborate(directory, **kwargs):
+        nonlocal damaged_reads
+        if Path(directory) == run_directory:
+            damaged_reads += 1
+        return original_corroborate(directory, **kwargs)
+
+    monkeypatch.setattr(store, "_corroborate_run_evidence", traced_corroborate)
+
+    package = load_workflow(
+        workflow_writer(tmp_path / "new-valid", name="new-valid")
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="new-valid",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="new-valid",
+            concurrency_key="new-valid",
+            operator_scope="scope-clean",
+        ),
+        immutable_snapshot=prepared,
+    )
+
+    assert admitted.run_id
+    assert damaged_reads == 1
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+    assert run_directory.is_dir()
+    preserved = [
+        event
+        for event in store.list_repair_events()
+        if event["run_id"] == damaged
+        and event["reason_code"] == "published_evidence_uncorroborated"
+    ]
+    assert len(preserved) == 1
+    assert preserved[0]["outcome"] == "evidence_preserved"
+
+    second_package = load_workflow(
+        workflow_writer(tmp_path / "new-valid-2", name="new-valid-2")
+    )
+    second_prepared = store.prepare_run_snapshot(second_package)
+    second = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="new-valid-2",
+            definition_digest=second_prepared.definition_digest,
+            policy_digest=second_prepared.policy_digest,
+            input_manifest_digest=second_prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="new-valid-2",
+            concurrency_key="new-valid-2",
+            operator_scope="scope-clean",
+        ),
+        immutable_snapshot=second_prepared,
+    )
+
+    assert second.run_id
+    assert damaged_reads == 1
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+    with pytest.raises(JournalRecoveryError):
+        store.get_run_status(damaged, operator_scope="scope-damaged")
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+
+    damaged_list = store.list_runs(operator_scope="scope-damaged")
+
+    assert damaged_list[0]["blocking_reason"] == "run_evidence_uncorroborated"
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+    assert not store.repair_marker.exists()
+    attention = store.attention_candidates(
+        operator_scope="scope-damaged",
+        observed_at=datetime.now(timezone.utc),
+        limit=10,
+    )
+    assert attention[0]["warnings"] == ["run_evidence_uncorroborated"]
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+    with pytest.raises(JournalRecoveryError):
+        EvidenceReader(store).query(
+            damaged,
+            kind="timeline",
+            operator_scope="scope-damaged",
+        )
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+    assert NotificationOutbox(store).reconcile_journal(limit_runs=1) == 0
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+    damaged_preview = store.cleanup_runs(
+        older_than=timedelta(0), operator_scope="scope-damaged"
+    )
+    assert damaged_preview["confirmation_token"] is None
+    assert "notification_reconciliation_unverified" in damaged_preview[
+        "candidates"
+    ][0]["blocked_reasons"]
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+
+    clean_preview = store.cleanup_runs(
+        older_than=timedelta(0), operator_scope="scope-clean"
+    )
+    assert clean_preview["confirmation_token"]
+    assert clean in clean_preview["run_ids"]
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+    clean_directory = store.run_directory(clean, operator_scope="scope-clean")
+    cleaned = store.cleanup_runs(
+        older_than=timedelta(0),
+        execute=True,
+        confirmation_token=clean_preview["confirmation_token"],
+    )
+    assert cleaned["run_ids"] == [clean]
+    assert not clean_directory.exists()
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+
+    journal.write_bytes(original_journal)
+    projection.write_bytes(original_projection)
+    restored = store.list_runs(operator_scope="scope-damaged")
+    assert restored[0]["health"] != "storage_degraded"
+    outbox = NotificationOutbox(store)
+    outbox.reconcile_journal(limit_runs=100)
+    outbox.reconcile_journal(limit_runs=100)
+    assert store._active_run_repair_reasons(damaged) == ()
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
 
 
 def test_prune_preserves_facts_until_explicit_workflow_cleanup(

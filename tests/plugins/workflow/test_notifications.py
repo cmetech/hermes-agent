@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import logging
+import threading
 from types import SimpleNamespace
 
 from hermes_cli.plugin_services import BackgroundServiceContext
@@ -8,10 +10,54 @@ from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.locks import workflow_lock
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
+
+
+def _terminal_background_failure(tmp_path, workflow_writer, *, name: str):
+    store = RunStore(tmp_path / "home")
+    now = datetime.now(timezone.utc)
+    identity = CoordinatorIdentity(
+        owner_id=f"{name}-owner",
+        host_kind="web",
+        host_instance_id=f"{name}-host",
+        pid=1,
+        process_start_time=None,
+    )
+    leadership = CoordinatorStore(store.database).try_acquire(
+        identity, now=now, lease_seconds=60
+    )
+    assert leadership.is_leader
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name=name,
+            nodes=[{"id": "fail", "bash": "exit 7"}],
+        )
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key=name,
+            concurrency_key=name,
+            execution_mode="background",
+        ),
+        immutable_snapshot=prepared,
+    )
+    RunScheduler(
+        store,
+        owner_id=f"coordinator:{identity.owner_id}:{leadership.lease.epoch}",
+        execution_fence=ExecutionFence(identity.owner_id, leadership.lease.epoch),
+    ).advance(admitted.run_id)
+    return store, admitted.run_id
 
 
 def test_outbox_lease_requires_electron_ack_and_survives_restart(tmp_path):
@@ -391,6 +437,89 @@ def test_oversized_first_journal_is_repaired(tmp_path, workflow_writer) -> None:
             "WHERE singleton=1"
         ).fetchone()
     assert cursor["cursor_run_id"] == admitted.run_id
+
+
+def test_torn_tail_repair_is_run_scoped_visible_and_later_verified(
+    tmp_path, workflow_writer
+) -> None:
+    store, run_id = _terminal_background_failure(
+        tmp_path, workflow_writer, name="run-scoped-torn-tail"
+    )
+    outbox = NotificationOutbox(store)
+    with store._connect() as connection:
+        connection.execute(
+            "DELETE FROM workflow_notification_facts WHERE run_id=?", (run_id,)
+        )
+        connection.execute(
+            "DELETE FROM workflow_notification_outbox WHERE run_id=?", (run_id,)
+        )
+    journal = store.run_directory(run_id) / "events.jsonl"
+    with journal.open("ab") as stream:
+        stream.write(b'{"sequence":999')
+
+    assert outbox.reconcile_journal(limit_runs=1) == 0
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+    assert not store.repair_marker.exists()
+    assert store._active_run_repair_reasons(run_id) == (
+        "notification_reconciliation_unverified",
+    )
+
+    store.get_run_status(run_id)
+    assert outbox.reconcile_journal(limit_runs=1) == 1
+    assert store._active_run_repair_reasons(run_id) == ()
+    assert store.list_repair_events()[-1]["outcome"] == "repair_verified"
+
+
+def test_repair_lock_timeout_retains_cursor_warns_and_retries(
+    tmp_path, workflow_writer, caplog
+) -> None:
+    store, run_id = _terminal_background_failure(
+        tmp_path, workflow_writer, name="repair-lock-timeout"
+    )
+    outbox = NotificationOutbox(store)
+    with store._connect() as connection:
+        connection.execute(
+            "DELETE FROM workflow_notification_facts WHERE run_id=?", (run_id,)
+        )
+        connection.execute(
+            "DELETE FROM workflow_notification_outbox WHERE run_id=?", (run_id,)
+        )
+
+    ready = threading.Event()
+    release = threading.Event()
+
+    def hold_run_lock() -> None:
+        with workflow_lock(store._run_lock_path(run_id)):
+            ready.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_run_lock)
+    holder.start()
+    assert ready.wait(timeout=1)
+    try:
+        with caplog.at_level(logging.WARNING):
+            assert [outbox.reconcile_journal(limit_runs=1) for _ in range(3)] == [
+                0,
+                0,
+                0,
+            ]
+        with store._connect() as connection:
+            cursor = connection.execute(
+                "SELECT cursor_run_id FROM "
+                "workflow_notification_reconcile_state WHERE singleton=1"
+            ).fetchone()
+        assert cursor["cursor_run_id"] is None
+        assert (
+            sum("cursor retained" in record.message for record in caplog.records) == 1
+        )
+        assert store._active_run_repair_reasons(run_id) == ()
+    finally:
+        release.set()
+        holder.join(timeout=2)
+
+    assert not holder.is_alive()
+    assert outbox.reconcile_journal(limit_runs=1) == 1
+    assert outbox.pending_attention(run_id=run_id)[0]["kind"] == "failure"
 
 
 def test_bounded_repair_has_its_own_cadence(monkeypatch, tmp_path) -> None:

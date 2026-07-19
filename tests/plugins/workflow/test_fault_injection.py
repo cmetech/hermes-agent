@@ -90,8 +90,13 @@ def test_run_listing_isolates_corrupt_evidence_and_reports_degradation(
     assert by_id[corrupt.run_id]["health"] == "storage_degraded"
     assert by_id[corrupt.run_id]["status_authoritative"] is False
     assert by_id[corrupt.run_id]["next_actions"] == []
-    assert by_id[corrupt.run_id]["blocking_reason"] == "storage_repair_required"
-    assert store.storage_health()["status"] == "repair_required"
+    assert by_id[corrupt.run_id]["blocking_reason"] == (
+        "run_evidence_uncorroborated"
+    )
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+    assert store._active_run_repair_reasons(corrupt.run_id) == (
+        "run_evidence_uncorroborated",
+    )
 
     with store._connect() as connection:
         connection.execute(
@@ -100,8 +105,8 @@ def test_run_listing_isolates_corrupt_evidence_and_reports_degradation(
     running = {run["run_id"]: run for run in store.list_runs(status="running")}
     assert healthy.run_id in running
     assert running[corrupt.run_id]["health"] == "storage_degraded"
-    refused = _start(store, package, "must-not-use-uncertain-capacity")
-    assert refused.reason_code == "storage_repair_required"
+    unrelated = _start(store, package, "unrelated-admission")
+    assert unrelated.run_id
 
 
 def test_status_drift_is_resynchronized_on_same_process_load(
@@ -174,7 +179,10 @@ def test_complete_frame_checksum_corruption_fails_closed_without_tail_truncation
 
     assert journal.read_text() == tampered
     assert not list(directory.glob("events.jsonl.torn-*"))
-    assert store.storage_health()["status"] == "repair_required"
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+    assert store._active_run_repair_reasons(admitted.run_id) == (
+        "run_evidence_uncorroborated",
+    )
 
 
 def test_middle_frame_corruption_cannot_replace_the_index_integrity_baseline(

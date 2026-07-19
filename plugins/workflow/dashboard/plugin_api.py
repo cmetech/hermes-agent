@@ -31,7 +31,7 @@ from plugins.workflow.runtime import (
     WorkflowRetentionPolicy,
 )
 from plugins.workflow.sanitize import sanitize_projection
-from plugins.workflow.store import RunStore
+from plugins.workflow.store import JournalRecoveryError, RunStore
 
 
 _CURSOR_SECRET = secrets.token_bytes(32)
@@ -260,6 +260,11 @@ def _load_authorized(store: RunStore, run_id: str, operator: WorkflowAuthority):
             run_id,
             operator_scope=None if operator.unrestricted else operator.scope,
         )
+    except JournalRecoveryError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "run_evidence_uncorroborated"},
+        ) from exc
     except (KeyError, OSError) as exc:
         raise HTTPException(status_code=404, detail={"code": "run_not_found"}) from exc
 

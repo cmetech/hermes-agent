@@ -598,28 +598,40 @@ class NotificationOutbox:
         processed_rows = []
         consumed_bytes = 0
         for row in rows:
+            run_id = str(row["run_id"])
             try:
                 run_candidates, journal_bytes = self._journal_candidates(
-                    str(row["run_id"]),
+                    run_id,
                     max_journal_bytes=int(self.store.max_journal_bytes),
                     page_bytes_remaining=byte_budget - consumed_bytes,
                     allow_page_overrun=not consumed_bytes,
                 )
             except _NotificationRepairPageFull:
                 break
-            except NotificationReconciliationError:
-                run_id = str(row["run_id"])
-                reason_code = "notification_reconciliation_unverified"
-                self.store._mark_repair_required(reason_code, run_id=run_id)
-                with self.store._connect() as connection:
-                    self.store._record_repair_event(
-                        connection,
-                        reason_code=reason_code,
-                        outcome="repair_required",
-                        run_id=run_id,
+            except WorkflowLockTimeout:
+                timeout_count = self.store._note_notification_repair_timeout(run_id)
+                if timeout_count == 3 or timeout_count % 10 == 0:
+                    logger.warning(
+                        "workflow notification repair lock contention run_id=%s "
+                        "consecutive_timeouts=%d cursor retained",
+                        run_id,
+                        timeout_count,
                     )
+                break
+            except NotificationReconciliationError:
+                self.store._transition_run_repair(
+                    "notification_reconciliation_unverified",
+                    run_id=run_id,
+                    outcome="repair_required",
+                )
                 processed_rows.append(row)
                 continue
+            self.store._clear_notification_repair_timeout(run_id)
+            self.store._transition_run_repair(
+                "notification_reconciliation_unverified",
+                run_id=run_id,
+                outcome="repair_verified",
+            )
             if not consumed_bytes and journal_bytes > byte_budget:
                 logger.warning(
                     "workflow notification repair processing bounded oversized "

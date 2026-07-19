@@ -107,6 +107,9 @@ class ForegroundExecutionLease:
 
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
+_RUN_SCOPED_REPAIR_REASONS = frozenset(
+    {"notification_reconciliation_unverified", "run_evidence_uncorroborated"}
+)
 _STORE_SCHEMA_VERSION = 13
 # Direct RunStore/CLI access is already the profile-local filesystem admin
 # boundary. Network adapters must always pass their verified authority binding.
@@ -346,6 +349,9 @@ class RunStore:
         }
         self._init_lock = threading.Lock()
         self._admission_gate = threading.RLock()
+        self._notification_repair_timeout_lock = threading.Lock()
+        self._notification_repair_timeout_run_id: str | None = None
+        self._notification_repair_timeout_count = 0
         self._admission_open = True
         self._initialized = False
         self._initialize()
@@ -1153,6 +1159,98 @@ class RunStore:
             ),
         )
 
+    def _transition_run_repair(
+        self,
+        reason_code: str,
+        *,
+        run_id: str,
+        outcome: str,
+    ) -> bool:
+        """Append a changed run-scoped repair state without degrading the store."""
+        if reason_code not in _RUN_SCOPED_REPAIR_REASONS:
+            raise ValueError("reason_code is not run-scoped")
+        if outcome not in {"repair_required", "repair_verified"}:
+            raise ValueError("invalid run repair outcome")
+        with self._connect() as connection:
+            latest = connection.execute(
+                "SELECT outcome FROM repair_events WHERE run_id=? AND reason_code=? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (run_id, reason_code),
+            ).fetchone()
+            if latest is not None and str(latest["outcome"]) == outcome:
+                return False
+            if outcome == "repair_verified" and latest is None:
+                return False
+            connection.execute("BEGIN IMMEDIATE")
+            latest = connection.execute(
+                "SELECT outcome FROM repair_events WHERE run_id=? AND reason_code=? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (run_id, reason_code),
+            ).fetchone()
+            if latest is not None and str(latest["outcome"]) == outcome:
+                return False
+            if outcome == "repair_verified" and latest is None:
+                return False
+            self._record_repair_event(
+                connection,
+                reason_code=reason_code,
+                outcome=outcome,
+                run_id=run_id,
+            )
+        return True
+
+    def _active_run_repair_reasons(self, run_id: str) -> tuple[str, ...]:
+        """Return active run-local repair reasons from their latest transitions."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT events.reason_code FROM repair_events AS events "
+                "WHERE events.run_id=? AND events.reason_code IN (?, ?) "
+                "AND events.sequence=(SELECT MAX(latest.sequence) "
+                "FROM repair_events AS latest WHERE latest.run_id=events.run_id "
+                "AND latest.reason_code=events.reason_code) "
+                "AND events.outcome='repair_required' ORDER BY events.reason_code",
+                (
+                    run_id,
+                    "notification_reconciliation_unverified",
+                    "run_evidence_uncorroborated",
+                ),
+            ).fetchall()
+        return tuple(str(row["reason_code"]) for row in rows)
+
+    def _note_notification_repair_timeout(self, run_id: str) -> int:
+        """Count consecutive repair-lock timeouts for one cursor-blocking run."""
+        with self._notification_repair_timeout_lock:
+            if self._notification_repair_timeout_run_id == run_id:
+                self._notification_repair_timeout_count += 1
+            else:
+                self._notification_repair_timeout_run_id = run_id
+                self._notification_repair_timeout_count = 1
+            return self._notification_repair_timeout_count
+
+    def _clear_notification_repair_timeout(self, run_id: str) -> None:
+        """Clear diagnostics after the blocked run is read successfully."""
+        with self._notification_repair_timeout_lock:
+            if self._notification_repair_timeout_run_id == run_id:
+                self._notification_repair_timeout_run_id = None
+                self._notification_repair_timeout_count = 0
+
+    @staticmethod
+    def _active_run_repair_ids(connection: sqlite3.Connection) -> set[str]:
+        rows = connection.execute(
+            "SELECT events.run_id FROM repair_events AS events "
+            "WHERE events.run_id IS NOT NULL "
+            "AND events.reason_code IN (?, ?) "
+            "AND events.sequence=(SELECT MAX(latest.sequence) "
+            "FROM repair_events AS latest WHERE latest.run_id=events.run_id "
+            "AND latest.reason_code=events.reason_code) "
+            "AND events.outcome='repair_required'",
+            (
+                "notification_reconciliation_unverified",
+                "run_evidence_uncorroborated",
+            ),
+        ).fetchall()
+        return {str(row["run_id"]) for row in rows}
+
     @staticmethod
     def _snapshot_owner_alive(pid: int) -> bool:
         if pid <= 0:
@@ -1540,28 +1638,36 @@ class RunStore:
             published = connection.execute(
                 "SELECT * FROM runs WHERE admission_state='published'"
             ).fetchall()
+            active_run_repairs = self._active_run_repair_ids(connection)
             known_directories = {
                 str(Path(row["run_directory"]).resolve()) for row in published
             }
             for row in published:
                 run_directory = Path(row["run_directory"])
+                run_id = str(row["run_id"])
+                if run_id in active_run_repairs:
+                    continue
                 try:
                     projection, projection_hash, journal_hash = (
                         self._corroborate_run_evidence(
-                            run_directory, run_id=row["run_id"]
+                            run_directory, run_id=run_id
                         )
                     )
                 except (OSError, ValueError, json.JSONDecodeError, JournalRecoveryError):
-                    self._mark_repair_required(
-                        "published_evidence_uncorroborated", run_id=row["run_id"]
+                    transitioned = self._transition_run_repair(
+                        "run_evidence_uncorroborated",
+                        run_id=run_id,
+                        outcome="repair_required",
                     )
-                    self._record_repair_event(
-                        connection,
-                        reason_code="published_evidence_uncorroborated",
-                        outcome="evidence_preserved",
-                        run_id=row["run_id"],
-                        source_path=run_directory,
-                    )
+                    active_run_repairs.add(run_id)
+                    if transitioned:
+                        self._record_repair_event(
+                            connection,
+                            reason_code="published_evidence_uncorroborated",
+                            outcome="evidence_preserved",
+                            run_id=run_id,
+                            source_path=run_directory,
+                        )
                     continue
                 if row["status"] != projection["status"]:
                     connection.execute(
@@ -3037,12 +3143,21 @@ class RunStore:
                         directory, projection=projection, run_id=run_id
                     )
                 except (JournalRecoveryError, OSError):
-                    self._mark_repair_required(
-                        "run_evidence_uncorroborated", run_id=run_id
+                    # This corroborates only the resolved run directory. Store-level
+                    # index/generation checks retain their global repair markers.
+                    self._transition_run_repair(
+                        "run_evidence_uncorroborated",
+                        run_id=run_id,
+                        outcome="repair_required",
                     )
                     raise
                 if journal_current:
                     self._sync_loaded_integrity(directory, projection)
+                    self._transition_run_repair(
+                        "run_evidence_uncorroborated",
+                        run_id=run_id,
+                        outcome="repair_verified",
+                    )
                     return projection
             if path.exists():
                 quarantine = directory / f"run.json.corrupt-{uuid.uuid4().hex}"
@@ -3050,8 +3165,12 @@ class RunStore:
             try:
                 rebuilt = self._rebuild_projection(directory, run_id=run_id)
             except (JournalRecoveryError, OSError, ValueError, json.JSONDecodeError):
-                self._mark_repair_required(
-                    "run_evidence_uncorroborated", run_id=run_id
+                # Projection replay is confined to this run. Cross-run/index
+                # reconciliation failures are handled by their global callers.
+                self._transition_run_repair(
+                    "run_evidence_uncorroborated",
+                    run_id=run_id,
+                    outcome="repair_required",
                 )
                 raise
             _atomic_json(path, rebuilt)
@@ -3067,6 +3186,11 @@ class RunStore:
                         (directory / "events.jsonl").read_bytes()
                     ),
                 )
+            self._transition_run_repair(
+                "run_evidence_uncorroborated",
+                run_id=run_id,
+                outcome="repair_verified",
+            )
             return rebuilt
 
     def _journal_matches_projection(
@@ -3611,7 +3735,18 @@ class RunStore:
             clauses.append("workflow_name=?")
             values.append(workflow)
         if status and not storage_degraded:
-            clauses.append("status=?")
+            clauses.append(
+                "(status=? OR EXISTS (SELECT 1 FROM repair_events AS repair "
+                "WHERE repair.run_id=runs.run_id "
+                "AND repair.reason_code IN "
+                "('notification_reconciliation_unverified',"
+                "'run_evidence_uncorroborated') "
+                "AND repair.sequence=(SELECT MAX(latest.sequence) "
+                "FROM repair_events AS latest "
+                "WHERE latest.run_id=repair.run_id "
+                "AND latest.reason_code=repair.reason_code) "
+                "AND repair.outcome='repair_required'))"
+            )
             values.append(status)
         if operator_scope is not None:
             clauses.append("operator_scope_digest=?")
@@ -3645,9 +3780,10 @@ class RunStore:
             ).fetchall()
         results = []
         for row in rows:
+            run_id = str(row["run_id"])
             try:
                 result = self.get_run_status(
-                    row["run_id"], operator_scope=operator_scope
+                    run_id, operator_scope=operator_scope
                 )
             except (
                 JournalRecoveryError,
@@ -3655,19 +3791,21 @@ class RunStore:
                 ValueError,
                 json.JSONDecodeError,
             ):
-                self._mark_repair_required(
-                    "run_evidence_uncorroborated", run_id=row["run_id"]
+                self._transition_run_repair(
+                    "run_evidence_uncorroborated",
+                    run_id=run_id,
+                    outcome="repair_required",
                 )
                 result = {
                     "schema_version": 1,
                     "action": "status",
-                    "run_id": row["run_id"],
+                    "run_id": run_id,
                     "workflow": row["workflow_name"],
                     "status": row["status"],
                     "status_authoritative": False,
                     "health": "storage_degraded",
                     "updated_at": row["updated_at"],
-                    "blocking_reason": "storage_repair_required",
+                    "blocking_reason": "run_evidence_uncorroborated",
                     "next_actions": [],
                     "warnings": ["run_evidence_uncorroborated"],
                 }
@@ -3719,6 +3857,16 @@ class RunStore:
             "EXISTS (SELECT 1 FROM worker_claims AS claims "
             "WHERE claims.run_id=runs.run_id AND claims.lease_expires_at<=?)"
             "))",
+            "EXISTS (SELECT 1 FROM repair_events AS repair "
+            "WHERE repair.run_id=runs.run_id "
+            "AND repair.reason_code IN "
+            "('notification_reconciliation_unverified',"
+            "'run_evidence_uncorroborated') "
+            "AND repair.sequence=(SELECT MAX(latest.sequence) "
+            "FROM repair_events AS latest "
+            "WHERE latest.run_id=repair.run_id "
+            "AND latest.reason_code=repair.reason_code) "
+            "AND repair.outcome='repair_required')",
         ]
         values.extend((observed_at.isoformat(), observed_at.isoformat()))
         if include_unavailable:
@@ -3744,9 +3892,11 @@ class RunStore:
             ).fetchall()
         results = []
         for row in rows:
+            run_id = str(row["run_id"])
+            status_read_succeeded = False
             try:
                 result = self.get_run_status(
-                    str(row["run_id"]), operator_scope=operator_scope
+                    run_id, operator_scope=operator_scope
                 )
             except (
                 JournalRecoveryError,
@@ -3754,22 +3904,46 @@ class RunStore:
                 ValueError,
                 json.JSONDecodeError,
             ):
-                self._mark_repair_required(
-                    "run_evidence_uncorroborated", run_id=str(row["run_id"])
+                self._transition_run_repair(
+                    "run_evidence_uncorroborated",
+                    run_id=run_id,
+                    outcome="repair_required",
                 )
                 result = {
                     "schema_version": 1,
                     "action": "status",
-                    "run_id": row["run_id"],
+                    "run_id": run_id,
                     "workflow": row["workflow_name"],
                     "status": row["status"],
                     "status_authoritative": False,
                     "health": "storage_degraded",
                     "updated_at": row["updated_at"],
-                    "blocking_reason": "storage_repair_required",
+                    "blocking_reason": "run_evidence_uncorroborated",
                     "next_actions": [],
                     "warnings": ["run_evidence_uncorroborated"],
                 }
+            else:
+                status_read_succeeded = True
+            active_reasons = self._active_run_repair_reasons(run_id)
+            if (
+                status_read_succeeded
+                and "notification_reconciliation_unverified" in active_reasons
+            ):
+                result = {
+                    **result,
+                    "status_authoritative": False,
+                    "health": "storage_degraded",
+                    "blocking_reason": "notification_reconciliation_unverified",
+                    "next_actions": [],
+                    "warnings": ["notification_reconciliation_unverified"],
+                }
+            elif (
+                status_read_succeeded
+                and not active_reasons
+                and result.get("status")
+                in {"succeeded", "cancelled", "abandoned"}
+            ):
+                continue
             results.append(result)
         return tuple(results)
 

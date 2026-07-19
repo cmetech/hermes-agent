@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import threading
 import time
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pytest
 
@@ -18,6 +18,7 @@ from plugins.workflow.coordinator_store import (
     CoordinatorStore,
 )
 from plugins.workflow.lease_clock import LeaseClockSample
+from plugins.workflow.locks import workflow_lock
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.provenance import TriggerProvenance
@@ -1145,6 +1146,122 @@ def test_idle_backoff_uses_actionable_work_not_rows_seen(
     assert actionable is False
     scheduler.submit.assert_called_once()
     scheduler.advance.assert_not_called()
+
+
+def test_repair_lock_timeout_does_not_block_delivery_or_scheduling(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path)
+    coordinator = CoordinatorStore(store.database)
+    identity = _identity("repair-contention")
+    now = datetime.now(timezone.utc)
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    assert leadership.is_leader
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="repair-contention")
+    )
+
+    terminal_snapshot = store.prepare_run_snapshot(package)
+    terminal = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=terminal_snapshot.definition_digest,
+            policy_digest=terminal_snapshot.policy_digest,
+            input_manifest_digest=terminal_snapshot.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="repair-contention-terminal",
+            concurrency_key="repair-contention-terminal",
+            execution_mode="background",
+        ),
+        immutable_snapshot=terminal_snapshot,
+    )
+    RunScheduler(
+        store,
+        owner_id=f"coordinator:{identity.owner_id}:{leadership.lease.epoch}",
+        execution_fence=fence,
+    ).advance(terminal.run_id)
+    for wake in coordinator.pending_wakes(
+        identity,
+        epoch=leadership.lease.epoch,
+        now=now,
+        limit=100,
+    ):
+        if wake.run_id == terminal.run_id:
+            assert coordinator.complete_wake(
+                wake.generation,
+                identity,
+                epoch=leadership.lease.epoch,
+                now=now,
+                outcome="test_terminal_setup",
+            )
+
+    queued_snapshot = store.prepare_run_snapshot(package)
+    queued = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=queued_snapshot.definition_digest,
+            policy_digest=queued_snapshot.policy_digest,
+            input_manifest_digest=queued_snapshot.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="repair-contention-queued",
+            concurrency_key="repair-contention-queued",
+            concurrency_policy="allow",
+            execution_mode="background",
+        ),
+        immutable_snapshot=queued_snapshot,
+    )
+    NotificationOutbox(store).record(
+        run_id=queued.run_id,
+        kind="failure",
+        destination="gateway:opaque-capability",
+        transition_version=999,
+        payload={"workflow": package.definition.name},
+        now=now,
+    )
+
+    delivered = []
+
+    class Port:
+        def deliver(self, capability: str, text: str, key: str) -> DeliveryReceipt:
+            delivered.append((capability, text, key))
+            return DeliveryReceipt(status="delivered", transport_id="message-1")
+
+    ready = threading.Event()
+    release = threading.Event()
+
+    def hold_run_lock() -> None:
+        with workflow_lock(store._run_lock_path(terminal.run_id)):
+            ready.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_run_lock)
+    holder.start()
+    assert ready.wait(timeout=1)
+    service = _service(
+        tmp_path,
+        host_kind="gateway",
+        host_instance_id="repair-contention",
+        delivery_port=Port(),
+    )
+    scheduler = MagicMock()
+    scheduler.submit.return_value = True
+    try:
+        actionable, _cursor, _progress = service._sweep_once(
+            store,
+            coordinator,
+            identity,
+            leadership.lease.epoch,
+            scheduler,
+        )
+    finally:
+        release.set()
+        holder.join(timeout=2)
+
+    assert not holder.is_alive()
+    assert actionable is True
+    assert delivered == [("opaque-capability", ANY, ANY)]
+    scheduler.submit.assert_any_call(queued.run_id, fence)
 
 
 def test_sweep_cursor_never_skips_page_prefix_when_wake_consumes_budget(
