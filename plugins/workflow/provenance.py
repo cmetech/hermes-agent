@@ -21,7 +21,7 @@ _ASSURANCES = frozenset(
 _ASSURANCE_SOURCES = {
     "verified_adapter": frozenset({"desktop", "chat", "background_agent", "api"}),
     "system_schedule": frozenset({"cron"}),
-    "local_admin_claim": frozenset({"cli", "chat", "background_agent", "cron"}),
+    "local_admin_claim": frozenset({"cli", "chat", "background_agent", "cron", "api"}),
     "legacy_unknown": _SOURCES,
 }
 
@@ -79,7 +79,7 @@ class TriggerProvenance:
     def local_admin_claim(
         cls,
         *,
-        source: Literal["cli", "chat", "background_agent", "cron"],
+        source: Literal["cli", "chat", "background_agent", "cron", "api"],
         intent_key: str,
         source_instance: str | None = None,
         claimed_actor: str | None = None,
@@ -96,6 +96,37 @@ class TriggerProvenance:
             intent_key=intent_key,
             source_instance=source_instance,
             claimed_actor=claimed_actor,
+        )
+
+    @classmethod
+    def authenticated_api(
+        cls,
+        *,
+        assurance: Literal["verified_adapter", "local_admin_claim"],
+        intent_key: str,
+        source_instance: str,
+        principal: str,
+        return_route: str | None = None,
+    ) -> "TriggerProvenance":
+        """Build API provenance only from an authenticated server authority."""
+        if assurance == "local_admin_claim":
+            if return_route is not None:
+                raise ValueError("local admin API claims cannot carry return routes")
+            return cls.local_admin_claim(
+                source="api",
+                intent_key=intent_key,
+                source_instance=source_instance,
+                claimed_actor=principal,
+            )
+        if assurance != "verified_adapter":
+            raise ValueError("unsupported authenticated API assurance")
+        return cls(
+            source="api",
+            assurance="verified_adapter",
+            intent_key=intent_key,
+            source_instance=source_instance,
+            actor_id=principal,
+            return_route=return_route,
         )
 
     @classmethod

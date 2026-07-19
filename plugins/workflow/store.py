@@ -6984,6 +6984,8 @@ class RunStore:
         *,
         expected_state_version: int,
         interaction_id: str | None = None,
+        actor: str | None = None,
+        channel: str | None = None,
         operator_scope: str | None = None,
     ) -> dict[str, object]:
         """Compare-and-set one paused interactive loop back to ready."""
@@ -7035,15 +7037,20 @@ class RunStore:
             node["state"] = "ready"
             node.pop("pending_interaction", None)
             node["loop_user_input_artifact"] = relative.as_posix()
+            event_payload: dict[str, object] = {
+                "artifact": artifact,
+                "iteration": generation,
+                "interaction_id": interaction_id,
+            }
+            if actor:
+                event_payload["actor"] = _sanitize_diagnostic(actor)
+            if channel:
+                event_payload["channel"] = _sanitize_diagnostic(channel)
             self._append_locked(
                 directory,
                 projection,
                 "loop_input_provided",
-                {
-                    "artifact": artifact,
-                    "iteration": generation,
-                    "interaction_id": interaction_id,
-                },
+                event_payload,
                 node_id=node_id,
             )
             return self._request_runnable_locked(

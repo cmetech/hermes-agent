@@ -204,3 +204,47 @@ def test_write_token_cannot_execute_cleanup(tmp_path, monkeypatch) -> None:
 
     assert response.status_code == 403
     assert response.json()["detail"]["code"] == "workflow_admin_required"
+
+
+def test_post_runs_real_middleware_requires_workflow_write_scope(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    path = "/api/plugins/workflow/runs"
+    app = _real_token_app(
+        paths={path},
+        principals={
+            "read-secret": TokenPrincipal(
+                principal="reader",
+                provider="workflow-token",
+                scopes=("workflow:read",),
+            ),
+            "write-secret": TokenPrincipal(
+                principal="writer",
+                provider="workflow-token",
+                scopes=("workflow:write",),
+            ),
+        },
+    )
+    body = {
+        "workflow": "missing-catalog-workflow",
+        "values": {},
+        "idempotency_key": "real-middleware",
+        "concurrency_policy": "queue",
+    }
+
+    denied = TestClient(app).post(
+        path,
+        headers={"Authorization": "Bearer read-secret"},
+        json=body,
+    )
+    allowed_to_resolve = TestClient(app).post(
+        path,
+        headers={"Authorization": "Bearer write-secret"},
+        json=body,
+    )
+
+    assert denied.status_code == 403
+    assert denied.json()["detail"]["code"] == "workflow_write_required"
+    assert allowed_to_resolve.status_code == 404
+    assert allowed_to_resolve.json()["detail"]["code"] == "workflow_not_found"

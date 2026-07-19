@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import asyncio
+from datetime import datetime, timezone
 import sys
 from pathlib import Path
 import threading
@@ -14,11 +15,19 @@ import httpx
 from hermes_cli.dashboard_auth.base import TokenPrincipal
 import pytest
 
+from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
 from plugins.workflow.showcase import run_showcase
+from plugins.workflow.trust import (
+    WorkflowTrustStore,
+    build_risk_summary,
+    compute_package_digest,
+)
 from plugins.workflow.runtime import (
     WorkflowApiLimits,
     WorkflowApiRuntime,
@@ -78,6 +87,55 @@ def _start(store, package, key, *, scope=None):
     )
 
 
+def _trusted_catalog_workflow(home, workflow_writer, *, name, nodes=None, **options):
+    package = load_workflow(
+        workflow_writer(
+            home / "workflows",
+            name=name,
+            nodes=nodes,
+            filename=f"{name}.yaml",
+            **options,
+        )
+    )
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(home).trust(
+        digest.sha256,
+        actor="test-operator",
+        risk_digest=risk.risk_digest,
+    )
+    return package
+
+
+def _healthy_coordinator(store):
+    acquired = CoordinatorStore(store.database).try_acquire(
+        CoordinatorIdentity(
+            owner_id="api-test",
+            host_kind="web",
+            host_instance_id="api-test",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=datetime.now(timezone.utc),
+        lease_seconds=60,
+    )
+    assert acquired.is_leader
+
+
+class _LoopRunner:
+    def run(self, request, **_kwargs):
+        return PluginAgentRunResult(
+            final_response="draft",
+            session_id="api-loop-session",
+            provider=request.provider or "fake-provider",
+            model=request.model or "fake-model",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={},
+        )
+
+
 def test_hidden_manifest_is_api_only():
     root = Path(__file__).parents[3] / "plugins/workflow/dashboard"
     assert '"hidden": true' in (root / "manifest.json").read_text()
@@ -92,6 +150,260 @@ def test_router_rejects_requests_without_verified_authentication() -> None:
 
     assert response.status_code == 401
     assert response.json()["detail"]["code"] == "authentication_required"
+
+
+def test_post_runs_api_admission_requires_write_and_server_derived_provenance(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, workflow_writer, name="api-admission")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    module = _module()
+    reader = TokenPrincipal(
+        principal="reader", provider="test", scopes=("workflow:read",)
+    )
+    writer = TokenPrincipal(
+        principal="writer", provider="test", scopes=("workflow:write",)
+    )
+    body = {
+        "workflow": "api-admission",
+        "values": {"subject": "safe"},
+        "idempotency_key": "request-1",
+        "concurrency_policy": "queue",
+    }
+
+    denied = TestClient(_app(module.router, token=reader)).post(
+        "/api/plugins/workflow/runs", json=body
+    )
+    missing_key = TestClient(_app(module.router, token=writer)).post(
+        "/api/plugins/workflow/runs",
+        json={key: value for key, value in body.items() if key != "idempotency_key"},
+    )
+    admitted = TestClient(_app(module.router, token=writer)).post(
+        "/api/plugins/workflow/runs",
+        json=body,
+        headers={
+            "X-Hermes-Workflow-Source": "cron",
+            "X-Hermes-Principal": "forged-admin",
+            "X-Hermes-Source-Instance": "forged-instance",
+            "X-Hermes-Channel": "forged-channel",
+            "X-Hermes-Return-Route": "forged-route",
+        },
+    )
+
+    assert denied.status_code == 403
+    assert denied.json()["detail"]["code"] == "workflow_write_required"
+    assert missing_key.status_code == 422
+    assert admitted.status_code == 202
+    assert admitted.json()["ok"] is True
+    result = admitted.json()["result"]
+    assert result["admission_disposition"] == "created"
+    run = store.get_run_status(result["run_id"], operator_scope="service:test:writer")
+    assert run["execution_mode"] == "background"
+    assert run["provenance"]["source"] == "api"
+    assert run["provenance"]["assurance"] == "verified_adapter"
+    assert run["provenance"]["actor_id"] == "service:test:writer"
+    assert run["provenance"]["source_instance"] == "api:token:test"
+    assert run["provenance"]["return_route"] is None
+    assert "forged" not in str(run["provenance"])
+
+
+def test_post_runs_api_admission_requires_healthy_coordinator_without_run(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, workflow_writer, name="api-no-coordinator")
+    store = RunStore(home)
+    writer = TokenPrincipal(
+        principal="writer", provider="test", scopes=("workflow:write",)
+    )
+
+    response = TestClient(_app(_router(), token=writer)).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "api-no-coordinator",
+            "values": {},
+            "idempotency_key": "no-coordinator",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "coordinator_unavailable"
+    assert list(store.runs_root.rglob("run.json")) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
+def test_post_runs_api_admission_joins_identical_and_conflicts_on_changed_input(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, workflow_writer, name="api-idempotent")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    writer = TokenPrincipal(
+        principal="writer", provider="test", scopes=("workflow:write",)
+    )
+    client = TestClient(_app(_router(), token=writer))
+    body = {
+        "workflow": "api-idempotent",
+        "values": {"subject": "same"},
+        "idempotency_key": "stable-request",
+        "concurrency_policy": "allow",
+    }
+
+    first = client.post("/api/plugins/workflow/runs", json=body)
+    duplicate = client.post("/api/plugins/workflow/runs", json=body)
+    conflict = client.post(
+        "/api/plugins/workflow/runs",
+        json={**body, "values": {"subject": "changed"}},
+    )
+
+    assert first.status_code == duplicate.status_code == 202
+    assert first.json()["result"]["run_id"] == duplicate.json()["result"]["run_id"]
+    assert first.json()["result"]["admission_disposition"] == "created"
+    assert duplicate.json()["result"]["admission_disposition"] == "existing"
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "idempotency_conflict"
+
+
+def test_api_admission_mutations_persist_authenticated_actor_and_channel(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    scope = "service:test:writer"
+    writer = TokenPrincipal(
+        principal="writer", provider="test", scopes=("workflow:write",)
+    )
+
+    approval = load_workflow(
+        workflow_writer(
+            tmp_path / "approval",
+            name="api-approval",
+            nodes=[{"id": "review", "approval": {"message": "Approve?"}}],
+        )
+    )
+    store = RunStore(home)
+    approval_run = _start(store, approval, "api-approval", scope=scope)
+    approval_paused = RunScheduler(store).advance(approval_run.run_id)
+    approval_interaction = approval_paused["nodes"]["review"]["pending_interaction"][
+        "interaction_id"
+    ]
+    client = TestClient(_app(_router(), token=writer))
+    approved = client.post(
+        f"/api/plugins/workflow/runs/{approval_run.run_id}/approve",
+        json={
+            "expected_version": approval_paused["state_version"],
+            "interaction_id": approval_interaction,
+            "comment": "approved",
+        },
+        headers={"X-Hermes-Channel": "forged-channel"},
+    )
+
+    rejection_run = _start(store, approval, "api-rejection", scope=scope)
+    rejection_paused = RunScheduler(store).advance(rejection_run.run_id)
+    rejection_interaction = rejection_paused["nodes"]["review"]["pending_interaction"][
+        "interaction_id"
+    ]
+    rejected = client.post(
+        f"/api/plugins/workflow/runs/{rejection_run.run_id}/reject",
+        json={
+            "expected_version": rejection_paused["state_version"],
+            "interaction_id": rejection_interaction,
+            "reason": "rejected",
+        },
+    )
+
+    loop = load_workflow(
+        workflow_writer(
+            tmp_path / "loop",
+            name="api-loop",
+            interactive=True,
+            nodes=[
+                {
+                    "id": "iterate",
+                    "loop": {
+                        "prompt": "Refine",
+                        "until": "DONE",
+                        "max_iterations": 2,
+                        "interactive": True,
+                        "gate_message": "Review",
+                    },
+                }
+            ],
+        )
+    )
+    loop_run = _start(store, loop, "api-loop", scope=scope)
+    loop_paused = RunScheduler(store, agent_runner=_LoopRunner()).advance(
+        loop_run.run_id
+    )
+    loop_interaction = loop_paused["nodes"]["iterate"]["pending_interaction"][
+        "interaction_id"
+    ]
+    provided = client.post(
+        f"/api/plugins/workflow/runs/{loop_run.run_id}/provide-input",
+        json={
+            "expected_version": loop_paused["state_version"],
+            "interaction_id": loop_interaction,
+            "value": "tighten evidence",
+        },
+    )
+
+    assert approved.status_code == rejected.status_code == provided.status_code == 200
+    approval_event = next(
+        event
+        for event in store.tail_events(approval_run.run_id)
+        if event["event_type"] == "interaction_approved"
+    )
+    input_event = next(
+        event
+        for event in store.tail_events(loop_run.run_id)
+        if event["event_type"] == "loop_input_provided"
+    )
+    rejection_event = next(
+        event
+        for event in store.tail_events(rejection_run.run_id)
+        if event["event_type"] == "interaction_rejected"
+    )
+    for event in (approval_event, rejection_event, input_event):
+        assert event["payload"]["actor"] == scope
+        assert event["payload"]["channel"] == "api:test"
+        assert "forged" not in str(event["payload"])
+
+
+def test_post_runs_api_admission_rejects_unbounded_or_caller_auth_fields(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    client = TestClient(_app(_router()))
+    base = {
+        "workflow": "bounded",
+        "idempotency_key": "bounded",
+        "concurrency_policy": "queue",
+    }
+
+    oversized = client.post(
+        "/api/plugins/workflow/runs",
+        json={**base, "values": {"input": "x" * (64 * 1024 + 1)}},
+    )
+    caller_identity = client.post(
+        "/api/plugins/workflow/runs",
+        json={
+            **base,
+            "values": {},
+            "principal": "caller-admin",
+            "source": "cron",
+            "return_route": "caller-route",
+        },
+    )
+
+    assert oversized.status_code == 422
+    assert caller_identity.status_code == 422
 
 
 def test_runs_are_bounded_cursor_paginated_and_scope_authorized(

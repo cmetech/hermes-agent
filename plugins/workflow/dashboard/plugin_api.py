@@ -13,10 +13,11 @@ import time
 import re
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
-from typing import Iterator, Mapping
+from pathlib import Path
+from typing import Iterator, Literal, Mapping
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from hermes_constants import get_hermes_home
 from plugins.workflow.actions import MUTATION_ACTIONS, mutation_is_valid
@@ -76,6 +77,10 @@ class WorkflowAuthority:
     unrestricted: bool
     capabilities: frozenset[str]
     delivery_destination: str | None = "desktop"
+    source_instance: str = "api:local-admin"
+    channel: str = "api:local-admin"
+    assurance: Literal["verified_adapter", "local_admin_claim"] = "local_admin_claim"
+    return_route: str | None = None
 
     @property
     def cursor_scope(self) -> str:
@@ -92,6 +97,10 @@ class WorkflowAuthority:
             sort_keys=True,
             separators=(",", ":"),
         )
+
+    @property
+    def idempotency_namespace(self) -> str:
+        return f"api:{self.principal}"
 
     def require(self, capability: str) -> None:
         if capability not in self.capabilities:
@@ -128,11 +137,9 @@ def _verified_operator(
     session = getattr(request.state, "session", None)
     token = getattr(request.state, "token_principal", None)
     if session is not None:
+        provider = getattr(session, "provider", "unknown")
         org = getattr(session, "org_id", "") or "personal"
-        maximum = (
-            f"dashboard:{getattr(session, 'provider', 'unknown')}:"
-            f"{org}:{getattr(session, 'user_id', 'unknown')}"
-        )
+        maximum = f"dashboard:{provider}:{org}:{getattr(session, 'user_id', 'unknown')}"
         if requested_scope and not (
             requested_scope == maximum or requested_scope.startswith(maximum + ":")
         ):
@@ -145,12 +152,13 @@ def _verified_operator(
             scope=requested_scope or maximum,
             unrestricted=False,
             capabilities=frozenset({"read", "write", "delivery"}),
+            source_instance=f"api:session:{provider}",
+            channel=f"api:{provider}",
+            assurance="verified_adapter",
         )
     if token is not None and getattr(request.state, "token_authenticated", False):
-        maximum = (
-            f"service:{getattr(token, 'provider', 'unknown')}:"
-            f"{getattr(token, 'principal', 'unknown')}"
-        )
+        provider = getattr(token, "provider", "unknown")
+        maximum = f"service:{provider}:{getattr(token, 'principal', 'unknown')}"
         scopes = tuple(getattr(token, "scopes", ()) or ())
         if requested_scope and not (
             requested_scope == maximum or requested_scope.startswith(maximum + ":")
@@ -164,6 +172,9 @@ def _verified_operator(
             scope=requested_scope or maximum,
             unrestricted=False,
             capabilities=_token_capabilities(scopes),
+            source_instance=f"api:token:{provider}",
+            channel=f"api:{provider}",
+            assurance="verified_adapter",
         )
     if getattr(request.state, "local_admin_authenticated", False):
         return WorkflowAuthority(
@@ -171,6 +182,9 @@ def _verified_operator(
             scope=requested_scope,
             unrestricted=requested_scope is None,
             capabilities=_ALL_WORKFLOW_CAPABILITIES,
+            source_instance="api:local-admin",
+            channel="api:local-admin",
+            assurance="local_admin_claim",
         )
     raise HTTPException(status_code=401, detail={"code": "authentication_required"})
 
@@ -570,6 +584,83 @@ def list_runs(
     }
 
 
+class StartRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workflow: str = Field(..., min_length=1, max_length=256)
+    values: dict[str, str] = Field(default_factory=dict)
+    idempotency_key: str = Field(..., min_length=1, max_length=512)
+    concurrency_policy: Literal["queue", "allow", "forbid"] = "queue"
+
+    @model_validator(mode="after")
+    def validate_bounds(self):
+        if not self.workflow.strip():
+            raise ValueError("workflow must not be blank")
+        if not self.idempotency_key.strip():
+            raise ValueError("idempotency_key must not be blank")
+        if len(self.values) > 64:
+            raise ValueError("values contains too many entries")
+        total = 0
+        for key, value in self.values.items():
+            if not key.strip() or len(key) > 128:
+                raise ValueError("value names must be bounded non-empty text")
+            encoded = value.encode("utf-8")
+            if len(encoded) > 64 * 1024:
+                raise ValueError("value exceeds the API input limit")
+            total += len(key.encode("utf-8")) + len(encoded)
+        if total > 256 * 1024:
+            raise ValueError("values exceed the aggregate API input limit")
+        return self
+
+
+@router.post("/runs", status_code=202)
+def post_runs(
+    request_context: Request,
+    request: StartRunRequest,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request_context, operator_scope)
+    operator.require("write")
+    from plugins.workflow.api_admission import (
+        ApiAdmissionAuthority,
+        ApiAdmissionError,
+        start_api_run,
+    )
+
+    authority = ApiAdmissionAuthority(
+        principal=operator.principal,
+        namespace=operator.idempotency_namespace,
+        operator_scope=None if operator.unrestricted else operator.scope,
+        source_instance=operator.source_instance,
+        assurance=operator.assurance,
+        return_route=operator.return_route,
+    )
+    try:
+        with _store_lease() as store:
+            result = start_api_run(
+                store,
+                hermes_home=get_hermes_home(),
+                workdir=Path.cwd(),
+                user_home=Path.home(),
+                workflow_name=request.workflow,
+                values=request.values,
+                idempotency_key=request.idempotency_key,
+                concurrency_policy=request.concurrency_policy,
+                authority=authority,
+            )
+    except ApiAdmissionError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "retryable": exc.retryable},
+        ) from exc
+    return {
+        "schema_version": 1,
+        "ok": True,
+        "result": sanitize_projection(result),
+        "error": None,
+    }
+
+
 @router.get("/runs/{run_id}")
 def get_run(
     request: Request,
@@ -777,7 +868,8 @@ def mutate_run(
                     comment=request.comment,
                     expected_state_version=request.expected_version,
                     interaction_id=request.interaction_id,
-                    channel="desktop",
+                    actor=operator.principal,
+                    channel=operator.channel,
                     operator_scope=scope,
                 )
                 if result.outcome != "applied":
@@ -788,7 +880,8 @@ def mutate_run(
                     reason=request.reason,
                     expected_state_version=request.expected_version,
                     interaction_id=request.interaction_id,
-                    channel="desktop",
+                    actor=operator.principal,
+                    channel=operator.channel,
                     operator_scope=scope,
                 )
                 if result.outcome != "applied":
@@ -807,6 +900,8 @@ def mutate_run(
                     request.value,
                     expected_state_version=request.expected_version,
                     interaction_id=request.interaction_id,
+                    actor=operator.principal,
+                    channel=operator.channel,
                     operator_scope=scope,
                 )
             elif action == "resume":
