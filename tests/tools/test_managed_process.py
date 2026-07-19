@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -137,7 +138,7 @@ def test_posix_group_permission_failure_is_not_reported_as_cleaned(monkeypatch) 
     assert tree._terminate_owned_posix_group() is False
 
 
-def test_windows_existing_tree_uses_taskkill_and_closes_handle(monkeypatch) -> None:
+def test_windows_legacy_tree_taskkill_is_not_proof_of_quiescence(monkeypatch) -> None:
     import tools.managed_process as managed
 
     calls: list[list[str]] = []
@@ -158,8 +159,305 @@ def test_windows_existing_tree_uses_taskkill_and_closes_handle(monkeypatch) -> N
     )
 
     identity = ProcessIdentity(pid=77, start_time=7, group_id=77)
-    assert ManagedProcessTree.terminate_existing(identity) is True
+    assert ManagedProcessTree.terminate_existing(identity) is False
     assert calls == [["taskkill", "/PID", "77", "/T", "/F"]]
+
+
+def test_windows_taskkill_unavailable_root_signal_is_outcome_uncertain(
+    monkeypatch,
+) -> None:
+    import tools.managed_process as managed
+
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(managed, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        ProcessIdentity,
+        "capture",
+        classmethod(lambda cls, pid: ProcessIdentity(pid, 7, pid)),
+    )
+
+    def unavailable(*_args, **_kwargs):
+        raise FileNotFoundError("taskkill unavailable")
+
+    identity = ProcessIdentity(pid=77, start_time=7, group_id=77)
+    assert ManagedProcessTree.terminate_existing(
+        identity,
+        subprocess_run=unavailable,
+        os_kill=lambda pid, sig: signalled.append((pid, sig)),
+    ) is False
+    assert signalled == [(77, signal.SIGTERM)]
+
+
+def test_windows_spawn_assigns_job_before_returning_owner(monkeypatch) -> None:
+    import tools.managed_process as managed
+
+    assigned: list[int] = []
+    resumed: list[int] = []
+    popen_kwargs: dict[str, object] = {}
+
+    class FakeJob:
+        name = "Local\\HermesManagedProcess-test"
+
+        def assign(self, handle):
+            assigned.append(handle)
+
+        def resume_process(self, pid):
+            resumed.append(pid)
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        pid = 77
+        _handle = 88
+
+    job = FakeJob()
+    monkeypatch.setattr(managed, "_IS_WINDOWS", True)
+    monkeypatch.setattr(managed._WindowsJob, "create", classmethod(lambda cls: job))
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **kwargs: popen_kwargs.update(kwargs) or FakeProcess(),
+    )
+    monkeypatch.setattr(
+        ProcessIdentity,
+        "capture",
+        classmethod(lambda cls, pid: ProcessIdentity(pid, 7, pid)),
+    )
+
+    tree = ManagedProcessTree.spawn(_sleep_argv())
+
+    assert assigned == [88]
+    assert resumed == [77]
+    assert int(popen_kwargs["creationflags"]) & managed._CREATE_SUSPENDED
+    assert tree.identity.job_name == job.name
+    assert tree._windows_job is job
+
+
+def test_windows_job_assignment_failure_kills_child_and_closes_job(
+    monkeypatch,
+) -> None:
+    import tools.managed_process as managed
+
+    events: list[str] = []
+
+    class FailingJob:
+        name = "Local\\HermesManagedProcess-test"
+
+        def assign(self, _handle):
+            raise OSError("assignment failed")
+
+        def close(self):
+            events.append("job_closed")
+
+    class FakeProcess:
+        pid = 77
+        _handle = 88
+
+        def kill(self):
+            events.append("child_killed")
+
+        def wait(self, timeout):
+            assert timeout == 1
+            events.append("child_reaped")
+
+    monkeypatch.setattr(managed, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        managed._WindowsJob,
+        "create",
+        classmethod(lambda cls: FailingJob()),
+    )
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+
+    with pytest.raises(OSError, match="assignment failed"):
+        ManagedProcessTree.spawn(_sleep_argv())
+
+    assert events == ["child_killed", "child_reaped", "job_closed"]
+
+
+def test_windows_spawn_failure_closes_job_when_child_kill_is_uncertain(
+    monkeypatch,
+) -> None:
+    import tools.managed_process as managed
+
+    events: list[str] = []
+
+    class FailingJob:
+        name = "Local\\HermesManagedProcess-test"
+
+        def assign(self, _handle):
+            raise OSError("assignment failed")
+
+        def close(self):
+            events.append("job_closed")
+
+    class UnkillableProcess:
+        pid = 77
+        _handle = 88
+
+        def kill(self):
+            events.append("child_kill_uncertain")
+            raise OSError("kill failed")
+
+        def wait(self, timeout):
+            assert timeout == 1
+            events.append("child_waited")
+            raise subprocess.TimeoutExpired("child", timeout)
+
+    monkeypatch.setattr(managed, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        managed._WindowsJob,
+        "create",
+        classmethod(lambda cls: FailingJob()),
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: UnkillableProcess(),
+    )
+
+    with pytest.raises(OSError, match="assignment failed"):
+        ManagedProcessTree.spawn(_sleep_argv())
+
+    assert events == ["child_kill_uncertain", "child_waited", "job_closed"]
+
+
+def test_windows_existing_named_job_requires_query_proven_quiescence(
+    monkeypatch,
+) -> None:
+    import tools.managed_process as managed
+
+    events: list[object] = []
+
+    class FakeJob:
+        def terminate_and_wait(self, timeout):
+            events.append(("terminated", timeout))
+            return True
+
+        def close(self):
+            events.append("closed")
+
+    monkeypatch.setattr(managed, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        managed._WindowsJob,
+        "open",
+        classmethod(lambda cls, name: FakeJob()),
+    )
+    monkeypatch.setattr(
+        ProcessIdentity,
+        "capture",
+        classmethod(
+            lambda cls, pid: ProcessIdentity(
+                pid, 7, pid, "Local\\HermesManagedProcess-test"
+            )
+        ),
+    )
+    identity = ProcessIdentity(
+        pid=77,
+        start_time=7,
+        group_id=77,
+        job_name="Local\\HermesManagedProcess-test",
+    )
+
+    assert ManagedProcessTree.terminate_existing(
+        identity,
+        term_grace_seconds=2,
+        kill_grace_seconds=1,
+    ) is True
+    assert events == [("terminated", 3), "closed"]
+
+
+def test_windows_named_job_remains_authoritative_after_root_pid_reuse(
+    monkeypatch,
+) -> None:
+    import tools.managed_process as managed
+
+    events: list[str] = []
+
+    class FakeJob:
+        def terminate_and_wait(self, _timeout):
+            events.append("terminated")
+            return True
+
+        def close(self):
+            events.append("closed")
+
+    monkeypatch.setattr(managed, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        managed._WindowsJob,
+        "open",
+        classmethod(lambda cls, name: FakeJob()),
+    )
+    monkeypatch.setattr(
+        ProcessIdentity,
+        "capture",
+        classmethod(lambda cls, pid: ProcessIdentity(pid, 99, pid)),
+    )
+    identity = ProcessIdentity(
+        pid=77,
+        start_time=7,
+        group_id=77,
+        job_name="Local\\HermesManagedProcess-test",
+    )
+
+    assert ManagedProcessTree.terminate_existing(identity) is True
+    assert events == ["terminated", "closed"]
+
+
+def test_windows_existing_tree_accepts_zero_active_job_members_as_quiescent(
+    monkeypatch,
+) -> None:
+    import tools.managed_process as managed
+
+    class FakeJob:
+        def active_processes(self):
+            return 0
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(managed, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        managed._WindowsJob,
+        "open",
+        classmethod(lambda cls, name: FakeJob()),
+    )
+    monkeypatch.setattr(ProcessIdentity, "is_current", lambda self: True)
+    identity = ProcessIdentity(
+        pid=77,
+        start_time=7,
+        group_id=77,
+        job_name="Local\\HermesManagedProcess-test",
+    )
+
+    assert ManagedProcessTree.existing_tree_active(identity) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows Job Object contract")
+@pytest.mark.live_system_guard_bypass
+def test_windows_job_kills_detached_grandchild_after_parent_exit() -> None:
+    grandchild_code = "import time; time.sleep(60)"
+    parent_code = (
+        "import subprocess,sys;"
+        f"p=subprocess.Popen([sys.executable,'-c',{grandchild_code!r}],"
+        "creationflags=subprocess.DETACHED_PROCESS,"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+        "stderr=subprocess.DEVNULL);"
+        "print(p.pid,flush=True)"
+    )
+    tree = ManagedProcessTree.spawn([sys.executable, "-c", parent_code])
+    assert tree.process.stdout is not None
+    grandchild_pid = int(tree.process.stdout.readline().decode().strip())
+    tree.process.wait(timeout=5)
+
+    try:
+        assert tree.tree_active() is True
+        tree.close()
+        assert tree.tree_active() is False
+        assert not psutil.pid_exists(grandchild_pid)
+    finally:
+        if psutil.pid_exists(grandchild_pid):
+            psutil.Process(grandchild_pid).kill()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group contract")

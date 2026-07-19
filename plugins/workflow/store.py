@@ -4682,6 +4682,7 @@ class RunStore:
                     "pid": identity.pid,
                     "start_time": identity.start_time,
                     "group_id": identity.group_id,
+                    "job_name": identity.job_name,
                 }
                 active["process_identity"] = serialized
                 node["attempts"][-1]["process_identity"] = serialized
@@ -4742,6 +4743,7 @@ class RunStore:
                     not isinstance(serialized, dict)
                     or serialized.get("pid") != identity.pid
                     or serialized.get("start_time") != identity.start_time
+                    or serialized.get("job_name") != identity.job_name
                 ):
                     return False
                 event_type = "process_reaped" if cleaned else "cleanup_failed"
@@ -5949,8 +5951,22 @@ class RunStore:
                     if serialized.get("group_id") is not None
                     else None
                 ),
+                job_name=(
+                    str(serialized["job_name"])
+                    if serialized.get("job_name")
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError):
+            return "outcome_uncertain"
+        if identity.job_name:
+            active = ManagedProcessTree.existing_tree_active(identity)
+            if active is True:
+                return "still_running"
+            if active is False:
+                return "known_stopped"
+            return "outcome_uncertain"
+        if os.name == "nt":
             return "outcome_uncertain"
         try:
             if identity.is_current():
@@ -6363,6 +6379,11 @@ class RunStore:
                             if serialized.get("group_id") is not None
                             else None
                         ),
+                        job_name=(
+                            str(serialized["job_name"])
+                            if serialized.get("job_name")
+                            else None
+                        ),
                     )
                 except (KeyError, TypeError, ValueError):
                     continue
@@ -6375,7 +6396,11 @@ class RunStore:
                 term_grace_seconds=5.0,
                 kill_grace_seconds=2.0,
             )
-            cleaned = terminated or not identity.is_current()
+            cleaned = (
+                terminated
+                if os.name == "nt"
+                else terminated or not identity.is_current()
+            )
             cleanup.append((node_id, attempt_id, identity, cleaned))
 
         with workflow_lock(self.admission_lock), workflow_lock(
@@ -6415,6 +6440,7 @@ class RunStore:
                     or not isinstance(serialized, dict)
                     or serialized.get("pid") != identity.pid
                     or serialized.get("start_time") != identity.start_time
+                    or serialized.get("job_name") != identity.job_name
                 ):
                     continue
                 if cleaned:

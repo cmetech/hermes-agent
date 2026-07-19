@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import os
 from pathlib import Path
 import time
 from typing import Any, BinaryIO, Callable, Mapping, Protocol
@@ -113,21 +112,8 @@ class BoundedProcessOutput:
 
 
 def process_tree_active(tree: Any) -> bool:
-    """Report whether the owned child or its POSIX process group is still live."""
-    if tree.process.poll() is None:
-        return True
-    if os.name == "nt":  # pragma: no cover - Windows lifecycle CI path
-        return False
-    group_id = tree.identity.group_id
-    if group_id is None or group_id <= 0 or group_id == os.getpgrp():
-        return False
-    try:
-        os.killpg(group_id, 0)  # windows-footgun: ok - guarded by os.name above
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    """Report live descendants, failing closed when tree proof is unavailable."""
+    return bool(tree.tree_active())
 
 
 class NodeExecutor(Protocol):

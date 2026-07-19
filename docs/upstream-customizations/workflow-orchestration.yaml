@@ -85,21 +85,32 @@ upstream_changes:
   files:
   - tools/managed_process.py
   - tools/process_registry.py
+  - plugins/workflow/executors/base.py
+  - plugins/workflow/store.py
   owned_symbols:
+  - _WindowsJob
   - ProcessIdentity
   - TerminationPolicy
   - ProcessResourceLimits
   - ManagedProcessTree
+  - process_tree_active
+  - RunStore._observe_process_identity
   tests:
   - tests/tools/test_managed_process.py
   - tests/tools/test_process_registry.py
-  expected_commit_subject: 'fix(tools): verify managed process cleanup'
+  - tests/plugins/workflow/test_process_lifecycle_soak.py
+  expected_commit_subject: 'fix(workflow): prove Windows process termination'
   upstream_candidate: true
   merge_guidance: Reconcile process identity, aggregate resource enforcement,
     process-tree termination, escalation, and wait/reap behavior before replaying
-    the extraction.
-  removal_condition: Remove when Hermes upstream exposes an equivalent generic managed-process-tree
-    primitive used by ProcessRegistry.
+    the extraction. On Windows preserve immediate assignment to a named Job Object
+    with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, owner-held handles, persisted job
+    identity, query-proven quiescence, and fail-closed recovery when assignment,
+    open, query, termination, or close cannot be proven.
+  removal_condition: Remove when Hermes upstream exposes an equivalent generic
+    managed-process-tree primitive used by ProcessRegistry and workflow executors,
+    including native Windows Job Object ownership and query-proven descendant
+    quiescence across direct-child exit and recovery.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: plugin-agent-runner
   change_class: agent-core-generic
@@ -459,6 +470,7 @@ upstream_changes:
   owned_symbols:
   - workflow-portability
   tests:
+  - tests/tools/test_managed_process.py
   - tests/plugins/workflow/test_portable_compatibility_e2e.py
   - tests/plugins/workflow/test_showcase_distribution_e2e.py
   - tests/plugins/workflow/test_fault_injection.py

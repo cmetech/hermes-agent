@@ -164,6 +164,7 @@ jobs:
           PYTHONUTF8: "1"
         run: |
           uv run --no-sync python -m pytest -q \
+            tests/tools/test_managed_process.py \
             tests/plugins/workflow/test_portable_compatibility_e2e.py \
             tests/plugins/workflow/test_showcase_catalog.py \
             tests/plugins/workflow/test_showcase_distribution_e2e.py \
