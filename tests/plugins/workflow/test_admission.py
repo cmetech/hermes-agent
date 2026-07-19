@@ -477,6 +477,101 @@ def test_fifo_promotion_refuses_newer_queue_sequence_until_older_runs(
     ]
 
 
+def test_lane_ineligible_fifo_head_does_not_starve_an_independent_lane(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home", max_executing_runs=2)
+    held_path = workflow_writer(
+        tmp_path / "held-package",
+        name="held-lane",
+        nodes=[{"id": "gate", "approval": {"message": "Hold lane?"}}],
+    )
+    held_path.with_name("example.hermes.yaml").write_text(
+        "overlap_policy: queue\n",
+        encoding="utf-8",
+    )
+    held_package = load_workflow(held_path)
+    independent_package = load_workflow(
+        workflow_writer(tmp_path / "independent-package", name="independent-lane")
+    )
+
+    def start(package, key: str):
+        snapshot = store.prepare_run_snapshot(package)
+        return store.start_run(
+            RunAdmissionRequest(
+                workflow_name=package.definition.name,
+                definition_digest=snapshot.definition_digest,
+                policy_digest=snapshot.policy_digest,
+                input_manifest_digest=snapshot.input_manifest_digest,
+                trigger_source="cli",
+                idempotency_key=key,
+                concurrency_key=package.definition.name,
+                concurrency_policy="queue",
+            ),
+            immutable_snapshot=snapshot,
+        )
+
+    holder = start(held_package, "held-lane-owner")
+    independent_holder = start(independent_package, "independent-owner")
+    blocked_head = start(held_package, "held-lane-blocked-head")
+    independent = start(independent_package, "independent-younger")
+
+    assert blocked_head.disposition == "queued"
+    assert independent.disposition == "queued"
+    assert RunScheduler(store).advance(holder.run_id)["status"] == "paused"
+    store.cancel_run(independent_holder.run_id)
+    assert not store.try_promote_run(blocked_head.run_id)
+    assert store.try_promote_run(independent.run_id)
+    assert store.load_run(independent.run_id)["status"] == "running"
+
+
+def test_runnable_request_skips_lane_ineligible_fifo_head(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "request-home", max_executing_runs=1)
+    held_path = workflow_writer(
+        tmp_path / "request-held-package",
+        name="request-held-lane",
+        nodes=[{"id": "gate", "approval": {"message": "Hold lane?"}}],
+    )
+    held_path.with_name("example.hermes.yaml").write_text(
+        "overlap_policy: queue\n",
+        encoding="utf-8",
+    )
+    held_package = load_workflow(held_path)
+    independent_package = load_workflow(
+        workflow_writer(
+            tmp_path / "request-independent-package",
+            name="request-independent-lane",
+        )
+    )
+
+    def start(package, key: str):
+        snapshot = store.prepare_run_snapshot(package)
+        return store.start_run(
+            RunAdmissionRequest(
+                workflow_name=package.definition.name,
+                definition_digest=snapshot.definition_digest,
+                policy_digest=snapshot.policy_digest,
+                input_manifest_digest=snapshot.input_manifest_digest,
+                trigger_source="cli",
+                idempotency_key=key,
+                concurrency_key=package.definition.name,
+                concurrency_policy="queue",
+            ),
+            immutable_snapshot=snapshot,
+        )
+
+    holder = start(held_package, "request-held-owner")
+    assert RunScheduler(store).advance(holder.run_id)["status"] == "paused"
+    assert start(held_package, "request-blocked-head").disposition == "queued"
+
+    independent = start(independent_package, "request-independent-younger")
+
+    assert independent.disposition == "created"
+    assert store.load_run(independent.run_id)["status"] == "running"
+
+
 def test_pause_lane_policy_is_rejected_outside_queue_overlap(
     tmp_path, workflow_writer
 ) -> None:

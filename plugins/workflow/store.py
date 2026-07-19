@@ -2555,10 +2555,10 @@ class RunStore:
                 "AND lane_state='held' ORDER BY created_at, run_id LIMIT 1",
                 (request.workflow_name, request.concurrency_key),
             ).fetchone()
-            older_queued = connection.execute(
-                "SELECT run_id FROM runs WHERE status='queued' "
-                "ORDER BY queue_sequence, created_at, run_id LIMIT 1"
-            ).fetchone()
+            older_queued = self._eligible_queued_predecessor(
+                connection,
+                run_id=None,
+            )
             status = "running"
             disposition = "created"
             blocked_by = None
@@ -3100,6 +3100,36 @@ class RunStore:
                 expected_version=expected_version,
             )
 
+    @staticmethod
+    def _eligible_queued_predecessor(
+        connection: sqlite3.Connection,
+        *,
+        run_id: str | None,
+        before_sequence: int | None = None,
+    ):
+        clauses = [
+            "candidate.status='queued'",
+            "(candidate.concurrency_policy='allow' OR NOT EXISTS ("
+            "SELECT 1 FROM runs AS holder WHERE holder.run_id<>candidate.run_id "
+            "AND holder.workflow_name=candidate.workflow_name "
+            "AND holder.concurrency_key=candidate.concurrency_key "
+            "AND holder.lane_state='held'))",
+        ]
+        values: list[object] = []
+        if run_id is not None:
+            clauses.insert(0, "candidate.run_id<>?")
+            values.append(run_id)
+        if before_sequence is not None:
+            clauses.append("candidate.queue_sequence<?")
+            values.append(before_sequence)
+        return connection.execute(
+            "SELECT candidate.run_id FROM runs AS candidate WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY candidate.queue_sequence, candidate.created_at, "
+            "candidate.run_id LIMIT 1",
+            tuple(values),
+        ).fetchone()
+
     def _request_runnable_locked(
         self,
         directory: Path,
@@ -3141,11 +3171,10 @@ class RunStore:
                     "SELECT COUNT(*) FROM runs WHERE status='running'"
                 ).fetchone()[0]
             )
-            older_queued = connection.execute(
-                "SELECT run_id FROM runs WHERE run_id<>? AND status='queued' "
-                "ORDER BY queue_sequence, created_at, run_id LIMIT 1",
-                (projection["run_id"],),
-            ).fetchone()
+            older_queued = self._eligible_queued_predecessor(
+                connection,
+                run_id=str(projection["run_id"]),
+            )
             if (
                 active is None
                 and older_queued is None
@@ -3217,11 +3246,11 @@ class RunStore:
                         "WHERE run_id=?",
                         (sequence, sequence, run_id),
                     )
-                older = connection.execute(
-                    "SELECT 1 FROM runs WHERE status='queued' "
-                    "AND queue_sequence<? LIMIT 1",
-                    (sequence,),
-                ).fetchone()
+                older = self._eligible_queued_predecessor(
+                    connection,
+                    run_id=run_id,
+                    before_sequence=int(sequence),
+                )
                 active = None
                 if row["concurrency_policy"] != "allow":
                     active = connection.execute(
