@@ -27,6 +27,33 @@ class ExecutionFence:
             raise ValueError("owner_epoch must be a positive integer")
 
 
+@dataclass(frozen=True, slots=True)
+class TerminalJournalReserve:
+    """Durable capacity held for one attempt's terminal/recovery evidence."""
+
+    projection_limit_bytes: int
+    terminal_reserve_bytes: int
+
+    @classmethod
+    def for_projection(cls, projection_bytes: int) -> "TerminalJournalReserve":
+        if (
+            isinstance(projection_bytes, bool)
+            or not isinstance(projection_bytes, int)
+            or projection_bytes <= 0
+        ):
+            raise ValueError("projection_bytes must be a positive integer")
+        # Ordinary progress may grow the materialized projection, but only
+        # within this attempt-owned bound. Three full recovery frames cover
+        # node terminal evidence, run terminal/retry evidence, and one repair
+        # frame; duplicated bounded payload data is included conservatively.
+        projection_limit = projection_bytes + max(8 * 1024, projection_bytes)
+        terminal_reserve = 3 * (2 * projection_limit + 8 * 1024)
+        return cls(projection_limit, terminal_reserve)
+
+    def contains_projection(self, projection_bytes: int) -> bool:
+        return 0 < projection_bytes <= self.projection_limit_bytes
+
+
 def freeze_value(value: Any) -> Any:
     """Recursively freeze parsed YAML without changing scalar values."""
     if isinstance(value, Mapping):

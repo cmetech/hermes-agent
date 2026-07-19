@@ -375,6 +375,60 @@ def test_scheduler_journals_each_loop_iteration_before_starting_the_next(
     assert len(result["artifacts"]) == 2
 
 
+def test_scheduler_preserves_terminal_frames_when_loop_reaches_journal_quota(
+    tmp_path: Path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="journal-quota-loop",
+            nodes=[
+                {
+                    "id": "iterate",
+                    "loop": {
+                        "prompt": "Refine",
+                        "until": "DONE",
+                        "max_iterations": 100,
+                    },
+                }
+            ],
+        )
+    )
+    store = RunStore(tmp_path / "home", max_journal_bytes=192 * 1024)
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="journal-quota-loop",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+
+    result = RunScheduler(
+        store,
+        agent_runner=FakeAgentRunner(*("keep working" for _ in range(100))),
+        heartbeat_seconds=10,
+        ai_idle_timeout_seconds=60,
+        ai_wall_timeout_seconds=60,
+        provider_request_timeout_seconds=60,
+    ).advance(admitted.run_id)
+
+    assert result["status"] == "failed"
+    assert result["nodes"]["iterate"]["state"] == "failed"
+    assert not result["nodes"]["iterate"].get("claim")
+    assert store.tail_events(admitted.run_id)[-1]["event_type"] == "run_failed"
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
+            (admitted.run_id,),
+        ).fetchone()[0] == 0
+
+
 def test_paused_loop_accepts_input_and_resumes_through_scheduler(
     tmp_path: Path, workflow_writer
 ) -> None:

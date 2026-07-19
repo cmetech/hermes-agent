@@ -142,6 +142,7 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
         }
         assert {
             "admission_events",
+            "attempt_journal_reserves",
             "cleanup_history",
             "cleanup_previews",
             "coordinator_events",
@@ -150,11 +151,36 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             "repair_events",
             "runs",
             "store_metadata",
+            "store_repair_state",
             "worker_claims",
             "workflow_notification_facts",
             "workflow_notification_outbox",
             "workflow_notification_reconcile_state",
         } <= tables
+        reserve_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(attempt_journal_reserves)"
+            )
+        }
+        assert {
+            "attempt_id",
+            "run_id",
+            "terminal_reserve_bytes",
+            "projection_limit_bytes",
+            "created_at",
+        } <= reserve_columns
+        repair_state_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(store_repair_state)")
+        }
+        assert {
+            "run_id",
+            "attempt_id",
+            "reason_code",
+            "detected_at",
+            "payload_json",
+        } <= repair_state_columns
         cleanup_preview_columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(cleanup_previews)")
@@ -176,6 +202,7 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             )
         }
         assert {
+            "attempt_journal_reserves_run",
             "coordinator_wakes_pending",
             "runs_concurrency",
             "worker_claims_lease",

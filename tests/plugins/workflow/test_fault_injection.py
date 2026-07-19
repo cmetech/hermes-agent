@@ -11,8 +11,13 @@ import pytest
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
-from plugins.workflow.store import JournalRecoveryError, RunStore
+from plugins.workflow.store import (
+    JournalRecoveryError,
+    RunStore,
+    StorageQuotaError,
+)
 import plugins.workflow.store as store_module
+from tools.managed_process import ProcessIdentity
 
 
 def _request(prepared, key: str) -> RunAdmissionRequest:
@@ -333,6 +338,135 @@ def test_healthy_load_validates_only_tail_and_does_not_rewrite_integrity_row(
         ).fetchone()[0]
     assert validated == [21]
     assert unchanged == verified_at
+
+
+@pytest.mark.parametrize("terminal_status", ["succeeded", "failed"])
+def test_terminal_reserve_survives_exhausted_ordinary_journal_quota(
+    tmp_path, workflow_writer, terminal_status
+) -> None:
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name=f"terminal-{terminal_status}")
+    )
+    store = RunStore(tmp_path / "home", max_journal_bytes=192 * 1024)
+    admitted = _start(store, package, f"terminal-{terminal_status}")
+    claim = store.claim_node(admitted.run_id, "start", "quota-worker")
+    assert claim is not None
+    store.mark_node_started(claim)
+
+    completed_iterations = 0
+    for iteration in range(1, 500):
+        try:
+            store.record_loop_iteration(
+                claim,
+                artifacts=(),
+                loop_state={"iteration": iteration, "padding": "x" * 2_000},
+            )
+        except StorageQuotaError:
+            break
+        completed_iterations = iteration
+    else:  # pragma: no cover - the bounded quota must stop ordinary frames
+        raise AssertionError("ordinary journal frames did not exhaust their budget")
+    assert completed_iterations > 0
+
+    store.complete_node(
+        claim,
+        status=terminal_status,
+        error_code="quota_probe" if terminal_status == "failed" else None,
+    )
+
+    projection = store.load_run(admitted.run_id)
+    assert projection["status"] == terminal_status
+    assert projection["nodes"]["start"]["state"] == terminal_status
+    events = store.tail_events(admitted.run_id)
+    assert events[-2]["event_type"] == f"node_{terminal_status}"
+    assert events[-1]["event_type"] == f"run_{terminal_status}"
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM attempt_journal_reserves WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == 0
+
+
+def test_terminal_reserve_failure_retains_claim_and_records_sqlite_repair_state(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="terminal-repair")
+    )
+    store = RunStore(tmp_path / "home")
+    admitted = _start(store, package, "terminal-repair")
+    claim = store.claim_node(admitted.run_id, "start", "repair-worker")
+    assert claim is not None
+    store.mark_node_started(claim)
+    original_append = store._append_locked
+
+    def fail_terminal_append(directory, projection, event_type, *args, **kwargs):
+        if event_type == "node_succeeded":
+            raise StorageQuotaError("simulated terminal reserve exhaustion")
+        return original_append(directory, projection, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(store, "_append_locked", fail_terminal_append)
+    with pytest.raises(StorageQuotaError, match="terminal reserve exhaustion"):
+        store.complete_node(claim, status="succeeded")
+
+    projection = store.load_run(admitted.run_id)
+    assert projection["status"] == "running"
+    assert projection["nodes"]["start"]["state"] == "running"
+    assert store.claim_node(admitted.run_id, "start", "second-worker") is None
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == 1
+        repair = connection.execute(
+            "SELECT reason_code FROM store_repair_state "
+            "WHERE run_id=? AND attempt_id=?",
+            (admitted.run_id, claim.attempt_id),
+        ).fetchone()
+    assert repair is not None
+    assert repair["reason_code"] == "terminal_journal_reserve_exhausted"
+    store.repair_marker.unlink()
+    assert {
+        reason["reason_code"] for reason in store.storage_health()["reasons"]
+    } == {"terminal_journal_reserve_exhausted"}
+
+
+def test_process_stop_keeps_active_claim_until_terminal_evidence_is_indexed(
+    tmp_path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="process-stop-terminal-order")
+    )
+    store = RunStore(tmp_path / "home")
+    admitted = _start(store, package, "process-stop-terminal-order")
+    claim = store.claim_node(admitted.run_id, "start", "process-worker")
+    assert claim is not None
+    store.mark_node_started(claim)
+    identity = ProcessIdentity(pid=999_989, start_time=91_234, group_id=999_989)
+    assert store.record_process_started(claim, identity)
+
+    assert store.record_process_stopped(claim, identity, cleaned=True)
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM attempt_journal_reserves WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == 1
+
+    store.complete_node(claim, status="succeeded")
+    assert store.load_run(admitted.run_id)["status"] == "succeeded"
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == 0
 
 
 def test_hundred_duplicate_deliveries_publish_exactly_one_run(

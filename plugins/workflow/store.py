@@ -35,7 +35,12 @@ from plugins.workflow.lease_clock import (
     lease_is_fresh,
     sample_lease_clock,
 )
-from plugins.workflow.models import ApprovalDecision, ExecutionFence, WorkflowPackage
+from plugins.workflow.models import (
+    ApprovalDecision,
+    ExecutionFence,
+    TerminalJournalReserve,
+    WorkflowPackage,
+)
 from plugins.workflow.provenance import (
     TriggerProvenance,
     legacy_projection_provenance,
@@ -97,7 +102,7 @@ class ForegroundExecutionLease:
 
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
-_STORE_SCHEMA_VERSION = 8
+_STORE_SCHEMA_VERSION = 9
 # Direct RunStore/CLI access is already the profile-local filesystem admin
 # boundary. Network adapters must always pass their verified authority binding.
 _LOCAL_ADMIN_AUTHORITY_BINDING = "profile-local-runstore-admin"
@@ -446,6 +451,25 @@ class RunStore:
                     );
                     CREATE INDEX IF NOT EXISTS worker_claims_lease
                     ON worker_claims(lease_expires_at);
+                    CREATE TABLE IF NOT EXISTS attempt_journal_reserves (
+                        attempt_id TEXT PRIMARY KEY REFERENCES worker_claims(attempt_id)
+                            ON DELETE CASCADE,
+                        run_id TEXT NOT NULL,
+                        terminal_reserve_bytes INTEGER NOT NULL,
+                        projection_limit_bytes INTEGER NOT NULL,
+                        consumed_bytes INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS attempt_journal_reserves_run
+                    ON attempt_journal_reserves(run_id);
+                    CREATE TABLE IF NOT EXISTS store_repair_state (
+                        run_id TEXT NOT NULL,
+                        attempt_id TEXT NOT NULL,
+                        reason_code TEXT NOT NULL,
+                        detected_at TEXT NOT NULL,
+                        payload_json TEXT NOT NULL DEFAULT '{}',
+                        PRIMARY KEY(run_id, attempt_id)
+                    );
                     CREATE TABLE IF NOT EXISTS store_metadata (
                         key TEXT PRIMARY KEY,
                         value TEXT NOT NULL
@@ -1418,22 +1442,51 @@ class RunStore:
         )
 
     def storage_health(self) -> dict[str, object]:
+        sqlite_reasons: list[dict[str, str | None]] = []
+        try:
+            with self._connect() as connection:
+                sqlite_reasons = [
+                    {
+                        "reason_code": str(row["reason_code"]),
+                        "run_id": str(row["run_id"]),
+                    }
+                    for row in connection.execute(
+                        "SELECT DISTINCT reason_code, run_id "
+                        "FROM store_repair_state ORDER BY reason_code, run_id"
+                    ).fetchall()
+                ]
+        except sqlite3.DatabaseError:
+            sqlite_reasons = [
+                {"reason_code": "repair_state_unreadable", "run_id": None}
+            ]
         try:
             marker = json.loads(self.repair_marker.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return {"status": "healthy", "reasons": []}
+            return (
+                {"status": "repair_required", "reasons": sqlite_reasons}
+                if sqlite_reasons
+                else {"status": "healthy", "reasons": []}
+            )
         except (OSError, json.JSONDecodeError):
             return {
                 "status": "repair_required",
                 "reasons": [{"reason_code": "repair_marker_unreadable", "run_id": None}],
             }
         reasons = marker.get("reasons") if isinstance(marker, dict) else None
+        combined = [
+            dict(reason)
+            for reason in reasons
+            if isinstance(reason, Mapping)
+        ] if isinstance(reasons, list) else []
+        for reason in sqlite_reasons:
+            if reason not in combined:
+                combined.append(reason)
         return {
             "status": "repair_required",
             "detected_at": marker.get("detected_at")
             if isinstance(marker, dict)
             else None,
-            "reasons": reasons if isinstance(reasons, list) else [],
+            "reasons": combined,
         }
 
     def list_repair_events(
@@ -1477,6 +1530,7 @@ class RunStore:
                 "run_evidence_uncorroborated",
                 "legacy_effect_policy_uncorroborated",
                 "repair_marker_unreadable",
+                "terminal_journal_reserve_exhausted",
             }
             if isinstance(reasons, list) and any(
                 isinstance(reason, dict)
@@ -1537,6 +1591,7 @@ class RunStore:
     def _reconcile_worker_claims(self) -> None:
         """Converge the capacity ledger with durable run projections."""
         active: dict[str, tuple[str, str, str, str]] = {}
+        reserves: dict[str, TerminalJournalReserve] = {}
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT run_id, run_directory FROM runs "
@@ -1575,12 +1630,27 @@ class RunStore:
                             or _utc_now()
                         ),
                     )
+                    projection_bytes = len(
+                        json.dumps(
+                            projection, sort_keys=True, ensure_ascii=False
+                        ).encode("utf-8")
+                    )
+                    reserves[attempt_id] = TerminalJournalReserve.for_projection(
+                        projection_bytes
+                    )
         with self._connect() as connection:
-            if active:
-                placeholders = ",".join("?" for _ in active)
+            repair_attempts = {
+                str(row["attempt_id"])
+                for row in connection.execute(
+                    "SELECT attempt_id FROM store_repair_state"
+                ).fetchall()
+            }
+            retained = set(active) | repair_attempts
+            if retained:
+                placeholders = ",".join("?" for _ in retained)
                 connection.execute(
                     f"DELETE FROM worker_claims WHERE attempt_id NOT IN ({placeholders})",
-                    tuple(active),
+                    tuple(sorted(retained)),
                 )
             else:
                 connection.execute("DELETE FROM worker_claims")
@@ -1595,6 +1665,20 @@ class RunStore:
                     "lease_expires_at=excluded.lease_expires_at",
                     (attempt_id, *values),
                 )
+                reserve = reserves[attempt_id]
+                connection.execute(
+                    "INSERT OR IGNORE INTO attempt_journal_reserves ("
+                    "attempt_id, run_id, terminal_reserve_bytes, "
+                    "projection_limit_bytes, consumed_bytes, created_at) "
+                    "VALUES (?, ?, ?, ?, 0, ?)",
+                    (
+                        attempt_id,
+                        values[0],
+                        reserve.terminal_reserve_bytes,
+                        reserve.projection_limit_bytes,
+                        _utc_now(),
+                    ),
+                )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -1605,6 +1689,7 @@ class RunStore:
         )
         connection.row_factory = sqlite3.Row
         try:
+            connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA busy_timeout=5000")
             connection.execute("PRAGMA synchronous=FULL")
@@ -1898,6 +1983,84 @@ class RunStore:
         if profile_bytes + required > self.max_profile_bytes:
             raise StorageQuotaError(
                 "profile_storage_quota would be exceeded before worker allocation"
+            )
+
+    def _check_journal_reserve(
+        self,
+        *,
+        run_id: str,
+        projection: Mapping[str, object],
+        journal_bytes: int,
+        frame_bytes: int,
+        terminal_attempt_id: str | None,
+        connection: sqlite3.Connection | None,
+    ) -> None:
+        with (
+            nullcontext(connection)
+            if connection is not None
+            else self._connect()
+        ) as reserve_connection:
+            rows = reserve_connection.execute(
+                "SELECT attempt_id, terminal_reserve_bytes, "
+                "projection_limit_bytes, consumed_bytes "
+                "FROM attempt_journal_reserves WHERE run_id=?",
+                (run_id,),
+            ).fetchall()
+        if not rows:
+            if journal_bytes + frame_bytes > self.max_journal_bytes:
+                raise StorageQuotaError("event_journal_quota exceeded")
+            return
+
+        projection_bytes = len(
+            json.dumps(projection, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        )
+        remaining_required = 0
+        terminal_found = terminal_attempt_id is None
+        for row in rows:
+            reserve_bytes = int(row["terminal_reserve_bytes"])
+            consumed_bytes = int(row["consumed_bytes"])
+            remaining = max(0, reserve_bytes - consumed_bytes)
+            if row["attempt_id"] == terminal_attempt_id:
+                terminal_found = True
+                if frame_bytes > remaining:
+                    raise StorageQuotaError(
+                        "terminal_journal_reserve exhausted before durable completion"
+                    )
+                remaining -= frame_bytes
+            else:
+                if projection_bytes > int(row["projection_limit_bytes"]):
+                    raise StorageQuotaError(
+                        "event_journal_quota protected terminal projection reserve"
+                    )
+            remaining_required += remaining
+        if not terminal_found:
+            raise StorageQuotaError("terminal_journal_reserve is missing")
+        if journal_bytes + frame_bytes + remaining_required > self.max_journal_bytes:
+            raise StorageQuotaError(
+                "event_journal_quota protected terminal recovery capacity"
+            )
+
+    def _consume_journal_reserve(
+        self,
+        attempt_id: str,
+        frame_bytes: int,
+        *,
+        connection: sqlite3.Connection | None,
+    ) -> None:
+        with (
+            nullcontext(connection)
+            if connection is not None
+            else self._connect()
+        ) as reserve_connection:
+            updated = reserve_connection.execute(
+                "UPDATE attempt_journal_reserves SET consumed_bytes=consumed_bytes+? "
+                "WHERE attempt_id=? "
+                "AND consumed_bytes+?<=terminal_reserve_bytes",
+                (frame_bytes, attempt_id, frame_bytes),
+            ).rowcount
+        if updated != 1:
+            raise StorageQuotaError(
+                "terminal_journal_reserve consumption could not be indexed"
             )
 
     def clone_prepared_snapshot(
@@ -3118,6 +3281,7 @@ class RunStore:
                     )
 
                 reconciliation_required = False
+                releasable_attempts: list[str] = []
                 for node_id, node, attempt, attempt_id in claimed_attempts:
                     claim = node["claim"]
                     observation = self._observe_attempt(attempt)
@@ -3189,11 +3353,11 @@ class RunStore:
                         node_id=node_id,
                         attempt_id=attempt_id,
                         defer_notification=True,
+                        terminal_reserve_attempt_id=attempt_id,
+                        reserve_connection=connection,
                     )
                     if not requires_reconcile:
-                        self._release_worker_claim(
-                            attempt_id, connection=connection
-                        )
+                        releasable_attempts.append(attempt_id)
 
                 projection["execution_mode"] = "background"
                 projection["foreground_owner_id"] = None
@@ -3215,6 +3379,10 @@ class RunStore:
                         "previous_foreground_epoch": expected[3],
                     },
                     defer_notification=True,
+                    terminal_reserve_attempt_id=(
+                        claimed_attempts[0][3] if claimed_attempts else None
+                    ),
+                    reserve_connection=connection,
                 )
                 updated = connection.execute(
                     "UPDATE runs SET execution_mode='background', "
@@ -3245,6 +3413,10 @@ class RunStore:
                         (directory / "events.jsonl").read_bytes()
                     ),
                 )
+                for attempt_id in releasable_attempts:
+                    self._release_worker_claim(
+                        attempt_id, connection=connection
+                    )
                 self._record_coordinator_wake(
                     connection,
                     run_id=run_id,
@@ -3599,10 +3771,20 @@ class RunStore:
                     )
                 ):
                     return None
+                preliminary_reserve = TerminalJournalReserve.for_projection(
+                    len(
+                        json.dumps(
+                            projection, sort_keys=True, ensure_ascii=False
+                        ).encode("utf-8")
+                    )
+                )
                 self._ensure_run_capacity(
                     directory,
                     projection,
-                    journal_reserve_bytes=journal_reserve_bytes,
+                    journal_reserve_bytes=(
+                        journal_reserve_bytes
+                        + preliminary_reserve.terminal_reserve_bytes
+                    ),
                 )
                 connection = self._connect()
                 try:
@@ -3674,6 +3856,33 @@ class RunStore:
                         ),
                         "evidence_paths": resolved_evidence_paths,
                     })
+                    reserve = TerminalJournalReserve.for_projection(
+                        len(
+                            json.dumps(
+                                projection, sort_keys=True, ensure_ascii=False
+                            ).encode("utf-8")
+                        )
+                    )
+                    self._ensure_run_capacity(
+                        directory,
+                        projection,
+                        journal_reserve_bytes=(
+                            journal_reserve_bytes + reserve.terminal_reserve_bytes
+                        ),
+                    )
+                    connection.execute(
+                        "INSERT INTO attempt_journal_reserves ("
+                        "attempt_id, run_id, terminal_reserve_bytes, "
+                        "projection_limit_bytes, consumed_bytes, created_at) "
+                        "VALUES (?, ?, ?, ?, 0, ?)",
+                        (
+                            attempt_id,
+                            run_id,
+                            reserve.terminal_reserve_bytes,
+                            reserve.projection_limit_bytes,
+                            _utc_now(),
+                        ),
+                    )
                     self._append_locked(
                         directory,
                         projection,
@@ -3681,6 +3890,7 @@ class RunStore:
                         {"owner_id": owner_id},
                         node_id=node_id,
                         attempt_id=attempt_id,
+                        reserve_connection=connection,
                     )
                     connection.commit()
                     return NodeClaim(
@@ -3742,8 +3952,19 @@ class RunStore:
                 {"retry_safe": True},
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
+                terminal_reserve_attempt_id=claim.attempt_id,
             )
-            self._release_worker_claim(claim.attempt_id)
+            with self._connect() as connection:
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                self._release_worker_claim(
+                    claim.attempt_id, connection=connection
+                )
             return True
 
     def mark_node_started(
@@ -4003,7 +4224,8 @@ class RunStore:
                 ):
                     return False
                 event_type = "process_reaped" if cleaned else "cleanup_failed"
-                if active.get("attempt_id") == claim.attempt_id and cleaned:
+                active_attempt = active.get("attempt_id") == claim.attempt_id
+                if active_attempt and cleaned:
                     active.pop("process_identity", None)
                 attempt["process_stop"] = {
                     "recorded_at": _utc_now(),
@@ -4027,15 +4249,68 @@ class RunStore:
                     node_id=claim.node_id,
                     attempt_id=claim.attempt_id,
                     defer_notification=fence_connection is not None,
+                    terminal_reserve_attempt_id=(
+                        claim.attempt_id if cleaned and not active_attempt else None
+                    ),
+                    reserve_connection=fence_connection,
                 )
-                if cleaned:
-                    self._release_worker_claim(
-                        claim.attempt_id, connection=fence_connection
-                    )
+                if cleaned and not active_attempt:
+                    with (
+                        nullcontext(fence_connection)
+                        if fence_connection is not None
+                        else self._connect()
+                    ) as connection:
+                        self._sync_integrity_index(
+                            connection,
+                            projection=projection,
+                            journal_sha256=_sha256(
+                                (directory / "events.jsonl").read_bytes()
+                            ),
+                        )
+                        self._release_worker_claim(
+                            claim.attempt_id, connection=connection
+                        )
                 return True
         except RuntimeError as exc:
             if "execution fence" in str(exc):
                 return False
+            raise
+
+    @contextmanager
+    def _terminal_completion_guard(self, claim: NodeClaim):
+        try:
+            yield
+        except StorageQuotaError as exc:
+            reason_code = "terminal_journal_reserve_exhausted"
+            self._mark_repair_required(reason_code, run_id=claim.run_id)
+            with self._connect() as connection:
+                connection.execute(
+                    "INSERT INTO store_repair_state ("
+                    "run_id, attempt_id, reason_code, detected_at, payload_json) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(run_id, attempt_id) DO UPDATE SET "
+                    "reason_code=excluded.reason_code, "
+                    "detected_at=excluded.detected_at, "
+                    "payload_json=excluded.payload_json",
+                    (
+                        claim.run_id,
+                        claim.attempt_id,
+                        reason_code,
+                        _utc_now(),
+                        json.dumps(
+                            {"error": _sanitize_diagnostic(str(exc))},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+                self._record_repair_event(
+                    connection,
+                    reason_code=reason_code,
+                    outcome="repair_required",
+                    run_id=claim.run_id,
+                    payload={"attempt_id": claim.attempt_id},
+                )
             raise
 
     def complete_node(
@@ -4061,7 +4336,7 @@ class RunStore:
         capacity_guard = (
             workflow_lock(self.admission_lock) if status == "paused" else nullcontext()
         )
-        with capacity_guard, workflow_lock(
+        with self._terminal_completion_guard(claim), capacity_guard, workflow_lock(
             self._run_lock_path(claim.run_id)
         ), self._execution_fence_transaction(
             claim.execution_fence, now
@@ -4197,6 +4472,8 @@ class RunStore:
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
                 defer_notification=fence_connection is not None,
+                terminal_reserve_attempt_id=claim.attempt_id,
+                reserve_connection=fence_connection,
             )
             states = {candidate["state"] for candidate in projection["nodes"].values()}
             terminal = None
@@ -4223,6 +4500,8 @@ class RunStore:
                     projection,
                     f"run_{terminal}",
                     defer_notification=fence_connection is not None,
+                    terminal_reserve_attempt_id=claim.attempt_id,
+                    reserve_connection=fence_connection,
                 )
                 with (
                     nullcontext(fence_connection)
@@ -4254,6 +4533,8 @@ class RunStore:
                         projection,
                         "run_retry_waiting",
                         defer_notification=fence_connection is not None,
+                        terminal_reserve_attempt_id=claim.attempt_id,
+                        reserve_connection=fence_connection,
                     )
                     with (
                         nullcontext(fence_connection)
@@ -4271,9 +4552,25 @@ class RunStore:
                             reason_code="retry_waiting",
                         )
                 _atomic_json(directory / "run.json", projection)
-            self._release_worker_claim(
-                claim.attempt_id, connection=fence_connection
-            )
+            with (
+                nullcontext(fence_connection)
+                if fence_connection is not None
+                else self._connect()
+            ) as final_connection:
+                if fence_connection is None:
+                    final_connection.execute("BEGIN IMMEDIATE")
+                self._sync_integrity_index(
+                    final_connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                self._release_worker_claim(
+                    claim.attempt_id, connection=final_connection
+                )
+                if fence_connection is None:
+                    final_connection.commit()
             if terminal or projection["status"] == "waiting_retry":
                 self._notify_coordinator()
 
@@ -4412,6 +4709,8 @@ class RunStore:
         attempt_id: str | None = None,
         compact_recovery: bool = False,
         defer_notification: bool = False,
+        terminal_reserve_attempt_id: str | None = None,
+        reserve_connection: sqlite3.Connection | None = None,
     ) -> dict[str, object]:
         sequence = int(projection["event_sequence"]) + 1
         now = _utc_now()
@@ -4437,15 +4736,24 @@ class RunStore:
         journal_path = directory / "events.jsonl"
         if journal_path.stat().st_size and not _file_ends_with_newline(journal_path):
             self._read_journal_events(directory)
-        if (
-            journal_path.stat().st_size + len(encoded)
-            > self.max_journal_bytes
-        ):
-            raise StorageQuotaError("event_journal_quota exceeded")
+        self._check_journal_reserve(
+            run_id=str(projection["run_id"]),
+            projection=projection,
+            journal_bytes=journal_path.stat().st_size,
+            frame_bytes=len(encoded),
+            terminal_attempt_id=terminal_reserve_attempt_id,
+            connection=reserve_connection,
+        )
         with journal_path.open("ab") as handle:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        if terminal_reserve_attempt_id is not None:
+            self._consume_journal_reserve(
+                terminal_reserve_attempt_id,
+                len(encoded),
+                connection=reserve_connection,
+            )
         _atomic_json(directory / "run.json", projection)
         if defer_notification:
             return event
@@ -4624,6 +4932,8 @@ class RunStore:
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
                 defer_notification=fence_connection is not None,
+                terminal_reserve_attempt_id=claim.attempt_id,
+                reserve_connection=fence_connection,
             )
             with (
                 nullcontext(fence_connection)
@@ -4639,9 +4949,16 @@ class RunStore:
                     run_id=claim.run_id,
                     reason_code="retry_scheduled",
                 )
-            self._release_worker_claim(
-                claim.attempt_id, connection=fence_connection
-            )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                self._release_worker_claim(
+                    claim.attempt_id, connection=connection
+                )
             self._notify_coordinator()
 
     def wake_due_retries(
@@ -4866,6 +5183,7 @@ class RunStore:
         )
         directory = self.run_directory(run_id)
         expired = []
+        releasable_attempts: list[str] = []
         reconciliation_required = False
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
@@ -4992,9 +5310,10 @@ class RunStore:
                     },
                     node_id=node_id,
                     attempt_id=attempt_id,
+                    terminal_reserve_attempt_id=attempt_id,
                 )
                 if observation in {"known_stopped", "not_started"}:
-                    self._release_worker_claim(attempt_id)
+                    releasable_attempts.append(attempt_id)
                 expired.append(node_id)
             if expired:
                 projection["status"] = (
@@ -5008,12 +5327,30 @@ class RunStore:
                         if reconciliation_required
                         else "run_interrupted"
                     ),
+                    terminal_reserve_attempt_id=(
+                        releasable_attempts[0]
+                        if releasable_attempts
+                        else str(
+                            projection["nodes"][expired[0]]["recovery"]["attempt_id"]
+                        )
+                    ),
                 )
                 with self._connect() as connection:
                     connection.execute(
                         "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
                         (projection["status"], projection["updated_at"], run_id),
                     )
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
+                    )
+                    for attempt_id in releasable_attempts:
+                        self._release_worker_claim(
+                            attempt_id, connection=connection
+                        )
         return tuple(expired)
 
     def _reclaim_still_running_claim(
@@ -5175,6 +5512,7 @@ class RunStore:
                 connection.commit()
         directory = self.run_directory(run_id)
         interrupted = []
+        releasable_attempts: list[str] = []
         with workflow_lock(
             self._run_lock_path(run_id), timeout_seconds=lock_timeout_seconds
         ), self._execution_fence_transaction(fence, now) as fence_connection:
@@ -5261,11 +5599,11 @@ class RunStore:
                     node_id=node_id,
                     attempt_id=claim["attempt_id"],
                     defer_notification=fence_connection is not None,
+                    terminal_reserve_attempt_id=claim["attempt_id"],
+                    reserve_connection=fence_connection,
                 )
                 if observation in {"known_stopped", "not_started"}:
-                    self._release_worker_claim(
-                        claim["attempt_id"], connection=fence_connection
-                    )
+                    releasable_attempts.append(str(claim["attempt_id"]))
                 interrupted.append(node_id)
             if interrupted:
                 projection["status"] = (
@@ -5280,6 +5618,10 @@ class RunStore:
                         else "run_interrupted"
                     ),
                     defer_notification=fence_connection is not None,
+                    terminal_reserve_attempt_id=str(
+                        projection["nodes"][interrupted[0]]["recovery"]["attempt_id"]
+                    ),
+                    reserve_connection=fence_connection,
                 )
                 with (
                     nullcontext(fence_connection)
@@ -5290,6 +5632,17 @@ class RunStore:
                         "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
                         (projection["status"], projection["updated_at"], run_id),
                     )
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
+                    )
+                    for attempt_id in releasable_attempts:
+                        self._release_worker_claim(
+                            attempt_id, connection=connection
+                        )
         return tuple(interrupted)
 
     def record_cleanup_failed(self, run_id: str, *, reason: str) -> None:
@@ -5390,14 +5743,24 @@ class RunStore:
                 },
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
+                terminal_reserve_attempt_id=claim.attempt_id,
             )
-            if observation in {"known_stopped", "not_started"}:
-                self._release_worker_claim(claim.attempt_id)
             with self._connect() as connection:
                 connection.execute(
                     "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
                     (projection["status"], projection["updated_at"], claim.run_id),
                 )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                if observation in {"known_stopped", "not_started"}:
+                    self._release_worker_claim(
+                        claim.attempt_id, connection=connection
+                    )
             return True
 
     def cancel_run(
@@ -5596,6 +5959,7 @@ class RunStore:
                     )
 
             reconciliation_nodes = []
+            releasable_outward_attempts: list[str] = []
             for node_id, attempt_id in sorted(outward_attempts):
                 node = projection["nodes"].get(node_id)
                 if not isinstance(node, dict):
@@ -5660,7 +6024,7 @@ class RunStore:
                     "error_code": "reconciliation_required",
                 })
                 if termination_confirmed:
-                    self._release_worker_claim(attempt_id)
+                    releasable_outward_attempts.append(attempt_id)
                 reconciliation_nodes.append(node_id)
             if reconciliation_nodes:
                 projection["status"] = "paused"
@@ -5678,6 +6042,10 @@ class RunStore:
                         "UPDATE runs SET status='paused', updated_at=? WHERE run_id=?",
                         (projection["updated_at"], run_id),
                     )
+                    for attempt_id in releasable_outward_attempts:
+                        self._release_worker_claim(
+                            attempt_id, connection=connection
+                        )
                 return {
                     **projection,
                     "cancellation_outcome": "reconciliation_required",
@@ -6276,8 +6644,6 @@ class RunStore:
                         "outcome": outcome,
                         "recorded_at": recovery["reconciled_at"],
                     }
-                if recovery.get("termination_confirmed") and attempt_id:
-                    self._release_worker_claim(str(attempt_id))
                 node.pop("recovery", None)
             self._append_locked(
                 directory,

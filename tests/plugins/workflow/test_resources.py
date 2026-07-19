@@ -6,6 +6,7 @@ import subprocess
 
 import pytest
 
+from plugins.workflow.models import TerminalJournalReserve
 from plugins.workflow.resources import ResourceResolver, VariableContext
 
 
@@ -117,3 +118,15 @@ def test_bash_substitution_preserves_values_inside_existing_shell_quotes(
     )
 
     assert completed.stdout == variables.arguments
+
+
+def test_terminal_journal_reserve_bounds_projection_growth_and_terminal_frames():
+    reserve = TerminalJournalReserve.for_projection(4_096)
+
+    assert reserve.projection_limit_bytes >= 4_096
+    assert reserve.terminal_reserve_bytes >= 3 * reserve.projection_limit_bytes
+    assert reserve.contains_projection(4_096)
+    assert not reserve.contains_projection(reserve.projection_limit_bytes + 1)
+
+    with pytest.raises(ValueError, match="projection_bytes"):
+        TerminalJournalReserve.for_projection(0)
