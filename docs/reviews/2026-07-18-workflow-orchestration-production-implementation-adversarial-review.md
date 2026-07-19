@@ -1,8 +1,104 @@
-# Portable Workflow Orchestration Production Implementation Review
+# Portable Workflow Orchestration Final Remediation Adversarial Review
 
-**Date:** 2026-07-18  
-**Verdict:** NOT READY FOR RELEASE — implementation is substantially complete,
-but two High product-surface gaps and the cross-platform/UAT gates remain open.
+**Fresh review date:** 2026-07-19
+
+**Reviewed branch:** `feat/workflow-production-remediation` through
+`546279a44db1de83cc3d72fcef5a0e75af39b4b0`
+
+**Verdict:** **READY FOR MAINTAINER MERGE REVIEW. No Critical or High merge
+blocker remains.**
+
+## Fresh-review scope and method
+
+This review re-ran the branch-owned merge gate, inspected the complete Task
+1–19 diff and sibling paths, checked the native Linux/macOS/Windows evidence,
+and reviewed the clean-environment install/update/rollback rehearsal. It
+specifically re-audited authorization, evidence containment, interaction
+binding, idempotency/provenance, showcase trust, coordinator leases and epochs,
+process recovery, terminal journal capacity, scheduling fairness, notification
+repair/delivery, provider reload, authenticated Gateway/API admission, Desktop
+attention/history, machine envelopes, resource bounds, packaging, and
+migrations.
+
+The architecture still has the required shape: Hermes core remains a narrow
+generic plugin host; workflow policy and execution stay in the plugin; there is
+no permanent model-facing workflow tool; and no prompt, model toolset, or
+conversation-history mutation was introduced. HTTP and Gateway mutations are
+bounded persistence-and-wake operations and do not execute workflow tails.
+
+## Fresh-review disposition
+
+| Prior finding group | Fresh-review result |
+|---|---|
+| C-01 authorization bypass | Closed: immutable authority distinguishes read, write, delivery, and admin; real middleware denies sibling mutations for read-only and unbound delivery principals. |
+| C-02 evidence exfiltration | Closed: descriptor-based no-follow reads verify type/identity/containment before and after open. |
+| H-03/H-04 coordinator fencing | Closed: execution, completion, retry, and shutdown are transactionally bound to exact owner and epoch. |
+| H-05 foreground orphan | Closed: expired foreground ownership is adopted or reconciled without replaying uncertain effects. |
+| H-06/H-07 idempotency/provenance | Closed: volatile PID, actor, source instance, and return route are outside the semantic start identity; stable cross-process retries join. |
+| H-08/H-09 Desktop attention/history | Closed: attention is itemized/actionable and board/history/archive use complete keyset traversal. |
+| H-10/H-02 direct API | Closed: plugin-owned authenticated `POST /runs` is background-only, coordinator-gated, server-derived, and never advances synchronously. |
+| H-11/H-01 Gateway delivery | Closed: authenticated invocation carries a server-minted opaque return-route capability into durable destination-bound delivery. |
+| M-04–M-16 | Closed: bounded cursor sweeps, real stall clocks, centralized lane admission, terminal/recovery reserve, recovery windows, Windows Job Objects, exact interaction binding, showcase key/trust behavior, notification retention/repair, and safe service reload all have current tests. |
+| L-01–L-09 | Closed: machine envelopes/failures, legacy provenance, sanitization, bounded registries/caches, Desktop resilience/accessibility, and gate quality were completed in Tasks 17–19. |
+| Prior M-01 | Closed: native Windows, Ubuntu, and macOS workflow portability jobs passed. |
+| Prior M-02 | Closed: clean install plus old/current/old/current rehearsal preserved seven evidence hashes and stable idempotent lookup. |
+| Prior M-03 | Closed for this branch: scoped Desktop lint and full typecheck pass; the unrelated repository lint baseline is recorded, not hidden. |
+
+The original two High product-surface gaps were implemented in Tasks 15 and
+16 using the approved amendments. Client strings do not become authenticated
+identity, authority, provenance, scope, or delivery routes. The Gateway port
+accepts only an opaque server-minted return-route capability, and remote hosted
+sessions do not inherit local-admin capability merely by existing.
+
+## Fresh verification conclusion
+
+The final no-argument merge gate at `546279a44` passed 635 Python tests with
+one platform-conditioned skip, the installed-distribution integration test, 17
+Desktop tests, and TypeScript compilation. Native workflow portability passed
+on Windows, Ubuntu, and macOS. The clean distribution rehearsal passed CLI,
+foreground showcase, real FastAPI middleware/router, authenticated Gateway,
+and trust preflight paths, then preserved immutable evidence and stable
+idempotency through upgrade, rollback, repair, and re-upgrade.
+
+The overall repository CI workflow also reports unrelated historical/private-
+branch baseline failures. They are enumerated in the companion
+`2026-07-18-workflow-orchestration-production-remediation-verification.md` and
+do not reopen a workflow Critical or High finding. No merge, tag, release, or
+deployment was performed.
+
+## Release-blocker status after remediation
+
+| # | Status | Current evidence |
+|---|---|---|
+| 1 | Complete | Index loss/corruption preserves evidence and requires exact corroborated repair. |
+| 2 | Complete | Cleanup is authority-bound preview plus exact single-use confirmation. |
+| 3 | Complete | Spawn intent, process identity, Job Objects, and uncertain-effect replay fences pass. |
+| 4 | Complete | Journal/projection/index recovery fails closed and cumulative migration preserves bytes. |
+| 5 | Complete | Generic host lifecycle, safe mode, health, overlap refusal, and real provider reload pass. |
+| 6 | Complete | Native multiprocess coordinator and process tests pass on all three OS runners. |
+| 7 | Complete | Every runnable transition is durable, wake-driven, fenced, bounded, and FIFO-admitted. |
+| 8 | Complete | Background admission refuses an unhealthy/missing coordinator. |
+| 9 | Complete | CLI and authenticated API stable-key admission join across process/reload boundaries. |
+| 10 | Complete | Skill/showcase behavior uses the real command/parser/store path. |
+| 11 | Complete | Sources and authenticated actors/routes are server-derived and durable. |
+| 12 | Complete | Capability, evidence, sanitizer, store-cache, and long-poll bounds pass real middleware tests. |
+| 13 | Complete | Desktop attention, inspector, evidence, archive/history, and state-valid actions pass. |
+| 14 | Complete | Retention, notification repair/retry/prune, cleanup, and UTC boundaries pass. |
+| 15 | Complete | Desktop and Gateway each have authenticated destination-bound delivery owners. |
+| 16 | Complete | Native, cross-surface UAT/soak, packaging, and rollback evidence is recorded. |
+| 17 | Complete | Fresh adversarial review finds no Critical or High merge blocker. |
+
+## Historical pre-remediation review (superseded)
+
+The remainder of this document is the 2026-07-18 review retained as historical
+evidence. Its open findings and NOT READY verdict describe the pre-remediation
+commit range and are superseded by the fresh review above.
+
+**Historical date:** 2026-07-18
+
+**Historical verdict:** NOT READY FOR RELEASE — implementation was
+substantially complete, but two High product-surface gaps and the
+cross-platform/UAT gates remained open.
 
 ## Reader and required action
 
