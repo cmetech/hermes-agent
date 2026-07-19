@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import httpx
 from hermes_cli.dashboard_auth.base import TokenPrincipal
+import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.schema import load_workflow
@@ -150,6 +151,50 @@ def test_events_cursor_and_stale_action_conflict(
     assert evidence.status_code == 200
     assert evidence.json()["kind"] == "timeline"
     assert evidence.json()["items"][0]["event_type"] == "run_admitted"
+
+
+@pytest.mark.parametrize(
+    ("action", "interaction_id", "extra"),
+    [
+        ("approve", None, {}),
+        ("reject", "", {"reason": "no"}),
+        ("provide-input", None, {"value": "feedback"}),
+        ("reconcile", "", {"outcome": "confirmed-failed"}),
+    ],
+)
+def test_null_interaction_is_rejected_before_desktop_mutation(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    action,
+    interaction_id,
+    extra,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name=f"desktop-{action}",
+            nodes=[{"id": "review", "approval": {"message": "Approve?"}}],
+        )
+    )
+    store = RunStore(home)
+    run = _start(store, package, action)
+    paused = RunScheduler(store).advance(run.run_id)
+    payload = {
+        "expected_version": paused["state_version"],
+        "interaction_id": interaction_id,
+        **extra,
+    }
+
+    response = TestClient(_app(_router())).post(
+        f"/api/plugins/workflow/runs/{run.run_id}/{action}", json=payload
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "interaction_id_required"
+    assert store.load_run(run.run_id)["state_version"] == paused["state_version"]
 
 
 def test_archive_restore_views_and_explicit_cleanup_api(

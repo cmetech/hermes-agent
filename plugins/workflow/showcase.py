@@ -403,15 +403,34 @@ def run_showcase(
     return _advance_until_wait(store, config, admitted.run_id)
 
 
+def _current_showcase_interaction_id(store: RunStore, run_id: str) -> str:
+    pending = store.get_run_status(run_id).get("pending_interaction")
+    if not isinstance(pending, Mapping):
+        raise ValueError("showcase run has no pending interaction")
+    interaction_id = pending.get("interaction_id") or pending.get("action_digest")
+    if not isinstance(interaction_id, str) or not interaction_id:
+        raise ValueError("showcase pending interaction has no identity")
+    return interaction_id
+
+
 def approve_showcase(run_id: str, *, hermes_home: str | Path) -> dict[str, object]:
     store, config = _store(hermes_home)
-    store.approve_run(run_id, channel="showcase")
+    store.approve_run(
+        run_id,
+        interaction_id=_current_showcase_interaction_id(store, run_id),
+        channel="showcase",
+    )
     return _advance_until_wait(store, config, run_id)
 
 
 def reject_showcase(run_id: str, reason: str, *, hermes_home: str | Path) -> dict[str, object]:
     store, config = _store(hermes_home)
-    store.reject_run(run_id, reason=reason, channel="showcase")
+    store.reject_run(
+        run_id,
+        reason=reason,
+        interaction_id=_current_showcase_interaction_id(store, run_id),
+        channel="showcase",
+    )
     return _advance_until_wait(store, config, run_id)
 
 

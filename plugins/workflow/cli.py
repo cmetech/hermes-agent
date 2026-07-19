@@ -434,7 +434,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         "outcome",
         choices=("confirmed-succeeded", "confirmed-failed", "safe-to-retry"),
     )
-    reconcile_parser.add_argument("--interaction-id")
+    reconcile_parser.add_argument("--interaction-id", required=True)
     reconcile_parser.add_argument("--expected-version", type=int)
     reconcile_parser.add_argument("--continue", dest="continue_run", action="store_true")
     _json_flag(reconcile_parser)
@@ -1656,6 +1656,7 @@ def _cmd_provide_input(
         args.run_id,
         args.value,
         expected_state_version=args.expected_version,
+        interaction_id=args.interaction_id,
     )
     _continue_if_requested(
         args, store, runtime, agent_runner=agent_runner, profile_name=profile_name

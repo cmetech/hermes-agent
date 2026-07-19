@@ -701,6 +701,13 @@ def mutate_run(
         current = _load_authorized(store, run_id, operator)
         if action not in MUTATION_ACTIONS:
             raise HTTPException(status_code=404, detail={"code": "action_not_found"})
+        if action in {"approve", "reject", "provide-input", "reconcile"} and (
+            not isinstance(request.interaction_id, str)
+            or not request.interaction_id.strip()
+        ):
+            raise HTTPException(
+                status_code=409, detail={"code": "interaction_id_required"}
+            )
         if not mutation_is_valid(
             action,
             status=str(current["status"]),
@@ -756,6 +763,7 @@ def mutate_run(
                     run_id,
                     request.value,
                     expected_state_version=request.expected_version,
+                    interaction_id=request.interaction_id,
                     operator_scope=scope,
                 )
             elif action == "resume":

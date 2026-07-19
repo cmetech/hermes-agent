@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from agent.plugin_agent import PluginAgentRunResult
@@ -201,6 +202,9 @@ def test_interactive_loop_pauses_and_resume_injects_user_input_fresh(
     assert paused.status == "paused"
     assert paused.metadata["pending_interaction"] == {
         "type": "loop_input",
+        "interaction_id": hashlib.sha256(
+            "\0".join(["run-1", "iterate", "1", "Review the draft"]).encode()
+        ).hexdigest(),
         "message": "Review the draft",
         "iteration": 1,
     }
@@ -409,11 +413,15 @@ def test_paused_loop_accepts_input_and_resumes_through_scheduler(
     )
     RunScheduler(store, agent_runner=FakeAgentRunner("draft")).advance(admitted.run_id)
     paused = store.load_run(admitted.run_id)
+    interaction_id = paused["nodes"]["iterate"]["pending_interaction"][
+        "interaction_id"
+    ]
 
     resumed = store.provide_loop_input(
         admitted.run_id,
         "tighten evidence",
         expected_state_version=paused["state_version"],
+        interaction_id=interaction_id,
     )
     runner = FakeAgentRunner("<promise>DONE</promise>")
     completed = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)

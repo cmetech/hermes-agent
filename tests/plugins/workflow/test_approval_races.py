@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import multiprocessing
 
+import pytest
+
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
@@ -76,3 +78,60 @@ def test_approve_reject_process_race_has_one_committed_winner(
     assert [outcome for _decision, outcome in outcomes].count("applied") == 1
     assert [outcome for _decision, outcome in outcomes].count("already_decided") == 1
     assert len({decision for decision, _outcome in outcomes}) == 1
+
+
+def test_null_interaction_does_not_apply_or_reuse_prior_gate_decision(
+    tmp_path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="two-gate-identity",
+            nodes=[
+                {"id": "first", "approval": {"message": "First?"}},
+                {
+                    "id": "second",
+                    "approval": {"message": "Second?"},
+                    "depends_on": ["first"],
+                },
+            ],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="two-gate",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    scheduler = RunScheduler(store)
+    first = scheduler.advance(admitted.run_id)
+    first_id = first["nodes"]["first"]["pending_interaction"]["interaction_id"]
+    store.approve_run(
+        admitted.run_id,
+        expected_state_version=first["state_version"],
+        interaction_id=first_id,
+    )
+    second = scheduler.advance(admitted.run_id)
+    second_id = second["nodes"]["second"]["pending_interaction"]["interaction_id"]
+    assert second_id != first_id
+
+    with pytest.raises(ValueError, match="interaction ID is required"):
+        store.approve_run(
+            admitted.run_id,
+            expected_state_version=second["state_version"],
+            interaction_id=None,
+        )
+
+    unchanged = store.load_run(admitted.run_id)
+    assert unchanged["state_version"] == second["state_version"]
+    assert unchanged["nodes"]["second"]["pending_interaction"][
+        "interaction_id"
+    ] == second_id

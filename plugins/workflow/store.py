@@ -4929,6 +4929,8 @@ class RunStore:
         projection: Mapping[str, object],
         interaction_id: str | None,
     ) -> ApprovalDecision | None:
+        if not isinstance(interaction_id, str) or not interaction_id.strip():
+            return None
         for node_id, raw_node in projection["nodes"].items():
             if not isinstance(raw_node, Mapping):
                 continue
@@ -4936,7 +4938,7 @@ class RunStore:
             if not isinstance(recorded, Mapping):
                 continue
             recorded_id = recorded.get("interaction_id")
-            if interaction_id is not None and recorded_id != interaction_id:
+            if recorded_id != interaction_id:
                 continue
             return ApprovalDecision(
                 run_id=str(projection["run_id"]),
@@ -5006,6 +5008,8 @@ class RunStore:
     ) -> ApprovalDecision:
         if decision not in {"approved", "rejected"}:
             raise ValueError("approval decision is invalid")
+        if not isinstance(interaction_id, str) or not interaction_id.strip():
+            raise ValueError("interaction ID is required")
         if not isinstance(response, str):
             raise TypeError("approval response must be text")
         if len(response.encode("utf-8")) > min(self.max_input_bytes, 64 * 1024):
@@ -5032,10 +5036,7 @@ class RunStore:
                 for node_id, node in projection["nodes"].items()
                 if node.get("state") == "paused"
                 and self._interaction_identity(node) is not None
-                and (
-                    interaction_id is None
-                    or self._interaction_identity(node) == interaction_id
-                )
+                and self._interaction_identity(node) == interaction_id
             ]
             if len(candidates) != 1:
                 if duplicate is not None:
@@ -5180,9 +5181,12 @@ class RunStore:
         user_input: str,
         *,
         expected_state_version: int,
+        interaction_id: str | None = None,
         operator_scope: str | None = None,
     ) -> dict[str, object]:
         """Compare-and-set one paused interactive loop back to ready."""
+        if not isinstance(interaction_id, str) or not interaction_id.strip():
+            raise ValueError("interaction ID is required")
         if not isinstance(user_input, str):
             raise TypeError("loop input must be text")
         encoded = user_input.encode("utf-8")
@@ -5201,6 +5205,7 @@ class RunStore:
                 if node.get("state") == "paused"
                 and isinstance(node.get("pending_interaction"), dict)
                 and node["pending_interaction"].get("type") == "loop_input"
+                and self._interaction_identity(node) == interaction_id
             ]
             if len(candidates) != 1:
                 raise ValueError("run does not have exactly one pending loop input")
@@ -5231,7 +5236,11 @@ class RunStore:
                 directory,
                 projection,
                 "loop_input_provided",
-                {"artifact": artifact, "iteration": generation},
+                {
+                    "artifact": artifact,
+                    "iteration": generation,
+                    "interaction_id": interaction_id,
+                },
                 node_id=node_id,
             )
             with self._connect() as connection:
@@ -5321,6 +5330,8 @@ class RunStore:
         """Resolve one unknown-side-effect pause without making an inference."""
         if outcome not in {"confirmed-succeeded", "confirmed-failed", "safe-to-retry"}:
             raise ValueError("invalid reconciliation outcome")
+        if not isinstance(interaction_id, str) or not interaction_id.strip():
+            raise ValueError("interaction ID is required")
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
@@ -5335,7 +5346,7 @@ class RunStore:
                     isinstance(pending, Mapping) and pending.get("type") == "reconcile"
                 )
                 identity = self._interaction_identity(node)
-                if is_reconcile and (interaction_id is None or identity == interaction_id):
+                if is_reconcile and identity == interaction_id:
                     candidates.append((candidate_id, node))
             if len(candidates) != 1:
                 raise ValueError("reconcile requires exactly one matching interaction")
@@ -5385,7 +5396,7 @@ class RunStore:
                 directory,
                 projection,
                 "node_reconciled",
-                {"outcome": outcome},
+                {"outcome": outcome, "interaction_id": interaction_id},
                 node_id=selected_id,
             )
             with self._connect() as connection:
