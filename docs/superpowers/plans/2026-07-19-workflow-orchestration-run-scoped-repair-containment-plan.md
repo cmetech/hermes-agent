@@ -4,7 +4,7 @@
 
 **Goal:** Contain run-local evidence failures to the damaged run, keep notification-repair lock contention from aborting coordinator work, and execute native evidence-containment tests in the three-OS release matrix.
 
-**Architecture:** Reuse the append-only `repair_events` table as a per-run state-transition log, deriving active reasons from the latest transition without adding schema. Five damage-scoped read sites—including both nested `load_run` corroboration catches—record or resolve only their own run-scoped reason, while index/generation, cross-run, claim, and journal-reserve global-marker writers remain unchanged. Notification-repair lock timeouts retain the durable cursor and return normally, with a bounded process-local diagnostic streak on `RunStore`.
+**Architecture:** Reuse the append-only `repair_events` table as a per-run state-transition log, deriving active reasons from the latest transition without adding schema. Six damage-scoped read sites—including both nested `load_run` corroboration catches and the published-run admission reconciliation catch—record or resolve only their own run-scoped reason, while index/generation, cross-run, claim, and journal-reserve global-marker writers remain unchanged. Notification-repair lock timeouts retain the durable cursor and return normally, with a bounded process-local diagnostic streak on `RunStore`.
 
 **Tech Stack:** Python 3.11, SQLite, pytest, FastAPI real middleware, filesystem advisory locks, GitHub Actions YAML, Bash merge gate.
 
@@ -15,7 +15,7 @@
 - Use `apply_patch` for every source, test, workflow, and documentation edit.
 - Workflow behavior remains plugin-owned; generic host/lifecycle code gains no workflow import.
 - Keep strict descriptor-contained notification journal reads; do not recover or rewrite torn tails in the scanner.
-- Never set the global repair marker for damage confined to one run at the five governed read/scan sites.
+- Never set the global repair marker for damage confined to one run at the six governed read/scan sites.
 - Never delete damaged evidence; damaged-run cleanup remains fail-closed.
 - Never advance the notification repair cursor beyond a contended run.
 - Gateway delivery and scheduler submission must continue in the same sweep after repair lock contention.
@@ -56,7 +56,7 @@
 - Consumes: `RunStore._record_repair_event(connection, *, reason_code, outcome, run_id, ...)`, `RunStore.attention_candidates(...)`, `NotificationOutbox.reconcile_journal(...)`, `WorkflowCoordinatorService._sweep_once(...)`.
 - Produces: `RunStore._transition_run_repair(reason_code: str, *, run_id: str, outcome: str) -> bool`, `RunStore._active_run_repair_reasons(run_id: str) -> tuple[str, ...]`, `RunStore._note_notification_repair_timeout(run_id: str) -> int`, and `RunStore._clear_notification_repair_timeout(run_id: str) -> None`.
 
-#### Slice 1.1: run-scoped state and five-site containment
+#### Slice 1.1: run-scoped state and six-site containment
 
 - [ ] **Step 1: Add a strict-scanner torn-tail failure test**
 
@@ -139,7 +139,7 @@ def test_torn_tail_repair_is_run_scoped_visible_and_later_verified(
 
 Reuse this helper from `test_oversized_first_journal_is_repaired` if doing so removes duplicated setup without changing that test's assertions.
 
-- [ ] **Step 2: Add five-site damage/visibility/cleanup tests**
+- [ ] **Step 2: Add the standing all-entry-surface damage/visibility/cleanup test**
 
 First extend the existing `_terminal_run` test helper with a nullable scope and pass it into `RunAdmissionRequest`:
 
@@ -164,7 +164,7 @@ def _terminal_run(store, tmp_path, workflow_writer, *, name: str, scope=None):
     return admitted.run_id
 ```
 
-Then add a direct store test to `tests/plugins/workflow/test_retention.py` using two operator scopes and genuine mid-file corruption. It must exercise `list_runs`, `attention_candidates`, cleanup preview, and unrelated admission:
+Then add a direct store test to `tests/plugins/workflow/test_retention.py` using two operator scopes and genuine mid-file corruption. It is the standing completeness proof and must exercise direct status, list, attention, evidence read, an unrelated admission, unrelated cleanup preview and execution, and notification repair while checking `storage_health()` after every entry surface. The first unrelated admission must detect and preserve the damaged published run once; a second admission must skip its active run-scoped repair state without rereading the full journal. Repairing the journal through the existing path must clear the active run-scoped state without deleting evidence.
 
 ```python
 def test_run_read_damage_is_contained_while_unrelated_cleanup_and_admission_work(
@@ -364,7 +364,7 @@ def _active_run_repair_reasons(self, run_id: str) -> tuple[str, ...]:
 
 Keep `_mark_repair_required` unchanged for all existing store-global callers.
 
-- [ ] **Step 5: Apply the helper at exactly the five governed sites**
+- [ ] **Step 5: Apply the helper at exactly the six governed sites**
 
 In `NotificationOutbox.reconcile_journal`, replace the global-marker branch with:
 
@@ -392,7 +392,9 @@ self.store._transition_run_repair(
 
 In both `RunStore.list_runs` and `RunStore.attention_candidates`, replace `_mark_repair_required("run_evidence_uncorroborated", ...)` with `_transition_run_repair(..., outcome="repair_required")`. Set the degraded result's `blocking_reason` to `run_evidence_uncorroborated`, not `storage_repair_required`.
 
-In the two `RunStore.load_run` catches around `_journal_matches_projection` and `_rebuild_projection`, replace only the `run_evidence_uncorroborated` global-marker write with `_transition_run_repair(..., outcome="repair_required")`. Those two operations inspect one resolved run directory; they do not diagnose index/generation or cross-run integrity. Leave every index/generation, admission, claim-retention/reconciliation, and journal-reserve `_mark_repair_required` caller unchanged. On either successful corroboration path, append `repair_verified` before returning the projection.
+In the two `RunStore.load_run` catches around `_journal_matches_projection` and `_rebuild_projection`, replace only the `run_evidence_uncorroborated` global-marker write with `_transition_run_repair(..., outcome="repair_required")`. Those two operations inspect one resolved run directory; they do not diagnose index/generation or cross-run integrity. Leave every index/generation, cross-run inconsistency, claim-retention/reconciliation, and journal-reserve `_mark_repair_required` caller unchanged. On either successful corroboration path, append `repair_verified` before returning the projection.
+
+In the published-run evidence-corruption catch in `RunStore._reconcile_admission`, record active `run_evidence_uncorroborated` state instead of setting the global marker. Preserve the existing `published_evidence_uncorroborated/evidence_preserved` audit event on the first transition. Load active run-scoped repair IDs once per admission sweep and skip a marked run before journal corroboration on later sweeps, so unrelated starts neither reread the damaged journal nor append duplicate repair events. Keep the adjacent `index_status_inconsistent`, generation, orphan/index, claim, and journal-reserve global-marker branches unchanged.
 
 A successful status read resolves only `run_evidence_uncorroborated`:
 
@@ -448,6 +450,8 @@ python -m pytest -q \
 ```
 
 Expected: the scanner and the two reviewed store read catches no longer appear in the grep output; all remaining callers match the approved store-level list. The complete notification, retention, and real-middleware suites pass.
+
+The design record's complete classification table must match every remaining production `_mark_repair_required` caller. The standing real-corruption test must keep the store healthy across every listed entry surface, keep the damaged run visible and fail-closed, prove unrelated admission and cleanup remain available, prove second admission avoids rereading the damaged journal, and prove successful repair clears the run-scoped state.
 
 #### Slice 1.2: contention retention, diagnostics, and same-sweep liveness
 

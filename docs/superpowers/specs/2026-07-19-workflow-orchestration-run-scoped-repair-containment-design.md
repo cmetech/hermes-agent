@@ -40,13 +40,14 @@ Advancing beyond a contended first row would create a permanent or repeated noti
 
 ## Contract 1: run-scoped damage never sets global repair state
 
-The invariant is damage-scoped, not caller-scoped: a failure that proves only one run's journal or projection is uncorroborated records run-scoped repair state and raises. Five current call sites implement that rule:
+The invariant is damage-scoped, not caller-scoped: a failure that proves only one run's journal or projection is uncorroborated records run-scoped repair state and raises. Six current call sites implement that rule:
 
 1. notification journal repair in `plugins/workflow/notifications.py`;
 2. the runs-list/status projection path in `plugins/workflow/store.py`;
-3. `RunStore.attention_candidates` in `plugins/workflow/store.py`.
+3. `RunStore.attention_candidates` in `plugins/workflow/store.py`;
 4. the `RunStore.load_run` journal-head corroboration failure;
-5. the `RunStore.load_run` single-run projection rebuild failure.
+5. the `RunStore.load_run` single-run projection rebuild failure;
+6. the published-run evidence-corruption catch in `RunStore._reconcile_admission`.
 
 When one published run raises `JournalRecoveryError`, `NotificationReconciliationError`, `OSError`, malformed-data errors, or the equivalent run-local read failure at these sites, the caller must:
 
@@ -56,7 +57,23 @@ When one published run raises `JournalRecoveryError`, `NotificationReconciliatio
 - leave `storage_health()` healthy unless an independent store-level failure already exists;
 - permit unrelated admission and unrelated cleanup to proceed.
 
-At the two `load_run` sites, only failures raised while corroborating that run's journal/projection become run-scoped. Index/generation damage, cross-run inconsistency, admission publication/reconciliation, journal-reserve exhaustion, claim retention/reconciliation, and other store-level durability failures continue to use `_mark_repair_required` unchanged.
+At the two `load_run` sites, only failures raised while corroborating that run's journal/projection become run-scoped. The published-run sweep also records the same run-scoped reason and preserves the evidence on first detection; later admission sweeps skip an active damaged run without rereading its journal. Index/generation damage, cross-run inconsistency, journal-reserve exhaustion, claim retention/reconciliation, and other store-level durability failures continue to use `_mark_repair_required` unchanged.
+
+### Complete global-marker classification
+
+This table classifies every production `_mark_repair_required` call site after the damage-scoped changes. It is the completeness audit; adding another caller requires classifying its blast radius here and adding it to the standing invariant when it is run-scoped.
+
+| Call site | Reason code(s) | Damage scope | Classification and required behavior |
+|---|---|---|---|
+| `RunStore._initialize`, after schema/generation establishment | `index_corrupt`, `authority_marker_corrupt`, `authority_marker_missing`, `index_missing`, `index_empty`, `index_generation_mismatch` | Store | The admission database or its generation authority cannot cover the evidence tree. Preserve/recreate the index and keep the global marker. |
+| `RunStore._sync_loaded_integrity`, after the indexed integrity tuple disagrees and full corroboration cannot rebuild it | `run_evidence_uncorroborated` | Store | This branch is entered because the authoritative index tuple and projection/journal integrity metadata disagree. It remains the approved index-reconciliation global marker; ordinary single-run reads fail earlier through run-scoped transitions. |
+| `RunStore._reconcile_admission`, when indexed status differs from corroborated published evidence | `index_status_inconsistent` | Store | The index and durable evidence disagree. Rebuild the index row and keep the global marker. |
+| `RunStore._reconcile_admission`, when an evidence directory has no indexed run and cannot be corroborated | `orphan_evidence_uncorroborated` | Store | Ownership/admission authority is unknown. Preserve the directory in quarantine and keep the global marker. |
+| `RunStore._reconcile_admission`, when valid orphan evidence proves an indexed run is missing | `index_run_missing` | Store | Rebuild the missing index row and keep the global marker. |
+| legacy outward-effect policy recovery | `legacy_effect_policy_uncorroborated` | Store | Safe effect/replay policy cannot be reconstructed from legacy state. Keep the global marker. |
+| terminal claim/journal-reserve persistence failure | `terminal_journal_reserve_exhausted` | Store | Durable terminal or recovery evidence cannot be written, so retain the claim and keep the global marker. |
+
+The published-run `published_evidence_uncorroborated` branch is intentionally absent from the table: it no longer calls the global helper. Its first encounter appends active `run_evidence_uncorroborated` plus the existing `published_evidence_uncorroborated/evidence_preserved` audit event, and later admission sweeps skip the active run without rereading it.
 
 ## Contract 2: run-scoped damage is visible and self-clearing
 
@@ -178,7 +195,7 @@ Reviewer-authored reports already present in the worktree remain untouched and u
 
 ## Acceptance criteria
 
-- None of the five governed run-scoped read/scan sites writes the global repair marker for one run's damage.
+- None of the six governed run-scoped read/scan sites writes the global repair marker for one run's damage.
 - Active run-scoped damage is visible in the attention surface with its exact stable reason.
 - Later successful corroboration clears only the matching active run-scoped warning through an append-only verified transition.
 - Damaged-run cleanup remains blocked while unrelated cleanup and admission remain available.
