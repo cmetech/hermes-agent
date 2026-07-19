@@ -1390,6 +1390,9 @@ export interface Translations {
     cleanupImpact: (runs: number, files: number) => string
     kanban: string
     needsAttention: string
+    workflowAttention: string
+    openWorkflowRun: (workflow: string) => string
+    attentionAge: (count: number, unit: 'day' | 'hour' | 'minute') => string
     status: string
     health: string
     graphProgress: string

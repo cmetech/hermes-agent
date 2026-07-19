@@ -300,8 +300,7 @@ export function listWorkflowAttention(): Promise<WorkflowAttentionPage> {
 
 export function listWorkflowEvents(runId: string, after = 0): Promise<WorkflowEventPage> {
   return window.hermesDesktop.api<WorkflowEventPage>({
-    path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/events?after=${after}&wait_seconds=20`,
-    timeoutMs: 25_000,
+    path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/events?after=${after}&wait_seconds=0`,
     ...profileScoped()
   })
 }

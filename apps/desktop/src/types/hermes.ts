@@ -219,8 +219,23 @@ export interface WorkflowRunPage {
   schema_version: number
 }
 
+export interface WorkflowAttentionItem {
+  cause: string
+  health: string
+  interaction?: null | Record<string, unknown>
+  kind: string
+  next_actions: string[]
+  node_id: null | string
+  origin: string
+  run_id: string
+  state_version: number
+  status: string
+  updated_at: string
+  workflow: string
+}
+
 export interface WorkflowAttentionPage {
-  items: Array<Record<string, unknown>>
+  items: WorkflowAttentionItem[]
   next_cursor: null | string
   schema_version: number
 }

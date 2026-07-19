@@ -126,12 +126,3 @@ export function workflowBoardModel(
     stale: options.stale ?? false
   }
 }
-
-export const WORKFLOW_NODE_COLUMNS = {
-  waiting: ['pending'],
-  starting: ['ready', 'claimed'],
-  active: ['running', 'waiting_retry'],
-  attention: ['paused'],
-  done: ['succeeded', 'skipped'],
-  stopped: ['failed', 'cancelled', 'interrupted']
-} as const

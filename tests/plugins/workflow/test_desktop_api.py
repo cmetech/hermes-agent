@@ -433,6 +433,61 @@ def test_runs_are_bounded_cursor_paginated_and_scope_authorized(
     assert detail.status_code == 404
 
 
+def test_runs_pagination_traverses_more_than_200_filtered_rows_without_gaps(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = load_workflow(workflow_writer(tmp_path / "package", name="pagination"))
+    store = RunStore(
+        home,
+        max_executing_runs=300,
+        max_nonterminal_runs=300,
+        max_start_requests_per_minute=300,
+    )
+    history = _start(store, package, "history-old")
+    RunScheduler(store).advance(history.run_id)
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE runs SET updated_at='2000-01-01T00:00:00+00:00' WHERE run_id=?",
+            (history.run_id,),
+        )
+    archived = _start(store, package, "archived-old")
+    archived_status = RunScheduler(store).advance(archived.run_id)
+    store.archive_run(
+        archived.run_id,
+        expected_state_version=archived_status["state_version"],
+    )
+    board_ids = {
+        _start(store, package, f"board-{index:03d}").run_id for index in range(250)
+    }
+    client = TestClient(_app(_router()))
+
+    def traverse(view: str) -> list[str]:
+        cursor = None
+        seen: list[str] = []
+        while True:
+            query = f"view={view}&limit=37"
+            if cursor is not None:
+                query += f"&cursor={cursor}"
+            response = client.get(f"/api/plugins/workflow/runs?{query}")
+            assert response.status_code == 200
+            page = response.json()
+            seen.extend(run["run_id"] for run in page["runs"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                return seen
+
+    board = traverse("board")
+    history_rows = traverse("history")
+    archive_rows = traverse("archive")
+
+    assert len(board) == len(set(board)) == 250
+    assert set(board) == board_ids
+    assert history_rows == [history.run_id]
+    assert archive_rows == [archived.run_id]
+
+
 def test_events_cursor_and_stale_action_conflict(
     tmp_path, monkeypatch, workflow_writer
 ):
@@ -670,6 +725,116 @@ def test_attention_includes_real_workflow_approval_interactions(tmp_path, monkey
         "reject",
         "cancel",
     ]
+
+
+def test_attention_returns_action_metadata_for_every_operator_attention_kind(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = RunStore(home, max_executing_runs=20, max_nonterminal_runs=20)
+
+    approval_package = load_workflow(
+        workflow_writer(
+            tmp_path / "approval-attention",
+            name="approval-attention",
+            nodes=[{"id": "review", "approval": {"message": "Approve?"}}],
+        )
+    )
+    approval = _start(store, approval_package, "approval-attention")
+    RunScheduler(store).advance(approval.run_id)
+
+    loop_package = load_workflow(
+        workflow_writer(
+            tmp_path / "input-attention",
+            name="input-attention",
+            interactive=True,
+            nodes=[
+                {
+                    "id": "iterate",
+                    "loop": {
+                        "prompt": "Refine",
+                        "until": "DONE",
+                        "max_iterations": 2,
+                        "interactive": True,
+                        "gate_message": "Provide feedback",
+                    },
+                }
+            ],
+        )
+    )
+    loop = _start(store, loop_package, "input-attention")
+    RunScheduler(store, agent_runner=_LoopRunner()).advance(loop.run_id)
+
+    failed_package = load_workflow(
+        workflow_writer(
+            tmp_path / "failure-attention",
+            name="failure-attention",
+            nodes=[{"id": "fail", "bash": "exit 7"}],
+        )
+    )
+    failed = _start(store, failed_package, "failure-attention")
+    RunScheduler(store).advance(failed.run_id)
+
+    stalled_package = load_workflow(
+        workflow_writer(tmp_path / "stalled-attention", name="stalled-attention")
+    )
+    stalled_snapshot = store.prepare_run_snapshot(stalled_package)
+    stalled = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=stalled_package.definition.name,
+            definition_digest=stalled_snapshot.definition_digest,
+            policy_digest=stalled_snapshot.policy_digest,
+            input_manifest_digest=stalled_snapshot.input_manifest_digest,
+            trigger_source="desktop",
+            idempotency_key="stalled-attention",
+            concurrency_key="stalled-attention",
+            concurrency_policy="allow",
+            foreground_owner_id="expired-owner",
+            foreground_lease_seconds=0.001,
+        ),
+        immutable_snapshot=stalled_snapshot,
+    )
+    time.sleep(0.01)
+
+    reconcile_package = load_workflow(
+        workflow_writer(
+            tmp_path / "reconcile-attention", name="reconcile-attention"
+        )
+    )
+    reconcile = _start(store, reconcile_package, "reconcile-attention")
+    claim = store.claim_node(reconcile.run_id, "start", "worker")
+    assert claim is not None
+    store.mark_node_started(claim)
+    store.complete_node(
+        claim,
+        status="paused",
+        error_code="outcome_uncertain",
+        metadata={"pending_interaction": "reconcile"},
+    )
+
+    response = TestClient(_app(_router())).get(
+        "/api/plugins/workflow/attention?limit=100"
+    )
+
+    assert response.status_code == 200
+    by_run = {item["run_id"]: item for item in response.json()["items"]}
+    expected = {
+        approval.run_id: ("workflow_approval", "approve"),
+        loop.run_id: ("loop_input", "provide-input"),
+        failed.run_id: ("failure", "retry"),
+        stalled.run_id: ("stalled", "cancel"),
+        reconcile.run_id: ("reconcile", "reconcile"),
+    }
+    assert set(expected) <= set(by_run)
+    for run_id, (kind, action) in expected.items():
+        item = by_run[run_id]
+        assert item["kind"] == kind
+        assert item["origin"] == "desktop"
+        assert item["cause"]
+        assert action in item["next_actions"]
+        assert item["state_version"] >= 1
+        assert item["updated_at"]
 
 
 def test_forged_scope_header_cannot_expand_verified_session(

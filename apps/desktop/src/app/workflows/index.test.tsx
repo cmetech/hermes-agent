@@ -66,6 +66,11 @@ function renderView(client: QueryClient) {
   )
 }
 
+function setVisibility(value: 'hidden' | 'visible') {
+  Object.defineProperty(document, 'visibilityState', { configurable: true, value })
+  document.dispatchEvent(new Event('visibilitychange'))
+}
+
 beforeEach(() => {
   for (const mock of [
     getWorkflowEvidence,
@@ -127,6 +132,7 @@ describe('WorkflowsView', () => {
   })
 
   it('replaces event history when the backend reports a cursor gap', async () => {
+    setVisibility('visible')
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     listWorkflowEvents
       .mockResolvedValueOnce({
@@ -212,5 +218,101 @@ describe('WorkflowsView', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Execute explicit cleanup' }))
 
     await waitFor(() => expect(executeWorkflowCleanup).toHaveBeenCalledWith('exact-token', '7d'))
+  })
+
+  it.each([429, 500])('keeps authoritative actions available when timeline loading fails with %s', async statusCode => {
+    setVisibility('visible')
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false }, queries: { retry: false } } })
+    getWorkflowRun.mockResolvedValue(run({ next_actions: ['approve', 'cancel'] }))
+    listWorkflowEvents.mockRejectedValue(Object.assign(new Error(`${statusCode}: timeline unavailable`), { statusCode }))
+
+    await renderView(client)
+    await waitFor(() => expect(listWorkflowEvents).toHaveBeenCalled())
+
+    expect((screen.getByRole('button', { name: 'Approve' }) as HTMLButtonElement).disabled).toBe(false)
+    expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('renders actionable attention rows with origin, age, cause, and click-through at laptop width', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 })
+    $workflowSelectedRunId.set(null)
+    listWorkflowAttention.mockResolvedValue({
+      items: [
+        ['approval', 'Approval workflow', 'workflow_approval', 'api', 'approval required', 'approve'],
+        ['input', 'Input workflow', 'loop_input', 'chat', 'operator input required', 'provide-input'],
+        ['stalled', 'Stalled workflow', 'stalled', 'cron', 'node lease expired', 'resume'],
+        ['failure', 'Failed workflow', 'failure', 'desktop', 'command failed', 'retry'],
+        ['reconcile', 'Reconcile workflow', 'reconcile', 'background_agent', 'outcome uncertain', 'reconcile']
+      ].map(([run_id, workflow, kind, origin, cause, action]) => ({
+        cause,
+        health: kind === 'stalled' ? 'stalled' : 'user_wait',
+        kind,
+        next_actions: [action],
+        node_id: 'node-1',
+        origin,
+        run_id,
+        state_version: 3,
+        status: kind === 'failure' ? 'failed' : 'paused',
+        updated_at: new Date(Date.now() - 60_000).toISOString(),
+        workflow
+      })),
+      next_cursor: null,
+      schema_version: 1
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client)
+
+    for (const workflow of [
+      'Approval workflow',
+      'Input workflow',
+      'Stalled workflow',
+      'Failed workflow',
+      'Reconcile workflow'
+    ]) {
+      expect(await screen.findByText(workflow)).toBeTruthy()
+    }
+
+    expect(screen.getByText('approval required')).toBeTruthy()
+    expect(screen.getByText('outcome uncertain')).toBeTruthy()
+    expect(screen.getAllByText(/1 minute ago/i)).toHaveLength(5)
+
+    for (const summary of [
+      'workflow approval · Approve',
+      'loop input · Provide input',
+      'stalled · Resume',
+      'failure · Retry',
+      'reconcile · Reconcile'
+    ]) {
+      expect(screen.getByText(summary)).toBeTruthy()
+    }
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open run Approval workflow' }))
+    await waitFor(() => expect(getWorkflowRun).toHaveBeenCalledWith('approval'))
+  })
+
+  it('marks the workflow region busy during an authoritative refresh', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    await renderView(client)
+    const main = await screen.findByRole('main')
+    expect(main.getAttribute('aria-busy')).toBe('false')
+    const refresh = deferred<{ next_cursor: null; runs: WorkflowRunSnapshot[]; schema_version: number }>()
+    listWorkflowRuns.mockImplementationOnce(() => refresh.promise)
+
+    const refetch = client.refetchQueries({ queryKey: ['workflow-runs', 'default', 'board'] })
+    await waitFor(() => expect(main.getAttribute('aria-busy')).toBe('true'))
+    refresh.resolve({ next_cursor: null, runs: [run()], schema_version: 1 })
+    await refetch
+    await waitFor(() => expect(main.getAttribute('aria-busy')).toBe('false'))
+  })
+
+  it('does not acquire an events poll while the inspector is hidden', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    setVisibility('hidden')
+
+    await renderView(client)
+    await waitFor(() => expect(getWorkflowRun).toHaveBeenCalledWith('run-1'))
+
+    expect(listWorkflowEvents).not.toHaveBeenCalled()
   })
 })

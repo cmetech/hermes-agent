@@ -135,6 +135,19 @@ describe('Hermes REST session helpers', () => {
     )
   })
 
+  it('uses a non-blocking events request so hidden inspectors cannot retain server permits', async () => {
+    api.mockResolvedValue({ cursor_reset: false, events: [], next_cursor: 4, schema_version: 1 })
+
+    await listWorkflowEvents('run 1', 4)
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/plugins/workflow/runs/run%201/events?after=4&wait_seconds=0'
+      })
+    )
+    expect(api.mock.calls[0]?.[0]).not.toHaveProperty('timeoutMs')
+  })
+
   it('gives the whole startup data burst the long timeout, not just profiles', async () => {
     api.mockResolvedValue({})
 

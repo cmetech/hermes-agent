@@ -102,7 +102,7 @@ class ForegroundExecutionLease:
 
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
-_STORE_SCHEMA_VERSION = 11
+_STORE_SCHEMA_VERSION = 12
 # Direct RunStore/CLI access is already the profile-local filesystem admin
 # boundary. Network adapters must always pass their verified authority binding.
 _LOCAL_ADMIN_AUTHORITY_BINDING = "profile-local-runstore-admin"
@@ -417,6 +417,8 @@ class RunStore:
                         run_directory TEXT NOT NULL,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
+                        archived_at TEXT,
+                        restored_to_history INTEGER NOT NULL DEFAULT 0,
                         admission_state TEXT NOT NULL DEFAULT 'published',
                         desired_status TEXT,
                         staging_directory TEXT,
@@ -579,6 +581,13 @@ class RunStore:
                         "ALTER TABLE runs ADD COLUMN lane_state TEXT "
                         "NOT NULL DEFAULT 'released'"
                     ),
+                    "archived_at": (
+                        "ALTER TABLE runs ADD COLUMN archived_at TEXT"
+                    ),
+                    "restored_to_history": (
+                        "ALTER TABLE runs ADD COLUMN restored_to_history INTEGER "
+                        "NOT NULL DEFAULT 0"
+                    ),
             }
             for name, statement in migrations.items():
                 if name not in columns:
@@ -591,6 +600,17 @@ class RunStore:
                 "WHERE admission_state='published' "
                 "AND status IN ('queued','running','waiting_retry') "
                 "AND execution_mode IN ('background','foreground')"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS runs_view_keyset "
+                "ON runs(operator_scope_digest, updated_at DESC, run_id DESC) "
+                "WHERE admission_state='published'"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS runs_view_filter "
+                "ON runs(archived_at, restored_to_history, status, "
+                "updated_at DESC, run_id DESC) "
+                "WHERE admission_state='published'"
             )
             cleanup_preview_columns = {
                 row["name"]
@@ -628,6 +648,8 @@ class RunStore:
                 "run_directory",
                 "created_at",
                 "updated_at",
+                "archived_at",
+                "restored_to_history",
                 "admission_state",
                 "desired_status",
                 "staging_directory",
@@ -756,6 +778,8 @@ class RunStore:
             "run_directory",
             "created_at",
             "updated_at",
+            "archived_at",
+            "restored_to_history",
             "admission_state",
             "desired_status",
             "staging_directory",
@@ -800,6 +824,8 @@ class RunStore:
                     run_directory TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    archived_at TEXT,
+                    restored_to_history INTEGER NOT NULL DEFAULT 0,
                     admission_state TEXT NOT NULL DEFAULT 'published',
                     desired_status TEXT,
                     staging_directory TEXT,
@@ -1131,7 +1157,8 @@ class RunStore:
         connection.execute(
             "UPDATE runs SET status=?, desired_status=?, execution_mode=?, "
             "queue_position=?, queue_sequence=?, blocked_by_run_id=?, "
-            "pause_lane_policy=?, lane_state=?, projection_schema_version=?, "
+            "pause_lane_policy=?, lane_state=?, archived_at=?, "
+            "restored_to_history=?, projection_schema_version=?, "
             "projection_state_version=?, projection_sha256=?, "
             "journal_sequence=?, journal_sha256=?, integrity_verified_at=? "
             "WHERE run_id=?",
@@ -1144,6 +1171,8 @@ class RunStore:
                 projection.get("blocked_by_run_id"),
                 projection.get("pause_lane_policy", "hold"),
                 RunStore._lane_state(projection),
+                projection.get("archived_at"),
+                int(bool(projection.get("restored_to_history"))),
                 int(projection.get("schema_version", 1)),
                 int(projection["state_version"]),
                 _projection_digest(projection),
@@ -1167,6 +1196,8 @@ class RunStore:
             projection.get("blocked_by_run_id"),
             projection.get("pause_lane_policy", "hold"),
             self._lane_state(projection),
+            projection.get("archived_at"),
+            int(bool(projection.get("restored_to_history"))),
             int(projection.get("schema_version", 1)),
             int(projection["state_version"]),
             _projection_digest(projection),
@@ -1177,6 +1208,7 @@ class RunStore:
             current = connection.execute(
                 "SELECT status, desired_status, execution_mode, queue_position, "
                 "queue_sequence, blocked_by_run_id, pause_lane_policy, lane_state, "
+                "archived_at, restored_to_history, "
                 "projection_schema_version, "
                 "projection_state_version, "
                 "projection_sha256, journal_sequence, journal_sha256 "
@@ -1289,11 +1321,12 @@ class RunStore:
             "start_digest, concurrency_key, concurrency_policy, disposition, "
             "status, queue_position, queue_sequence, blocked_by_run_id, "
             "pause_lane_policy, lane_state, run_directory, "
-            "created_at, updated_at, admission_state, desired_status, "
+            "created_at, updated_at, archived_at, restored_to_history, "
+            "admission_state, desired_status, "
             "staging_directory, operator_scope_digest, provenance_json, "
             "execution_mode, foreground_owner_id, foreground_lease_expires_at, "
             "foreground_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "?, ?, 'published', NULL, NULL, ?, ?, ?, ?, ?, ?)",
+            "?, ?, ?, ?, 'published', NULL, NULL, ?, ?, ?, ?, ?, ?)",
             (
                 projection["run_id"],
                 projection["workflow"],
@@ -1314,6 +1347,8 @@ class RunStore:
                 str(directory),
                 projection.get("created_at") or projection["updated_at"],
                 projection["updated_at"],
+                projection.get("archived_at"),
+                int(bool(projection.get("restored_to_history"))),
                 projection.get("operator_scope_digest"),
                 (
                     json.dumps(projection["provenance"], sort_keys=True)
@@ -3350,6 +3385,7 @@ class RunStore:
         view: str = "all",
         now: datetime | None = None,
         terminal_board_days: int = 7,
+        after: tuple[str, str] | None = None,
     ) -> tuple[dict[str, object], ...]:
         if not 1 <= limit <= 200:
             raise ValueError("limit must be between 1 and 200")
@@ -3362,6 +3398,22 @@ class RunStore:
             raise ValueError("now must be timezone-aware")
         observed_at = observed_at.astimezone(timezone.utc)
         terminal_cutoff = observed_at - timedelta(days=terminal_board_days)
+        if after is not None:
+            if (
+                not isinstance(after, tuple)
+                or len(after) != 2
+                or not all(isinstance(value, str) and value for value in after)
+            ):
+                raise ValueError("after must be an updated_at and run_id tuple")
+            try:
+                after_updated_at = datetime.fromisoformat(after[0])
+            except ValueError as exc:
+                raise ValueError("after updated_at must be an ISO timestamp") from exc
+            if (
+                after_updated_at.tzinfo is None
+                or after_updated_at.utcoffset() is None
+            ):
+                raise ValueError("after updated_at must be timezone-aware")
         storage_degraded = self.storage_health()["status"] != "healthy"
         clauses = ["admission_state='published'"]
         values: list[object] = []
@@ -3374,12 +3426,31 @@ class RunStore:
         if operator_scope is not None:
             clauses.append("operator_scope_digest=?")
             values.append(self._scope_digest(operator_scope))
+        terminal_statuses = "'succeeded','failed','cancelled','abandoned'"
+        cutoff = terminal_cutoff.isoformat()
+        if view == "archive":
+            clauses.append("archived_at IS NOT NULL")
+        elif view == "history":
+            clauses.append("archived_at IS NULL")
+            clauses.append(f"status IN ({terminal_statuses})")
+            clauses.append("(restored_to_history=1 OR updated_at<?)")
+            values.append(cutoff)
+        elif view == "board":
+            clauses.append("archived_at IS NULL")
+            clauses.append(
+                f"(status NOT IN ({terminal_statuses}) OR "
+                "(restored_to_history=0 AND updated_at>=?))"
+            )
+            values.append(cutoff)
+        if after is not None:
+            clauses.append("(updated_at<? OR (updated_at=? AND run_id<?))")
+            values.extend((after[0], after[0], after[1]))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         query_limit = 200 if storage_degraded else limit
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT run_id, workflow_name, status, updated_at FROM runs"
-                f"{where} ORDER BY created_at DESC, run_id DESC LIMIT ?",
+                f"{where} ORDER BY updated_at DESC, run_id DESC LIMIT ?",
                 (*values, query_limit),
             ).fetchall()
         results = []
@@ -3418,34 +3489,6 @@ class RunStore:
                 continue
             if storage_degraded:
                 result = {**result, "store_health": "repair_required"}
-            archived = bool(result.get("archived_at"))
-            restored = bool(result.get("restored_to_history"))
-            terminal = str(result.get("status")) in {
-                "succeeded",
-                "failed",
-                "cancelled",
-                "abandoned",
-            }
-            indexed_updated_at = datetime.fromisoformat(row["updated_at"])
-            if indexed_updated_at.tzinfo is None:
-                indexed_updated_at = indexed_updated_at.replace(tzinfo=timezone.utc)
-            indexed_updated_at = indexed_updated_at.astimezone(timezone.utc)
-            if view == "archive" and not archived:
-                continue
-            if view == "history" and not (
-                terminal
-                and not archived
-                and (restored or indexed_updated_at < terminal_cutoff)
-            ):
-                continue
-            if view == "board" and (
-                archived
-                or (
-                    terminal
-                    and (restored or indexed_updated_at < terminal_cutoff)
-                )
-            ):
-                continue
             results.append(result)
             if len(results) >= limit:
                 break
@@ -3487,8 +3530,14 @@ class RunStore:
             )
         with self._connect() as connection:
             connection.execute(
-                "UPDATE runs SET updated_at=? WHERE run_id=?",
-                (projection["updated_at"], run_id),
+                "UPDATE runs SET updated_at=?, archived_at=?, "
+                "restored_to_history=? WHERE run_id=?",
+                (
+                    projection["updated_at"],
+                    projection["archived_at"],
+                    int(bool(projection["restored_to_history"])),
+                    run_id,
+                ),
             )
         return self.get_run_status(run_id, operator_scope=operator_scope)
 
@@ -3520,8 +3569,14 @@ class RunStore:
             )
         with self._connect() as connection:
             connection.execute(
-                "UPDATE runs SET updated_at=? WHERE run_id=?",
-                (projection["updated_at"], run_id),
+                "UPDATE runs SET updated_at=?, archived_at=?, "
+                "restored_to_history=? WHERE run_id=?",
+                (
+                    projection["updated_at"],
+                    projection["archived_at"],
+                    int(bool(projection["restored_to_history"])),
+                    run_id,
+                ),
             )
         return self.get_run_status(run_id, operator_scope=operator_scope)
 

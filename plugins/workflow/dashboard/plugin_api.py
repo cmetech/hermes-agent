@@ -13,6 +13,7 @@ import time
 import re
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Literal, Mapping
 
@@ -234,13 +235,21 @@ def _decode_cursor(value: str, *, kind: str, scope: str) -> dict[str, object]:
 
 
 def _authorized_runs(
-    store: RunStore, operator: WorkflowAuthority, *, view: str = "all"
+    store: RunStore,
+    operator: WorkflowAuthority,
+    *,
+    view: str = "all",
+    limit: int = 200,
+    after: tuple[str, str] | None = None,
+    now: datetime | None = None,
 ):
     retention = WorkflowRetentionPolicy.from_profile(get_hermes_home())
     return store.list_runs(
         operator_scope=None if operator.unrestricted else operator.scope,
-        limit=200,
+        limit=limit,
         view=view,
+        after=after,
+        now=now,
         terminal_board_days=retention.terminal_board_days,
     )
 
@@ -556,26 +565,59 @@ def list_runs(
 ):
     operator = _verified_operator(request, operator_scope)
     operator.require("read")
+    retention = WorkflowRetentionPolicy.from_profile(get_hermes_home())
+    cursor_scope = (
+        f"{operator.cursor_scope}:{view}:{retention.terminal_board_days}"
+    )
+    observed_at = datetime.now(timezone.utc)
+    after = None
+    if cursor:
+        payload = _decode_cursor(cursor, kind="runs", scope=cursor_scope)
+        keyset = payload.get("keyset")
+        observed_value = payload.get("observed_at")
+        try:
+            if (
+                not isinstance(keyset, list)
+                or len(keyset) != 2
+                or not all(isinstance(value, str) and value for value in keyset)
+                or not isinstance(observed_value, str)
+            ):
+                raise ValueError
+            observed_at = datetime.fromisoformat(observed_value)
+            if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+                raise ValueError
+            observed_at = observed_at.astimezone(timezone.utc)
+            after = (keyset[0], keyset[1])
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=410,
+                detail={"code": "cursor_expired", "cursor_reset": True},
+            ) from exc
     with _store_lease() as store:
-        runs = list(_authorized_runs(store, operator, view=view))
-    cursor_scope = f"{operator.cursor_scope}:{view}"
-    start = (
-        int(
-            _decode_cursor(cursor, kind="runs", scope=cursor_scope).get(
-                "position", 0
+        runs = list(
+            _authorized_runs(
+                store,
+                operator,
+                view=view,
+                limit=limit + 1,
+                after=after,
+                now=observed_at,
             )
         )
-        if cursor
-        else 0
-    )
-    page = runs[start : start + limit]
+    page = runs[:limit]
     next_cursor = None
-    if start + limit < len(runs):
+    if len(runs) > limit:
+        last = page[-1]
         next_cursor = _encode_cursor({
             "v": 1,
             "kind": "runs",
             "scope": _scope_key(cursor_scope),
-            "position": start + limit,
+            "observed_at": observed_at.isoformat(),
+            "filter": {
+                "view": view,
+                "terminal_board_days": retention.terminal_board_days,
+            },
+            "keyset": [last["updated_at"], last["run_id"]],
         })
     return {
         "schema_version": 1,
@@ -684,6 +726,12 @@ def attention(
     items = []
     with _store_lease() as store:
         for run in _authorized_runs(store, operator):
+            provenance = run.get("provenance")
+            origin = str(
+                provenance.get("source")
+                if isinstance(provenance, Mapping) and provenance.get("source")
+                else run.get("trigger") or "workflow"
+            )
             for node_id, node in run.get("nodes", {}).items():
                 pending = (
                     node.get("pending_interaction")
@@ -699,14 +747,86 @@ def attention(
                     "reconcile",
                 }:
                     continue
+                item_kind = {
+                    "approval": "approval",
+                    "workflow_approval": "workflow_approval",
+                    "loop_input": "loop_input",
+                    "capability": "capability",
+                    "reconcile": "reconcile",
+                }[str(kind)]
+                interaction = (
+                    dict(pending)
+                    if isinstance(pending, Mapping)
+                    else {"type": item_kind}
+                )
+                cause = str(
+                    interaction.get("message")
+                    or interaction.get("gate_message")
+                    or interaction.get("prompt")
+                    or item_kind
+                )
                 items.append({
                     "run_id": run["run_id"],
                     "workflow": run["workflow"],
                     "node_id": node_id,
-                    "interaction": pending,
+                    "kind": item_kind,
+                    "origin": origin,
+                    "cause": cause,
+                    "interaction": interaction,
+                    "status": run["status"],
+                    "health": run["health"],
+                    "next_actions": run["next_actions"],
                     "state_version": run["state_version"],
                     "updated_at": run["updated_at"],
                 })
+            if run["status"] == "failed":
+                last_error = run.get("last_error")
+                failure_cause = (
+                    last_error.get("message") or last_error.get("code")
+                    if isinstance(last_error, Mapping)
+                    else None
+                )
+                items.append(
+                    {
+                        "run_id": run["run_id"],
+                        "workflow": run["workflow"],
+                        "node_id": None,
+                        "kind": "failure",
+                        "origin": origin,
+                        "cause": str(
+                            failure_cause
+                            or run.get("blocking_reason")
+                            or "workflow_failed"
+                        ),
+                        "interaction": None,
+                        "status": run["status"],
+                        "health": run["health"],
+                        "next_actions": run["next_actions"],
+                        "state_version": run["state_version"],
+                        "updated_at": run["updated_at"],
+                    }
+                )
+            elif run["health"] in {
+                "stalled",
+                "coordinator_unavailable",
+                "storage_degraded",
+            }:
+                items.append(
+                    {
+                        "run_id": run["run_id"],
+                        "workflow": run["workflow"],
+                        "node_id": None,
+                        "kind": "stalled",
+                        "origin": origin,
+                        "cause": str(run.get("blocking_reason") or run["health"]),
+                        "interaction": None,
+                        "status": run["status"],
+                        "health": run["health"],
+                        "next_actions": run["next_actions"],
+                        "state_version": run["state_version"],
+                        "updated_at": run["updated_at"],
+                    }
+                )
         for fact in NotificationOutbox(store).pending_attention():
             try:
                 run = _load_authorized(store, str(fact["run_id"]), operator)
@@ -717,11 +837,22 @@ def attention(
                     "run_id": fact["run_id"],
                     "workflow": run["workflow"],
                     "node_id": None,
+                    "kind": "notification",
+                    "origin": str(
+                        run.get("provenance", {}).get("source")
+                        if isinstance(run.get("provenance"), Mapping)
+                        and run["provenance"].get("source")
+                        else run.get("trigger") or "workflow"
+                    ),
+                    "cause": str(fact["kind"]),
                     "interaction": {
                         "type": "notification",
                         "kind": fact["kind"],
                         "notification_id": fact["notification_id"],
                     },
+                    "status": run["status"],
+                    "health": run["health"],
+                    "next_actions": run["next_actions"],
                     "state_version": run["state_version"],
                     "updated_at": fact["updated_at"],
                 }

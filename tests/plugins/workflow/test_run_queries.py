@@ -5,7 +5,25 @@ import pytest
 from plugins.workflow.actions import MUTATION_ACTIONS, available_actions, mutation_is_valid
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.schema import load_workflow
+from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
+
+
+def _start(store: RunStore, package, key: str):
+    prepared = store.prepare_run_snapshot(package)
+    return store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="desktop",
+            idempotency_key=key,
+            concurrency_key=package.definition.name,
+            concurrency_policy="allow",
+        ),
+        immutable_snapshot=prepared,
+    )
 
 
 def test_run_summary_is_stable_redacted_and_filterable(tmp_path, workflow_writer):
@@ -48,6 +66,36 @@ def test_run_summary_is_stable_redacted_and_filterable(tmp_path, workflow_writer
     assert "secret-value" not in str(tail)
     assert "also-secret" not in str(tail)
     assert tail[-1]["payload"]["api_key"] == "[REDACTED]"
+
+
+def test_run_pagination_filters_before_limit_and_keyset_has_no_gaps(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=20,
+        max_nonterminal_runs=20,
+        max_start_requests_per_minute=20,
+    )
+    package = load_workflow(workflow_writer(tmp_path / "package", name="keyset"))
+    history = _start(store, package, "history")
+    RunScheduler(store).advance(history.run_id)
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE runs SET updated_at='2000-01-01T00:00:00+00:00' WHERE run_id=?",
+            (history.run_id,),
+        )
+    board_ids = [_start(store, package, f"board-{index}").run_id for index in range(6)]
+
+    history_page = store.list_runs(view="history", limit=2)
+    first = store.list_runs(view="board", limit=3)
+    cursor = (first[-1]["updated_at"], first[-1]["run_id"])
+    second = store.list_runs(view="board", limit=3, after=cursor)
+
+    assert [run["run_id"] for run in history_page] == [history.run_id]
+    traversed = [run["run_id"] for run in (*first, *second)]
+    assert len(traversed) == len(set(traversed)) == 6
+    assert set(traversed) == set(board_ids)
 
 
 def test_conversation_scope_filters_lists_and_explicit_run_ids(

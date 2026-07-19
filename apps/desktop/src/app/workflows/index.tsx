@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { ActivityBoard } from '@/components/activity-board/activity-board'
 import { PageLoader } from '@/components/page-loader'
@@ -40,33 +40,45 @@ export function WorkflowsView() {
   const selectedRunId = useStore($workflowSelectedRunId)
   const actionInFlight = useRef(false)
   const [actionPending, setActionPending] = useState(false)
+  const [isVisible, setIsVisible] = useState(() => document.visibilityState === 'visible')
   const [view, setView] = useState<WorkflowRunView>('board')
+
+  useEffect(() => {
+    const onVisibilityChange = () => setIsVisible(document.visibilityState === 'visible')
+
+    document.addEventListener('visibilitychange', onVisibilityChange)
+
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange)
+  }, [])
 
   const runs = useInfiniteQuery({
     getNextPageParam: (page: WorkflowRunPage) => page.next_cursor ?? undefined,
     initialPageParam: undefined as string | undefined,
     queryFn: ({ pageParam }) => listWorkflowRuns(pageParam as string | undefined, view),
     queryKey: ['workflow-runs', profile, view],
-    refetchInterval: () => (document.visibilityState === 'visible' ? 20_000 : false)
+    refetchInterval: () => (isVisible ? 20_000 : false)
   })
 
   const attention = useQuery({
     queryFn: listWorkflowAttention,
     queryKey: ['workflow-attention', profile],
-    refetchInterval: () => (document.visibilityState === 'visible' ? 20_000 : false)
+    refetchInterval: () => (isVisible ? 20_000 : false)
   })
 
   const selected = useQuery({
     enabled: Boolean(selectedRunId),
     queryFn: () => getWorkflowRun(selectedRunId!),
     queryKey: ['workflow-run', profile, selectedRunId],
-    refetchInterval: () => (document.visibilityState === 'visible' ? 20_000 : false)
+    refetchInterval: () => (isVisible ? 20_000 : false)
   })
 
-  const eventQueryKey = ['workflow-events', profile, selectedRunId] as const
+  const eventQueryKey = useMemo(
+    () => ['workflow-events', profile, selectedRunId] as const,
+    [profile, selectedRunId]
+  )
 
   const events = useQuery({
-    enabled: Boolean(selectedRunId),
+    enabled: Boolean(selectedRunId) && isVisible,
     queryFn: async () => {
       const previous = queryClient.getQueryData<WorkflowEventPage>(eventQueryKey)
       const page = await listWorkflowEvents(selectedRunId!, previous?.next_cursor ?? 0)
@@ -78,8 +90,18 @@ export function WorkflowsView() {
       return { ...page, events: [...previous.events, ...page.events].slice(-200) }
     },
     queryKey: eventQueryKey,
-    refetchInterval: () => (document.visibilityState === 'visible' ? 1_000 : false)
+    refetchInterval: () => (isVisible ? 1_000 : false)
   })
+
+  useEffect(() => {
+    if (!isVisible || !selectedRunId) {
+      void queryClient.cancelQueries({ exact: true, queryKey: eventQueryKey })
+    }
+
+    return () => {
+      void queryClient.cancelQueries({ exact: true, queryKey: eventQueryKey })
+    }
+  }, [eventQueryKey, isVisible, queryClient, selectedRunId])
 
   const mutation = useMutation({
     mutationFn: ({ action, body = {} }: { action: string; body?: Record<string, unknown> }) =>
@@ -156,7 +178,17 @@ export function WorkflowsView() {
   }
 
   return (
-    <main className={`min-w-0 overflow-x-hidden py-6 ${PAGE_INSET_X}`}>
+    <main
+      aria-busy={
+        runs.isFetching ||
+        attention.isFetching ||
+        selected.isFetching ||
+        mutation.isPending ||
+        cleanupPreview.isPending ||
+        cleanupExecute.isPending
+      }
+      className={`min-w-0 overflow-x-hidden py-6 ${PAGE_INSET_X}`}
+    >
       <h1 className="mb-4 text-lg font-medium">{t.operations.workflows}</h1>
       <div aria-label={t.operations.workflowViews} className="mb-4 flex gap-2" role="tablist">
         {(['board', 'history', 'archive'] as const).map(candidate => (
@@ -179,7 +211,7 @@ export function WorkflowsView() {
           </Button>
         ))}
       </div>
-      <AttentionInbox items={attention.data?.items ?? []} />
+      <AttentionInbox items={attention.data?.items ?? []} onOpenRun={selectWorkflowRun} />
       <ActivityBoard
         model={model}
         onLoadMore={() => void runs.fetchNextPage()}
@@ -187,7 +219,7 @@ export function WorkflowsView() {
       />
       {selected.data && (
         <RunInspector
-          actionsDisabled={actionPending || mutation.isPending || selected.isError || events.isError}
+          actionsDisabled={actionPending || mutation.isPending || selected.isError}
           events={events.data?.events}
           onAction={mutateRun}
           run={selected.data}
