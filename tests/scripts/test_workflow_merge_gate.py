@@ -20,6 +20,17 @@ def test_merge_gate_references_only_existing_invariant_tests() -> None:
     assert not [path for path in sorted(referenced) if not (ROOT / path).is_file()]
 
 
+def test_merge_gate_enforces_async_reload_and_delivery_regressions() -> None:
+    source = GATE.read_text()
+
+    for required_test in (
+        "tests/gateway/test_plugin_background_services.py",
+        "tests/gateway/test_plugin_delivery.py",
+        "tests/hermes_cli/test_plugin_provider_hot_reload.py",
+    ):
+        assert required_test in source
+
+
 def test_native_workflow_matrix_covers_every_release_gate() -> None:
     source = CI.read_text()
 

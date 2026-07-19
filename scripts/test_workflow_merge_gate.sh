@@ -59,6 +59,9 @@ if [[ "$PHASE" == "base" ]]; then
       tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py \
       tests/hermes_cli/test_kanban_dispatch_lock.py \
       tests/plugins/test_kanban_dashboard_plugin.py \
+      tests/gateway/test_plugin_background_services.py \
+      tests/gateway/test_plugin_delivery.py \
+      tests/hermes_cli/test_plugin_provider_hot_reload.py \
       tests/plugins/workflow/test_admission.py tests/plugins/workflow/test_trust_policy.py \
       tests/plugins/workflow/test_showcase_catalog.py \
       tests/plugins/workflow/test_showcase_distribution_e2e.py \
