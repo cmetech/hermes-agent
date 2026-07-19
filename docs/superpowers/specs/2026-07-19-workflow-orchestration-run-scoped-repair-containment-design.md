@@ -11,6 +11,8 @@ This follow-up closes the three failure-branch regressions found in the operator
 - **NR-1 (High):** run-scoped read damage must not create a store-global admission outage.
 - **NR-2 (Medium):** transient run-lock contention during notification repair must not abort the coordinator sweep.
 - **NR-3 (Medium):** the native evidence-containment tests must execute in the three-OS release-gate matrix.
+- **NR2-F1 (Medium):** corrupt legacy policy evidence must remain confined to its run.
+- **NR2-F2 (Medium):** every workflow test file must be gate-selected or explicitly opted out.
 
 The work is deliberately contained to the workflow plugin, its release-gate selection, failure-injection tests, and corrected verification evidence. It adds no core tool, host import, user-facing environment variable, or synchronous workflow execution path.
 
@@ -40,14 +42,15 @@ Advancing beyond a contended first row would create a permanent or repeated noti
 
 ## Contract 1: run-scoped damage never sets global repair state
 
-The invariant is damage-scoped, not caller-scoped: a failure that proves only one run's journal or projection is uncorroborated records run-scoped repair state and raises. Six current call sites implement that rule:
+The invariant is damage-scoped, not caller-scoped: a failure that proves only one run's journal, projection, or immutable policy is uncorroborated records run-scoped repair state and raises. Seven current call sites implement that rule:
 
 1. notification journal repair in `plugins/workflow/notifications.py`;
 2. the runs-list/status projection path in `plugins/workflow/store.py`;
 3. `RunStore.attention_candidates` in `plugins/workflow/store.py`;
 4. the `RunStore.load_run` journal-head corroboration failure;
 5. the `RunStore.load_run` single-run projection rebuild failure;
-6. the published-run evidence-corruption catch in `RunStore._reconcile_admission`.
+6. the published-run evidence-corruption catch in `RunStore._reconcile_admission`;
+7. legacy policy corroboration in `RunStore.node_effect_classification`.
 
 When one published run raises `JournalRecoveryError`, `NotificationReconciliationError`, `OSError`, malformed-data errors, or the equivalent run-local read failure at these sites, the caller must:
 
@@ -70,16 +73,17 @@ This table classifies every production `_mark_repair_required` call site after t
 | `RunStore._reconcile_admission`, when indexed status differs from corroborated published evidence | `index_status_inconsistent` | Store | The index and durable evidence disagree. Rebuild the index row and keep the global marker. |
 | `RunStore._reconcile_admission`, when an evidence directory has no indexed run and cannot be corroborated | `orphan_evidence_uncorroborated` | Store | Ownership/admission authority is unknown. Preserve the directory in quarantine and keep the global marker. |
 | `RunStore._reconcile_admission`, when valid orphan evidence proves an indexed run is missing | `index_run_missing` | Store | Rebuild the missing index row and keep the global marker. |
-| legacy outward-effect policy recovery | `legacy_effect_policy_uncorroborated` | Store | Safe effect/replay policy cannot be reconstructed from legacy state. Keep the global marker. |
 | terminal claim/journal-reserve persistence failure | `terminal_journal_reserve_exhausted` | Store | Durable terminal or recovery evidence cannot be written, so retain the claim and keep the global marker. |
 
 The published-run `published_evidence_uncorroborated` branch is intentionally absent from the table: it no longer calls the global helper. Its first encounter appends active `run_evidence_uncorroborated` plus the existing `published_evidence_uncorroborated/evidence_preserved` audit event, and later admission sweeps skip the active run without rereading it.
+
+Legacy policy corruption is also intentionally absent from the global table. It appends active `legacy_effect_policy_uncorroborated`, raises before effect classification or claim, leaves unrelated admission available, and clears only after the policy bytes and digest corroborate successfully. Operator attention presents that exact reason while the run remains fail-closed for outward-effect execution.
 
 ## Contract 2: run-scoped damage is visible and self-clearing
 
 Removing the global marker must not make evidence damage invisible.
 
-Run-scoped repair state uses the existing append-only `repair_events` table without a schema change:
+Run-scoped repair state uses the existing append-only `repair_events` table without a schema change. Its bounded reason set is `notification_reconciliation_unverified`, `run_evidence_uncorroborated`, and `legacy_effect_policy_uncorroborated`:
 
 - a latest transition with `outcome='repair_required'` is active;
 - a later successful strict scanner read resolves `notification_reconciliation_unverified`, while a later successful status read resolves `run_evidence_uncorroborated`; one reader cannot clear the other reader's reason;
@@ -143,6 +147,10 @@ The process-local counter is diagnostic only. Correctness depends solely on the 
 
 `tests/plugins/workflow/test_evidence_api.py` is added to the workflow portability selection in `.github/workflows/ci.yml` and to the exact pinned list in `tests/scripts/test_workflow_merge_gate.py`.
 
+`tests/plugins/workflow/test_notifications.py` and `tests/plugins/workflow/test_desktop_api.py` are also matrix-selected and pinned because they carry the only cursor-retention and real operator-surface regressions for NR-1/NR-2.
+
+Gate membership is opt-out rather than silently opt-in. The meta-test enumerates every `tests/plugins/workflow/test_*.py` file and requires each path to appear explicitly in the base merge gate, the portability matrix, or a documented explicit opt-out set. It rejects both uncovered inventory and stale opt-outs that later become selected. Wildcards and name-pattern exemptions are not valid opt-outs.
+
 The selection grows by exactly this file; it is not replaced by a wildcard and no existing test is removed. At the approved HEAD, the file has one platform marker: the native Windows reparse-point test skips on POSIX, while its descriptor/fallback containment tests are platform-neutral. There are no `mkfifo` or `O_NOFOLLOW` skip-marked tests in this file. Every supported matrix OS executes the applicable containment path, and the verification record must use the file's actual markers rather than assuming inverse skips that do not exist.
 
 The final verification record reports each platform's collected/pass/skip arithmetic and reconciles the inverse platform skips. It must not claim matrix coverage based only on a local POSIX run.
@@ -195,7 +203,7 @@ Reviewer-authored reports already present in the worktree remain untouched and u
 
 ## Acceptance criteria
 
-- None of the six governed run-scoped read/scan sites writes the global repair marker for one run's damage.
+- None of the seven governed run-scoped read/scan/classification sites writes the global repair marker for one run's damage.
 - Active run-scoped damage is visible in the attention surface with its exact stable reason.
 - Later successful corroboration clears only the matching active run-scoped warning through an append-only verified transition.
 - Damaged-run cleanup remains blocked while unrelated cleanup and admission remain available.
@@ -203,4 +211,5 @@ Reviewer-authored reports already present in the worktree remain untouched and u
 - Repeated same-run timeouts emit a bounded diagnostic.
 - Gateway drain and scheduler submission still occur in the same contended sweep.
 - `test_evidence_api.py` is pinned in both CI and the merge-gate meta-test, with honest cross-platform skip arithmetic.
+- `test_notifications.py` and `test_desktop_api.py` are pinned in the portability matrix, and every workflow test is selected or explicitly opted out.
 - The full strengthened gate is green, and no unrelated or reviewer-owned file is included in task commits.

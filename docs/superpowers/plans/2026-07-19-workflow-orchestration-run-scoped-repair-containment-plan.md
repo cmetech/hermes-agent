@@ -870,3 +870,81 @@ git diff --check
 ```
 
 Expected: only the two preserved reviewer-owned files remain modified/untracked. Report the design, plan, fix, CI, and verification commit IDs; all red/green and gate evidence; exact changed files; and that no merge, tag, release, or push occurred.
+
+---
+
+### Task 4: Contain corrupt legacy policy evidence to its run
+
+**Files:**
+- Modify: `plugins/workflow/store.py`
+- Test: `tests/plugins/workflow/test_schema_migrations.py`
+- Modify: `docs/superpowers/specs/2026-07-19-workflow-orchestration-run-scoped-repair-containment-design.md`
+
+**Interfaces:**
+- Consumes: `RunStore._transition_run_repair(...)`, `RunStore.node_effect_classification(...)`, `RunStore.attention_candidates(...)`.
+- Produces: active `legacy_effect_policy_uncorroborated` run state that clears after successful policy corroboration.
+
+- [ ] **Step 1: Write the genuine legacy-fixture failure test**
+
+Copy the hash-pinned v2.0.9 fixture into a temporary home, relocate its indexed run directory, instantiate `RunStore`, and corrupt only `policy.yaml`. Assert `node_effect_classification` raises `JournalRecoveryError`, `storage_health()` remains healthy, the exact run-scoped reason is active and visible in attention, and an unrelated run is admitted. Restore the policy bytes, assert classification returns `outward`, and assert the active reason clears.
+
+- [ ] **Step 2: Run the focused test red**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/plugins/workflow/test_schema_migrations.py::test_legacy_policy_damage_is_run_scoped_visible_and_self_clearing
+```
+
+Expected: fail because the legacy policy catch writes `.repair-required.json`, making storage health and unrelated admission fail globally.
+
+- [ ] **Step 3: Implement the third run-scoped reason**
+
+Add `legacy_effect_policy_uncorroborated` to `_RUN_SCOPED_REPAIR_REASONS` and every active-reason SQL predicate. Replace the legacy policy global marker with `_transition_run_repair(..., outcome="repair_required")`. After either persisted classification or successful legacy policy corroboration, append `repair_verified`. Overlay any active exact run-scoped reason in attention rather than special-casing only notification reconciliation.
+
+- [ ] **Step 4: Verify and commit**
+
+Run the focused test, the complete schema-migration and containment selections, `git diff --check`, and an exact staged-file audit. Commit:
+
+```bash
+git commit -m "fix(workflow): contain legacy policy damage"
+```
+
+### Task 5: Make workflow-test gate membership opt-out
+
+**Files:**
+- Modify: `.github/workflows/ci.yml`
+- Modify: `tests/scripts/test_workflow_merge_gate.py`
+
+**Interfaces:**
+- Consumes: explicit pytest paths in the base merge gate and portability matrix.
+- Produces: matrix coverage for `test_notifications.py` and `test_desktop_api.py`, plus a complete inventory-minus-selected-minus-opt-outs invariant.
+
+- [ ] **Step 1: Write the red membership assertions**
+
+Add both critical files to `test_native_workflow_matrix_covers_every_release_gate`. Add a meta-test that enumerates `tests/plugins/workflow/test_*.py`, extracts explicit workflow test paths from the gate and CI YAML, and fails for uncovered files, stale opt-outs, empty reasons, or wildcard opt-outs. Start with no opt-outs so the structural test demonstrates the current uncovered inventory.
+
+- [ ] **Step 2: Run the two meta-tests red**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/scripts/test_workflow_merge_gate.py::test_native_workflow_matrix_covers_every_release_gate \
+  tests/scripts/test_workflow_merge_gate.py::test_every_workflow_test_is_selected_or_explicitly_opted_out
+```
+
+Expected: the first test reports the two missing matrix paths; the second reports every existing workflow test that is neither explicitly selected nor explicitly opted out.
+
+- [ ] **Step 3: Add exact matrix paths and explicit opt-outs**
+
+Add `test_desktop_api.py` and `test_notifications.py` to the portability pytest command. Populate a path-to-reason opt-out mapping with the exact current unselected inventory; use no globs or prefix exemptions. Require opt-outs to be removed if a file becomes selected.
+
+- [ ] **Step 4: Verify and commit**
+
+Run the meta-tests, both newly selected test files, the final focused selection, installed-distribution integration, and the base merge gate. Audit the exact two-file staged set and commit:
+
+```bash
+git commit -m "test(workflow): require explicit gate membership"
+```
