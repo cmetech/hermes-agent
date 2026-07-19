@@ -3,7 +3,7 @@
 **Fresh review date:** 2026-07-19
 
 **Reviewed branch:** `feat/workflow-production-remediation` through
-`ace0024368a36efd2ce6d21d32c19f579df61043`
+`2feebb17343142d25271bd27590a1d687ebfa616`
 
 **Verdict:** **READY FOR MAINTAINER MERGE REVIEW. No Critical or High merge
 blocker remains.**
@@ -33,6 +33,25 @@ compilation. The focused cross-finding selection passed 102 tests, and the
 hash-pinned cumulative v2.0.9 migration test passed separately. The thirteen
 new Low findings remain explicitly backlogged as non-blocking follow-ups; none
 is silently described as fixed.
+
+## Follow-up-fixes correction
+
+The independent follow-up-fixes review at `b850e2cc7`, preserved in
+`2026-07-19-workflow-orchestration-followup-fixes-adversarial-review.md`,
+verified NF-H1 and NF-M1–NF-M5 closed and found one new Medium, NF2-M1. The
+synchronous standby delivery drain could occupy the election thread for the
+full adapter timeout budget and delay failover by minutes.
+
+`2feebb173` moves standby delivery onto one bounded worker. The election loop
+continues to observe and contend while that worker is blocked; the existing
+per-row outbox lease and receipt machinery remains unchanged. A real two-host
+test stops the web leader while the Gateway adapter is blocked and proves the
+Gateway acquires leadership before the adapter is released. A companion test
+pins `retryable_failure` to `outbox.fail()` and verifies the row returns to
+pending with its attempt and error recorded. The coordinator/lifecycle
+selection passed 63 tests, and the exact-commit no-argument gate again passed
+652 tests with one platform-conditioned skip, the installed-distribution
+test, 17 Desktop tests, and TypeScript compilation.
 
 ## Fresh-review scope and method
 
@@ -78,7 +97,7 @@ sessions do not inherit local-admin capability merely by existing.
 
 ## Fresh verification conclusion
 
-The final no-argument merge gate at `ace002436` passed 652 Python tests with
+The final no-argument merge gate at `2feebb173` passed 652 Python tests with
 one platform-conditioned skip, the installed-distribution integration test, 17
 Desktop tests, and TypeScript compilation. Native workflow portability passed
 on Windows, Ubuntu, and macOS. The clean distribution rehearsal passed CLI,

@@ -8,7 +8,7 @@
 
 **Final runtime commit:** `2b81fd45be40451f12fea90b2f9a5860042a68d3`
 
-**Final code-and-test commit:** `ace0024368a36efd2ce6d21d32c19f579df61043`
+**Final code-and-test commit:** `2feebb17343142d25271bd27590a1d687ebfa616`
 
 ## Verdict
 
@@ -18,7 +18,10 @@ original adversarial re-review are closed, as are prior release gates M-01,
 M-02, and M-03. A second review at `aea2d9d95` correctly falsified the initial
 completion claim by finding NF-H1 and five Medium follow-ups. NF-H1 and
 NF-M1–NF-M5 are now fixed in six independently verified commits, and the
-post-fix evidence reports **no remaining Critical or High merge blocker**.
+post-fix evidence reports **no remaining Critical or High merge blocker**. A
+third adversarial pass at `b850e2cc7` verified those closures and identified
+NF2-M1, a Medium failover-latency risk. `2feebb173` closes it without changing
+delivery ownership or election safety.
 
 This is evidence for maintainer merge review, not an authorization to merge or
 release. Nothing in this remediation execution was merged, tagged, released,
@@ -63,6 +66,7 @@ or deployed.
 | Adversarial follow-up | `883b33ad5` | Foreground node claims require the exact live owner and epoch in the claim transaction |
 | Adversarial follow-up | `fefed8eb2` | FIFO admission skips predecessors blocked by unrelated held lanes |
 | Adversarial follow-up | `ace002436` | Async reload and Gateway delivery regressions are enforced by the green merge gate |
+| Follow-up correction | `2feebb173` | A single standby delivery worker keeps election and takeover responsive while preserving bounded outbox leases and quiescent shutdown |
 
 The corrective commits discovered by Task 19 changed only branch-owned runtime,
 gate, and test files. In particular, the final builder correction replaces the
@@ -72,15 +76,15 @@ vocabulary.
 
 ## Local merge and focused gates
 
-The final no-argument merge gate was rerun from code commit `ace002436`:
+The final no-argument merge gate was rerun from code commit `2feebb173`:
 
 ```text
 scripts/test_workflow_merge_gate.sh
-652 passed, 1 skipped in 51.27s
-installed-distribution integration: 1 passed in 3.70s
+652 passed, 1 skipped in 50.61s
+installed-distribution integration: 1 passed in 3.59s
 Desktop: 6 files passed, 17 tests passed
 TypeScript: tsc --noEmit passed
-TESTED_BASE_SHA=ace0024368a36efd2ce6d21d32c19f579df61043
+TESTED_BASE_SHA=2feebb17343142d25271bd27590a1d687ebfa616
 ```
 
 Additional current-branch results:
@@ -94,6 +98,9 @@ Builder/provenance/admission regression selection: 38 passed in 2.55s
 Adversarial follow-up integration selection: 102 passed in 28.67s
 Hash-pinned cumulative v2.0.9 migration: 1 passed in 0.12s
 Async reload/delivery merge-gate selection: 15 passed in 1.02s
+NF2-M1 coordinator/lifecycle selection: 63 passed in 6.90s
+NF2-M1 red: blocked standby could not take leadership before adapter release
+NF2-M1 green: takeover completed while the adapter remained blocked; retryable receipt requeued
 Scoped Task 17 Desktop ESLint: passed with zero errors
 git diff --check: passed
 ```
@@ -135,6 +142,16 @@ repeated the workflow-portability result at `ace002436`:
 | Windows | `88206687837` | Passed |
 | Ubuntu | `88206687835` | Passed |
 | macOS | `88206687803` | Passed |
+
+NF2-M1 exact-code run
+[`29693605156`](https://github.com/cmetech/hermes-agent/actions/runs/29693605156)
+passed every workflow-portability job at `2feebb173`:
+
+| Runner | Job | Result |
+|---|---:|---|
+| Windows | `88210510868` | 132 passed, 5 platform-conditioned skips in 170.09s |
+| Ubuntu | `88210510859` | 135 passed, 2 platform-conditioned skips in 37.31s |
+| macOS | `88210510832` | 135 passed, 2 platform-conditioned skips in 41.14s |
 
 That matrix exercises SQLite locking and shadow-table migration, atomic
 replacement, process identity/tree termination, coordinator election and
@@ -250,5 +267,5 @@ claim that the whole unrelated repository baseline is green.
 | M-01 native Linux/macOS/Windows | Passed |
 | M-02 install/update/rollback | Passed with immutable-evidence comparison |
 | M-03 branch-owned no-regression | Passed; unrelated baseline recorded |
-| Fresh adversarial review | NF-H1 found at `aea2d9d95`; post-fix topology and gate evidence close it with no remaining Critical or High blocker |
+| Fresh adversarial review | NF-H1 found at `aea2d9d95` and NF2-M1 found at `b850e2cc7`; both follow-up rounds are closed with no remaining Critical or High blocker |
 | Merge/tag/release/deploy | Not performed |
