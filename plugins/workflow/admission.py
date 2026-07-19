@@ -18,6 +18,7 @@ class RunAdmissionRequest:
     trigger_source: TriggerSource
     idempotency_key: str
     concurrency_key: str
+    idempotency_namespace: str = "profile-local:cli"
     concurrency_policy: Literal["queue", "allow", "forbid"] = "queue"
     execution_mode: Literal["foreground", "background"] = "foreground"
     foreground_owner_id: str | None = None
@@ -25,6 +26,14 @@ class RunAdmissionRequest:
     operator_scope: str | None = None
     run_metadata: Mapping[str, str] | None = None
     provenance: TriggerProvenance | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.idempotency_namespace, str)
+            or not self.idempotency_namespace.strip()
+            or len(self.idempotency_namespace) > 512
+        ):
+            raise ValueError("idempotency_namespace must be bounded non-empty text")
 
 
 @dataclass(frozen=True)

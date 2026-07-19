@@ -87,7 +87,7 @@ class ForegroundExecutionLease:
 
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
-_STORE_SCHEMA_VERSION = 6
+_STORE_SCHEMA_VERSION = 7
 # Direct RunStore/CLI access is already the profile-local filesystem admin
 # boundary. Network adapters must always pass their verified authority binding.
 _LOCAL_ADMIN_AUTHORITY_BINDING = "profile-local-runstore-admin"
@@ -381,6 +381,7 @@ class RunStore:
                         run_id TEXT PRIMARY KEY,
                         workflow_name TEXT NOT NULL,
                         trigger_source TEXT NOT NULL,
+                        idempotency_namespace_digest TEXT NOT NULL,
                         idempotency_digest TEXT NOT NULL,
                         start_digest TEXT NOT NULL,
                         concurrency_key TEXT NOT NULL,
@@ -407,7 +408,11 @@ class RunStore:
                         journal_sequence INTEGER,
                         journal_sha256 TEXT,
                         integrity_verified_at TEXT,
-                        UNIQUE(trigger_source, workflow_name, idempotency_digest)
+                        UNIQUE(
+                            idempotency_namespace_digest,
+                            workflow_name,
+                            idempotency_digest
+                        )
                     );
                     CREATE INDEX IF NOT EXISTS runs_concurrency
                     ON runs(workflow_name, concurrency_key, status);
@@ -524,6 +529,7 @@ class RunStore:
             for name, statement in migrations.items():
                 if name not in columns:
                     connection.execute(statement)
+            self._migrate_runs_idempotency_namespace(connection)
             cleanup_preview_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(cleanup_previews)")
@@ -545,6 +551,7 @@ class RunStore:
                 "run_id",
                 "workflow_name",
                 "trigger_source",
+                "idempotency_namespace_digest",
                 "idempotency_digest",
                 "start_digest",
                 "concurrency_key",
@@ -578,6 +585,150 @@ class RunStore:
                     f"admission index schema is incomplete: {missing}"
                 )
             connection.execute(f"PRAGMA user_version={_STORE_SCHEMA_VERSION}")
+
+    @staticmethod
+    def _migrate_runs_idempotency_namespace(
+        connection: sqlite3.Connection,
+    ) -> None:
+        columns = [
+            row["name"] for row in connection.execute("PRAGMA table_info(runs)")
+        ]
+        table_sql_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='runs'"
+        ).fetchone()
+        table_sql = "".join(str(table_sql_row["sql"] or "").lower().split())
+        expected_unique = (
+            "unique(idempotency_namespace_digest,workflow_name,"
+            "idempotency_digest)"
+        )
+        if "idempotency_namespace_digest" in columns and expected_unique in table_sql:
+            return
+
+        target_columns = (
+            "run_id",
+            "workflow_name",
+            "trigger_source",
+            "idempotency_namespace_digest",
+            "idempotency_digest",
+            "start_digest",
+            "concurrency_key",
+            "concurrency_policy",
+            "disposition",
+            "status",
+            "queue_position",
+            "blocked_by_run_id",
+            "run_directory",
+            "created_at",
+            "updated_at",
+            "admission_state",
+            "desired_status",
+            "staging_directory",
+            "operator_scope_digest",
+            "provenance_json",
+            "execution_mode",
+            "foreground_owner_id",
+            "foreground_lease_expires_at",
+            "foreground_epoch",
+            "projection_schema_version",
+            "projection_state_version",
+            "projection_sha256",
+            "journal_sequence",
+            "journal_sha256",
+            "integrity_verified_at",
+        )
+        source_columns = set(columns)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            source_rows = connection.execute(
+                "SELECT * FROM runs ORDER BY run_id"
+            ).fetchall()
+            connection.execute("DROP TABLE IF EXISTS runs_namespace_migration")
+            connection.execute(
+                """
+                CREATE TABLE runs_namespace_migration (
+                    run_id TEXT PRIMARY KEY,
+                    workflow_name TEXT NOT NULL,
+                    trigger_source TEXT NOT NULL,
+                    idempotency_namespace_digest TEXT NOT NULL,
+                    idempotency_digest TEXT NOT NULL,
+                    start_digest TEXT NOT NULL,
+                    concurrency_key TEXT NOT NULL,
+                    concurrency_policy TEXT NOT NULL,
+                    disposition TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    queue_position INTEGER,
+                    blocked_by_run_id TEXT,
+                    run_directory TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    admission_state TEXT NOT NULL DEFAULT 'published',
+                    desired_status TEXT,
+                    staging_directory TEXT,
+                    operator_scope_digest TEXT,
+                    provenance_json TEXT,
+                    execution_mode TEXT NOT NULL DEFAULT 'foreground',
+                    foreground_owner_id TEXT,
+                    foreground_lease_expires_at TEXT,
+                    foreground_epoch INTEGER,
+                    projection_schema_version INTEGER NOT NULL DEFAULT 1,
+                    projection_state_version INTEGER,
+                    projection_sha256 TEXT,
+                    journal_sequence INTEGER,
+                    journal_sha256 TEXT,
+                    integrity_verified_at TEXT,
+                    UNIQUE(
+                        idempotency_namespace_digest,
+                        workflow_name,
+                        idempotency_digest
+                    )
+                )
+                """
+            )
+            placeholders = ", ".join("?" for _ in target_columns)
+            column_sql = ", ".join(target_columns)
+            for row in source_rows:
+                namespace_digest = (
+                    row["idempotency_namespace_digest"]
+                    if "idempotency_namespace_digest" in source_columns
+                    and row["idempotency_namespace_digest"]
+                    else _sha256(
+                        f"profile-local:{row['trigger_source']}".encode()
+                    )
+                )
+                values = [
+                    namespace_digest
+                    if name == "idempotency_namespace_digest"
+                    else row[name]
+                    for name in target_columns
+                ]
+                connection.execute(
+                    f"INSERT INTO runs_namespace_migration ({column_sql}) "
+                    f"VALUES ({placeholders})",
+                    values,
+                )
+            copied = connection.execute(
+                "SELECT COUNT(*) FROM runs_namespace_migration"
+            ).fetchone()[0]
+            if copied != len(source_rows):
+                raise sqlite3.DatabaseError("runs namespace migration lost rows")
+            connection.execute("DROP TABLE runs")
+            connection.execute("ALTER TABLE runs_namespace_migration RENAME TO runs")
+            connection.execute(
+                "CREATE INDEX runs_concurrency "
+                "ON runs(workflow_name, concurrency_key, status)"
+            )
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise sqlite3.DatabaseError(
+                    "runs namespace migration violated foreign keys"
+                )
+            if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise sqlite3.DatabaseError(
+                    "runs namespace migration failed integrity check"
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
 
     def _preserve_damaged_index(self) -> None:
         preserved_root = self.quarantine_root / f"admission-index-{uuid.uuid4().hex}"
@@ -860,11 +1011,18 @@ class RunStore:
                 "operator_scope_digest": projection.get("operator_scope_digest"),
                 "run_metadata": dict(sorted(metadata.items())),
                 **(
-                    {"provenance": {
-                        key: value
-                        for key, value in projection["provenance"].items()
-                        if key != "admitted_at"
-                    }}
+                    {
+                        "provenance": {
+                            "source": projection["provenance"].get("source"),
+                            "assurance": projection["provenance"].get("assurance"),
+                            "idempotency_namespace_digest": projection.get(
+                                "idempotency_namespace_digest"
+                            )
+                            or _sha256(
+                                f"profile-local:{projection['trigger']}".encode()
+                            ),
+                        }
+                    }
                     if isinstance(projection.get("provenance"), Mapping)
                     and projection["provenance"].get("assurance")
                     != "legacy_unknown"
@@ -888,18 +1046,21 @@ class RunStore:
             raise JournalRecoveryError("run concurrency policy is invalid")
         connection.execute(
             "INSERT INTO runs ("
-            "run_id, workflow_name, trigger_source, idempotency_digest, "
+            "run_id, workflow_name, trigger_source, "
+            "idempotency_namespace_digest, idempotency_digest, "
             "start_digest, concurrency_key, concurrency_policy, disposition, "
             "status, queue_position, blocked_by_run_id, run_directory, "
             "created_at, updated_at, admission_state, desired_status, "
             "staging_directory, operator_scope_digest, provenance_json, "
             "execution_mode, foreground_owner_id, foreground_lease_expires_at, "
-            "foreground_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "foreground_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
             "'published', NULL, NULL, ?, ?, ?, ?, ?, ?)",
             (
                 projection["run_id"],
                 projection["workflow"],
                 projection["trigger"],
+                projection.get("idempotency_namespace_digest")
+                or _sha256(f"profile-local:{projection['trigger']}".encode()),
                 projection["idempotency_key_digest"],
                 self._start_digest_from_projection(projection),
                 projection["concurrency_key"],
@@ -1690,9 +1851,11 @@ class RunStore:
                 "concurrency": request.concurrency_key,
                 "operator_scope_digest": RunStore._scope_digest(request.operator_scope),
                 "run_metadata": dict(sorted((request.run_metadata or {}).items())),
-            }
+        }
         if request.provenance is not None:
-            identity["provenance"] = request.provenance.digest_record()
+            identity["provenance"] = request.provenance.semantic_record(
+                idempotency_namespace=request.idempotency_namespace
+            )
         material = json.dumps(
             identity,
             sort_keys=True,
@@ -1732,6 +1895,11 @@ class RunStore:
             return RunAdmissionResult(None, "rejected", "storage_repair_required")
         if not request.idempotency_key:
             raise ValueError("idempotency_key must not be empty")
+        if (
+            not isinstance(request.idempotency_namespace, str)
+            or not request.idempotency_namespace.strip()
+        ):
+            raise ValueError("idempotency_namespace must not be empty")
         metadata = dict(request.run_metadata or {})
         if any(
             not isinstance(key, str)
@@ -1769,14 +1937,17 @@ class RunStore:
             shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
             raise ValueError("snapshot digests do not match admission request")
         key_digest = _sha256(request.idempotency_key.encode())
+        namespace_digest = _sha256(request.idempotency_namespace.encode())
         operator_scope_digest = self._scope_digest(request.operator_scope)
         start_digest = self._start_digest(request)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
-                "SELECT run_id, start_digest FROM runs WHERE trigger_source=? AND workflow_name=? AND idempotency_digest=?",
-                (request.trigger_source, request.workflow_name, key_digest),
+                "SELECT run_id, start_digest FROM runs "
+                "WHERE idempotency_namespace_digest=? AND workflow_name=? "
+                "AND idempotency_digest=?",
+                (namespace_digest, request.workflow_name, key_digest),
             ).fetchone()
             if existing:
                 connection.commit()
@@ -1888,17 +2059,19 @@ class RunStore:
             provenance_record = provenance.durable_record(admitted_at=now)
             connection.execute(
                 "INSERT INTO runs ("
-                "run_id, workflow_name, trigger_source, idempotency_digest, "
+                "run_id, workflow_name, trigger_source, "
+                "idempotency_namespace_digest, idempotency_digest, "
                 "start_digest, concurrency_key, concurrency_policy, disposition, "
                 "status, queue_position, blocked_by_run_id, run_directory, "
                 "created_at, updated_at, admission_state, desired_status, "
                 "staging_directory, operator_scope_digest, provenance_json, execution_mode, "
                 "foreground_owner_id, foreground_lease_expires_at, foreground_epoch) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     run_id,
                     request.workflow_name,
                     request.trigger_source,
+                    namespace_digest,
                     key_digest,
                     start_digest,
                     request.concurrency_key,
@@ -1928,6 +2101,7 @@ class RunStore:
                 request=request,
                 snapshot=immutable_snapshot,
                 key_digest=key_digest,
+                namespace_digest=namespace_digest,
                 operator_scope_digest=operator_scope_digest,
                 disposition=disposition,
                 status=status,
@@ -1958,6 +2132,7 @@ class RunStore:
         request: RunAdmissionRequest,
         snapshot: PreparedRunSnapshot,
         key_digest: str,
+        namespace_digest: str,
         operator_scope_digest: str | None,
         disposition: str,
         status: str,
@@ -1983,6 +2158,7 @@ class RunStore:
             "input_manifest_digest": request.input_manifest_digest,
             "trigger": request.trigger_source,
             "provenance": dict(provenance_record),
+            "idempotency_namespace_digest": namespace_digest,
             "idempotency_key_digest": key_digest,
             "operator_scope_digest": operator_scope_digest,
             "run_metadata": dict(sorted((request.run_metadata or {}).items())),

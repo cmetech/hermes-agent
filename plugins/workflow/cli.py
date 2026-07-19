@@ -1441,6 +1441,7 @@ def _cmd_run(
         input_manifest_digest=prepared.input_manifest_digest,
         trigger_source=args.trigger_source,
         idempotency_key=intent_key,
+        idempotency_namespace=f"profile-local:{args.trigger_source}",
         concurrency_key=args.concurrency_key
         or str(package.sidecar.get("concurrency_key") or package.definition.name),
         concurrency_policy=str(package.sidecar.get("overlap_policy") or "queue"),

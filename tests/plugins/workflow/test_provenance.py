@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
-from plugins.workflow.provenance import TriggerProvenance
+from plugins.workflow.provenance import (
+    TriggerProvenance,
+    legacy_projection_provenance,
+)
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 
 
-def _request(package, prepared, *, provenance=None, source="cli"):
+def _request(
+    package,
+    prepared,
+    *,
+    provenance=None,
+    source="cli",
+    namespace="profile-local:cli",
+    concurrency_policy="queue",
+):
     return RunAdmissionRequest(
         workflow_name=package.definition.name,
         definition_digest=prepared.definition_digest,
@@ -18,7 +30,9 @@ def _request(package, prepared, *, provenance=None, source="cli"):
         input_manifest_digest=prepared.input_manifest_digest,
         trigger_source=source,
         idempotency_key=f"intent-{source}",
+        idempotency_namespace=namespace,
         concurrency_key=package.definition.name,
+        concurrency_policy=concurrency_policy,
         provenance=provenance,
     )
 
@@ -104,3 +118,108 @@ def test_provenance_must_match_legacy_trigger_source(tmp_path, workflow_writer) 
             _request(package, prepared, provenance=provenance, source="cli"),
             immutable_snapshot=prepared,
         )
+
+
+def test_verified_principals_have_separate_idempotency_namespaces(
+    tmp_path, workflow_writer
+) -> None:
+    package = load_workflow(workflow_writer(tmp_path / "package", name="principals"))
+    store = RunStore(tmp_path / "home")
+
+    admitted = []
+    for principal in ("alice", "bob"):
+        prepared = store.prepare_run_snapshot(package)
+        provenance = TriggerProvenance(
+            source="api",
+            assurance="verified_adapter",
+            intent_key="intent-api",
+            actor_id=principal,
+        )
+        admitted.append(
+            store.start_run(
+                _request(
+                    package,
+                    prepared,
+                    provenance=provenance,
+                    source="api",
+                    namespace=f"verified:test:{principal}",
+                    concurrency_policy="allow",
+                ),
+                immutable_snapshot=prepared,
+            )
+        )
+
+    assert [result.disposition for result in admitted] == ["created", "created"]
+    assert admitted[0].run_id != admitted[1].run_id
+
+
+def test_return_route_and_source_instance_rotation_do_not_change_start_identity(
+    tmp_path, workflow_writer
+) -> None:
+    package = load_workflow(workflow_writer(tmp_path / "package", name="delivery"))
+    store = RunStore(tmp_path / "home")
+
+    def admit(source_instance: str, actor_id: str, return_route: str):
+        prepared = store.prepare_run_snapshot(package)
+        provenance = TriggerProvenance(
+            source="api",
+            assurance="verified_adapter",
+            intent_key="intent-api",
+            source_instance=source_instance,
+            actor_id=actor_id,
+            return_route=return_route,
+        )
+        request = _request(
+            package,
+            prepared,
+            provenance=provenance,
+            source="api",
+            namespace="verified:test:alice",
+        )
+        return store.start_run(request, immutable_snapshot=prepared), request
+
+    (first, first_request) = admit(
+        "api-instance-a", "display-actor-a", "route-capability-a"
+    )
+    (retry, _retry_request) = admit(
+        "api-instance-b", "display-actor-b", "route-capability-b"
+    )
+
+    assert retry.disposition == "existing"
+    assert retry.run_id == first.run_id
+    projection = store.load_run(first.run_id)
+    assert projection["provenance"]["return_route"] == (
+        "route-capability-a"
+    )
+    assert projection["provenance"]["actor_id"] == "display-actor-a"
+    assert store._start_digest(first_request) == store._start_digest_from_projection(
+        projection
+    )
+
+
+def test_semantic_provenance_excludes_volatile_audit_and_delivery_fields() -> None:
+    provenance = TriggerProvenance(
+        source="api",
+        assurance="verified_adapter",
+        intent_key="intent",
+        source_instance="pid-like-instance",
+        actor_id="verified-principal",
+        return_route="opaque-route",
+    )
+
+    assert provenance.semantic_record(
+        idempotency_namespace="verified:test:principal"
+    ) == {
+        "source": "api",
+        "assurance": "verified_adapter",
+        "idempotency_namespace_digest": hashlib.sha256(
+            b"verified:test:principal"
+        ).hexdigest(),
+    }
+
+
+def test_missing_legacy_trigger_is_unknown_not_cli() -> None:
+    provenance = legacy_projection_provenance({})
+
+    assert provenance["source"] == "unknown"
+    assert provenance["assurance"] == "legacy_unknown"

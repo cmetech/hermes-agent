@@ -114,14 +114,30 @@ class TriggerProvenance:
             "admitted_at": admitted_at,
         }
 
-    def digest_record(self) -> dict[str, str | None]:
-        record = self.durable_record(admitted_at="")
-        record.pop("admitted_at")
-        return record
+    def semantic_record(self, *, idempotency_namespace: str) -> dict[str, str]:
+        """Return only stable, verified identity used by admission semantics."""
+        namespace = _bounded(
+            idempotency_namespace,
+            name="idempotency_namespace",
+            required=True,
+        )
+        assert namespace is not None
+        return {
+            "source": self.source,
+            "assurance": self.assurance,
+            "idempotency_namespace_digest": hashlib.sha256(
+                namespace.encode()
+            ).hexdigest(),
+        }
+
+    def digest_record(self, *, idempotency_namespace: str) -> dict[str, str]:
+        """Backward-compatible name for the semantic admission record."""
+        return self.semantic_record(idempotency_namespace=idempotency_namespace)
 
 
 def legacy_projection_provenance(projection: dict[str, object]) -> dict[str, str | None]:
-    source = str(projection.get("trigger") or "cli")
+    trigger = projection.get("trigger")
+    source = str(trigger) if isinstance(trigger, str) and trigger in _SOURCES else "unknown"
     return {
         "source": source,
         "assurance": "legacy_unknown",

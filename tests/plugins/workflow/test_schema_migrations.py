@@ -121,6 +121,7 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             row["name"] for row in connection.execute("PRAGMA table_info(runs)")
         }
         assert {
+            "idempotency_namespace_digest",
             "execution_mode",
             "foreground_epoch",
             "foreground_lease_expires_at",
@@ -172,6 +173,14 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             "workflow_notification_delivery",
             "workflow_notification_fact_run",
         } <= indexes
+        runs_schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='runs'"
+        ).fetchone()[0]
+        normalized_runs_schema = "".join(runs_schema.lower().split())
+        assert (
+            "unique(idempotency_namespace_digest,workflow_name,"
+            "idempotency_digest)" in normalized_runs_schema
+        )
         assert connection.execute("PRAGMA user_version").fetchone()[0] == (
             _STORE_SCHEMA_VERSION
         )
@@ -218,6 +227,7 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             input_manifest_digest=prepared.input_manifest_digest,
             trigger_source="cli",
             idempotency_key="legacy-semantic-request",
+            idempotency_namespace="profile-local:cli",
             concurrency_key="migration-fixture",
         ),
         immutable_snapshot=prepared,
