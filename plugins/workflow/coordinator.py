@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from concurrent.futures import Future, ThreadPoolExecutor
 import logging
+import json
 import os
 from pathlib import Path
 import threading
@@ -207,6 +208,50 @@ class WorkflowCoordinatorService:
             max_journal_bytes=int(run_store.max_journal_bytes),
         )
 
+    @staticmethod
+    def _deliver_gateway_notifications(outbox, delivery_port, *, owner_id: str) -> int:
+        """Project leased outbox rows through the host port exactly once."""
+        delivered = 0
+        for notification in outbox.lease_gateway(owner_id=owner_id, limit=20):
+            notification_id = str(notification["notification_id"])
+            destination = str(notification["destination"])
+            capability = destination.removeprefix("gateway:")
+            idempotency_key = (
+                f"workflow-notification:{notification_id}:"
+                f"{notification['transition_version']}"
+            )
+            text = json.dumps(
+                notification["payload"], sort_keys=True, separators=(",", ":")
+            )
+            try:
+                receipt = delivery_port.deliver(capability, text, idempotency_key)
+            except Exception as exc:
+                logger.exception("Gateway notification delivery failed before receipt")
+                outbox.terminal_fail(
+                    notification_id,
+                    owner_id=owner_id,
+                    error=f"delivery_exception:{type(exc).__name__}",
+                    outcome_uncertain=True,
+                )
+                continue
+            if receipt.status == "delivered":
+                if outbox.ack(notification_id, owner_id=owner_id):
+                    delivered += 1
+            elif receipt.status == "retryable_failure":
+                outbox.fail(
+                    notification_id,
+                    owner_id=owner_id,
+                    error=receipt.detail or receipt.status,
+                )
+            else:
+                outbox.terminal_fail(
+                    notification_id,
+                    owner_id=owner_id,
+                    error=receipt.detail or receipt.status,
+                    outcome_uncertain=receipt.status == "outcome_uncertain",
+                )
+        return delivered
+
     def _sweep_once(
         self,
         run_store,
@@ -229,6 +274,14 @@ class WorkflowCoordinatorService:
             run_store,
             now_monotonic=sweep_started,
         )
+        if self.context.delivery_port is not None:
+            from plugins.workflow.notifications import NotificationOutbox
+
+            self._deliver_gateway_notifications(
+                NotificationOutbox(run_store),
+                self.context.delivery_port,
+                owner_id=f"coordinator:{identity.owner_id}:{epoch}",
+            )
         now = self._utcnow().astimezone(timezone.utc)
         wakes = coordinator_store.pending_wakes(
             identity,

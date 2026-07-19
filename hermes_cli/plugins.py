@@ -620,6 +620,20 @@ class PluginContext:
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 
+    def register_authenticated_command(
+        self,
+        name: str,
+        handler: Callable,
+        description: str = "",
+        args_hint: str = "",
+    ) -> None:
+        """Register a command that receives host-verified invocation facts."""
+        self.register_command(name, handler, description, args_hint)
+        clean = name.lower().strip().lstrip("/").replace(" ", "-")
+        entry = self._manager._plugin_commands.get(clean)
+        if entry is not None and entry.get("handler") is handler:
+            entry["authenticated"] = True
+
     # -- tool dispatch -------------------------------------------------------
 
     def dispatch_tool(self, tool_name: str, args: dict, **kwargs) -> str:
@@ -1315,6 +1329,7 @@ class PluginManager:
         self._background_service_hosts: Dict[
             BackgroundServiceHostKind, BackgroundServiceHost
         ] = {}
+        self._background_delivery_ports: Dict[BackgroundServiceHostKind, Any] = {}
         self._background_service_lock = threading.RLock()
         self._background_reload_condition = threading.Condition(
             self._background_service_lock
@@ -1444,6 +1459,7 @@ class PluginManager:
         host_kind: BackgroundServiceHostKind,
         *,
         shutdown_timeout: float,
+        delivery_port=None,
     ) -> BackgroundServiceHost:
         self._background_service_generation += 1
         host = BackgroundServiceHost(
@@ -1453,16 +1469,30 @@ class PluginManager:
             generation=self._background_service_generation,
             shutdown_timeout=shutdown_timeout,
             safe_mode=env_var_enabled("HERMES_SAFE_MODE"),
+            delivery_port=delivery_port,
             on_quiescent=self._background_host_quiescent,
         )
         self._background_service_hosts[host_kind] = host
         return host
+
+    def bind_background_delivery_port(
+        self, host: BackgroundServiceHostKind, delivery_port
+    ) -> None:
+        """Bind a host-owned port before constructing its service generation."""
+        if host not in VALID_BACKGROUND_SERVICE_HOSTS:
+            raise ValueError(f"unknown background service host: {host}")
+        with self._background_service_lock:
+            existing = self._background_service_hosts.get(host)
+            if existing is not None and existing.delivery_port is not delivery_port:
+                raise RuntimeError("background service host is already bound")
+            self._background_delivery_ports[host] = delivery_port
 
     def start_background_services(
         self,
         host: BackgroundServiceHostKind,
         *,
         shutdown_timeout: float = 10.0,
+        delivery_port=None,
     ) -> BackgroundServiceHost:
         """Bind and start one generic service generation for ``host``."""
         if host not in VALID_BACKGROUND_SERVICE_HOSTS:
@@ -1472,8 +1502,15 @@ class PluginManager:
             if self._background_reload_in_progress:
                 raise RuntimeError("background service reload is in progress")
             existing = self._background_service_hosts.get(host)
+            selected_port = (
+                delivery_port
+                if delivery_port is not None
+                else self._background_delivery_ports.get(host)
+            )
             bound = existing or self._make_background_host_locked(
-                host, shutdown_timeout=shutdown_timeout
+                host,
+                shutdown_timeout=shutdown_timeout,
+                delivery_port=selected_port,
             )
         bound.start()
         return bound
@@ -1497,7 +1534,12 @@ class PluginManager:
             self._prune_quiescent_background_hosts_locked()
             old_hosts = tuple(self._background_service_hosts.values())
             host_specs = tuple(
-                (host.host_kind, host.shutdown_timeout) for host in old_hosts
+                (
+                    host.host_kind,
+                    host.shutdown_timeout,
+                    getattr(host, "delivery_port", None),
+                )
+                for host in old_hosts
             )
             self._background_reload_in_progress = True
             self._background_reload_thread_id = threading.get_ident()
@@ -1525,9 +1567,11 @@ class PluginManager:
             with self._background_service_lock:
                 replacements = tuple(
                     self._make_background_host_locked(
-                        host_kind, shutdown_timeout=shutdown_timeout
+                        host_kind,
+                        shutdown_timeout=shutdown_timeout,
+                        delivery_port=delivery_port,
                     )
-                    for host_kind, shutdown_timeout in host_specs
+                    for host_kind, shutdown_timeout, delivery_port in host_specs
                 )
         except BaseException:
             if registries_cleared:
@@ -2587,7 +2631,21 @@ def get_plugin_context_engine():
 def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
-    return entry["handler"] if entry else None
+    return entry["handler"] if entry and not entry.get("authenticated") else None
+
+
+def invoke_plugin_command(name: str, raw_args: str, *, context=None) -> Any:
+    """Invoke a plugin command without allowing callers to synthesize authority."""
+    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+    if entry is None:
+        return None
+    if entry.get("authenticated"):
+        if context is None:
+            raise PermissionError("authenticated invocation context is required")
+        result = entry["handler"](raw_args, context)
+    else:
+        result = entry["handler"](raw_args)
+    return resolve_plugin_command_result(result)
 
 
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0

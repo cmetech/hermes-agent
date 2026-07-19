@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import shlex
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8,12 +10,23 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from hermes_cli.dashboard_auth.base import TokenPrincipal
+from hermes_cli.plugin_invocation import PluginInvocationContext
 
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.notifications import NotificationOutbox
+from plugins.workflow.coordinator import WorkflowCoordinatorService
+from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
+from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.gateway_command import workflow_gateway_command
+from plugins.workflow.trust import (
+    WorkflowTrustStore,
+    build_risk_summary,
+    compute_package_digest,
+)
 
 
 def _module():
@@ -284,3 +297,132 @@ def test_notification_prune_requires_admin_authority(tmp_path, monkeypatch) -> N
     )
     assert allowed.status_code == 200
     assert allowed.json()["pruned"] == 1
+
+
+def test_verified_gateway_route_is_projected_and_delivered_by_coordinator(
+    tmp_path, workflow_writer
+) -> None:
+    capability = "opaque-server-capability"
+    store = RunStore(tmp_path / "home")
+    now = datetime.now(timezone.utc)
+    assert CoordinatorStore(store.database).try_acquire(
+        CoordinatorIdentity(
+            owner_id="gateway-test",
+            host_kind="gateway",
+            host_instance_id="gateway-test",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=now,
+        lease_seconds=60,
+    ).is_leader
+    package = load_workflow(workflow_writer(tmp_path / "gateway", name="gateway-run"))
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="gateway-run",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="chat",
+            idempotency_key="gateway-run",
+            idempotency_namespace="gateway:default:telegram:user-1",
+            concurrency_key="gateway-run",
+            execution_mode="background",
+            provenance=TriggerProvenance(
+                source="chat",
+                assurance="verified_adapter",
+                intent_key="gateway-run",
+                source_instance="gateway:telegram",
+                actor_id="gateway:telegram:user-1",
+                return_route=capability,
+            ),
+        ),
+        immutable_snapshot=prepared,
+    )
+    outbox = NotificationOutbox(store)
+    notification_id = outbox.record(
+        run_id=admitted.run_id,
+        kind="completion",
+        destination="desktop",
+        transition_version=99,
+        payload={"workflow": "gateway-run", "status": "succeeded"},
+    )
+    deliveries = []
+
+    class Port:
+        def deliver(self, route_capability, text, idempotency_key):
+            deliveries.append((route_capability, text, idempotency_key))
+            from hermes_cli.plugin_invocation import DeliveryReceipt
+
+            return DeliveryReceipt(status="delivered", transport_id="message-1")
+
+    delivered = WorkflowCoordinatorService._deliver_gateway_notifications(
+        outbox,
+        Port(),
+        owner_id="coordinator:1",
+    )
+
+    assert delivered == 1
+    assert deliveries[0][0] == capability
+    assert deliveries[0][2] != notification_id
+    gateway_history = [
+        item
+        for item in outbox.history(run_id=admitted.run_id)
+        if item["destination"].startswith("gateway:")
+    ]
+    assert gateway_history[0]["state"] == "delivered"
+
+
+def test_authenticated_gateway_command_starts_real_background_run(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workflow_path = workflow_writer(tmp_path / "package", name="gateway-real")
+    package = load_workflow(workflow_path)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(home).trust(
+        digest.sha256,
+        actor="test-operator",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    assert CoordinatorStore(store.database).try_acquire(
+        CoordinatorIdentity(
+            owner_id="gateway-test",
+            host_kind="gateway",
+            host_instance_id="gateway-test",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=datetime.now(timezone.utc),
+        lease_seconds=60,
+    ).is_leader
+    invocation = PluginInvocationContext(
+        boundary="gateway",
+        principal="gateway:telegram:user-1",
+        operator_scope="gateway:default:telegram:chat-1:user-1",
+        assurance="verified_adapter",
+        return_route_capability="opaque-capability",
+    )
+
+    response = json.loads(
+        workflow_gateway_command(
+            f"run {shlex.quote(str(workflow_path))} "
+            "--idempotency-key stable-request",
+            invocation,
+            hermes_home=home,
+            workdir=tmp_path,
+        )
+    )
+
+    assert response["ok"] is True
+    run = store.get_run_status(
+        response["result"]["run_id"],
+        operator_scope=invocation.operator_scope,
+    )
+    assert run["execution_mode"] == "background"
+    assert run["provenance"]["assurance"] == "verified_adapter"
+    assert run["provenance"]["actor_id"] == invocation.principal
+    assert run["provenance"]["return_route"] == "opaque-capability"

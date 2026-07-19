@@ -202,6 +202,11 @@ class NotificationOutbox:
         safe_payload = json.dumps(
             sanitize_projection(dict(payload)), sort_keys=True, separators=(",", ":")
         )
+        gateway_destination = self._gateway_destination(
+            run_id,
+            source_destination=destination,
+            delivery_state=delivery_state,
+        )
         with self.store._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             duplicate = connection.execute(
@@ -211,7 +216,18 @@ class NotificationOutbox:
             ).fetchone()
             if duplicate is not None:
                 connection.commit()
-                return str(duplicate["notification_id"])
+                notification_id = str(duplicate["notification_id"])
+                if gateway_destination is not None:
+                    self.record(
+                        run_id=run_id,
+                        kind=kind,
+                        destination=gateway_destination,
+                        transition_version=transition_version,
+                        payload=payload,
+                        delivery_state=delivery_state,
+                        now=observed,
+                    )
+                return notification_id
             if kind in COALESCED_KINDS:
                 window = (observed - timedelta(seconds=60)).isoformat()
                 candidate = connection.execute(
@@ -250,7 +266,18 @@ class NotificationOutbox:
                         ),
                     )
                     connection.commit()
-                    return str(candidate["notification_id"])
+                    notification_id = str(candidate["notification_id"])
+                    if gateway_destination is not None:
+                        self.record(
+                            run_id=run_id,
+                            kind=kind,
+                            destination=gateway_destination,
+                            transition_version=transition_version,
+                            payload=payload,
+                            delivery_state=delivery_state,
+                            now=observed,
+                        )
+                    return notification_id
             notification_id = uuid.uuid4().hex
             connection.execute(
                 "INSERT INTO workflow_notification_outbox ("
@@ -288,7 +315,46 @@ class NotificationOutbox:
                 ),
             )
             connection.commit()
+        if gateway_destination is not None:
+            self.record(
+                run_id=run_id,
+                kind=kind,
+                destination=gateway_destination,
+                transition_version=transition_version,
+                payload=payload,
+                delivery_state=delivery_state,
+                now=observed,
+            )
         return notification_id
+
+    def _gateway_destination(
+        self,
+        run_id: str,
+        *,
+        source_destination: str,
+        delivery_state: str,
+    ) -> str | None:
+        if source_destination != "desktop" or delivery_state != "pending":
+            return None
+        with self.store._connect() as connection:
+            row = connection.execute(
+                "SELECT provenance_json FROM runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            provenance = json.loads(str(row["provenance_json"]))
+        except (TypeError, ValueError):
+            return None
+        capability = provenance.get("return_route")
+        if (
+            provenance.get("assurance") != "verified_adapter"
+            or not isinstance(capability, str)
+            or not capability
+        ):
+            return None
+        return f"gateway:{capability}"
 
     @staticmethod
     def _existing_transition_keys(
@@ -488,6 +554,97 @@ class NotificationOutbox:
                 )
             connection.commit()
         return tuple(self._public(row, lease_owner=owner_id, lease_expires_at=expires) for row in rows)
+
+    def lease_gateway(
+        self,
+        *,
+        owner_id: str,
+        now: datetime | None = None,
+        lease_seconds: float = 30,
+        limit: int = 20,
+    ) -> tuple[dict[str, object], ...]:
+        """Lease pending opaque Gateway projections without resolving routes."""
+        if not owner_id or len(owner_id) > 256:
+            raise ValueError("owner_id must be bounded text")
+        if not 1 <= limit <= 100 or lease_seconds <= 0:
+            raise ValueError("notification lease bounds are invalid")
+        observed = self._aware(now or datetime.now(timezone.utc))
+        timestamp = observed.isoformat()
+        expires = (observed + timedelta(seconds=lease_seconds)).isoformat()
+        with self.store._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE workflow_notification_outbox SET state='pending', "
+                "lease_owner=NULL, lease_expires_at=NULL WHERE state='leased' "
+                "AND destination LIKE 'gateway:%' AND lease_expires_at<=?",
+                (timestamp,),
+            )
+            rows = connection.execute(
+                "SELECT * FROM workflow_notification_outbox WHERE "
+                "destination LIKE 'gateway:%' AND state='pending' "
+                "AND available_at<=? ORDER BY created_at, notification_id LIMIT ?",
+                (timestamp, limit),
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    "UPDATE workflow_notification_outbox SET state='leased', "
+                    "lease_owner=?, lease_expires_at=?, attempts=attempts+1, "
+                    "updated_at=? WHERE notification_id=? AND state='pending'",
+                    (owner_id, expires, timestamp, row["notification_id"]),
+                )
+            connection.commit()
+        return tuple(
+            self._public(
+                row,
+                include_gateway_capability=True,
+                lease_owner=owner_id,
+                lease_expires_at=expires,
+            )
+            for row in rows
+        )
+
+    def terminal_fail(
+        self,
+        notification_id: str,
+        *,
+        owner_id: str,
+        error: str,
+        outcome_uncertain: bool = False,
+        now: datetime | None = None,
+    ) -> bool:
+        """Durably stop a delivery that is unsafe or pointless to replay."""
+        observed = self._aware(now or datetime.now(timezone.utc))
+        with self.store._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM workflow_notification_outbox WHERE "
+                "notification_id=? AND state='leased' AND lease_owner=?",
+                (notification_id, owner_id),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            decision = (
+                "delivery_outcome_uncertain"
+                if outcome_uncertain
+                else "terminal_dead_letter"
+            )
+            connection.execute(
+                "UPDATE workflow_notification_outbox SET state='dead', "
+                "updated_at=?, lease_owner=NULL, lease_expires_at=NULL, "
+                "last_error=? WHERE notification_id=?",
+                (observed.isoformat(), error[:512], notification_id),
+            )
+            self._record_decision_fact(
+                connection,
+                row,
+                decision=decision,
+                occurrence_key=f"{decision}:{uuid.uuid4().hex}",
+                payload={"error": error[:512], "attempts": row["attempts"]},
+                occurred_at=observed.isoformat(),
+            )
+            connection.commit()
+        return True
 
     def ack(self, notification_id: str, *, owner_id: str, now: datetime | None = None) -> bool:
         timestamp = self._aware(now or datetime.now(timezone.utc)).isoformat()
@@ -724,12 +881,20 @@ class NotificationOutbox:
         )
 
     @staticmethod
-    def _public(row: Mapping[str, object], **updates: object) -> dict[str, object]:
+    def _public(
+        row: Mapping[str, object],
+        *,
+        include_gateway_capability: bool = False,
+        **updates: object,
+    ) -> dict[str, object]:
+        destination = str(row["destination"])
+        if destination.startswith("gateway:") and not include_gateway_capability:
+            destination = "gateway:opaque"
         return {
             "notification_id": row["notification_id"],
             "run_id": row["run_id"],
             "kind": row["kind"],
-            "destination": row["destination"],
+            "destination": destination,
             "transition_version": row["transition_version"],
             "coalesced_count": row["coalesced_count"],
             "payload": json.loads(str(row["payload_json"])),

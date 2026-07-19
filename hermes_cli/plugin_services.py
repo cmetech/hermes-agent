@@ -17,6 +17,8 @@ import threading
 import time
 from typing import Callable, Collection, Literal, Protocol, runtime_checkable
 
+from hermes_cli.plugin_invocation import PluginDeliveryPort
+
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,7 @@ class BackgroundServiceContext:
 
     host_kind: BackgroundServiceHostKind
     host_instance_id: str
+    delivery_port: PluginDeliveryPort | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +187,7 @@ class BackgroundServiceHost:
         generation: int,
         shutdown_timeout: float,
         safe_mode: bool,
+        delivery_port: PluginDeliveryPort | None = None,
         on_quiescent: Callable[["BackgroundServiceHost"], None] | None = None,
     ) -> None:
         if host_kind not in VALID_BACKGROUND_SERVICE_HOSTS:
@@ -195,6 +199,7 @@ class BackgroundServiceHost:
             shutdown_timeout, name="shutdown_timeout"
         )
         self._safe_mode = safe_mode
+        self.delivery_port = delivery_port
         self._on_quiescent = on_quiescent
         self._states = tuple(
             _HostedServiceState(registration=registration)
@@ -241,6 +246,7 @@ class BackgroundServiceHost:
         context = BackgroundServiceContext(
             host_kind=self.host_kind,
             host_instance_id=self.host_instance_id,
+            delivery_port=self.delivery_port,
         )
         try:
             service = registration.factory(context)

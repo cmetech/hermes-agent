@@ -585,6 +585,59 @@ upstream_changes:
     migrated to it without weakening same-kind exclusion, quiescence-proven
     reload, or host-owned provider publication.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: authenticated-plugin-gateway-delivery
+  change_class: product-surface-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/plugin_invocation.py
+  - hermes_cli/plugin_services.py
+  - hermes_cli/plugins.py
+  - gateway/plugin_delivery.py
+  - gateway/run.py
+  - plugins/workflow/__init__.py
+  - plugins/workflow/gateway_command.py
+  - plugins/workflow/coordinator.py
+  - plugins/workflow/notifications.py
+  - tests/hermes_cli/test_authenticated_plugin_commands.py
+  - tests/gateway/test_plugin_delivery.py
+  - tests/plugins/workflow/test_notification_delivery.py
+  owned_symbols:
+  - PluginInvocationContext
+  - PluginDeliveryPort
+  - DeliveryReceipt
+  - PluginContext.register_authenticated_command
+  - PluginManager.bind_background_delivery_port
+  - invoke_plugin_command
+  - GatewayPluginDeliveryPort
+  - GatewayRunner authenticated plugin invocation and delivery boundary
+  - workflow_gateway_command
+  - WorkflowCoordinatorService._deliver_gateway_notifications
+  tests:
+  - tests/hermes_cli/test_authenticated_plugin_commands.py
+  - tests/gateway/test_plugin_delivery.py
+  - tests/plugins/workflow/test_notification_delivery.py
+  - tests/hermes_cli/test_plugin_background_services.py
+  - tests/gateway/test_plugin_background_services.py
+  - tests/hermes_cli/test_plugin_provider_hot_reload.py
+  expected_commit_subject: 'feat(plugins): add authenticated gateway delivery'
+  upstream_candidate: true
+  merge_guidance: Preserve immutable host-verified invocation facts and the
+    distinction between existing one-argument commands and authenticated
+    two-argument commands. Gateway return routes must be server-minted opaque
+    capabilities whose durable registry stores only a digest and normalized
+    verified route. Fence every adapter send durably before the outward effect,
+    deduplicate by delivery key across receipt loss, and never replay a sending
+    or otherwise uncertain outcome. Keep delivery optional and host-owned in
+    generic service context; web hosts receive no port. The workflow plugin is
+    the concrete consumer and must keep return-route capability out of semantic
+    admission identity while persisting it as durable provenance and projecting
+    its authoritative notification outbox through the coordinator.
+  removal_condition: Remove when Hermes upstream provides equivalent generic
+    authenticated plugin invocation and restart-safe opaque Gateway delivery
+    capabilities, and workflow has migrated without exposing adapter routes,
+    accepting client provenance, adding a competing queue, or replaying
+    uncertain outward effects.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: web-plugin-background-service-host
   change_class: product-surface-generic
   owner: workflow-orchestration
