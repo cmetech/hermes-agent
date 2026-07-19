@@ -90,7 +90,7 @@ def test_published_contract_constructs_real_commands_without_duplicates(
         common,
         _render(commands["run_foreground"], **values),
     )
-    assert exit_code == 1
+    assert exit_code == 0
     assert started["ok"] is True
     paused = started["result"]
     assert paused["status"] == "paused"
@@ -136,6 +136,20 @@ def test_showcase_preflight_publishes_the_same_operator_contract(tmp_path) -> No
         "evidence",
         "symptom",
     ]
+
+
+def test_operator_contract_publishes_complete_exit_code_table() -> None:
+    assert operator_command_contract()["exit_codes"] == {
+        "success": 0,
+        "invocation": 2,
+        "not_found": 3,
+        "authorization": 4,
+        "conflict": 5,
+        "coordinator_unavailable": 6,
+        "blocking_finding": 7,
+        "action_failed": 8,
+        "internal": 70,
+    }
 
 
 def test_operator_skills_are_structured_and_defer_syntax_to_runtime() -> None:

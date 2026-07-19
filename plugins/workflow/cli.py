@@ -39,18 +39,21 @@ from plugins.workflow.models import (
     WorkflowValidationError,
 )
 from plugins.workflow.machine_contract import (
+    CoordinatorUnavailable,
     EXIT_ACTION_FAILED,
     EXIT_AUTHORIZATION,
     EXIT_BLOCKING_FINDING,
-    EXIT_CONFLICT,
-    EXIT_COORDINATOR_UNAVAILABLE,
     EXIT_INTERNAL,
     EXIT_INVOCATION,
-    EXIT_NOT_FOUND,
     MachineError,
+    WorkflowActionFailed,
+    WorkflowAuthorization,
     WorkflowCommandError,
+    WorkflowConflict,
+    WorkflowNotFound,
     error_envelope,
     operator_command_contract,
+    projection_was_truncated,
     success_envelope,
 )
 from plugins.workflow.provenance import TriggerProvenance
@@ -76,6 +79,40 @@ from tools.managed_process import ProcessResourceLimits
 _MACHINE_COMMAND: ContextVar[str] = ContextVar(
     "workflow_machine_command", default="workflow"
 )
+
+
+class _WorkflowArgumentParser(argparse.ArgumentParser):
+    """Keep argparse failures inside the JSON machine contract."""
+
+    _machine_mode = False
+
+    def parse_known_args(self, args=None, namespace=None):
+        arguments = list(args) if args is not None else sys.argv[1:]
+        self._machine_mode = "--json" in arguments
+        parsed, extras = super().parse_known_args(arguments, namespace)
+        if self._machine_mode and extras:
+            self.error(f"unrecognized arguments: {' '.join(extras)}")
+        return parsed, extras
+
+    def error(self, message: str) -> None:
+        if not self._machine_mode:
+            super().error(message)
+        parts = self.prog.split()
+        action = (
+            " ".join(parts[-2:])
+            if len(parts) >= 2 and parts[-2] == "showcase"
+            else parts[-1]
+        )
+        error = MachineError("invalid_request", message)
+        print(
+            json.dumps(
+                error_envelope(f"workflow {action}", error),
+                sort_keys=True,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        self.exit(EXIT_INVOCATION)
 
 
 def _compat_dict(report: CompatibilityReport) -> dict[str, object]:
@@ -318,7 +355,9 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument(
         "--hermes-home", default=str(get_hermes_home()), help=argparse.SUPPRESS
     )
-    actions = subparser.add_subparsers(dest="workflow_action")
+    actions = subparser.add_subparsers(
+        dest="workflow_action", parser_class=_WorkflowArgumentParser
+    )
 
     list_parser = actions.add_parser(
         "list", aliases=["ls"], help="List discovered workflows"
@@ -539,10 +578,8 @@ def _resolve(args: argparse.Namespace, name: str) -> WorkflowPackage:
         {"id": package.definition.name, "kind": "workflow", "label": package.definition.name}
         for package in sorted(packages, key=lambda item: item.definition.name)[:10]
     ]
-    raise WorkflowCommandError(
-        "not_found",
+    raise WorkflowNotFound(
         f"workflow not found: {name}",
-        exit_code=EXIT_NOT_FOUND,
         details={"candidates": candidates},
     )
 
@@ -558,9 +595,10 @@ def _cron_jobs() -> Iterable[Mapping[str, object]]:
 
 def _emit(payload: object, *, as_json: bool) -> None:
     if as_json:
+        command = _MACHINE_COMMAND.get()
         print(
             json.dumps(
-                success_envelope(_MACHINE_COMMAND.get(), payload),
+                success_envelope(command, payload),
                 sort_keys=True,
                 ensure_ascii=False,
                 indent=2,
@@ -639,6 +677,13 @@ def _cmd_validate(args: argparse.Namespace) -> int:
             for issue in issues
         ],
     }
+    if args.json and not payload["valid"]:
+        raise WorkflowCommandError(
+            "validation_failed",
+            "workflow validation found blocking issues",
+            exit_code=EXIT_BLOCKING_FINDING,
+            result=payload,
+        )
     if args.json:
         _emit(payload, as_json=True)
     else:
@@ -647,7 +692,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         )
         for issue in payload["issues"]:
             print(f"- {issue['severity']}: {issue['path']}: {issue['message']}")
-    return 0 if payload["valid"] else 1
+    return 0 if payload["valid"] else EXIT_BLOCKING_FINDING
 
 
 _MCP_ENV_REFERENCE = re.compile(
@@ -1262,11 +1307,9 @@ def _cmd_trust(args: argparse.Namespace) -> int:
         or risk.package_digest != after.sha256
         or risk.risk_digest != fresh_risk.risk_digest
     ):
-        raise WorkflowCommandError(
-            "package_changed",
+        raise WorkflowConflict(
             "package changed while trust was being recorded; rerun doctor",
-            exit_code=EXIT_CONFLICT,
-            retryable=True,
+            code="package_changed",
         )
     WorkflowTrustStore(args.hermes_home).trust(
         after.sha256,
@@ -1402,10 +1445,9 @@ def _cmd_run(
     if WorkflowTrustStore(args.hermes_home).check(
         digest.sha256, risk_digest=risk.risk_digest
     ) != "trusted":
-        raise WorkflowCommandError(
-            "trust_required",
+        raise WorkflowAuthorization(
             "workflow package is not trusted; run doctor and trust its exact digest",
-            exit_code=EXIT_AUTHORIZATION,
+            code="trust_required",
         )
     preflight_execution(risk, trusted=True)
     store = _store(args, runtime)
@@ -1416,12 +1458,9 @@ def _cmd_run(
     )
     execution_mode = "foreground" if args.foreground else "background"
     if execution_mode == "background" and coordinator.status != "healthy":
-        raise WorkflowCommandError(
-            "coordinator_unavailable",
+        raise CoordinatorUnavailable(
             "background execution requires a healthy workflow coordinator; "
-            "use --foreground for explicit local execution",
-            exit_code=EXIT_COORDINATOR_UNAVAILABLE,
-            retryable=True,
+            "use --foreground for explicit local execution"
         )
     if (args.json or args.no_wait) and not args.idempotency_key:
         raise WorkflowCommandError(
@@ -1462,16 +1501,18 @@ def _cmd_run(
     if admitted.run_id is None:
         reason = admitted.reason_code or "admission_rejected"
         if reason == "coordinator_unavailable":
-            exit_code = EXIT_COORDINATOR_UNAVAILABLE
-        elif reason in {"idempotency_conflict", "coordinator_active"}:
-            exit_code = EXIT_CONFLICT
-        else:
-            exit_code = EXIT_ACTION_FAILED
-        raise WorkflowCommandError(
-            reason,
+            raise CoordinatorUnavailable(
+                f"workflow admission was rejected: {reason}"
+            )
+        if reason in {"idempotency_conflict", "coordinator_active"}:
+            raise WorkflowConflict(
+                f"workflow admission was rejected: {reason}",
+                code=reason,
+                details={"admission_disposition": admitted.disposition},
+            )
+        raise WorkflowActionFailed(
             f"workflow admission was rejected: {reason}",
-            exit_code=exit_code,
-            retryable=reason in {"coordinator_unavailable", "coordinator_active"},
+            code=reason,
             details={"admission_disposition": admitted.disposition},
         )
     if admitted.disposition == "created" and execution_mode == "foreground":
@@ -1502,12 +1543,61 @@ def _cmd_run(
     payload = store.get_run_status(admitted.run_id)
     payload["action"] = "run"
     payload["admission_disposition"] = admitted.disposition
+    payload["truncated"] = projection_was_truncated(payload)
+    payload["next_cursor"] = None
+    if payload["status"] in {"failed", "cancelled", "abandoned"}:
+        raise WorkflowActionFailed(
+            f"workflow run entered terminal state: {payload['status']}",
+            code="run_failed",
+            result=payload,
+        )
     _emit(payload, as_json=args.json)
-    return 0 if payload["status"] in {"queued", "running", "succeeded"} else 1
+    return 0
+
+
+def _require_run(store: RunStore, run_id: str) -> dict[str, object]:
+    try:
+        return store.get_run_status(run_id)
+    except KeyError as exc:
+        raise WorkflowNotFound(
+            f"workflow run not found: {run_id}",
+            details={"run_id": run_id},
+        ) from exc
+
+
+def _run_page(
+    store: RunStore,
+    *,
+    workflow: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    view: str = "all",
+) -> dict[str, object]:
+    runs = store.list_runs(
+        workflow=workflow, status=status, limit=limit, view=view
+    )
+    next_cursor = None
+    if len(runs) == limit and runs:
+        keyset = (str(runs[-1]["updated_at"]), str(runs[-1]["run_id"]))
+        remainder = store.list_runs(
+            workflow=workflow,
+            status=status,
+            limit=1,
+            view=view,
+            after=keyset,
+        )
+        if remainder:
+            next_cursor = list(keyset)
+    return {
+        "runs": runs,
+        "truncated": next_cursor is not None or projection_was_truncated(runs),
+        "next_cursor": next_cursor,
+    }
 
 
 def _cmd_runs(args: argparse.Namespace) -> int:
-    payload = _store(args).list_runs(
+    payload = _run_page(
+        _store(args),
         workflow=args.workflow, status=args.status, limit=args.limit, view=args.view
     )
     _emit(payload, as_json=args.json)
@@ -1516,13 +1606,22 @@ def _cmd_runs(args: argparse.Namespace) -> int:
 
 def _cmd_status(args: argparse.Namespace) -> int:
     store = _store(args)
-    payload = store.get_run_status(args.run_id) if args.run_id else store.list_runs()
+    if args.run_id:
+        payload = _require_run(store, args.run_id)
+        payload["truncated"] = projection_was_truncated(payload)
+        payload["next_cursor"] = None
+    else:
+        payload = _run_page(store)
     _emit(payload, as_json=args.json)
     return 0
 
 
 def _cmd_events(args: argparse.Namespace) -> int:
-    payload = _store(args).latest_events(args.run_id, limit=args.tail)
+    if not 1 <= args.tail <= 200:
+        raise ValueError("limit must be between 1 and 200")
+    store = _store(args)
+    _require_run(store, args.run_id)
+    payload = store.latest_event_page(args.run_id, limit=args.tail)
     _emit(payload, as_json=args.json)
     return 0
 
@@ -1536,6 +1635,7 @@ def _cmd_approval_decision(
 ) -> int:
     runtime = _runtime_config(args.hermes_home)
     store = _store(args, runtime)
+    _require_run(store, args.run_id)
     if decision == "approved":
         result = store.approve_run(
             args.run_id,
@@ -1564,10 +1664,9 @@ def _cmd_approval_decision(
     payload["action"] = "approve" if decision == "approved" else "reject"
     payload["run_status"] = store.get_run_status(args.run_id)["status"]
     if result.outcome == "already_decided" and result.decision != decision:
-        raise WorkflowCommandError(
-            "decision_conflict",
+        raise WorkflowConflict(
             "the interaction already has a different decision",
-            exit_code=EXIT_CONFLICT,
+            code="decision_conflict",
             details={"interaction_id": result.interaction_id},
         )
     _emit(payload, as_json=args.json)
@@ -1579,7 +1678,7 @@ def _cmd_resume(
 ) -> int:
     runtime = _runtime_config(args.hermes_home)
     store = _store(args, runtime)
-    before = store.get_run_status(args.run_id)
+    before = _require_run(store, args.run_id)
     foreground_conflict = False
     try:
         store.resume_run(args.run_id)
@@ -1594,11 +1693,8 @@ def _cmd_resume(
     )
     after = store.get_run_status(args.run_id)
     if foreground_conflict and after["state_version"] == before["state_version"]:
-        raise WorkflowCommandError(
-            "version_conflict",
+        raise WorkflowConflict(
             "foreground owner conflict: resume made no durable transition",
-            exit_code=EXIT_CONFLICT,
-            retryable=True,
             details={"run_id": args.run_id},
         )
     _emit(after, as_json=args.json)
@@ -1665,7 +1761,7 @@ def _cmd_provide_input(
 ) -> int:
     runtime = _runtime_config(args.hermes_home)
     store = _store(args, runtime)
-    current = store.get_run_status(args.run_id)
+    current = _require_run(store, args.run_id)
     pending = current.get("pending_interaction")
     if isinstance(pending, Mapping):
         actual = pending.get("interaction_id") or pending.get("action_digest")
@@ -1691,6 +1787,7 @@ def _cmd_retry(
 ) -> int:
     runtime = _runtime_config(args.hermes_home)
     store = _store(args, runtime)
+    _require_run(store, args.run_id)
     store.retry_run(
         args.run_id,
         node_id=args.node_id,
@@ -1710,6 +1807,7 @@ def _cmd_reconcile(
 ) -> int:
     runtime = _runtime_config(args.hermes_home)
     store = _store(args, runtime)
+    _require_run(store, args.run_id)
     store.reconcile_run(
         args.run_id,
         args.outcome,
@@ -1727,6 +1825,7 @@ def _cmd_reconcile(
 
 def _cmd_cancel(args: argparse.Namespace) -> int:
     store = _store(args)
+    _require_run(store, args.run_id)
     store.cancel_run(args.run_id)
     _emit(store.get_run_status(args.run_id), as_json=args.json)
     return 0
@@ -1734,13 +1833,16 @@ def _cmd_cancel(args: argparse.Namespace) -> int:
 
 def _cmd_abandon(args: argparse.Namespace) -> int:
     store = _store(args)
+    _require_run(store, args.run_id)
     store.abandon_run(args.run_id)
     _emit(store.get_run_status(args.run_id), as_json=args.json)
     return 0
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:
-    payload = _store(args).archive_run(
+    store = _store(args)
+    _require_run(store, args.run_id)
+    payload = store.archive_run(
         args.run_id, expected_state_version=args.expected_version
     )
     _emit(payload, as_json=args.json)
@@ -1748,7 +1850,9 @@ def _cmd_archive(args: argparse.Namespace) -> int:
 
 
 def _cmd_restore(args: argparse.Namespace) -> int:
-    payload = _store(args).restore_run(
+    store = _store(args)
+    _require_run(store, args.run_id)
+    payload = store.restore_run(
         args.run_id, expected_state_version=args.expected_version
     )
     _emit(payload, as_json=args.json)
@@ -1816,10 +1920,8 @@ def _cmd_showcase(args: argparse.Namespace) -> int:
     action = getattr(args, "showcase_action", None)
     catalog = load_showcase_catalog()
     if action in {"describe", "preflight", "run", "reset"} and args.showcase_id not in catalog:
-        raise WorkflowCommandError(
-            "not_found",
+        raise WorkflowNotFound(
             f"showcase not found: {args.showcase_id}",
-            exit_code=EXIT_NOT_FOUND,
             details={
                 "candidates": [
                     {"id": item.id, "kind": "showcase", "label": item.display_name}
@@ -1853,8 +1955,9 @@ def _cmd_showcase(args: argparse.Namespace) -> int:
             claimed_actor=args.claimed_actor,
         )
     elif action == "status":
-        payload = _store(args).get_run_status(args.run_id)
+        payload = _require_run(_store(args), args.run_id)
     elif action == "report":
+        _require_run(_store(args), args.run_id)
         payload = report_to_dict(
             build_showcase_report(args.run_id, hermes_home=args.hermes_home)
         )
@@ -1979,16 +2082,6 @@ def workflow_command(
         else:
             print(str(exc), file=sys.stderr)
         return exc.exit_code
-    except KeyError as exc:
-        error = MachineError(
-            "not_found",
-            f"requested workflow resource was not found: {exc.args[0]}",
-        )
-        if getattr(args, "json", False):
-            print(json.dumps(error_envelope(command, error), sort_keys=True, indent=2))
-        else:
-            print(error.message, file=sys.stderr)
-        return EXIT_NOT_FOUND
     except WorkflowTrustError as exc:
         error = MachineError("trust_required", str(exc))
         if getattr(args, "json", False):
@@ -1996,19 +2089,6 @@ def workflow_command(
         else:
             print(str(exc), file=sys.stderr)
         return EXIT_AUTHORIZATION
-    except RuntimeError as exc:
-        conflict = "stale" in str(exc).lower() or "conflict" in str(exc).lower()
-        error = MachineError(
-            "version_conflict" if conflict else "action_failed",
-            str(exc),
-            retryable=conflict,
-        )
-        exit_code = EXIT_CONFLICT if conflict else EXIT_ACTION_FAILED
-        if getattr(args, "json", False):
-            print(json.dumps(error_envelope(command, error), sort_keys=True, indent=2))
-        else:
-            print(str(exc), file=sys.stderr)
-        return exit_code
     except (ValueError, WorkflowValidationError) as exc:
         error = MachineError("invalid_request", str(exc))
         if getattr(args, "json", False):

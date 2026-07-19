@@ -7,7 +7,11 @@ from unittest.mock import MagicMock
 from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.coordinator import WorkflowCoordinatorService
-from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.coordinator_store import (
+    CoordinatorIdentity,
+    CoordinatorStore,
+    record_coordinator_wake,
+)
 from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.schema import load_workflow
@@ -35,6 +39,47 @@ def test_thousand_node_projection_is_bounded_and_disables_mermaid(
     assert result.mermaid is None
     assert "topology_mermaid_too_many_nodes" in result.warnings
     assert elapsed < 2.0
+
+
+def test_ten_thousand_expired_coordinator_diagnostics_are_pruned_without_losing_wakes(
+    tmp_path,
+) -> None:
+    store = RunStore(tmp_path / "home")
+    now = datetime.now(timezone.utc)
+    expired = (now - timedelta(days=8)).isoformat()
+    with store._connect() as connection:
+        connection.executemany(
+            "INSERT INTO coordinator_events "
+            "(timestamp, event_type, owner_id, epoch, payload_json) "
+            "VALUES (?, 'diagnostic', 'owner', 1, '{}')",
+            ((expired,) for _ in range(10_000)),
+        )
+        connection.executemany(
+            "INSERT INTO coordinator_wakes "
+            "(run_id, reason_code, created_at, completed_at, completed_epoch, outcome) "
+            "VALUES (?, 'test', ?, ?, 1, 'processed')",
+            ((f"completed-{index}", expired, expired) for index in range(9_999)),
+        )
+        connection.execute(
+            "INSERT INTO coordinator_wakes (run_id, reason_code, created_at) "
+            "VALUES ('unprocessed', 'test', ?)",
+            (expired,),
+        )
+        record_coordinator_wake(
+            connection, run_id="fresh", reason_code="test", now=now
+        )
+        event_count = connection.execute(
+            "SELECT COUNT(*) FROM coordinator_events"
+        ).fetchone()[0]
+        wakes = connection.execute(
+            "SELECT run_id, completed_at FROM coordinator_wakes ORDER BY generation"
+        ).fetchall()
+
+    assert event_count == 0
+    assert [(row["run_id"], row["completed_at"]) for row in wakes] == [
+        ("unprocessed", None),
+        ("fresh", None),
+    ]
 
 
 def test_topology_injection_canaries_remain_strict_graph_grammar(

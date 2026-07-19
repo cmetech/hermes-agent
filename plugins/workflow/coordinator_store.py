@@ -23,6 +23,7 @@ CoordinatorHostKind = Literal["web", "gateway"]
 CoordinatorHealthStatus = Literal["healthy", "standby", "unavailable", "degraded"]
 _LOCAL_WAKE_LOCK = threading.Lock()
 _LOCAL_WAKE_CONDITIONS: dict[str, threading.Condition] = {}
+_DIAGNOSTIC_RETENTION = timedelta(days=7)
 
 
 def _instant(value: datetime, *, name: str) -> datetime:
@@ -50,6 +51,20 @@ def _lease_seconds(value: float) -> float:
     ):
         raise ValueError("lease_seconds must be positive and finite")
     return float(value)
+
+
+def _prune_expired_diagnostics(
+    connection: sqlite3.Connection, *, now: datetime
+) -> None:
+    cutoff = _encoded(now - _DIAGNOSTIC_RETENTION)
+    connection.execute(
+        "DELETE FROM coordinator_events WHERE timestamp<?", (cutoff,)
+    )
+    connection.execute(
+        "DELETE FROM coordinator_wakes "
+        "WHERE completed_at IS NOT NULL AND completed_at<?",
+        (cutoff,),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +184,8 @@ def install_coordinator_schema(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS coordinator_wakes_pending
         ON coordinator_wakes(completed_at, generation);
+        CREATE INDEX IF NOT EXISTS coordinator_events_retention
+        ON coordinator_events(timestamp);
         """
     )
     columns = {
@@ -202,6 +219,7 @@ def record_coordinator_wake(
     if not isinstance(reason_code, str) or not reason_code or len(reason_code) > 128:
         raise ValueError("reason_code must be bounded non-empty text")
     instant = _instant(now or datetime.now(timezone.utc), name="now")
+    _prune_expired_diagnostics(connection, now=instant)
     return int(
         connection.execute(
             "INSERT INTO coordinator_wakes (run_id, reason_code, created_at) "
@@ -332,6 +350,7 @@ class CoordinatorStore:
         epoch: int,
         payload: dict[str, object] | None = None,
     ) -> None:
+        _prune_expired_diagnostics(connection, now=timestamp)
         connection.execute(
             "INSERT INTO coordinator_events "
             "(timestamp, event_type, owner_id, epoch, payload_json) "
@@ -682,6 +701,7 @@ class CoordinatorStore:
                         "WHERE generation=? AND completed_at IS NULL",
                         (_encoded(instant), epoch, outcome, generation),
                     ).rowcount
+                    _prune_expired_diagnostics(connection, now=instant)
                 connection.commit()
             except BaseException:
                 connection.rollback()

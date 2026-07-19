@@ -11,6 +11,8 @@ import pytest
 from plugins import workflow as workflow_plugin
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import _runtime_config, register_cli
+from plugins.workflow import machine_contract
+from plugins.workflow.models import ValidationIssue
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
@@ -38,6 +40,23 @@ def _json_envelope(capsys):
     output = capsys.readouterr()
     assert output.err == ""
     return json.loads(output.out)
+
+
+def test_success_envelope_sanitizes_every_machine_payload_and_preserves_cleanup_capability():
+    ordinary = machine_contract.success_envelope(
+        "workflow list",
+        {"api_token": "secret", "label": "\x1b[31mvisible\x1b[0m"},
+    )
+    assert ordinary["result"] == {"api_token": "[REDACTED]", "label": "visible"}
+
+    cleanup = machine_contract.success_envelope(
+        "workflow cleanup",
+        {"confirmation_token": "server-minted-capability", "api_token": "secret"},
+    )
+    assert cleanup["result"] == {
+        "confirmation_token": "server-minted-capability",
+        "api_token": "[REDACTED]",
+    }
 
 
 def _write(workflow_writer, workdir):
@@ -302,7 +321,7 @@ def test_trust_rejects_package_mutation_during_admission(
     assert WorkflowTrustStore(profile).check(original.sha256) == "untrusted"
 
 
-def test_run_status_events_and_runs_use_the_durable_store(
+def test_run_status_events_and_runs_sanitize_the_durable_store(
     workflow_writer, tmp_path, capsys
 ):
     workdir = tmp_path / "repo"
@@ -327,12 +346,30 @@ def test_run_status_events_and_runs_use_the_durable_store(
         "--json",
     ])
     assert args.func(args) == 0
-    run = _json_result(capsys)
+    run_envelope = _json_envelope(capsys)
+    run = run_envelope["result"]
     assert run["status"] == "succeeded"
+    assert "operator_scope_digest" not in json.dumps(run_envelope)
+    assert "idempotency_key_digest" not in json.dumps(run_envelope)
+
+    RunStore(profile).append_event(
+        run["run_id"],
+        "diagnostic",
+        {
+            "items": list(range(250)),
+            "operator_scope_digest": "scope-secret",
+            "idempotency_key_digest": "intent-secret",
+        },
+    )
 
     args = parser.parse_args([*common, "status", run["run_id"], "--json"])
     assert args.func(args) == 0
-    assert _json_result(capsys)["run_id"] == run["run_id"]
+    status = _json_result(capsys)
+    assert status["run_id"] == run["run_id"]
+    assert status["truncated"] is False
+    assert status["next_cursor"] is None
+    assert "operator_scope_digest" not in json.dumps(status)
+    assert "idempotency_key_digest" not in json.dumps(status)
 
     args = parser.parse_args([
         *common,
@@ -343,11 +380,36 @@ def test_run_status_events_and_runs_use_the_durable_store(
         "--json",
     ])
     assert args.func(args) == 0
-    assert len(_json_result(capsys)) == 2
+    events = _json_result(capsys)
+    assert len(events["events"]) == 2
+    assert events["truncated"] is True
+    assert events["next_cursor"] == events["events"][-1]["sequence"]
+    assert events["events"][-1]["payload_truncated"] is True
+    assert len(events["events"][-1]["payload"]["items"]) == 200
+    assert "operator_scope_digest" not in json.dumps(events)
+    assert "idempotency_key_digest" not in json.dumps(events)
 
     args = parser.parse_args([*common, "runs", "--status", "succeeded", "--json"])
     assert args.func(args) == 0
-    assert _json_result(capsys)[0]["run_id"] == run["run_id"]
+    runs = _json_result(capsys)
+    assert runs["runs"][0]["run_id"] == run["run_id"]
+    assert runs["truncated"] is False
+    assert runs["next_cursor"] is None
+    assert "operator_scope_digest" not in json.dumps(runs)
+    assert "idempotency_key_digest" not in json.dumps(runs)
+
+    args = parser.parse_args([
+        *common,
+        "archive",
+        run["run_id"],
+        "--expected-version",
+        "-1",
+        "--json",
+    ])
+    assert args.func(args) == 5
+    conflict = _json_envelope(capsys)
+    assert conflict["error"]["code"] == "version_conflict"
+    assert conflict["error"]["retryable"] is True
 
 
 def test_foreground_cli_releases_at_gate_and_claims_new_epoch_for_continue(
@@ -381,7 +443,7 @@ def test_foreground_cli_releases_at_gate_and_claims_new_epoch_for_continue(
         "--foreground",
         "--json",
     ])
-    assert start_args.func(start_args) == 1
+    assert start_args.func(start_args) == 0
     paused = _json_result(capsys)
     assert paused["status"] == "paused"
     assert datetime.fromisoformat(paused["foreground_lease_expires_at"]) <= datetime.now(
@@ -474,7 +536,9 @@ def test_json_failures_use_stable_envelopes_and_exit_categories(
 
     monkeypatch.setattr(
         "plugins.workflow.cli._cmd_status",
-        lambda _args: (_ for _ in ()).throw(RuntimeError("stale state version")),
+        lambda _args: (_ for _ in ()).throw(
+            machine_contract.WorkflowConflict("stale state version")
+        ),
     )
     conflict = parser.parse_args([*common, "status", "run", "--json"])
     assert conflict.func(conflict) == 5
@@ -491,6 +555,176 @@ def test_json_failures_use_stable_envelopes_and_exit_categories(
     internal_envelope = _json_envelope(capsys)
     assert internal_envelope["error"]["code"] == "internal_error"
     assert "secret internal detail" not in json.dumps(internal_envelope)
+
+
+def test_json_argparse_failure_uses_one_stdout_envelope(capsys) -> None:
+    with pytest.raises(SystemExit) as exited:
+        _parser().parse_args(["run", "sample", "--json", "--bogus"])
+
+    assert exited.value.code == 2
+    envelope = _json_envelope(capsys)
+    assert envelope["schema_version"] == 1
+    assert envelope["ok"] is False
+    assert envelope["command"] == "workflow run"
+    assert envelope["error"]["code"] == "invalid_request"
+
+
+def test_runs_json_reports_sanitized_keyset_truncation(
+    tmp_path, capsys, workflow_writer
+) -> None:
+    profile = tmp_path / "profile"
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="runs-page")
+    )
+    store = RunStore(
+        profile,
+        max_executing_runs=10,
+        max_nonterminal_runs=10,
+        max_start_requests_per_minute=10,
+    )
+    for index in range(3):
+        prepared = store.prepare_run_snapshot(package)
+        store.start_run(
+            RunAdmissionRequest(
+                workflow_name="runs-page",
+                definition_digest=prepared.definition_digest,
+                policy_digest=prepared.policy_digest,
+                input_manifest_digest=prepared.input_manifest_digest,
+                trigger_source="cli",
+                idempotency_key=f"runs-page-{index}",
+                concurrency_key=f"runs-page-{index}",
+                concurrency_policy="allow",
+            ),
+            immutable_snapshot=prepared,
+        )
+    args = _parser().parse_args([
+        "--hermes-home",
+        str(profile),
+        "runs",
+        "--limit",
+        "2",
+        "--json",
+    ])
+
+    assert args.func(args) == 0
+    page = _json_result(capsys)
+    assert len(page["runs"]) == 2
+    assert page["truncated"] is True
+    assert page["next_cursor"] == [
+        page["runs"][-1]["updated_at"],
+        page["runs"][-1]["run_id"],
+    ]
+    assert "operator_scope_digest" not in json.dumps(page)
+    assert "idempotency_key_digest" not in json.dumps(page)
+
+
+@pytest.mark.parametrize(
+    ("exception_name", "expected_code", "expected_exit", "retryable"),
+    [
+        ("WorkflowNotFound", "not_found", 3, False),
+        ("WorkflowAuthorization", "authorization_required", 4, False),
+        ("WorkflowConflict", "version_conflict", 5, True),
+        ("CoordinatorUnavailable", "coordinator_unavailable", 6, True),
+        ("WorkflowActionFailed", "action_failed", 8, False),
+    ],
+)
+def test_typed_domain_failures_map_without_message_classification(
+    tmp_path,
+    capsys,
+    monkeypatch,
+    exception_name,
+    expected_code,
+    expected_exit,
+    retryable,
+) -> None:
+    exception_type = getattr(machine_contract, exception_name)
+    monkeypatch.setattr(
+        "plugins.workflow.cli._cmd_status",
+        lambda _args: (_ for _ in ()).throw(exception_type("domain detail")),
+    )
+    args = _parser().parse_args([
+        "--hermes-home",
+        str(tmp_path / "profile"),
+        "status",
+        "run",
+        "--json",
+    ])
+
+    assert args.func(args) == expected_exit
+    envelope = _json_envelope(capsys)
+    assert envelope["error"]["code"] == expected_code
+    assert envelope["error"]["retryable"] is retryable
+
+
+@pytest.mark.parametrize("error", [KeyError(), KeyError("internal-lookup")])
+def test_internal_key_errors_use_typed_internal_failure_not_not_found(
+    tmp_path, capsys, monkeypatch, error
+) -> None:
+    monkeypatch.setattr(
+        "plugins.workflow.cli._cmd_status",
+        lambda _args: (_ for _ in ()).throw(error),
+    )
+    args = _parser().parse_args([
+        "--hermes-home",
+        str(tmp_path / "profile"),
+        "status",
+        "run",
+        "--json",
+    ])
+
+    assert args.func(args) == 70
+    envelope = _json_envelope(capsys)
+    assert envelope["error"]["code"] == "internal_error"
+    assert "internal-lookup" not in json.dumps(envelope)
+
+
+def test_untyped_runtime_error_is_internal_even_when_message_says_conflict(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "plugins.workflow.cli._cmd_status",
+        lambda _args: (_ for _ in ()).throw(
+            RuntimeError("diagnostic conflict text is not a typed CAS conflict")
+        ),
+    )
+    args = _parser().parse_args([
+        "--hermes-home",
+        str(tmp_path / "profile"),
+        "status",
+        "run",
+        "--json",
+    ])
+
+    assert args.func(args) == 70
+    envelope = _json_envelope(capsys)
+    assert envelope["error"]["code"] == "internal_error"
+    assert envelope["error"]["retryable"] is False
+    assert "diagnostic conflict" not in json.dumps(envelope)
+
+
+def test_invalid_workflow_validation_uses_documented_blocking_exit(
+    workflow_writer, tmp_path, capsys, monkeypatch
+) -> None:
+    workdir = tmp_path / "repo"
+    _write(workflow_writer, workdir)
+    monkeypatch.setattr(
+        "plugins.workflow.cli.validate_package",
+        lambda _package: (
+            ValidationIssue("nodes", "invalid", "invalid workflow", blocking=True),
+        ),
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "validate",
+        "sample",
+        "--json",
+    ])
+
+    assert args.func(args) == 7
+    envelope = _json_envelope(capsys)
+    assert envelope["ok"] is False
+    assert envelope["error"]["code"] == "validation_failed"
 
 
 def test_machine_start_requires_stable_key_and_background_owner(

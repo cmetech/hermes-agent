@@ -30,6 +30,7 @@ from plugins.workflow.admission import (
     RunAdmissionResult,
 )
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
+from plugins.workflow.machine_contract import WorkflowConflict, projection_was_truncated
 from plugins.workflow.lease_clock import (
     LeaseClockSample,
     lease_is_fresh,
@@ -45,6 +46,7 @@ from plugins.workflow.provenance import (
     TriggerProvenance,
     legacy_projection_provenance,
 )
+from plugins.workflow.sanitize import sanitize_projection
 from plugins.workflow.trust import compute_package_digest
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
@@ -179,7 +181,9 @@ def _recovery_fields(projection: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-def _sanitize(value: object, *, key: str = "") -> object:
+def _sanitize(value: object, *, key: str = "", depth: int = 0) -> object:
+    if depth > 12:
+        return "[TRUNCATED_DEPTH]"
     lowered = key.lower()
     if any(
         marker in lowered
@@ -188,12 +192,13 @@ def _sanitize(value: object, *, key: str = "") -> object:
         return "[REDACTED]"
     if isinstance(value, Mapping):
         return {
-            str(child): _sanitize(item, key=str(child)) for child, item in value.items()
+            str(child): _sanitize(item, key=str(child), depth=depth + 1)
+            for child, item in list(value.items())[:200]
         }
     if isinstance(value, list | tuple):
-        return [_sanitize(item) for item in value[:100]]
+        return [_sanitize(item, key=key, depth=depth + 1) for item in value[:200]]
     if isinstance(value, str):
-        return value[:2000]
+        return value[:16_384]
     if value is None or isinstance(value, bool | int | float):
         return value
     return str(value)[:2000]
@@ -3362,18 +3367,44 @@ class RunStore:
         operator_scope: str | None = None,
     ) -> tuple[dict[str, object], ...]:
         """Return the newest bounded event tail in chronological display order."""
+        return tuple(
+            self.latest_event_page(
+                run_id, limit=limit, operator_scope=operator_scope
+            )["events"]
+        )
+
+    def latest_event_page(
+        self,
+        run_id: str,
+        *,
+        limit: int = 100,
+        operator_scope: str | None = None,
+    ) -> dict[str, object]:
+        """Return one sanitized newest-event page with explicit truncation."""
         if not 1 <= limit <= 200:
             raise ValueError("limit must be between 1 and 200")
         directory = self.run_directory(run_id, operator_scope=operator_scope)
         with workflow_lock(self._run_lock_path(run_id)):
-            selected = self._read_journal_events(directory)[-limit:]
+            all_events = self._read_journal_events(directory)
+            selected = all_events[-limit:]
+        truncated = (
+            len(all_events) > limit
+            or projection_was_truncated(selected)
+            or any(bool(event.get("payload_truncated")) for event in selected)
+        )
         public_events = []
         for event in selected:
             event = dict(event)
             event.pop("projection", None)
             event.pop("projection_sha256", None)
-            public_events.append(_sanitize(event))
-        return tuple(public_events)
+            public_events.append(sanitize_projection(event))
+        return {
+            "events": tuple(public_events),
+            "truncated": truncated,
+            "next_cursor": (
+                int(public_events[-1]["sequence"]) if public_events else 0
+            ),
+        }
 
     def list_runs(
         self,
@@ -3506,7 +3537,7 @@ class RunStore:
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
             if int(projection["state_version"]) != expected_state_version:
-                raise RuntimeError("state version changed")
+                raise WorkflowConflict("state version changed")
             if projection["status"] not in {
                 "succeeded",
                 "failed",
@@ -3553,7 +3584,7 @@ class RunStore:
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
             if int(projection["state_version"]) != expected_state_version:
-                raise RuntimeError("state version changed")
+                raise WorkflowConflict("state version changed")
             if not projection.get("archived_at"):
                 raise ValueError("run is not archived")
             projection["archived_at"] = None
@@ -5313,6 +5344,7 @@ class RunStore:
             recovery["projection"] = json.loads(
                 json.dumps(projection, sort_keys=True, ensure_ascii=False)
             )
+        raw_payload = dict(payload or {})
         event = {
             "sequence": sequence,
             "timestamp": now,
@@ -5320,9 +5352,11 @@ class RunStore:
             "node_id": node_id,
             "attempt_id": attempt_id,
             "event_type": event_type,
-            "payload": _sanitize(dict(payload or {})),
+            "payload": _sanitize(raw_payload),
             **recovery,
         }
+        if projection_was_truncated(raw_payload):
+            event["payload_truncated"] = True
         event, encoded = _encode_journal_frame(event)
         journal_path = directory / "events.jsonl"
         if journal_path.stat().st_size and not _file_ends_with_newline(journal_path):
@@ -6355,7 +6389,7 @@ class RunStore:
             if expected_state_version is not None and (
                 int(projection["state_version"]) != expected_state_version
             ):
-                raise RuntimeError("stale cancellation decision")
+                raise WorkflowConflict("stale cancellation decision")
             if projection["status"] in {
                 "succeeded",
                 "failed",
@@ -6704,7 +6738,7 @@ class RunStore:
             if expected_state_version is not None and (
                 int(projection["state_version"]) != expected_state_version
             ):
-                raise RuntimeError("stale resume decision")
+                raise WorkflowConflict("stale resume decision")
             if projection["status"] not in {"failed", "interrupted"}:
                 if (
                     projection.get("status") == "running"
@@ -6874,7 +6908,7 @@ class RunStore:
             ):
                 if duplicate is not None:
                     return duplicate
-                raise RuntimeError("stale approval decision")
+                raise WorkflowConflict("stale approval decision")
             candidates = [
                 (node_id, node)
                 for node_id, node in projection["nodes"].items()
@@ -7057,7 +7091,7 @@ class RunStore:
         ):
             projection = json.loads((directory / "run.json").read_text())
             if projection["state_version"] != expected_state_version:
-                raise RuntimeError("stale loop input decision")
+                raise WorkflowConflict("stale loop input decision")
             if projection["status"] != "paused":
                 raise ValueError("run is not waiting for loop input")
             candidates = [
@@ -7131,7 +7165,7 @@ class RunStore:
             if expected_state_version is not None and (
                 int(projection["state_version"]) != expected_state_version
             ):
-                raise RuntimeError("stale retry decision")
+                raise WorkflowConflict("stale retry decision")
             candidates = [
                 (candidate_id, node)
                 for candidate_id, node in projection["nodes"].items()
@@ -7196,7 +7230,7 @@ class RunStore:
             if expected_state_version is not None and (
                 int(projection["state_version"]) != expected_state_version
             ):
-                raise RuntimeError("stale reconciliation decision")
+                raise WorkflowConflict("stale reconciliation decision")
             candidates = []
             for candidate_id, node in projection["nodes"].items():
                 pending = node.get("pending_interaction")
@@ -7305,7 +7339,7 @@ class RunStore:
             if expected_state_version is not None and (
                 int(projection["state_version"]) != expected_state_version
             ):
-                raise RuntimeError("stale terminal transition")
+                raise WorkflowConflict("stale terminal transition")
             if projection["status"] not in allowed_from and projection[
                 "status"
             ] not in {"succeeded", "failed", "cancelled", "abandoned"}:

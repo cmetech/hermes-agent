@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
+from plugins.workflow.sanitize import sanitize_projection
+
 
 SCHEMA_VERSION = 1
 EXIT_SUCCESS = 0
@@ -51,12 +53,111 @@ class WorkflowCommandError(RuntimeError):
         self.result = result
 
 
+class WorkflowNotFound(WorkflowCommandError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        super().__init__(
+            "not_found", message, exit_code=EXIT_NOT_FOUND, details=details
+        )
+
+
+class WorkflowAuthorization(WorkflowCommandError):
+    def __init__(self, message: str, *, code: str = "authorization_required") -> None:
+        super().__init__(code, message, exit_code=EXIT_AUTHORIZATION)
+
+
+class WorkflowConflict(WorkflowCommandError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "version_conflict",
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        super().__init__(
+            code,
+            message,
+            exit_code=EXIT_CONFLICT,
+            retryable=True,
+            details=details,
+        )
+
+
+class CoordinatorUnavailable(WorkflowCommandError):
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            "coordinator_unavailable",
+            message,
+            exit_code=EXIT_COORDINATOR_UNAVAILABLE,
+            retryable=True,
+        )
+
+
+class WorkflowActionFailed(WorkflowCommandError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "action_failed",
+        details: Mapping[str, object] | None = None,
+        result: object = None,
+    ) -> None:
+        super().__init__(
+            code,
+            message,
+            exit_code=EXIT_ACTION_FAILED,
+            details=details,
+            result=result,
+        )
+
+
+def projection_was_truncated(value: object, *, depth: int = 0) -> bool:
+    """Report whether the shared machine sanitizer will bound this value."""
+    if depth > 12:
+        return True
+    if isinstance(value, Mapping):
+        if len(value) > 200:
+            return True
+        return any(
+            projection_was_truncated(item, depth=depth + 1)
+            for item in value.values()
+        )
+    if isinstance(value, list | tuple):
+        if len(value) > 200:
+            return True
+        return any(
+            projection_was_truncated(item, depth=depth + 1) for item in value
+        )
+    return isinstance(value, str) and len(value) > 16_384
+
+
+def _sanitize_success_result(command: str, result: object) -> object:
+    sanitized = sanitize_projection(result)
+    if (
+        command == "workflow cleanup"
+        and isinstance(result, Mapping)
+        and isinstance(sanitized, dict)
+        and isinstance(result.get("confirmation_token"), str)
+    ):
+        # This single-use, authority-bound capability is the intentional output
+        # of cleanup preview and must round-trip into cleanup execution.
+        sanitized["confirmation_token"] = sanitize_projection(
+            result["confirmation_token"]
+        )
+    return sanitized
+
+
 def success_envelope(command: str, result: object) -> dict[str, object]:
+    sanitized_result = _sanitize_success_result(command, result)
     next_actions = []
     warnings = []
-    if isinstance(result, Mapping):
-        raw_actions = result.get("next_actions", [])
-        raw_warnings = result.get("warnings", [])
+    if isinstance(sanitized_result, Mapping):
+        raw_actions = sanitized_result.get("next_actions", [])
+        raw_warnings = sanitized_result.get("warnings", [])
         if isinstance(raw_actions, list | tuple):
             next_actions = list(raw_actions)
         if isinstance(raw_warnings, list | tuple):
@@ -65,7 +166,7 @@ def success_envelope(command: str, result: object) -> dict[str, object]:
         "schema_version": SCHEMA_VERSION,
         "ok": True,
         "command": command,
-        "result": result,
+        "result": sanitized_result,
         "error": None,
         "warnings": warnings,
         "next_actions": next_actions,
@@ -82,8 +183,8 @@ def error_envelope(
         "schema_version": SCHEMA_VERSION,
         "ok": False,
         "command": command,
-        "result": result,
-        "error": error.to_dict(),
+        "result": sanitize_projection(result),
+        "error": sanitize_projection(error.to_dict()),
         "warnings": [],
         "next_actions": [],
     }
@@ -94,6 +195,17 @@ def operator_command_contract() -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,
         "argv_prefix": ["workflow"],
+        "exit_codes": {
+            "success": EXIT_SUCCESS,
+            "invocation": EXIT_INVOCATION,
+            "not_found": EXIT_NOT_FOUND,
+            "authorization": EXIT_AUTHORIZATION,
+            "conflict": EXIT_CONFLICT,
+            "coordinator_unavailable": EXIT_COORDINATOR_UNAVAILABLE,
+            "blocking_finding": EXIT_BLOCKING_FINDING,
+            "action_failed": EXIT_ACTION_FAILED,
+            "internal": EXIT_INTERNAL,
+        },
         "identifier_kinds": {
             "workflow_name": "catalog workflow name",
             "showcase_id": "showcase catalog ID",
@@ -220,9 +332,15 @@ __all__ = [
     "EXIT_NOT_FOUND",
     "EXIT_SUCCESS",
     "MachineError",
+    "CoordinatorUnavailable",
     "SCHEMA_VERSION",
     "WorkflowCommandError",
+    "WorkflowActionFailed",
+    "WorkflowAuthorization",
+    "WorkflowConflict",
+    "WorkflowNotFound",
     "error_envelope",
     "operator_command_contract",
+    "projection_was_truncated",
     "success_envelope",
 ]
