@@ -24,7 +24,7 @@ from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
-from plugins.workflow.store import RunStore
+from plugins.workflow.store import ForegroundExecutionConflict, RunStore
 from tools.managed_process import ProcessIdentity
 
 
@@ -120,6 +120,134 @@ def test_legacy_clock_domain_fails_closed_until_utc_deadline(
     )
     assert acquired.is_leader
     assert acquired.lease.epoch == first.lease.epoch + 1
+
+
+def test_foreground_lease_clock_resists_backward_and_forward_wall_steps(
+    tmp_path, workflow_writer
+) -> None:
+    utc = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+
+    backward_clock = _LeaseClock(LeaseClockSample(utc, 100.0, "boot-a"))
+    backward_store = RunStore(tmp_path / "backward-home", lease_clock=backward_clock)
+    package = load_workflow(
+        workflow_writer(tmp_path / "backward-package", name="foreground-backward")
+    )
+    prepared = backward_store.prepare_run_snapshot(package)
+    backward = backward_store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="foreground-backward",
+            concurrency_key="foreground-backward",
+            execution_mode="foreground",
+            foreground_owner_id="original-owner",
+            foreground_lease_seconds=30,
+        ),
+        immutable_snapshot=prepared,
+    )
+    backward_clock.sample = LeaseClockSample(utc - timedelta(days=1), 131.0, "boot-a")
+    replacement = backward_store.claim_foreground_execution(
+        backward.run_id,
+        owner_id="replacement-owner",
+        now=backward_clock.sample.utc_now,
+        lease_seconds=30,
+    )
+    assert replacement is not None
+    assert replacement.boot_id == "boot-a"
+    assert replacement.heartbeat_monotonic == 131.0
+
+    forward_clock = _LeaseClock(LeaseClockSample(utc, 200.0, "boot-a"))
+    forward_store = RunStore(tmp_path / "forward-home", lease_clock=forward_clock)
+    package = load_workflow(
+        workflow_writer(tmp_path / "forward-package", name="foreground-forward")
+    )
+    prepared = forward_store.prepare_run_snapshot(package)
+    forward = forward_store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="foreground-forward",
+            concurrency_key="foreground-forward",
+            execution_mode="foreground",
+            foreground_owner_id="forward-owner",
+            foreground_lease_seconds=30,
+        ),
+        immutable_snapshot=prepared,
+    )
+    coordinator = CoordinatorStore(forward_store.database, clock=forward_clock)
+    leadership = coordinator.try_acquire(
+        _identity("foreground-forward-coordinator"),
+        now=utc,
+        lease_seconds=30,
+    )
+    forward_clock.sample = LeaseClockSample(utc + timedelta(days=1), 201.0, "boot-a")
+    with pytest.raises(ForegroundExecutionConflict, match="still active"):
+        forward_store.adopt_expired_foreground(
+            forward.run_id,
+            ExecutionFence(leadership.lease.owner_id, leadership.lease.epoch),
+            forward_clock.sample.utc_now,
+        )
+
+
+def test_legacy_foreground_lease_fails_closed_until_utc_deadline(
+    tmp_path, workflow_writer
+) -> None:
+    utc = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(utc, 100.0, "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="legacy-foreground")
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="legacy-foreground",
+            concurrency_key="legacy-foreground",
+            execution_mode="foreground",
+            foreground_owner_id="legacy-owner",
+            foreground_lease_seconds=30,
+        ),
+        immutable_snapshot=prepared,
+    )
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE runs SET foreground_boot_id=NULL, "
+            "foreground_heartbeat_monotonic=NULL, foreground_lease_seconds=NULL "
+            "WHERE run_id=?",
+            (admitted.run_id,),
+        )
+
+    clock.sample = LeaseClockSample(utc + timedelta(seconds=29), 10000.0, "boot-b")
+    assert (
+        store.claim_foreground_execution(
+            admitted.run_id,
+            owner_id="contender",
+            now=clock.sample.utc_now,
+            lease_seconds=30,
+        )
+        is None
+    )
+
+    clock.sample = LeaseClockSample(utc + timedelta(seconds=31), 10001.0, "boot-b")
+    acquired = store.claim_foreground_execution(
+        admitted.run_id,
+        owner_id="contender",
+        now=clock.sample.utc_now,
+        lease_seconds=30,
+    )
+    assert acquired is not None
+    assert acquired.epoch == 2
 
 
 def test_stale_execution_fence_cannot_mutate_or_interrupt_successor_claim(
@@ -1248,7 +1376,9 @@ def test_scheduler_does_not_claim_after_foreground_execution_lease_expires(
     tmp_path, workflow_writer
 ) -> None:
     marker = tmp_path / "must-not-run"
-    store = RunStore(tmp_path / "home")
+    utc = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(utc, 100.0, "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
     package = load_workflow(
         workflow_writer(
             tmp_path / "package",
@@ -1275,6 +1405,7 @@ def test_scheduler_does_not_claim_after_foreground_execution_lease_expires(
     expired_at = datetime.fromisoformat(
         store.load_run(admitted.run_id)["foreground_lease_expires_at"]
     ) + timedelta(seconds=1)
+    clock.sample = LeaseClockSample(expired_at, 102.0, "boot-a")
 
     result = RunScheduler(
         store,
@@ -1292,7 +1423,9 @@ def test_stale_foreground_scheduler_cannot_claim_after_background_adoption(
     tmp_path, workflow_writer, monkeypatch
 ) -> None:
     marker = tmp_path / "must-not-run-after-adoption"
-    store = RunStore(tmp_path / "home")
+    utc = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(utc, 100.0, "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
     package = load_workflow(
         workflow_writer(
             tmp_path / "package",
@@ -1319,11 +1452,10 @@ def test_stale_foreground_scheduler_cannot_claim_after_background_adoption(
     expired_at = datetime.fromisoformat(
         store.load_run(admitted.run_id)["foreground_lease_expires_at"]
     ) + timedelta(seconds=1)
-    coordinator = CoordinatorStore(store.database)
+    clock.sample = LeaseClockSample(expired_at, 102.0, "boot-a")
+    coordinator = CoordinatorStore(store.database, clock=clock)
     identity = _identity("foreground-adopter")
-    leadership = coordinator.try_acquire(
-        identity, now=expired_at, lease_seconds=30
-    )
+    leadership = coordinator.try_acquire(identity, now=expired_at, lease_seconds=30)
     assert leadership.is_leader
     fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
     scheduler = RunScheduler(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+import threading
 import textwrap
 from types import SimpleNamespace
 
@@ -145,3 +147,37 @@ async def test_provider_hot_add_uses_production_web_host_reload(
         _reset_for_tests()
         for provider in prior_providers:
             register_provider(provider)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_provider_reload_returns_typed_conflict(
+    monkeypatch,
+) -> None:
+    manager = PluginManager()
+    monkeypatch.setattr("hermes_cli.plugins._plugin_manager", manager)
+    old_host = manager.start_background_services("web")
+    app = SimpleNamespace(state=SimpleNamespace(plugin_background_services=old_host))
+    entered = threading.Event()
+    release = threading.Event()
+    real_discovery = manager._discover_and_load_inner
+
+    def held_discovery() -> None:
+        entered.set()
+        assert release.wait(timeout=2)
+        real_discovery()
+
+    monkeypatch.setattr(manager, "_discover_and_load_inner", held_discovery)
+    winner = asyncio.create_task(
+        web_server._reload_plugin_background_services(app, timeout=1.0)
+    )
+    assert await asyncio.to_thread(entered.wait, 1)
+    request = SimpleNamespace(app=app)
+    try:
+        with pytest.raises(web_server.HTTPException) as conflict:
+            await web_server._reload_plugin_background_services_or_raise(request)
+        assert conflict.value.status_code == 409
+        assert conflict.value.detail == {"code": "plugin_reload_in_progress"}
+    finally:
+        release.set()
+    assert await winner == {"ok": True}
+    assert app.state.plugin_background_services.shutdown(timeout=1)

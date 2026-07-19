@@ -868,6 +868,61 @@ class TestWebServerEndpoints:
         assert response.json()["detail"]["code"] == "plugin_reload_blocked"
         assert load_config()["context"]["engine"] == "old-engine"
 
+    def test_conditional_reload_rollback_preserves_concurrent_config(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        config.setdefault("context", {})["engine"] = "old-engine"
+        save_config(config)
+
+        async def blocked(_app, *, timeout=10.0):
+            current = load_config()
+            current.setdefault("unrelated", {})["concurrent"] = "preserved"
+            save_config(current)
+            return {"ok": False, "error": "plugin_reload_blocked"}
+
+        monkeypatch.setattr(web_server, "_reload_plugin_background_services", blocked)
+
+        response = self.client.put(
+            "/api/dashboard/plugin-providers",
+            json={"context_engine": "new-engine"},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "plugin_reload_blocked"
+        restored = load_config()
+        assert restored["context"]["engine"] == "old-engine"
+        assert restored["unrelated"]["concurrent"] == "preserved"
+
+    def test_conditional_reload_rollback_failure_is_typed(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        config.setdefault("context", {})["engine"] = "old-engine"
+        save_config(config)
+
+        async def blocked(_app, *, timeout=10.0):
+            return {"ok": False, "error": "plugin_reload_blocked"}
+
+        monkeypatch.setattr(web_server, "_reload_plugin_background_services", blocked)
+        monkeypatch.setattr(
+            web_server,
+            "save_config",
+            lambda _config: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+        response = self.client.put(
+            "/api/dashboard/plugin-providers",
+            json={"context_engine": "new-engine"},
+        )
+
+        assert response.status_code == 500
+        assert response.json()["detail"]["code"] == (
+            "provider_config_consistency_failed"
+        )
+
     def test_get_moa_models_returns_provider_model_slots(self):
         resp = self.client.get("/api/model/moa")
         assert resp.status_code == 200

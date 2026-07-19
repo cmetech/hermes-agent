@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping
 
-from plugins.workflow.locks import workflow_lock
+from plugins.workflow.evidence import (
+    _UnsafeEvidencePath,
+    _read_contained_regular_file,
+)
+from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
 from plugins.workflow.sanitize import sanitize_projection
+
+
+logger = logging.getLogger(__name__)
 
 
 COALESCED_KINDS = frozenset({"failure", "stalled", "retry"})
@@ -24,6 +32,14 @@ ATTENTION_KINDS = frozenset(
         "reconciliation_required",
     }
 )
+
+
+class NotificationReconciliationError(RuntimeError):
+    """A run journal could not be safely corroborated for notifications."""
+
+
+class _NotificationRepairPageFull(Exception):
+    """The next safe journal would exceed this scanner iteration's budget."""
 
 
 def install_notification_schema(connection: sqlite3.Connection) -> None:
@@ -387,6 +403,145 @@ class NotificationOutbox:
             )
         return existing
 
+    def _journal_candidates(
+        self,
+        run_id: str,
+        *,
+        max_journal_bytes: int,
+        page_bytes_remaining: int | None = None,
+        allow_page_overrun: bool = False,
+    ) -> tuple[list[dict[str, object]], int]:
+        directory = self.store.run_directory(run_id)
+        journal_path = Path(directory) / "events.jsonl"
+        try:
+            with workflow_lock(self.store._run_lock_path(run_id), timeout_seconds=0.05):
+                _, reported_size = _read_contained_regular_file(
+                    directory, journal_path, 0
+                )
+                if reported_size > max_journal_bytes:
+                    raise NotificationReconciliationError(
+                        "journal exceeds its enforced quota"
+                    )
+                if (
+                    page_bytes_remaining is not None
+                    and reported_size > page_bytes_remaining
+                    and not allow_page_overrun
+                ):
+                    raise _NotificationRepairPageFull
+                data, reported_size = _read_contained_regular_file(
+                    directory, journal_path, max_journal_bytes + 1
+                )
+                if reported_size > max_journal_bytes:
+                    raise NotificationReconciliationError(
+                        "journal exceeds its enforced quota"
+                    )
+                events = self.store._read_journal_events(
+                    directory,
+                    recover_torn_tail=False,
+                    journal_data=data,
+                )
+        except NotificationReconciliationError:
+            raise
+        except _NotificationRepairPageFull:
+            raise
+        except WorkflowLockTimeout:
+            raise
+        except (
+            _UnsafeEvidencePath,
+            KeyError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            raise NotificationReconciliationError(
+                "journal could not be safely corroborated"
+            ) from exc
+        if not events:
+            raise NotificationReconciliationError("journal contains no events")
+        candidates: list[dict[str, object]] = []
+        for event in events:
+            projection = event.get("projection")
+            if not isinstance(projection, Mapping):
+                continue
+            kind = notification_kind(str(event.get("event_type") or ""), projection)
+            if kind is None:
+                continue
+            candidates.append(
+                {
+                    "transition_key": (
+                        f"{run_id}:{kind}:{int(projection['state_version'])}:desktop"
+                    ),
+                    "run_id": run_id,
+                    "kind": kind,
+                    "transition_version": int(projection["state_version"]),
+                    "projection": projection,
+                    "event": event,
+                }
+            )
+        return candidates, reported_size
+
+    def _record_candidates(self, candidates: list[dict[str, object]]) -> int:
+        with self.store._connect() as connection:
+            existing = self._existing_transition_keys(
+                connection,
+                (candidate["transition_key"] for candidate in candidates),
+            )
+        repaired = 0
+        for candidate in candidates:
+            transition_key = str(candidate["transition_key"])
+            if transition_key in existing:
+                continue
+            projection = candidate["projection"]
+            event = candidate["event"]
+            if not isinstance(projection, Mapping) or not isinstance(event, Mapping):
+                continue
+            timestamp = datetime.fromisoformat(str(event["timestamp"]))
+            self.record(
+                run_id=str(candidate["run_id"]),
+                kind=str(candidate["kind"]),
+                destination="desktop",
+                transition_version=int(candidate["transition_version"]),
+                payload={
+                    "workflow": projection.get("workflow"),
+                    "status": projection.get("status"),
+                    "event_type": event.get("event_type"),
+                    "node_id": event.get("node_id"),
+                    "last_error": projection.get("last_error"),
+                },
+                delivery_state=(
+                    "pending"
+                    if projection.get("execution_mode") == "background"
+                    else "suppressed"
+                ),
+                now=timestamp,
+            )
+            existing.add(transition_key)
+            repaired += 1
+        return repaired
+
+    def reconcile_run(
+        self,
+        run_id: str,
+        *,
+        max_journal_bytes: int | None = None,
+    ) -> int:
+        """Corroborate one complete bounded journal and repair missing facts."""
+        enforced_limit = (
+            int(self.store.max_journal_bytes)
+            if max_journal_bytes is None
+            else max_journal_bytes
+        )
+        if (
+            isinstance(enforced_limit, bool)
+            or not isinstance(enforced_limit, int)
+            or enforced_limit < 1
+        ):
+            raise ValueError("max_journal_bytes must be a positive integer")
+        candidates, _ = self._journal_candidates(
+            run_id, max_journal_bytes=enforced_limit
+        )
+        return self._record_candidates(candidates)
+
     def reconcile_journal(
         self,
         *,
@@ -407,7 +562,6 @@ class NotificationOutbox:
             or byte_budget < 1
         ):
             raise ValueError("max_journal_bytes must be a positive integer")
-        repaired = 0
         with self.store._connect() as connection:
             cursor = connection.execute(
                 "SELECT cursor_created_at, cursor_run_id FROM "
@@ -445,74 +599,39 @@ class NotificationOutbox:
         consumed_bytes = 0
         for row in rows:
             try:
-                directory = self.store.run_directory(str(row["run_id"]))
-                with workflow_lock(
-                    self.store._run_lock_path(str(row["run_id"])),
-                    timeout_seconds=0.05,
-                ):
-                    journal_bytes = (Path(directory) / "events.jsonl").stat().st_size
-                    if consumed_bytes + journal_bytes > byte_budget:
-                        break
-                    events = self.store._read_journal_events(directory)
-            except (KeyError, OSError, ValueError):
+                run_candidates, journal_bytes = self._journal_candidates(
+                    str(row["run_id"]),
+                    max_journal_bytes=int(self.store.max_journal_bytes),
+                    page_bytes_remaining=byte_budget - consumed_bytes,
+                    allow_page_overrun=not consumed_bytes,
+                )
+            except _NotificationRepairPageFull:
+                break
+            except NotificationReconciliationError:
+                run_id = str(row["run_id"])
+                reason_code = "notification_reconciliation_unverified"
+                self.store._mark_repair_required(reason_code, run_id=run_id)
+                with self.store._connect() as connection:
+                    self.store._record_repair_event(
+                        connection,
+                        reason_code=reason_code,
+                        outcome="repair_required",
+                        run_id=run_id,
+                    )
                 processed_rows.append(row)
                 continue
+            if not consumed_bytes and journal_bytes > byte_budget:
+                logger.warning(
+                    "workflow notification repair processing bounded oversized "
+                    "journal run_id=%s journal_bytes=%d byte_budget=%d",
+                    row["run_id"],
+                    journal_bytes,
+                    byte_budget,
+                )
             consumed_bytes += journal_bytes
             processed_rows.append(row)
-            for event in events:
-                projection = event.get("projection")
-                if not isinstance(projection, Mapping):
-                    continue
-                kind = notification_kind(str(event.get("event_type") or ""), projection)
-                if kind is None:
-                    continue
-                transition_key = (
-                    f"{row['run_id']}:{kind}:"
-                    f"{int(projection['state_version'])}:desktop"
-                )
-                candidates.append({
-                    "transition_key": transition_key,
-                    "run_id": str(row["run_id"]),
-                    "kind": kind,
-                    "transition_version": int(projection["state_version"]),
-                    "projection": projection,
-                    "event": event,
-                })
-        with self.store._connect() as connection:
-            existing = self._existing_transition_keys(
-                connection,
-                (candidate["transition_key"] for candidate in candidates),
-            )
-        for candidate in candidates:
-            transition_key = str(candidate["transition_key"])
-            if transition_key in existing:
-                continue
-            projection = candidate["projection"]
-            event = candidate["event"]
-            if not isinstance(projection, Mapping) or not isinstance(event, Mapping):
-                continue
-            timestamp = datetime.fromisoformat(str(event["timestamp"]))
-            self.record(
-                run_id=str(candidate["run_id"]),
-                kind=str(candidate["kind"]),
-                destination="desktop",
-                transition_version=int(candidate["transition_version"]),
-                payload={
-                    "workflow": projection.get("workflow"),
-                    "status": projection.get("status"),
-                    "event_type": event.get("event_type"),
-                    "node_id": event.get("node_id"),
-                    "last_error": projection.get("last_error"),
-                },
-                delivery_state=(
-                    "pending"
-                    if projection.get("execution_mode") == "background"
-                    else "suppressed"
-                ),
-                now=timestamp,
-            )
-            existing.add(transition_key)
-            repaired += 1
+            candidates.extend(run_candidates)
+        repaired = self._record_candidates(candidates)
         if processed_rows:
             last = processed_rows[-1]
             with self.store._connect() as connection:
@@ -830,6 +949,63 @@ class NotificationOutbox:
                 + " AND ".join(clauses)
                 + " ORDER BY created_at",
                 values,
+            ).fetchall()
+        return tuple(self._public(row) for row in rows)
+
+    def pending_attention_page(
+        self,
+        *,
+        limit: int,
+        observed_at: datetime,
+        before: tuple[str, str, str] | None = None,
+        operator_scope: str | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        """Return a bounded newest-first keyset page of attention deliveries."""
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        observed = self._aware(observed_at)
+        if before is not None and (
+            not isinstance(before, tuple)
+            or len(before) != 3
+            or not all(isinstance(value, str) and value for value in before)
+        ):
+            raise ValueError(
+                "before must be an updated_at/run_id/notification_id tuple"
+            )
+        clauses = [
+            "outbox.kind IN ('approval_required','input_required','failure','stalled','reconciliation_required')",
+            "outbox.state IN ('pending','leased','dead')",
+            "outbox.updated_at<=?",
+        ]
+        values: list[object] = [observed.isoformat()]
+        if operator_scope is not None:
+            clauses.append("runs.operator_scope_digest=?")
+            values.append(self.store._scope_digest(operator_scope))
+        if before is not None:
+            clauses.append(
+                "(outbox.updated_at<? OR "
+                "(outbox.updated_at=? AND outbox.run_id<?) OR "
+                "(outbox.updated_at=? AND outbox.run_id=? "
+                "AND outbox.notification_id<?))"
+            )
+            values.extend(
+                (
+                    before[0],
+                    before[0],
+                    before[1],
+                    before[0],
+                    before[1],
+                    before[2],
+                )
+            )
+        with self.store._connect() as connection:
+            rows = connection.execute(
+                "SELECT outbox.* FROM workflow_notification_outbox AS outbox "
+                "JOIN runs ON runs.run_id=outbox.run_id WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY outbox.updated_at DESC, outbox.run_id DESC, "
+                "outbox.notification_id DESC LIMIT ?",
+                (*values, limit + 1),
             ).fetchall()
         return tuple(self._public(row) for row in rows)
 

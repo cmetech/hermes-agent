@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import hashlib
 import sqlite3
 from dataclasses import replace
 from datetime import timedelta
@@ -181,6 +183,75 @@ def test_pre_send_storage_contention_is_retryable_without_transport_attempt(
         status="retryable_failure", detail="delivery_store_unavailable"
     )
     assert sends == []
+
+
+def test_prune_expired_removes_only_terminal_receipts_and_unreferenced_routes(
+    tmp_path,
+) -> None:
+    observed = [datetime(2026, 6, 1, tzinfo=timezone.utc)]
+
+    def sender(_route, text):
+        if text == "permanent":
+            return DeliveryReceipt(status="permanent_failure", detail="rejected")
+        return DeliveryReceipt(status="delivered", transport_id="message-1")
+
+    port = GatewayPluginDeliveryPort(
+        tmp_path,
+        profile="default",
+        sender=sender,
+        now=lambda: observed[0],
+    )
+    delivered = port.mint_return_route(_source(), _invocation())
+    permanent = port.mint_return_route(_source(), _invocation())
+    uncertain = port.mint_return_route(_source(), _invocation())
+    unexpired = port.mint_return_route(_source(), _invocation())
+    assert port.deliver(delivered, "delivered", "receipt-delivered").status == (
+        "delivered"
+    )
+    assert port.deliver(permanent, "permanent", "receipt-permanent").status == (
+        "permanent_failure"
+    )
+    uncertain_digest = hashlib.sha256(uncertain.encode()).hexdigest()
+    with port._connect() as connection:
+        connection.execute(
+            "INSERT INTO plugin_delivery_receipts (capability_digest, "
+            "idempotency_key, state, created_at, updated_at) "
+            "VALUES (?, 'receipt-uncertain', 'sending', ?, ?)",
+            (
+                uncertain_digest,
+                observed[0].isoformat(),
+                observed[0].isoformat(),
+            ),
+        )
+
+    observed[0] = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    with port._connect() as connection:
+        connection.execute(
+            "UPDATE plugin_return_routes SET expires_at=? WHERE capability_digest=?",
+            (
+                (observed[0] + timedelta(days=7)).isoformat(),
+                hashlib.sha256(unexpired.encode()).hexdigest(),
+            ),
+        )
+    result = port.prune_expired(limit=100, receipt_retention=timedelta(days=30))
+
+    assert result == {"receipts": 2, "routes": 2}
+    with port._connect() as connection:
+        states = {
+            row[0]
+            for row in connection.execute(
+                "SELECT state FROM plugin_delivery_receipts"
+            ).fetchall()
+        }
+        routes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT capability_digest FROM plugin_return_routes"
+            ).fetchall()
+        }
+    assert states == {"sending"}
+    assert uncertain_digest in routes
+    assert hashlib.sha256(unexpired.encode()).hexdigest() in routes
 
 
 def test_gateway_invocation_uses_only_verified_session_source() -> None:

@@ -67,6 +67,7 @@ def _schema_manifest(store: RunStore) -> tuple[object, ...]:
 def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
     tmp_path: Path,
 ) -> None:
+    assert _STORE_SCHEMA_VERSION == 13
     manifest = json.loads((FIXTURE / "fixture-manifest.json").read_text())
     _assert_fixture_hashes(manifest)
     expected = manifest["expected"]
@@ -132,6 +133,9 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             "idempotency_namespace_digest",
             "execution_mode",
             "foreground_epoch",
+            "foreground_boot_id",
+            "foreground_heartbeat_monotonic",
+            "foreground_lease_seconds",
             "foreground_lease_expires_at",
             "foreground_owner_id",
             "provenance_json",

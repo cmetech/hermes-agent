@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import logging
 from pathlib import Path
 import secrets
 import sqlite3
@@ -17,6 +18,9 @@ from hermes_cli.plugin_invocation import DeliveryReceipt, PluginInvocationContex
 _DEFAULT_CAPABILITY_TTL = timedelta(days=7)
 _MAX_DELIVERY_TEXT_BYTES = 256 * 1024
 _MAX_ROUTE_VALUE_BYTES = 4096
+
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -146,6 +150,10 @@ class GatewayPluginDeliveryPort:
             raise PermissionError("Gateway return route scope does not match source")
         if not isinstance(ttl, timedelta) or ttl <= timedelta(0):
             raise ValueError("return route ttl must be positive")
+        try:
+            self.prune_expired()
+        except sqlite3.Error:
+            logger.warning("Gateway plugin delivery retention pass failed")
         observed = self._now_utc()
         capability = f"gwrt_{secrets.token_urlsafe(32)}"
         with self._connect() as connection:
@@ -164,6 +172,87 @@ class GatewayPluginDeliveryPort:
                 ),
             )
         return capability
+
+    def prune_expired(
+        self,
+        *,
+        limit: int = 100,
+        receipt_retention: timedelta = timedelta(days=30),
+    ) -> dict[str, int]:
+        """Prune expired routes and old terminal receipts in one transaction."""
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("limit must be between 1 and 1000")
+        if not isinstance(
+            receipt_retention, timedelta
+        ) or receipt_retention <= timedelta(0):
+            raise ValueError("receipt_retention must be positive")
+        observed = self._now_utc()
+        timestamp = observed.isoformat()
+        receipt_cutoff = (observed - receipt_retention).isoformat()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            receipt_rows = connection.execute(
+                "SELECT receipts.capability_digest, receipts.idempotency_key "
+                "FROM plugin_delivery_receipts AS receipts "
+                "JOIN plugin_return_routes AS routes "
+                "ON routes.capability_digest=receipts.capability_digest "
+                "WHERE routes.expires_at<=? AND receipts.updated_at<=? "
+                "AND receipts.state IN ('delivered','permanent_failure','unauthorized') "
+                "ORDER BY receipts.updated_at, receipts.capability_digest, "
+                "receipts.idempotency_key LIMIT ?",
+                (timestamp, receipt_cutoff, limit),
+            ).fetchall()
+            receipts_pruned = 0
+            for row in receipt_rows:
+                receipts_pruned += connection.execute(
+                    "DELETE FROM plugin_delivery_receipts "
+                    "WHERE capability_digest=? AND idempotency_key=? "
+                    "AND updated_at<=? "
+                    "AND state IN ('delivered','permanent_failure','unauthorized') "
+                    "AND EXISTS (SELECT 1 FROM plugin_return_routes AS routes "
+                    "WHERE routes.capability_digest=? AND routes.expires_at<=?)",
+                    (
+                        row["capability_digest"],
+                        row["idempotency_key"],
+                        receipt_cutoff,
+                        row["capability_digest"],
+                        timestamp,
+                    ),
+                ).rowcount
+            remaining = limit - receipts_pruned
+            route_rows = connection.execute(
+                "SELECT routes.capability_digest FROM plugin_return_routes AS routes "
+                "WHERE routes.expires_at<=? AND NOT EXISTS ("
+                "SELECT 1 FROM plugin_delivery_receipts AS receipts "
+                "WHERE receipts.capability_digest=routes.capability_digest) "
+                "ORDER BY routes.expires_at, routes.capability_digest LIMIT ?",
+                (timestamp, remaining),
+            ).fetchall()
+            routes_pruned = 0
+            for row in route_rows:
+                routes_pruned += connection.execute(
+                    "DELETE FROM plugin_return_routes WHERE capability_digest=? "
+                    "AND expires_at<=? AND NOT EXISTS ("
+                    "SELECT 1 FROM plugin_delivery_receipts "
+                    "WHERE capability_digest=?)",
+                    (
+                        row["capability_digest"],
+                        timestamp,
+                        row["capability_digest"],
+                    ),
+                ).rowcount
+            connection.commit()
+            return {"receipts": receipts_pruned, "routes": routes_pruned}
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     @staticmethod
     def _receipt_from_row(row: sqlite3.Row) -> DeliveryReceipt:

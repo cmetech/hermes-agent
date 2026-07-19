@@ -7,10 +7,11 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from hermes_cli.dashboard_auth.base import TokenPrincipal
-from hermes_cli.plugin_invocation import PluginInvocationContext
+from hermes_cli.plugin_invocation import DeliveryReceipt, PluginInvocationContext
 
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.notifications import NotificationOutbox
@@ -27,6 +28,9 @@ from plugins.workflow.trust import (
     build_risk_summary,
     compute_package_digest,
 )
+from gateway.plugin_delivery import GatewayPluginDeliveryPort
+from gateway.config import Platform
+from gateway.session import SessionSource
 
 
 def _module():
@@ -73,6 +77,66 @@ def _terminal_run(store, tmp_path, workflow_writer, *, name: str) -> str:
     )
     RunScheduler(store).advance(admitted.run_id)
     return admitted.run_id
+
+
+@pytest.mark.parametrize("outbox_state", ["pending", "leased", "dead"])
+def test_pruning_preserves_unexpired_route_referenced_by_gateway_outbox(
+    tmp_path, outbox_state
+) -> None:
+    now = datetime(2026, 7, 19, tzinfo=timezone.utc)
+    port = GatewayPluginDeliveryPort(
+        tmp_path,
+        profile="default",
+        sender=lambda _route, _text: DeliveryReceipt(status="delivered"),
+        now=lambda: now,
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-1",
+        chat_type="dm",
+        user_id="user-1",
+        profile="default",
+    )
+    invocation = PluginInvocationContext(
+        boundary="gateway",
+        principal="gateway:telegram:user-1",
+        operator_scope="gateway:default:telegram:chat-1:user-1",
+        assurance="verified_adapter",
+        return_route_capability=None,
+    )
+    capability = port.mint_return_route(source, invocation)
+    store = RunStore(tmp_path)
+    outbox = NotificationOutbox(store)
+    notification_id = outbox.record(
+        run_id=f"route-{outbox_state}",
+        kind="completion",
+        destination=f"gateway:{capability}",
+        transition_version=1,
+        payload={"status": "succeeded"},
+        now=now,
+    )
+    if outbox_state in {"leased", "dead"}:
+        assert outbox.lease_gateway(owner_id="gateway", now=now, limit=1)
+    if outbox_state == "dead":
+        assert outbox.terminal_fail(
+            notification_id,
+            owner_id="gateway",
+            error="permanent",
+            now=now,
+        )
+
+    assert port.prune_expired(limit=100) == {"receipts": 0, "routes": 0}
+    assert (
+        port.deliver(capability, "still authorized", f"delivery-{outbox_state}").status
+        == "delivered"
+    )
+    with store._connect() as connection:
+        destination = connection.execute(
+            "SELECT destination FROM workflow_notification_outbox "
+            "WHERE notification_id=?",
+            (notification_id,),
+        ).fetchone()[0]
+    assert destination == f"gateway:{capability}"
 
 
 def test_desktop_delivery_is_leased_until_explicit_electron_ack(tmp_path, monkeypatch):

@@ -715,119 +715,243 @@ def get_run(
         return sanitize_projection(_load_authorized(store, run_id, operator))
 
 
-@router.get("/attention")
-def attention(
-    request: Request,
-    limit: int = Query(100, ge=1, le=100),
-    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
-):
-    operator = _verified_operator(request, operator_scope)
-    operator.require("read")
-    items = []
-    with _store_lease() as store:
-        for run in _authorized_runs(store, operator):
-            provenance = run.get("provenance")
-            origin = str(
-                provenance.get("source")
-                if isinstance(provenance, Mapping) and provenance.get("source")
-                else run.get("trigger") or "workflow"
-            )
-            for node_id, node in run.get("nodes", {}).items():
-                pending = (
-                    node.get("pending_interaction")
-                    if isinstance(node, Mapping)
-                    else None
-                )
-                kind = pending.get("type") if isinstance(pending, Mapping) else pending
-                if kind not in {
-                    "approval",
-                    "workflow_approval",
-                    "loop_input",
-                    "capability",
-                    "reconcile",
-                }:
-                    continue
-                item_kind = {
-                    "approval": "approval",
-                    "workflow_approval": "workflow_approval",
-                    "loop_input": "loop_input",
-                    "capability": "capability",
-                    "reconcile": "reconcile",
-                }[str(kind)]
-                interaction = (
-                    dict(pending)
-                    if isinstance(pending, Mapping)
-                    else {"type": item_kind}
-                )
-                cause = str(
+def _attention_origin(run: Mapping[str, object]) -> str:
+    provenance = run.get("provenance")
+    if isinstance(provenance, Mapping) and provenance.get("source"):
+        return str(provenance["source"])
+    return str(run.get("trigger") or "workflow")
+
+
+def _run_attention_items(run: Mapping[str, object]) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    origin = _attention_origin(run)
+    nodes = run.get("nodes", {})
+    node_items = nodes.items() if isinstance(nodes, Mapping) else ()
+    for node_id, node in node_items:
+        pending = node.get("pending_interaction") if isinstance(node, Mapping) else None
+        kind = pending.get("type") if isinstance(pending, Mapping) else pending
+        if kind not in {
+            "approval",
+            "workflow_approval",
+            "loop_input",
+            "capability",
+            "reconcile",
+        }:
+            continue
+        item_kind = str(kind)
+        interaction = (
+            dict(pending) if isinstance(pending, Mapping) else {"type": item_kind}
+        )
+        items.append(
+            {
+                "run_id": run["run_id"],
+                "workflow": run["workflow"],
+                "node_id": str(node_id),
+                "kind": item_kind,
+                "origin": origin,
+                "cause": str(
                     interaction.get("message")
                     or interaction.get("gate_message")
                     or interaction.get("prompt")
                     or item_kind
+                ),
+                "interaction": interaction,
+                "status": run["status"],
+                "health": run["health"],
+                "next_actions": run["next_actions"],
+                "state_version": run.get("state_version"),
+                "updated_at": run["updated_at"],
+                "_source": "run",
+                "_source_position": [
+                    str(run["updated_at"]),
+                    str(run["run_id"]),
+                    str(node_id),
+                    item_kind,
+                ],
+            }
+        )
+    if run["status"] == "failed":
+        last_error = run.get("last_error")
+        failure_cause = (
+            last_error.get("message") or last_error.get("code")
+            if isinstance(last_error, Mapping)
+            else None
+        )
+        items.append(
+            {
+                "run_id": run["run_id"],
+                "workflow": run["workflow"],
+                "node_id": None,
+                "kind": "failure",
+                "origin": origin,
+                "cause": str(
+                    failure_cause or run.get("blocking_reason") or "workflow_failed"
+                ),
+                "interaction": None,
+                "status": run["status"],
+                "health": run["health"],
+                "next_actions": run["next_actions"],
+                "state_version": run.get("state_version"),
+                "updated_at": run["updated_at"],
+                "_source": "run",
+                "_source_position": [
+                    str(run["updated_at"]),
+                    str(run["run_id"]),
+                    "",
+                    "failure",
+                ],
+            }
+        )
+    elif run["health"] in {
+        "stalled",
+        "coordinator_unavailable",
+        "storage_degraded",
+    }:
+        items.append(
+            {
+                "run_id": run["run_id"],
+                "workflow": run["workflow"],
+                "node_id": None,
+                "kind": "stalled",
+                "origin": origin,
+                "cause": str(run.get("blocking_reason") or run["health"]),
+                "interaction": None,
+                "status": run["status"],
+                "health": run["health"],
+                "next_actions": run["next_actions"],
+                "state_version": run.get("state_version"),
+                "updated_at": run["updated_at"],
+                "_source": "run",
+                "_source_position": [
+                    str(run["updated_at"]),
+                    str(run["run_id"]),
+                    "",
+                    "stalled",
+                ],
+            }
+        )
+    return sorted(
+        items,
+        key=lambda item: (
+            str(item["node_id"] or ""),
+            str(item["kind"]),
+        ),
+        reverse=True,
+    )
+
+
+def _attention_order_key(item: Mapping[str, object]) -> tuple[str, ...]:
+    return (
+        str(item["updated_at"]),
+        str(item["run_id"]),
+        str(item["_source"]),
+        str(item.get("node_id") or ""),
+        str(item["kind"]),
+        str(
+            item.get("interaction", {}).get("notification_id", "")
+            if isinstance(item.get("interaction"), Mapping)
+            else ""
+        ),
+    )
+
+
+def _attention_cursor_position(
+    payload: Mapping[str, object], name: str, length: int
+) -> tuple[str, ...] | None:
+    value = payload.get(name)
+    if value is None:
+        return None
+    if (
+        not isinstance(value, list)
+        or len(value) != length
+        or not all(isinstance(part, str) for part in value)
+    ):
+        raise ValueError
+    return tuple(value)
+
+
+@router.get("/attention")
+def attention(
+    request: Request,
+    limit: int = Query(100, ge=1, le=100),
+    cursor: str | None = None,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request, operator_scope)
+    operator.require("read")
+    cursor_scope = f"{operator.cursor_scope}:attention"
+    observed_at = datetime.now(timezone.utc)
+    run_position: tuple[str, ...] | None = None
+    notification_position: tuple[str, ...] | None = None
+    if cursor:
+        payload = _decode_cursor(cursor, kind="attention", scope=cursor_scope)
+        try:
+            observed_value = payload.get("observed_at")
+            if not isinstance(observed_value, str):
+                raise ValueError
+            observed_at = datetime.fromisoformat(observed_value)
+            if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+                raise ValueError
+            observed_at = observed_at.astimezone(timezone.utc)
+            run_position = _attention_cursor_position(payload, "run_position", 4)
+            notification_position = _attention_cursor_position(
+                payload, "notification_position", 3
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=410,
+                detail={"code": "cursor_expired", "cursor_reset": True},
+            ) from exc
+
+    items: list[dict[str, object]] = []
+    run_candidates: tuple[dict[str, object], ...] = ()
+    facts: tuple[dict[str, object], ...] = ()
+    with _store_lease() as store:
+        if run_position is not None:
+            try:
+                same_run = _load_authorized(store, run_position[1], operator)
+            except HTTPException:
+                same_run = None
+            if (
+                isinstance(same_run, Mapping)
+                and str(same_run.get("updated_at")) == run_position[0]
+            ):
+                remaining_key = (run_position[2], run_position[3])
+                items.extend(
+                    item
+                    for item in _run_attention_items(same_run)
+                    if (
+                        str(item.get("node_id") or ""),
+                        str(item["kind"]),
+                    )
+                    < remaining_key
                 )
-                items.append({
-                    "run_id": run["run_id"],
-                    "workflow": run["workflow"],
-                    "node_id": node_id,
-                    "kind": item_kind,
-                    "origin": origin,
-                    "cause": cause,
-                    "interaction": interaction,
-                    "status": run["status"],
-                    "health": run["health"],
-                    "next_actions": run["next_actions"],
-                    "state_version": run["state_version"],
-                    "updated_at": run["updated_at"],
-                })
-            if run["status"] == "failed":
-                last_error = run.get("last_error")
-                failure_cause = (
-                    last_error.get("message") or last_error.get("code")
-                    if isinstance(last_error, Mapping)
-                    else None
-                )
-                items.append(
-                    {
-                        "run_id": run["run_id"],
-                        "workflow": run["workflow"],
-                        "node_id": None,
-                        "kind": "failure",
-                        "origin": origin,
-                        "cause": str(
-                            failure_cause
-                            or run.get("blocking_reason")
-                            or "workflow_failed"
-                        ),
-                        "interaction": None,
-                        "status": run["status"],
-                        "health": run["health"],
-                        "next_actions": run["next_actions"],
-                        "state_version": run["state_version"],
-                        "updated_at": run["updated_at"],
-                    }
-                )
-            elif run["health"] in {
-                "stalled",
-                "coordinator_unavailable",
-                "storage_degraded",
-            }:
-                items.append(
-                    {
-                        "run_id": run["run_id"],
-                        "workflow": run["workflow"],
-                        "node_id": None,
-                        "kind": "stalled",
-                        "origin": origin,
-                        "cause": str(run.get("blocking_reason") or run["health"]),
-                        "interaction": None,
-                        "status": run["status"],
-                        "health": run["health"],
-                        "next_actions": run["next_actions"],
-                        "state_version": run["state_version"],
-                        "updated_at": run["updated_at"],
-                    }
-                )
-        for fact in NotificationOutbox(store).pending_attention():
+        from plugins.workflow.coordinator_store import CoordinatorStore
+
+        coordinator = CoordinatorStore(store.database).health(now=observed_at)
+        include_unavailable = (
+            coordinator.status != "healthy"
+            or store.storage_health()["status"] != "healthy"
+        )
+        run_candidates = store.attention_candidates(
+            operator_scope=None if operator.unrestricted else operator.scope,
+            observed_at=observed_at,
+            limit=200,
+            before=(run_position[0], run_position[1])
+            if run_position is not None
+            else None,
+            include_unavailable=include_unavailable,
+        )
+        for run in run_candidates[:200]:
+            items.extend(_run_attention_items(run))
+
+        facts = NotificationOutbox(store).pending_attention_page(
+            limit=200,
+            observed_at=observed_at,
+            before=notification_position,
+            operator_scope=None if operator.unrestricted else operator.scope,
+        )
+        for fact in facts[:200]:
             try:
                 run = _load_authorized(store, str(fact["run_id"]), operator)
             except HTTPException:
@@ -838,12 +962,7 @@ def attention(
                     "workflow": run["workflow"],
                     "node_id": None,
                     "kind": "notification",
-                    "origin": str(
-                        run.get("provenance", {}).get("source")
-                        if isinstance(run.get("provenance"), Mapping)
-                        and run["provenance"].get("source")
-                        else run.get("trigger") or "workflow"
-                    ),
+                    "origin": _attention_origin(run),
                     "cause": str(fact["kind"]),
                     "interaction": {
                         "type": "notification",
@@ -855,19 +974,51 @@ def attention(
                     "next_actions": run["next_actions"],
                     "state_version": run["state_version"],
                     "updated_at": fact["updated_at"],
+                    "_source": "notification",
+                    "_source_position": [
+                        str(fact["updated_at"]),
+                        str(fact["run_id"]),
+                        str(fact["notification_id"]),
+                    ],
                 }
             )
-    items.sort(
-        key=lambda item: (
-            str(item["updated_at"]),
-            str(item["run_id"]),
-            str(item["node_id"]),
+
+    items.sort(key=_attention_order_key, reverse=True)
+    page = items[:limit]
+    has_more = len(items) > limit or len(run_candidates) > 200 or len(facts) > 200
+    next_cursor = None
+    if has_more and page:
+        next_run_position = list(run_position) if run_position is not None else None
+        next_notification_position = (
+            list(notification_position) if notification_position is not None else None
         )
-    )
+        for item in page:
+            if item["_source"] == "run":
+                next_run_position = list(item["_source_position"])
+            else:
+                next_notification_position = list(item["_source_position"])
+        next_cursor = _encode_cursor(
+            {
+                "v": 1,
+                "kind": "attention",
+                "scope": _scope_key(cursor_scope),
+                "observed_at": observed_at.isoformat(),
+                "run_position": next_run_position,
+                "notification_position": next_notification_position,
+            }
+        )
+    public_page = [
+        {
+            key: value
+            for key, value in item.items()
+            if key not in {"_source", "_source_position"}
+        }
+        for item in page
+    ]
     return {
         "schema_version": 1,
-        "items": sanitize_projection(items[:limit]),
-        "next_cursor": None,
+        "items": sanitize_projection(public_page),
+        "next_cursor": next_cursor,
     }
 
 

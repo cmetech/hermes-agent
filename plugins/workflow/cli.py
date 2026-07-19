@@ -16,6 +16,7 @@ from collections import Counter
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MethodType
 from typing import AbstractSet, Iterable, Mapping
 
 import yaml
@@ -89,14 +90,16 @@ class _WorkflowArgumentParser(argparse.ArgumentParser):
     def parse_known_args(self, args=None, namespace=None):
         arguments = list(args) if args is not None else sys.argv[1:]
         self._machine_mode = "--json" in arguments
-        parsed, extras = super().parse_known_args(arguments, namespace)
+        parsed, extras = argparse.ArgumentParser.parse_known_args(
+            self, arguments, namespace
+        )
         if self._machine_mode and extras:
             self.error(f"unrecognized arguments: {' '.join(extras)}")
         return parsed, extras
 
     def error(self, message: str) -> None:
         if not self._machine_mode:
-            super().error(message)
+            argparse.ArgumentParser.error(self, message)
         parts = self.prog.split()
         action = (
             " ".join(parts[-2:])
@@ -351,6 +354,10 @@ def _json_flag(parser: argparse.ArgumentParser) -> None:
 
 
 def register_cli(subparser: argparse.ArgumentParser) -> None:
+    subparser.parse_known_args = MethodType(
+        _WorkflowArgumentParser.parse_known_args, subparser
+    )
+    subparser.error = MethodType(_WorkflowArgumentParser.error, subparser)
     subparser.add_argument("--workdir", default=os.getcwd(), help=argparse.SUPPRESS)
     subparser.add_argument(
         "--hermes-home", default=str(get_hermes_home()), help=argparse.SUPPRESS
@@ -1442,9 +1449,12 @@ def _cmd_run(
     runtime = _runtime_config(args.hermes_home, sidecar=package.sidecar)
     digest = compute_package_digest(package)
     risk = build_risk_summary(package, assess_compatibility(package))
-    if WorkflowTrustStore(args.hermes_home).check(
-        digest.sha256, risk_digest=risk.risk_digest
-    ) != "trusted":
+    if (
+        WorkflowTrustStore(args.hermes_home).check(
+            digest.sha256, risk_digest=risk.risk_digest
+        )
+        != "trusted"
+    ):
         raise WorkflowAuthorization(
             "workflow package is not trusted; run doctor and trust its exact digest",
             code="trust_required",
@@ -1550,6 +1560,16 @@ def _cmd_run(
             f"workflow run entered terminal state: {payload['status']}",
             code="run_failed",
             result=payload,
+        )
+    handoff = payload.get("execution_handoff")
+    if (
+        not args.json
+        and isinstance(handoff, Mapping)
+        and handoff.get("transition") == "foreground_execution_adopted"
+    ):
+        print(
+            "This run was adopted by the background coordinator and continues; "
+            f"watch it with workflow status {admitted.run_id}."
         )
     _emit(payload, as_json=args.json)
     return 0
@@ -2097,7 +2117,11 @@ def workflow_command(
             print(str(exc), file=sys.stderr)
         return EXIT_INVOCATION
     except (OSError, StorageQuotaError) as exc:
-        error = MachineError("action_failed", str(exc))
+        error = MachineError(
+            "action_failed",
+            "workflow storage operation failed",
+            details={"exception_type": type(exc).__name__},
+        )
         if getattr(args, "json", False):
             print(json.dumps(error_envelope(command, error), sort_keys=True, indent=2))
         else:

@@ -171,6 +171,109 @@ def _resolve_restart_drain_timeout() -> float:
         return DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
 
 
+_PROVIDER_RELOAD_LOCK = threading.Lock()
+_CONFIG_MISSING = object()
+
+
+def _changed_config_leaf_paths(
+    previous: object,
+    attempted: object,
+    prefix: tuple[str, ...] = (),
+) -> list[tuple[str, ...]]:
+    previous_mapping = previous if isinstance(previous, dict) else None
+    attempted_mapping = attempted if isinstance(attempted, dict) else None
+    if previous_mapping is not None and attempted_mapping is not None:
+        paths: list[tuple[str, ...]] = []
+        for key in sorted(set(previous_mapping) | set(attempted_mapping)):
+            paths.extend(
+                _changed_config_leaf_paths(
+                    previous_mapping.get(key, _CONFIG_MISSING),
+                    attempted_mapping.get(key, _CONFIG_MISSING),
+                    (*prefix, str(key)),
+                )
+            )
+        return paths
+    if previous is _CONFIG_MISSING and attempted_mapping is not None:
+        if not attempted_mapping:
+            return [prefix]
+        paths = []
+        for key in sorted(attempted_mapping):
+            paths.extend(
+                _changed_config_leaf_paths(
+                    _CONFIG_MISSING,
+                    attempted_mapping[key],
+                    (*prefix, str(key)),
+                )
+            )
+        return paths
+    if attempted is _CONFIG_MISSING and previous_mapping is not None:
+        if not previous_mapping:
+            return [prefix]
+        paths = []
+        for key in sorted(previous_mapping):
+            paths.extend(
+                _changed_config_leaf_paths(
+                    previous_mapping[key],
+                    _CONFIG_MISSING,
+                    (*prefix, str(key)),
+                )
+            )
+        return paths
+    return [] if previous == attempted else [prefix]
+
+
+def _config_leaf(config: dict, path: tuple[str, ...]) -> object:
+    current: object = config
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return _CONFIG_MISSING
+        current = current[key]
+    return current
+
+
+def _restore_config_leaf(
+    config: dict,
+    path: tuple[str, ...],
+    value: object,
+) -> None:
+    if not path:
+        raise ValueError("config rollback path must not be empty")
+    current = config
+    for key in path[:-1]:
+        child = current.get(key)
+        if not isinstance(child, dict):
+            child = {}
+            current[key] = child
+        current = child
+    if value is _CONFIG_MISSING:
+        current.pop(path[-1], None)
+    else:
+        current[path[-1]] = copy.deepcopy(value)
+
+
+def _conditional_provider_config_rollback(
+    previous_config: dict,
+    attempted_config: dict,
+) -> None:
+    current_config = load_config()
+    changed = _changed_config_leaf_paths(previous_config, attempted_config)
+    for path in changed:
+        attempted_value = _config_leaf(attempted_config, path)
+        current_value = _config_leaf(current_config, path)
+        if current_value is attempted_value or current_value == attempted_value:
+            _restore_config_leaf(
+                current_config, path, _config_leaf(previous_config, path)
+            )
+    save_config(current_config)
+
+
+def _provider_reload_conflict() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"code": "plugin_reload_in_progress"},
+    )
+
+
 async def _reload_plugin_background_services(
     app: "FastAPI", *, timeout: float = 10.0
 ) -> dict[str, object]:
@@ -186,6 +289,10 @@ async def _reload_plugin_background_services(
         replacements = await asyncio.to_thread(
             manager.reload_background_services, timeout=timeout
         )
+    except RuntimeError as exc:
+        if str(exc) == "plugin background service reload is already in progress":
+            return {"ok": False, "error": "plugin_reload_in_progress"}
+        raise
     except BackgroundServiceReloadBlocked:
         _log.warning("Plugin provider reload blocked by a live service generation")
         return {"ok": False, "error": "plugin_reload_blocked"}
@@ -14042,20 +14149,34 @@ async def select_toolset_provider(
         raise HTTPException(status_code=400, detail=f"Unknown toolset: {name}")
 
     with _profile_scope(body.profile or profile):
-        config = load_config()
-        previous_config = copy.deepcopy(config)
+        if not _PROVIDER_RELOAD_LOCK.acquire(blocking=False):
+            raise _provider_reload_conflict()
         try:
-            apply_provider_selection(name, body.provider, config)
-        except KeyError as exc:
-            raise HTTPException(status_code=400, detail=str(exc).strip('"'))
-        save_config(config)
-        reload_result = await _reload_plugin_background_services(request.app)
-        if not reload_result["ok"]:
-            save_config(previous_config)
-            raise HTTPException(
-                status_code=409,
-                detail={"code": reload_result["error"]},
-            )
+            config = load_config()
+            previous_config = copy.deepcopy(config)
+            try:
+                apply_provider_selection(name, body.provider, config)
+            except KeyError as exc:
+                raise HTTPException(status_code=400, detail=str(exc).strip('"'))
+            save_config(config)
+            attempted_config = copy.deepcopy(config)
+            reload_result = await _reload_plugin_background_services(request.app)
+            if not reload_result["ok"]:
+                try:
+                    _conditional_provider_config_rollback(
+                        previous_config, attempted_config
+                    )
+                except OSError as exc:
+                    raise HTTPException(
+                        status_code=500,
+                        detail={"code": "provider_config_consistency_failed"},
+                    ) from exc
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": reload_result["error"]},
+                )
+        finally:
+            _PROVIDER_RELOAD_LOCK.release()
     return {"ok": True, "name": name, "provider": body.provider}
 
 
@@ -16981,19 +17102,31 @@ async def put_plugin_providers(request: Request, body: _PluginProvidersPutBody):
         _save_context_engine,
         _save_memory_provider,
     )
-    previous_config = copy.deepcopy(load_config())
 
-    if body.memory_provider is not None:
-        memory_provider = _normalize_memory_provider_name(body.memory_provider)
-        _require_memory_provider_ready(memory_provider)
-        _save_memory_provider(memory_provider)
-    if body.context_engine is not None:
-        _save_context_engine(body.context_engine)
+    if not _PROVIDER_RELOAD_LOCK.acquire(blocking=False):
+        raise _provider_reload_conflict()
     try:
-        await _reload_plugin_background_services_or_raise(request)
-    except HTTPException:
-        save_config(previous_config)
-        raise
+        previous_config = copy.deepcopy(load_config())
+        if body.memory_provider is not None:
+            memory_provider = _normalize_memory_provider_name(body.memory_provider)
+            _require_memory_provider_ready(memory_provider)
+            _save_memory_provider(memory_provider)
+        if body.context_engine is not None:
+            _save_context_engine(body.context_engine)
+        attempted_config = copy.deepcopy(load_config())
+        try:
+            await _reload_plugin_background_services_or_raise(request)
+        except HTTPException:
+            try:
+                _conditional_provider_config_rollback(previous_config, attempted_config)
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail={"code": "provider_config_consistency_failed"},
+                ) from exc
+            raise
+    finally:
+        _PROVIDER_RELOAD_LOCK.release()
     return {"ok": True}
 
 

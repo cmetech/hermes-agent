@@ -189,6 +189,107 @@ def test_start_rate_and_queue_capacity_reject_before_worker_allocation(
     assert not queued_snapshots[2].staging_directory.exists()
 
 
+@pytest.mark.parametrize("with_unrelated_held_lane", [False, True])
+def test_queue_policy_start_queues_at_execution_capacity(
+    tmp_path, workflow_writer, with_unrelated_held_lane
+) -> None:
+    store = RunStore(
+        tmp_path / "execution-capacity-home",
+        max_executing_runs=1,
+        max_queued_runs=2,
+        max_nonterminal_runs=10,
+        max_start_requests_per_minute=10,
+    )
+    if with_unrelated_held_lane:
+        held_path = workflow_writer(
+            tmp_path / "held-capacity-package",
+            name="held-capacity-lane",
+            nodes=[{"id": "gate", "approval": {"message": "Hold?"}}],
+        )
+        held_package = load_workflow(held_path)
+        held_snapshot = store.prepare_run_snapshot(held_package)
+        held = store.start_run(
+            _request(
+                held_snapshot,
+                key="held-capacity-lane",
+                policy="queue",
+                name="held-capacity-lane",
+            ),
+            immutable_snapshot=held_snapshot,
+        )
+        assert RunScheduler(store).advance(held.run_id)["status"] == "paused"
+
+    blocker = _prepared(
+        store,
+        workflow_writer,
+        tmp_path,
+        name="execution-capacity-blocker",
+    )
+    assert (
+        store.start_run(
+            _request(
+                blocker,
+                key="execution-capacity-blocker",
+                policy="allow",
+                name="execution-capacity-blocker",
+            ),
+            immutable_snapshot=blocker,
+        ).disposition
+        == "created"
+    )
+    queued = _prepared(
+        store,
+        workflow_writer,
+        tmp_path,
+        name="execution-capacity-queued",
+    )
+
+    result = store.start_run(
+        _request(
+            queued,
+            key="execution-capacity-queued",
+            policy="queue",
+            name="execution-capacity-queued",
+        ),
+        immutable_snapshot=queued,
+    )
+
+    assert result.disposition == "queued"
+    assert result.run_id is not None
+    assert store.load_run(result.run_id)["status"] == "queued"
+
+
+def test_execution_capacity_queue_respects_queue_bound_and_other_policies(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(
+        tmp_path / "execution-policy-home",
+        max_executing_runs=1,
+        max_queued_runs=1,
+        max_nonterminal_runs=10,
+        max_start_requests_per_minute=10,
+    )
+
+    def start(name: str, *, policy: str):
+        snapshot = _prepared(store, workflow_writer, tmp_path, name=name)
+        return store.start_run(
+            _request(snapshot, key=name, policy=policy, name=name),
+            immutable_snapshot=snapshot,
+        )
+
+    assert start("capacity-policy-blocker", policy="allow").disposition == "created"
+    assert start("capacity-policy-allow", policy="allow").reason_code == (
+        "executing_capacity"
+    )
+    assert start("capacity-policy-forbid", policy="forbid").reason_code == (
+        "executing_capacity"
+    )
+    assert start("capacity-policy-queued", policy="queue").disposition == "queued"
+    assert start("capacity-policy-queue-full", policy="queue").reason_code == (
+        "queued_capacity"
+    )
+
+
 def test_start_racing_shutdown_is_discoverable_or_rejected_before_publish(
     tmp_path, workflow_writer
 ):

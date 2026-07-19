@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
@@ -11,8 +11,9 @@ import pytest
 from plugins import workflow as workflow_plugin
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import _runtime_config, register_cli
+from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow import machine_contract
-from plugins.workflow.models import ValidationIssue
+from plugins.workflow.models import ExecutionFence, ValidationIssue
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
@@ -491,6 +492,88 @@ def test_foreground_cli_releases_at_gate_and_claims_new_epoch_for_continue(
     assert projection["foreground_epoch"] == 2
 
 
+@pytest.mark.parametrize("as_json", [False, True])
+def test_foreground_cli_reports_background_coordinator_adoption(
+    workflow_writer, tmp_path, capsys, monkeypatch, as_json
+) -> None:
+    workdir = tmp_path / "repo"
+    path = workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="foreground-adoption-notice",
+        nodes=[{"id": "finish", "bash": "true"}],
+    )
+    profile = tmp_path / ("json-profile" if as_json else "human-profile")
+    package = load_workflow(path)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(profile).trust(
+        digest.sha256, actor="test", risk_digest=risk.risk_digest
+    )
+
+    def adopting_scheduler(store, _runtime, **_kwargs):
+        class AdoptOnAdvance:
+            def advance(self, run_id):
+                current = store.load_run(run_id)
+                released_at = datetime.now(timezone.utc)
+                assert store.release_foreground_execution(
+                    run_id,
+                    owner_id=current["foreground_owner_id"],
+                    epoch=current["foreground_epoch"],
+                    now=released_at,
+                )
+                expired_at = released_at + timedelta(microseconds=1)
+                identity = CoordinatorIdentity(
+                    owner_id="cli-adoption-test",
+                    host_kind="web",
+                    host_instance_id="cli-adoption-test",
+                    pid=1,
+                    process_start_time=None,
+                )
+                acquired = CoordinatorStore(store.database).try_acquire(
+                    identity,
+                    now=expired_at,
+                    lease_seconds=60,
+                )
+                assert acquired.is_leader
+                return store.adopt_expired_foreground(
+                    run_id,
+                    ExecutionFence(identity.owner_id, acquired.lease.epoch),
+                    expired_at,
+                )
+
+        return AdoptOnAdvance()
+
+    monkeypatch.setattr("plugins.workflow.cli._scheduler", adopting_scheduler)
+    argv = [
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(profile),
+        "run",
+        "foreground-adoption-notice",
+        "--idempotency-key",
+        "foreground-adoption-notice",
+        "--foreground",
+    ]
+    if as_json:
+        argv.append("--json")
+    args = _parser().parse_args(argv)
+
+    assert args.func(args) == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    if as_json:
+        envelope = json.loads(output.out)
+        assert envelope["result"]["execution_mode"] == "background"
+        assert envelope["result"]["execution_handoff"]["transition"] == (
+            "foreground_execution_adopted"
+        )
+    else:
+        run_id = RunStore(profile).list_runs()[0]["run_id"]
+        assert "adopted by the background coordinator and continues" in output.out
+        assert f"workflow status {run_id}" in output.out
+
+
 def test_run_refuses_trusted_package_that_requires_an_isolated_backend(
     workflow_writer, tmp_path, capsys
 ):
@@ -507,17 +590,19 @@ def test_run_refuses_trusted_package_that_requires_an_isolated_backend(
     WorkflowTrustStore(profile).trust(
         digest.sha256, actor="test", risk_digest=risk.risk_digest
     )
-    args = _parser().parse_args([
-        "--workdir",
-        str(workdir),
-        "--hermes-home",
-        str(profile),
-        "run",
-        "sample",
-        "--json",
-    ])
+    args = _parser().parse_args(
+        [
+            "--workdir",
+            str(workdir),
+            "--hermes-home",
+            str(profile),
+            "run",
+            "sample",
+            "--json",
+        ]
+    )
 
-    assert args.func(args) == 4
+    assert args.func(args) == machine_contract.EXIT_AUTHORIZATION
     assert _json_envelope(capsys)["error"]["code"] == "trust_required"
     assert RunStore(profile).list_runs() == ()
 
@@ -590,6 +675,48 @@ def test_json_argparse_failure_uses_one_stdout_envelope(capsys) -> None:
     assert envelope["ok"] is False
     assert envelope["command"] == "workflow run"
     assert envelope["error"]["code"] == "invalid_request"
+
+
+def test_top_level_json_parse_error_uses_one_stdout_envelope(capsys) -> None:
+    with pytest.raises(SystemExit) as exited:
+        _parser().parse_args(["bogus", "--json"])
+
+    assert exited.value.code == 2
+    output = capsys.readouterr()
+    assert output.err == ""
+    envelope = json.loads(output.out)
+    assert envelope["schema_version"] == 1
+    assert envelope["ok"] is False
+    assert envelope["error"]["code"] == "invalid_request"
+
+
+def test_os_error_is_sanitized(tmp_path, capsys, monkeypatch) -> None:
+    private_path = "/private/profile/workflows/admission.sqlite3"
+    monkeypatch.setattr(
+        "plugins.workflow.cli._cmd_status",
+        lambda _args: (_ for _ in ()).throw(OSError(private_path)),
+    )
+    args = _parser().parse_args(
+        [
+            "--hermes-home",
+            str(tmp_path / "profile"),
+            "status",
+            "run",
+            "--json",
+        ]
+    )
+
+    assert args.func(args) == machine_contract.EXIT_ACTION_FAILED
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert private_path not in output.out
+    envelope = json.loads(output.out)
+    assert envelope["error"] == {
+        "code": "action_failed",
+        "message": "workflow storage operation failed",
+        "retryable": False,
+        "details": {"exception_type": "OSError"},
+    }
 
 
 def test_runs_json_reports_sanitized_keyset_truncation(

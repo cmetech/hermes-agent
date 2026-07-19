@@ -359,6 +359,10 @@ def test_foreground_owner_death_is_adopted_and_replay_safe_run_continues(
         projection = store.load_run(run_id)
         assert projection["execution_mode"] == "background"
         assert projection["foreground_owner_id"] is None
+        assert projection["execution_handoff"]["transition"] == (
+            "foreground_execution_adopted"
+        )
+        assert projection["execution_handoff"]["execution_mode"] == "background"
         assert "foreground_execution_adopted" in {
             event["event_type"] for event in store.tail_events(run_id)
         }

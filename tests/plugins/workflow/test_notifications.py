@@ -7,6 +7,8 @@ from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.coordinator import WorkflowCoordinatorService
+from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.models import ExecutionFence
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
@@ -320,6 +322,75 @@ def test_bounded_repair_reads_one_run_page_and_only_candidate_fact_keys(
     assert sum(journal_reads) <= byte_budget
     assert candidate_batches and candidate_batches[0]
     assert all(first in key for key in candidate_batches[0])
+
+
+def test_oversized_first_journal_is_repaired(tmp_path, workflow_writer) -> None:
+    store = RunStore(tmp_path / "home")
+    now = datetime.now(timezone.utc)
+    identity = CoordinatorIdentity(
+        owner_id="oversized-repair",
+        host_kind="web",
+        host_instance_id="oversized-repair",
+        pid=1,
+        process_start_time=None,
+    )
+    leadership = CoordinatorStore(store.database).try_acquire(
+        identity, now=now, lease_seconds=60
+    )
+    assert leadership.is_leader
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="oversized-repair",
+            nodes=[{"id": "fail", "bash": "exit 7"}],
+        )
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="oversized-repair",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="oversized-repair",
+            concurrency_key="oversized-repair",
+            execution_mode="background",
+        ),
+        immutable_snapshot=prepared,
+    )
+    RunScheduler(
+        store,
+        owner_id="coordinator:oversized-repair:1",
+        execution_fence=ExecutionFence(identity.owner_id, leadership.lease.epoch),
+    ).advance(admitted.run_id)
+    outbox = NotificationOutbox(store)
+    with store._connect() as connection:
+        connection.execute(
+            "DELETE FROM workflow_notification_facts WHERE run_id=?",
+            (admitted.run_id,),
+        )
+        connection.execute(
+            "DELETE FROM workflow_notification_outbox WHERE run_id=?",
+            (admitted.run_id,),
+        )
+    journal_size = (
+        (store.run_directory(admitted.run_id) / "events.jsonl").stat().st_size
+    )
+
+    repaired = outbox.reconcile_journal(
+        limit_runs=1, max_journal_bytes=journal_size - 1
+    )
+
+    assert repaired == 1
+    attention = outbox.pending_attention(run_id=admitted.run_id)
+    assert attention[0]["kind"] == "failure"
+    with store._connect() as connection:
+        cursor = connection.execute(
+            "SELECT cursor_run_id FROM workflow_notification_reconcile_state "
+            "WHERE singleton=1"
+        ).fetchone()
+    assert cursor["cursor_run_id"] == admitted.run_id
 
 
 def test_bounded_repair_has_its_own_cadence(monkeypatch, tmp_path) -> None:

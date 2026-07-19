@@ -7,7 +7,9 @@ import threading
 import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.locks import workflow_lock
+from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
@@ -30,6 +32,42 @@ def _terminal_run(store, tmp_path, workflow_writer, *, name: str):
         immutable_snapshot=prepared,
     )
     RunScheduler(store).advance(admitted.run_id)
+    return admitted.run_id
+
+
+def _terminal_background_run(store, tmp_path, workflow_writer, *, name: str):
+    now = datetime.now(timezone.utc)
+    identity = CoordinatorIdentity(
+        owner_id=f"{name}-coordinator",
+        host_kind="web",
+        host_instance_id=f"{name}-coordinator",
+        pid=1,
+        process_start_time=None,
+    )
+    leadership = CoordinatorStore(store.database).try_acquire(
+        identity, now=now, lease_seconds=60
+    )
+    assert leadership.is_leader
+    package = load_workflow(workflow_writer(tmp_path / name, name=name))
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key=name,
+            concurrency_key=name,
+            execution_mode="background",
+        ),
+        immutable_snapshot=prepared,
+    )
+    RunScheduler(
+        store,
+        owner_id=f"coordinator:{identity.owner_id}:{leadership.lease.epoch}",
+        execution_fence=ExecutionFence(identity.owner_id, leadership.lease.epoch),
+    ).advance(admitted.run_id)
     return admitted.run_id
 
 
@@ -369,6 +407,58 @@ def test_cleanup_preview_blocks_pending_notification_dependency(
         "blocked_reasons"
     ]
     assert preview["notification_dependencies"]["count"] >= 1
+
+
+def test_cleanup_repairs_terminal_notification_gap_before_preview(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home")
+    run_id = _terminal_background_run(
+        store, tmp_path, workflow_writer, name="cleanup-notification-gap"
+    )
+    with store._connect() as connection:
+        connection.execute(
+            "DELETE FROM workflow_notification_facts WHERE run_id=?", (run_id,)
+        )
+        connection.execute(
+            "DELETE FROM workflow_notification_outbox WHERE run_id=?", (run_id,)
+        )
+
+    preview = store.cleanup_runs(older_than=timedelta(0))
+
+    assert preview["confirmation_token"] is None
+    assert preview["notification_dependencies"]["count"] == 1
+    assert store.run_directory(run_id).is_dir()
+
+
+@pytest.mark.parametrize("damage", ["missing", "empty", "corrupt", "oversized"])
+def test_cleanup_preserves_run_when_notification_corroboration_fails(
+    tmp_path, workflow_writer, damage
+) -> None:
+    store = RunStore(tmp_path / "home")
+    run_id = _terminal_run(
+        store, tmp_path, workflow_writer, name=f"cleanup-{damage}-journal"
+    )
+    journal = store.run_directory(run_id) / "events.jsonl"
+    store.max_journal_bytes = journal.stat().st_size + 1024
+    if damage == "missing":
+        journal.unlink()
+    elif damage == "empty":
+        journal.write_bytes(b"")
+    elif damage == "corrupt":
+        journal.write_bytes(b"{not-valid-json}\n")
+    else:
+        with journal.open("ab") as stream:
+            stream.write(b"x" * 1025)
+
+    preview = store.cleanup_runs(older_than=timedelta(0))
+
+    assert preview["confirmation_token"] is None
+    assert (
+        "notification_reconciliation_unverified"
+        in preview["candidates"][0]["blocked_reasons"]
+    )
+    assert store.run_directory(run_id).is_dir()
 
 
 def test_prune_preserves_facts_until_explicit_workflow_cleanup(

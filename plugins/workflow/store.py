@@ -100,11 +100,14 @@ class ForegroundExecutionLease:
     owner_id: str
     epoch: int
     lease_expires_at: datetime
+    boot_id: str | None = None
+    heartbeat_monotonic: float | None = None
+    lease_seconds: float | None = None
 
 
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
-_STORE_SCHEMA_VERSION = 12
+_STORE_SCHEMA_VERSION = 13
 # Direct RunStore/CLI access is already the profile-local filesystem admin
 # boundary. Network adapters must always pass their verified authority binding.
 _LOCAL_ADMIN_AUTHORITY_BINDING = "profile-local-runstore-admin"
@@ -433,6 +436,9 @@ class RunStore:
                         foreground_owner_id TEXT,
                         foreground_lease_expires_at TEXT,
                         foreground_epoch INTEGER,
+                        foreground_boot_id TEXT,
+                        foreground_heartbeat_monotonic REAL,
+                        foreground_lease_seconds REAL,
                         projection_schema_version INTEGER NOT NULL DEFAULT 1,
                         projection_state_version INTEGER,
                         projection_sha256 TEXT,
@@ -527,72 +533,73 @@ class RunStore:
                 row["name"] for row in connection.execute("PRAGMA table_info(runs)")
             }
             migrations = {
-                    "admission_state": (
-                        "ALTER TABLE runs ADD COLUMN admission_state TEXT "
-                        "NOT NULL DEFAULT 'published'"
-                    ),
-                    "desired_status": (
-                        "ALTER TABLE runs ADD COLUMN desired_status TEXT"
-                    ),
-                    "staging_directory": (
-                        "ALTER TABLE runs ADD COLUMN staging_directory TEXT"
-                    ),
-                    "operator_scope_digest": (
-                        "ALTER TABLE runs ADD COLUMN operator_scope_digest TEXT"
-                    ),
-                    "provenance_json": (
-                        "ALTER TABLE runs ADD COLUMN provenance_json TEXT"
-                    ),
-                    "projection_schema_version": (
-                        "ALTER TABLE runs ADD COLUMN projection_schema_version "
-                        "INTEGER NOT NULL DEFAULT 1"
-                    ),
-                    "projection_state_version": (
-                        "ALTER TABLE runs ADD COLUMN projection_state_version INTEGER"
-                    ),
-                    "projection_sha256": (
-                        "ALTER TABLE runs ADD COLUMN projection_sha256 TEXT"
-                    ),
-                    "journal_sequence": (
-                        "ALTER TABLE runs ADD COLUMN journal_sequence INTEGER"
-                    ),
-                    "journal_sha256": (
-                        "ALTER TABLE runs ADD COLUMN journal_sha256 TEXT"
-                    ),
-                    "integrity_verified_at": (
-                        "ALTER TABLE runs ADD COLUMN integrity_verified_at TEXT"
-                    ),
-                    "execution_mode": (
-                        "ALTER TABLE runs ADD COLUMN execution_mode TEXT "
-                        "NOT NULL DEFAULT 'foreground'"
-                    ),
-                    "foreground_owner_id": (
-                        "ALTER TABLE runs ADD COLUMN foreground_owner_id TEXT"
-                    ),
-                    "foreground_lease_expires_at": (
-                        "ALTER TABLE runs ADD COLUMN foreground_lease_expires_at TEXT"
-                    ),
-                    "foreground_epoch": (
-                        "ALTER TABLE runs ADD COLUMN foreground_epoch INTEGER"
-                    ),
-                    "queue_sequence": (
-                        "ALTER TABLE runs ADD COLUMN queue_sequence INTEGER"
-                    ),
-                    "pause_lane_policy": (
-                        "ALTER TABLE runs ADD COLUMN pause_lane_policy TEXT "
-                        "NOT NULL DEFAULT 'hold'"
-                    ),
-                    "lane_state": (
-                        "ALTER TABLE runs ADD COLUMN lane_state TEXT "
-                        "NOT NULL DEFAULT 'released'"
-                    ),
-                    "archived_at": (
-                        "ALTER TABLE runs ADD COLUMN archived_at TEXT"
-                    ),
-                    "restored_to_history": (
-                        "ALTER TABLE runs ADD COLUMN restored_to_history INTEGER "
-                        "NOT NULL DEFAULT 0"
-                    ),
+                "admission_state": (
+                    "ALTER TABLE runs ADD COLUMN admission_state TEXT "
+                    "NOT NULL DEFAULT 'published'"
+                ),
+                "desired_status": ("ALTER TABLE runs ADD COLUMN desired_status TEXT"),
+                "staging_directory": (
+                    "ALTER TABLE runs ADD COLUMN staging_directory TEXT"
+                ),
+                "operator_scope_digest": (
+                    "ALTER TABLE runs ADD COLUMN operator_scope_digest TEXT"
+                ),
+                "provenance_json": ("ALTER TABLE runs ADD COLUMN provenance_json TEXT"),
+                "projection_schema_version": (
+                    "ALTER TABLE runs ADD COLUMN projection_schema_version "
+                    "INTEGER NOT NULL DEFAULT 1"
+                ),
+                "projection_state_version": (
+                    "ALTER TABLE runs ADD COLUMN projection_state_version INTEGER"
+                ),
+                "projection_sha256": (
+                    "ALTER TABLE runs ADD COLUMN projection_sha256 TEXT"
+                ),
+                "journal_sequence": (
+                    "ALTER TABLE runs ADD COLUMN journal_sequence INTEGER"
+                ),
+                "journal_sha256": ("ALTER TABLE runs ADD COLUMN journal_sha256 TEXT"),
+                "integrity_verified_at": (
+                    "ALTER TABLE runs ADD COLUMN integrity_verified_at TEXT"
+                ),
+                "execution_mode": (
+                    "ALTER TABLE runs ADD COLUMN execution_mode TEXT "
+                    "NOT NULL DEFAULT 'foreground'"
+                ),
+                "foreground_owner_id": (
+                    "ALTER TABLE runs ADD COLUMN foreground_owner_id TEXT"
+                ),
+                "foreground_lease_expires_at": (
+                    "ALTER TABLE runs ADD COLUMN foreground_lease_expires_at TEXT"
+                ),
+                "foreground_epoch": (
+                    "ALTER TABLE runs ADD COLUMN foreground_epoch INTEGER"
+                ),
+                "foreground_boot_id": (
+                    "ALTER TABLE runs ADD COLUMN foreground_boot_id TEXT"
+                ),
+                "foreground_heartbeat_monotonic": (
+                    "ALTER TABLE runs ADD COLUMN foreground_heartbeat_monotonic REAL"
+                ),
+                "foreground_lease_seconds": (
+                    "ALTER TABLE runs ADD COLUMN foreground_lease_seconds REAL"
+                ),
+                "queue_sequence": (
+                    "ALTER TABLE runs ADD COLUMN queue_sequence INTEGER"
+                ),
+                "pause_lane_policy": (
+                    "ALTER TABLE runs ADD COLUMN pause_lane_policy TEXT "
+                    "NOT NULL DEFAULT 'hold'"
+                ),
+                "lane_state": (
+                    "ALTER TABLE runs ADD COLUMN lane_state TEXT "
+                    "NOT NULL DEFAULT 'released'"
+                ),
+                "archived_at": ("ALTER TABLE runs ADD COLUMN archived_at TEXT"),
+                "restored_to_history": (
+                    "ALTER TABLE runs ADD COLUMN restored_to_history INTEGER "
+                    "NOT NULL DEFAULT 0"
+                ),
             }
             for name, statement in migrations.items():
                 if name not in columns:
@@ -670,6 +677,9 @@ class RunStore:
                 "foreground_owner_id",
                 "foreground_lease_expires_at",
                 "foreground_epoch",
+                "foreground_boot_id",
+                "foreground_heartbeat_monotonic",
+                "foreground_lease_seconds",
             }
             if not required_columns <= columns:
                 missing = ", ".join(sorted(required_columns - columns))
@@ -693,6 +703,54 @@ class RunStore:
         lease = CoordinatorStore._lease(row)
         observed = sample or self._lease_clock()
         return lease if lease_is_fresh(lease, observed) else None
+
+    @staticmethod
+    def _foreground_lease(row: Mapping[str, object]) -> ForegroundExecutionLease | None:
+        def value(name: str) -> object:
+            try:
+                return row[name]
+            except (IndexError, KeyError):
+                return None
+
+        owner_id = value("foreground_owner_id")
+        epoch = value("foreground_epoch")
+        expires_at = value("foreground_lease_expires_at")
+        if (
+            not isinstance(owner_id, str)
+            or not owner_id
+            or isinstance(epoch, bool)
+            or not isinstance(epoch, int)
+            or not isinstance(expires_at, str)
+        ):
+            return None
+        return ForegroundExecutionLease(
+            owner_id=owner_id,
+            epoch=epoch,
+            lease_expires_at=datetime.fromisoformat(expires_at),
+            boot_id=(
+                str(value("foreground_boot_id"))
+                if value("foreground_boot_id") is not None
+                else None
+            ),
+            heartbeat_monotonic=(
+                float(value("foreground_heartbeat_monotonic"))
+                if value("foreground_heartbeat_monotonic") is not None
+                else None
+            ),
+            lease_seconds=(
+                float(value("foreground_lease_seconds"))
+                if value("foreground_lease_seconds") is not None
+                else None
+            ),
+        )
+
+    def _foreground_sample(self, now: datetime) -> LeaseClockSample:
+        observed = self._lease_clock()
+        return LeaseClockSample(
+            now.astimezone(timezone.utc),
+            observed.monotonic_now,
+            observed.boot_id,
+        )
 
     def assert_execution_fence(
         self,
@@ -794,6 +852,9 @@ class RunStore:
             "foreground_owner_id",
             "foreground_lease_expires_at",
             "foreground_epoch",
+            "foreground_boot_id",
+            "foreground_heartbeat_monotonic",
+            "foreground_lease_seconds",
             "projection_schema_version",
             "projection_state_version",
             "projection_sha256",
@@ -840,6 +901,9 @@ class RunStore:
                     foreground_owner_id TEXT,
                     foreground_lease_expires_at TEXT,
                     foreground_epoch INTEGER,
+                    foreground_boot_id TEXT,
+                    foreground_heartbeat_monotonic REAL,
+                    foreground_lease_seconds REAL,
                     projection_schema_version INTEGER NOT NULL DEFAULT 1,
                     projection_state_version INTEGER,
                     projection_sha256 TEXT,
@@ -1182,6 +1246,9 @@ class RunStore:
             queue_position = queue_sequence
         connection.execute(
             "UPDATE runs SET status=?, desired_status=?, execution_mode=?, "
+            "foreground_owner_id=?, foreground_lease_expires_at=?, "
+            "foreground_epoch=?, foreground_boot_id=?, "
+            "foreground_heartbeat_monotonic=?, foreground_lease_seconds=?, "
             "queue_position=?, queue_sequence=?, blocked_by_run_id=?, "
             "pause_lane_policy=?, lane_state=?, archived_at=?, "
             "restored_to_history=?, projection_schema_version=?, "
@@ -1192,6 +1259,12 @@ class RunStore:
                 projection["status"],
                 projection.get("desired_status"),
                 projection.get("execution_mode", "foreground"),
+                projection.get("foreground_owner_id"),
+                projection.get("foreground_lease_expires_at"),
+                projection.get("foreground_epoch"),
+                projection.get("foreground_boot_id"),
+                projection.get("foreground_heartbeat_monotonic"),
+                projection.get("foreground_lease_seconds"),
                 queue_position,
                 queue_sequence,
                 projection.get("blocked_by_run_id"),
@@ -1351,8 +1424,10 @@ class RunStore:
             "admission_state, desired_status, "
             "staging_directory, operator_scope_digest, provenance_json, "
             "execution_mode, foreground_owner_id, foreground_lease_expires_at, "
-            "foreground_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "?, ?, ?, ?, 'published', NULL, NULL, ?, ?, ?, ?, ?, ?)",
+            "foreground_epoch, foreground_boot_id, "
+            "foreground_heartbeat_monotonic, foreground_lease_seconds) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?, 'published', NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 projection["run_id"],
                 projection["workflow"],
@@ -1385,6 +1460,9 @@ class RunStore:
                 projection.get("foreground_owner_id"),
                 projection.get("foreground_lease_expires_at"),
                 projection.get("foreground_epoch"),
+                projection.get("foreground_boot_id"),
+                projection.get("foreground_heartbeat_monotonic"),
+                projection.get("foreground_lease_seconds"),
             ),
         )
 
@@ -2508,6 +2586,9 @@ class RunStore:
             foreground_owner_id = None
             foreground_lease_expires_at = None
             foreground_epoch = None
+            foreground_boot_id = None
+            foreground_heartbeat_monotonic = None
+            foreground_lease_seconds = None
             if request.execution_mode == "foreground":
                 foreground_owner_id = request.foreground_owner_id or (
                     f"foreground-{os.getpid()}-{uuid.uuid4().hex}"
@@ -2519,6 +2600,9 @@ class RunStore:
                     + timedelta(seconds=float(request.foreground_lease_seconds))
                 ).isoformat()
                 foreground_epoch = 1
+                foreground_boot_id = admission_sample.boot_id
+                foreground_heartbeat_monotonic = admission_sample.monotonic_now
+                foreground_lease_seconds = float(request.foreground_lease_seconds)
             cutoff = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
             recent_starts = connection.execute(
                 "SELECT COUNT(*) FROM runs WHERE created_at>=?", (cutoff,)
@@ -2564,15 +2648,15 @@ class RunStore:
             blocked_by = None
             queue_position = None
             queue_sequence = None
+            execution_at_capacity = counts.get("running", 0) >= self.limits["executing"]
             if active and request.concurrency_policy == "forbid":
                 connection.rollback()
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
                 return RunAdmissionResult(None, "rejected", "overlap_forbidden")
             if (
-                active and request.concurrency_policy == "queue"
-            ) or (
-                older_queued is not None
-                and request.concurrency_policy != "allow"
+                (active and request.concurrency_policy == "queue")
+                or (older_queued is not None and request.concurrency_policy != "allow")
+                or (execution_at_capacity and request.concurrency_policy == "queue")
             ):
                 if counts.get("queued", 0) >= self.limits["queued"]:
                     connection.rollback()
@@ -2585,7 +2669,7 @@ class RunStore:
                 blocked_by = active["run_id"] if active is not None else None
                 queue_sequence = self._next_queue_sequence(connection)
                 queue_position = queue_sequence
-            elif counts.get("running", 0) >= self.limits["executing"]:
+            elif execution_at_capacity:
                 connection.rollback()
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
                 return RunAdmissionResult(None, "rejected", "executing_capacity")
@@ -2604,8 +2688,10 @@ class RunStore:
                 "pause_lane_policy, lane_state, run_directory, "
                 "created_at, updated_at, admission_state, desired_status, "
                 "staging_directory, operator_scope_digest, provenance_json, execution_mode, "
-                "foreground_owner_id, foreground_lease_expires_at, foreground_epoch) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "foreground_owner_id, foreground_lease_expires_at, foreground_epoch, "
+                "foreground_boot_id, foreground_heartbeat_monotonic, "
+                "foreground_lease_seconds) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     run_id,
                     request.workflow_name,
@@ -2634,6 +2720,9 @@ class RunStore:
                     foreground_owner_id,
                     foreground_lease_expires_at,
                     foreground_epoch,
+                    foreground_boot_id,
+                    foreground_heartbeat_monotonic,
+                    foreground_lease_seconds,
                 ),
             )
             connection.commit()
@@ -2657,6 +2746,9 @@ class RunStore:
                 foreground_owner_id=foreground_owner_id,
                 foreground_lease_expires_at=foreground_lease_expires_at,
                 foreground_epoch=foreground_epoch,
+                foreground_boot_id=foreground_boot_id,
+                foreground_heartbeat_monotonic=foreground_heartbeat_monotonic,
+                foreground_lease_seconds=foreground_lease_seconds,
             )
             self._mark_reservation_published(run_id, status=status)
             self.load_run(run_id)
@@ -2691,6 +2783,9 @@ class RunStore:
         foreground_owner_id: str | None,
         foreground_lease_expires_at: str | None,
         foreground_epoch: int | None,
+        foreground_boot_id: str | None,
+        foreground_heartbeat_monotonic: float | None,
+        foreground_lease_seconds: float | None,
     ) -> None:
         (snapshot.staging_directory / ".snapshot-owner.json").unlink(missing_ok=True)
         _durable_replace(snapshot.staging_directory, run_directory)
@@ -2717,6 +2812,9 @@ class RunStore:
             "foreground_owner_id": foreground_owner_id,
             "foreground_lease_expires_at": foreground_lease_expires_at,
             "foreground_epoch": foreground_epoch,
+            "foreground_boot_id": foreground_boot_id,
+            "foreground_heartbeat_monotonic": foreground_heartbeat_monotonic,
+            "foreground_lease_seconds": foreground_lease_seconds,
             "outward_action_nodes": list(snapshot.outward_action_nodes),
             "admission_disposition": disposition,
             "queue_position": queue_position,
@@ -2828,12 +2926,16 @@ class RunStore:
         directory: Path,
         *,
         recover_torn_tail: bool = True,
+        journal_data: bytes | None = None,
     ) -> list[dict[str, object]]:
         journal_path = directory / "events.jsonl"
-        try:
-            data = journal_path.read_bytes()
-        except OSError as exc:
-            raise JournalRecoveryError(f"journal unavailable: {exc}") from exc
+        if journal_data is None:
+            try:
+                data = journal_path.read_bytes()
+            except OSError as exc:
+                raise JournalRecoveryError(f"journal unavailable: {exc}") from exc
+        else:
+            data = journal_data
         raw_frames = data.splitlines(keepends=True)
         events: list[dict[str, object]] = []
         offset = 0
@@ -2847,12 +2949,19 @@ class RunStore:
             try:
                 event = json.loads(content.decode("utf-8"))
                 self._validate_journal_frame(event, line_number=line_number)
-            except (UnicodeDecodeError, json.JSONDecodeError, JournalRecoveryError) as exc:
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                JournalRecoveryError,
+            ) as exc:
                 is_torn_tail = index == len(raw_frames) - 1 and not complete
-                if recover_torn_tail and is_torn_tail and events:
-                    preserved = directory / (
-                        f"events.jsonl.torn-{uuid.uuid4().hex}"
-                    )
+                if (
+                    recover_torn_tail
+                    and journal_data is None
+                    and is_torn_tail
+                    and events
+                ):
+                    preserved = directory / (f"events.jsonl.torn-{uuid.uuid4().hex}")
                     _atomic_bytes(preserved, data[offset:])
                     _atomic_bytes(journal_path, data[:offset])
                     return events
@@ -2863,7 +2972,7 @@ class RunStore:
                 ) from exc
             events.append(event)
             offset += len(raw_frame)
-        if events and data and not data.endswith(b"\n"):
+        if journal_data is None and events and data and not data.endswith(b"\n"):
             _atomic_bytes(journal_path, data + b"\n")
         return events
 
@@ -3575,6 +3684,95 @@ class RunStore:
                 break
         return tuple(results)
 
+    def attention_candidates(
+        self,
+        *,
+        operator_scope: str | None,
+        observed_at: datetime,
+        limit: int,
+        before: tuple[str, str] | None = None,
+        include_unavailable: bool = False,
+    ) -> tuple[dict[str, object], ...]:
+        """Return a bounded newest-first page of runs that may need attention."""
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("observed_at must be timezone-aware")
+        observed_at = observed_at.astimezone(timezone.utc)
+        if before is not None and (
+            not isinstance(before, tuple)
+            or len(before) != 2
+            or not all(isinstance(value, str) and value for value in before)
+        ):
+            raise ValueError("before must be an updated_at and run_id tuple")
+        clauses = [
+            "runs.admission_state='published'",
+            "runs.updated_at<=?",
+        ]
+        values: list[object] = [observed_at.isoformat()]
+        attention_states = [
+            "runs.status IN ('failed','paused')",
+            "(runs.status='running' AND ("
+            "(runs.execution_mode='foreground' AND "
+            "(runs.foreground_lease_expires_at IS NULL OR "
+            "runs.foreground_lease_expires_at<=?)) OR "
+            "EXISTS (SELECT 1 FROM worker_claims AS claims "
+            "WHERE claims.run_id=runs.run_id AND claims.lease_expires_at<=?)"
+            "))",
+        ]
+        values.extend((observed_at.isoformat(), observed_at.isoformat()))
+        if include_unavailable:
+            attention_states.append(
+                "runs.status IN ('queued','running','waiting_retry')"
+            )
+        clauses.append("(" + " OR ".join(attention_states) + ")")
+        if operator_scope is not None:
+            clauses.append("runs.operator_scope_digest=?")
+            values.append(self._scope_digest(operator_scope))
+        if before is not None:
+            clauses.append(
+                "(runs.updated_at<? OR (runs.updated_at=? AND runs.run_id<?))"
+            )
+            values.extend((before[0], before[0], before[1]))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT runs.run_id, runs.workflow_name, runs.status, "
+                "runs.updated_at FROM runs WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY runs.updated_at DESC, runs.run_id DESC LIMIT ?",
+                (*values, limit + 1),
+            ).fetchall()
+        results = []
+        for row in rows:
+            try:
+                result = self.get_run_status(
+                    str(row["run_id"]), operator_scope=operator_scope
+                )
+            except (
+                JournalRecoveryError,
+                OSError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                self._mark_repair_required(
+                    "run_evidence_uncorroborated", run_id=str(row["run_id"])
+                )
+                result = {
+                    "schema_version": 1,
+                    "action": "status",
+                    "run_id": row["run_id"],
+                    "workflow": row["workflow_name"],
+                    "status": row["status"],
+                    "status_authoritative": False,
+                    "health": "storage_degraded",
+                    "updated_at": row["updated_at"],
+                    "blocking_reason": "storage_repair_required",
+                    "next_actions": [],
+                    "warnings": ["run_evidence_uncorroborated"],
+                }
+            results.append(result)
+        return tuple(results)
+
     def archive_run(
         self,
         run_id: str,
@@ -3682,6 +3880,7 @@ class RunStore:
         ):
             raise ValueError("lease_seconds must be positive and finite")
         instant = now.astimezone(timezone.utc)
+        sample = self._foreground_sample(instant)
         expires_at = instant + timedelta(seconds=float(lease_seconds))
         directory = self.run_directory(run_id)
         with workflow_lock(self._run_lock_path(run_id)):
@@ -3709,18 +3908,20 @@ class RunStore:
                 connection.execute("BEGIN IMMEDIATE")
                 coordinator = self._fresh_coordinator_lease(connection)
                 row = connection.execute(
-                    "SELECT foreground_lease_expires_at, foreground_epoch "
+                    "SELECT foreground_owner_id, foreground_lease_expires_at, "
+                    "foreground_epoch, foreground_boot_id, "
+                    "foreground_heartbeat_monotonic, foreground_lease_seconds "
                     "FROM runs WHERE run_id=? AND execution_mode='foreground' "
                     "AND status IN ('queued','running','waiting_retry','paused','interrupted')",
                     (run_id,),
                 ).fetchone()
+                current_lease = self._foreground_lease(row) if row is not None else None
                 if (
                     coordinator is not None
                     or row is None
                     or (
-                        row["foreground_lease_expires_at"] is not None
-                        and datetime.fromisoformat(row["foreground_lease_expires_at"])
-                        > instant
+                        current_lease is not None
+                        and lease_is_fresh(current_lease, sample)
                     )
                 ):
                     connection.rollback()
@@ -3729,6 +3930,9 @@ class RunStore:
                 projection["foreground_owner_id"] = owner_id
                 projection["foreground_epoch"] = epoch
                 projection["foreground_lease_expires_at"] = expires_at.isoformat()
+                projection["foreground_boot_id"] = sample.boot_id
+                projection["foreground_heartbeat_monotonic"] = sample.monotonic_now
+                projection["foreground_lease_seconds"] = float(lease_seconds)
                 self._append_locked(
                     directory,
                     projection,
@@ -3737,17 +3941,34 @@ class RunStore:
                 )
                 connection.execute(
                     "UPDATE runs SET foreground_owner_id=?, foreground_epoch=?, "
-                    "foreground_lease_expires_at=?, updated_at=? WHERE run_id=?",
+                    "foreground_lease_expires_at=?, foreground_boot_id=?, "
+                    "foreground_heartbeat_monotonic=?, foreground_lease_seconds=?, "
+                    "updated_at=? WHERE run_id=?",
                     (
                         owner_id,
                         epoch,
                         expires_at.isoformat(),
+                        sample.boot_id,
+                        sample.monotonic_now,
+                        float(lease_seconds),
                         projection["updated_at"],
                         run_id,
                     ),
                 )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256((directory / "events.jsonl").read_bytes()),
+                )
                 connection.commit()
-                return ForegroundExecutionLease(owner_id, epoch, expires_at)
+                return ForegroundExecutionLease(
+                    owner_id,
+                    epoch,
+                    expires_at,
+                    sample.boot_id,
+                    sample.monotonic_now,
+                    float(lease_seconds),
+                )
             except BaseException:
                 connection.rollback()
                 raise
@@ -3764,6 +3985,7 @@ class RunStore:
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("now must be timezone-aware")
         instant = now.astimezone(timezone.utc)
+        sample = self._foreground_sample(instant)
         directory = self.run_directory(run_id)
         with workflow_lock(self._run_lock_path(run_id)):
             projection = json.loads((directory / "run.json").read_text())
@@ -3773,7 +3995,9 @@ class RunStore:
                 self.assert_execution_fence(connection, fence)
                 row = connection.execute(
                     "SELECT execution_mode, foreground_owner_id, "
-                    "foreground_lease_expires_at, foreground_epoch, status, "
+                    "foreground_lease_expires_at, foreground_epoch, "
+                    "foreground_boot_id, foreground_heartbeat_monotonic, "
+                    "foreground_lease_seconds, status, "
                     "projection_state_version "
                     "FROM runs WHERE run_id=?",
                     (run_id,),
@@ -3787,10 +4011,8 @@ class RunStore:
                         "foreground owner conflict: run is not coordinator-adoptable"
                     )
                 expires_text = row["foreground_lease_expires_at"]
-                if (
-                    not isinstance(expires_text, str)
-                    or datetime.fromisoformat(expires_text) > instant
-                ):
+                foreground_lease = self._foreground_lease(row)
+                if foreground_lease is None or lease_is_fresh(foreground_lease, sample):
                     raise ForegroundExecutionConflict(
                         "foreground owner conflict: owner lease is still active"
                     )
@@ -3799,6 +4021,9 @@ class RunStore:
                     row["foreground_owner_id"],
                     expires_text,
                     row["foreground_epoch"],
+                    row["foreground_boot_id"],
+                    row["foreground_heartbeat_monotonic"],
+                    row["foreground_lease_seconds"],
                     row["status"],
                     row["projection_state_version"],
                 )
@@ -3807,6 +4032,9 @@ class RunStore:
                     projection.get("foreground_owner_id"),
                     projection.get("foreground_lease_expires_at"),
                     projection.get("foreground_epoch"),
+                    projection.get("foreground_boot_id"),
+                    projection.get("foreground_heartbeat_monotonic"),
+                    projection.get("foreground_lease_seconds"),
                     projection.get("status"),
                     projection.get("state_version"),
                 )
@@ -3922,11 +4150,20 @@ class RunStore:
                 projection["foreground_owner_id"] = None
                 projection["foreground_epoch"] = None
                 projection["foreground_lease_expires_at"] = None
+                projection["foreground_boot_id"] = None
+                projection["foreground_heartbeat_monotonic"] = None
+                projection["foreground_lease_seconds"] = None
                 if reconciliation_required:
                     projection["status"] = "paused"
                     transition = "foreground_execution_reconciliation_required"
                 else:
                     transition = "foreground_execution_adopted"
+                    projection["execution_handoff"] = {
+                        "transition": transition,
+                        "execution_mode": "background",
+                        "coordinator_epoch": fence.owner_epoch,
+                        "occurred_at": instant.isoformat(),
+                    }
                 self._append_locked(
                     directory,
                     projection,
@@ -3946,10 +4183,15 @@ class RunStore:
                 updated = connection.execute(
                     "UPDATE runs SET execution_mode='background', "
                     "foreground_owner_id=NULL, foreground_lease_expires_at=NULL, "
-                    "foreground_epoch=NULL, status=?, updated_at=? "
+                    "foreground_epoch=NULL, foreground_boot_id=NULL, "
+                    "foreground_heartbeat_monotonic=NULL, "
+                    "foreground_lease_seconds=NULL, status=?, updated_at=? "
                     "WHERE run_id=? AND execution_mode='foreground' "
                     "AND foreground_owner_id IS ? "
                     "AND foreground_lease_expires_at=? AND foreground_epoch IS ? "
+                    "AND foreground_boot_id IS ? "
+                    "AND foreground_heartbeat_monotonic IS ? "
+                    "AND foreground_lease_seconds IS ? "
                     "AND projection_state_version IS ?",
                     (
                         projection["status"],
@@ -3958,7 +4200,10 @@ class RunStore:
                         expected[1],
                         expected[2],
                         expected[3],
+                        expected[4],
                         expected[5],
+                        expected[6],
+                        expected[8],
                     ),
                 ).rowcount
                 if updated != 1:
@@ -4021,6 +4266,9 @@ class RunStore:
                     connection.rollback()
                     return False
                 projection["foreground_lease_expires_at"] = instant.isoformat()
+                projection["foreground_boot_id"] = None
+                projection["foreground_heartbeat_monotonic"] = None
+                projection["foreground_lease_seconds"] = None
                 self._append_locked(
                     directory,
                     projection,
@@ -4028,7 +4276,10 @@ class RunStore:
                     {"owner_id": owner_id, "epoch": epoch},
                 )
                 connection.execute(
-                    "UPDATE runs SET foreground_lease_expires_at=?, updated_at=? "
+                    "UPDATE runs SET foreground_lease_expires_at=?, "
+                    "foreground_boot_id=NULL, "
+                    "foreground_heartbeat_monotonic=NULL, "
+                    "foreground_lease_seconds=NULL, updated_at=? "
                     "WHERE run_id=? AND foreground_owner_id=? AND foreground_epoch=?",
                     (
                         instant.isoformat(),
@@ -4037,6 +4288,11 @@ class RunStore:
                         owner_id,
                         epoch,
                     ),
+                )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256((directory / "events.jsonl").read_bytes()),
                 )
                 connection.commit()
                 return True
@@ -4069,20 +4325,82 @@ class RunStore:
             raise ValueError("lease_seconds must be positive and finite")
         if now.tzinfo is None:
             raise ValueError("now must be timezone-aware")
-        current = now.astimezone(timezone.utc).isoformat()
-        expires_at = (
-            now.astimezone(timezone.utc) + timedelta(seconds=float(lease_seconds))
-        ).isoformat()
-        with self._connect() as connection:
-            cursor = connection.execute(
-                "UPDATE runs SET foreground_lease_expires_at=?, updated_at=? "
-                "WHERE run_id=? AND execution_mode='foreground' "
-                "AND foreground_owner_id=? AND foreground_epoch=? "
-                "AND foreground_lease_expires_at>? "
-                "AND status IN ('queued','running','waiting_retry','paused','interrupted')",
-                (expires_at, current, run_id, owner_id, epoch, current),
-            )
-            return cursor.rowcount == 1
+        instant = now.astimezone(timezone.utc)
+        sample = self._foreground_sample(instant)
+        expires_at = (instant + timedelta(seconds=float(lease_seconds))).isoformat()
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT foreground_owner_id, foreground_lease_expires_at, "
+                    "foreground_epoch, foreground_boot_id, "
+                    "foreground_heartbeat_monotonic, foreground_lease_seconds "
+                    "FROM runs WHERE run_id=? AND execution_mode='foreground' "
+                    "AND status IN ('queued','running','waiting_retry','paused','interrupted')",
+                    (run_id,),
+                ).fetchone()
+                current_lease = self._foreground_lease(row) if row is not None else None
+                if (
+                    current_lease is None
+                    or current_lease.owner_id != owner_id
+                    or current_lease.epoch != epoch
+                    or not lease_is_fresh(current_lease, sample)
+                ):
+                    connection.rollback()
+                    return False
+                projection["foreground_lease_expires_at"] = expires_at
+                projection["foreground_boot_id"] = sample.boot_id
+                projection["foreground_heartbeat_monotonic"] = sample.monotonic_now
+                projection["foreground_lease_seconds"] = float(lease_seconds)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "foreground_execution_renewed",
+                    {"owner_id": owner_id, "epoch": epoch},
+                )
+                updated = connection.execute(
+                    "UPDATE runs SET foreground_lease_expires_at=?, "
+                    "foreground_boot_id=?, foreground_heartbeat_monotonic=?, "
+                    "foreground_lease_seconds=?, updated_at=? "
+                    "WHERE run_id=? AND foreground_owner_id=? "
+                    "AND foreground_epoch=? AND foreground_lease_expires_at=? "
+                    "AND foreground_boot_id IS ? "
+                    "AND foreground_heartbeat_monotonic IS ? "
+                    "AND foreground_lease_seconds IS ?",
+                    (
+                        expires_at,
+                        sample.boot_id,
+                        sample.monotonic_now,
+                        float(lease_seconds),
+                        projection["updated_at"],
+                        run_id,
+                        owner_id,
+                        epoch,
+                        current_lease.lease_expires_at.isoformat(),
+                        current_lease.boot_id,
+                        current_lease.heartbeat_monotonic,
+                        current_lease.lease_seconds,
+                    ),
+                ).rowcount
+                if updated != 1:
+                    raise ForegroundExecutionConflict(
+                        "foreground owner conflict: renewal comparison failed"
+                    )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256((directory / "events.jsonl").read_bytes()),
+                )
+                connection.commit()
+                return True
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
 
     def get_run_status(
         self, run_id: str, *, operator_scope: str | None = None
@@ -4090,7 +4408,8 @@ class RunStore:
         run = self.load_run(run_id, operator_scope=operator_scope)
         if not isinstance(run.get("provenance"), Mapping):
             run["provenance"] = legacy_projection_provenance(run)
-        observed_at = self._lease_clock().utc_now
+        observed_sample = self._lease_clock()
+        observed_at = observed_sample.utc_now
         nodes = run.get("nodes", {})
         node_values = list(nodes.values()) if isinstance(nodes, dict) else []
         completed = sum(
@@ -4160,13 +4479,13 @@ class RunStore:
                 "epoch": run.get("foreground_epoch"),
                 "lease_expires_at": run.get("foreground_lease_expires_at"),
             }
+        foreground_lease = self._foreground_lease(run)
         foreground_owner_missing = (
             execution_mode == "foreground"
             and status == "running"
             and (
-                not isinstance(run.get("foreground_lease_expires_at"), str)
-                or datetime.fromisoformat(run["foreground_lease_expires_at"])
-                <= observed_at
+                foreground_lease is None
+                or not lease_is_fresh(foreground_lease, observed_sample)
             )
         )
         stale_claim = any(
@@ -4194,8 +4513,10 @@ class RunStore:
                 if run.get("blocked_by_run_id")
                 else "execution_capacity"
             )
-            if observed is not None and observed.status != "healthy" and not run.get(
-                "blocked_by_run_id"
+            if (
+                observed is not None
+                and observed.status != "healthy"
+                and not run.get("blocked_by_run_id")
             ):
                 health = "coordinator_unavailable"
                 blocking_reason = observed.reason_code
@@ -4465,7 +4786,9 @@ class RunStore:
                     elif require_execution_authority or foreground_owner_id is not None:
                         execution = connection.execute(
                             "SELECT execution_mode, foreground_owner_id, "
-                            "foreground_epoch, foreground_lease_expires_at "
+                            "foreground_epoch, foreground_lease_expires_at, "
+                            "foreground_boot_id, foreground_heartbeat_monotonic, "
+                            "foreground_lease_seconds "
                             "FROM runs WHERE run_id=?",
                             (run_id,),
                         ).fetchone()
@@ -4473,15 +4796,24 @@ class RunStore:
                             connection.rollback()
                             return None
                         if execution["execution_mode"] == "foreground":
-                            expires_at = execution["foreground_lease_expires_at"]
+                            foreground_sample = self._foreground_sample(instant)
+                            if monotonic_now is not None:
+                                foreground_sample = LeaseClockSample(
+                                    foreground_sample.utc_now,
+                                    float(monotonic_now),
+                                    foreground_sample.boot_id,
+                                )
+                            foreground_lease = self._foreground_lease(execution)
                             if (
                                 foreground_owner_id is None
                                 or execution["foreground_owner_id"]
                                 != foreground_owner_id
                                 or execution["foreground_epoch"]
                                 != foreground_owner_epoch
-                                or not isinstance(expires_at, str)
-                                or datetime.fromisoformat(expires_at) <= instant
+                                or foreground_lease is None
+                                or not lease_is_fresh(
+                                    foreground_lease, foreground_sample
+                                )
                             ):
                                 connection.rollback()
                                 return None
@@ -6820,8 +7152,9 @@ class RunStore:
             for node in package.definition.nodes
             if node.options.get("always_run")
         }
-        with workflow_lock(self.admission_lock), workflow_lock(
-            self._run_lock_path(run_id)
+        with (
+            workflow_lock(self.admission_lock),
+            workflow_lock(self._run_lock_path(run_id)),
         ):
             projection = json.loads((directory / "run.json").read_text())
             if expected_state_version is not None and (
@@ -6833,13 +7166,8 @@ class RunStore:
                     projection.get("status") == "running"
                     and projection.get("execution_mode") == "foreground"
                     and (
-                        not isinstance(
-                            projection.get("foreground_lease_expires_at"), str
-                        )
-                        or datetime.fromisoformat(
-                            projection["foreground_lease_expires_at"]
-                        )
-                        <= datetime.now(timezone.utc)
+                        (lease := self._foreground_lease(projection)) is None
+                        or not lease_is_fresh(lease, self._lease_clock())
                     )
                 ):
                     raise ForegroundExecutionConflict(
@@ -7555,47 +7883,56 @@ class RunStore:
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT run_id, run_directory, status, updated_at FROM runs "
-                f"WHERE admission_state='published'{scope_clause} "
-                "ORDER BY updated_at, run_id",
-                values,
+                "WHERE admission_state='published' "
+                "AND status IN ('succeeded','failed','cancelled','abandoned') "
+                f"AND updated_at<=?{scope_clause} "
+                "ORDER BY updated_at, run_id LIMIT 201",
+                (cutoff.isoformat(), *values),
             ).fetchall()
-        rows = [
-            row
-            for row in rows
-            if row["status"] in {"succeeded", "failed", "cancelled", "abandoned"}
-            and datetime.fromisoformat(row["updated_at"]) <= cutoff
-        ]
+        more_candidates = len(rows) > 200
+        rows = rows[:200]
         if required_metadata:
             rows = [
                 row
                 for row in rows
-                if self._run_has_metadata(
-                    Path(row["run_directory"]), required_metadata
-                )
+                if self._run_has_metadata(Path(row["run_directory"]), required_metadata)
             ]
+        from plugins.workflow.notifications import (
+            NotificationOutbox,
+            NotificationReconciliationError,
+        )
+
+        outbox = NotificationOutbox(self)
         candidates: list[dict[str, object]] = []
         for row in rows:
+            reconciliation_failed = False
+            try:
+                outbox.reconcile_run(str(row["run_id"]))
+            except NotificationReconciliationError:
+                reconciliation_failed = True
+            except WorkflowLockTimeout:
+                pass
             try:
                 with workflow_lock(
                     self._run_lock_path(row["run_id"]), timeout_seconds=0.05
                 ):
                     candidate = self._cleanup_candidate(row)
             except WorkflowLockTimeout:
-                candidate = {
-                    "run_id": row["run_id"],
-                    "run_directory": row["run_directory"],
-                    "status": row["status"],
-                    "updated_at": row["updated_at"],
-                    "state_version": None,
-                    "event_sequence": None,
-                    "projection_sha256": None,
-                    "journal_sha256": None,
-                    "files": 0,
-                    "bytes": 0,
-                    "evidence_types": [],
-                    "notification_dependencies": 0,
-                    "blocked_reasons": ["active_reader_or_writer"],
-                }
+                candidate = self._blocked_cleanup_candidate(
+                    row, "active_reader_or_writer"
+                )
+            except (JournalRecoveryError, OSError, ValueError, json.JSONDecodeError):
+                reconciliation_failed = True
+                candidate = self._blocked_cleanup_candidate(
+                    row, "notification_reconciliation_unverified"
+                )
+            if reconciliation_failed and (
+                "notification_reconciliation_unverified"
+                not in candidate["blocked_reasons"]
+            ):
+                candidate["blocked_reasons"].append(
+                    "notification_reconciliation_unverified"
+                )
             candidates.append(candidate)
         health = self.storage_health()
         blocked_reasons = (
@@ -7648,6 +7985,27 @@ class RunStore:
             },
             "confirmation_token": token,
             "confirmation_expires_at": expires_at.isoformat() if token else None,
+            "more_candidates": more_candidates,
+        }
+
+    @staticmethod
+    def _blocked_cleanup_candidate(
+        row: sqlite3.Row, reason_code: str
+    ) -> dict[str, object]:
+        return {
+            "run_id": row["run_id"],
+            "run_directory": row["run_directory"],
+            "status": row["status"],
+            "updated_at": row["updated_at"],
+            "state_version": None,
+            "event_sequence": None,
+            "projection_sha256": None,
+            "journal_sha256": None,
+            "files": 0,
+            "bytes": 0,
+            "evidence_types": [],
+            "notification_dependencies": 0,
+            "blocked_reasons": [reason_code],
         }
 
     def _cleanup_candidate(self, row: sqlite3.Row) -> dict[str, object]:
@@ -7763,6 +8121,21 @@ class RunStore:
             candidates = json.loads(preview["candidates_json"])
             if not isinstance(candidates, list) or not candidates:
                 raise ValueError("cleanup confirmation token has no candidates")
+            from plugins.workflow.notifications import (
+                NotificationOutbox,
+                NotificationReconciliationError,
+            )
+
+            outbox = NotificationOutbox(self)
+            for candidate in candidates:
+                try:
+                    outbox.reconcile_run(str(candidate["run_id"]))
+                except NotificationReconciliationError as exc:
+                    self._invalidate_cleanup_preview(token_digest)
+                    raise RuntimeError(
+                        "cleanup preview changed: notification reconciliation "
+                        "could not be verified"
+                    ) from exc
             with ExitStack() as locks:
                 for candidate in sorted(candidates, key=lambda item: item["run_id"]):
                     locks.enter_context(

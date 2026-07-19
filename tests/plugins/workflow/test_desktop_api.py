@@ -837,6 +837,110 @@ def test_attention_returns_action_metadata_for_every_operator_attention_kind(
         assert item["updated_at"]
 
 
+def _approval_attention_runs(
+    home: Path,
+    package,
+    *,
+    count: int,
+    scope: str | None = None,
+) -> list[str]:
+    store = RunStore(
+        home,
+        max_executing_runs=max(4, count),
+        max_nonterminal_runs=max(200, count + 1),
+        max_start_requests_per_minute=max(60, count + 1),
+    )
+    run_ids = []
+    for index in range(count):
+        admitted = _start(
+            store,
+            package,
+            f"attention-page-{index:03d}",
+            scope=scope,
+        )
+        RunScheduler(store).advance(admitted.run_id)
+        run_ids.append(admitted.run_id)
+    return run_ids
+
+
+def test_attention_is_newest_first(tmp_path, monkeypatch, workflow_writer) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "newest-attention",
+            name="newest-attention",
+            nodes=[{"id": "review", "approval": {"message": "Approve?"}}],
+        )
+    )
+    run_ids = _approval_attention_runs(home, package, count=3)
+
+    response = TestClient(_app(_router())).get(
+        "/api/plugins/workflow/attention?limit=3"
+    )
+
+    assert response.status_code == 200
+    assert [item["run_id"] for item in response.json()["items"]] == list(
+        reversed(run_ids)
+    )
+
+
+def test_attention_cursor_traverses_more_than_100_tied_items_and_is_scope_bound(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    fixed = datetime.now(timezone.utc).isoformat()
+    monkeypatch.setattr("plugins.workflow.store._utc_now", lambda: fixed)
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "paged-attention",
+            name="paged-attention",
+            nodes=[{"id": "review", "approval": {"message": "Approve?"}}],
+        )
+    )
+    expected = set(
+        _approval_attention_runs(
+            home,
+            package,
+            count=105,
+            scope="alice/conversation",
+        )
+    )
+    client = TestClient(_app(_router()))
+    cursor = None
+    seen: list[str] = []
+    cursors: set[str] = set()
+
+    while True:
+        query = "limit=37"
+        if cursor is not None:
+            query += f"&cursor={cursor}"
+        response = client.get(
+            f"/api/plugins/workflow/attention?{query}",
+            headers={"X-Hermes-Operator-Scope": "alice/conversation"},
+        )
+        assert response.status_code == 200
+        page = response.json()
+        seen.extend(item["run_id"] for item in page["items"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+        assert cursor not in cursors
+        cursors.add(cursor)
+
+    assert len(seen) == len(set(seen)) == 105
+    assert set(seen) == expected
+    assert len(cursors) == 2
+
+    denied = client.get(
+        f"/api/plugins/workflow/attention?limit=37&cursor={next(iter(cursors))}",
+        headers={"X-Hermes-Operator-Scope": "bob/conversation"},
+    )
+    assert denied.status_code == 410
+    assert denied.json()["detail"]["code"] == "cursor_expired"
+
+
 def test_forged_scope_header_cannot_expand_verified_session(
     tmp_path, monkeypatch, workflow_writer
 ):
