@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  executeWorkflowCleanup,
   getApiRequestProfile,
   getCronJobs,
   getGlobalModelInfo,
@@ -10,6 +11,7 @@ import {
   getProfiles,
   getSessionMessages,
   getStatus,
+  getWorkflowEvidence,
   getWorkflowRun,
   listAllProfileSessions,
   listSessions,
@@ -17,6 +19,7 @@ import {
   listWorkflowEvents,
   listWorkflowRuns,
   mutateWorkflowRun,
+  previewWorkflowCleanup,
   saveMoaModels,
   setApiRequestProfile
 } from './hermes'
@@ -111,20 +114,38 @@ describe('Hermes REST session helpers', () => {
       getWorkflowRun('run 1'),
       listWorkflowAttention(),
       listWorkflowEvents('run 1', 7),
+      getWorkflowEvidence('run 1', 'attempts'),
+      previewWorkflowCleanup('7d'),
+      executeWorkflowCleanup('exact-token', '7d'),
       mutateWorkflowRun('run 1', 'cancel', { expected_version: 3 })
     ])
 
-    expect(api).toHaveBeenCalledTimes(5)
+    expect(api).toHaveBeenCalledTimes(8)
 
     for (const [request] of api.mock.calls) {
       expect(request).toEqual(expect.objectContaining({ profile: 'remote-profile' }))
     }
 
-    expect(api).toHaveBeenLastCalledWith(expect.objectContaining({
-      body: { expected_version: 3 },
-      method: 'POST',
-      path: '/api/plugins/workflow/runs/run%201/cancel'
-    }))
+    expect(api).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        body: { expected_version: 3 },
+        method: 'POST',
+        path: '/api/plugins/workflow/runs/run%201/cancel'
+      })
+    )
+  })
+
+  it('uses a non-blocking events request so hidden inspectors cannot retain server permits', async () => {
+    api.mockResolvedValue({ cursor_reset: false, events: [], next_cursor: 4, schema_version: 1 })
+
+    await listWorkflowEvents('run 1', 4)
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/plugins/workflow/runs/run%201/events?after=4&wait_seconds=0'
+      })
+    )
+    expect(api.mock.calls[0]?.[0]).not.toHaveProperty('timeoutMs')
   })
 
   it('gives the whole startup data burst the long timeout, not just profiles', async () => {

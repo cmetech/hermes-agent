@@ -8,9 +8,18 @@
 
 **Tech Stack:** Python 3.11+, PyYAML, dataclasses, FastAPI plugin routes, `jsonschema` from Hermes' existing `mcp`/`all` install path, Hermes plugin/skill/cron/MCP infrastructure, Electron/React, TanStack Query, nanostores, the desktop app's existing design primitives and Mermaid/Streamdown renderer, pytest, Vitest, and Node test runner for capability vendoring and brand generation.
 
-**Status:** Final; approved for implementation
+**Status:** Historical milestone plan; remaining production/operator work is superseded and requires review approval
 
 **Amended:** 2026-07-16 — native workflow/Kanban operational boards (option 3), neutral internal package naming, expanded status/diagnostic coverage, idempotent admission, trusted-package execution, cancellation races, generic Kanban CAS (option 2), offline production showcase harness, and overlap-aware upstream merge preservation
+
+**2026-07-18 supersession:** Completed historical tasks remain useful evidence,
+but no unfinished task in this document authorizes implementation or release.
+Safety remediation, generic plugin background services, durable coordination,
+machine contracts, operator UX, and release gates must follow
+`docs/superpowers/plans/2026-07-18-workflow-orchestration-operator-experience-plan.md`
+in its risk order. That plan and its focused coordinator design supersede any
+earlier foreground-owned continuation, cleanup, notification, or touch-budget
+assumption.
 
 ## Global Constraints
 

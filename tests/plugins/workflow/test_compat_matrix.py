@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+
+import pytest
+
 from plugins.workflow.compat import (
     ARCHON_TOOL_ALIASES,
     CompatibilityLevel,
@@ -7,6 +11,9 @@ from plugins.workflow.compat import (
 )
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.schema import HOOK_EVENTS
+from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.evidence import EvidenceReader
+from plugins.workflow.store import RunStore
 
 
 def test_portable_mapped_and_unsupported_fields_are_reported(workflow_writer, tmp_path):
@@ -214,3 +221,38 @@ def test_every_published_hook_event_is_classified(workflow_writer, tmp_path):
         "WorktreeCreate",
         "WorktreeRemove",
     }
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point boundary")
+def test_windows_log_evidence_rejects_reparse_parent(
+    workflow_writer, tmp_path
+) -> None:
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="windows-reparse")
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="windows-reparse",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="windows-reparse-intent",
+            concurrency_key="windows-reparse",
+        ),
+        immutable_snapshot=prepared,
+    )
+    outside = tmp_path / "outside" / "a1"
+    outside.mkdir(parents=True)
+    (outside / "stdout.txt").write_text("REPARSE_ESCAPE_SENTINEL")
+    nodes = store.run_directory(admitted.run_id) / "nodes"
+    nodes.mkdir(exist_ok=True)
+    os.symlink(outside.parent, nodes / "n1", target_is_directory=True)
+
+    page = EvidenceReader(store).query(admitted.run_id, kind="logs")
+
+    assert "REPARSE_ESCAPE_SENTINEL" not in str(page)
+    assert page["items"] == []
+    assert page["warnings"] == ["unsafe_evidence_path"]

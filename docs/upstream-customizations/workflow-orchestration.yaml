@@ -85,21 +85,32 @@ upstream_changes:
   files:
   - tools/managed_process.py
   - tools/process_registry.py
+  - plugins/workflow/executors/base.py
+  - plugins/workflow/store.py
   owned_symbols:
+  - _WindowsJob
   - ProcessIdentity
   - TerminationPolicy
   - ProcessResourceLimits
   - ManagedProcessTree
+  - process_tree_active
+  - RunStore._observe_process_identity
   tests:
   - tests/tools/test_managed_process.py
   - tests/tools/test_process_registry.py
-  expected_commit_subject: 'fix(tools): verify managed process cleanup'
+  - tests/plugins/workflow/test_process_lifecycle_soak.py
+  expected_commit_subject: 'fix(workflow): prove Windows process termination'
   upstream_candidate: true
   merge_guidance: Reconcile process identity, aggregate resource enforcement,
     process-tree termination, escalation, and wait/reap behavior before replaying
-    the extraction.
-  removal_condition: Remove when Hermes upstream exposes an equivalent generic managed-process-tree
-    primitive used by ProcessRegistry.
+    the extraction. On Windows preserve immediate assignment to a named Job Object
+    with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, owner-held handles, persisted job
+    identity, query-proven quiescence, and fail-closed recovery when assignment,
+    open, query, termination, or close cannot be proven.
+  removal_condition: Remove when Hermes upstream exposes an equivalent generic
+    managed-process-tree primitive used by ProcessRegistry and workflow executors,
+    including native Windows Job Object ownership and query-proven descendant
+    quiescence across direct-child exit and recovery.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: plugin-agent-runner
   change_class: agent-core-generic
@@ -299,6 +310,31 @@ upstream_changes:
   removal_condition: Remove when upstream Desktop provides equivalent compare-and-set
     workflow action recovery and tested activity-board accessibility at scale.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-notification-projection
+  change_class: desktop-composition-generic
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/store/native-notifications.ts
+  - apps/desktop/src/store/workflow-notifications.ts
+  - apps/desktop/src/store/workflow-notifications.test.ts
+  owned_symbols:
+  - projectNativeNotification
+  - deliverWorkflowNotificationsOnce
+  - startWorkflowNotificationDelivery
+  tests:
+  - apps/desktop/src/store/native-notifications.test.ts
+  - apps/desktop/src/store/workflow-notifications.test.ts
+  expected_commit_subject: 'feat(workflow): add retention and durable notifications'
+  upstream_candidate: true
+  merge_guidance: Preserve durable server-owned notification leases, stable
+    Electron client identity, projection-before-ack ordering, and the bounded
+    local projected-receipt cache that retries a lost server acknowledgement
+    without projecting a duplicate OS notification. Desktop preferences and
+    dismissal remain presentation policy and never mutate workflow state.
+  removal_condition: Remove when upstream Desktop provides an equivalent
+    generic durable-notification projection with leased reads, Electron receipt
+    acknowledgement, crash recovery, and send-before-receipt deduplication.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: capability-workflow-package-staging
   change_class: capability-staging-generic
   owner: workflow-orchestration
@@ -434,6 +470,7 @@ upstream_changes:
   owned_symbols:
   - workflow-portability
   tests:
+  - tests/tools/test_managed_process.py
   - tests/plugins/workflow/test_portable_compatibility_e2e.py
   - tests/plugins/workflow/test_showcase_distribution_e2e.py
   - tests/plugins/workflow/test_fault_injection.py
@@ -498,4 +535,164 @@ upstream_changes:
   removal_condition: Remove when every supported managed Windows updater both
     migrates pre-attribute checkouts to LF bytes and pins local autocrlf before
     future pulls, with equivalent semantic-tamper rejection coverage.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: plugin-background-service-lifecycle
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/plugin_services.py
+  - hermes_cli/plugins.py
+  - tools/tts_tool.py
+  - tools/transcription_tools.py
+  - tools/video_generation_tool.py
+  - tools/image_generation_tool.py
+  - tests/hermes_cli/test_plugin_background_services.py
+  - tests/hermes_cli/test_plugin_provider_hot_reload.py
+  owned_symbols:
+  - BackgroundService
+  - BackgroundServiceContext
+  - BackgroundServiceHealth
+  - BackgroundServiceHost
+  - HostedServiceSnapshot
+  - PluginContext.register_background_service
+  - PluginManager.start_background_services
+  - PluginManager.reload_background_services
+  - PluginManager.has_bound_background_service_host
+  - hosted media-provider dispatch reload boundary
+  tests:
+  - tests/hermes_cli/test_plugin_background_services.py
+  - tests/hermes_cli/test_plugins.py
+  - tests/hermes_cli/test_safe_mode.py
+  - tests/hermes_cli/test_plugin_provider_hot_reload.py
+  - tests/tools/test_image_generation_plugin_dispatch.py
+  - tests/tools/test_transcription_plugin_dispatch.py
+  - tests/tools/test_tts_plugin_dispatch.py
+  - tests/tools/test_video_generation_dispatch.py
+  expected_commit_subject: 'fix(plugins): prevent background service overlap'
+  upstream_candidate: true
+  merge_guidance: Preserve attributed dormant factories, host filtering,
+    registration rollback, one host-owned blocking run thread, cached bounded
+    health probes, aggregate shutdown, failure isolation, safe-mode factory
+    suppression, one indexed live generation per host kind (including the
+    bind-before-start race), and the no-overlap force-reload barrier. Hosted
+    provider callers wait for host-controlled publication and never force a
+    rescan; unhosted CLI processes retain direct force discovery. The workflow
+    coordinator is the concrete consumer; generic lifecycle code must not
+    receive workflow, agent, prompt, conversation, tool, provider, web, or
+    Gateway authority.
+  removal_condition: Remove when Hermes upstream provides an equivalent or
+    stronger generic plugin service host and the workflow coordinator has
+    migrated to it without weakening same-kind exclusion, quiescence-proven
+    reload, or host-owned provider publication.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: authenticated-plugin-gateway-delivery
+  change_class: product-surface-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/plugin_invocation.py
+  - hermes_cli/plugin_services.py
+  - hermes_cli/plugins.py
+  - gateway/plugin_delivery.py
+  - gateway/run.py
+  - plugins/workflow/__init__.py
+  - plugins/workflow/gateway_command.py
+  - plugins/workflow/coordinator.py
+  - plugins/workflow/notifications.py
+  - tests/hermes_cli/test_authenticated_plugin_commands.py
+  - tests/gateway/test_plugin_delivery.py
+  - tests/plugins/workflow/test_notification_delivery.py
+  owned_symbols:
+  - PluginInvocationContext
+  - PluginDeliveryPort
+  - DeliveryReceipt
+  - PluginContext.register_authenticated_command
+  - PluginManager.bind_background_delivery_port
+  - invoke_plugin_command
+  - GatewayPluginDeliveryPort
+  - GatewayRunner authenticated plugin invocation and delivery boundary
+  - workflow_gateway_command
+  - WorkflowCoordinatorService._deliver_gateway_notifications
+  tests:
+  - tests/hermes_cli/test_authenticated_plugin_commands.py
+  - tests/gateway/test_plugin_delivery.py
+  - tests/plugins/workflow/test_notification_delivery.py
+  - tests/hermes_cli/test_plugin_background_services.py
+  - tests/gateway/test_plugin_background_services.py
+  - tests/hermes_cli/test_plugin_provider_hot_reload.py
+  expected_commit_subject: 'feat(plugins): add authenticated gateway delivery'
+  upstream_candidate: true
+  merge_guidance: Preserve immutable host-verified invocation facts and the
+    distinction between existing one-argument commands and authenticated
+    two-argument commands. Gateway return routes must be server-minted opaque
+    capabilities whose durable registry stores only a digest and normalized
+    verified route. Fence every adapter send durably before the outward effect,
+    deduplicate by delivery key across receipt loss, and never replay a sending
+    or otherwise uncertain outcome. Keep delivery optional and host-owned in
+    generic service context; web hosts receive no port. The workflow plugin is
+    the concrete consumer and must keep return-route capability out of semantic
+    admission identity while persisting it as durable provenance and projecting
+    its authoritative notification outbox through the coordinator.
+  removal_condition: Remove when Hermes upstream provides equivalent generic
+    authenticated plugin invocation and restart-safe opaque Gateway delivery
+    capabilities, and workflow has migrated without exposing adapter routes,
+    accepting client provenance, adding a competing queue, or replaying
+    uncertain outward effects.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: web-plugin-background-service-host
+  change_class: product-surface-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/web_server.py
+  - tests/hermes_cli/test_web_server.py
+  - tests/hermes_cli/test_web_server_plugin_services.py
+  - tests/hermes_cli/test_plugin_provider_hot_reload.py
+  owned_symbols:
+  - _lifespan plugin background service boundary
+  - app.state.plugin_background_services
+  - _reload_plugin_background_services
+  - provider and plugin configuration reload routing
+  tests:
+  - tests/hermes_cli/test_web_server_plugin_services.py
+  - tests/hermes_cli/test_web_server_boot_handshake.py
+  - tests/hermes_cli/test_workflow_dashboard_auth.py
+  - tests/hermes_cli/test_plugin_provider_hot_reload.py
+  expected_commit_subject: 'fix(plugins): prevent background service overlap'
+  upstream_candidate: true
+  merge_guidance: Preserve generic plugin discovery and web-host binding before
+    FastAPI readiness, process-local cached lifecycle inspection on app.state,
+    failure isolation from HTTP readiness, host-controller provider/plugin
+    reload with explicit plugin_reload_blocked rollback, and bounded service
+    shutdown before PTY and cron resource teardown. Do not add workflow imports
+    or expose local service health as cross-process workflow authority.
+  removal_condition: Remove when Hermes upstream binds an equivalent generic
+    plugin service host in both dashboard and headless-serve FastAPI lifespan
+    with the same failure, provider-publication, and shutdown ordering.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: gateway-plugin-background-service-host
+  change_class: product-surface-generic
+  owner: workflow-orchestration
+  files:
+  - gateway/run.py
+  - tests/gateway/test_plugin_background_services.py
+  owned_symbols:
+  - GatewayRunner.plugin_background_services
+  - GatewayRunner.reload_plugin_background_services
+  - GatewayRunner.start plugin background service boundary
+  - GatewayRunner.stop plugin background service boundary
+  tests:
+  - tests/gateway/test_plugin_background_services.py
+  - tests/gateway/test_gateway_shutdown.py
+  - tests/gateway/test_startup_restart_race.py
+  expected_commit_subject: 'fix(plugins): prevent background service overlap'
+  upstream_candidate: true
+  merge_guidance: Preserve generic Gateway-host binding after plugin discovery
+    and required adapter/runtime readiness but before the running status, plus
+    host-controller provider publication, and bounded service quiescence while
+    adapters and persistence are still live. Service construction, run, health,
+    reload, and shutdown failures must remain isolated from unrelated Gateway
+    startup and teardown. Do not add workflow imports or treat process-local
+    service health as cross-process authority.
+  removal_condition: Remove when Hermes upstream binds an equivalent generic
+    plugin service host in Gateway with the same readiness, provider-publication,
+    failure-isolation, and pre-resource-teardown shutdown ordering.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

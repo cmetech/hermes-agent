@@ -210,6 +210,46 @@ def test_profile_worker_cap_holds_across_scheduler_instances(tmp_path, workflow_
     assert {store.load_run(run_id)["status"] for run_id in runs} == {"succeeded"}
 
 
+def test_runnable_request_does_not_jump_an_older_fifo_waiter(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    setup_store = RunStore(home, max_executing_runs=2)
+    lane_package = load_workflow(
+        workflow_writer(tmp_path / "lane", name="fifo-lane")
+    )
+    resume_package = load_workflow(
+        workflow_writer(tmp_path / "resume", name="fifo-resume")
+    )
+
+    blocker = _start(setup_store, lane_package, key="blocker")
+    older = _start(setup_store, lane_package, key="older")
+    resumable = _start(setup_store, resume_package, key="resumable")
+    assert older.disposition == "queued"
+    setup_store.interrupt_for_host_pressure(
+        resumable.run_id, message="synthetic fairness setup"
+    )
+    resume_state = setup_store.load_run(resumable.run_id)
+    assert RunScheduler(setup_store).advance(blocker.run_id)["status"] == "succeeded"
+
+    store = RunStore(home, max_executing_runs=1)
+    resumed = store.resume_run(
+        resumable.run_id,
+        expected_state_version=resume_state["state_version"],
+    )
+
+    assert resumed["status"] == "queued"
+    assert resumed["queue_sequence"] > store.load_run(older.run_id)[
+        "queue_sequence"
+    ]
+    fresh = _start(store, resume_package, key="fresh")
+    assert fresh.disposition == "queued"
+    assert store.load_run(fresh.run_id)["queue_sequence"] > resumed[
+        "queue_sequence"
+    ]
+    assert store.try_promote_run(older.run_id)
+
+
 def test_finished_slot_is_replenished_while_slow_peer_is_still_running(
     tmp_path, workflow_writer
 ):

@@ -2800,6 +2800,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
+    plugin_background_services = None
+    plugin_delivery_port = None
+    _plugin_delivery_loop = None
+
+    async def reload_plugin_background_services(
+        self, *, timeout: float = 10.0
+    ) -> dict[str, object]:
+        """Rediscover plugins through the Gateway-owned lifecycle controller."""
+        from hermes_cli.plugin_services import BackgroundServiceReloadBlocked
+        from hermes_cli.plugins import get_plugin_manager
+
+        manager = get_plugin_manager()
+        try:
+            replacements = await asyncio.to_thread(
+                manager.reload_background_services, timeout=timeout
+            )
+        except BackgroundServiceReloadBlocked:
+            logger.warning(
+                "Gateway plugin provider reload blocked by a live service generation"
+            )
+            return {"ok": False, "error": "plugin_reload_blocked"}
+        replacement = next(
+            (host for host in replacements if host.host_kind == "gateway"), None
+        )
+        if replacement is None:
+            manager.bind_background_delivery_port(
+                "gateway", self.plugin_delivery_port
+            )
+            replacement = manager.start_background_services("gateway")
+        self.plugin_background_services = replacement
+        return {"ok": True}
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -3111,6 +3142,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Generic plugin services are bound only after Gateway discovery and
+        # adapter readiness. The host owns their threads and bounded shutdown;
+        # Gateway never receives workflow-specific service authority.
+        self.plugin_background_services = None
 
         # scale-to-zero (Phase 0, F13): gateway-scoped "last inbound seen" clock.
         # There is no such clock today (only a per-agent _last_activity_ts), so the
@@ -7252,6 +7287,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self.delivery_router.adapters = self.adapters
         self._wire_teams_pipeline_runtime()
 
+        # Bind generic plugin services only after plugin discovery and the
+        # Gateway's required adapter/runtime resources are ready. Construction
+        # and run failures are isolated by the generic host and must not make
+        # unrelated messaging surfaces unavailable.
+        try:
+            from gateway.plugin_delivery import GatewayPluginDeliveryPort
+            from hermes_constants import get_hermes_home
+            from hermes_cli.plugins import get_plugin_manager
+
+            self._plugin_delivery_loop = asyncio.get_running_loop()
+            self.plugin_delivery_port = GatewayPluginDeliveryPort(
+                get_hermes_home(),
+                profile=self._active_profile_name(),
+                sender=self._send_plugin_delivery,
+            )
+            manager = get_plugin_manager()
+            manager.bind_background_delivery_port(
+                "gateway", self.plugin_delivery_port
+            )
+            self.plugin_background_services = manager.start_background_services(
+                "gateway"
+            )
+        except Exception:
+            self.plugin_background_services = None
+            logger.exception(
+                "Plugin background services failed to bind; Gateway will continue"
+            )
+
         self._running = True
         self._update_runtime_status("running")
         
@@ -7837,6 +7900,84 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return "default"
 
+    def _authenticated_plugin_invocation(self, source: SessionSource):
+        """Mint invocation facts exclusively from a verified adapter source."""
+        from dataclasses import replace
+
+        from hermes_cli.plugin_invocation import PluginInvocationContext
+
+        if self.plugin_delivery_port is None:
+            raise RuntimeError("authenticated plugin delivery is unavailable")
+        platform = source.platform.value
+        user_id = str(source.user_id or "")
+        if not user_id:
+            raise PermissionError("authenticated plugin commands require a user identity")
+        profile = str(source.profile or self._active_profile_name())
+        invocation = PluginInvocationContext(
+            boundary="gateway",
+            principal=f"gateway:{platform}:{user_id}",
+            operator_scope=(
+                f"gateway:{profile}:{platform}:{source.chat_id}:{user_id}"
+            ),
+            assurance="verified_adapter",
+            return_route_capability=None,
+        )
+        capability = self.plugin_delivery_port.mint_return_route(source, invocation)
+        return replace(invocation, return_route_capability=capability)
+
+    def _send_plugin_delivery(self, route, text):
+        """Perform one bounded adapter send from a coordinator worker thread."""
+        from hermes_cli.plugin_invocation import DeliveryReceipt
+
+        loop = self._plugin_delivery_loop
+        if loop is None or not loop.is_running():
+            return DeliveryReceipt(
+                status="retryable_failure", detail="gateway_loop_unavailable"
+            )
+        try:
+            platform = Platform(str(route["platform"]))
+            profile = str(route.get("profile") or self._active_profile_name())
+            adapters = (
+                self.adapters
+                if profile == self._active_profile_name()
+                else self._profile_adapters.get(profile, {})
+            )
+            adapter = adapters.get(platform)
+            if adapter is None:
+                return DeliveryReceipt(
+                    status="retryable_failure", detail="adapter_unavailable"
+                )
+            metadata = {}
+            if route.get("thread_id"):
+                metadata["thread_id"] = str(route["thread_id"])
+            future = asyncio.run_coroutine_threadsafe(
+                adapter.send(
+                    str(route["chat_id"]),
+                    text,
+                    metadata=metadata or None,
+                ),
+                loop,
+            )
+            result = future.result(timeout=15.0)
+        except concurrent.futures.TimeoutError:
+            return DeliveryReceipt(
+                status="outcome_uncertain", detail="adapter_send_timeout"
+            )
+        except Exception as exc:
+            logger.exception("Authenticated plugin delivery failed")
+            return DeliveryReceipt(
+                status="outcome_uncertain",
+                detail=f"adapter_send_exception:{type(exc).__name__}",
+            )
+        if result.success:
+            return DeliveryReceipt(
+                status="delivered", transport_id=result.message_id
+            )
+        return DeliveryReceipt(
+            status="retryable_failure" if result.retryable else "permanent_failure",
+            detail=str(result.error or result.error_kind or "adapter_send_failed")[:512],
+        )
+
     # ── Kanban board watchers ───────────────────────────────────────────
     # The kanban notifier/dispatcher watcher loops + their helpers live in
     # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). They use only
@@ -8126,6 +8267,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+
+            # Quiesce plugin-owned work while Gateway adapters and persistence
+            # are still available. A failed or timed-out service remains
+            # visible through its host snapshot but cannot block unrelated
+            # Gateway teardown.
+            _plugin_services = getattr(self, "plugin_background_services", None)
+            if _plugin_services is not None:
+                try:
+                    _services_stopped = await asyncio.to_thread(
+                        _plugin_services.shutdown
+                    )
+                    if not _services_stopped:
+                        logger.error(
+                            "Plugin background service shutdown exceeded its deadline"
+                        )
+                except Exception:
+                    logger.exception(
+                        "Plugin background service shutdown failed; "
+                        "Gateway teardown will continue"
+                    )
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
@@ -10061,20 +10222,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Plugin-registered slash commands
         if command:
+            plugin_entry = None
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
+                from hermes_cli.plugins import (
+                    get_plugin_command_handler,
+                    get_plugin_commands,
+                    invoke_plugin_command,
+                )
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
-                if plugin_handler:
+                plugin_name = command.replace("_", "-")
+                plugin_entry = get_plugin_commands().get(plugin_name)
+                if plugin_entry:
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
-                    if asyncio.iscoroutine(result):
-                        result = await result
+                    invocation = None
+                    if plugin_entry.get("authenticated"):
+                        invocation = self._authenticated_plugin_invocation(event.source)
+                        result = await asyncio.to_thread(
+                            invoke_plugin_command,
+                            plugin_name,
+                            user_args,
+                            context=invocation,
+                        )
+                    else:
+                        plugin_handler = get_plugin_command_handler(plugin_name)
+                        result = plugin_handler(user_args) if plugin_handler else None
+                        if asyncio.iscoroutine(result):
+                            result = await result
                     return str(result) if result else None
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
+                if plugin_entry and plugin_entry.get("authenticated"):
+                    return "Authenticated plugin command is unavailable."
 
         # Skill slash commands: /skill-name loads the skill and sends to agent.
         # resolve_skill_command_key() handles the Telegram underscore/hyphen

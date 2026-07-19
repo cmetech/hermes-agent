@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
-PHASE=""
+PHASE="base"
 BRAND=""
 TESTED_BASE_SHA=""
 
@@ -36,7 +36,15 @@ fi
 
 export OPENROUTER_API_KEY="" OPENAI_API_KEY="" NOUS_API_KEY=""
 export HERMES_OFFLINE=1
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  :
+elif [[ -x "$ROOT/.venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT/.venv/bin/python"
+elif [[ -x "$ROOT/venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT/venv/bin/python"
+else
+  PYTHON_BIN="python3"
+fi
 
 cd "$ROOT"
 "$PYTHON_BIN" "$CHECKER" --manifest "$MANIFEST"
@@ -51,6 +59,10 @@ if [[ "$PHASE" == "base" ]]; then
       tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py \
       tests/hermes_cli/test_kanban_dispatch_lock.py \
       tests/plugins/test_kanban_dashboard_plugin.py \
+      tests/gateway/test_plugin_background_services.py \
+      tests/gateway/test_plugin_delivery.py \
+      tests/hermes_cli/test_plugin_provider_hot_reload.py \
+      tests/scripts/test_workflow_merge_gate.py \
       tests/plugins/workflow/test_admission.py tests/plugins/workflow/test_trust_policy.py \
       tests/plugins/workflow/test_showcase_catalog.py \
       tests/plugins/workflow/test_showcase_distribution_e2e.py \
@@ -58,6 +70,8 @@ if [[ "$PHASE" == "base" ]]; then
       tests/hermes_cli/test_capability_staging.py \
       tests/hermes_cli/test_baked_seed.py \
       tests/test_packaging_metadata.py
+    "$PYTHON_BIN" -m pytest -q -m integration \
+      tests/plugins/workflow/test_installed_distribution_e2e.py
     SHARED_GIT_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
     SHARED_ROOT="$(dirname "$SHARED_GIT_DIR")"
     if [[ ! -d node_modules && -d "$SHARED_ROOT/node_modules" ]]; then

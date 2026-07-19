@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
+import threading
+
+import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.schema import load_workflow
@@ -99,3 +102,26 @@ def test_windows_lock_backend_uses_one_byte_region(tmp_path, monkeypatch):
         pass
 
     assert [call[1:] for call in calls] == [(1, 1), (2, 1)]
+
+
+def test_workflow_lock_timeout_is_bounded_and_does_not_steal_owner(tmp_path):
+    lock_path = tmp_path / "bounded.lock"
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def owner():
+        with locks.workflow_lock(lock_path):
+            acquired.set()
+            assert release.wait(timeout=2)
+
+    thread = threading.Thread(target=owner)
+    thread.start()
+    assert acquired.wait(timeout=1)
+    try:
+        with pytest.raises(locks.WorkflowLockTimeout):
+            with locks.workflow_lock(lock_path, timeout_seconds=0.05):
+                pytest.fail("contender stole the workflow lock")
+    finally:
+        release.set()
+        thread.join(timeout=2)
+    assert not thread.is_alive()

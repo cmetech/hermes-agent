@@ -15,13 +15,18 @@ from plugins.workflow.schema import load_workflow
 _PARSE_CACHE: dict[
     tuple[str, str, int], tuple[tuple[int, int, str], WorkflowPackage]
 ] = {}
+_PROFILE_STATE_DIRECTORIES = frozenset({"runs", ".staging", ".quarantine", ".locks"})
 
 
 def clear_discovery_cache() -> None:
     _PARSE_CACHE.clear()
 
 
-def _yaml_paths(location: Path) -> tuple[Path, ...]:
+def _yaml_paths(
+    location: Path,
+    *,
+    excluded_top_level: frozenset[str] = frozenset(),
+) -> tuple[Path, ...]:
     if location.is_file():
         return (location,) if location.suffix.lower() in {".yaml", ".yml"} else ()
     if not location.is_dir():
@@ -32,6 +37,10 @@ def _yaml_paths(location: Path) -> tuple[Path, ...]:
         if path.is_file()
         and path.suffix.lower() in {".yaml", ".yml"}
         and not path.name.endswith(".hermes.yaml")
+        and (
+            not excluded_top_level
+            or path.relative_to(location).parts[0] not in excluded_top_level
+        )
     )
     return tuple(sorted(paths, key=lambda item: item.resolve().as_posix()))
 
@@ -78,7 +87,12 @@ def discover_workflows(
         ):
             scan_location = location / "workflows"
         level: dict[str, WorkflowPackage] = {}
-        for path in _yaml_paths(scan_location):
+        for path in _yaml_paths(
+            scan_location,
+            excluded_top_level=(
+                _PROFILE_STATE_DIRECTORIES if source == "profile" else frozenset()
+            ),
+        ):
             package = _load_cached(path, source=source, precedence=precedence)
             name = package.definition.name
             if name in level:

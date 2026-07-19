@@ -814,100 +814,76 @@ class TestSpawnEnvSanitization:
 class TestPopenLeakOnSetupFailure:
     """Regression for issue #2749: subprocess orphaned when post-Popen setup raises."""
 
-    def test_popen_killed_when_thread_creation_fails(self, registry):
-        """If Thread() raises after Popen, proc must be killed — not orphaned."""
-        killed = []
+    @staticmethod
+    def _managed_owner(proc):
+        owner = MagicMock()
+        owner.process = proc
+        owner.identity.start_time = None
+        return owner
+
+    def test_managed_tree_terminated_when_thread_creation_fails(self, registry):
+        """If Thread() raises after spawn, the managed tree must be terminated."""
 
         proc = MagicMock()
         proc.pid = 9999
         proc.stdout = iter([])
         proc.stdin = MagicMock()
         proc.poll.return_value = None
-
-        def fake_kill():
-            killed.append(True)
-
-        proc.kill = fake_kill
-        proc.wait = MagicMock()
+        owner = self._managed_owner(proc)
 
         def boom(*args, **kwargs):
             raise RuntimeError("Thread creation failed")
 
-        # proc.pid is a MagicMock-backed fake; os.getpgid(fake_pid) would query
-        # the real OS for an arbitrary PID. On a busy host that PID may exist,
-        # in which case spawn_local's primary cleanup path
-        # (os.killpg(os.getpgid(pid), SIGKILL)) succeeds against an UNRELATED
-        # real process group and proc.kill() is never reached — flaky failure,
-        # and a real risk of SIGKILLing an innocent process group. Force the
-        # ProcessLookupError fallback so the test deterministically exercises
-        # proc.kill() and never issues a real killpg.
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
-             patch("subprocess.Popen", return_value=proc), \
+             patch("tools.process_registry.ManagedProcessTree.spawn", return_value=owner), \
              patch("threading.Thread", side_effect=boom), \
-             patch("os.getpgid", side_effect=ProcessLookupError), \
              patch.object(registry, "_write_checkpoint"):
             with pytest.raises(RuntimeError, match="Thread creation failed"):
                 registry.spawn_local("echo hello", cwd="/tmp")
 
-        assert killed, "proc.kill() must be called when post-Popen setup raises"
+        owner.terminate.assert_called_once_with("process registry setup failed")
 
-    def test_popen_killed_when_write_checkpoint_fails(self, registry):
-        """If _write_checkpoint raises after Popen, proc must still be killed."""
-        killed = []
+    def test_managed_tree_terminated_when_write_checkpoint_fails(self, registry):
+        """If checkpointing fails after spawn, the managed tree must be terminated."""
 
         proc = MagicMock()
         proc.pid = 8888
         proc.stdout = iter([])
         proc.stdin = MagicMock()
         proc.poll.return_value = None
-
-        def fake_kill():
-            killed.append(True)
-
-        proc.kill = fake_kill
-        proc.wait = MagicMock()
+        owner = self._managed_owner(proc)
 
         fake_thread = MagicMock()
 
-        # See note in test_popen_killed_when_thread_creation_fails: force the
-        # ProcessLookupError fallback so cleanup deterministically calls
-        # proc.kill() instead of issuing a real os.killpg against whatever
-        # process group happens to own the fake PID on the host.
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
-             patch("subprocess.Popen", return_value=proc), \
+             patch("tools.process_registry.ManagedProcessTree.spawn", return_value=owner), \
              patch("threading.Thread", return_value=fake_thread), \
-             patch("os.getpgid", side_effect=ProcessLookupError), \
              patch.object(registry, "_write_checkpoint", side_effect=OSError("disk full")):
             with pytest.raises(OSError, match="disk full"):
                 registry.spawn_local("echo hello", cwd="/tmp")
 
-        assert killed, "proc.kill() must be called when _write_checkpoint raises"
+        owner.terminate.assert_called_once_with("process registry setup failed")
 
-    def test_popen_not_killed_on_success(self, registry):
-        """Successful spawn must NOT kill the process."""
-        killed = []
+    def test_managed_tree_not_terminated_on_success(self, registry):
+        """Successful spawn must retain the managed owner."""
 
         proc = MagicMock()
         proc.pid = 7777
         proc.stdout = iter([])
         proc.stdin = MagicMock()
         proc.poll.return_value = None
-
-        def fake_kill():
-            killed.append(True)
-
-        proc.kill = fake_kill
-        proc.wait = MagicMock()
+        owner = self._managed_owner(proc)
 
         fake_thread = MagicMock()
 
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
-             patch("subprocess.Popen", return_value=proc), \
+             patch("tools.process_registry.ManagedProcessTree.spawn", return_value=owner), \
              patch("threading.Thread", return_value=fake_thread), \
              patch.object(registry, "_write_checkpoint"):
             session = registry.spawn_local("echo hello", cwd="/tmp")
 
-        assert not killed, "proc.kill() must NOT be called on successful spawn"
+        owner.terminate.assert_not_called()
+        assert session._managed_process is owner
         assert session.pid == 7777
 
 

@@ -2,17 +2,49 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 from pathlib import Path
 import shutil
 
 import pytest
 
 from plugins.workflow.showcase import ShowcaseCatalogError, load_showcase_catalog
+from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.evidence import EvidenceReader
+import plugins.workflow.evidence as evidence_module
+from plugins.workflow.store import RunStore
 from plugins.workflow.trust import WorkflowTrustStore, compute_package_digest
 from plugins.workflow.schema import load_workflow
 
 
 SHOWCASES = Path(__file__).parents[3] / "plugins/workflow/showcases"
+
+
+def _log_path(tmp_path, workflow_writer, *, name: str):
+    package = load_workflow(workflow_writer(tmp_path / "package", name=name))
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key=f"{name}-intent",
+            concurrency_key=name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    stdout = (
+        store.run_directory(admitted.run_id)
+        / "nodes"
+        / "n1"
+        / "a1"
+        / "stdout.txt"
+    )
+    stdout.parent.mkdir(parents=True)
+    return store, admitted.run_id, stdout
 
 
 @pytest.mark.parametrize(
@@ -87,3 +119,70 @@ def test_even_digest_consistent_bundle_rejects_live_inventory_commands(
 
     with pytest.raises(ShowcaseCatalogError, match="safety"):
         load_showcase_catalog(copied)
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd,
+    reason="descriptor-relative no-follow reads require POSIX openat",
+)
+def test_log_evidence_rejects_replace_between_enumeration_and_open(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store, run_id, stdout = _log_path(tmp_path, workflow_writer, name="log-race")
+    stdout.write_text("SAFE", encoding="utf-8")
+    secret = tmp_path / "race-secret"
+    secret.write_text("RACE_ESCAPE_SENTINEL", encoding="utf-8")
+    original_read_bytes = Path.read_bytes
+    original_os_open = os.open
+    swapped = False
+
+    def swap_candidate() -> None:
+        nonlocal swapped
+        if swapped:
+            return
+        swapped = True
+        stdout.unlink()
+        stdout.symlink_to(secret)
+
+    def racing_read_bytes(path: Path) -> bytes:
+        if path == stdout:
+            swap_candidate()
+        return original_read_bytes(path)
+
+    def racing_os_open(path, flags, mode=0o777, *, dir_fd=None):
+        if str(path) == stdout.name and dir_fd is not None:
+            swap_candidate()
+        return original_os_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(Path, "read_bytes", racing_read_bytes)
+    if hasattr(evidence_module, "os"):
+        monkeypatch.setattr(evidence_module.os, "open", racing_os_open)
+
+    page = EvidenceReader(store).query(run_id, kind="logs")
+
+    assert swapped is True
+    assert "RACE_ESCAPE_SENTINEL" not in str(page)
+    assert page["items"] == []
+    assert page["warnings"] == ["unsafe_evidence_path"]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO is POSIX-specific")
+def test_log_evidence_rejects_non_regular_fifo(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store, run_id, stdout = _log_path(tmp_path, workflow_writer, name="log-fifo")
+    os.mkfifo(stdout)
+    original_read_bytes = Path.read_bytes
+
+    def nonblocking_legacy_read(path: Path) -> bytes:
+        if path == stdout:
+            return b"NON_REGULAR_SENTINEL"
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", nonblocking_legacy_read)
+
+    page = EvidenceReader(store).query(run_id, kind="logs")
+
+    assert "NON_REGULAR_SENTINEL" not in str(page)
+    assert page["items"] == []
+    assert page["warnings"] == ["unsafe_evidence_path"]

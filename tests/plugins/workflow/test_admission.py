@@ -3,11 +3,15 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import shutil
+import sqlite3
 import threading
 
 import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.models import WorkflowValidationError
+from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 
@@ -185,6 +189,107 @@ def test_start_rate_and_queue_capacity_reject_before_worker_allocation(
     assert not queued_snapshots[2].staging_directory.exists()
 
 
+@pytest.mark.parametrize("with_unrelated_held_lane", [False, True])
+def test_queue_policy_start_queues_at_execution_capacity(
+    tmp_path, workflow_writer, with_unrelated_held_lane
+) -> None:
+    store = RunStore(
+        tmp_path / "execution-capacity-home",
+        max_executing_runs=1,
+        max_queued_runs=2,
+        max_nonterminal_runs=10,
+        max_start_requests_per_minute=10,
+    )
+    if with_unrelated_held_lane:
+        held_path = workflow_writer(
+            tmp_path / "held-capacity-package",
+            name="held-capacity-lane",
+            nodes=[{"id": "gate", "approval": {"message": "Hold?"}}],
+        )
+        held_package = load_workflow(held_path)
+        held_snapshot = store.prepare_run_snapshot(held_package)
+        held = store.start_run(
+            _request(
+                held_snapshot,
+                key="held-capacity-lane",
+                policy="queue",
+                name="held-capacity-lane",
+            ),
+            immutable_snapshot=held_snapshot,
+        )
+        assert RunScheduler(store).advance(held.run_id)["status"] == "paused"
+
+    blocker = _prepared(
+        store,
+        workflow_writer,
+        tmp_path,
+        name="execution-capacity-blocker",
+    )
+    assert (
+        store.start_run(
+            _request(
+                blocker,
+                key="execution-capacity-blocker",
+                policy="allow",
+                name="execution-capacity-blocker",
+            ),
+            immutable_snapshot=blocker,
+        ).disposition
+        == "created"
+    )
+    queued = _prepared(
+        store,
+        workflow_writer,
+        tmp_path,
+        name="execution-capacity-queued",
+    )
+
+    result = store.start_run(
+        _request(
+            queued,
+            key="execution-capacity-queued",
+            policy="queue",
+            name="execution-capacity-queued",
+        ),
+        immutable_snapshot=queued,
+    )
+
+    assert result.disposition == "queued"
+    assert result.run_id is not None
+    assert store.load_run(result.run_id)["status"] == "queued"
+
+
+def test_execution_capacity_queue_respects_queue_bound_and_other_policies(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(
+        tmp_path / "execution-policy-home",
+        max_executing_runs=1,
+        max_queued_runs=1,
+        max_nonterminal_runs=10,
+        max_start_requests_per_minute=10,
+    )
+
+    def start(name: str, *, policy: str):
+        snapshot = _prepared(store, workflow_writer, tmp_path, name=name)
+        return store.start_run(
+            _request(snapshot, key=name, policy=policy, name=name),
+            immutable_snapshot=snapshot,
+        )
+
+    assert start("capacity-policy-blocker", policy="allow").disposition == "created"
+    assert start("capacity-policy-allow", policy="allow").reason_code == (
+        "executing_capacity"
+    )
+    assert start("capacity-policy-forbid", policy="forbid").reason_code == (
+        "executing_capacity"
+    )
+    assert start("capacity-policy-queued", policy="queue").disposition == "queued"
+    assert start("capacity-policy-queue-full", policy="queue").reason_code == (
+        "queued_capacity"
+    )
+
+
 def test_start_racing_shutdown_is_discoverable_or_rejected_before_publish(
     tmp_path, workflow_writer
 ):
@@ -332,3 +437,298 @@ def test_snapshot_owner_probe_uses_cross_platform_pid_helper(monkeypatch) -> Non
 
     assert RunStore._snapshot_owner_alive(12345) is True
     assert observed == [12345]
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing", "empty", "corrupt", "replaced", "partial"]
+)
+def test_damaged_admission_index_preserves_and_recovers_corroborated_run_evidence(
+    tmp_path, workflow_writer, damage
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    prepared = _prepared(store, workflow_writer, tmp_path)
+    admitted = store.start_run(_request(prepared), immutable_snapshot=prepared)
+    run_id = admitted.run_id
+    assert run_id
+    evidence_directory = store.run_directory(run_id)
+    projection_before = (evidence_directory / "run.json").read_bytes()
+    journal_before = (evidence_directory / "events.jsonl").read_bytes()
+
+    if damage == "replaced":
+        replacement = RunStore(tmp_path / "replacement-home")
+        shutil.copyfile(replacement.database, store.database)
+    elif damage == "partial":
+        partial = tmp_path / "partial.sqlite3"
+        with sqlite3.connect(partial) as connection:
+            connection.execute(
+                "CREATE TABLE runs (run_id TEXT PRIMARY KEY, status TEXT NOT NULL)"
+            )
+        shutil.copyfile(partial, store.database)
+    else:
+        store.database.unlink()
+        if damage == "empty":
+            store.database.touch()
+            store.authority_marker.unlink()
+        elif damage == "corrupt":
+            store.database.write_bytes(b"not a sqlite database")
+
+    restarted = RunStore(home)
+
+    assert evidence_directory.is_dir()
+    assert (evidence_directory / "run.json").read_bytes() == projection_before
+    assert (evidence_directory / "events.jsonl").read_bytes() == journal_before
+    assert restarted.load_run(run_id)["status"] == "running"
+    assert restarted.storage_health()["status"] == "repair_required"
+    repair = restarted.list_repair_events()[-1]
+    assert repair["run_id"] == run_id
+    assert repair["outcome"] == "index_rebuilt"
+    assert repair["projection_sha256"]
+    assert repair["journal_sha256"]
+
+    blocked_snapshot = _prepared(
+        restarted, workflow_writer, tmp_path, name="blocked-after-index-damage"
+    )
+    blocked = restarted.start_run(
+        _request(
+            blocked_snapshot,
+            key="blocked-after-index-damage",
+            name="blocked-after-index-damage",
+        ),
+        immutable_snapshot=blocked_snapshot,
+    )
+    assert blocked.reason_code == "storage_repair_required"
+    assert not blocked_snapshot.staging_directory.exists()
+
+    assert restarted.repair_storage()["status"] == "healthy"
+    resumed_snapshot = _prepared(
+        restarted, workflow_writer, tmp_path, name="after-index-repair"
+    )
+    resumed = restarted.start_run(
+        _request(
+            resumed_snapshot,
+            key="after-index-repair",
+            name="after-index-repair",
+        ),
+        immutable_snapshot=resumed_snapshot,
+    )
+    assert resumed.disposition == "created"
+
+
+def test_status_inconsistency_uses_corroborated_evidence_and_requires_repair(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    prepared = _prepared(store, workflow_writer, tmp_path)
+    run_id = store.start_run(_request(prepared), immutable_snapshot=prepared).run_id
+    assert run_id
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE runs SET status='failed' WHERE run_id=?",
+            (run_id,),
+        )
+
+    restarted = RunStore(home)
+
+    assert restarted.get_run_status(run_id)["status"] == "running"
+    assert restarted.storage_health()["status"] == "repair_required"
+    repair = restarted.list_repair_events()[-1]
+    assert repair["reason_code"] == "index_status_inconsistent"
+    assert repair["outcome"] == "index_rebuilt"
+
+
+def test_fifo_promotion_refuses_newer_queue_sequence_until_older_runs(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home", max_executing_runs=1)
+    package = load_workflow(
+        workflow_writer(tmp_path / "fifo-package", name="fifo-promotion")
+    )
+
+    def start(key: str):
+        prepared = store.prepare_run_snapshot(package)
+        return store.start_run(
+            RunAdmissionRequest(
+                workflow_name=package.definition.name,
+                definition_digest=prepared.definition_digest,
+                policy_digest=prepared.policy_digest,
+                input_manifest_digest=prepared.input_manifest_digest,
+                trigger_source="cli",
+                idempotency_key=key,
+                concurrency_key=package.definition.name,
+                concurrency_policy="queue",
+            ),
+            immutable_snapshot=prepared,
+        )
+
+    blocker = start("fifo-blocker")
+    older = start("fifo-older")
+    newer = start("fifo-newer")
+    assert older.disposition == newer.disposition == "queued"
+    older_projection = store.load_run(older.run_id)
+    newer_projection = store.load_run(newer.run_id)
+    assert older_projection["queue_sequence"] < newer_projection["queue_sequence"]
+
+    assert RunScheduler(store).advance(blocker.run_id)["status"] == "succeeded"
+    assert not store.try_promote_run(newer.run_id)
+    assert store.try_promote_run(older.run_id)
+    assert store.load_run(newer.run_id)["queue_sequence"] == newer_projection[
+        "queue_sequence"
+    ]
+
+
+def test_lane_ineligible_fifo_head_does_not_starve_an_independent_lane(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home", max_executing_runs=2)
+    held_path = workflow_writer(
+        tmp_path / "held-package",
+        name="held-lane",
+        nodes=[{"id": "gate", "approval": {"message": "Hold lane?"}}],
+    )
+    held_path.with_name("example.hermes.yaml").write_text(
+        "overlap_policy: queue\n",
+        encoding="utf-8",
+    )
+    held_package = load_workflow(held_path)
+    independent_package = load_workflow(
+        workflow_writer(tmp_path / "independent-package", name="independent-lane")
+    )
+
+    def start(package, key: str):
+        snapshot = store.prepare_run_snapshot(package)
+        return store.start_run(
+            RunAdmissionRequest(
+                workflow_name=package.definition.name,
+                definition_digest=snapshot.definition_digest,
+                policy_digest=snapshot.policy_digest,
+                input_manifest_digest=snapshot.input_manifest_digest,
+                trigger_source="cli",
+                idempotency_key=key,
+                concurrency_key=package.definition.name,
+                concurrency_policy="queue",
+            ),
+            immutable_snapshot=snapshot,
+        )
+
+    holder = start(held_package, "held-lane-owner")
+    independent_holder = start(independent_package, "independent-owner")
+    blocked_head = start(held_package, "held-lane-blocked-head")
+    independent = start(independent_package, "independent-younger")
+
+    assert blocked_head.disposition == "queued"
+    assert independent.disposition == "queued"
+    assert RunScheduler(store).advance(holder.run_id)["status"] == "paused"
+    store.cancel_run(independent_holder.run_id)
+    assert not store.try_promote_run(blocked_head.run_id)
+    assert store.try_promote_run(independent.run_id)
+    assert store.load_run(independent.run_id)["status"] == "running"
+
+
+def test_runnable_request_skips_lane_ineligible_fifo_head(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "request-home", max_executing_runs=1)
+    held_path = workflow_writer(
+        tmp_path / "request-held-package",
+        name="request-held-lane",
+        nodes=[{"id": "gate", "approval": {"message": "Hold lane?"}}],
+    )
+    held_path.with_name("example.hermes.yaml").write_text(
+        "overlap_policy: queue\n",
+        encoding="utf-8",
+    )
+    held_package = load_workflow(held_path)
+    independent_package = load_workflow(
+        workflow_writer(
+            tmp_path / "request-independent-package",
+            name="request-independent-lane",
+        )
+    )
+
+    def start(package, key: str):
+        snapshot = store.prepare_run_snapshot(package)
+        return store.start_run(
+            RunAdmissionRequest(
+                workflow_name=package.definition.name,
+                definition_digest=snapshot.definition_digest,
+                policy_digest=snapshot.policy_digest,
+                input_manifest_digest=snapshot.input_manifest_digest,
+                trigger_source="cli",
+                idempotency_key=key,
+                concurrency_key=package.definition.name,
+                concurrency_policy="queue",
+            ),
+            immutable_snapshot=snapshot,
+        )
+
+    holder = start(held_package, "request-held-owner")
+    assert RunScheduler(store).advance(holder.run_id)["status"] == "paused"
+    assert start(held_package, "request-blocked-head").disposition == "queued"
+
+    independent = start(independent_package, "request-independent-younger")
+
+    assert independent.disposition == "created"
+    assert store.load_run(independent.run_id)["status"] == "running"
+
+
+def test_pause_lane_policy_is_rejected_outside_queue_overlap(
+    tmp_path, workflow_writer
+) -> None:
+    path = workflow_writer(tmp_path / "invalid-lane-policy", name="invalid-lane")
+    path.with_name("example.hermes.yaml").write_text(
+        "overlap_policy: allow\npause_lane_policy: release\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        WorkflowValidationError, match="pause_lane_policy requires queue"
+    ):
+        load_workflow(path)
+
+
+def test_uncorroborated_orphan_evidence_is_quarantined_without_deletion(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    prepared = _prepared(store, workflow_writer, tmp_path)
+    run_id = store.start_run(_request(prepared), immutable_snapshot=prepared).run_id
+    assert run_id
+    evidence_directory = store.run_directory(run_id)
+    events_path = evidence_directory / "events.jsonl"
+    event = json.loads(events_path.read_text())
+    event["projection_sha256"] = "0" * 64
+    events_path.write_text(json.dumps(event, sort_keys=True) + "\n")
+    store.database.unlink()
+
+    restarted = RunStore(home)
+
+    assert not evidence_directory.exists()
+    preserved = list(restarted.quarantine_root.glob(f"orphan-{run_id}-*"))
+    assert len(preserved) == 1
+    assert (preserved[0] / "run.json").is_file()
+    assert (preserved[0] / "events.jsonl").is_file()
+    assert restarted.storage_health()["status"] == "repair_required"
+    repair = restarted.list_repair_events()[-1]
+    assert repair["run_id"] == run_id
+    assert repair["outcome"] == "evidence_quarantined"
+    assert repair["preserved_path"] == str(preserved[0])
+    with pytest.raises(KeyError):
+        restarted.load_run(run_id)
+
+
+def test_corrupt_index_is_preserved_for_forensics(tmp_path, workflow_writer) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    prepared = _prepared(store, workflow_writer, tmp_path)
+    store.start_run(_request(prepared), immutable_snapshot=prepared)
+    corrupt_bytes = b"not a sqlite database"
+    store.database.write_bytes(corrupt_bytes)
+
+    restarted = RunStore(home)
+
+    preserved = list(restarted.quarantine_root.glob("admission-index-*/admission.sqlite3"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == corrupt_bytes

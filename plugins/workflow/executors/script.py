@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import time
+import uuid
 from pathlib import Path
 from typing import Callable
 
@@ -142,6 +143,10 @@ class ScriptExecutor:
         output = BoundedProcessOutput(
             stdout_path, stderr_path, limit=context.max_output_bytes
         )
+        executor_nonce = uuid.uuid4().hex
+        if context.spawn_intent is not None and not context.spawn_intent(executor_nonce):
+            output.close()
+            raise RuntimeError("executor spawn intent was rejected")
         try:
             tree = ManagedProcessTree.spawn(
                 argv,
@@ -153,6 +158,8 @@ class ScriptExecutor:
             )
         except OSError as exc:
             output.close()
+            if context.spawn_failed is not None:
+                context.spawn_failed(executor_nonce, type(exc).__name__)
             return NodeExecutionResult(
                 "failed", error_code="runtime_missing", error_message=str(exc)
             )

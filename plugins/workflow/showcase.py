@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 from importlib import resources
@@ -21,10 +21,18 @@ import yaml
 from agent.plugin_agent import PluginAgentRunResult
 from cron.jobs import create_job, list_jobs, use_cron_store
 from plugins.workflow.admission import RunAdmissionRequest
-from plugins.workflow.cli import _runtime_config, _scheduler
+from plugins.workflow.cli import _input_requirements, _runtime_config, _scheduler
+from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.machine_contract import operator_command_contract
+from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
-from plugins.workflow.trust import WorkflowTrustStore, compute_package_digest
+from plugins.workflow.trust import (
+    WorkflowRiskSummary,
+    WorkflowTrustError,
+    build_risk_summary,
+    preflight_execution,
+)
 
 
 _ALLOWED_CLAIMS = frozenset({
@@ -66,6 +74,7 @@ class ShowcaseScenario:
     limits: Mapping[str, int]
     cleanup_ownership: str
     package_digest: str
+    verified_bundled_provenance: bool
 
 
 @dataclass(frozen=True)
@@ -181,7 +190,11 @@ def load_showcase_catalog(bundle_root: Path | None = None) -> dict[str, Showcase
                 )
 
                 if repair_authenticated_resource_checkout(root):
-                    return load_showcase_catalog(root)
+                    repaired = load_showcase_catalog(root)
+                    return {
+                        key: replace(value, verified_bundled_provenance=True)
+                        for key, value in repaired.items()
+                    }
             raise ShowcaseCatalogError("showcase catalog digest mismatch")
         package_digests = manifest.get("packages")
         if not isinstance(package_digests, Mapping):
@@ -235,6 +248,7 @@ def load_showcase_catalog(bundle_root: Path | None = None) -> dict[str, Showcase
                 capability_claims=claims,
                 limits={str(key): int(value) for key, value in limits.items()},
                 package_digest=actual_digest,
+                verified_bundled_provenance=bundle_root is None,
             )
         return dict(sorted(result.items()))
 
@@ -242,6 +256,35 @@ def load_showcase_catalog(bundle_root: Path | None = None) -> dict[str, Showcase
 def _scenario_package(scenario: ShowcaseScenario):
     with _bundle_path() as root:
         return load_workflow(_contained(root, scenario.workflow_path))
+
+
+def _verified_distribution_risk(
+    scenario: ShowcaseScenario, package
+) -> WorkflowRiskSummary:
+    if not scenario.verified_bundled_provenance:
+        raise ShowcaseCatalogError(
+            "showcase lacks verified bundled distribution provenance"
+        )
+    if _tree_digest(package.root) != scenario.package_digest:
+        raise ShowcaseCatalogError(
+            f"showcase package changed after catalog verification: {scenario.id}"
+        )
+    compatibility = assess_compatibility(package)
+    if not compatibility.runnable:
+        raise ShowcaseCatalogError(
+            f"showcase package is not runnable under ordinary compatibility policy: {scenario.id}"
+        )
+    risk = build_risk_summary(package, compatibility)
+    try:
+        preflight_execution(
+            risk,
+            trusted=scenario.verified_bundled_provenance,
+        )
+    except WorkflowTrustError as exc:
+        raise ShowcaseCatalogError(
+            f"showcase package failed ordinary execution-risk policy: {exc}"
+        ) from exc
+    return risk
 
 
 def preflight_showcase(showcase_id: str, *, hermes_home: str | Path) -> dict[str, object]:
@@ -260,6 +303,7 @@ def preflight_showcase(showcase_id: str, *, hermes_home: str | Path) -> dict[str
         (len(node.options.get("agents", {})) for node in package.definition.nodes),
         default=0,
     )
+    input_requirements = _input_requirements(package, [])
     return {
         "schema_version": 1, "showcase_id": scenario.id, "display_name": scenario.display_name,
         "purpose": scenario.purpose, "runnable": True, "offline": scenario.offline,
@@ -269,7 +313,9 @@ def preflight_showcase(showcase_id: str, *, hermes_home: str | Path) -> dict[str
         "package_digest": scenario.package_digest, "bundle_digest": bundle_digest,
         "requested_skills": requested_skills, "local_mcp_servers": [f"mcp/{value}" for value in local_mcp],
         "inline_agent_limit": inline_agents, "wall_seconds": scenario.limits["wall_seconds"],
+        "input_requirements": [asdict(item) for item in input_requirements],
         "side_effects_initialized": False,
+        "command_contract": operator_command_contract(),
     }
 
 
@@ -347,10 +393,16 @@ def run_showcase(
     showcase_id: str, *, hermes_home: str | Path, symptom: str | None = None,
     confirmation_token: str | None = None, schedule_at: str | None = None,
     no_wait: bool = False, idempotency_key: str | None = None,
+    trigger_source: str = "cli", source_instance: str | None = None,
+    claimed_actor: str | None = None,
 ) -> dict[str, object]:
     scenario = load_showcase_catalog().get(showcase_id)
     if scenario is None:
         raise ShowcaseCatalogError(f"unknown showcase: {showcase_id}")
+    if no_wait and not idempotency_key:
+        raise ShowcaseCatalogError(
+            "an idempotency key is required for no-wait showcase starts"
+        )
     home = Path(hermes_home).expanduser().resolve()
     preflight = preflight_showcase(showcase_id, hermes_home=home)
     if scenario.requires_ai and confirmation_token != preflight["confirmation_token"]:
@@ -362,6 +414,7 @@ def run_showcase(
     if showcase_id == "laptop-diagnostic" and not (symptom and symptom.strip()):
         return {"status": "input_required", "reason_code": "showcase_input_required", "required_input": "symptom", "run_id": None}
     package = _scenario_package(scenario)
+    risk = _verified_distribution_risk(scenario, package)
     store, config = _store(home, package)
     fixture_dir: Path | None = None
     try:
@@ -373,15 +426,21 @@ def run_showcase(
     finally:
         if fixture_dir is not None:
             shutil.rmtree(fixture_dir, ignore_errors=True)
-    package_digest = compute_package_digest(package).sha256
-    WorkflowTrustStore(home).trust(package_digest, actor="trusted_distribution", risk_digest=package_digest)
+    intent_key = idempotency_key or secrets.token_urlsafe(24)
     request = RunAdmissionRequest(
         workflow_name=package.definition.name, definition_digest=prepared.definition_digest,
         policy_digest=prepared.policy_digest, input_manifest_digest=prepared.input_manifest_digest,
-        trigger_source="cli", idempotency_key=idempotency_key or secrets.token_urlsafe(24),
+        trigger_source=trigger_source, idempotency_key=intent_key,
+        idempotency_namespace=f"profile-local:{trigger_source}",
         concurrency_key=f"showcase:{scenario.id}",
         concurrency_policy=str(package.sidecar.get("overlap_policy") or "queue"),
-        run_metadata={"showcase_id": scenario.id, "showcase_version": scenario.package_version, "bundle_digest": str(preflight["bundle_digest"])},
+        run_metadata={"showcase_id": scenario.id, "showcase_version": scenario.package_version, "bundle_digest": str(preflight["bundle_digest"]), "risk_digest": risk.risk_digest},
+        provenance=TriggerProvenance.local_admin_claim(
+            source=trigger_source,
+            intent_key=intent_key,
+            source_instance=source_instance or f"cli:pid:{os.getpid()}",
+            claimed_actor=claimed_actor,
+        ),
     )
     admitted = store.start_run(request, immutable_snapshot=prepared)
     if admitted.run_id is None:
@@ -391,15 +450,34 @@ def run_showcase(
     return _advance_until_wait(store, config, admitted.run_id)
 
 
+def _current_showcase_interaction_id(store: RunStore, run_id: str) -> str:
+    pending = store.get_run_status(run_id).get("pending_interaction")
+    if not isinstance(pending, Mapping):
+        raise ValueError("showcase run has no pending interaction")
+    interaction_id = pending.get("interaction_id") or pending.get("action_digest")
+    if not isinstance(interaction_id, str) or not interaction_id:
+        raise ValueError("showcase pending interaction has no identity")
+    return interaction_id
+
+
 def approve_showcase(run_id: str, *, hermes_home: str | Path) -> dict[str, object]:
     store, config = _store(hermes_home)
-    store.approve_run(run_id, channel="showcase")
+    store.approve_run(
+        run_id,
+        interaction_id=_current_showcase_interaction_id(store, run_id),
+        channel="showcase",
+    )
     return _advance_until_wait(store, config, run_id)
 
 
 def reject_showcase(run_id: str, reason: str, *, hermes_home: str | Path) -> dict[str, object]:
     store, config = _store(hermes_home)
-    store.reject_run(run_id, reason=reason, channel="showcase")
+    store.reject_run(
+        run_id,
+        reason=reason,
+        interaction_id=_current_showcase_interaction_id(store, run_id),
+        channel="showcase",
+    )
     return _advance_until_wait(store, config, run_id)
 
 
@@ -458,7 +536,10 @@ def _cleanup_evidence(
                 if not isinstance(attempt, Mapping):
                     continue
                 identity = attempt.get("process_identity")
-                if isinstance(identity, Mapping):
+                process_stop = attempt.get("process_stop")
+                if isinstance(identity, Mapping) and not (
+                    isinstance(process_stop, Mapping) and process_stop.get("cleaned")
+                ):
                     key = (node_id, attempt.get("attempt_id"), identity.get("pid"))
                     unresolved[key] = attempt
 
@@ -613,15 +694,22 @@ def reset_showcase(showcase_id: str, *, hermes_home: str | Path) -> dict[str, ob
     return {"showcase_id": showcase_id, "owned_schedule": owned_schedule, "removed": False, "requires_explicit_cron_removal": owned_schedule is not None}
 
 
-def cleanup_showcases(*, hermes_home: str | Path, dry_run: bool = True, older_than_days: int = 7) -> dict[str, object]:
+def cleanup_showcases(
+    *,
+    hermes_home: str | Path,
+    execute: bool = False,
+    confirmation_token: str | None = None,
+    older_than_days: int = 7,
+) -> dict[str, object]:
     store, _ = _store(hermes_home)
     tagged = [run["run_id"] for run in store.list_runs(limit=200) if isinstance(run.get("run_metadata"), Mapping) and run["run_metadata"].get("showcase_id")]
     result = store.cleanup_runs(
         older_than=timedelta(days=older_than_days),
-        dry_run=dry_run,
+        execute=execute,
+        confirmation_token=confirmation_token,
         required_metadata={"showcase_id": None},
     )
-    return {**result, "showcase_run_ids": tagged, "dry_run": dry_run}
+    return {**result, "showcase_run_ids": tagged}
 
 
 def report_to_dict(report: ShowcaseReport) -> dict[str, object]:

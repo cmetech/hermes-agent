@@ -145,6 +145,7 @@ _SIDECAR_FIELDS = frozenset({
     "outward_action_policy",
     "execution_environment",
     "overlap_policy",
+    "pause_lane_policy",
     "concurrency_key",
     "limits",
     "resource_limits",
@@ -835,6 +836,21 @@ def _load_sidecar(
             "sidecar.execution_environment",
             "invalid_sidecar",
             "execution_environment must be trusted_local or isolated_backend_required",
+        )
+    pause_lane_policy = sidecar.get("pause_lane_policy", "hold")
+    if pause_lane_policy not in {"hold", "release"}:
+        _fail(
+            "sidecar.pause_lane_policy",
+            "invalid_sidecar",
+            "pause_lane_policy must be hold or release",
+        )
+    if "pause_lane_policy" in sidecar and sidecar.get(
+        "overlap_policy", "queue"
+    ) != "queue":
+        _fail(
+            "sidecar.pause_lane_policy",
+            "invalid_sidecar",
+            "pause_lane_policy requires queue overlap_policy",
         )
     return sidecar_path, freeze_value(sidecar)
 

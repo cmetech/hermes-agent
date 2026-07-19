@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import time
+import uuid
 from pathlib import Path
 
 from plugins.workflow.executors.base import (
@@ -66,6 +67,10 @@ class BashExecutor:
         output = BoundedProcessOutput(
             stdout_path, stderr_path, limit=context.max_output_bytes
         )
+        executor_nonce = uuid.uuid4().hex
+        if context.spawn_intent is not None and not context.spawn_intent(executor_nonce):
+            output.close()
+            raise RuntimeError("executor spawn intent was rejected")
         try:
             tree = ManagedProcessTree.spawn(
                 argv,
@@ -75,8 +80,10 @@ class BashExecutor:
                 stdout=output.stdout,
                 stderr=output.stderr,
             )
-        except BaseException:
+        except BaseException as exc:
             output.close()
+            if context.spawn_failed is not None:
+                context.spawn_failed(executor_nonce, type(exc).__name__)
             raise
         if context.process_started is not None and not context.process_started(
             tree.identity
