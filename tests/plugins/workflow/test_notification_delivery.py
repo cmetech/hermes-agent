@@ -374,6 +374,86 @@ def test_verified_gateway_route_is_projected_and_delivered_by_coordinator(
     assert gateway_history[0]["state"] == "delivered"
 
 
+def test_read_apis_never_expose_gateway_return_route_capability(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    capability = "live-seven-day-bearer-capability"
+    store = RunStore(home)
+    assert CoordinatorStore(store.database).try_acquire(
+        CoordinatorIdentity(
+            owner_id="gateway-read-test",
+            host_kind="gateway",
+            host_instance_id="gateway-read-test",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=datetime.now(timezone.utc),
+        lease_seconds=60,
+    ).is_leader
+    package = load_workflow(
+        workflow_writer(tmp_path / "read-api", name="gateway-read-api")
+    )
+    snapshot = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=snapshot.definition_digest,
+            policy_digest=snapshot.policy_digest,
+            input_manifest_digest=snapshot.input_manifest_digest,
+            trigger_source="chat",
+            idempotency_key="gateway-read-api",
+            concurrency_key=package.definition.name,
+            execution_mode="background",
+            operator_scope="service:test:desktop-client",
+            provenance=TriggerProvenance(
+                source="chat",
+                assurance="verified_adapter",
+                intent_key="gateway-read-api",
+                source_instance="gateway:telegram",
+                actor_id="gateway:telegram:user-1",
+                return_route=capability,
+            ),
+        ),
+        immutable_snapshot=snapshot,
+    )
+    outbox = NotificationOutbox(store)
+    outbox.record(
+        run_id=admitted.run_id,
+        kind="completion",
+        destination="desktop",
+        transition_version=1,
+        payload={"status": "succeeded"},
+    )
+    stored_gateway = next(
+        item
+        for item in outbox.history(run_id=admitted.run_id)
+        if item["destination"] == "gateway:opaque"
+    )
+    assert capability not in stored_gateway["transition_key"]
+    client = TestClient(_app(_module().router))
+
+    run_response = client.get(f"/api/plugins/workflow/runs/{admitted.run_id}")
+    notification_response = client.get(
+        f"/api/plugins/workflow/runs/{admitted.run_id}/evidence",
+        params={"kind": "notifications"},
+    )
+
+    assert run_response.status_code == 200
+    assert notification_response.status_code == 200
+    assert capability not in run_response.text
+    assert capability not in notification_response.text
+    assert run_response.json()["provenance"]["return_route"] == "[REDACTED]"
+    gateway_items = [
+        item
+        for item in notification_response.json()["items"]
+        if item["destination"] == "gateway:opaque"
+    ]
+    assert gateway_items
+    assert gateway_items[0]["transition_key"].endswith(":gateway:opaque")
+
+
 def test_authenticated_gateway_command_starts_real_background_run(
     tmp_path, workflow_writer
 ) -> None:

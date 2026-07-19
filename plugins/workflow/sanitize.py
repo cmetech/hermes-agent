@@ -8,7 +8,7 @@ from typing import Mapping
 
 
 _SECRET_KEY = re.compile(
-    r"(?i)(secret|password|token|authorization|api[_-]?key|credential|reasoning|prompt)"
+    r"(?i)(secret|password|token|authorization|api[_-]?key|credential|reasoning|prompt|return[_-]?route)"
 )
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -46,6 +46,8 @@ def sanitize_projection(value: object, *, key: str = "", depth: int = 0) -> obje
         ]
     if isinstance(value, str):
         cleaned, truncated = sanitize_text(value, max_chars=16_384)
+        if key.lower() == "transition_key" and ":gateway:" in cleaned:
+            cleaned = cleaned.partition(":gateway:")[0] + ":gateway:opaque"
         if key.lower() in {"path", "source_path", "run_directory", "relative_path"}:
             cleaned = PurePath(cleaned).name
         return cleaned + ("…[TRUNCATED]" if truncated else "")

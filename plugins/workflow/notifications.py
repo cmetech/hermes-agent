@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -198,7 +199,15 @@ class NotificationOutbox:
             raise ValueError("delivery_state must be pending or suppressed")
         observed = self._aware(now or datetime.now(timezone.utc))
         timestamp = observed.isoformat()
-        transition_key = f"{run_id}:{kind}:{transition_version}:{destination}"
+        transition_destination = destination
+        if destination.startswith("gateway:"):
+            capability = destination.removeprefix("gateway:")
+            transition_destination = (
+                "gateway:sha256:" + hashlib.sha256(capability.encode()).hexdigest()
+            )
+        transition_key = (
+            f"{run_id}:{kind}:{transition_version}:{transition_destination}"
+        )
         safe_payload = json.dumps(
             sanitize_projection(dict(payload)), sort_keys=True, separators=(",", ":")
         )
