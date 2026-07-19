@@ -4,7 +4,7 @@
 
 **Goal:** Contain run-local evidence failures to the damaged run, keep notification-repair lock contention from aborting coordinator work, and execute native evidence-containment tests in the three-OS release matrix.
 
-**Architecture:** Reuse the append-only `repair_events` table as a per-run state-transition log, deriving active reasons from the latest transition without adding schema. The three reviewed readers record or resolve only their own run-scoped reason, while existing global-marker writers remain unchanged. Notification-repair lock timeouts retain the durable cursor and return normally, with a bounded process-local diagnostic streak on `RunStore`.
+**Architecture:** Reuse the append-only `repair_events` table as a per-run state-transition log, deriving active reasons from the latest transition without adding schema. Five damage-scoped read sites—including both nested `load_run` corroboration catches—record or resolve only their own run-scoped reason, while index/generation, cross-run, claim, and journal-reserve global-marker writers remain unchanged. Notification-repair lock timeouts retain the durable cursor and return normally, with a bounded process-local diagnostic streak on `RunStore`.
 
 **Tech Stack:** Python 3.11, SQLite, pytest, FastAPI real middleware, filesystem advisory locks, GitHub Actions YAML, Bash merge gate.
 
@@ -15,7 +15,7 @@
 - Use `apply_patch` for every source, test, workflow, and documentation edit.
 - Workflow behavior remains plugin-owned; generic host/lifecycle code gains no workflow import.
 - Keep strict descriptor-contained notification journal reads; do not recover or rewrite torn tails in the scanner.
-- Never set the global repair marker for damage confined to one run at the three governed read/scan sites.
+- Never set the global repair marker for damage confined to one run at the five governed read/scan sites.
 - Never delete damaged evidence; damaged-run cleanup remains fail-closed.
 - Never advance the notification repair cursor beyond a contended run.
 - Gateway delivery and scheduler submission must continue in the same sweep after repair lock contention.
@@ -30,6 +30,7 @@
 
 - `plugins/workflow/store.py` — owns append-only run-repair transitions, active-reason lookup, list/status degradation, attention selection, and timeout-streak state.
 - `plugins/workflow/notifications.py` — records/resolves notification reconciliation reasons and converts `WorkflowLockTimeout` into cursor-retaining cadence completion.
+- `plugins/workflow/dashboard/plugin_api.py` — maps damaged-run reads to a typed conflict before mutation dispatch.
 - `tests/plugins/workflow/test_notifications.py` — strict torn-tail, repair-resolution, cursor-retention, retry, and timeout-diagnostic failure injection.
 - `tests/plugins/workflow/test_retention.py` — damaged-run cleanup containment plus unrelated cleanup/admission availability.
 - `tests/plugins/workflow/test_desktop_api.py` — real middleware proof that an active run-scoped reason is visible in the operator attention surface.
@@ -45,6 +46,7 @@
 **Files:**
 - Modify: `plugins/workflow/store.py:301-355, 1094-1148, 3587-3780`
 - Modify: `plugins/workflow/notifications.py:125-145, 534-635`
+- Modify: `plugins/workflow/dashboard/plugin_api.py:34, 257-265`
 - Modify: `tests/plugins/workflow/test_notifications.py`
 - Modify: `tests/plugins/workflow/test_retention.py`
 - Modify: `tests/plugins/workflow/test_desktop_api.py`
@@ -54,7 +56,7 @@
 - Consumes: `RunStore._record_repair_event(connection, *, reason_code, outcome, run_id, ...)`, `RunStore.attention_candidates(...)`, `NotificationOutbox.reconcile_journal(...)`, `WorkflowCoordinatorService._sweep_once(...)`.
 - Produces: `RunStore._transition_run_repair(reason_code: str, *, run_id: str, outcome: str) -> bool`, `RunStore._active_run_repair_reasons(run_id: str) -> tuple[str, ...]`, `RunStore._note_notification_repair_timeout(run_id: str) -> int`, and `RunStore._clear_notification_repair_timeout(run_id: str) -> None`.
 
-#### Slice 1.1: run-scoped state and three-site containment
+#### Slice 1.1: run-scoped state and five-site containment
 
 - [ ] **Step 1: Add a strict-scanner torn-tail failure test**
 
@@ -137,7 +139,7 @@ def test_torn_tail_repair_is_run_scoped_visible_and_later_verified(
 
 Reuse this helper from `test_oversized_first_journal_is_repaired` if doing so removes duplicated setup without changing that test's assertions.
 
-- [ ] **Step 2: Add three-site damage/visibility/cleanup tests**
+- [ ] **Step 2: Add five-site damage/visibility/cleanup tests**
 
 First extend the existing `_terminal_run` test helper with a nullable scope and pass it into `RunAdmissionRequest`:
 
@@ -263,6 +265,28 @@ def test_attention_surfaces_run_scoped_notification_repair_damage(
     assert "events.jsonl" not in response.text
 ```
 
+Add a second real-middleware test with an approval-paused run. Save its journal bytes, insert a malformed complete middle frame, remove `run.json` to force corroborating replay, then attempt the otherwise-valid approval:
+
+```python
+response = TestClient(_app(_router())).post(
+    f"/api/plugins/workflow/runs/{run_id}/approve",
+    json={
+        "expected_version": state_version,
+        "interaction_id": interaction_id,
+        "comment": "approved",
+    },
+)
+assert response.status_code == 409
+assert response.json()["detail"]["code"] == "run_evidence_uncorroborated"
+assert journal.read_bytes() == corrupted_journal
+assert store.storage_health() == {"status": "healthy", "reasons": []}
+assert store._active_run_repair_reasons(run_id) == (
+    "run_evidence_uncorroborated",
+)
+```
+
+This request must fail in `_load_authorized` before `store.approve_run` can append a decision. The test uses a real FastAPI/TestClient route and real SQLite/filesystem evidence.
+
 - [ ] **Step 3: Run the NR-1 tests red**
 
 Run:
@@ -271,10 +295,11 @@ Run:
 python -m pytest -q \
   tests/plugins/workflow/test_notifications.py::test_torn_tail_repair_is_run_scoped_visible_and_later_verified \
   tests/plugins/workflow/test_retention.py::test_run_read_damage_is_contained_while_unrelated_cleanup_and_admission_work \
-  tests/plugins/workflow/test_desktop_api.py::test_attention_surfaces_run_scoped_notification_repair_damage
+  tests/plugins/workflow/test_desktop_api.py::test_attention_surfaces_run_scoped_notification_repair_damage \
+  tests/plugins/workflow/test_desktop_api.py::test_corrupted_run_rejects_mutation_with_typed_error
 ```
 
-Expected: all new tests fail for the reviewed defect class: the global marker is created, no active-reason helper exists, and/or the damaged terminal run is absent from attention. No failure may be caused by fixture setup or import errors before production work starts.
+Expected: all new tests fail for the reviewed defect class: the global marker is created, no active-reason helper exists, the damaged terminal run is absent from attention, and/or the mutation returns an untyped server error. No failure may be caused by fixture setup or import errors before production work starts.
 
 - [ ] **Step 4: Add append-only run-repair state helpers**
 
@@ -339,7 +364,7 @@ def _active_run_repair_reasons(self, run_id: str) -> tuple[str, ...]:
 
 Keep `_mark_repair_required` unchanged for all existing store-global callers.
 
-- [ ] **Step 5: Apply the helper at exactly the three governed sites**
+- [ ] **Step 5: Apply the helper at exactly the five governed sites**
 
 In `NotificationOutbox.reconcile_journal`, replace the global-marker branch with:
 
@@ -366,6 +391,8 @@ self.store._transition_run_repair(
 ```
 
 In both `RunStore.list_runs` and `RunStore.attention_candidates`, replace `_mark_repair_required("run_evidence_uncorroborated", ...)` with `_transition_run_repair(..., outcome="repair_required")`. Set the degraded result's `blocking_reason` to `run_evidence_uncorroborated`, not `storage_repair_required`.
+
+In the two `RunStore.load_run` catches around `_journal_matches_projection` and `_rebuild_projection`, replace only the `run_evidence_uncorroborated` global-marker write with `_transition_run_repair(..., outcome="repair_required")`. Those two operations inspect one resolved run directory; they do not diagnose index/generation or cross-run integrity. Leave every index/generation, admission, claim-retention/reconciliation, and journal-reserve `_mark_repair_required` caller unchanged. On either successful corroboration path, append `repair_verified` before returning the projection.
 
 A successful status read resolves only `run_evidence_uncorroborated`:
 
@@ -394,9 +421,21 @@ if "notification_reconciliation_unverified" in active_reasons:
 
 If a repair-only `run_evidence_uncorroborated` reason is successfully resolved during that attention call and the run does not meet an ordinary attention state, omit it rather than emitting a stale item. Preserve keyset ordering and the `limit + 1` bound.
 
+Import `JournalRecoveryError` beside `RunStore` in `plugins/workflow/dashboard/plugin_api.py`. In `_load_authorized`, catch it before the existing not-found mapping and raise a typed conflict:
+
+```python
+except JournalRecoveryError as exc:
+    raise HTTPException(
+        status_code=409,
+        detail={"code": "run_evidence_uncorroborated"},
+    ) from exc
+```
+
+This mapping applies equally to reads and the mutation preflight; it does not catch index/generation health failures or authorize the underlying mutation.
+
 - [ ] **Step 6: Run the NR-1 tests green and audit global callers**
 
-Run the Step 3 command again. Expected: `3 passed`.
+Run the Step 3 command again. Expected: `4 passed`.
 
 Then run:
 
@@ -635,18 +674,20 @@ git diff --check
 git diff --stat
 git status --short
 git diff -- plugins/workflow/store.py plugins/workflow/notifications.py \
+  plugins/workflow/dashboard/plugin_api.py \
   tests/plugins/workflow/test_notifications.py \
   tests/plugins/workflow/test_retention.py \
   tests/plugins/workflow/test_desktop_api.py \
   tests/plugins/workflow/test_coordinator.py
 ```
 
-Confirm the two reviewer-owned files are the only unrelated paths. Stage exactly the six Task 1 files and audit the staged set:
+Confirm the two reviewer-owned files are the only unrelated paths. Stage exactly the seven Task 1 files and audit the staged set:
 
 ```bash
 git add -- \
   plugins/workflow/store.py \
   plugins/workflow/notifications.py \
+  plugins/workflow/dashboard/plugin_api.py \
   tests/plugins/workflow/test_notifications.py \
   tests/plugins/workflow/test_retention.py \
   tests/plugins/workflow/test_desktop_api.py \
@@ -656,7 +697,7 @@ git diff --cached --name-only
 git commit -m "fix(workflow): contain run-scoped repair failures"
 ```
 
-Expected: the staged name list contains exactly those six files; commit succeeds.
+Expected: the staged name list contains exactly those seven files; commit succeeds.
 
 ---
 

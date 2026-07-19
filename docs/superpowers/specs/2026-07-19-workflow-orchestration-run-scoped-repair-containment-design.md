@@ -38,13 +38,15 @@ The defect is a scope rule, not a single exception. Two operator read paths adde
 
 Advancing beyond a contended first row would create a permanent or repeated notification-repair blind spot. The cursor stays before the contended run, and the current cadence ends cleanly so a later sweep retries the same evidence.
 
-## Contract 1: run-scoped readers never set global repair state
+## Contract 1: run-scoped damage never sets global repair state
 
-The following three call sites are governed by one auditable rule:
+The invariant is damage-scoped, not caller-scoped: a failure that proves only one run's journal or projection is uncorroborated records run-scoped repair state and raises. Five current call sites implement that rule:
 
 1. notification journal repair in `plugins/workflow/notifications.py`;
 2. the runs-list/status projection path in `plugins/workflow/store.py`;
 3. `RunStore.attention_candidates` in `plugins/workflow/store.py`.
+4. the `RunStore.load_run` journal-head corroboration failure;
+5. the `RunStore.load_run` single-run projection rebuild failure.
 
 When one published run raises `JournalRecoveryError`, `NotificationReconciliationError`, `OSError`, malformed-data errors, or the equivalent run-local read failure at these sites, the caller must:
 
@@ -54,7 +56,7 @@ When one published run raises `JournalRecoveryError`, `NotificationReconciliatio
 - leave `storage_health()` healthy unless an independent store-level failure already exists;
 - permit unrelated admission and unrelated cleanup to proceed.
 
-The remaining `_mark_repair_required` call sites are intentionally unchanged. They cover authority/index/generation integrity, admission publication and reconciliation, projection/journal write durability, claim reconciliation, or other state whose safe scope is the store rather than a read projection.
+At the two `load_run` sites, only failures raised while corroborating that run's journal/projection become run-scoped. Index/generation damage, cross-run inconsistency, admission publication/reconciliation, journal-reserve exhaustion, claim retention/reconciliation, and other store-level durability failures continue to use `_mark_repair_required` unchanged.
 
 ## Contract 2: run-scoped damage is visible and self-clearing
 
@@ -78,6 +80,8 @@ Run-scoped repair state uses the existing append-only `repair_events` table with
 The dashboard attention mapper therefore emits a stalled/degraded attention item whose `cause` names `notification_reconciliation_unverified` or `run_evidence_uncorroborated`. The reason is visible without exposing evidence contents or filesystem paths.
 
 A successful later corroboration resolves only that run-scoped reason. It does not clear, rewrite, or acknowledge any unrelated global repair marker.
+
+A write request against the damaged run remains fail-closed because `load_run` raises after recording the run-scoped transition. The authenticated Desktop/API mutation surface maps that failure to a typed `409 run_evidence_uncorroborated` response before executing the mutation; removal of the global marker does not authorize or weaken the write.
 
 ## Contract 3: cleanup containment is bidirectional
 
@@ -132,7 +136,7 @@ The production fixes are implemented only after focused failure-injection tests 
 
 ### NR-1 red cycle
 
-Tests inject a strict torn tail through the notification scanner and genuine mid-file damage through the status-list and attention readers, then assert:
+Tests inject a strict torn tail through the notification scanner and genuine mid-file damage through `load_run`, the status-list, attention, and mutation readers, then assert:
 
 - an active run-scoped repair event with the exact reason exists;
 - no global repair marker exists and `storage_health()` stays healthy;
@@ -140,6 +144,7 @@ Tests inject a strict torn tail through the notification scanner and genuine mid
 - its cleanup remains blocked;
 - another terminal run remains cleanup-eligible;
 - a new unrelated run is admitted successfully.
+- a mutation on the damaged run receives typed `409 run_evidence_uncorroborated` and appends no journal state;
 
 The tests also prove a later successful read or scan appends `repair_verified` and removes the run from repair-only attention.
 
@@ -173,7 +178,7 @@ Reviewer-authored reports already present in the worktree remain untouched and u
 
 ## Acceptance criteria
 
-- None of the three governed run-scoped read/scan sites writes the global repair marker for one run's damage.
+- None of the five governed run-scoped read/scan sites writes the global repair marker for one run's damage.
 - Active run-scoped damage is visible in the attention surface with its exact stable reason.
 - Later successful corroboration clears only the matching active run-scoped warning through an append-only verified transition.
 - Damaged-run cleanup remains blocked while unrelated cleanup and admission remain available.
