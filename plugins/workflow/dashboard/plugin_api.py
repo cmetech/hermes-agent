@@ -190,6 +190,94 @@ def _verified_operator(
     raise HTTPException(status_code=401, detail={"code": "authentication_required"})
 
 
+class WorkflowCatalogInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=128)
+    type: str = Field(..., min_length=1, max_length=64)
+    required: bool
+
+
+class WorkflowCatalogInputSupport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    supported: bool
+    reason: Literal[
+        "parameterless",
+        "flat_inputs",
+        "unsupported_input_type",
+        "unsupported_input_shape",
+    ]
+
+
+class WorkflowCatalogEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=128)
+    version: str = Field(..., min_length=1, max_length=32)
+    description: str = Field(..., max_length=16_400)
+    source: Literal["project", "profile"]
+    precedence: Literal[1, 2]
+    trust_state: Literal["trusted", "untrusted"]
+    inputs: list[WorkflowCatalogInput] = Field(..., max_length=64)
+    supported_inputs: WorkflowCatalogInputSupport
+
+
+class WorkflowCatalogErrorEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=128)
+    error: Literal["invalid_definition", "catalog_capacity"]
+
+
+class WorkflowCatalogResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[WorkflowCatalogEntry | WorkflowCatalogErrorEntry] = Field(
+        ..., max_length=500
+    )
+    truncated: bool
+
+
+@router.get("/workflows", response_model=WorkflowCatalogResponse)
+def list_workflows(
+    request: Request,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request, operator_scope)
+    operator.require("read")
+    from plugins.workflow.catalog_api import (
+        WorkflowCatalogCapacityError,
+        WorkflowCatalogTrustUnavailableError,
+        WorkflowCatalogUnavailableError,
+        build_workflow_catalog,
+    )
+
+    try:
+        items, truncated = build_workflow_catalog(
+            hermes_home=get_hermes_home(), workdir=Path.cwd()
+        )
+    except WorkflowCatalogCapacityError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "workflow_catalog_capacity", "retryable": True},
+        ) from exc
+    except WorkflowCatalogUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "workflow_catalog_unavailable", "retryable": True},
+        ) from exc
+    except WorkflowCatalogTrustUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "workflow_trust_unavailable", "retryable": True},
+        ) from exc
+    return {
+        "items": [sanitize_projection(item) for item in items],
+        "truncated": truncated,
+    }
+
+
 @contextmanager
 def _store_lease() -> Iterator[RunStore]:
     try:

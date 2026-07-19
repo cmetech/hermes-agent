@@ -12,6 +12,52 @@ _SECRET_KEY = re.compile(
 )
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_PORTABLE_INPUT_INVALID = re.compile(r'[<>:"/\\|?*]')
+_WINDOWS_DEVICE_NAME = re.compile(
+    r"(?i)^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$"
+)
+_PORTABLE_COMPONENT_MAX_UNITS = 255
+_TEXT_INPUT_SUFFIX = ".txt"
+
+
+def workflow_input_name_is_portable(name: object, *, max_length: int = 128) -> bool:
+    """Return whether a name is one portable filename segment on every host OS."""
+    if not isinstance(name, str):
+        return False
+    component = name + _TEXT_INPUT_SUFFIX
+    try:
+        utf8_units = len(component.encode("utf-8"))
+        utf16_units = len(component.encode("utf-16-le")) // 2
+    except UnicodeError:
+        return False
+    return (
+        bool(name.strip())
+        and len(name) <= max_length
+        and utf8_units <= _PORTABLE_COMPONENT_MAX_UNITS
+        and utf16_units <= _PORTABLE_COMPONENT_MAX_UNITS
+        and name not in {".", ".."}
+        and not name.endswith((".", " "))
+        and _PORTABLE_INPUT_INVALID.search(name) is None
+        and _CONTROL.search(name) is None
+        and _WINDOWS_DEVICE_NAME.fullmatch(name) is None
+    )
+
+
+def workflow_input_names_are_portable(names: object) -> bool:
+    """Reject non-portable names and case-insensitive component collisions."""
+    try:
+        iterator = iter(names)
+    except TypeError:
+        return False
+    seen: set[str] = set()
+    for name in iterator:
+        if not workflow_input_name_is_portable(name):
+            return False
+        folded = name.casefold()
+        if folded in seen:
+            return False
+        seen.add(folded)
+    return True
 
 
 def sanitize_text(value: str, *, max_chars: int = 16_384) -> tuple[str, bool]:
@@ -56,4 +102,10 @@ def sanitize_projection(value: object, *, key: str = "", depth: int = 0) -> obje
     return sanitize_projection(str(value), key=key, depth=depth + 1)
 
 
-__all__ = ["sanitize_evidence_bytes", "sanitize_projection", "sanitize_text"]
+__all__ = [
+    "sanitize_evidence_bytes",
+    "sanitize_projection",
+    "sanitize_text",
+    "workflow_input_name_is_portable",
+    "workflow_input_names_are_portable",
+]

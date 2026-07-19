@@ -259,8 +259,10 @@ def show_package(
     isolated_workdir: bool = False,
     mcp_available: bool = False,
     cron_jobs: Iterable[Mapping[str, object]] = (),
+    compatibility_report: CompatibilityReport | None = None,
+    include_argument_hints: bool = True,
 ) -> dict[str, object]:
-    report = assess_compatibility(
+    report = compatibility_report or assess_compatibility(
         package,
         available_tools=available_tools,
         available_services=available_services,
@@ -307,7 +309,7 @@ def show_package(
     }
     result.update({
         "action": "show",
-        "argument_hints": _argument_hints(package),
+        "argument_hints": _argument_hints(package) if include_argument_hints else {},
         "topology_text": topology.text,
         "topology_mermaid": topology.mermaid,
         "topology_warnings": list(topology.warnings),

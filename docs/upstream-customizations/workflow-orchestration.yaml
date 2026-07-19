@@ -698,3 +698,54 @@ upstream_changes:
     plugin service host in Gateway with the same readiness, provider-publication,
     failure-isolation, and pre-resource-teardown shutdown ordering.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-catalog-read-api
+  change_class: workflow-rest-adapter
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/cli.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/sanitize.py
+  - plugins/workflow/trust.py
+  - scripts/test_workflow_merge_gate.sh
+  owned_symbols:
+  - CATALOG_LIMIT
+  - CATALOG_MAX_SCAN_ENTRIES
+  - CATALOG_MAX_TRUST_STORE_BYTES
+  - build_workflow_catalog
+  - show_package
+  - WorkflowResourceReadBudget
+  - WorkflowCatalogCapacityError
+  - WorkflowCatalogUnavailableError
+  - WorkflowCatalogTrustUnavailableError
+  - WorkflowTrustStore.snapshot_read_only
+  - WorkflowTrustStore.check_snapshot
+  - Desktop enum-choice support classification
+  - desktop_input_name_is_representable
+  - workflow_input_name_is_portable
+  - workflow_input_names_are_portable
+  - CATALOG_MAX_RESOURCE_REQUEST_BYTES
+  - WorkflowCatalogResponse
+  - list_workflows
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(workflow): Task 1 add catalog endpoint'
+  upstream_candidate: true
+  merge_guidance: Preserve the authenticated workflow:read boundary, server-derived
+    trust and Desktop input-support classification, body/default-free CLI show
+    projection, per-entry invalid-definition isolation, stable ordering, the finite
+    deterministic filesystem scan budget with typed retryable capacity/unavailable
+    errors, bounded definition and digest-resource reads, one byte-bounded,
+    shape-validated, nonmutating trust snapshot per request, trust-store failure
+    isolation, cross-platform storage-safe and sanitizer-stable Desktop input
+    names bounded as generated UTF-8 and UTF-16 filename components, including
+    superscript Windows device aliases and case-insensitive collisions,
+    per-package resource classification with a separately bounded
+    request-work truncation signal, honest
+    unsupported classification for enums without usable string choices,
+    and the explicit 500-entry truncation signal. Keep discovery inside the
+    workflow plugin and do not add execution authority to this read route.
+  removal_condition: Remove when upstream provides an equivalent authenticated,
+    bounded, sanitized, failure-isolated workflow catalog for generic clients.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

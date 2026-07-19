@@ -1,0 +1,478 @@
+"""Bounded, redacted workflow catalog projection for authenticated APIs."""
+
+from __future__ import annotations
+
+import os
+import stat
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator, Literal, TypedDict
+
+from plugins.workflow.cli import show_package
+from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.models import WorkflowPackage, WorkflowValidationError
+from plugins.workflow.schema import load_workflow
+from plugins.workflow.sanitize import (
+    sanitize_projection,
+    sanitize_text,
+    workflow_input_name_is_portable,
+    workflow_input_names_are_portable,
+)
+from plugins.workflow.trust import (
+    WorkflowResourceCapacityError,
+    WorkflowResourceReadBudget,
+    WorkflowTrustError,
+    WorkflowTrustStore,
+    build_risk_summary,
+)
+
+
+CATALOG_LIMIT = 500
+CATALOG_MAX_SCAN_ENTRIES = 4096
+CATALOG_MAX_DEFINITION_FILE_BYTES = 2 * 1024 * 1024
+CATALOG_MAX_DEFINITION_TOTAL_BYTES = 16 * 1024 * 1024
+CATALOG_MAX_RESOURCE_FILE_BYTES = 1024 * 1024
+CATALOG_MAX_RESOURCE_TOTAL_BYTES = 8 * 1024 * 1024
+CATALOG_MAX_RESOURCE_FILES = 512
+CATALOG_MAX_RESOURCE_REQUEST_BYTES = 2 * CATALOG_MAX_RESOURCE_TOTAL_BYTES
+CATALOG_MAX_TRUST_STORE_BYTES = 4 * 1024 * 1024
+_PROFILE_STATE_DIRECTORIES = frozenset({"runs", ".staging", ".quarantine", ".locks"})
+_SUPPORTED_INPUT_TYPES = frozenset({"string", "number", "boolean", "enum"})
+_RICH_INPUT_FIELDS = frozenset({"items", "properties", "schema"})
+_ENUM_INPUT_FIELDS = ("values", "enum", "options", "choices")
+_ENUM_MAX_CHOICES = 128
+_ENUM_MAX_CHOICE_LENGTH = 512
+
+
+class CatalogInput(TypedDict):
+    name: str
+    type: str
+    required: bool
+
+
+class SupportedInputs(TypedDict):
+    supported: bool
+    reason: Literal[
+        "parameterless",
+        "flat_inputs",
+        "unsupported_input_type",
+        "unsupported_input_shape",
+    ]
+
+
+class CatalogEntry(TypedDict):
+    name: str
+    version: str
+    description: str
+    source: str
+    precedence: int
+    trust_state: Literal["trusted", "untrusted"]
+    inputs: list[CatalogInput]
+    supported_inputs: SupportedInputs
+
+
+class InvalidCatalogEntry(TypedDict):
+    name: str
+    error: Literal["invalid_definition", "catalog_capacity"]
+
+
+CatalogItem = CatalogEntry | InvalidCatalogEntry
+
+
+class WorkflowCatalogCapacityError(RuntimeError):
+    """The catalog cannot be enumerated within its fixed work budget."""
+
+
+class WorkflowCatalogUnavailableError(RuntimeError):
+    """The catalog filesystem cannot be enumerated safely."""
+
+
+class WorkflowCatalogTrustUnavailableError(RuntimeError):
+    """The trust store cannot classify a catalog entry safely."""
+
+
+@dataclass(slots=True)
+class _DirectoryScanBudget:
+    max_entries: int
+    entries_seen: int = 0
+
+    def consume(self) -> None:
+        self.entries_seen += 1
+        if self.entries_seen >= self.max_entries:
+            raise WorkflowCatalogCapacityError(
+                "workflow catalog scan entry limit exceeded"
+            )
+
+
+@dataclass(slots=True)
+class _DefinitionReadBudget:
+    bytes_reserved: int = 0
+
+    def reserve(self, workflow_path: Path) -> None:
+        paths = [workflow_path]
+        sidecar = workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml")
+        if sidecar.is_file():
+            paths.append(sidecar)
+        sizes: list[int] = []
+        for path in paths:
+            size = path.stat().st_size
+            if size > CATALOG_MAX_DEFINITION_FILE_BYTES:
+                raise WorkflowResourceCapacityError(
+                    "workflow definition file limit exceeded"
+                )
+            sizes.append(size)
+        reserved = sum(sizes)
+        if self.bytes_reserved + reserved > CATALOG_MAX_DEFINITION_TOTAL_BYTES:
+            raise WorkflowResourceCapacityError(
+                "workflow definition byte limit exceeded"
+            )
+        self.bytes_reserved += reserved
+
+
+def _error_entry(
+    name: str,
+    error: Literal["invalid_definition", "catalog_capacity"],
+) -> InvalidCatalogEntry:
+    return {"name": name[:128] or "invalid-workflow", "error": error}
+
+
+def _directory_entries(directory: Path) -> Iterator[os.DirEntry[str]]:
+    with os.scandir(directory) as entries:
+        yield from entries
+
+
+def _yaml_paths(
+    location: Path,
+    *,
+    profile: bool,
+    scan_budget: _DirectoryScanBudget,
+) -> Iterator[Path]:
+    try:
+        mode = location.stat().st_mode
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise WorkflowCatalogUnavailableError(
+            "workflow catalog root is unavailable"
+        ) from exc
+    if not stat.S_ISDIR(mode):
+        return
+
+    pending = [location]
+    while pending:
+        directory = pending.pop()
+        children: list[tuple[str, Path, bool, bool]] = []
+        try:
+            for entry in _directory_entries(directory):
+                scan_budget.consume()
+                is_directory = entry.is_dir(follow_symlinks=False)
+                is_file = entry.is_file(follow_symlinks=False)
+                children.append((entry.name, Path(entry.path), is_directory, is_file))
+        except WorkflowCatalogCapacityError:
+            raise
+        except OSError as exc:
+            raise WorkflowCatalogUnavailableError(
+                "workflow catalog enumeration is unavailable"
+            ) from exc
+
+        directories: list[Path] = []
+        for name, path, is_directory, is_file in sorted(children):
+            if is_directory:
+                if not (
+                    profile
+                    and directory == location
+                    and name in _PROFILE_STATE_DIRECTORIES
+                ):
+                    directories.append(path)
+                continue
+            if (
+                is_file
+                and path.suffix.lower() in {".yaml", ".yml"}
+                and not name.endswith(".hermes.yaml")
+            ):
+                yield path
+        pending.extend(reversed(directories))
+
+
+def _catalog_candidates(
+    workdir: Path, hermes_home: Path
+) -> tuple[list[tuple[str, int, Path]], bool]:
+    locations = (
+        ("project", 1, workdir / ".hermes" / "workflows", False),
+        ("profile", 2, hermes_home / "workflows", True),
+    )
+    scan_budget = _DirectoryScanBudget(CATALOG_MAX_SCAN_ENTRIES)
+    candidates = [
+        (source, precedence, path)
+        for source, precedence, location, profile in locations
+        for path in _yaml_paths(location, profile=profile, scan_budget=scan_budget)
+    ]
+    candidates.sort(key=lambda item: (item[1], item[2].as_posix()))
+    return candidates[:CATALOG_LIMIT], len(candidates) > CATALOG_LIMIT
+
+
+def _discover_catalog(
+    workdir: Path, hermes_home: Path
+) -> tuple[tuple[WorkflowPackage | InvalidCatalogEntry, ...], bool]:
+    selected: dict[str, WorkflowPackage] = {}
+    invalid: list[InvalidCatalogEntry] = []
+    candidates, truncated = _catalog_candidates(workdir, hermes_home)
+    definition_budget = _DefinitionReadBudget()
+    by_location: dict[tuple[str, int], list[Path]] = {}
+    for source, precedence, path in candidates:
+        by_location.setdefault((source, precedence), []).append(path)
+    for (source, precedence), paths in by_location.items():
+        level: dict[str, WorkflowPackage] = {}
+        duplicate_names: set[str] = set()
+        for path in paths:
+            try:
+                definition_budget.reserve(path)
+                package = load_workflow(path, source=source, precedence=precedence)
+            except WorkflowResourceCapacityError:
+                invalid.append(_error_entry(path.stem, "catalog_capacity"))
+                continue
+            except (OSError, UnicodeError, WorkflowValidationError, ValueError):
+                invalid.append(_error_entry(path.stem, "invalid_definition"))
+                continue
+            name = package.definition.name
+            if not name.strip() or len(name) > 128:
+                invalid.append(_error_entry(name, "invalid_definition"))
+                continue
+            if name in level:
+                duplicate_names.add(name)
+                level.pop(name, None)
+                continue
+            if name not in duplicate_names:
+                level[name] = package
+        invalid.extend(
+            _error_entry(name, "invalid_definition") for name in sorted(duplicate_names)
+        )
+        for name, package in level.items():
+            selected.setdefault(name, package)
+    return (
+        tuple(
+            sorted(
+                [*selected.values(), *invalid],
+                key=lambda item: (
+                    item.definition.name
+                    if isinstance(item, WorkflowPackage)
+                    else item["name"]
+                ),
+            )
+        ),
+        truncated,
+    )
+
+
+def _input_projection(
+    package: WorkflowPackage,
+) -> tuple[list[CatalogInput], SupportedInputs]:
+    delivery = package.sidecar.get("delivery_defaults")
+    if delivery is None:
+        return [], {"supported": True, "reason": "parameterless"}
+    if not isinstance(delivery, Mapping):
+        return [], {"supported": False, "reason": "unsupported_input_shape"}
+    raw_inputs = delivery.get("inputs")
+    if raw_inputs is None or raw_inputs == {}:
+        return [], {"supported": True, "reason": "parameterless"}
+    if not isinstance(raw_inputs, Mapping) or len(raw_inputs) > 64:
+        return [], {"supported": False, "reason": "unsupported_input_shape"}
+
+    inputs: list[CatalogInput] = []
+    unsupported_type = False
+    unsupported_shape = not workflow_input_names_are_portable(raw_inputs)
+    for raw_name, raw in sorted(raw_inputs.items(), key=lambda item: str(item[0])):
+        if (
+            not isinstance(raw_name, str)
+            or not desktop_input_name_is_representable(raw_name)
+            or not isinstance(raw, Mapping)
+        ):
+            unsupported_shape = True
+            continue
+        declared_type = raw.get("type", raw.get("kind"))
+        if "type" in raw and "kind" in raw and raw.get("type") != raw.get("kind"):
+            unsupported_shape = True
+        if (
+            not isinstance(declared_type, str)
+            or not declared_type
+            or len(declared_type) > 64
+        ):
+            declared_type = "unknown"
+            unsupported_shape = True
+        required = raw.get("required", True)
+        if not isinstance(required, bool):
+            required = True
+            unsupported_shape = True
+        if _RICH_INPUT_FIELDS.intersection(raw):
+            unsupported_shape = True
+        if declared_type not in _SUPPORTED_INPUT_TYPES:
+            unsupported_type = True
+        if declared_type == "enum" and not _enum_choices_supported(raw):
+            unsupported_shape = True
+        inputs.append({
+            "name": raw_name,
+            "type": declared_type,
+            "required": required,
+        })
+
+    if unsupported_type:
+        classification: SupportedInputs = {
+            "supported": False,
+            "reason": "unsupported_input_type",
+        }
+    elif unsupported_shape:
+        classification = {
+            "supported": False,
+            "reason": "unsupported_input_shape",
+        }
+    else:
+        classification = {"supported": True, "reason": "flat_inputs"}
+    return inputs, classification
+
+
+def _enum_choices_supported(specification: Mapping[object, object]) -> bool:
+    choice_fields = [field for field in _ENUM_INPUT_FIELDS if field in specification]
+    if len(choice_fields) != 1:
+        return False
+    choices = specification[choice_fields[0]]
+    if (
+        not isinstance(choices, (list, tuple))
+        or not choices
+        or len(choices) > _ENUM_MAX_CHOICES
+    ):
+        return False
+    projected: set[str] = set()
+    for choice in choices:
+        if not isinstance(choice, str):
+            return False
+        label = choice
+        if not label or len(label) > _ENUM_MAX_CHOICE_LENGTH or label in projected:
+            return False
+        projected.add(label)
+    return True
+
+
+def desktop_input_name_is_representable(name: object) -> bool:
+    """Match Desktop values to storage paths and the redacted detail projection."""
+    if not workflow_input_name_is_portable(name):
+        return False
+    cleaned, truncated = sanitize_text(name, max_chars=128)
+    projected = sanitize_projection({name: None})
+    return (
+        not truncated
+        and cleaned == name
+        and isinstance(projected, Mapping)
+        and name in projected
+        and projected[name] is None
+    )
+
+
+def _catalog_entry(
+    package: WorkflowPackage,
+    trust_store: WorkflowTrustStore,
+    trust_snapshot: Mapping[str, object],
+    resource_budget: WorkflowResourceReadBudget,
+) -> CatalogEntry:
+    # The CLI show projection is the established body-free catalog contract.
+    compatibility = assess_compatibility(package)
+    shown = show_package(
+        package,
+        compatibility_report=compatibility,
+        include_argument_hints=False,
+    )
+    risk = build_risk_summary(package, compatibility, read_budget=resource_budget)
+    trust_state = trust_store.check_snapshot(
+        trust_snapshot,
+        risk.package_digest,
+        risk_digest=risk.risk_digest,
+    )
+    inputs, supported_inputs = _input_projection(package)
+    return {
+        "name": str(shown["name"]),
+        "version": "1",
+        "description": str(shown["description"]),
+        "source": str(shown["source"]),
+        "precedence": int(shown["precedence"]),
+        "trust_state": trust_state,
+        "inputs": inputs,
+        "supported_inputs": supported_inputs,
+    }
+
+
+def build_workflow_catalog(
+    *, hermes_home: str | Path, workdir: str | Path
+) -> tuple[list[CatalogItem], bool]:
+    """Return at most 500 stable entries without executing workflow code."""
+    home = Path(hermes_home).expanduser().resolve()
+    discovered, truncated = _discover_catalog(
+        Path(workdir).expanduser().resolve(), home
+    )
+    trust_store = WorkflowTrustStore(home)
+    try:
+        trust_snapshot = trust_store.snapshot_read_only(
+            max_bytes=CATALOG_MAX_TRUST_STORE_BYTES
+        )
+    except WorkflowTrustError as exc:
+        raise WorkflowCatalogTrustUnavailableError(
+            "workflow catalog trust classification is unavailable"
+        ) from exc
+    items: list[CatalogItem] = []
+    resource_bytes_read = 0
+    for discovered_item in discovered:
+        if (
+            resource_bytes_read + CATALOG_MAX_RESOURCE_TOTAL_BYTES
+            > CATALOG_MAX_RESOURCE_REQUEST_BYTES
+        ):
+            truncated = True
+            break
+        if not isinstance(discovered_item, WorkflowPackage):
+            items.append(discovered_item)
+            continue
+        resource_budget = WorkflowResourceReadBudget(
+            max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
+            max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
+            max_files=CATALOG_MAX_RESOURCE_FILES,
+        )
+        try:
+            items.append(
+                _catalog_entry(
+                    discovered_item,
+                    trust_store,
+                    trust_snapshot,
+                    resource_budget,
+                )
+            )
+        except WorkflowResourceCapacityError:
+            items.append(
+                _error_entry(discovered_item.definition.name, "catalog_capacity")
+            )
+        except WorkflowTrustError as exc:
+            raise WorkflowCatalogTrustUnavailableError(
+                "workflow catalog trust classification is unavailable"
+            ) from exc
+        except (OSError, UnicodeError, WorkflowValidationError, ValueError):
+            items.append(
+                _error_entry(discovered_item.definition.name, "invalid_definition")
+            )
+        finally:
+            resource_bytes_read += resource_budget.bytes_read
+    return items, truncated
+
+
+__all__ = [
+    "CATALOG_LIMIT",
+    "CATALOG_MAX_SCAN_ENTRIES",
+    "CATALOG_MAX_DEFINITION_FILE_BYTES",
+    "CATALOG_MAX_DEFINITION_TOTAL_BYTES",
+    "CATALOG_MAX_RESOURCE_FILE_BYTES",
+    "CATALOG_MAX_RESOURCE_FILES",
+    "CATALOG_MAX_RESOURCE_REQUEST_BYTES",
+    "CATALOG_MAX_RESOURCE_TOTAL_BYTES",
+    "CATALOG_MAX_TRUST_STORE_BYTES",
+    "WorkflowCatalogCapacityError",
+    "WorkflowCatalogTrustUnavailableError",
+    "WorkflowCatalogUnavailableError",
+    "build_workflow_catalog",
+    "desktop_input_name_is_representable",
+]

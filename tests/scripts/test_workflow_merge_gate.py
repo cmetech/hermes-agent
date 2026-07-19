@@ -77,6 +77,12 @@ def test_merge_gate_enforces_async_reload_and_delivery_regressions() -> None:
         assert required_test in source
 
 
+def test_merge_gate_pins_workflow_catalog_api_contract() -> None:
+    source = GATE.read_text()
+
+    assert "tests/plugins/workflow/test_catalog_api.py" in source
+
+
 def test_native_workflow_matrix_covers_every_release_gate() -> None:
     source = CI.read_text()
 

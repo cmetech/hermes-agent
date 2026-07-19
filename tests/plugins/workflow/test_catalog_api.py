@@ -1,0 +1,857 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from dataclasses import replace
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from hermes_cli.dashboard_auth.base import TokenPrincipal
+import pytest
+import yaml
+
+from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.schema import load_workflow
+from plugins.workflow.trust import (
+    WorkflowTrustError,
+    WorkflowTrustStore,
+    build_risk_summary,
+    compute_package_digest,
+)
+
+
+def _module():
+    path = Path(__file__).parents[3] / "plugins/workflow/dashboard/plugin_api.py"
+    spec = importlib.util.spec_from_file_location("workflow_catalog_api_test", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _app(router, *, token=None):
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def authenticated(request, call_next):
+        if token is not None:
+            request.state.token_principal = token
+            request.state.token_authenticated = True
+        return await call_next(request)
+
+    app.include_router(router, prefix="/api/plugins/workflow")
+    return app
+
+
+def _reader() -> TokenPrincipal:
+    return TokenPrincipal(
+        principal="reader", provider="test", scopes=("workflow:read",)
+    )
+
+
+def _catalog_get(router, *, token=None):
+    return TestClient(_app(router, token=token)).get("/api/plugins/workflow/workflows")
+
+
+def test_workflow_catalog_requires_verified_authentication() -> None:
+    response = _catalog_get(_module().router)
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": {"code": "authentication_required"}}
+
+
+def test_workflow_catalog_requires_read_capability() -> None:
+    token = TokenPrincipal(principal="writer", provider="test", scopes=())
+
+    response = _catalog_get(_module().router, token=token)
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": {"code": "workflow_read_required"}}
+
+
+def test_workflow_catalog_returns_stable_redacted_server_classification(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    beta = workflow_writer(
+        home / "workflows",
+        name="beta",
+        description="Parameterless workflow",
+        filename="beta.yaml",
+    )
+    alpha = workflow_writer(
+        home / "workflows",
+        name="alpha",
+        description="Typed workflow",
+        filename="alpha.yaml",
+    )
+    alpha.with_name("alpha.hermes.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "delivery_defaults": {
+                    "inputs": {
+                        "count": {
+                            "type": "number",
+                            "required": False,
+                            "default": "SECRET_NUMERIC_DEFAULT",
+                        },
+                        "enabled": {
+                            "type": "boolean",
+                            "required": False,
+                        },
+                        "mode": {
+                            "type": "enum",
+                            "required": True,
+                            "values": ["safe", "fast"],
+                        },
+                        "title": {
+                            "type": "string",
+                            "required": True,
+                            "default": "SECRET_TITLE_DEFAULT",
+                        },
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    package = load_workflow(alpha, source="profile", precedence=2)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(home).trust(
+        digest.sha256, actor="catalog-test", risk_digest=risk.risk_digest
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["truncated"] is False
+    assert [item["name"] for item in payload["items"]] == ["alpha", "beta"]
+    assert payload["items"][0] == {
+        "name": "alpha",
+        "version": "1",
+        "description": "Typed workflow",
+        "source": "profile",
+        "precedence": 2,
+        "trust_state": "trusted",
+        "inputs": [
+            {"name": "count", "type": "number", "required": False},
+            {"name": "enabled", "type": "boolean", "required": False},
+            {"name": "mode", "type": "enum", "required": True},
+            {"name": "title", "type": "string", "required": True},
+        ],
+        "supported_inputs": {"supported": True, "reason": "flat_inputs"},
+    }
+    assert payload["items"][1]["trust_state"] == "untrusted"
+    assert payload["items"][1]["inputs"] == []
+    assert payload["items"][1]["supported_inputs"] == {
+        "supported": True,
+        "reason": "parameterless",
+    }
+    assert b"SECRET_NUMERIC_DEFAULT" not in response.content
+    assert b"SECRET_TITLE_DEFAULT" not in response.content
+    assert beta.is_file()
+
+
+def test_workflow_catalog_marks_legacy_and_rich_input_kinds_unsupported(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    path = workflow_writer(home / "workflows", name="legacy-inputs")
+    path.with_name("example.hermes.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "delivery_defaults": {
+                    "inputs": {
+                        "attachment": {"kind": "file", "required": True},
+                        "metadata": {
+                            "type": "object",
+                            "required": False,
+                            "properties": {"secret": {"type": "string"}},
+                        },
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["inputs"] == [
+        {"name": "attachment", "type": "file", "required": True},
+        {"name": "metadata", "type": "object", "required": False},
+    ]
+    assert item["supported_inputs"] == {
+        "supported": False,
+        "reason": "unsupported_input_type",
+    }
+    assert b"properties" not in response.content
+    assert b"secret" not in response.content
+
+
+def test_workflow_catalog_marks_enum_without_usable_choices_unsupported(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    path = workflow_writer(home / "workflows", name="empty-enum")
+    path.with_name("example.hermes.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "delivery_defaults": {
+                    "inputs": {
+                        "mode": {
+                            "type": "enum",
+                            "required": False,
+                        }
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["inputs"] == [{"name": "mode", "type": "enum", "required": False}]
+    assert item["supported_inputs"] == {
+        "supported": False,
+        "reason": "unsupported_input_shape",
+    }
+
+
+@pytest.mark.parametrize(
+    "input_name",
+    [
+        "   ",
+        "x" * 129,
+        "foo/bar",
+        "foo\\bar",
+        "mode\x1b[31m",
+        "api_token",
+        "CON",
+        "nul.txt",
+        "COM1",
+        "foo:bar",
+        "a?b",
+        "a*b",
+        "<x>",
+        "a|b",
+        "trailing.",
+        "trailing ",
+        "😀" * 64,
+        "COM¹",
+        "COM².txt",
+        "com³",
+        "LPT¹",
+        "lpt².log",
+        "LPT³",
+    ],
+)
+def test_workflow_catalog_rejects_unrepresentable_input_names_without_renaming(
+    tmp_path, monkeypatch, workflow_writer, input_name
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    path = workflow_writer(home / "workflows", name="invalid-input-name")
+    path.with_name("example.hermes.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "delivery_defaults": {
+                    "inputs": {
+                        input_name: {"type": "string", "required": True},
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["inputs"] == []
+    assert item["supported_inputs"] == {
+        "supported": False,
+        "reason": "unsupported_input_shape",
+    }
+
+
+def test_workflow_catalog_rejects_case_insensitive_input_name_collisions(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    path = workflow_writer(home / "workflows", name="colliding-input-names")
+    path.with_name("example.hermes.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "delivery_defaults": {
+                    "inputs": {
+                        "Mode": {"type": "string", "required": True},
+                        "mode": {"type": "string", "required": True},
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["supported_inputs"] == {
+        "supported": False,
+        "reason": "unsupported_input_shape",
+    }
+
+
+@pytest.mark.parametrize(
+    "choices",
+    [
+        [1, 1.0],
+        [9_007_199_254_740_992, 9_007_199_254_740_993],
+    ],
+)
+def test_workflow_catalog_rejects_enum_choices_that_collapse_on_the_json_wire(
+    tmp_path, monkeypatch, workflow_writer, choices
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    path = workflow_writer(home / "workflows", name="wire-unsafe-enum")
+    path.with_name("example.hermes.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "delivery_defaults": {
+                    "inputs": {
+                        "mode": {
+                            "type": "enum",
+                            "required": True,
+                            "values": choices,
+                        }
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["inputs"] == [{"name": "mode", "type": "enum", "required": True}]
+    assert item["supported_inputs"] == {
+        "supported": False,
+        "reason": "unsupported_input_shape",
+    }
+
+
+def test_workflow_catalog_degrades_unrepresentable_workflow_name_per_entry(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="normal", filename="normal.yaml")
+    workflow_writer(home / "workflows", name="placeholder", filename="long.yaml")
+    import plugins.workflow.catalog_api as catalog_api
+
+    original_load = catalog_api.load_workflow
+    long_name = "x" * 129
+
+    def long_name_load(path, **kwargs):
+        package = original_load(path, **kwargs)
+        if Path(path).name == "long.yaml":
+            return replace(
+                package,
+                definition=replace(package.definition, name=long_name),
+            )
+        return package
+
+    monkeypatch.setattr(catalog_api, "load_workflow", long_name_load)
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    assert response.json()["items"] == [
+        {
+            "name": "normal",
+            "version": "1",
+            "description": "Portable workflow fixture",
+            "source": "profile",
+            "precedence": 2,
+            "trust_state": "untrusted",
+            "inputs": [],
+            "supported_inputs": {
+                "supported": True,
+                "reason": "parameterless",
+            },
+        },
+        {"name": "x" * 128, "error": "invalid_definition"},
+    ]
+
+
+def test_workflow_catalog_empty_is_not_an_error(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    assert response.json() == {"items": [], "truncated": False}
+
+
+def test_workflow_catalog_isolates_invalid_definition(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="valid", filename="valid.yaml")
+    (home / "workflows" / "broken.yaml").write_text(
+        "name: broken\nnodes: [SECRET_TRACEBACK_MATERIAL\n", encoding="utf-8"
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    assert response.json()["items"] == [
+        {"name": "broken", "error": "invalid_definition"},
+        {
+            "name": "valid",
+            "version": "1",
+            "description": "Portable workflow fixture",
+            "source": "profile",
+            "precedence": 2,
+            "trust_state": "untrusted",
+            "inputs": [],
+            "supported_inputs": {
+                "supported": True,
+                "reason": "parameterless",
+            },
+        },
+    ]
+    assert response.json()["truncated"] is False
+    assert b"SECRET_TRACEBACK_MATERIAL" not in response.content
+    assert b"Traceback" not in response.content
+
+
+def test_workflow_catalog_caps_items_and_reports_truncation(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for index in range(501):
+        name = f"workflow-{index:03d}"
+        workflow_writer(home / "workflows", name=name, filename=f"{name}.yaml")
+    import plugins.workflow.catalog_api as catalog_api
+
+    original_load = catalog_api.load_workflow
+    original_read = catalog_api.WorkflowTrustStore._read
+    loaded = 0
+    trust_reads = 0
+
+    def counted_load(*args, **kwargs):
+        nonlocal loaded
+        loaded += 1
+        return original_load(*args, **kwargs)
+
+    def counted_read(*args, **kwargs):
+        nonlocal trust_reads
+        trust_reads += 1
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(catalog_api, "load_workflow", counted_load)
+    monkeypatch.setattr(catalog_api.WorkflowTrustStore, "_read", counted_read)
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload["items"]) == 500
+    assert payload["truncated"] is True
+    assert payload["items"][0]["name"] == "workflow-000"
+    assert payload["items"][-1]["name"] == "workflow-499"
+    assert loaded == 500
+    assert trust_reads == 1
+    assert not (home / "workflow" / "trust.lock").exists()
+
+
+def test_workflow_catalog_bounds_one_trust_snapshot_read(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="bounded-trust")
+    import plugins.workflow.catalog_api as catalog_api
+
+    trust_path = WorkflowTrustStore(home).path
+    trust_path.parent.mkdir(parents=True)
+    trust_path.write_text(
+        json.dumps({
+            "version": 1,
+            "records": {"padding": "x" * catalog_api.CATALOG_MAX_TRUST_STORE_BYTES},
+        }),
+        encoding="utf-8",
+    )
+    original_open = Path.open
+    read_sizes: list[int] = []
+
+    class RecordingReader:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def __enter__(self):
+            self._wrapped.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._wrapped.__exit__(*args)
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            return self._wrapped.read(size)
+
+    def recording_open(path, *args, **kwargs):
+        opened = original_open(path, *args, **kwargs)
+        return RecordingReader(opened) if Path(path) == trust_path else opened
+
+    monkeypatch.setattr(Path, "open", recording_open)
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["trust_state"] == "untrusted"
+    assert read_sizes == [catalog_api.CATALOG_MAX_TRUST_STORE_BYTES + 1]
+    assert not WorkflowTrustStore(home).lock_path.exists()
+
+
+def test_workflow_catalog_treats_non_object_trust_json_as_untrusted(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="non-object-trust")
+    trust_path = WorkflowTrustStore(home).path
+    trust_path.parent.mkdir(parents=True)
+    trust_path.write_text("[]", encoding="utf-8")
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["trust_state"] == "untrusted"
+    assert not WorkflowTrustStore(home).lock_path.exists()
+
+
+def test_workflow_catalog_rejects_oversized_resource_without_reading_it_all(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(
+        home / "workflows",
+        name="oversized-resource",
+        nodes=[{"id": "run", "command": "large"}],
+    )
+    commands = home / "commands"
+    commands.mkdir()
+    resource = commands / "large.md"
+    resource.write_bytes(b"x" * (1024 * 1024 + 1))
+    original_open = Path.open
+    read_sizes: list[int] = []
+
+    class RecordingReader:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def __enter__(self):
+            self._wrapped.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._wrapped.__exit__(*args)
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            return self._wrapped.read(size)
+
+    def recording_open(path, *args, **kwargs):
+        opened = original_open(path, *args, **kwargs)
+        return RecordingReader(opened) if Path(path) == resource else opened
+
+    monkeypatch.setattr(Path, "open", recording_open)
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    assert response.json()["items"] == [
+        {"name": "oversized-resource", "error": "catalog_capacity"}
+    ]
+    assert read_sizes
+    assert all(0 < size <= 1024 * 1024 + 1 for size in read_sizes)
+
+
+def test_workflow_catalog_enforces_aggregate_resource_budget(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    commands = home / "commands"
+    commands.mkdir(parents=True)
+    nodes = []
+    for index in range(9):
+        name = f"resource-{index}"
+        (commands / f"{name}.md").write_bytes(b"x" * 1024 * 1024)
+        nodes.append({"id": f"node-{index}", "command": name})
+    workflow_writer(
+        home / "workflows",
+        name="aggregate-resource-budget",
+        nodes=nodes,
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    assert response.json()["items"] == [
+        {"name": "aggregate-resource-budget", "error": "catalog_capacity"}
+    ]
+
+
+def test_workflow_catalog_truncates_before_global_resource_work_bound(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import plugins.workflow.catalog_api as catalog_api
+
+    monkeypatch.setattr(
+        catalog_api,
+        "CATALOG_MAX_RESOURCE_REQUEST_BYTES",
+        catalog_api.CATALOG_MAX_RESOURCE_TOTAL_BYTES,
+        raising=False,
+    )
+    workflow_writer(home / "workflows", name="alpha", filename="alpha.yaml")
+    workflow_writer(home / "workflows", name="beta", filename="beta.yaml")
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    assert response.json()["truncated"] is True
+    assert [item["name"] for item in response.json()["items"]] == ["alpha"]
+
+
+def test_workflow_catalog_stops_directory_enumeration_at_scan_budget(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    catalog = home / "workflows"
+    catalog.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import plugins.workflow.catalog_api as catalog_api
+
+    monkeypatch.setattr(catalog_api, "CATALOG_MAX_SCAN_ENTRIES", 3, raising=False)
+    enumerated = 0
+
+    class FakeEntry:
+        def __init__(self, index: int):
+            self.name = f"ignored-{index}.txt"
+            self.path = str(catalog / self.name)
+
+        def is_dir(self, *, follow_symlinks=True):
+            return False
+
+        def is_file(self, *, follow_symlinks=True):
+            return True
+
+    def endless_entries(_directory):
+        nonlocal enumerated
+        while True:
+            enumerated += 1
+            yield FakeEntry(enumerated)
+
+    monkeypatch.setattr(
+        catalog_api, "_directory_entries", endless_entries, raising=False
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "workflow_catalog_capacity", "retryable": True}
+    }
+    assert enumerated == 3
+
+
+def test_workflow_catalog_maps_enumeration_failure_to_typed_unavailable(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    (home / "workflows").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import plugins.workflow.catalog_api as catalog_api
+
+    def fail_enumeration(_directory):
+        raise PermissionError("SECRET_ENUMERATION_PATH")
+
+    monkeypatch.setattr(
+        catalog_api, "_directory_entries", fail_enumeration, raising=False
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "workflow_catalog_unavailable", "retryable": True}
+    }
+    assert b"SECRET_ENUMERATION_PATH" not in response.content
+
+
+def test_workflow_catalog_maps_trust_store_failure_to_typed_unavailable(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="trust-failure")
+    import plugins.workflow.catalog_api as catalog_api
+
+    def fail_snapshot(*_args, **_kwargs):
+        raise WorkflowTrustError("SECRET_TRUST_LOCK_PATH")
+
+    monkeypatch.setattr(
+        catalog_api.WorkflowTrustStore,
+        "snapshot_read_only",
+        fail_snapshot,
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "workflow_trust_unavailable", "retryable": True}
+    }
+    assert b"SECRET_TRUST_LOCK_PATH" not in response.content
+
+
+def test_workflow_catalog_enforces_definition_file_budget_per_entry(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import plugins.workflow.catalog_api as catalog_api
+
+    workflow_writer(home / "workflows", name="valid", filename="valid.yaml")
+    oversized = home / "workflows" / "oversized.yaml"
+    oversized.write_bytes(b" " * (catalog_api.CATALOG_MAX_DEFINITION_FILE_BYTES + 1))
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert {item["name"] for item in items} == {"oversized", "valid"}
+    assert next(item for item in items if item["name"] == "oversized") == {
+        "name": "oversized",
+        "error": "catalog_capacity",
+    }
+    assert "error" not in next(item for item in items if item["name"] == "valid")
+
+
+def test_workflow_catalog_enforces_aggregate_definition_budget_per_entry(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import plugins.workflow.catalog_api as catalog_api
+
+    alpha = workflow_writer(home / "workflows", name="alpha", filename="alpha.yaml")
+    bravo = workflow_writer(home / "workflows", name="bravo", filename="bravo.yaml")
+    monkeypatch.setattr(
+        catalog_api,
+        "CATALOG_MAX_DEFINITION_TOTAL_BYTES",
+        alpha.stat().st_size + bravo.stat().st_size - 1,
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert "error" not in next(item for item in items if item["name"] == "alpha")
+    assert next(item for item in items if item["name"] == "bravo") == {
+        "name": "bravo",
+        "error": "catalog_capacity",
+    }
+
+
+def test_workflow_catalog_project_definition_overrides_profile(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(
+        home / "workflows",
+        name="shared",
+        filename="profile.yaml",
+        description="profile definition",
+    )
+    workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="shared",
+        filename="project.yaml",
+        description="project definition",
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    assert response.json()["items"] == [
+        {
+            "name": "shared",
+            "version": "1",
+            "description": "project definition",
+            "source": "project",
+            "precedence": 1,
+            "trust_state": "untrusted",
+            "inputs": [],
+            "supported_inputs": {
+                "supported": True,
+                "reason": "parameterless",
+            },
+        }
+    ]
+
+
+def test_workflow_catalog_isolates_same_precedence_duplicate_names(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows" / "one", name="duplicate")
+    workflow_writer(home / "workflows" / "two", name="duplicate")
+    workflow_writer(home / "workflows", name="valid", filename="valid.yaml")
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert items[0] == {"name": "duplicate", "error": "invalid_definition"}
+    assert items[1]["name"] == "valid"
+    assert "error" not in items[1]
