@@ -4,11 +4,11 @@
 **Branch:** `feat/workflow-production-remediation`
 **Design:** `docs/superpowers/specs/2026-07-19-workflow-orchestration-operator-robustness-design.md`
 **Plan:** `docs/superpowers/plans/2026-07-19-workflow-orchestration-operator-robustness-plan.md`
-**Verified code HEAD:** `a3ca14b4b913a923be06b3ced29878f976fb2eb3`
+**Verified code HEAD:** `7f56a439ba046f62ac2a5edaec367d1482302a32`
 
 ## Result
 
-The approved operator-robustness batch and its repair-containment follow-up are implemented, and the strengthened base merge gate passes. The nine operator-facing fixes are in `f293f68d1`; the four production-invariant pins and merge-gate self-test are in `7684c7733`; the damage-scope classification is in `9c4855a06`; the NR-1/NR-2 fixes are in `544602aaa`; and the NR-3 matrix enforcement is in `a3ca14b4b`. No merge, tag, release, or push was performed during this batch.
+The approved operator-robustness batch and its repair-containment follow-ups are implemented, and the strengthened base merge gate passes. The nine operator-facing fixes are in `f293f68d1`; the four production-invariant pins and merge-gate self-test are in `7684c7733`; the damage-scope classification is in `9c4855a06`; the NR-1/NR-2 fixes are in `544602aaa`; NR-3 matrix enforcement is in `a3ca14b4b`; legacy-policy containment is in `6d213e421`; and structural gate membership is in `7f56a439b`. No merge, tag, release, or push was performed during this batch.
 
 The pre-existing reviewer-authored modification to `docs/reviews/2026-07-19-workflow-orchestration-followup-fixes-adversarial-review.md` and the untracked `docs/reviews/2026-07-19-workflow-orchestration-operator-robustness-adversarial-review.md` were preserved and excluded from the implementation commits.
 
@@ -110,6 +110,31 @@ TESTED_BASE_SHA=a3ca14b4b913a923be06b3ced29878f976fb2eb3
 ### Platform arithmetic boundary
 
 `test_evidence_api.py` currently contains one platform marker. On macOS and Linux, the native Windows reparse-point test skips and the seven platform-neutral tests run. On Windows, all eight tests are selected; there is no inverse POSIX-only skip in this file. This verification proves the local macOS result and the exact three-OS CI selection. It does not claim that the final commit has already executed on a remote Windows runner.
+
+## Final Medium follow-up
+
+The adversarial addendum at `e3d92184a` closed NR-1, NR-2, and NR-3 and identified two final Mediums. Both were implemented with focused red/green cycles.
+
+| Finding | Observed red | Focused green | Commit |
+|---|---|---|---|
+| NR2-F1 legacy policy classification | A genuine copied v2.0.9 run with only `policy.yaml` corrupted raised the expected digest error, then reported store-global `repair_required`, reproducing the unrelated-admission outage class. | The fixture test passed with exact `legacy_effect_policy_uncorroborated` run state, healthy store state, attention visibility, unrelated admission, fail-closed effect classification, and self-clearing after the original policy bytes were restored. The complete migration/containment selection passed `76 passed in 39.43s`. | `6d213e421` |
+| NR2-F2 gate membership | The pinned matrix test failed on missing `test_desktop_api.py`; the structural inventory test independently failed because unselected workflow tests had no explicit disposition. | Both meta-tests passed after adding `test_desktop_api.py` and `test_notifications.py` to the three-OS matrix and explicitly accounting for every other workflow test. The newly selected files plus the complete meta-suite passed `50 passed in 36.39s`. | `7f56a439b` |
+
+The structural rule enumerates every `tests/plugins/workflow/test_*.py` file and rejects uncovered files, empty reasons, wildcard opt-outs, stale paths, and opt-outs that later become selected. New workflow test files therefore fail the green base gate until their release-gate membership is chosen explicitly.
+
+Final verification at the exact code HEAD:
+
+```text
+Focused containment/migration/gate selection: 125 passed, 1 skipped in 44.10s
+Installed distribution:                       1 passed in 4.15s
+Python base selection:                         668 passed, 1 skipped in 52.61s
+Base-gate installed distribution:              1 passed in 3.64s
+Desktop Vitest:                                6 files passed, 17 tests passed
+Desktop TypeScript:                            exit 0
+TESTED_BASE_SHA=7f56a439ba046f62ac2a5edaec367d1482302a32
+```
+
+The two additional Python files are selected in the three-OS portability workflow, but this local macOS verification does not claim a remote Windows execution result.
 
 ## Schema 13 and cumulative migration evidence
 
