@@ -4,13 +4,13 @@
 **Branch:** `feat/workflow-production-remediation`
 **Design:** `docs/superpowers/specs/2026-07-19-workflow-orchestration-operator-robustness-design.md`
 **Plan:** `docs/superpowers/plans/2026-07-19-workflow-orchestration-operator-robustness-plan.md`
-**Verified code HEAD:** `7684c7733b163de7427575101a3cc6e0821dbbd1`
+**Verified code HEAD:** `a3ca14b4b913a923be06b3ced29878f976fb2eb3`
 
 ## Result
 
-The approved operator-robustness batch is implemented and its strengthened base merge gate passes. The nine operator-facing fixes are in `f293f68d1`; the four production-invariant pins and merge-gate self-test are in `7684c7733`. No merge, tag, release, or push was performed during this batch.
+The approved operator-robustness batch and its repair-containment follow-up are implemented, and the strengthened base merge gate passes. The nine operator-facing fixes are in `f293f68d1`; the four production-invariant pins and merge-gate self-test are in `7684c7733`; the damage-scope classification is in `9c4855a06`; the NR-1/NR-2 fixes are in `544602aaa`; and the NR-3 matrix enforcement is in `a3ca14b4b`. No merge, tag, release, or push was performed during this batch.
 
-The pre-existing reviewer-authored modification to `docs/reviews/2026-07-19-workflow-orchestration-followup-fixes-adversarial-review.md` was preserved and excluded from both implementation commits.
+The pre-existing reviewer-authored modification to `docs/reviews/2026-07-19-workflow-orchestration-followup-fixes-adversarial-review.md` and the untracked `docs/reviews/2026-07-19-workflow-orchestration-operator-robustness-adversarial-review.md` were preserved and excluded from the implementation commits.
 
 ## Red/green evidence by behavior
 
@@ -30,9 +30,9 @@ The pre-existing reviewer-authored modification to `docs/reviews/2026-07-19-work
 | NF2-L1 concurrent drainers | Coverage gap: the lease was code-reviewed but no test held one real drainer after lease acquisition while a second SQLite connection attempted the same outward send. | The test passed five consecutive runs: counts `[0, 1]`, one sender call, and one delivered history row each time. | `7684c7733` |
 | NF2-L6 gate self-enforcement | The new meta-test failed because `scripts/test_workflow_merge_gate.sh` did not name `tests/scripts/test_workflow_merge_gate.py` (`1 failed`). | The meta suite passed `10 passed`; the FAST gate returned `TESTED_BASE_SHA=f293f68d1555fae607377b0bc4148ffbae18b991` without recursion. The final full gate includes the same meta-test at the final HEAD. | `7684c7733` |
 
-## Final gate evidence
+## Original operator-robustness gate evidence
 
-The strengthened base gate ran from the final code commit:
+The strengthened base gate for the original operator-robustness batch ran from its then-final code commit:
 
 ```text
 scripts/test_workflow_merge_gate.sh --phase base
@@ -65,7 +65,51 @@ pytest -q -m integration tests/plugins/workflow/test_installed_distribution_e2e.
 
 The Task 1 complete operator-robustness matrix passed `587 passed` with no failures. It was run with `OTTO_BRAND=unbranded-test` solely to make four pre-existing all-channel catalog assertions exercise their stated fail-open catalog contract instead of OTTO's intentional channel allowlist. Production brand filtering was not changed.
 
-The Task 2 invariant set passed `33 passed, 1 skipped in 3.83s`. The one skip is the native Windows reparse assertion because this verification host is macOS. This record does not claim that native assertion ran locally. The test is selected by the repository's native workflow matrix and is written to fail, rather than skip, on Windows if neither a real symlink nor junction can be created. The two platform-neutral fallback probes ran and passed locally.
+The earlier Task 2 invariant set at `7684c7733` passed `33 passed, 1 skipped in 3.83s`. The one skip was the native Windows reparse assertion because that verification host was macOS. At that historical HEAD, `test_evidence_api.py` was not yet selected by the native workflow matrix; NR-3 below adds and pins that selection. The native test is written to fail, rather than skip, on Windows if neither a real symlink nor junction can be created. The platform-neutral containment probes ran and passed locally.
+
+## Run-scoped repair containment follow-up
+
+The follow-up implements the damage-scoped rule documented in `docs/superpowers/specs/2026-07-19-workflow-orchestration-run-scoped-repair-containment-design.md`: one run's evidence damage records run-scoped repair state, while store/index, generation, orphan, cross-run, replay-policy, and terminal-reserve integrity failures retain global repair state. The design includes a complete classification of every remaining production `_mark_repair_required` caller.
+
+### Red/green failure-injection evidence
+
+| Finding | Observed red | Focused green | Commit |
+|---|---|---|---|
+| NR-1 run-scoped containment | The strict torn-tail scanner created the global marker; list returned `storage_repair_required`; attention omitted the damaged run; an approval mutation returned 500; and the expanded first-observer test showed an unrelated admission rejected by the global marker. | The four focused scanner/store/middleware tests passed. The standing real-corruption invariant exercises direct status, list, attention, evidence read, two unrelated admissions, damaged and clean cleanup preview/execution, and notification repair. It keeps storage healthy after every surface, keeps the damaged run visible and fail-closed, performs no second admission journal reread, preserves its evidence, and clears run-scoped state after successful corroboration. | `544602aaa` |
+| NR-2 repair-lock contention | Both real held-lock tests failed because `WorkflowLockTimeout` escaped `reconcile_journal`; the coordinator sweep stopped before Gateway delivery and scheduler submission. | `2 passed`: three consecutive timeouts retained the cursor and emitted one bounded warning, release retried and repaired the notification, and the same contended coordinator sweep delivered Gateway output and submitted queued work. | `544602aaa` |
+| NR-3 native evidence matrix | The merge-gate meta-test failed because `tests/plugins/workflow/test_evidence_api.py` was absent from `.github/workflows/ci.yml`. | The meta-test plus evidence file passed `8 passed, 1 skipped in 0.30s`; the CI selection grew by exactly that file and no existing path was removed. | `a3ca14b4b` |
+
+The complete Task 1 SQLite, real-middleware, coordinator, fault-injection, and cumulative migration selection passed:
+
+```text
+106 passed in 42.61s
+```
+
+The final focused selection at the final code HEAD passed:
+
+```text
+123 passed, 1 skipped in 43.53s
+```
+
+The independently rerun installed-distribution integration passed:
+
+```text
+1 passed in 4.26s
+```
+
+The strengthened base gate then passed at the exact final code commit:
+
+```text
+Python base selection:       667 passed, 1 skipped in 52.05s
+Installed distribution:       1 passed in 3.57s
+Desktop Vitest:               6 files passed, 17 tests passed
+Desktop TypeScript:           exit 0
+TESTED_BASE_SHA=a3ca14b4b913a923be06b3ced29878f976fb2eb3
+```
+
+### Platform arithmetic boundary
+
+`test_evidence_api.py` currently contains one platform marker. On macOS and Linux, the native Windows reparse-point test skips and the seven platform-neutral tests run. On Windows, all eight tests are selected; there is no inverse POSIX-only skip in this file. This verification proves the local macOS result and the exact three-OS CI selection. It does not claim that the final commit has already executed on a remote Windows runner.
 
 ## Schema 13 and cumulative migration evidence
 
@@ -103,4 +147,4 @@ The approved design explicitly leaves these five findings recorded rather than s
 
 The optional deliver-only facade half of NF-L11 also remains backlog; this batch implements the approved bounded pruning half without weakening delivery authority.
 
-No remaining item in this record is a Critical or High merge blocker. The prior adversarial follow-up verdict remains ready for maintainer merge review, subject to the maintainer's ordinary review of these additional low-severity fixes.
+The NR-1, NR-2, and NR-3 defects reported by the operator-robustness adversarial review now have focused failure-injection regressions and a green final gate. This document records implementation verification; it does not substitute for a fresh adversarial assessment of the follow-up delta.
