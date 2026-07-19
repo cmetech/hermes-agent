@@ -108,7 +108,15 @@ class ForegroundExecutionLease:
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
 _RUN_SCOPED_REPAIR_REASONS = frozenset(
-    {"notification_reconciliation_unverified", "run_evidence_uncorroborated"}
+    {
+        "legacy_effect_policy_uncorroborated",
+        "notification_reconciliation_unverified",
+        "run_evidence_uncorroborated",
+    }
+)
+_RUN_SCOPED_REPAIR_REASON_ORDER = tuple(sorted(_RUN_SCOPED_REPAIR_REASONS))
+_RUN_SCOPED_REPAIR_REASON_SQL = ",".join(
+    f"'{reason}'" for reason in _RUN_SCOPED_REPAIR_REASON_ORDER
 )
 _STORE_SCHEMA_VERSION = 13
 # Direct RunStore/CLI access is already the profile-local filesystem admin
@@ -1201,19 +1209,16 @@ class RunStore:
 
     def _active_run_repair_reasons(self, run_id: str) -> tuple[str, ...]:
         """Return active run-local repair reasons from their latest transitions."""
+        placeholders = ",".join("?" for _ in _RUN_SCOPED_REPAIR_REASON_ORDER)
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT events.reason_code FROM repair_events AS events "
-                "WHERE events.run_id=? AND events.reason_code IN (?, ?) "
+                f"WHERE events.run_id=? AND events.reason_code IN ({placeholders}) "
                 "AND events.sequence=(SELECT MAX(latest.sequence) "
                 "FROM repair_events AS latest WHERE latest.run_id=events.run_id "
                 "AND latest.reason_code=events.reason_code) "
                 "AND events.outcome='repair_required' ORDER BY events.reason_code",
-                (
-                    run_id,
-                    "notification_reconciliation_unverified",
-                    "run_evidence_uncorroborated",
-                ),
+                (run_id, *_RUN_SCOPED_REPAIR_REASON_ORDER),
             ).fetchall()
         return tuple(str(row["reason_code"]) for row in rows)
 
@@ -1236,18 +1241,16 @@ class RunStore:
 
     @staticmethod
     def _active_run_repair_ids(connection: sqlite3.Connection) -> set[str]:
+        placeholders = ",".join("?" for _ in _RUN_SCOPED_REPAIR_REASON_ORDER)
         rows = connection.execute(
             "SELECT events.run_id FROM repair_events AS events "
             "WHERE events.run_id IS NOT NULL "
-            "AND events.reason_code IN (?, ?) "
+            f"AND events.reason_code IN ({placeholders}) "
             "AND events.sequence=(SELECT MAX(latest.sequence) "
             "FROM repair_events AS latest WHERE latest.run_id=events.run_id "
             "AND latest.reason_code=events.reason_code) "
             "AND events.outcome='repair_required'",
-            (
-                "notification_reconciliation_unverified",
-                "run_evidence_uncorroborated",
-            ),
+            _RUN_SCOPED_REPAIR_REASON_ORDER,
         ).fetchall()
         return {str(row["run_id"]) for row in rows}
 
@@ -3739,8 +3742,7 @@ class RunStore:
                 "(status=? OR EXISTS (SELECT 1 FROM repair_events AS repair "
                 "WHERE repair.run_id=runs.run_id "
                 "AND repair.reason_code IN "
-                "('notification_reconciliation_unverified',"
-                "'run_evidence_uncorroborated') "
+                f"({_RUN_SCOPED_REPAIR_REASON_SQL}) "
                 "AND repair.sequence=(SELECT MAX(latest.sequence) "
                 "FROM repair_events AS latest "
                 "WHERE latest.run_id=repair.run_id "
@@ -3860,8 +3862,7 @@ class RunStore:
             "EXISTS (SELECT 1 FROM repair_events AS repair "
             "WHERE repair.run_id=runs.run_id "
             "AND repair.reason_code IN "
-            "('notification_reconciliation_unverified',"
-            "'run_evidence_uncorroborated') "
+            f"({_RUN_SCOPED_REPAIR_REASON_SQL}) "
             "AND repair.sequence=(SELECT MAX(latest.sequence) "
             "FROM repair_events AS latest "
             "WHERE latest.run_id=repair.run_id "
@@ -3925,17 +3926,14 @@ class RunStore:
             else:
                 status_read_succeeded = True
             active_reasons = self._active_run_repair_reasons(run_id)
-            if (
-                status_read_succeeded
-                and "notification_reconciliation_unverified" in active_reasons
-            ):
+            if status_read_succeeded and active_reasons:
                 result = {
                     **result,
                     "status_authoritative": False,
                     "health": "storage_degraded",
-                    "blocking_reason": "notification_reconciliation_unverified",
+                    "blocking_reason": active_reasons[0],
                     "next_actions": [],
-                    "warnings": ["notification_reconciliation_unverified"],
+                    "warnings": list(active_reasons),
                 }
             elif (
                 status_read_succeeded
@@ -4877,10 +4875,17 @@ class RunStore:
                     "legacy outward-action policy is malformed"
                 )
         except (OSError, KeyError, yaml.YAMLError, JournalRecoveryError):
-            self._mark_repair_required(
-                "legacy_effect_policy_uncorroborated", run_id=run_id
+            self._transition_run_repair(
+                "legacy_effect_policy_uncorroborated",
+                run_id=run_id,
+                outcome="repair_required",
             )
             raise
+        self._transition_run_repair(
+            "legacy_effect_policy_uncorroborated",
+            run_id=run_id,
+            outcome="repair_verified",
+        )
         return "outward" if node_id in outward else "replay_safe"
 
     def claim_node(

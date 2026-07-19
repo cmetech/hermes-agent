@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from contextlib import closing
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
 import shutil
 import sqlite3
 
+import pytest
+
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.schema import load_workflow
-from plugins.workflow.store import RunStore, _STORE_SCHEMA_VERSION
+from plugins.workflow.store import JournalRecoveryError, RunStore, _STORE_SCHEMA_VERSION
 
 
 FIXTURE = (
@@ -327,6 +330,81 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
     assert reopened.load_run("migration-run")["event_sequence"] == (
         expected["event_sequence"] + 1
     )
+
+
+def test_legacy_policy_damage_is_run_scoped_visible_and_self_clearing(
+    tmp_path: Path, workflow_writer
+) -> None:
+    manifest = json.loads((FIXTURE / "fixture-manifest.json").read_text())
+    home = tmp_path / "home"
+    workflows = home / "workflows"
+    workflows.mkdir(parents=True)
+    shutil.copy2(FIXTURE / "admission.db", workflows / "admission.sqlite3")
+    shutil.copytree(FIXTURE / "runs", workflows / "runs")
+    database = workflows / "admission.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT run_directory FROM runs WHERE run_id='migration-run'"
+        ).fetchone()
+        legacy_prefix = str(manifest["legacy_run_directory_prefix"])
+        relocated = str(workflows) + str(row["run_directory"])[len(legacy_prefix) :]
+        connection.execute(
+            "UPDATE runs SET run_directory=? WHERE run_id='migration-run'",
+            (relocated,),
+        )
+
+    store = RunStore(home)
+    projection = store.load_run("migration-run")
+    policy = Path(relocated) / "policy.yaml"
+    original_policy = policy.read_bytes()
+    policy.write_text("outward_action_nodes: []\n", encoding="utf-8")
+
+    with pytest.raises(JournalRecoveryError, match="policy digest mismatch"):
+        store.node_effect_classification(
+            "migration-run", "start", projection=projection
+        )
+
+    assert store.storage_health() == {"status": "healthy", "reasons": []}
+    assert not store.repair_marker.exists()
+    assert store._active_run_repair_reasons("migration-run") == (
+        "legacy_effect_policy_uncorroborated",
+    )
+    attention = store.attention_candidates(
+        operator_scope=None,
+        observed_at=datetime.now(timezone.utc),
+        limit=10,
+    )
+    damaged = next(row for row in attention if row["run_id"] == "migration-run")
+    assert damaged["health"] == "storage_degraded"
+    assert damaged["blocking_reason"] == "legacy_effect_policy_uncorroborated"
+
+    package = load_workflow(
+        workflow_writer(tmp_path / "unrelated", name="unrelated-policy-run")
+    )
+    prepared = store.prepare_run_snapshot(package)
+    unrelated = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="unrelated-policy-run",
+            concurrency_key="unrelated-policy-run",
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert unrelated.run_id
+
+    policy.write_bytes(original_policy)
+    assert (
+        store.node_effect_classification(
+            "migration-run", "start", projection=projection
+        )
+        == "outward"
+    )
+    assert store._active_run_repair_reasons("migration-run") == ()
 
 
 def test_legacy_queued_projection_sync_preserves_migrated_fifo_sequence(
