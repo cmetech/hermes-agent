@@ -369,3 +369,62 @@ def test_cleanup_preview_blocks_pending_notification_dependency(
         "blocked_reasons"
     ]
     assert preview["notification_dependencies"]["count"] >= 1
+
+
+def test_prune_preserves_facts_until_explicit_workflow_cleanup(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home")
+    run_id = _terminal_run(store, tmp_path, workflow_writer, name="prune-cleanup")
+    outbox = NotificationOutbox(store)
+    delivered_at = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    notification_id = outbox.record(
+        run_id=run_id,
+        kind="failure",
+        destination="desktop",
+        transition_version=999,
+        payload={},
+        now=delivered_at,
+    )
+    assert outbox.lease(
+        destination="desktop",
+        owner_id="electron",
+        now=delivered_at,
+        limit=1,
+    )
+    assert outbox.ack(notification_id, owner_id="electron", now=delivered_at)
+
+    assert outbox.prune_deliveries(
+        older_than=timedelta(days=30),
+        authority_scope="profile-local-dashboard",
+        now=delivered_at + timedelta(days=29),
+    ) == 0
+    assert outbox.prune_deliveries(
+        older_than=timedelta(days=30),
+        authority_scope="profile-local-dashboard",
+        now=delivered_at + timedelta(days=31),
+    ) == 1
+    history = outbox.history(run_id=run_id)
+    prune_fact = next(
+        item
+        for item in history
+        if item["payload"].get("decision") == "delivery_pruned"
+    )
+    assert prune_fact["state"] == "pruned"
+    assert any(item["transition_version"] == 999 for item in history)
+
+    preview = store.cleanup_runs(older_than=timedelta(0))
+    assert preview["confirmation_token"]
+    store.cleanup_runs(
+        execute=True,
+        confirmation_token=preview["confirmation_token"],
+    )
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workflow_notification_facts WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workflow_notification_outbox WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0] == 0

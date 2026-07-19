@@ -6,8 +6,10 @@ import json
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Mapping
 
+from plugins.workflow.locks import workflow_lock
 from plugins.workflow.sanitize import sanitize_projection
 
 
@@ -50,6 +52,11 @@ def install_notification_schema(connection: sqlite3.Connection) -> None:
         ON workflow_notification_outbox(destination, state, available_at);
         CREATE INDEX IF NOT EXISTS workflow_notification_attention
         ON workflow_notification_outbox(run_id, kind, state);
+        CREATE INDEX IF NOT EXISTS workflow_notification_dead_letter
+        ON workflow_notification_outbox(updated_at, notification_id)
+        WHERE state='dead';
+        CREATE INDEX IF NOT EXISTS workflow_notification_retention
+        ON workflow_notification_outbox(state, dismissed_at, delivered_at, notification_id);
         CREATE TABLE IF NOT EXISTS workflow_notification_facts (
             transition_key TEXT PRIMARY KEY,
             notification_id TEXT NOT NULL,
@@ -62,6 +69,10 @@ def install_notification_schema(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS workflow_notification_fact_run
         ON workflow_notification_facts(run_id, occurred_at);
+        CREATE INDEX IF NOT EXISTS workflow_notification_fact_history
+        ON workflow_notification_facts(
+            run_id, occurred_at DESC, transition_key DESC
+        );
         CREATE TABLE IF NOT EXISTS workflow_notification_reconcile_state (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             cursor_created_at TEXT,
@@ -130,6 +141,47 @@ class NotificationOutbox:
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("notification clock must be timezone-aware")
         return now.astimezone(timezone.utc)
+
+    @staticmethod
+    def _authority_scope(authority_scope: str) -> str:
+        if not isinstance(authority_scope, str) or not authority_scope.strip():
+            raise ValueError("authority_scope must not be empty")
+        normalized = authority_scope.strip()
+        if len(normalized.encode("utf-8")) > 4096:
+            raise ValueError("authority_scope is too large")
+        return normalized
+
+    @staticmethod
+    def _record_decision_fact(
+        connection: sqlite3.Connection,
+        row: Mapping[str, object],
+        *,
+        decision: str,
+        occurrence_key: str,
+        payload: Mapping[str, object],
+        occurred_at: str,
+    ) -> None:
+        safe_payload = json.dumps(
+            sanitize_projection({"decision": decision, **dict(payload)}),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO workflow_notification_facts ("
+            "transition_key, notification_id, run_id, kind, destination, "
+            "transition_version, payload_json, occurred_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                f"notification:{row['notification_id']}:{occurrence_key}",
+                row["notification_id"],
+                row["run_id"],
+                row["kind"],
+                row["destination"],
+                row["transition_version"],
+                safe_payload,
+                occurred_at,
+            ),
+        )
 
     def record(
         self,
@@ -238,10 +290,48 @@ class NotificationOutbox:
             connection.commit()
         return notification_id
 
-    def reconcile_journal(self, *, limit_runs: int = 200) -> int:
+    @staticmethod
+    def _existing_transition_keys(
+        connection: sqlite3.Connection,
+        transition_keys,
+    ) -> set[str]:
+        keys = tuple(dict.fromkeys(str(key) for key in transition_keys))
+        existing: set[str] = set()
+        for start in range(0, len(keys), 500):
+            batch = keys[start : start + 500]
+            if not batch:
+                continue
+            placeholders = ",".join("?" for _ in batch)
+            existing.update(
+                str(row["transition_key"])
+                for row in connection.execute(
+                    "SELECT transition_key FROM workflow_notification_facts "
+                    f"WHERE transition_key IN ({placeholders})",
+                    batch,
+                ).fetchall()
+            )
+        return existing
+
+    def reconcile_journal(
+        self,
+        *,
+        limit_runs: int = 20,
+        max_journal_bytes: int | None = None,
+    ) -> int:
         """Idempotently repair a crash gap between journal and outbox writes."""
         if not 1 <= limit_runs <= 1000:
             raise ValueError("limit_runs must be between 1 and 1000")
+        byte_budget = (
+            int(self.store.max_journal_bytes)
+            if max_journal_bytes is None
+            else max_journal_bytes
+        )
+        if (
+            isinstance(byte_budget, bool)
+            or not isinstance(byte_budget, int)
+            or byte_budget < 1
+        ):
+            raise ValueError("max_journal_bytes must be a positive integer")
         repaired = 0
         with self.store._connect() as connection:
             cursor = connection.execute(
@@ -275,19 +365,25 @@ class NotificationOutbox:
             rows = page(cursor_created_at, cursor_run_id)
             if not rows and cursor_created_at is not None:
                 rows = page(None, None)
-            existing = {
-                str(item["transition_key"])
-                for item in connection.execute(
-                    "SELECT transition_key FROM workflow_notification_facts"
-                ).fetchall()
-            }
+        candidates: list[dict[str, object]] = []
+        processed_rows = []
+        consumed_bytes = 0
         for row in rows:
             try:
-                events = self.store._read_journal_events(
-                    self.store.run_directory(str(row["run_id"]))
-                )
+                directory = self.store.run_directory(str(row["run_id"]))
+                with workflow_lock(
+                    self.store._run_lock_path(str(row["run_id"])),
+                    timeout_seconds=0.05,
+                ):
+                    journal_bytes = (Path(directory) / "events.jsonl").stat().st_size
+                    if consumed_bytes + journal_bytes > byte_budget:
+                        break
+                    events = self.store._read_journal_events(directory)
             except (KeyError, OSError, ValueError):
+                processed_rows.append(row)
                 continue
+            consumed_bytes += journal_bytes
+            processed_rows.append(row)
             for event in events:
                 projection = event.get("projection")
                 if not isinstance(projection, Mapping):
@@ -299,32 +395,51 @@ class NotificationOutbox:
                     f"{row['run_id']}:{kind}:"
                     f"{int(projection['state_version'])}:desktop"
                 )
-                if transition_key in existing:
-                    continue
-                timestamp = datetime.fromisoformat(str(event["timestamp"]))
-                self.record(
-                    run_id=str(row["run_id"]),
-                    kind=kind,
-                    destination="desktop",
-                    transition_version=int(projection["state_version"]),
-                    payload={
-                        "workflow": projection.get("workflow"),
-                        "status": projection.get("status"),
-                        "event_type": event.get("event_type"),
-                        "node_id": event.get("node_id"),
-                        "last_error": projection.get("last_error"),
-                    },
-                    delivery_state=(
-                        "pending"
-                        if projection.get("execution_mode") == "background"
-                        else "suppressed"
-                    ),
-                    now=timestamp,
-                )
-                existing.add(transition_key)
-                repaired += 1
-        if rows:
-            last = rows[-1]
+                candidates.append({
+                    "transition_key": transition_key,
+                    "run_id": str(row["run_id"]),
+                    "kind": kind,
+                    "transition_version": int(projection["state_version"]),
+                    "projection": projection,
+                    "event": event,
+                })
+        with self.store._connect() as connection:
+            existing = self._existing_transition_keys(
+                connection,
+                (candidate["transition_key"] for candidate in candidates),
+            )
+        for candidate in candidates:
+            transition_key = str(candidate["transition_key"])
+            if transition_key in existing:
+                continue
+            projection = candidate["projection"]
+            event = candidate["event"]
+            if not isinstance(projection, Mapping) or not isinstance(event, Mapping):
+                continue
+            timestamp = datetime.fromisoformat(str(event["timestamp"]))
+            self.record(
+                run_id=str(candidate["run_id"]),
+                kind=str(candidate["kind"]),
+                destination="desktop",
+                transition_version=int(candidate["transition_version"]),
+                payload={
+                    "workflow": projection.get("workflow"),
+                    "status": projection.get("status"),
+                    "event_type": event.get("event_type"),
+                    "node_id": event.get("node_id"),
+                    "last_error": projection.get("last_error"),
+                },
+                delivery_state=(
+                    "pending"
+                    if projection.get("execution_mode") == "background"
+                    else "suppressed"
+                ),
+                now=timestamp,
+            )
+            existing.add(transition_key)
+            repaired += 1
+        if processed_rows:
+            last = processed_rows[-1]
             with self.store._connect() as connection:
                 connection.execute(
                     "UPDATE workflow_notification_reconcile_state SET "
@@ -395,8 +510,9 @@ class NotificationOutbox:
     ) -> bool:
         observed = self._aware(now or datetime.now(timezone.utc))
         with self.store._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT attempts FROM workflow_notification_outbox WHERE "
+                "SELECT * FROM workflow_notification_outbox WHERE "
                 "notification_id=? AND state='leased' AND lease_owner=?",
                 (notification_id, owner_id),
             ).fetchone()
@@ -417,7 +533,109 @@ class NotificationOutbox:
                     notification_id,
                 ),
             )
+            if dead:
+                self._record_decision_fact(
+                    connection,
+                    row,
+                    decision="terminal_dead_letter",
+                    occurrence_key=f"terminal-dead:{attempts}:{uuid.uuid4().hex}",
+                    payload={"attempts": attempts, "error": error[:512]},
+                    occurred_at=observed.isoformat(),
+                )
+            connection.commit()
         return True
+
+    def retry_dead(
+        self,
+        notification_id: str,
+        authority_scope: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        scope = self._authority_scope(authority_scope)
+        observed = self._aware(now or datetime.now(timezone.utc))
+        timestamp = observed.isoformat()
+        with self.store._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM workflow_notification_outbox "
+                "WHERE notification_id=? AND state='dead'",
+                (notification_id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            attempts = int(row["attempts"])
+            self._record_decision_fact(
+                connection,
+                row,
+                decision="dead_letter_retried",
+                occurrence_key=f"dead-retry:{attempts}:{uuid.uuid4().hex}",
+                payload={
+                    "authority_scope": scope,
+                    "previous_attempts": attempts,
+                    "previous_error": row["last_error"],
+                },
+                occurred_at=timestamp,
+            )
+            connection.execute(
+                "UPDATE workflow_notification_outbox SET state='pending', "
+                "available_at=?, updated_at=?, lease_owner=NULL, "
+                "lease_expires_at=NULL, attempts=0, last_error=NULL "
+                "WHERE notification_id=? AND state='dead'",
+                (timestamp, timestamp, notification_id),
+            )
+            connection.commit()
+        return True
+
+    def prune_deliveries(
+        self,
+        *,
+        older_than: timedelta,
+        authority_scope: str,
+        limit: int = 200,
+        now: datetime | None = None,
+    ) -> int:
+        scope = self._authority_scope(authority_scope)
+        if not isinstance(older_than, timedelta) or older_than < timedelta(0):
+            raise ValueError("older_than must be a non-negative duration")
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        observed = self._aware(now or datetime.now(timezone.utc))
+        timestamp = observed.isoformat()
+        cutoff = (observed - older_than).isoformat()
+        with self.store._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT * FROM workflow_notification_outbox WHERE "
+                "(state='delivered' OR dismissed_at IS NOT NULL) AND "
+                "COALESCE(dismissed_at, delivered_at, updated_at)<=? "
+                "ORDER BY COALESCE(dismissed_at, delivered_at, updated_at), "
+                "notification_id LIMIT ?",
+                (cutoff, limit),
+            ).fetchall()
+            for row in rows:
+                self._record_decision_fact(
+                    connection,
+                    row,
+                    decision="delivery_pruned",
+                    occurrence_key=f"delivery-pruned:{timestamp}",
+                    payload={
+                        "authority_scope": scope,
+                        "delivery_state": row["state"],
+                        "delivered_at": row["delivered_at"],
+                        "dismissed_at": row["dismissed_at"],
+                    },
+                    occurred_at=timestamp,
+                )
+                connection.execute(
+                    "DELETE FROM workflow_notification_outbox "
+                    "WHERE notification_id=? AND "
+                    "(state='delivered' OR dismissed_at IS NOT NULL)",
+                    (row["notification_id"],),
+                )
+            connection.commit()
+        return len(rows)
 
     def dismiss(
         self, notification_id: str, *, owner_id: str, now: datetime | None = None
@@ -449,22 +667,50 @@ class NotificationOutbox:
             ).fetchall()
         return tuple(self._public(row) for row in rows)
 
-    def history(self, *, run_id: str | None = None, limit: int = 200) -> tuple[dict[str, object], ...]:
+    def history(
+        self,
+        *,
+        run_id: str | None = None,
+        limit: int = 200,
+        before: tuple[str, str] | None = None,
+    ) -> tuple[dict[str, object], ...]:
         if not 1 <= limit <= 200:
             raise ValueError("limit must be between 1 and 200")
-        where = " WHERE facts.run_id=?" if run_id else ""
-        values = (run_id, limit) if run_id else (limit,)
+        if before is not None and (
+            not isinstance(before, tuple)
+            or len(before) != 2
+            or not all(isinstance(value, str) and value for value in before)
+        ):
+            raise ValueError("before must be an occurred_at/transition_key tuple")
+        clauses = []
+        values: list[object] = []
+        if run_id is not None:
+            clauses.append("facts.run_id=?")
+            values.append(run_id)
+        if before is not None:
+            clauses.append(
+                "(facts.occurred_at<? OR "
+                "(facts.occurred_at=? AND facts.transition_key<?))"
+            )
+            values.extend((before[0], before[0], before[1]))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        values.append(limit)
         with self.store._connect() as connection:
             rows = connection.execute(
-                "SELECT facts.*, outbox.state, outbox.coalesced_count, "
-                "outbox.created_at, outbox.updated_at, outbox.lease_owner, "
+                "SELECT facts.*, COALESCE(outbox.state, 'pruned') AS state, "
+                "COALESCE(outbox.coalesced_count, 1) AS coalesced_count, "
+                "COALESCE(outbox.created_at, facts.occurred_at) AS created_at, "
+                "COALESCE(outbox.updated_at, facts.occurred_at) AS updated_at, "
+                "outbox.lease_owner, "
                 "outbox.lease_expires_at, outbox.delivered_at, "
-                "outbox.dismissed_at, outbox.attempts, outbox.last_error "
-                "FROM workflow_notification_facts AS facts JOIN "
+                "outbox.dismissed_at, COALESCE(outbox.attempts, 0) AS attempts, "
+                "outbox.last_error "
+                "FROM workflow_notification_facts AS facts LEFT JOIN "
                 "workflow_notification_outbox AS outbox USING(notification_id)"
                 + where
-                + " ORDER BY occurred_at, transition_key LIMIT ?",
-                values,
+                + " ORDER BY facts.occurred_at DESC, "
+                "facts.transition_key DESC LIMIT ?",
+                tuple(values),
             ).fetchall()
         return tuple(
             {
@@ -472,6 +718,7 @@ class NotificationOutbox:
                 "transition_version": row["transition_version"],
                 "payload": json.loads(str(row["payload_json"])),
                 "occurred_at": row["occurred_at"],
+                "transition_key": row["transition_key"],
             }
             for row in rows
         )

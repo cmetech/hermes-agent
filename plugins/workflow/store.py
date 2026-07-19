@@ -7636,6 +7636,14 @@ class RunStore:
                             (candidate["run_id"],),
                         )
                         connection.execute(
+                            "DELETE FROM workflow_notification_facts WHERE run_id=?",
+                            (candidate["run_id"],),
+                        )
+                        connection.execute(
+                            "DELETE FROM workflow_notification_outbox WHERE run_id=?",
+                            (candidate["run_id"],),
+                        )
+                        connection.execute(
                             "DELETE FROM runs WHERE run_id=?",
                             (candidate["run_id"],),
                         )

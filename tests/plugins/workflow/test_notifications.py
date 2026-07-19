@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
+from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
@@ -231,3 +234,118 @@ def test_journal_reconciliation_pages_and_wraps_without_stranding_old_runs(
     repaired = [outbox.reconcile_journal(limit_runs=1) for _ in range(4)]
     assert sum(repaired) == 1
     assert outbox.history(run_id=oldest)
+
+
+def test_notification_history_is_newest_first_and_keyset_paginated(tmp_path):
+    outbox = NotificationOutbox(RunStore(tmp_path / "home"))
+    now = datetime(2026, 7, 18, 12, tzinfo=timezone.utc)
+    for version in range(205):
+        outbox.record(
+            run_id="run-newest",
+            kind="completion",
+            destination="desktop",
+            transition_version=version,
+            payload={"version": version},
+            delivery_state="suppressed",
+            now=now + timedelta(microseconds=version),
+        )
+
+    newest = outbox.history(run_id="run-newest", limit=200)
+
+    assert [item["payload"]["version"] for item in newest[:3]] == [204, 203, 202]
+    assert newest[-1]["payload"]["version"] == 5
+    older = outbox.history(
+        run_id="run-newest",
+        limit=200,
+        before=(newest[-1]["occurred_at"], newest[-1]["transition_key"]),
+    )
+    assert [item["payload"]["version"] for item in older] == [4, 3, 2, 1, 0]
+
+
+def test_bounded_repair_reads_one_run_page_and_only_candidate_fact_keys(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(workflow_writer(tmp_path / "package", name="bounded-gap"))
+    run_ids = []
+    for index in range(3):
+        prepared = store.prepare_run_snapshot(package)
+        admitted = store.start_run(
+            RunAdmissionRequest(
+                workflow_name="bounded-gap",
+                definition_digest=prepared.definition_digest,
+                policy_digest=prepared.policy_digest,
+                input_manifest_digest=prepared.input_manifest_digest,
+                trigger_source="cli",
+                idempotency_key=f"bounded-gap-{index}",
+                concurrency_key=f"bounded-gap-{index}",
+            ),
+            immutable_snapshot=prepared,
+        )
+        RunScheduler(store).advance(admitted.run_id)
+        run_ids.append(admitted.run_id)
+    outbox = NotificationOutbox(store)
+    with store._connect() as connection:
+        connection.execute("DELETE FROM workflow_notification_facts")
+        connection.execute("DELETE FROM workflow_notification_outbox")
+        first = connection.execute(
+            "SELECT run_id FROM runs ORDER BY created_at, run_id LIMIT 1"
+        ).fetchone()["run_id"]
+    byte_budget = (store.run_directory(first) / "events.jsonl").stat().st_size
+    journal_reads = []
+    original_read = store._read_journal_events
+
+    def traced_read(directory, **kwargs):
+        journal_reads.append((directory / "events.jsonl").stat().st_size)
+        return original_read(directory, **kwargs)
+
+    candidate_batches = []
+    original_existing = outbox._existing_transition_keys
+
+    def traced_existing(connection, transition_keys):
+        keys = tuple(transition_keys)
+        candidate_batches.append(keys)
+        return original_existing(connection, keys)
+
+    monkeypatch.setattr(store, "_read_journal_events", traced_read)
+    monkeypatch.setattr(outbox, "_existing_transition_keys", traced_existing)
+
+    repaired = outbox.reconcile_journal(
+        limit_runs=2,
+        max_journal_bytes=byte_budget,
+    )
+
+    assert repaired == 1
+    assert len(journal_reads) == 1
+    assert sum(journal_reads) <= byte_budget
+    assert candidate_batches and candidate_batches[0]
+    assert all(first in key for key in candidate_batches[0])
+
+
+def test_bounded_repair_has_its_own_cadence(monkeypatch, tmp_path) -> None:
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(
+            host_kind="gateway",
+            host_instance_id="notification-cadence",
+        ),
+        hermes_home=tmp_path,
+        notification_repair_seconds=300,
+    )
+    store = SimpleNamespace(max_journal_bytes=4096)
+    calls = []
+
+    def reconcile(_self, **kwargs):
+        calls.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(NotificationOutbox, "__init__", lambda self, _store: None)
+    monkeypatch.setattr(NotificationOutbox, "reconcile_journal", reconcile)
+
+    service._repair_notifications_if_due(store, now_monotonic=0.0)
+    service._repair_notifications_if_due(store, now_monotonic=299.0)
+    service._repair_notifications_if_due(store, now_monotonic=300.0)
+
+    assert calls == [
+        {"limit_runs": 20, "max_journal_bytes": 4096},
+        {"limit_runs": 20, "max_journal_bytes": 4096},
+    ]

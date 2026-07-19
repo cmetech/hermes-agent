@@ -421,6 +421,49 @@ class NotificationReceiptRequest(BaseModel):
     error: str = Field("", max_length=512)
 
 
+class NotificationPruneRequest(BaseModel):
+    older_than: str = "30d"
+    limit: int = Field(200, ge=1, le=200)
+
+
+@router.post("/notifications/prune")
+def prune_notifications(
+    request_context: Request,
+    request: NotificationPruneRequest,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request_context, operator_scope)
+    operator.require("admin")
+    with _store_lease() as store:
+        pruned = NotificationOutbox(store).prune_deliveries(
+            older_than=_cleanup_duration(request.older_than),
+            authority_scope=operator.cursor_scope,
+            limit=request.limit,
+        )
+    return {"schema_version": 1, "pruned": pruned}
+
+
+@router.post("/notifications/{notification_id}/retry")
+def retry_dead_notification(
+    request_context: Request,
+    notification_id: str,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request_context, operator_scope)
+    operator.require("admin")
+    with _store_lease() as store:
+        _notification_destination(store, notification_id)
+        applied = NotificationOutbox(store).retry_dead(
+            notification_id,
+            operator.cursor_scope,
+        )
+    if not applied:
+        raise HTTPException(
+            status_code=409, detail={"code": "notification_not_dead"}
+        )
+    return {"schema_version": 1, "outcome": "requeued"}
+
+
 @router.post("/notifications/{notification_id}/ack")
 def acknowledge_notification(
     request_context: Request,

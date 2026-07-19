@@ -46,6 +46,7 @@ class WorkflowCoordinatorService:
         web_election_grace_seconds: float = 3.0,
         runnable_stall_seconds: float = 60.0,
         semantic_stall_seconds: float = 300.0,
+        notification_repair_seconds: float = 300.0,
         sweep_backoff_seconds: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0, 60.0),
         utcnow: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -56,6 +57,7 @@ class WorkflowCoordinatorService:
             ("web_election_grace_seconds", web_election_grace_seconds),
             ("runnable_stall_seconds", runnable_stall_seconds),
             ("semantic_stall_seconds", semantic_stall_seconds),
+            ("notification_repair_seconds", notification_repair_seconds),
         ):
             if (
                 isinstance(value, bool)
@@ -80,10 +82,12 @@ class WorkflowCoordinatorService:
         self.web_election_grace_seconds = float(web_election_grace_seconds)
         self.runnable_stall_seconds = float(runnable_stall_seconds)
         self.semantic_stall_seconds = float(semantic_stall_seconds)
+        self.notification_repair_seconds = float(notification_repair_seconds)
         self.sweep_backoff_seconds = tuple(float(value) for value in sweep_backoff_seconds)
         self._utcnow = utcnow or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic
         self._boot_id = current_boot_id()
+        self._notification_repair_due_at = 0.0
         self._health_lock = threading.Lock()
         self._health = BackgroundServiceHealth(
             state="starting",
@@ -185,6 +189,24 @@ class WorkflowCoordinatorService:
         scheduler.execution_fence = fence
         return scheduler
 
+    def _repair_notifications_if_due(
+        self,
+        run_store,
+        *,
+        now_monotonic: float,
+    ) -> None:
+        if now_monotonic < self._notification_repair_due_at:
+            return
+        self._notification_repair_due_at = (
+            now_monotonic + self.notification_repair_seconds
+        )
+        from plugins.workflow.notifications import NotificationOutbox
+
+        NotificationOutbox(run_store).reconcile_journal(
+            limit_runs=20,
+            max_journal_bytes=int(run_store.max_journal_bytes),
+        )
+
     def _sweep_once(
         self,
         run_store,
@@ -194,7 +216,6 @@ class WorkflowCoordinatorService:
         scheduler,
         cursor: tuple[str, str] | None = None,
     ) -> tuple[bool, tuple[str, str] | None, datetime | None]:
-        from plugins.workflow.notifications import NotificationOutbox
         from plugins.workflow.store import ForegroundExecutionConflict
 
         fence = ExecutionFence(identity.owner_id, epoch)
@@ -202,8 +223,12 @@ class WorkflowCoordinatorService:
             connection.execute("BEGIN IMMEDIATE")
             run_store.assert_execution_fence(connection, fence)
             connection.commit()
-        deadline = self._monotonic() + 2.0
-        NotificationOutbox(run_store).reconcile_journal(limit_runs=200)
+        sweep_started = self._monotonic()
+        deadline = sweep_started + 2.0
+        self._repair_notifications_if_due(
+            run_store,
+            now_monotonic=sweep_started,
+        )
         now = self._utcnow().astimezone(timezone.utc)
         wakes = coordinator_store.pending_wakes(
             identity,

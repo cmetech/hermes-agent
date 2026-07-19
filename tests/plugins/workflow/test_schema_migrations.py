@@ -213,8 +213,11 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             "runs_concurrency",
             "runs_coordinator_scan",
             "worker_claims_lease",
+            "workflow_notification_dead_letter",
             "workflow_notification_delivery",
+            "workflow_notification_fact_history",
             "workflow_notification_fact_run",
+            "workflow_notification_retention",
         } <= indexes
         runs_schema = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='runs'"
