@@ -23,7 +23,7 @@ from typing import Callable, Iterable, Mapping
 
 import yaml
 
-from plugins.workflow.actions import available_actions
+from plugins.workflow.actions import available_actions, lane_state_for
 from plugins.workflow.admission import (
     PreparedRunSnapshot,
     RunAdmissionRequest,
@@ -102,7 +102,7 @@ class ForegroundExecutionLease:
 
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
-_STORE_SCHEMA_VERSION = 10
+_STORE_SCHEMA_VERSION = 11
 # Direct RunStore/CLI access is already the profile-local filesystem admin
 # boundary. Network adapters must always pass their verified authority binding.
 _LOCAL_ADMIN_AUTHORITY_BINDING = "profile-local-runstore-admin"
@@ -350,35 +350,39 @@ class RunStore:
             self.staging_root.mkdir(parents=True, exist_ok=True)
             self.quarantine_root.mkdir(parents=True, exist_ok=True)
             self.locks_root.mkdir(parents=True, exist_ok=True)
-            database_existed = self.database.exists()
-            database_was_empty = database_existed and self.database.stat().st_size == 0
-            evidence_existed = any(
-                path.is_dir()
-                for workflow in self.runs_root.iterdir()
-                if workflow.is_dir()
-                for path in workflow.iterdir()
-            )
-            index_damage = None
-            try:
-                self._create_or_migrate_schema()
-            except sqlite3.DatabaseError:
-                self._preserve_damaged_index()
-                self._create_or_migrate_schema()
-                index_damage = "index_corrupt"
-            generation_damage = self._establish_index_generation(
-                database_existed=database_existed,
-                database_was_empty=database_was_empty,
-                evidence_existed=evidence_existed,
-            )
-            if index_damage or generation_damage:
-                self._mark_repair_required(index_damage or generation_damage)
-                with self._connect() as connection:
-                    self._record_repair_event(
-                        connection,
-                        reason_code=index_damage or generation_damage or "index_unknown",
-                        outcome="index_recreated",
-                    )
             with workflow_lock(self.admission_lock):
+                database_existed = self.database.exists()
+                database_was_empty = (
+                    database_existed and self.database.stat().st_size == 0
+                )
+                evidence_existed = any(
+                    path.is_dir()
+                    for workflow in self.runs_root.iterdir()
+                    if workflow.is_dir()
+                    for path in workflow.iterdir()
+                )
+                index_damage = None
+                try:
+                    self._create_or_migrate_schema()
+                except sqlite3.DatabaseError:
+                    self._preserve_damaged_index()
+                    self._create_or_migrate_schema()
+                    index_damage = "index_corrupt"
+                generation_damage = self._establish_index_generation(
+                    database_existed=database_existed,
+                    database_was_empty=database_was_empty,
+                    evidence_existed=evidence_existed,
+                )
+                if index_damage or generation_damage:
+                    self._mark_repair_required(index_damage or generation_damage)
+                    with self._connect() as connection:
+                        self._record_repair_event(
+                            connection,
+                            reason_code=(
+                                index_damage or generation_damage or "index_unknown"
+                            ),
+                            outcome="index_recreated",
+                        )
                 self._reconcile_admission()
                 self._reconcile_worker_claims()
             self._initialized = True
@@ -406,7 +410,10 @@ class RunStore:
                         disposition TEXT NOT NULL,
                         status TEXT NOT NULL,
                         queue_position INTEGER,
+                        queue_sequence INTEGER,
                         blocked_by_run_id TEXT,
+                        pause_lane_policy TEXT NOT NULL DEFAULT 'hold',
+                        lane_state TEXT NOT NULL DEFAULT 'released',
                         run_directory TEXT NOT NULL,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
@@ -561,11 +568,23 @@ class RunStore:
                     "foreground_epoch": (
                         "ALTER TABLE runs ADD COLUMN foreground_epoch INTEGER"
                     ),
+                    "queue_sequence": (
+                        "ALTER TABLE runs ADD COLUMN queue_sequence INTEGER"
+                    ),
+                    "pause_lane_policy": (
+                        "ALTER TABLE runs ADD COLUMN pause_lane_policy TEXT "
+                        "NOT NULL DEFAULT 'hold'"
+                    ),
+                    "lane_state": (
+                        "ALTER TABLE runs ADD COLUMN lane_state TEXT "
+                        "NOT NULL DEFAULT 'released'"
+                    ),
             }
             for name, statement in migrations.items():
                 if name not in columns:
                     connection.execute(statement)
             self._migrate_runs_idempotency_namespace(connection)
+            self._migrate_runnable_admission(connection)
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS runs_coordinator_scan "
                 "ON runs(created_at, run_id) "
@@ -602,7 +621,10 @@ class RunStore:
                 "disposition",
                 "status",
                 "queue_position",
+                "queue_sequence",
                 "blocked_by_run_id",
+                "pause_lane_policy",
+                "lane_state",
                 "run_directory",
                 "created_at",
                 "updated_at",
@@ -727,7 +749,10 @@ class RunStore:
             "disposition",
             "status",
             "queue_position",
+            "queue_sequence",
             "blocked_by_run_id",
+            "pause_lane_policy",
+            "lane_state",
             "run_directory",
             "created_at",
             "updated_at",
@@ -768,7 +793,10 @@ class RunStore:
                     disposition TEXT NOT NULL,
                     status TEXT NOT NULL,
                     queue_position INTEGER,
+                    queue_sequence INTEGER,
                     blocked_by_run_id TEXT,
+                    pause_lane_policy TEXT NOT NULL DEFAULT 'hold',
+                    lane_state TEXT NOT NULL DEFAULT 'released',
                     run_directory TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -836,6 +864,49 @@ class RunStore:
                 raise sqlite3.DatabaseError(
                     "runs namespace migration failed integrity check"
                 )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_runnable_admission(connection: sqlite3.Connection) -> None:
+        """Install one durable FIFO counter and conservative legacy lane state."""
+        migrated = connection.execute(
+            "SELECT value FROM store_metadata WHERE key='queue_sequence'"
+        ).fetchone()
+        if migrated is not None:
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            maximum = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(queue_sequence), 0) FROM runs"
+                ).fetchone()[0]
+            )
+            queued = connection.execute(
+                "SELECT run_id FROM runs WHERE status='queued' "
+                "AND queue_sequence IS NULL ORDER BY created_at, run_id"
+            ).fetchall()
+            for row in queued:
+                maximum += 1
+                connection.execute(
+                    "UPDATE runs SET queue_sequence=?, queue_position=? "
+                    "WHERE run_id=?",
+                    (maximum, maximum, row["run_id"]),
+                )
+            connection.execute(
+                "UPDATE runs SET lane_state=CASE "
+                "WHEN status='running' THEN 'held' "
+                "WHEN status='paused' AND pause_lane_policy='hold' THEN 'held' "
+                "WHEN status='interrupted' THEN 'held' "
+                "ELSE 'released' END"
+            )
+            connection.execute(
+                "INSERT INTO store_metadata (key, value) VALUES "
+                "('queue_sequence', ?)",
+                (str(maximum),),
+            )
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -1040,9 +1111,27 @@ class RunStore:
         projection: Mapping[str, object],
         journal_sha256: str,
     ) -> None:
+        queue_position = projection.get("queue_position")
+        queue_sequence = projection.get("queue_sequence")
+        if projection.get("status") == "queued" and (
+            isinstance(queue_sequence, bool)
+            or not isinstance(queue_sequence, int)
+        ):
+            indexed = connection.execute(
+                "SELECT queue_sequence FROM runs WHERE run_id=?",
+                (projection["run_id"],),
+            ).fetchone()
+            indexed_sequence = indexed["queue_sequence"] if indexed else None
+            queue_sequence = (
+                indexed_sequence
+                if isinstance(indexed_sequence, int)
+                else RunStore._next_queue_sequence(connection)
+            )
+            queue_position = queue_sequence
         connection.execute(
             "UPDATE runs SET status=?, desired_status=?, execution_mode=?, "
-            "queue_position=?, blocked_by_run_id=?, projection_schema_version=?, "
+            "queue_position=?, queue_sequence=?, blocked_by_run_id=?, "
+            "pause_lane_policy=?, lane_state=?, projection_schema_version=?, "
             "projection_state_version=?, projection_sha256=?, "
             "journal_sequence=?, journal_sha256=?, integrity_verified_at=? "
             "WHERE run_id=?",
@@ -1050,8 +1139,11 @@ class RunStore:
                 projection["status"],
                 projection.get("desired_status"),
                 projection.get("execution_mode", "foreground"),
-                projection.get("queue_position"),
+                queue_position,
+                queue_sequence,
                 projection.get("blocked_by_run_id"),
+                projection.get("pause_lane_policy", "hold"),
+                RunStore._lane_state(projection),
                 int(projection.get("schema_version", 1)),
                 int(projection["state_version"]),
                 _projection_digest(projection),
@@ -1071,7 +1163,10 @@ class RunStore:
             projection.get("desired_status"),
             projection.get("execution_mode", "foreground"),
             projection.get("queue_position"),
+            projection.get("queue_sequence"),
             projection.get("blocked_by_run_id"),
+            projection.get("pause_lane_policy", "hold"),
+            self._lane_state(projection),
             int(projection.get("schema_version", 1)),
             int(projection["state_version"]),
             _projection_digest(projection),
@@ -1081,12 +1176,23 @@ class RunStore:
         with self._connect() as connection:
             current = connection.execute(
                 "SELECT status, desired_status, execution_mode, queue_position, "
-                "blocked_by_run_id, projection_schema_version, "
+                "queue_sequence, blocked_by_run_id, pause_lane_policy, lane_state, "
+                "projection_schema_version, "
                 "projection_state_version, "
                 "projection_sha256, journal_sequence, journal_sha256 "
                 "FROM runs WHERE run_id=?",
                 (projection["run_id"],),
             ).fetchone()
+        if (
+            current is not None
+            and projection.get("status") == "queued"
+            and not isinstance(projection.get("queue_sequence"), int)
+            and isinstance(current["queue_sequence"], int)
+        ):
+            legacy_expected = list(expected)
+            legacy_expected[3] = current["queue_sequence"]
+            legacy_expected[4] = current["queue_sequence"]
+            expected = tuple(legacy_expected)
         if current is not None and tuple(current) == expected:
             return
         try:
@@ -1168,17 +1274,26 @@ class RunStore:
         concurrency_policy = projection.get("concurrency_policy", "queue")
         if concurrency_policy not in {"queue", "allow", "forbid"}:
             raise JournalRecoveryError("run concurrency policy is invalid")
+        queue_sequence = projection.get("queue_sequence")
+        queue_position = projection.get("queue_position")
+        if projection.get("status") == "queued" and (
+            isinstance(queue_sequence, bool)
+            or not isinstance(queue_sequence, int)
+        ):
+            queue_sequence = self._next_queue_sequence(connection)
+            queue_position = queue_sequence
         connection.execute(
             "INSERT INTO runs ("
             "run_id, workflow_name, trigger_source, "
             "idempotency_namespace_digest, idempotency_digest, "
             "start_digest, concurrency_key, concurrency_policy, disposition, "
-            "status, queue_position, blocked_by_run_id, run_directory, "
+            "status, queue_position, queue_sequence, blocked_by_run_id, "
+            "pause_lane_policy, lane_state, run_directory, "
             "created_at, updated_at, admission_state, desired_status, "
             "staging_directory, operator_scope_digest, provenance_json, "
             "execution_mode, foreground_owner_id, foreground_lease_expires_at, "
-            "foreground_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "'published', NULL, NULL, ?, ?, ?, ?, ?, ?)",
+            "foreground_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, 'published', NULL, NULL, ?, ?, ?, ?, ?, ?)",
             (
                 projection["run_id"],
                 projection["workflow"],
@@ -1191,8 +1306,11 @@ class RunStore:
                 concurrency_policy,
                 projection.get("admission_disposition", "created"),
                 projection["status"],
-                projection.get("queue_position"),
+                queue_position,
+                queue_sequence,
                 projection.get("blocked_by_run_id"),
+                projection.get("pause_lane_policy", "hold"),
+                self._lane_state(projection),
                 str(directory),
                 projection.get("created_at") or projection["updated_at"],
                 projection["updated_at"],
@@ -2104,6 +2222,89 @@ class RunStore:
         return _sha256(operator_scope.encode())
 
     @staticmethod
+    def _pause_lane_policy(snapshot: PreparedRunSnapshot) -> str:
+        policy_path = snapshot.staging_directory / "policy.yaml"
+        if not policy_path.is_file():
+            return "hold"
+        policy_bytes = policy_path.read_bytes()
+        if not hmac.compare_digest(_sha256(policy_bytes), snapshot.policy_digest):
+            raise InputSnapshotError("workflow sidecar digest changed before admission")
+        try:
+            policy = yaml.safe_load(policy_bytes) or {}
+        except yaml.YAMLError as exc:
+            raise InputSnapshotError("workflow sidecar is malformed") from exc
+        value = policy.get("pause_lane_policy", "hold")
+        if value not in {"hold", "release"}:
+            raise InputSnapshotError("pause_lane_policy must be hold or release")
+        return str(value)
+
+    @staticmethod
+    def _next_queue_sequence(connection: sqlite3.Connection) -> int:
+        row = connection.execute(
+            "SELECT value FROM store_metadata WHERE key='queue_sequence'"
+        ).fetchone()
+        current = int(row["value"]) if row is not None else 0
+        sequence = current + 1
+        connection.execute(
+            "INSERT INTO store_metadata (key, value) VALUES "
+            "('queue_sequence', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(sequence),),
+        )
+        return sequence
+
+    @staticmethod
+    def _has_unresolved_outward_attempt(
+        projection: Mapping[str, object],
+    ) -> bool:
+        outward = {
+            str(node_id)
+            for node_id in projection.get("outward_action_nodes", ())
+            if isinstance(node_id, str)
+        }
+        nodes = projection.get("nodes")
+        if not isinstance(nodes, Mapping):
+            return False
+        for node_id, node in nodes.items():
+            if not isinstance(node, Mapping):
+                continue
+            pending = node.get("pending_interaction")
+            pending_reconcile = pending == "reconcile" or (
+                isinstance(pending, Mapping) and pending.get("type") == "reconcile"
+            )
+            recovery = node.get("recovery")
+            if isinstance(recovery, Mapping):
+                effect = recovery.get("effect_classification")
+                if (str(node_id) in outward or effect == "outward") and (
+                    pending_reconcile
+                    or recovery.get("observation")
+                    in {"still_running", "outcome_uncertain"}
+                ):
+                    return True
+            for attempt in node.get("attempts", ()):
+                if not isinstance(attempt, Mapping):
+                    continue
+                if (
+                    attempt.get("effect_classification") == "outward"
+                    and attempt.get("state")
+                    in {"claimed", "running", "paused", "interrupted"}
+                    and not attempt.get("reconciliation")
+                ):
+                    return True
+        return False
+
+    @classmethod
+    def _lane_state(cls, projection: Mapping[str, object]) -> str:
+        return lane_state_for(
+            str(projection.get("status") or ""),
+            pause_lane_policy=str(
+                projection.get("pause_lane_policy") or "hold"
+            ),
+            unresolved_outward_attempt=cls._has_unresolved_outward_attempt(
+                projection
+            ),
+        )
+
+    @staticmethod
     def _start_digest(request: RunAdmissionRequest) -> str:
         identity = {
                 "workflow": request.workflow_name,
@@ -2199,6 +2400,7 @@ class RunStore:
         if supplied != actual:
             shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
             raise ValueError("snapshot digests do not match admission request")
+        pause_lane_policy = self._pause_lane_policy(immutable_snapshot)
         key_digest = _sha256(request.idempotency_key.encode())
         namespace_digest = _sha256(request.idempotency_namespace.encode())
         operator_scope_digest = self._scope_digest(request.operator_scope)
@@ -2288,18 +2490,29 @@ class RunStore:
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
                 return RunAdmissionResult(None, "rejected", "profile_storage_quota")
             active = connection.execute(
-                "SELECT run_id FROM runs WHERE workflow_name=? AND concurrency_key=? AND status IN ('running','paused','interrupted') ORDER BY created_at, run_id LIMIT 1",
+                "SELECT run_id FROM runs WHERE workflow_name=? AND concurrency_key=? "
+                "AND lane_state='held' ORDER BY created_at, run_id LIMIT 1",
                 (request.workflow_name, request.concurrency_key),
+            ).fetchone()
+            older_queued = connection.execute(
+                "SELECT run_id FROM runs WHERE status='queued' "
+                "ORDER BY queue_sequence, created_at, run_id LIMIT 1"
             ).fetchone()
             status = "running"
             disposition = "created"
             blocked_by = None
             queue_position = None
+            queue_sequence = None
             if active and request.concurrency_policy == "forbid":
                 connection.rollback()
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
                 return RunAdmissionResult(None, "rejected", "overlap_forbidden")
-            if active and request.concurrency_policy == "queue":
+            if (
+                active and request.concurrency_policy == "queue"
+            ) or (
+                older_queued is not None
+                and request.concurrency_policy != "allow"
+            ):
                 if counts.get("queued", 0) >= self.limits["queued"]:
                     connection.rollback()
                     shutil.rmtree(
@@ -2308,8 +2521,9 @@ class RunStore:
                     return RunAdmissionResult(None, "rejected", "queued_capacity")
                 status = "queued"
                 disposition = "queued"
-                blocked_by = active["run_id"]
-                queue_position = counts.get("queued", 0) + 1
+                blocked_by = active["run_id"] if active is not None else None
+                queue_sequence = self._next_queue_sequence(connection)
+                queue_position = queue_sequence
             elif counts.get("running", 0) >= self.limits["executing"]:
                 connection.rollback()
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
@@ -2319,16 +2533,18 @@ class RunStore:
             run_directory.parent.mkdir(parents=True, exist_ok=True)
             now = _utc_now()
             provenance_record = provenance.durable_record(admitted_at=now)
+            lane_state = "held" if status == "running" else "released"
             connection.execute(
                 "INSERT INTO runs ("
                 "run_id, workflow_name, trigger_source, "
                 "idempotency_namespace_digest, idempotency_digest, "
                 "start_digest, concurrency_key, concurrency_policy, disposition, "
-                "status, queue_position, blocked_by_run_id, run_directory, "
+                "status, queue_position, queue_sequence, blocked_by_run_id, "
+                "pause_lane_policy, lane_state, run_directory, "
                 "created_at, updated_at, admission_state, desired_status, "
                 "staging_directory, operator_scope_digest, provenance_json, execution_mode, "
                 "foreground_owner_id, foreground_lease_expires_at, foreground_epoch) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     run_id,
                     request.workflow_name,
@@ -2341,7 +2557,10 @@ class RunStore:
                     disposition,
                     "admitting",
                     queue_position,
+                    queue_sequence,
                     blocked_by,
+                    pause_lane_policy,
+                    lane_state,
                     str(run_directory),
                     now,
                     now,
@@ -2368,7 +2587,10 @@ class RunStore:
                 disposition=disposition,
                 status=status,
                 queue_position=queue_position,
+                queue_sequence=queue_sequence,
                 blocked_by=blocked_by,
+                pause_lane_policy=pause_lane_policy,
+                lane_state=lane_state,
                 created_at=now,
                 provenance_record=provenance_record,
                 foreground_owner_id=foreground_owner_id,
@@ -2399,7 +2621,10 @@ class RunStore:
         disposition: str,
         status: str,
         queue_position: int | None,
+        queue_sequence: int | None,
         blocked_by: str | None,
+        pause_lane_policy: str,
+        lane_state: str,
         created_at: str,
         provenance_record: Mapping[str, object],
         foreground_owner_id: str | None,
@@ -2434,7 +2659,10 @@ class RunStore:
             "outward_action_nodes": list(snapshot.outward_action_nodes),
             "admission_disposition": disposition,
             "queue_position": queue_position,
+            "queue_sequence": queue_sequence,
             "blocked_by_run_id": blocked_by,
+            "pause_lane_policy": pause_lane_policy,
+            "lane_state": lane_state,
             "state_version": 1,
             "event_sequence": 1,
             "status": status,
@@ -2790,27 +3018,160 @@ class RunStore:
             raise JournalRecoveryError("journal contains no recoverable projection")
         return latest
 
+    def request_runnable(
+        self,
+        run_id: str,
+        reason: str,
+        expected_version: int | None = None,
+    ) -> dict[str, object]:
+        """Request one capacity- and lane-checked runnable transition."""
+        if not isinstance(reason, str) or not reason or len(reason) > 128:
+            raise ValueError("runnable reason must be bounded non-empty text")
+        directory = self.run_directory(run_id)
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
+            projection = json.loads((directory / "run.json").read_text())
+            return self._request_runnable_locked(
+                directory,
+                projection,
+                reason=reason,
+                expected_version=expected_version,
+            )
+
+    def _request_runnable_locked(
+        self,
+        directory: Path,
+        projection: dict[str, object],
+        *,
+        reason: str,
+        expected_version: int | None = None,
+    ) -> dict[str, object]:
+        if expected_version is not None and int(projection["state_version"]) != int(
+            expected_version
+        ):
+            raise RuntimeError("stale runnable request")
+        if projection.get("status") in {"running", "queued"}:
+            return projection
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT workflow_name, concurrency_key, concurrency_policy "
+                "FROM runs WHERE run_id=?",
+                (projection["run_id"],),
+            ).fetchone()
+            if row is None:
+                raise KeyError(str(projection["run_id"]))
+            active = None
+            if row["concurrency_policy"] != "allow":
+                active = connection.execute(
+                    "SELECT run_id FROM runs WHERE run_id<>? AND workflow_name=? "
+                    "AND concurrency_key=? AND lane_state='held' "
+                    "ORDER BY created_at, run_id LIMIT 1",
+                    (
+                        projection["run_id"],
+                        row["workflow_name"],
+                        row["concurrency_key"],
+                    ),
+                ).fetchone()
+            running = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM runs WHERE status='running'"
+                ).fetchone()[0]
+            )
+            older_queued = connection.execute(
+                "SELECT run_id FROM runs WHERE run_id<>? AND status='queued' "
+                "ORDER BY queue_sequence, created_at, run_id LIMIT 1",
+                (projection["run_id"],),
+            ).fetchone()
+            if (
+                active is None
+                and older_queued is None
+                and running < self.limits["executing"]
+            ):
+                projection["status"] = "running"
+                projection["queue_position"] = None
+                projection["queue_sequence"] = None
+                projection["blocked_by_run_id"] = None
+                event_type = "run_runnable"
+            else:
+                sequence = projection.get("queue_sequence")
+                if not isinstance(sequence, int):
+                    sequence = self._next_queue_sequence(connection)
+                projection["status"] = "queued"
+                projection["queue_position"] = sequence
+                projection["queue_sequence"] = sequence
+                projection["blocked_by_run_id"] = (
+                    str(active["run_id"]) if active is not None else None
+                )
+                event_type = "run_runnable_queued"
+            self._append_locked(
+                directory,
+                projection,
+                event_type,
+                {"reason_code": reason},
+                defer_notification=True,
+            )
+            self._sync_integrity_index(
+                connection,
+                projection=projection,
+                journal_sha256=_sha256((directory / "events.jsonl").read_bytes()),
+            )
+            self._record_coordinator_wake(
+                connection,
+                run_id=str(projection["run_id"]),
+                reason_code=reason,
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        self._notify_coordinator()
+        return projection
+
     def try_promote_run(self, run_id: str) -> bool:
         directory = self.run_directory(run_id)
-        with workflow_lock(self._run_lock_path(run_id)):
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
-                    "SELECT workflow_name, concurrency_key, status FROM runs WHERE run_id=?",
+                    "SELECT workflow_name, concurrency_key, concurrency_policy, "
+                    "status, queue_sequence FROM runs WHERE run_id=?",
                     (run_id,),
                 ).fetchone()
                 if row is None or row["status"] != "queued":
                     connection.rollback()
                     return bool(row and row["status"] == "running")
-                active = connection.execute(
-                    "SELECT 1 FROM runs WHERE run_id<>? AND workflow_name=? AND concurrency_key=? AND status IN ('running','paused','interrupted') LIMIT 1",
-                    (run_id, row["workflow_name"], row["concurrency_key"]),
+                sequence = row["queue_sequence"]
+                if sequence is None:
+                    sequence = self._next_queue_sequence(connection)
+                    connection.execute(
+                        "UPDATE runs SET queue_sequence=?, queue_position=? "
+                        "WHERE run_id=?",
+                        (sequence, sequence, run_id),
+                    )
+                older = connection.execute(
+                    "SELECT 1 FROM runs WHERE status='queued' "
+                    "AND queue_sequence<? LIMIT 1",
+                    (sequence,),
                 ).fetchone()
+                active = None
+                if row["concurrency_policy"] != "allow":
+                    active = connection.execute(
+                        "SELECT 1 FROM runs WHERE run_id<>? AND workflow_name=? "
+                        "AND concurrency_key=? AND lane_state='held' LIMIT 1",
+                        (run_id, row["workflow_name"], row["concurrency_key"]),
+                    ).fetchone()
                 running = connection.execute(
                     "SELECT COUNT(*) FROM runs WHERE status='running'"
                 ).fetchone()[0]
-                if active or running >= self.limits["executing"]:
+                if older or active or running >= self.limits["executing"]:
                     connection.rollback()
                     return False
                 projection = json.loads((directory / "run.json").read_text())
@@ -2818,11 +3179,15 @@ class RunStore:
                 projection["status"] = "running"
                 projection["started_at"] = now
                 projection["queue_position"] = None
+                projection["queue_sequence"] = None
                 projection["blocked_by_run_id"] = None
                 self._append_locked(directory, projection, "run_promoted")
-                connection.execute(
-                    "UPDATE runs SET status='running', queue_position=NULL, blocked_by_run_id=NULL, updated_at=? WHERE run_id=?",
-                    (projection["updated_at"], run_id),
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
                 )
                 self._record_coordinator_wake(
                     connection, run_id=run_id, reason_code="run_promoted"
@@ -4489,14 +4854,14 @@ class RunStore:
         }:
             raise ValueError(f"invalid node completion state: {status}")
         directory = self.run_directory(claim.run_id)
-        capacity_guard = (
-            workflow_lock(self.admission_lock) if status == "paused" else nullcontext()
-        )
-        with self._terminal_completion_guard(claim), capacity_guard, workflow_lock(
-            self._run_lock_path(claim.run_id)
-        ), self._execution_fence_transaction(
-            claim.execution_fence, now
-        ) as fence_connection:
+        with (
+            self._terminal_completion_guard(claim),
+            workflow_lock(self.admission_lock),
+            workflow_lock(self._run_lock_path(claim.run_id)),
+            self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection,
+        ):
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
@@ -4868,6 +5233,9 @@ class RunStore:
         terminal_reserve_attempt_id: str | None = None,
         reserve_connection: sqlite3.Connection | None = None,
     ) -> dict[str, object]:
+        projection.setdefault("pause_lane_policy", "hold")
+        projection.setdefault("queue_sequence", None)
+        projection["lane_state"] = self._lane_state(projection)
         if event_type not in {
             "node_heartbeat",
             "run_stalled",
@@ -5002,7 +5370,9 @@ class RunStore:
 
     def finalize_if_complete(self, run_id: str) -> bool:
         directory = self.run_directory(run_id)
-        with workflow_lock(self._run_lock_path(run_id)):
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
             projection = json.loads((directory / "run.json").read_text())
             if projection["status"] != "running":
                 return False
@@ -5019,9 +5389,12 @@ class RunStore:
             projection["status"] = target
             self._append_locked(directory, projection, f"run_{target}")
             with self._connect() as connection:
-                connection.execute(
-                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
-                    (target, projection["updated_at"], run_id),
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
                 )
                 self._record_coordinator_wake(
                     connection, run_id=run_id, reason_code=f"run_{target}"
@@ -5044,11 +5417,13 @@ class RunStore:
         if next_attempt_at.tzinfo is None:
             raise ValueError("next_attempt_at must be timezone-aware")
         directory = self.run_directory(claim.run_id)
-        with workflow_lock(
-            self._run_lock_path(claim.run_id)
-        ), self._execution_fence_transaction(
-            claim.execution_fence, now
-        ) as fence_connection:
+        with (
+            workflow_lock(self.admission_lock),
+            workflow_lock(self._run_lock_path(claim.run_id)),
+            self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection,
+        ):
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             if node.get("claim", {}).get("attempt_id") != claim.attempt_id:
@@ -5133,7 +5508,9 @@ class RunStore:
         instant = now or datetime.now(timezone.utc)
         directory = self.run_directory(run_id)
         ready = []
-        with workflow_lock(self._run_lock_path(run_id)):
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
             projection = json.loads((directory / "run.json").read_text())
             if projection["status"] not in {"waiting_retry", "running"}:
                 return ()
@@ -5146,71 +5523,13 @@ class RunStore:
             if not due_nodes:
                 return ()
             if projection["status"] == "waiting_retry":
-                connection = self._connect()
-                try:
-                    connection.execute("BEGIN IMMEDIATE")
-                    row = connection.execute(
-                        "SELECT workflow_name, concurrency_key, concurrency_policy "
-                        "FROM runs WHERE run_id=? AND status='waiting_retry'",
-                        (run_id,),
-                    ).fetchone()
-                    if row is None:
-                        connection.rollback()
-                        return ()
-                    active = None
-                    if row["concurrency_policy"] != "allow":
-                        active = connection.execute(
-                            "SELECT run_id FROM runs WHERE run_id<>? "
-                            "AND workflow_name=? AND concurrency_key=? "
-                            "AND status IN ('running','paused','interrupted') "
-                            "ORDER BY created_at, run_id LIMIT 1",
-                            (run_id, row["workflow_name"], row["concurrency_key"]),
-                        ).fetchone()
-                    running = connection.execute(
-                        "SELECT COUNT(*) FROM runs WHERE status='running'"
-                    ).fetchone()[0]
-                    if active is not None or running >= self.limits["executing"]:
-                        queue_position = (
-                            connection.execute(
-                                "SELECT COUNT(*) FROM runs WHERE status='queued'"
-                            ).fetchone()[0]
-                            + 1
-                        )
-                        projection["status"] = "queued"
-                        projection["queue_position"] = queue_position
-                        projection["blocked_by_run_id"] = (
-                            active["run_id"] if active is not None else None
-                        )
-                        self._append_locked(
-                            directory,
-                            projection,
-                            "run_retry_queued",
-                            {"reason_code": "concurrency_lane_busy"},
-                        )
-                        connection.execute(
-                            "UPDATE runs SET status='queued', queue_position=?, "
-                            "blocked_by_run_id=?, updated_at=? WHERE run_id=?",
-                            (
-                                queue_position,
-                                projection["blocked_by_run_id"],
-                                projection["updated_at"],
-                                run_id,
-                            ),
-                        )
-                        self._record_coordinator_wake(
-                            connection,
-                            run_id=run_id,
-                            reason_code="retry_queued",
-                        )
-                        connection.commit()
-                        self._notify_coordinator()
-                        return ()
-                    connection.commit()
-                except BaseException:
-                    connection.rollback()
-                    raise
-                finally:
-                    connection.close()
+                projection = self._request_runnable_locked(
+                    directory,
+                    projection,
+                    reason="retry_due",
+                )
+                if projection["status"] == "queued":
+                    return ()
             for node_id, node in projection["nodes"].items():
                 if node["state"] != "waiting_retry":
                     continue
@@ -5227,12 +5546,14 @@ class RunStore:
                 )
                 ready.append(node_id)
             if ready:
-                projection["status"] = "running"
                 self._append_locked(directory, projection, "run_retry_resumed")
                 with self._connect() as connection:
-                    connection.execute(
-                        "UPDATE runs SET status='running', updated_at=? WHERE run_id=?",
-                        (projection["updated_at"], run_id),
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
                     )
                     self._record_coordinator_wake(
                         connection, run_id=run_id, reason_code="retry_due"
@@ -5351,7 +5672,9 @@ class RunStore:
         expired = []
         releasable_attempts: list[str] = []
         reconciliation_required = False
-        with workflow_lock(self._run_lock_path(run_id)):
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
             projection = json.loads((directory / "run.json").read_text())
             if projection.get("desired_status") == "cleanup_failed":
                 return ()
@@ -5679,9 +6002,13 @@ class RunStore:
         directory = self.run_directory(run_id)
         interrupted = []
         releasable_attempts: list[str] = []
-        with workflow_lock(
-            self._run_lock_path(run_id), timeout_seconds=lock_timeout_seconds
-        ), self._execution_fence_transaction(fence, now) as fence_connection:
+        with (
+            workflow_lock(self.admission_lock),
+            workflow_lock(
+                self._run_lock_path(run_id), timeout_seconds=lock_timeout_seconds
+            ),
+            self._execution_fence_transaction(fence, now) as fence_connection,
+        ):
             projection = json.loads((directory / "run.json").read_text())
             if projection.get("desired_status") == "cleanup_failed":
                 return ()
@@ -5822,7 +6149,9 @@ class RunStore:
 
     def interrupt_for_host_pressure(self, run_id: str, *, message: str) -> None:
         directory = self.run_directory(run_id)
-        with workflow_lock(self._run_lock_path(run_id)):
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
             projection = json.loads((directory / "run.json").read_text())
             if projection["status"] != "running":
                 return
@@ -5833,14 +6162,25 @@ class RunStore:
             }
             self._append_locked(directory, projection, "host_pressure_refused")
             with self._connect() as connection:
-                connection.execute(
-                    "UPDATE runs SET status='interrupted', updated_at=? WHERE run_id=?",
-                    (projection["updated_at"], run_id),
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
                 )
+                self._record_coordinator_wake(
+                    connection,
+                    run_id=run_id,
+                    reason_code="host_pressure_refused",
+                )
+            self._notify_coordinator()
 
     def release_or_expire_claim(self, claim: NodeClaim) -> bool:
         directory = self.run_directory(claim.run_id)
-        with workflow_lock(self._run_lock_path(claim.run_id)):
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(claim.run_id)
+        ):
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"].get(claim.node_id)
             if not node or node.get("claim", {}).get("attempt_id") != claim.attempt_id:
@@ -6038,7 +6378,9 @@ class RunStore:
             cleaned = terminated or not identity.is_current()
             cleanup.append((node_id, attempt_id, identity, cleaned))
 
-        with workflow_lock(self._run_lock_path(run_id)):
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
             projection = json.loads((directory / "run.json").read_text())
             if projection["status"] in {
                 "succeeded",
@@ -6204,14 +6546,23 @@ class RunStore:
                     },
                 )
                 with self._connect() as connection:
-                    connection.execute(
-                        "UPDATE runs SET status='paused', updated_at=? WHERE run_id=?",
-                        (projection["updated_at"], run_id),
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
                     )
                     for attempt_id in releasable_outward_attempts:
                         self._release_worker_claim(
                             attempt_id, connection=connection
                         )
+                    self._record_coordinator_wake(
+                        connection,
+                        run_id=run_id,
+                        reason_code="cancel_reconciliation_required",
+                    )
+                self._notify_coordinator()
                 return {
                     **projection,
                     "cancellation_outcome": "reconciliation_required",
@@ -6233,10 +6584,12 @@ class RunStore:
                         })
             self._append_locked(directory, projection, "run_cancelled")
             with self._connect() as connection:
-                connection.execute(
-                    "UPDATE runs SET status='cancelled', desired_status=NULL, "
-                    "updated_at=? WHERE run_id=?",
-                    (projection["updated_at"], run_id),
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
                 )
                 connection.execute(
                     "DELETE FROM worker_claims WHERE run_id=?", (run_id,)
@@ -6263,7 +6616,9 @@ class RunStore:
             for node in package.definition.nodes
             if node.options.get("always_run")
         }
-        with workflow_lock(self._run_lock_path(run_id)):
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
             projection = json.loads((directory / "run.json").read_text())
             if expected_state_version is not None and (
                 int(projection["state_version"]) != expected_state_version
@@ -6316,19 +6671,13 @@ class RunStore:
                     )
                     else "pending"
                 )
-            projection["status"] = "running"
             projection["last_error"] = None
             self._append_locked(directory, projection, "run_resumed")
-            with self._connect() as connection:
-                connection.execute(
-                    "UPDATE runs SET status='running', updated_at=? WHERE run_id=?",
-                    (projection["updated_at"], run_id),
-                )
-                self._record_coordinator_wake(
-                    connection, run_id=run_id, reason_code="run_resumed"
-                )
-            self._notify_coordinator()
-            return projection
+            return self._request_runnable_locked(
+                directory,
+                projection,
+                reason="run_resumed",
+            )
 
     @staticmethod
     def _interaction_identity(node: Mapping[str, object]) -> str | None:
@@ -6506,7 +6855,6 @@ class RunStore:
                     node["action_grant"] = resolved_id
                 else:
                     raise ValueError("pending interaction is not approvable")
-                projection["status"] = "running"
             else:
                 definition = definitions[node_id]
                 approval = (
@@ -6524,7 +6872,6 @@ class RunStore:
                 if pending_type == "workflow_approval" and attempts < maximum:
                     node["state"] = "ready"
                     node["approval_rework"] = {"reason": safe_response}
-                    projection["status"] = "running"
                 else:
                     terminal = True
                     projection["status"] = "cancelled"
@@ -6543,21 +6890,29 @@ class RunStore:
             )
             if terminal:
                 self._append_locked(directory, projection, "run_cancelled")
-            with self._connect() as connection:
-                connection.execute(
-                    "UPDATE runs SET status=?, desired_status=NULL, updated_at=? WHERE run_id=?",
-                    (projection["status"], projection["updated_at"], run_id),
-                )
-                if terminal:
+                with self._connect() as connection:
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
+                    )
                     connection.execute(
                         "DELETE FROM worker_claims WHERE run_id=?", (run_id,)
                     )
-                self._record_coordinator_wake(
-                    connection,
-                    run_id=run_id,
-                    reason_code=f"interaction_{decision}",
+                    self._record_coordinator_wake(
+                        connection,
+                        run_id=run_id,
+                        reason_code=f"interaction_{decision}",
+                    )
+                self._notify_coordinator()
+            else:
+                projection = self._request_runnable_locked(
+                    directory,
+                    projection,
+                    reason=f"interaction_{decision}",
                 )
-            self._notify_coordinator()
             return ApprovalDecision(
                 run_id=run_id,
                 node_id=node_id,
@@ -6614,7 +6969,9 @@ class RunStore:
         if len(encoded) > self.max_input_bytes:
             raise InputSnapshotError("loop input exceeds the configured input limit")
         directory = self.run_directory(run_id, operator_scope=operator_scope)
-        with workflow_lock(self._run_lock_path(run_id)):
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
             projection = json.loads((directory / "run.json").read_text())
             if projection["state_version"] != expected_state_version:
                 raise RuntimeError("stale loop input decision")
@@ -6652,7 +7009,6 @@ class RunStore:
             node["state"] = "ready"
             node.pop("pending_interaction", None)
             node["loop_user_input_artifact"] = relative.as_posix()
-            projection["status"] = "running"
             self._append_locked(
                 directory,
                 projection,
@@ -6664,16 +7020,11 @@ class RunStore:
                 },
                 node_id=node_id,
             )
-            with self._connect() as connection:
-                connection.execute(
-                    "UPDATE runs SET status='running', updated_at=? WHERE run_id=?",
-                    (projection["updated_at"], run_id),
-                )
-                self._record_coordinator_wake(
-                    connection, run_id=run_id, reason_code="input_provided"
-                )
-            self._notify_coordinator()
-            return projection
+            return self._request_runnable_locked(
+                directory,
+                projection,
+                reason="input_provided",
+            )
 
     def retry_run(
         self,
@@ -6685,7 +7036,9 @@ class RunStore:
     ) -> dict[str, object]:
         """Explicitly retry one failed/interrupted node with compare-and-set safety."""
         directory = self.run_directory(run_id, operator_scope=operator_scope)
-        with workflow_lock(self._run_lock_path(run_id)):
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
             projection = json.loads((directory / "run.json").read_text())
             if expected_state_version is not None and (
                 int(projection["state_version"]) != expected_state_version
@@ -6719,7 +7072,6 @@ class RunStore:
                 )
                 else "pending"
             )
-            projection["status"] = "running"
             projection["last_error"] = None
             self._append_locked(
                 directory,
@@ -6728,16 +7080,11 @@ class RunStore:
                 {"reason_code": "operator_retry"},
                 node_id=selected_id,
             )
-            with self._connect() as connection:
-                connection.execute(
-                    "UPDATE runs SET status='running', updated_at=? WHERE run_id=?",
-                    (projection["updated_at"], run_id),
-                )
-                self._record_coordinator_wake(
-                    connection, run_id=run_id, reason_code="operator_retry"
-                )
-            self._notify_coordinator()
-            return projection
+            return self._request_runnable_locked(
+                directory,
+                projection,
+                reason="operator_retry",
+            )
 
     def reconcile_run(
         self,
@@ -6754,7 +7101,9 @@ class RunStore:
         if not isinstance(interaction_id, str) or not interaction_id.strip():
             raise ValueError("interaction ID is required")
         directory = self.run_directory(run_id, operator_scope=operator_scope)
-        with workflow_lock(self._run_lock_path(run_id)):
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
             projection = json.loads((directory / "run.json").read_text())
             if expected_state_version is not None and (
                 int(projection["state_version"]) != expected_state_version
@@ -6784,14 +7133,12 @@ class RunStore:
             node.pop("pending_interaction", None)
             if outcome == "confirmed-succeeded":
                 node["state"] = "succeeded"
-                projection["status"] = "running"
                 projection["last_error"] = None
             elif outcome == "confirmed-failed":
                 node["state"] = "failed"
                 projection["status"] = "failed"
             else:
                 node["state"] = "ready"
-                projection["status"] = "running"
                 projection["last_error"] = None
             if isinstance(recovery, dict):
                 recovery["reconciled_outcome"] = outcome
@@ -6818,10 +7165,19 @@ class RunStore:
                 {"outcome": outcome, "interaction_id": interaction_id},
                 node_id=selected_id,
             )
+            if outcome != "confirmed-failed":
+                return self._request_runnable_locked(
+                    directory,
+                    projection,
+                    reason="run_reconciled",
+                )
             with self._connect() as connection:
-                connection.execute(
-                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
-                    (projection["status"], projection["updated_at"], run_id),
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
                 )
                 self._record_coordinator_wake(
                     connection, run_id=run_id, reason_code="run_reconciled"
@@ -6854,7 +7210,9 @@ class RunStore:
         operator_scope: str | None = None,
     ) -> dict[str, object]:
         directory = self.run_directory(run_id, operator_scope=operator_scope)
-        with workflow_lock(self._run_lock_path(run_id)):
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
             projection = json.loads((directory / "run.json").read_text())
             if expected_state_version is not None and (
                 int(projection["state_version"]) != expected_state_version
@@ -6915,9 +7273,12 @@ class RunStore:
                         })
             self._append_locked(directory, projection, f"run_{target}")
             with self._connect() as connection:
-                connection.execute(
-                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
-                    (target, projection["updated_at"], run_id),
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
                 )
                 connection.execute(
                     "DELETE FROM worker_claims WHERE run_id=?", (run_id,)

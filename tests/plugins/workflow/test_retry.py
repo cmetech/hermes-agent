@@ -86,7 +86,7 @@ def test_transient_failure_waits_without_occupying_capacity_then_retries(
     assert calls == 2
 
 
-def test_waiting_retry_releases_lane_and_requeues_when_due_lane_is_busy(
+def test_waiting_retry_lane_policy_releases_and_requeues_when_due_lane_is_busy(
     tmp_path, workflow_writer
 ):
     package = load_workflow(
@@ -135,16 +135,19 @@ def test_waiting_retry_releases_lane_and_requeues_when_due_lane_is_busy(
     assert store.wake_due_retries(first.run_id, now=due) == ("work",)
 
 
-def test_paused_and_interrupted_runs_continue_to_hold_their_lane(
+def test_default_paused_outward_lane_policy_holds_and_explicit_release_interleaves(
     tmp_path, workflow_writer
 ):
-    paused_package = load_workflow(
-        workflow_writer(
-            tmp_path / "paused-package",
-            name="held-paused-lane",
-            nodes=[{"id": "gate", "approval": {"message": "Hold?"}}],
-        )
+    default_path = workflow_writer(
+        tmp_path / "paused-package",
+        name="held-paused-lane",
+        nodes=[{"id": "gate", "approval": {"message": "Hold?"}}],
     )
+    default_path.with_name("example.hermes.yaml").write_text(
+        "overlap_policy: queue\noutward_action_nodes: [gate]\n",
+        encoding="utf-8",
+    )
+    paused_package = load_workflow(default_path)
     paused_store = RunStore(tmp_path / "paused-home")
     paused = _start(paused_store, paused_package, key="paused")
     assert RunScheduler(paused_store).advance(paused.run_id)["status"] == "paused"
@@ -152,22 +155,85 @@ def test_paused_and_interrupted_runs_continue_to_hold_their_lane(
     assert behind_paused.disposition == "queued"
     assert not paused_store.try_promote_run(behind_paused.run_id)
 
-    interrupted_package = load_workflow(
+    release_path = workflow_writer(
+        tmp_path / "released-package",
+        name="released-paused-lane",
+        nodes=[{"id": "gate", "approval": {"message": "Hold?"}}],
+    )
+    release_path.with_name("example.hermes.yaml").write_text(
+        "overlap_policy: queue\npause_lane_policy: release\n"
+        "outward_action_nodes: [gate]\n",
+        encoding="utf-8",
+    )
+    release_package = load_workflow(release_path)
+    release_store = RunStore(tmp_path / "released-home")
+    released = _start(release_store, release_package, key="released")
+    assert RunScheduler(release_store).advance(released.run_id)["status"] == "paused"
+    interleaved = _start(release_store, release_package, key="interleaved")
+
+    assert interleaved.disposition == "created"
+    assert release_store.load_run(interleaved.run_id)["status"] == "running"
+
+
+def test_interrupted_lane_policy_releases_replay_safe_but_holds_uncertain_outward(
+    tmp_path, workflow_writer
+) -> None:
+    safe_package = load_workflow(
         workflow_writer(
-            tmp_path / "interrupted-package",
-            name="held-interrupted-lane",
+            tmp_path / "safe-interrupted-package",
+            name="safe-interrupted-lane",
         )
     )
-    interrupted_store = RunStore(tmp_path / "interrupted-home")
-    interrupted = _start(interrupted_store, interrupted_package, key="interrupted")
-    interrupted_store.interrupt_for_host_pressure(
-        interrupted.run_id, message="synthetic pressure"
+    safe_store = RunStore(tmp_path / "safe-interrupted-home")
+    safe = _start(safe_store, safe_package, key="safe-interrupted")
+    safe_store.interrupt_for_host_pressure(safe.run_id, message="synthetic pressure")
+    behind_safe = _start(safe_store, safe_package, key="behind-safe")
+    assert behind_safe.disposition == "created"
+
+    outward_path = workflow_writer(
+        tmp_path / "outward-interrupted-package",
+        name="outward-interrupted-lane",
     )
-    behind_interrupted = _start(
-        interrupted_store, interrupted_package, key="behind-interrupted"
+    outward_path.with_name("example.hermes.yaml").write_text(
+        "overlap_policy: queue\npause_lane_policy: release\n"
+        "outward_action_nodes: [start]\n",
+        encoding="utf-8",
     )
-    assert behind_interrupted.disposition == "queued"
-    assert not interrupted_store.try_promote_run(behind_interrupted.run_id)
+    outward_package = load_workflow(outward_path)
+    outward_store = RunStore(tmp_path / "outward-interrupted-home")
+    outward = _start(outward_store, outward_package, key="outward-interrupted")
+    projection = outward_store.load_run(outward.run_id)
+    nodes = {node_id: dict(node) for node_id, node in projection["nodes"].items()}
+    nodes["start"].update({
+        "state": "interrupted",
+        "attempts": [
+            {
+                "attempt_id": "uncertain-outward-attempt",
+                "state": "interrupted",
+                "effect_classification": "outward",
+            }
+        ],
+        "recovery": {
+            "attempt_id": "uncertain-outward-attempt",
+            "effect_classification": "outward",
+            "observation": "outcome_uncertain",
+            "termination_confirmed": False,
+        },
+    })
+    outward_store.append_event(
+        outward.run_id,
+        "fault_injected_uncertain_outward_interrupt",
+        projection_updates={"status": "interrupted", "nodes": nodes},
+    )
+    with outward_store._connect() as connection:
+        connection.execute(
+            "UPDATE runs SET status='interrupted' WHERE run_id=?",
+            (outward.run_id,),
+        )
+    behind_outward = _start(outward_store, outward_package, key="behind-outward")
+
+    assert behind_outward.disposition == "queued"
+    assert not outward_store.try_promote_run(behind_outward.run_id)
 
 
 def test_fatal_and_unknown_side_effect_failures_are_not_retried(

@@ -133,6 +133,9 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             "journal_sequence",
             "journal_sha256",
             "integrity_verified_at",
+            "queue_sequence",
+            "pause_lane_policy",
+            "lane_state",
         } <= columns
         tables = {
             row["name"]
@@ -229,6 +232,9 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
                 "SELECT * FROM runs WHERE run_id='migration-run'"
             ).fetchone()
         )
+        queue_counter = connection.execute(
+            "SELECT value FROM store_metadata WHERE key='queue_sequence'"
+        ).fetchone()
     for key, value in before.items():
         if key != "run_directory":
             assert migrated[key] == value
@@ -246,6 +252,11 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
     assert migrated["journal_sequence"] == expected["event_sequence"]
     assert len(migrated["journal_sha256"]) == 64
     assert migrated["integrity_verified_at"]
+    assert migrated["queue_sequence"] is None
+    assert migrated["pause_lane_policy"] == "hold"
+    assert migrated["lane_state"] == "released"
+    assert queue_counter is not None
+    assert int(queue_counter["value"]) >= 0
 
     reopened = RunStore(home)
     second_manifest = _schema_manifest(reopened)
@@ -297,6 +308,51 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
     assert reopened.load_run("migration-run")["event_sequence"] == (
         expected["event_sequence"] + 1
     )
+
+
+def test_legacy_queued_projection_sync_preserves_migrated_fifo_sequence(
+    tmp_path: Path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home", max_executing_runs=1)
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="legacy-queued-fifo")
+    )
+
+    def start(key: str):
+        prepared = store.prepare_run_snapshot(package)
+        return store.start_run(
+            RunAdmissionRequest(
+                workflow_name=package.definition.name,
+                definition_digest=prepared.definition_digest,
+                policy_digest=prepared.policy_digest,
+                input_manifest_digest=prepared.input_manifest_digest,
+                trigger_source="cli",
+                idempotency_key=key,
+                concurrency_key=package.definition.name,
+                concurrency_policy="queue",
+            ),
+            immutable_snapshot=prepared,
+        )
+
+    start("blocker")
+    queued = start("legacy-queued")
+    projection = store.load_run(queued.run_id)
+    sequence = projection.pop("queue_sequence")
+    directory = store.run_directory(queued.run_id)
+
+    with store._connect() as connection:
+        store._sync_integrity_index(
+            connection,
+            projection=projection,
+            journal_sha256=_sha256(directory / "events.jsonl"),
+        )
+        indexed = connection.execute(
+            "SELECT queue_sequence, queue_position FROM runs WHERE run_id=?",
+            (queued.run_id,),
+        ).fetchone()
+
+    assert indexed["queue_sequence"] == sequence
+    assert indexed["queue_position"] == sequence
 
 
 def test_future_index_schema_is_preserved_and_rebuilt_fail_closed(

@@ -18,6 +18,25 @@ MUTATION_ACTIONS = frozenset({
     "archive",
     "restore",
 })
+LANE_STATES = frozenset({"held", "released"})
+
+
+def lane_state_for(
+    status: str,
+    *,
+    pause_lane_policy: str = "hold",
+    unresolved_outward_attempt: bool = False,
+) -> str:
+    """Project durable lane ownership independently from lifecycle status."""
+    if pause_lane_policy not in {"hold", "release"}:
+        raise ValueError("pause_lane_policy must be hold or release")
+    if status == "running":
+        return "held"
+    if status == "paused":
+        return "held" if pause_lane_policy == "hold" else "released"
+    if status == "interrupted":
+        return "held" if unresolved_outward_attempt else "released"
+    return "released"
 
 
 def available_actions(
@@ -72,7 +91,9 @@ def mutation_is_valid(
 
 __all__ = [
     "INSPECTION_ACTIONS",
+    "LANE_STATES",
     "MUTATION_ACTIONS",
     "available_actions",
+    "lane_state_for",
     "mutation_is_valid",
 ]

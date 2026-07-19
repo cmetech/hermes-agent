@@ -10,6 +10,8 @@ import threading
 import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.models import WorkflowValidationError
+from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 
@@ -433,6 +435,61 @@ def test_status_inconsistency_uses_corroborated_evidence_and_requires_repair(
     repair = restarted.list_repair_events()[-1]
     assert repair["reason_code"] == "index_status_inconsistent"
     assert repair["outcome"] == "index_rebuilt"
+
+
+def test_fifo_promotion_refuses_newer_queue_sequence_until_older_runs(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home", max_executing_runs=1)
+    package = load_workflow(
+        workflow_writer(tmp_path / "fifo-package", name="fifo-promotion")
+    )
+
+    def start(key: str):
+        prepared = store.prepare_run_snapshot(package)
+        return store.start_run(
+            RunAdmissionRequest(
+                workflow_name=package.definition.name,
+                definition_digest=prepared.definition_digest,
+                policy_digest=prepared.policy_digest,
+                input_manifest_digest=prepared.input_manifest_digest,
+                trigger_source="cli",
+                idempotency_key=key,
+                concurrency_key=package.definition.name,
+                concurrency_policy="queue",
+            ),
+            immutable_snapshot=prepared,
+        )
+
+    blocker = start("fifo-blocker")
+    older = start("fifo-older")
+    newer = start("fifo-newer")
+    assert older.disposition == newer.disposition == "queued"
+    older_projection = store.load_run(older.run_id)
+    newer_projection = store.load_run(newer.run_id)
+    assert older_projection["queue_sequence"] < newer_projection["queue_sequence"]
+
+    assert RunScheduler(store).advance(blocker.run_id)["status"] == "succeeded"
+    assert not store.try_promote_run(newer.run_id)
+    assert store.try_promote_run(older.run_id)
+    assert store.load_run(newer.run_id)["queue_sequence"] == newer_projection[
+        "queue_sequence"
+    ]
+
+
+def test_pause_lane_policy_is_rejected_outside_queue_overlap(
+    tmp_path, workflow_writer
+) -> None:
+    path = workflow_writer(tmp_path / "invalid-lane-policy", name="invalid-lane")
+    path.with_name("example.hermes.yaml").write_text(
+        "overlap_policy: allow\npause_lane_policy: release\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        WorkflowValidationError, match="pause_lane_policy requires queue"
+    ):
+        load_workflow(path)
 
 
 def test_uncorroborated_orphan_evidence_is_quarantined_without_deletion(
