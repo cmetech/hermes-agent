@@ -56,6 +56,10 @@ class JournalRecoveryError(RuntimeError):
     pass
 
 
+class ForegroundExecutionConflict(RuntimeError):
+    """A foreground owner transition lost its exact state/epoch comparison."""
+
+
 class _ClosingConnection(sqlite3.Connection):
     """Preserve sqlite transaction semantics and release the handle on exit."""
 
@@ -3028,6 +3032,236 @@ class RunStore:
             finally:
                 connection.close()
 
+    def adopt_expired_foreground(
+        self,
+        run_id: str,
+        fence: ExecutionFence,
+        now: datetime,
+    ) -> dict[str, object]:
+        """Convert one expired foreground owner into fenced coordinator ownership."""
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        instant = now.astimezone(timezone.utc)
+        directory = self.run_directory(run_id)
+        with workflow_lock(self._run_lock_path(run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self.assert_execution_fence(connection, fence)
+                row = connection.execute(
+                    "SELECT execution_mode, foreground_owner_id, "
+                    "foreground_lease_expires_at, foreground_epoch, status, "
+                    "projection_state_version "
+                    "FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None or row["execution_mode"] != "foreground":
+                    raise ForegroundExecutionConflict(
+                        "foreground owner conflict: run is not foreground-owned"
+                    )
+                if row["status"] not in {"queued", "running", "waiting_retry"}:
+                    raise ForegroundExecutionConflict(
+                        "foreground owner conflict: run is not coordinator-adoptable"
+                    )
+                expires_text = row["foreground_lease_expires_at"]
+                if (
+                    not isinstance(expires_text, str)
+                    or datetime.fromisoformat(expires_text) > instant
+                ):
+                    raise ForegroundExecutionConflict(
+                        "foreground owner conflict: owner lease is still active"
+                    )
+                expected = (
+                    row["execution_mode"],
+                    row["foreground_owner_id"],
+                    expires_text,
+                    row["foreground_epoch"],
+                    row["status"],
+                    row["projection_state_version"],
+                )
+                observed = (
+                    projection.get("execution_mode"),
+                    projection.get("foreground_owner_id"),
+                    projection.get("foreground_lease_expires_at"),
+                    projection.get("foreground_epoch"),
+                    projection.get("status"),
+                    projection.get("state_version"),
+                )
+                if observed != expected:
+                    raise ForegroundExecutionConflict(
+                        "foreground owner conflict: journal and index owner differ"
+                    )
+
+                claimed_attempts: list[
+                    tuple[str, dict[str, object], dict[str, object], str]
+                ] = []
+                for node_id, node in projection.get("nodes", {}).items():
+                    claim = node.get("claim") if isinstance(node, dict) else None
+                    if not isinstance(claim, dict):
+                        continue
+                    attempt_id = str(claim.get("attempt_id") or "")
+                    attempt = next(
+                        (
+                            candidate
+                            for candidate in reversed(node.get("attempts", []))
+                            if candidate.get("attempt_id") == attempt_id
+                        ),
+                        None,
+                    )
+                    if not isinstance(attempt, dict) or not attempt_id:
+                        raise ForegroundExecutionConflict(
+                            "foreground owner conflict: active claim lacks attempt evidence"
+                        )
+                    claimed_attempts.append(
+                        (str(node_id), node, attempt, attempt_id)
+                    )
+
+                reconciliation_required = False
+                for node_id, node, attempt, attempt_id in claimed_attempts:
+                    claim = node["claim"]
+                    observation = self._observe_attempt(attempt)
+                    effect_classification = str(
+                        attempt.get(
+                            "effect_classification",
+                            claim.get("effect_classification", "replay_safe"),
+                        )
+                    )
+                    recovery = {
+                        "attempt_id": attempt_id,
+                        "owner_id": attempt.get("owner_id", claim.get("owner_id")),
+                        "owner_epoch": attempt.get(
+                            "owner_epoch", claim.get("owner_epoch")
+                        ),
+                        "executor_id": attempt.get(
+                            "executor_id", claim.get("executor_id", "unknown")
+                        ),
+                        "effect_classification": effect_classification,
+                        "process_identity": attempt.get("process_identity"),
+                        "observation": observation,
+                        "foreground_owner_expired_at": instant.isoformat(),
+                        "termination_confirmed": observation
+                        in {"known_stopped", "not_started"},
+                    }
+                    node.pop("claim", None)
+                    node["recovery"] = recovery
+                    requires_reconcile = (
+                        effect_classification == "outward"
+                        or observation in {"still_running", "outcome_uncertain"}
+                    )
+                    if requires_reconcile:
+                        node["state"] = "paused"
+                        node["pending_interaction"] = {
+                            "type": "reconcile",
+                            "interaction_id": f"reconcile-{attempt_id}",
+                            "attempt_id": attempt_id,
+                            "reason_code": "foreground_owner_expired_outcome_uncertain",
+                        }
+                        attempt.update({
+                            "state": "paused",
+                            "error_code": "reconciliation_required",
+                        })
+                        reconciliation_required = True
+                        event_type = "node_reconciliation_required"
+                    else:
+                        node["state"] = (
+                            "ready"
+                            if all(
+                                projection["nodes"][dependency]["state"]
+                                == "succeeded"
+                                for dependency in node["depends_on"]
+                            )
+                            else "pending"
+                        )
+                        attempt.update({
+                            "state": "interrupted",
+                            "error_code": "foreground_owner_expired",
+                        })
+                        event_type = "node_foreground_owner_expired"
+                    self._append_locked(
+                        directory,
+                        projection,
+                        event_type,
+                        {
+                            "observation": observation,
+                            "effect_classification": effect_classification,
+                        },
+                        node_id=node_id,
+                        attempt_id=attempt_id,
+                        defer_notification=True,
+                    )
+                    if not requires_reconcile:
+                        self._release_worker_claim(
+                            attempt_id, connection=connection
+                        )
+
+                projection["execution_mode"] = "background"
+                projection["foreground_owner_id"] = None
+                projection["foreground_epoch"] = None
+                projection["foreground_lease_expires_at"] = None
+                if reconciliation_required:
+                    projection["status"] = "paused"
+                    transition = "foreground_execution_reconciliation_required"
+                else:
+                    transition = "foreground_execution_adopted"
+                self._append_locked(
+                    directory,
+                    projection,
+                    transition,
+                    {
+                        "coordinator_owner_id": fence.owner_id,
+                        "coordinator_epoch": fence.owner_epoch,
+                        "previous_foreground_owner_id": expected[1],
+                        "previous_foreground_epoch": expected[3],
+                    },
+                    defer_notification=True,
+                )
+                updated = connection.execute(
+                    "UPDATE runs SET execution_mode='background', "
+                    "foreground_owner_id=NULL, foreground_lease_expires_at=NULL, "
+                    "foreground_epoch=NULL, status=?, updated_at=? "
+                    "WHERE run_id=? AND execution_mode='foreground' "
+                    "AND foreground_owner_id IS ? "
+                    "AND foreground_lease_expires_at=? AND foreground_epoch IS ? "
+                    "AND projection_state_version IS ?",
+                    (
+                        projection["status"],
+                        projection["updated_at"],
+                        run_id,
+                        expected[1],
+                        expected[2],
+                        expected[3],
+                        expected[5],
+                    ),
+                ).rowcount
+                if updated != 1:
+                    raise ForegroundExecutionConflict(
+                        "foreground owner conflict: adoption comparison failed"
+                    )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                self._record_coordinator_wake(
+                    connection,
+                    run_id=run_id,
+                    reason_code=(
+                        "foreground_reconciliation_required"
+                        if reconciliation_required
+                        else "foreground_adopted"
+                    ),
+                )
+                connection.commit()
+                return projection
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
     def release_foreground_execution(
         self,
         run_id: str,
@@ -3285,6 +3519,7 @@ class RunStore:
                 pending_interaction,
                 health=health,
                 archived=bool(run.get("archived_at")),
+                can_resume=blocking_reason != "foreground_owner_unavailable",
             ),
         }
 
@@ -5501,6 +5736,22 @@ class RunStore:
             ):
                 raise RuntimeError("stale resume decision")
             if projection["status"] not in {"failed", "interrupted"}:
+                if (
+                    projection.get("status") == "running"
+                    and projection.get("execution_mode") == "foreground"
+                    and (
+                        not isinstance(
+                            projection.get("foreground_lease_expires_at"), str
+                        )
+                        or datetime.fromisoformat(
+                            projection["foreground_lease_expires_at"]
+                        )
+                        <= datetime.now(timezone.utc)
+                    )
+                ):
+                    raise ForegroundExecutionConflict(
+                        "foreground owner conflict: expired owner requires adoption"
+                    )
                 return projection
             for node in projection["nodes"].values():
                 recovery = node.get("recovery")
@@ -6542,6 +6793,7 @@ class RunStore:
 
 __all__ = [
     "ArtifactRef",
+    "ForegroundExecutionConflict",
     "InputSnapshotError",
     "NodeClaim",
     "RunStore",

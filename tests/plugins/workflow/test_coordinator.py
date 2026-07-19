@@ -399,8 +399,8 @@ def _service(
             host_instance_id=host_instance_id,
         ),
         hermes_home=home,
-        heartbeat_seconds=0.02,
-        lease_seconds=0.15,
+        heartbeat_seconds=0.1,
+        lease_seconds=3.0,
         web_election_grace_seconds=web_grace_seconds,
         sweep_backoff_seconds=(0.02, 0.04, 0.08),
     )

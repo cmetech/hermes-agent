@@ -26,6 +26,7 @@ def available_actions(
     *,
     health: str | None = None,
     archived: bool = False,
+    can_resume: bool = True,
 ) -> list[str]:
     actions = list(INSPECTION_ACTIONS)
     interaction_type = (
@@ -42,7 +43,7 @@ def available_actions(
             actions.append("cancel")
     elif status in {"running", "queued", "waiting_retry"}:
         actions.append("cancel")
-        if status == "running" and health == "stalled":
+        if status == "running" and health == "stalled" and can_resume:
             actions.append("resume")
     elif status in {"failed", "interrupted"}:
         actions.extend(("resume", "retry", "abandon"))
@@ -58,12 +59,14 @@ def mutation_is_valid(
     pending_interaction: Mapping[str, object] | None = None,
     health: str | None = None,
     archived: bool = False,
+    can_resume: bool = True,
 ) -> bool:
     return action in MUTATION_ACTIONS and action in available_actions(
         status,
         pending_interaction,
         health=health,
         archived=archived,
+        can_resume=can_resume,
     )
 
 

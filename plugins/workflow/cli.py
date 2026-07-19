@@ -57,7 +57,11 @@ from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.schema import load_workflow, validate_package
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.sessions import NodeSessionRegistry
-from plugins.workflow.store import RunStore, StorageQuotaError
+from plugins.workflow.store import (
+    ForegroundExecutionConflict,
+    RunStore,
+    StorageQuotaError,
+)
 from plugins.workflow.topology import project_topology
 from plugins.workflow.trust import (
     WorkflowTrustError,
@@ -1575,7 +1579,12 @@ def _cmd_resume(
 ) -> int:
     runtime = _runtime_config(args.hermes_home)
     store = _store(args, runtime)
-    store.resume_run(args.run_id)
+    before = store.get_run_status(args.run_id)
+    foreground_conflict = False
+    try:
+        store.resume_run(args.run_id)
+    except ForegroundExecutionConflict:
+        foreground_conflict = True
     _continue_foreground_if_owned(
         args.run_id,
         store,
@@ -1583,7 +1592,16 @@ def _cmd_resume(
         agent_runner=agent_runner,
         profile_name=profile_name,
     )
-    _emit(store.get_run_status(args.run_id), as_json=args.json)
+    after = store.get_run_status(args.run_id)
+    if foreground_conflict and after["state_version"] == before["state_version"]:
+        raise WorkflowCommandError(
+            "version_conflict",
+            "foreground owner conflict: resume made no durable transition",
+            exit_code=EXIT_CONFLICT,
+            retryable=True,
+            details={"run_id": args.run_id},
+        )
+    _emit(after, as_json=args.json)
     return 0
 
 

@@ -186,6 +186,7 @@ class WorkflowCoordinatorService:
         scheduler,
     ) -> tuple[bool, str | None, datetime | None]:
         from plugins.workflow.notifications import NotificationOutbox
+        from plugins.workflow.store import ForegroundExecutionConflict
 
         fence = ExecutionFence(identity.owner_id, epoch)
         with run_store._connect() as connection:
@@ -206,7 +207,7 @@ class WorkflowCoordinatorService:
             str(run["run_id"])
             for run in periodic
             if run.get("status") in {"queued", "running", "waiting_retry"}
-            and run.get("execution_mode") == "background"
+            and run.get("execution_mode") in {"background", "foreground"}
             and run.get("run_id") not in run_ids
         )
         progress_at: datetime | None = None
@@ -214,10 +215,20 @@ class WorkflowCoordinatorService:
             outcome = "advanced"
             try:
                 before = run_store.get_run_status(run_id)
-                if before.get("execution_mode") != "background":
-                    after = before
-                    outcome = "foreground_owned"
-                else:
+                after = before
+                if before.get("execution_mode") == "foreground":
+                    try:
+                        run_store.adopt_expired_foreground(run_id, fence, now)
+                    except ForegroundExecutionConflict:
+                        after = before
+                        outcome = "foreground_owned"
+                    else:
+                        before = run_store.get_run_status(run_id)
+                        after = before
+                        outcome = "foreground_adopted"
+                if before.get("execution_mode") == "background" and before.get(
+                    "status"
+                ) in {"queued", "running", "waiting_retry"}:
                     scheduler.advance(run_id)
                     after = run_store.get_run_status(run_id)
                     if after.get("state_version") != before.get("state_version"):

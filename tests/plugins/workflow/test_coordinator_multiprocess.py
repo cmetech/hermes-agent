@@ -5,8 +5,11 @@ import multiprocessing
 import os
 from pathlib import Path
 import sqlite3
+import threading
 import time
 
+from hermes_cli.plugin_services import BackgroundServiceContext
+from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.models import ExecutionFence
@@ -87,6 +90,70 @@ def _run_blocked_old_epoch(
             projection["nodes"]["start"]["state"],
         )
     )
+
+
+def _own_foreground_until_killed(
+    home: str,
+    workflow_path: str,
+    key: str,
+    unresolved_outward_spawn: bool,
+    results,
+) -> None:
+    store = RunStore(Path(home))
+    package = load_workflow(Path(workflow_path))
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=key,
+            concurrency_key=package.definition.name,
+            execution_mode="foreground",
+            foreground_owner_id=f"foreground-process-{os.getpid()}",
+            foreground_lease_seconds=0.2,
+        ),
+        immutable_snapshot=prepared,
+    )
+    if unresolved_outward_spawn:
+        claim = store.claim_node(
+            admitted.run_id,
+            "start",
+            f"foreground-process-{os.getpid()}",
+            executor_id="bash",
+            effect_classification="outward",
+        )
+        assert claim is not None
+        store.mark_node_started(claim)
+        assert store.record_spawn_intent(
+            claim, executor_nonce="owner-died-after-spawn-intent"
+        )
+    results.put(admitted.run_id)
+    time.sleep(30)
+
+
+def _coordinator_service(home: Path) -> WorkflowCoordinatorService:
+    return WorkflowCoordinatorService(
+        BackgroundServiceContext(
+            host_kind="gateway",
+            host_instance_id="foreground-adopter",
+        ),
+        hermes_home=home,
+        heartbeat_seconds=0.1,
+        lease_seconds=3.0,
+        sweep_backoff_seconds=(0.02, 0.04, 0.08),
+    )
+
+
+def _wait_until(predicate, *, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("condition did not become true before deadline")
 
 
 def test_two_processes_elect_exactly_one_leader(tmp_path) -> None:
@@ -252,3 +319,92 @@ def test_mid_node_takeover_fences_old_epoch_before_outward_effect(
         if old_epoch.is_alive():
             old_epoch.terminate()
             old_epoch.join(timeout=5)
+
+
+def test_foreground_owner_death_is_adopted_and_replay_safe_run_continues(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workflow_path = workflow_writer(
+        tmp_path / "safe-package",
+        name="foreground-safe-adoption",
+        nodes=[{"id": "start", "bash": "true"}],
+    )
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    owner = context.Process(
+        target=_own_foreground_until_killed,
+        args=(str(home), str(workflow_path), "safe-adoption", False, results),
+    )
+    owner.start()
+    run_id = results.get(timeout=5)
+    owner.terminate()
+    owner.join(timeout=5)
+    assert owner.exitcode is not None
+    time.sleep(0.25)
+
+    service = _coordinator_service(home)
+    stop = threading.Event()
+    thread = threading.Thread(target=service.run, args=(stop,))
+    thread.start()
+    store = RunStore(home)
+    try:
+        _wait_until(lambda: store.get_run_status(run_id)["status"] == "succeeded")
+        projection = store.load_run(run_id)
+        assert projection["execution_mode"] == "background"
+        assert projection["foreground_owner_id"] is None
+        assert "foreground_execution_adopted" in {
+            event["event_type"] for event in store.tail_events(run_id)
+        }
+    finally:
+        stop.set()
+        CoordinatorStore(store.database).notify_local()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
+def test_foreground_owner_death_with_unresolved_outward_spawn_reconciles(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    marker = tmp_path / "must-not-run.txt"
+    workflow_path = workflow_writer(
+        tmp_path / "outward-package",
+        name="foreground-outward-adoption",
+        nodes=[{"id": "start", "bash": f"echo duplicate >> {marker}"}],
+    )
+    workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml").write_text(
+        "outward_action_nodes: [start]\n",
+        encoding="utf-8",
+    )
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    owner = context.Process(
+        target=_own_foreground_until_killed,
+        args=(str(home), str(workflow_path), "outward-adoption", True, results),
+    )
+    owner.start()
+    run_id = results.get(timeout=5)
+    owner.terminate()
+    owner.join(timeout=5)
+    assert owner.exitcode is not None
+    time.sleep(0.25)
+
+    service = _coordinator_service(home)
+    stop = threading.Event()
+    thread = threading.Thread(target=service.run, args=(stop,))
+    thread.start()
+    store = RunStore(home)
+    try:
+        _wait_until(lambda: store.get_run_status(run_id)["status"] == "paused")
+        projection = store.load_run(run_id)
+        node = projection["nodes"]["start"]
+        assert projection["execution_mode"] == "background"
+        assert node["recovery"]["observation"] == "outcome_uncertain"
+        assert node["pending_interaction"]["type"] == "reconcile"
+        assert not marker.exists()
+    finally:
+        stop.set()
+        CoordinatorStore(store.database).notify_local()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
