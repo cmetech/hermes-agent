@@ -5,10 +5,15 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import shutil
 import sqlite3
+import stat
+import tempfile
 import threading
 from typing import Callable, Iterator, Literal
 
@@ -24,6 +29,23 @@ CoordinatorHealthStatus = Literal["healthy", "standby", "unavailable", "degraded
 _LOCAL_WAKE_LOCK = threading.Lock()
 _LOCAL_WAKE_CONDITIONS: dict[str, threading.Condition] = {}
 _DIAGNOSTIC_RETENTION = timedelta(days=7)
+_HEALTH_SNAPSHOT_MAX_DATABASE_BYTES = 64 * 1024 * 1024
+_HEALTH_SNAPSHOT_MAX_WAL_BYTES = 32 * 1024 * 1024
+_HEALTH_SNAPSHOT_ATTEMPTS = 3
+_SNAPSHOT_COPY_CHUNK_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotFileSignature:
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+
+class CoordinatorHealthSnapshotError(OSError):
+    """A bounded stable coordinator-health snapshot could not be captured."""
 
 
 def _instant(value: datetime, *, name: str) -> datetime:
@@ -380,6 +402,189 @@ class CoordinatorStore:
             ).fetchone()
             sample = self._sample(requested_now)
         lease = self._lease(row) if row is not None else None
+        return self._health_for_lease(lease, sample)
+
+    @staticmethod
+    def _snapshot_signature(path: Path) -> _SnapshotFileSignature | None:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(metadata.st_mode):
+            raise CoordinatorHealthSnapshotError(
+                "coordinator snapshot source is not a regular file"
+            )
+        return _SnapshotFileSignature(
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            size=metadata.st_size,
+            modified_ns=metadata.st_mtime_ns,
+            changed_ns=metadata.st_ctime_ns,
+        )
+
+    @staticmethod
+    def _copy_snapshot_file(
+        source: Path,
+        destination: Path,
+        *,
+        expected: _SnapshotFileSignature,
+        max_bytes: int,
+    ) -> tuple[int, str]:
+        if expected.size > max_bytes:
+            raise CoordinatorHealthSnapshotError(
+                "coordinator snapshot source exceeds its byte budget"
+            )
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(source, flags)
+        try:
+            opened = os.fstat(descriptor)
+            opened_signature = _SnapshotFileSignature(
+                device=opened.st_dev,
+                inode=opened.st_ino,
+                size=opened.st_size,
+                modified_ns=opened.st_mtime_ns,
+                changed_ns=opened.st_ctime_ns,
+            )
+            if opened_signature != expected:
+                raise CoordinatorHealthSnapshotError(
+                    "coordinator snapshot source changed before capture"
+                )
+            copied = 0
+            digest = hashlib.sha256()
+            with os.fdopen(descriptor, "rb", closefd=False) as source_stream:
+                with destination.open("xb") as destination_stream:
+                    while True:
+                        chunk = source_stream.read(_SNAPSHOT_COPY_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        copied += len(chunk)
+                        if copied > max_bytes:
+                            raise CoordinatorHealthSnapshotError(
+                                "coordinator snapshot source exceeds its byte budget"
+                            )
+                        digest.update(chunk)
+                        destination_stream.write(chunk)
+            finished = os.fstat(descriptor)
+            finished_signature = _SnapshotFileSignature(
+                device=finished.st_dev,
+                inode=finished.st_ino,
+                size=finished.st_size,
+                modified_ns=finished.st_mtime_ns,
+                changed_ns=finished.st_ctime_ns,
+            )
+            if finished_signature != expected or copied != expected.size:
+                raise CoordinatorHealthSnapshotError(
+                    "coordinator snapshot source changed during capture"
+                )
+            return copied, digest.hexdigest()
+        finally:
+            os.close(descriptor)
+
+    def _capture_snapshot_generation(
+        self,
+        destination_root: Path,
+        *,
+        database_signature: _SnapshotFileSignature,
+        wal_signature: _SnapshotFileSignature | None,
+    ) -> tuple[Path, tuple[tuple[int, str], tuple[int, str] | None]]:
+        wal = self.database.with_name(self.database.name + "-wal")
+        destination_root.mkdir(mode=0o700)
+        snapshot_database = destination_root / self.database.name
+        database_content = self._copy_snapshot_file(
+            self.database,
+            snapshot_database,
+            expected=database_signature,
+            max_bytes=_HEALTH_SNAPSHOT_MAX_DATABASE_BYTES,
+        )
+        wal_content = None
+        if wal_signature is not None:
+            wal_content = self._copy_snapshot_file(
+                wal,
+                snapshot_database.with_name(snapshot_database.name + "-wal"),
+                expected=wal_signature,
+                max_bytes=_HEALTH_SNAPSHOT_MAX_WAL_BYTES,
+            )
+        after_database = self._snapshot_signature(self.database)
+        after_wal = self._snapshot_signature(wal)
+        if (after_database, after_wal) != (database_signature, wal_signature):
+            raise CoordinatorHealthSnapshotError(
+                "coordinator files changed during generation capture"
+            )
+        return snapshot_database, (database_content, wal_content)
+
+    def _capture_health_snapshot(self, temporary_root: Path) -> Path:
+        wal = self.database.with_name(self.database.name + "-wal")
+        for attempt in range(_HEALTH_SNAPSHOT_ATTEMPTS):
+            attempt_root = temporary_root / f"attempt-{attempt}"
+            attempt_root.mkdir(mode=0o700)
+            try:
+                first_database_signature = self._snapshot_signature(self.database)
+                first_wal_signature = self._snapshot_signature(wal)
+                if first_database_signature is None:
+                    raise CoordinatorHealthSnapshotError(
+                        "coordinator database disappeared during snapshot"
+                    )
+                first_path, first_content = self._capture_snapshot_generation(
+                    attempt_root / "generation-1",
+                    database_signature=first_database_signature,
+                    wal_signature=first_wal_signature,
+                )
+                second_database_signature = self._snapshot_signature(self.database)
+                second_wal_signature = self._snapshot_signature(wal)
+                if second_database_signature is None:
+                    raise CoordinatorHealthSnapshotError(
+                        "coordinator database disappeared during snapshot"
+                    )
+                second_path, second_content = self._capture_snapshot_generation(
+                    attempt_root / "generation-2",
+                    database_signature=second_database_signature,
+                    wal_signature=second_wal_signature,
+                )
+            except CoordinatorHealthSnapshotError:
+                shutil.rmtree(attempt_root)
+                if attempt + 1 >= _HEALTH_SNAPSHOT_ATTEMPTS:
+                    raise
+                continue
+            if first_content == second_content:
+                shutil.rmtree(first_path.parent)
+                return second_path
+            shutil.rmtree(attempt_root)
+            if attempt + 1 >= _HEALTH_SNAPSHOT_ATTEMPTS:
+                raise CoordinatorHealthSnapshotError(
+                    "coordinator content changed throughout bounded snapshot retries"
+                )
+        raise CoordinatorHealthSnapshotError(
+            "coordinator health snapshot retry budget exhausted"
+        )
+
+    def health_read_only(self, *, now: datetime) -> CoordinatorHealth:
+        """Inspect health from a bounded stable copy, never opening live SQLite."""
+        requested_now = _instant(now, name="now")
+        with tempfile.TemporaryDirectory(prefix="hermes-workflow-health-") as root:
+            snapshot = self._capture_health_snapshot(Path(root))
+            connection = sqlite3.connect(
+                snapshot,
+                timeout=self.busy_timeout_seconds,
+                isolation_level=None,
+            )
+            connection.row_factory = sqlite3.Row
+            try:
+                connection.execute("PRAGMA query_only=ON")
+                row = connection.execute(
+                    "SELECT * FROM coordinator_lease WHERE singleton=1"
+                ).fetchone()
+                sample = self._sample(requested_now)
+            finally:
+                connection.close()
+        lease = self._lease(row) if row is not None else None
+        return self._health_for_lease(lease, sample)
+
+    @staticmethod
+    def _health_for_lease(
+        lease: CoordinatorLease | None, sample: LeaseClockSample
+    ) -> CoordinatorHealth:
         if lease is None:
             return CoordinatorHealth(
                 status="unavailable",

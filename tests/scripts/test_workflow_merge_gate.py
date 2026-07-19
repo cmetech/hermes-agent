@@ -83,6 +83,12 @@ def test_merge_gate_pins_workflow_catalog_api_contract() -> None:
     assert "tests/plugins/workflow/test_catalog_api.py" in source
 
 
+def test_merge_gate_pins_workflow_detail_api_contract() -> None:
+    source = GATE.read_text()
+
+    assert "tests/plugins/workflow/test_workflow_detail_api.py" in source
+
+
 def test_native_workflow_matrix_covers_every_release_gate() -> None:
     source = CI.read_text()
 

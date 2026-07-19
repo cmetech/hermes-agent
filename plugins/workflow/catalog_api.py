@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Literal, TypedDict
 
-from plugins.workflow.cli import show_package
+from plugins.workflow.cli import (
+    WorkflowDefinitionProjectionCapacityError,
+    show_package,
+)
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.models import WorkflowPackage, WorkflowValidationError
 from plugins.workflow.schema import load_workflow
@@ -90,6 +95,14 @@ class WorkflowCatalogUnavailableError(RuntimeError):
 
 class WorkflowCatalogTrustUnavailableError(RuntimeError):
     """The trust store cannot classify a catalog entry safely."""
+
+
+class WorkflowCatalogInvalidDefinitionError(RuntimeError):
+    """The requested workflow references an invalid package resource."""
+
+
+class WorkflowDetailNotFoundError(LookupError):
+    """The requested workflow is absent from the bounded catalog."""
 
 
 @dataclass(slots=True)
@@ -331,6 +344,22 @@ def _input_projection(
     return inputs, classification
 
 
+def qualify_workflow_catalog_package(
+    package: WorkflowPackage, *, compatibility
+) -> dict[str, object]:
+    """Apply the shared bounded show/detail/admission projection contract."""
+    try:
+        return show_package(
+            package,
+            compatibility_report=compatibility,
+            include_argument_hints=False,
+        )
+    except WorkflowDefinitionProjectionCapacityError as exc:
+        raise WorkflowCatalogCapacityError(
+            "workflow catalog definition projection limit exceeded"
+        ) from exc
+
+
 def _enum_choices_supported(specification: Mapping[object, object]) -> bool:
     choice_fields = [field for field in _ENUM_INPUT_FIELDS if field in specification]
     if len(choice_fields) != 1:
@@ -376,10 +405,9 @@ def _catalog_entry(
 ) -> CatalogEntry:
     # The CLI show projection is the established body-free catalog contract.
     compatibility = assess_compatibility(package)
-    shown = show_package(
+    shown = qualify_workflow_catalog_package(
         package,
-        compatibility_report=compatibility,
-        include_argument_hints=False,
+        compatibility=compatibility,
     )
     risk = build_risk_summary(package, compatibility, read_budget=resource_budget)
     trust_state = trust_store.check_snapshot(
@@ -443,7 +471,7 @@ def build_workflow_catalog(
                     resource_budget,
                 )
             )
-        except WorkflowResourceCapacityError:
+        except (WorkflowCatalogCapacityError, WorkflowResourceCapacityError):
             items.append(
                 _error_entry(discovered_item.definition.name, "catalog_capacity")
             )
@@ -460,6 +488,154 @@ def build_workflow_catalog(
     return items, truncated
 
 
+def _coordinator_projection(hermes_home: Path) -> dict[str, object]:
+    database = hermes_home / "workflows" / "admission.sqlite3"
+    if not database.is_file():
+        return {
+            "healthy": False,
+            "status": "unavailable",
+            "reason": "coordinator_missing",
+        }
+    try:
+        from plugins.workflow.coordinator_store import CoordinatorStore
+
+        health = CoordinatorStore(database).health_read_only(
+            now=datetime.now(timezone.utc)
+        )
+    except (
+        OSError,
+        sqlite3.Error,
+        TypeError,
+        ValueError,
+        IndexError,
+        KeyError,
+        AssertionError,
+        OverflowError,
+    ):
+        return {
+            "healthy": False,
+            "status": "unavailable",
+            "reason": "coordinator_health_unavailable",
+        }
+    return {
+        "healthy": health.status == "healthy",
+        "status": health.status,
+        "reason": health.reason_code,
+    }
+
+
+def build_workflow_detail(
+    name: str, *, hermes_home: str | Path, workdir: str | Path
+) -> dict[str, object]:
+    """Return one bounded, redacted, read-only workflow preflight projection."""
+    if not isinstance(name, str) or not name.strip() or len(name) > 128:
+        raise WorkflowDetailNotFoundError(name)
+    home = Path(hermes_home).expanduser().resolve()
+    discovered, _truncated = _discover_catalog(
+        Path(workdir).expanduser().resolve(), home
+    )
+    package = next(
+        (
+            item
+            for item in discovered
+            if isinstance(item, WorkflowPackage) and item.definition.name == name
+        ),
+        None,
+    )
+    if package is None:
+        if any(
+            isinstance(item, dict)
+            and item.get("name") == name
+            and item.get("error") == "catalog_capacity"
+            for item in discovered
+        ):
+            raise WorkflowCatalogCapacityError(
+                "workflow detail definition limit exceeded"
+            )
+        raise WorkflowDetailNotFoundError(name)
+
+    resource_budget = WorkflowResourceReadBudget(
+        max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
+        max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
+        max_files=CATALOG_MAX_RESOURCE_FILES,
+    )
+    compatibility = assess_compatibility(package)
+    shown = qualify_workflow_catalog_package(
+        package,
+        compatibility=compatibility,
+    )
+    try:
+        risk = build_risk_summary(package, compatibility, read_budget=resource_budget)
+    except WorkflowResourceCapacityError as exc:
+        raise WorkflowCatalogCapacityError(
+            "workflow detail resource limit exceeded"
+        ) from exc
+    except WorkflowValidationError as exc:
+        raise WorkflowCatalogInvalidDefinitionError(
+            "workflow detail contains an invalid package resource"
+        ) from exc
+    try:
+        trust_store = WorkflowTrustStore(home)
+        trust_snapshot = trust_store.snapshot_read_only(
+            max_bytes=CATALOG_MAX_TRUST_STORE_BYTES
+        )
+        trust_state = trust_store.check_snapshot(
+            trust_snapshot,
+            risk.package_digest,
+            risk_digest=risk.risk_digest,
+        )
+    except WorkflowTrustError as exc:
+        raise WorkflowCatalogTrustUnavailableError(
+            "workflow trust classification is unavailable"
+        ) from exc
+    inputs, supported_inputs = _input_projection(package)
+    warnings = [str(item) for item in shown["topology_warnings"]]
+    mermaid = shown["topology_mermaid"]
+    omitted = None
+    if mermaid is None:
+        omitted = next(
+            (
+                warning
+                for warning in warnings
+                if warning.startswith("topology_mermaid_")
+            ),
+            "topology_mermaid_omitted",
+        )
+    return {
+        "name": str(shown["name"]),
+        "version": "1",
+        "description": str(shown["definition"]["description"]),
+        "source": str(shown["source"]),
+        "precedence": int(shown["precedence"]),
+        "trust_state": trust_state,
+        "inputs": inputs,
+        "supported_inputs": supported_inputs,
+        "risk_summary": risk.to_dict(),
+        "compatibility": {
+            "level": compatibility.level.value,
+            "runnable": compatibility.runnable,
+            "findings": [
+                {
+                    "path": finding.path,
+                    "level": finding.level.value,
+                    "message": finding.message,
+                    "blocking": finding.blocking,
+                    "code": finding.code,
+                }
+                for finding in compatibility.findings
+            ],
+        },
+        "coordinator": _coordinator_projection(home),
+        "topology": {
+            "text": shown["topology_text"],
+            "mermaid": mermaid,
+            "warnings": warnings,
+            "omitted": omitted,
+        },
+        "definition": shown["definition"],
+    }
+
+
 __all__ = [
     "CATALOG_LIMIT",
     "CATALOG_MAX_SCAN_ENTRIES",
@@ -471,8 +647,12 @@ __all__ = [
     "CATALOG_MAX_RESOURCE_TOTAL_BYTES",
     "CATALOG_MAX_TRUST_STORE_BYTES",
     "WorkflowCatalogCapacityError",
+    "WorkflowCatalogInvalidDefinitionError",
     "WorkflowCatalogTrustUnavailableError",
     "WorkflowCatalogUnavailableError",
+    "WorkflowDetailNotFoundError",
     "build_workflow_catalog",
+    "build_workflow_detail",
     "desktop_input_name_is_representable",
+    "qualify_workflow_catalog_package",
 ]

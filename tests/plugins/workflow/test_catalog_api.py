@@ -798,6 +798,28 @@ def test_workflow_catalog_enforces_aggregate_definition_budget_per_entry(
     }
 
 
+def test_workflow_catalog_classifies_projection_exhaustion_as_capacity(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(
+        home / "workflows",
+        name="projection-capacity",
+        nodes=[
+            {"id": f"node-{index:03d}", "bash": "true"}
+            for index in range(513)
+        ],
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    assert response.json()["items"] == [
+        {"name": "projection-capacity", "error": "catalog_capacity"}
+    ]
+
+
 def test_workflow_catalog_project_definition_overrides_profile(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:

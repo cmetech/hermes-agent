@@ -239,6 +239,41 @@ class WorkflowCatalogResponse(BaseModel):
     truncated: bool
 
 
+class WorkflowTopologyResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., max_length=16_384)
+    mermaid: str | None = Field(None, max_length=65_536)
+    warnings: list[str] = Field(..., max_length=8)
+    omitted: str | None = Field(None, max_length=256)
+
+
+class WorkflowCoordinatorResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    healthy: bool
+    status: str = Field(..., max_length=64)
+    reason: str = Field(..., max_length=128)
+
+
+class WorkflowDetailResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=128)
+    version: str = Field(..., min_length=1, max_length=32)
+    description: str = Field(..., max_length=16_384)
+    source: str = Field(..., min_length=1, max_length=64)
+    precedence: int
+    trust_state: Literal["trusted", "untrusted"]
+    inputs: list[WorkflowCatalogInput] = Field(..., max_length=64)
+    supported_inputs: WorkflowCatalogInputSupport
+    risk_summary: dict[str, object]
+    compatibility: dict[str, object]
+    coordinator: WorkflowCoordinatorResponse
+    topology: WorkflowTopologyResponse
+    definition: dict[str, object]
+
+
 @router.get("/workflows", response_model=WorkflowCatalogResponse)
 def list_workflows(
     request: Request,
@@ -276,6 +311,62 @@ def list_workflows(
         "items": [sanitize_projection(item) for item in items],
         "truncated": truncated,
     }
+
+
+@router.get("/workflows/{name}", response_model=WorkflowDetailResponse)
+def workflow_detail(
+    name: str,
+    request: Request,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request, operator_scope)
+    operator.require("read")
+    from plugins.workflow.catalog_api import (
+        WorkflowCatalogCapacityError,
+        WorkflowCatalogInvalidDefinitionError,
+        WorkflowCatalogTrustUnavailableError,
+        WorkflowCatalogUnavailableError,
+        WorkflowDetailNotFoundError,
+        build_workflow_detail,
+    )
+
+    try:
+        detail = build_workflow_detail(
+            name, hermes_home=get_hermes_home(), workdir=Path.cwd()
+        )
+    except WorkflowDetailNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail={"code": "workflow_not_found"}
+        ) from exc
+    except WorkflowCatalogCapacityError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "workflow_catalog_capacity", "retryable": True},
+        ) from exc
+    except WorkflowCatalogInvalidDefinitionError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "workflow_invalid_definition",
+                "retryable": False,
+            },
+        ) from exc
+    except WorkflowCatalogUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "workflow_catalog_unavailable", "retryable": True},
+        ) from exc
+    except WorkflowCatalogTrustUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "workflow_trust_unavailable", "retryable": True},
+        ) from exc
+    sanitized = sanitize_projection(detail)
+    assert isinstance(sanitized, dict)
+    # build_workflow_detail already supplies the shared semantically redacted,
+    # byte-bounded definition; generic list limits must not silently clip it.
+    sanitized["definition"] = detail["definition"]
+    return sanitized
 
 
 @contextmanager

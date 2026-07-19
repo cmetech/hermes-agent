@@ -571,6 +571,14 @@ class WorkflowTrustStore:
         """Classify one digest from a previously loaded read-only snapshot."""
         return self._classify(snapshot, package_digest, risk_digest=risk_digest)
 
+    def check_read_only(
+        self, package_digest: str, *, risk_digest: str | None = None
+    ) -> Literal["trusted", "untrusted"]:
+        """Classify trust without creating locks, directories, or store files."""
+        return self._classify(
+            self._read(mutation=False), package_digest, risk_digest=risk_digest
+        )
+
     @staticmethod
     def _classify(
         payload: Mapping[str, object],

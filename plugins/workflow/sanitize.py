@@ -18,6 +18,8 @@ _WINDOWS_DEVICE_NAME = re.compile(
 )
 _PORTABLE_COMPONENT_MAX_UNITS = 255
 _TEXT_INPUT_SUFFIX = ".txt"
+_PROJECTION_MAX_CHARS = 16_384
+_TRUNCATION_SUFFIX = "…[TRUNCATED]"
 
 
 def workflow_input_name_is_portable(name: object, *, max_length: int = 128) -> bool:
@@ -60,6 +62,11 @@ def workflow_input_names_are_portable(names: object) -> bool:
     return True
 
 
+def projection_key_is_secret(key: str) -> bool:
+    """Return whether a projection key names operator-sensitive content."""
+    return bool(_SECRET_KEY.search(key))
+
+
 def sanitize_text(value: str, *, max_chars: int = 16_384) -> tuple[str, bool]:
     cleaned = _CONTROL.sub("�", _ANSI.sub("", value))
     if len(cleaned) <= max_chars:
@@ -77,7 +84,7 @@ def sanitize_evidence_bytes(
 def sanitize_projection(value: object, *, key: str = "", depth: int = 0) -> object:
     if depth > 12:
         return "[TRUNCATED_DEPTH]"
-    if _SECRET_KEY.search(key):
+    if projection_key_is_secret(key):
         return "[REDACTED]"
     if isinstance(value, Mapping):
         return {
@@ -91,18 +98,22 @@ def sanitize_projection(value: object, *, key: str = "", depth: int = 0) -> obje
             sanitize_projection(item, key=key, depth=depth + 1) for item in value[:200]
         ]
     if isinstance(value, str):
-        cleaned, truncated = sanitize_text(value, max_chars=16_384)
+        cleaned, truncated = sanitize_text(value, max_chars=_PROJECTION_MAX_CHARS)
         if key.lower() == "transition_key" and ":gateway:" in cleaned:
             cleaned = cleaned.partition(":gateway:")[0] + ":gateway:opaque"
         if key.lower() in {"path", "source_path", "run_directory", "relative_path"}:
             cleaned = PurePath(cleaned).name
-        return cleaned + ("…[TRUNCATED]" if truncated else "")
+        if truncated:
+            cleaned = cleaned[: _PROJECTION_MAX_CHARS - len(_TRUNCATION_SUFFIX)]
+            return cleaned + _TRUNCATION_SUFFIX
+        return cleaned
     if value is None or isinstance(value, bool | int | float):
         return value
     return sanitize_projection(str(value), key=key, depth=depth + 1)
 
 
 __all__ = [
+    "projection_key_is_secret",
     "sanitize_evidence_bytes",
     "sanitize_projection",
     "sanitize_text",

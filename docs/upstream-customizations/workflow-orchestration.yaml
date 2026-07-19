@@ -749,3 +749,53 @@ upstream_changes:
   removal_condition: Remove when upstream provides an equivalent authenticated,
     bounded, sanitized, failure-isolated workflow catalog for generic clients.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-detail-preflight-api
+  change_class: workflow-rest-adapter
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/cli.py
+  - plugins/workflow/coordinator_store.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/machine_contract.py
+  - plugins/workflow/sanitize.py
+  - plugins/workflow/trust.py
+  - scripts/test_workflow_merge_gate.sh
+  owned_symbols:
+  - _definition_projection
+  - WorkflowDefinitionProjectionCapacityError
+  - qualify_workflow_catalog_package
+  - build_workflow_detail
+  - WorkflowCatalogInvalidDefinitionError
+  - WorkflowDetailNotFoundError
+  - CoordinatorStore.health_read_only
+  - CoordinatorHealthSnapshotError
+  - bounded stable coordinator DB/WAL snapshot contract
+  - consecutive full-pair SHA-256 generation verification
+  - WorkflowTrustStore.check_read_only
+  - projection_key_is_secret
+  - suffix-bounded sanitize_projection strings
+  - workflow show complete definition preservation
+  - WorkflowDetailResponse
+  - workflow_detail
+  tests:
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(workflow): Task 2 add detail preflight endpoint'
+  upstream_candidate: true
+  merge_guidance: Preserve the authenticated workflow:read boundary, bounded
+    catalog and package-resource reads, shared CLI/REST redacted normalized
+    definition and topology values, one shared list/detail/admission qualifier
+    for explicit complete-definition node/edge/byte bounds, ordered Mermaid
+    warning preservation, cancel/hook/body redaction with
+    benign policy preservation, nonmutating trust classification from the same
+    byte-bounded shape-validated snapshot contract as the catalog, WAL-aware
+    coordinator health from two consecutive bounded SHA-256-verified temporary
+    DB/WAL generations per attempt, including same-metadata overwrite detection,
+    without ever opening authoritative SQLite files; typed invalid-resource
+    failure isolation; and byte-stable profile state. Keep all workflow imports
+    lazy in the generic dashboard host and do not add execution, admission,
+    staging, or trust mutation authority.
+  removal_condition: Remove when upstream provides an equivalent authenticated,
+    bounded, redacted, mutation-free workflow detail and preflight API.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
