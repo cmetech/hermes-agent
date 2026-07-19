@@ -448,16 +448,18 @@ def test_windows_job_kills_detached_grandchild_after_parent_exit() -> None:
     tree = ManagedProcessTree.spawn([sys.executable, "-c", parent_code])
     assert tree.process.stdout is not None
     grandchild_pid = int(tree.process.stdout.readline().decode().strip())
+    grandchild = psutil.Process(grandchild_pid)
     tree.process.wait(timeout=5)
 
     try:
         assert tree.tree_active() is True
         tree.close()
         assert tree.tree_active() is False
-        assert not psutil.pid_exists(grandchild_pid)
+        grandchild.wait(timeout=5)
+        assert not grandchild.is_running()
     finally:
-        if psutil.pid_exists(grandchild_pid):
-            psutil.Process(grandchild_pid).kill()
+        if grandchild.is_running():
+            grandchild.kill()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group contract")

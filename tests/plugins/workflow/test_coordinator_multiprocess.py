@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import multiprocessing
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import threading
 import time
@@ -240,7 +241,12 @@ def test_mid_node_takeover_fences_old_epoch_before_outward_effect(
     path = workflow_writer(
         tmp_path / "package",
         name="mid-node-takeover",
-        nodes=[{"id": "start", "bash": f"echo epoch-2 >> {marker}"}],
+        nodes=[
+            {
+                "id": "start",
+                "bash": f"echo epoch-2 >> {shlex.quote(str(marker))}",
+            }
+        ],
     )
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         "outward_action_nodes: [start]\n",

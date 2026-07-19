@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import hashlib
 import json
 from pathlib import Path
@@ -394,7 +395,7 @@ def test_future_index_schema_is_preserved_and_rebuilt_fail_closed(
         for path in directory.rglob("*")
         if path.is_file()
     }
-    with sqlite3.connect(store.database) as connection:
+    with closing(sqlite3.connect(store.database)) as connection, connection:
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         connection.execute("PRAGMA user_version=999")
 
