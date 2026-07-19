@@ -44,6 +44,8 @@ class NodeExecutionContext:
     record_iteration: (
         Callable[[tuple[ArtifactRef, ...], Mapping[str, object]], None] | None
     ) = None
+    spawn_intent: Callable[[str], bool] | None = None
+    spawn_failed: Callable[[str, str], bool] | None = None
     process_started: Callable[[ProcessIdentity], bool] | None = None
     process_stopped: Callable[[ProcessIdentity, bool], None] | None = None
     monotonic: Callable[[], float] = time.monotonic

@@ -1006,11 +1006,17 @@ class RunStore:
         journal_sha256: str,
     ) -> None:
         connection.execute(
-            "UPDATE runs SET projection_schema_version=?, "
+            "UPDATE runs SET status=?, desired_status=?, execution_mode=?, "
+            "queue_position=?, blocked_by_run_id=?, projection_schema_version=?, "
             "projection_state_version=?, projection_sha256=?, "
             "journal_sequence=?, journal_sha256=?, integrity_verified_at=? "
             "WHERE run_id=?",
             (
+                projection["status"],
+                projection.get("desired_status"),
+                projection.get("execution_mode", "foreground"),
+                projection.get("queue_position"),
+                projection.get("blocked_by_run_id"),
                 int(projection.get("schema_version", 1)),
                 int(projection["state_version"]),
                 _projection_digest(projection),
@@ -1026,6 +1032,11 @@ class RunStore:
     ) -> None:
         journal_sha256 = _sha256((directory / "events.jsonl").read_bytes())
         expected = (
+            projection["status"],
+            projection.get("desired_status"),
+            projection.get("execution_mode", "foreground"),
+            projection.get("queue_position"),
+            projection.get("blocked_by_run_id"),
             int(projection.get("schema_version", 1)),
             int(projection["state_version"]),
             _projection_digest(projection),
@@ -1034,7 +1045,9 @@ class RunStore:
         )
         with self._connect() as connection:
             current = connection.execute(
-                "SELECT projection_schema_version, projection_state_version, "
+                "SELECT status, desired_status, execution_mode, queue_position, "
+                "blocked_by_run_id, projection_schema_version, "
+                "projection_state_version, "
                 "projection_sha256, journal_sequence, journal_sha256 "
                 "FROM runs WHERE run_id=?",
                 (projection["run_id"],),
@@ -3529,6 +3542,141 @@ class RunStore:
                 defer_notification=fence_connection is not None,
             )
 
+    @staticmethod
+    def _executor_nonce(value: str) -> str:
+        if not isinstance(value, str) or not value or len(value) > 256:
+            raise ValueError("executor_nonce must be bounded non-empty text")
+        return value
+
+    def record_spawn_intent(
+        self,
+        claim: NodeClaim,
+        *,
+        executor_nonce: str,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Persist an attempt-bound intent before any process may be created."""
+        nonce = self._executor_nonce(executor_nonce)
+        directory = self.run_directory(claim.run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection["nodes"][claim.node_id]
+                active = node.get("claim", {})
+                if active.get("attempt_id") != claim.attempt_id:
+                    return False
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == claim.attempt_id
+                    ),
+                    None,
+                )
+                if not isinstance(attempt, dict):
+                    return False
+                existing = attempt.get("spawn")
+                if isinstance(existing, Mapping):
+                    return (
+                        existing.get("executor_nonce") == nonce
+                        and existing.get("state") == "intent"
+                    )
+                effect_classification = str(
+                    attempt.get(
+                        "effect_classification",
+                        active.get("effect_classification", "replay_safe"),
+                    )
+                )
+                spawn = {
+                    "state": "intent",
+                    "executor_nonce": nonce,
+                    "effect_classification": effect_classification,
+                    "recorded_at": _utc_now(),
+                }
+                attempt["spawn"] = spawn
+                active["spawn"] = dict(spawn)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "spawn_intent",
+                    {
+                        "executor_nonce": nonce,
+                        "effect_classification": effect_classification,
+                    },
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
+
+    def record_spawn_failed(
+        self,
+        claim: NodeClaim,
+        *,
+        executor_nonce: str,
+        error_code: str,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Prove that one persisted spawn intent did not create a process."""
+        nonce = self._executor_nonce(executor_nonce)
+        safe_error = _sanitize_diagnostic(error_code) or "spawn_failed"
+        directory = self.run_directory(claim.run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection["nodes"][claim.node_id]
+                active = node.get("claim", {})
+                if active.get("attempt_id") != claim.attempt_id:
+                    return False
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(node.get("attempts", []))
+                        if candidate.get("attempt_id") == claim.attempt_id
+                    ),
+                    None,
+                )
+                spawn = attempt.get("spawn") if isinstance(attempt, dict) else None
+                if (
+                    not isinstance(spawn, dict)
+                    or spawn.get("executor_nonce") != nonce
+                    or spawn.get("state") != "intent"
+                    or attempt.get("process_identity") is not None
+                ):
+                    return False
+                spawn.update({
+                    "state": "failed",
+                    "failed_at": _utc_now(),
+                    "error_code": safe_error,
+                })
+                active["spawn"] = dict(spawn)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "spawn_failed",
+                    {"executor_nonce": nonce, "error_code": safe_error},
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
+
     def record_process_started(
         self,
         claim: NodeClaim,
@@ -3561,6 +3709,13 @@ class RunStore:
                 active["process_identity"] = serialized
                 node["attempts"][-1]["process_identity"] = serialized
                 node["attempts"][-1]["process_started_at"] = _utc_now()
+                spawn = node["attempts"][-1].get("spawn")
+                if isinstance(spawn, dict):
+                    spawn["state"] = "started"
+                    spawn["process_started_at"] = node["attempts"][-1][
+                        "process_started_at"
+                    ]
+                    active["spawn"] = dict(spawn)
                 self._append_locked(
                     directory,
                     projection,
@@ -4527,7 +4682,7 @@ class RunStore:
                     )
                 )
                 serialized = attempt.get("process_identity")
-                observation = self._observe_process_identity(serialized)
+                observation = self._observe_attempt(attempt)
                 if self._reclaim_still_running_claim(
                     directory,
                     projection,
@@ -4753,6 +4908,18 @@ class RunStore:
         except Exception:
             return "outcome_uncertain"
 
+    @classmethod
+    def _observe_attempt(cls, attempt: Mapping[str, object]) -> str:
+        serialized = attempt.get("process_identity")
+        if isinstance(serialized, Mapping):
+            return cls._observe_process_identity(serialized)
+        spawn = attempt.get("spawn")
+        if not isinstance(spawn, Mapping):
+            return "not_started"
+        if spawn.get("state") == "failed":
+            return "not_started"
+        return "outcome_uncertain"
+
     def interrupt_active_claims(
         self,
         run_id: str,
@@ -4807,9 +4974,7 @@ class RunStore:
                     ),
                     node["attempts"][-1],
                 )
-                observation = self._observe_process_identity(
-                    attempt.get("process_identity")
-                )
+                observation = self._observe_attempt(attempt)
                 effect_classification = str(
                     attempt.get("effect_classification", "replay_safe")
                 )
@@ -4935,9 +5100,7 @@ class RunStore:
                 ),
                 node["attempts"][-1],
             )
-            observation = self._observe_process_identity(
-                attempt.get("process_identity")
-            )
+            observation = self._observe_attempt(attempt)
             effect_classification = str(
                 attempt.get("effect_classification", "replay_safe")
             )
@@ -5930,6 +6093,11 @@ class RunStore:
                 raise RuntimeError(
                     "cannot abandon while executor termination is unproven"
                 )
+            if any(
+                isinstance(node.get("claim"), Mapping)
+                for node in projection["nodes"].values()
+            ):
+                raise RuntimeError("cannot abandon while a live executor claim exists")
             if projection["status"] in {"succeeded", "cancelled", "abandoned"}:
                 if target == "cancelled":
                     return {**projection, "cancellation_outcome": "already_terminal"}

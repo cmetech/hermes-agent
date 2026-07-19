@@ -9,6 +9,7 @@ import time
 import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import JournalRecoveryError, RunStore
 import plugins.workflow.store as store_module
@@ -96,6 +97,44 @@ def test_run_listing_isolates_corrupt_evidence_and_reports_degradation(
     assert running[corrupt.run_id]["health"] == "storage_degraded"
     refused = _start(store, package, "must-not-use-uncertain-capacity")
     assert refused.reason_code == "storage_repair_required"
+
+
+def test_status_drift_is_resynchronized_on_same_process_load(
+    tmp_path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="status-drift")
+    )
+    store = RunStore(tmp_path / "home")
+    admitted = _start(store, package, "status-drift")
+    terminal = RunScheduler(store).advance(admitted.run_id)
+    assert terminal["status"] == "succeeded"
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE runs SET status='running', desired_status='cancelled', "
+            "execution_mode='background', queue_position=7, "
+            "blocked_by_run_id='stale-blocker', projection_state_version=0 "
+            "WHERE run_id=?",
+            (admitted.run_id,),
+        )
+
+    loaded = store.load_run(admitted.run_id)
+
+    assert loaded == terminal
+    with store._connect() as connection:
+        row = connection.execute(
+            "SELECT status, desired_status, execution_mode, queue_position, "
+            "blocked_by_run_id, projection_state_version FROM runs WHERE run_id=?",
+            (admitted.run_id,),
+        ).fetchone()
+    assert tuple(row) == (
+        "succeeded",
+        terminal.get("desired_status"),
+        terminal["execution_mode"],
+        terminal.get("queue_position"),
+        terminal.get("blocked_by_run_id"),
+        terminal["state_version"],
+    )
 
 
 def test_new_journal_frames_have_content_checksums(tmp_path, workflow_writer) -> None:

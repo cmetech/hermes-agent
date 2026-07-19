@@ -107,9 +107,9 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
     assert projection["status"] == expected["status"]
     assert projection["event_sequence"] == expected["event_sequence"]
     assert projection["state_version"] == expected["state_version"]
-    assert projection["nodes"]["start"]["attempts"][0]["attempt_id"] == expected[
-        "attempt_id"
-    ]
+    legacy_attempt = projection["nodes"]["start"]["attempts"][0]
+    assert legacy_attempt["attempt_id"] == expected["attempt_id"]
+    assert "spawn" not in legacy_attempt
     assert (
         store.node_effect_classification(
             "migration-run", "start", projection=projection
@@ -204,6 +204,13 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
     assert migrated["run_directory"] == relocated
     assert migrated["projection_schema_version"] == 1
     assert migrated["projection_state_version"] == expected["state_version"]
+    assert migrated["status"] == projection["status"]
+    assert migrated["desired_status"] == projection.get("desired_status")
+    assert migrated["execution_mode"] == projection.get(
+        "execution_mode", "foreground"
+    )
+    assert migrated["queue_position"] == projection.get("queue_position")
+    assert migrated["blocked_by_run_id"] == projection.get("blocked_by_run_id")
     assert len(migrated["projection_sha256"]) == 64
     assert migrated["journal_sequence"] == expected["event_sequence"]
     assert len(migrated["journal_sha256"]) == 64

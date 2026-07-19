@@ -327,6 +327,9 @@ class RunScheduler:
             lease_seconds=self.lease_seconds,
         )
 
+    def _is_execution_fence_loss(self, exc: RuntimeError) -> bool:
+        return self.execution_fence is not None and "execution fence" in str(exc)
+
     @property
     def active_run_count(self) -> int:
         """Return the scheduler-local active-run count for lifecycle diagnostics."""
@@ -602,6 +605,18 @@ class RunScheduler:
                                     loop_state=state,
                                 )
                             ),
+                            spawn_intent=lambda executor_nonce: (
+                                self.store.record_spawn_intent(
+                                    claim, executor_nonce=executor_nonce
+                                )
+                            ),
+                            spawn_failed=lambda executor_nonce, error_code: (
+                                self.store.record_spawn_failed(
+                                    claim,
+                                    executor_nonce=executor_nonce,
+                                    error_code=error_code,
+                                )
+                            ),
                             process_started=lambda identity: (
                                 self.store.record_process_started(claim, identity)
                             ),
@@ -771,6 +786,7 @@ class RunScheduler:
                 if remaining is not None:
                     capacity = min(capacity, remaining)
                 claims = []
+                fence_lost = False
                 for node_id in ready[:capacity]:
                     try:
                         claim = self.store.claim_node(
@@ -795,8 +811,17 @@ class RunScheduler:
                     except StorageQuotaError as exc:
                         self.store.interrupt_for_host_pressure(run_id, message=str(exc))
                         break
+                    except RuntimeError as exc:
+                        if not self._is_execution_fence_loss(exc):
+                            raise
+                        fence_lost = True
+                        break
                     if claim is not None:
                         claims.append((claim, by_id[node_id], projection))
+                if fence_lost:
+                    for claim, _node, _projection in claims:
+                        self.store.release_claim_before_execution(claim)
+                    break
                 if not claims:
                     break
                 with ThreadPoolExecutor(
@@ -841,6 +866,7 @@ class RunScheduler:
         fair_cursor = 0
         try:
             while not self._shutdown.is_set():
+                fence_lost = False
                 if len(futures) >= self.max_parallel_nodes:
                     done, _pending = wait(futures, return_when=FIRST_COMPLETED)
                     for future in done:
@@ -925,6 +951,11 @@ class RunScheduler:
                             )
                             candidates[run_id].clear()
                             continue
+                        except RuntimeError as exc:
+                            if not self._is_execution_fence_loss(exc):
+                                raise
+                            fence_lost = True
+                            break
                         if claim is None:
                             continue
                         node = next(
@@ -941,8 +972,14 @@ class RunScheduler:
                         ))
                         fair_cursor = (active.index(run_id) + 1) % len(active)
                         claimed_this_round = True
+                    if fence_lost:
+                        break
                     if not claimed_this_round:
                         break
+                if fence_lost:
+                    for _run_id, claim, _node, _package, _snapshot in claims:
+                        self.store.release_claim_before_execution(claim)
+                    break
                 for claim in claims:
                     futures.add(pool.submit(self._execute_claim, *claim))
                 if not claims:

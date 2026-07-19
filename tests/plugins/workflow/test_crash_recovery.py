@@ -9,6 +9,8 @@ import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.executors.script import ScriptExecutor
+from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import JournalRecoveryError, RunStore
@@ -114,6 +116,106 @@ def test_expired_outward_attempt_preserves_identity_and_requires_reconciliation(
     stopped = store.load_run(admitted.run_id)["nodes"]["start"]["attempts"][-1]
     assert stopped["process_identity"]["pid"] == identity.pid
     assert stopped["process_stop"]["cleaned"] is True
+
+
+def test_spawn_intent_without_process_identity_is_outcome_uncertain(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(workflow_writer(tmp_path / "package"))
+    admitted = _run(store, package)
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "owner",
+        lease_seconds=1,
+        executor_id="bash",
+        effect_classification="outward",
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+    assert store.record_spawn_intent(claim, executor_nonce="nonce-before-spawn")
+
+    assert store.expire_stale_claims(
+        admitted.run_id, now=claim.lease_expires_at + timedelta(seconds=1)
+    ) == ("start",)
+
+    projection = store.load_run(admitted.run_id)
+    node = projection["nodes"]["start"]
+    attempt = node["attempts"][-1]
+    assert projection["status"] == "paused"
+    assert node["recovery"]["observation"] == "outcome_uncertain"
+    assert node["recovery"]["termination_confirmed"] is False
+    assert attempt["spawn"]["state"] == "intent"
+    assert attempt["spawn"]["executor_nonce"] == "nonce-before-spawn"
+    assert attempt["spawn"]["effect_classification"] == "outward"
+
+
+@pytest.mark.parametrize("node_type", ["bash", "script"])
+def test_spawn_intent_precedes_process_creation_and_spawn_failure_is_durable(
+    tmp_path, workflow_writer, monkeypatch, node_type
+) -> None:
+    node = (
+        {"id": "start", "bash": "true"}
+        if node_type == "bash"
+        else {
+            "id": "start",
+            "script": "print('never')",
+            "runtime": "uv",
+        }
+    )
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", nodes=[node])
+    )
+    admitted = _run(store, package)
+    observed_spawn_states = []
+
+    def fail_spawn(cls, *args, **kwargs):
+        projection = store.load_run(admitted.run_id)
+        attempt = projection["nodes"]["start"]["attempts"][-1]
+        observed_spawn_states.append(attempt["spawn"]["state"])
+        assert "process_identity" not in attempt
+        raise OSError("injected spawn failure")
+
+    monkeypatch.setattr(ManagedProcessTree, "spawn", classmethod(fail_spawn))
+    scheduler = RunScheduler(store)
+    if node_type == "script":
+        scheduler.executors["script"] = ScriptExecutor(
+            runtime_locator=lambda _runtime: "/fake/uv"
+        )
+
+    failed = scheduler.advance(admitted.run_id)
+
+    assert failed["status"] == "failed"
+    assert observed_spawn_states == ["intent"]
+    attempt = failed["nodes"]["start"]["attempts"][-1]
+    assert attempt["spawn"]["state"] == "failed"
+    events = [event["event_type"] for event in store.tail_events(admitted.run_id)]
+    assert events.index("spawn_intent") < events.index("spawn_failed")
+    assert events.index("spawn_failed") < events.index("node_failed")
+
+
+def test_stale_epoch_between_renewal_and_claim_is_nonfatal(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(workflow_writer(tmp_path / "package"))
+    admitted = _run(store, package)
+    scheduler = RunScheduler(
+        store, execution_fence=ExecutionFence("old-coordinator", 1)
+    )
+    monkeypatch.setattr(scheduler, "_renew_execution_owner", lambda _run_id: True)
+
+    def lose_epoch(*args, **kwargs):
+        raise RuntimeError("stale coordinator execution fence")
+
+    monkeypatch.setattr(store, "claim_node", lose_epoch)
+
+    projection = scheduler.advance(admitted.run_id)
+
+    assert projection["status"] == "running"
+    assert projection["nodes"]["start"]["state"] == "ready"
 
 
 def test_expired_attempt_is_reclaimed_only_by_same_fresh_coordinator_epoch(
@@ -342,6 +444,56 @@ def test_abandon_failed_run_is_atomic_and_blocks_live_recovery(
 
     with pytest.raises(RuntimeError, match="termination is unproven"):
         store.abandon_run(active.run_id)
+
+
+def test_abandon_refuses_paused_run_with_live_claim(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store = RunStore(tmp_path / "home")
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "parallel-package",
+            name="parallel-abandon",
+            nodes=[
+                {"id": "gate", "approval": {"message": "Continue?"}},
+                {"id": "worker", "bash": "sleep 30"},
+            ],
+        )
+    )
+    admitted = _run(store, package)
+    worker = store.claim_node(
+        admitted.run_id,
+        "worker",
+        "worker-owner",
+        executor_id="bash",
+    )
+    assert worker is not None
+    store.mark_node_started(worker)
+    identity = ProcessIdentity(pid=999_996, start_time=56789, group_id=999_996)
+    assert store.record_process_started(worker, identity)
+    monkeypatch.setattr(ProcessIdentity, "is_current", lambda self: True)
+    gate = store.claim_node(admitted.run_id, "gate", "gate-owner")
+    assert gate is not None
+    store.mark_node_started(gate)
+    store.complete_node(
+        gate,
+        status="paused",
+        metadata={
+            "pending_interaction": {
+                "type": "workflow_approval",
+                "interaction_id": "parallel-gate",
+            }
+        },
+    )
+    before = store.load_run(admitted.run_id)
+    assert before["status"] == "paused"
+
+    with pytest.raises(RuntimeError, match="live executor claim"):
+        store.abandon_run(admitted.run_id)
+
+    after = store.load_run(admitted.run_id)
+    assert after["state_version"] == before["state_version"]
+    assert after["nodes"]["worker"]["claim"]["attempt_id"] == worker.attempt_id
 
 
 def test_scheduler_persists_outward_effect_classification_before_execution(
