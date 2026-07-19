@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 
 try:  # pragma: no cover - platform import
@@ -22,15 +23,46 @@ class WorkflowLockTimeout(TimeoutError):
     """Raised when a workflow state lock cannot be acquired in time."""
 
 
-_process_locks: dict[str, threading.RLock] = {}
+@dataclass
+class _ProcessLockEntry:
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    owners: int = 0
+    waiters: int = 0
+
+
+_process_locks: dict[str, _ProcessLockEntry] = {}
 _process_locks_guard = threading.Lock()
 _local = threading.local()
 
 
-def _process_lock(path: Path) -> threading.RLock:
-    key = str(path.resolve())
+def _reserve_process_lock(key: str) -> _ProcessLockEntry:
     with _process_locks_guard:
-        return _process_locks.setdefault(key, threading.RLock())
+        entry = _process_locks.setdefault(key, _ProcessLockEntry())
+        entry.waiters += 1
+        return entry
+
+
+def _acquire_process_lock(
+    key: str, entry: _ProcessLockEntry, *, timeout: float
+) -> bool:
+    acquired = entry.lock.acquire(timeout=timeout)
+    with _process_locks_guard:
+        entry.waiters -= 1
+        if acquired:
+            entry.owners += 1
+        elif entry.owners == 0 and entry.waiters == 0:
+            if _process_locks.get(key) is entry:
+                del _process_locks[key]
+    return acquired
+
+
+def _release_process_lock(key: str, entry: _ProcessLockEntry) -> None:
+    entry.lock.release()
+    with _process_locks_guard:
+        entry.owners -= 1
+        if entry.owners == 0 and entry.waiters == 0:
+            if _process_locks.get(key) is entry:
+                del _process_locks[key]
 
 
 @contextmanager
@@ -41,9 +73,11 @@ def workflow_lock(path: Path, *, timeout_seconds: float = 5.0):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     key = str(path.resolve())
-    lock = _process_lock(path)
+    entry = _reserve_process_lock(key)
     deadline = time.monotonic() + timeout_seconds
-    if not lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+    if not _acquire_process_lock(
+        key, entry, timeout=max(0.0, deadline - time.monotonic())
+    ):
         raise WorkflowLockTimeout(f"timed out acquiring workflow lock: {path}")
     depths = getattr(_local, "depths", {})
     depth = depths.get(key, 0)
@@ -86,4 +120,4 @@ def workflow_lock(path: Path, *, timeout_seconds: float = 5.0):
         depths[key] -= 1
         if depths[key] == 0:
             del depths[key]
-        lock.release()
+        _release_process_lock(key, entry)

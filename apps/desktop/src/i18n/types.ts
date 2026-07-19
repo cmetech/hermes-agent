@@ -1377,8 +1377,22 @@ export interface Translations {
 
   operations: {
     workflows: string
+    workflowViews: string
+    activeBoard: string
+    history: string
+    archive: string
+    restore: string
+    cleanup: string
+    cleanupExplanation: string
+    inspectCleanupImpact: string
+    executeCleanup: string
+    cleanupBlocked: string
+    cleanupImpact: (runs: number, files: number) => string
     kanban: string
     needsAttention: string
+    workflowAttention: string
+    openWorkflowRun: (workflow: string) => string
+    attentionAge: (count: number, unit: 'day' | 'hour' | 'minute') => string
     status: string
     health: string
     graphProgress: string
@@ -1391,6 +1405,26 @@ export interface Translations {
     timeline: string
     trigger: string
     waitingFor: string
+    origin: string
+    assurance: string
+    coordinator: string
+    currentNode: string
+    previousNode: string
+    lastProgress: string
+    failureCause: string
+    overview: string
+    attempts: string
+    logs: string
+    outputs: string
+    recovery: string
+    noEvidence: string
+    provideInput: string
+    inputValue: string
+    reconcile: string
+    reconciliationOutcome: string
+    confirmedSucceeded: string
+    confirmedFailed: string
+    safeToRetry: string
     approve: string
     reject: string
     cancel: string

@@ -2,6 +2,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { useRef } from 'react'
 
 import { Button } from '@/components/ui/button'
+import { Codicon } from '@/components/ui/codicon'
 
 import type { ActivityBoardCard, ActivityBoardColumn } from './types'
 
@@ -25,11 +26,12 @@ export function VirtualCardColumn({ column, loadMoreLabel, onLoadMore, onOpenCar
 
   const virtualRows = virtual.getVirtualItems()
 
-  const rows = column.cards.length > 50
-    ? virtualRows.length > 0
-      ? virtualRows
-      : column.cards.slice(0, 16).map((_, index) => ({ index, start: index * 82 }))
-    : column.cards.map((_, index) => ({ index }))
+  const rows =
+    column.cards.length > 50
+      ? virtualRows.length > 0
+        ? virtualRows
+        : column.cards.slice(0, 16).map((_, index) => ({ index, start: index * 82 }))
+      : column.cards.map((_, index) => ({ index }))
 
   return (
     <section aria-label={`${column.label}, ${column.count}`} className="min-w-0" data-column={column.id}>
@@ -44,7 +46,10 @@ export function VirtualCardColumn({ column, loadMoreLabel, onLoadMore, onOpenCar
           {rows.map(row => {
             const card = column.cards[row.index]
 
-            if (!card) {return null}
+            if (!card) {
+              return null
+            }
+
             const virtualRow = 'start' in row ? row : null
 
             return (
@@ -53,14 +58,23 @@ export function VirtualCardColumn({ column, loadMoreLabel, onLoadMore, onOpenCar
                 className="block w-full rounded-sm bg-(--ui-bg-quaternary) p-3 text-left focus-visible:outline focus-visible:outline-(--ui-accent)"
                 key={card.id}
                 onClick={() => onOpenCard(card)}
-                style={virtualRow ? { position: 'absolute', transform: `translateY(${virtualRow.start}px)`, width: '100%' } : undefined}
+                style={
+                  virtualRow
+                    ? { position: 'absolute', transform: `translateY(${virtualRow.start}px)`, width: '100%' }
+                    : undefined
+                }
                 type="button"
               >
                 <span className="block truncate text-sm font-medium">{card.title}</span>
                 <span className="mt-1 block text-xs text-(--ui-text-tertiary)">{card.exactState}</span>
                 {card.badges.length > 0 && (
                   <span className="mt-2 flex flex-wrap gap-1 text-xs text-(--ui-text-secondary)">
-                    {card.badges.map(badge => <span key={`${badge.label}:${badge.tone}`}>{badge.label}</span>)}
+                    {card.badges.map(badge => (
+                      <span className="inline-flex items-center gap-1" key={`${badge.label}:${badge.tone}`}>
+                        {badge.icon && <Codicon name={badge.icon} />}
+                        {badge.label}
+                      </span>
+                    ))}
                   </span>
                 )}
               </button>
@@ -68,7 +82,12 @@ export function VirtualCardColumn({ column, loadMoreLabel, onLoadMore, onOpenCar
           })}
         </div>
         {column.nextCursor && (
-          <Button className="motion-reduce:transition-none" onClick={() => onLoadMore(column.id, column.nextCursor!)} size="xs" variant="text">
+          <Button
+            className="motion-reduce:transition-none"
+            onClick={() => onLoadMore(column.id, column.nextCursor!)}
+            size="xs"
+            variant="text"
+          >
             {loadMoreLabel}
           </Button>
         )}

@@ -153,21 +153,29 @@ export interface NativeNotificationInput {
 }
 
 export function dispatchNativeNotification(input: NativeNotificationInput): void {
+  void projectNativeNotification(input)
+}
+
+export async function projectNativeNotification(input: NativeNotificationInput): Promise<'projected' | 'suppressed'> {
   const prefs = $nativeNotifyPrefs.get()
 
   if (!prefs.enabled || !prefs.kinds[input.kind]) {
-    return
+    return 'suppressed'
   }
 
   if (!shouldFire(input.kind, input.sessionId, input.global)) {
-    return
+    return 'suppressed'
   }
 
   if (throttled(`${input.kind}:${input.sessionId ?? (input.global ? 'global' : '')}`, Date.now())) {
-    return
+    return 'suppressed'
   }
 
-  void window.hermesDesktop?.notify({
+  if (!window.hermesDesktop?.notify) {
+    throw new Error('Electron notification bridge unavailable')
+  }
+
+  await window.hermesDesktop.notify({
     actions: input.actions,
     body: input.body,
     kind: input.kind,
@@ -175,6 +183,8 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
     silent: input.silent,
     title: input.title
   })
+
+  return 'projected'
 }
 
 // Resolve a pending approval from a notification button, mirroring the in-app

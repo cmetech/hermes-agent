@@ -105,24 +105,112 @@ export interface WorkflowProgress {
   total_nodes: number
 }
 
+export interface WorkflowProvenance {
+  actor_id?: null | string
+  admitted_at?: string
+  assurance: 'legacy_unknown' | 'local_admin_claim' | 'system_schedule' | 'verified_adapter'
+  claimed_actor?: null | string
+  source: 'api' | 'background_agent' | 'chat' | 'cli' | 'cron' | 'desktop'
+  source_instance?: null | string
+}
+
+export interface WorkflowCoordinatorSnapshot {
+  epoch?: null | number
+  heartbeat_at?: null | string
+  host_kind?: null | string
+  lease_expires_at?: null | string
+  owner_id?: null | string
+  reason_code?: null | string
+  status: string
+}
+
 export interface WorkflowRunSnapshot {
+  archived_at?: null | string
+  archive_version?: number
   admission_disposition?: string
   artifacts?: unknown[]
   blocked_by_run_id?: null | string
   concurrency_key?: string
+  coordinator?: WorkflowCoordinatorSnapshot
   current_nodes?: string[]
   health: string
   next_actions: string[]
   pending_interaction?: null | Record<string, unknown>
+  previous_node?: null | string
+  provenance?: WorkflowProvenance
   progress: WorkflowProgress
   queue_position?: null | number
   run_id: string
   state_version: number
   status: string
+  restored_to_history?: boolean
   updated_at: string
   workflow: string
   workflow_version?: string
   [key: string]: unknown
+}
+
+export type WorkflowRunView = 'archive' | 'board' | 'history'
+
+export interface WorkflowCleanupCandidate {
+  blocked_reasons: string[]
+  bytes: number
+  evidence_types: string[]
+  files: number
+  run_id: string
+  status: string
+}
+
+export interface WorkflowCleanupPreview {
+  blocked_reasons: string[]
+  bytes: number
+  candidates: WorkflowCleanupCandidate[]
+  confirmation_expires_at: null | string
+  confirmation_token: null | string
+  execute: false
+  files: number
+  run_ids: string[]
+}
+
+export interface WorkflowCleanupResult {
+  bytes: number
+  execute: true
+  files: number
+  run_ids: string[]
+}
+
+export interface WorkflowNotification {
+  coalesced_count: number
+  kind: string
+  notification_id: string
+  payload: Record<string, unknown>
+  run_id: string
+  transition_version: number
+}
+
+export interface WorkflowNotificationPage {
+  items: WorkflowNotification[]
+  schema_version: number
+}
+
+export type WorkflowEvidenceKind =
+  | 'artifacts'
+  | 'attempts'
+  | 'cleanup'
+  | 'coordinator'
+  | 'interactions'
+  | 'logs'
+  | 'notifications'
+  | 'outputs'
+  | 'recovery'
+  | 'timeline'
+
+export interface WorkflowEvidencePage {
+  items: Array<Record<string, unknown>>
+  kind: WorkflowEvidenceKind
+  next_cursor: number
+  schema_version: number
+  truncated: boolean
 }
 
 export interface WorkflowRunPage {
@@ -131,8 +219,23 @@ export interface WorkflowRunPage {
   schema_version: number
 }
 
+export interface WorkflowAttentionItem {
+  cause: string
+  health: string
+  interaction?: null | Record<string, unknown>
+  kind: string
+  next_actions: string[]
+  node_id: null | string
+  origin: string
+  run_id: string
+  state_version: number
+  status: string
+  updated_at: string
+  workflow: string
+}
+
 export interface WorkflowAttentionPage {
-  items: Array<Record<string, unknown>>
+  items: WorkflowAttentionItem[]
   next_cursor: null | string
   schema_version: number
 }

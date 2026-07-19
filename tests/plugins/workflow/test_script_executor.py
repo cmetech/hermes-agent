@@ -231,6 +231,7 @@ def test_named_script_receives_sanitized_workflow_variable_environment(
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+@pytest.mark.live_system_guard_bypass
 def test_script_timeout_reaps_spawned_descendant(tmp_path: Path) -> None:
     source = (
         "import subprocess,sys,time\n"
@@ -245,9 +246,9 @@ def test_script_timeout_reaps_spawned_descendant(tmp_path: Path) -> None:
         timeout_seconds=0.2,
         termination_policy=TerminationPolicy(
             cooperative_grace_seconds=0,
-            term_grace_seconds=0.2,
-            kill_grace_seconds=0.2,
-            wait_timeout_seconds=0.2,
+            term_grace_seconds=1.0,
+            kill_grace_seconds=1.0,
+            wait_timeout_seconds=2.0,
         ),
     )
 

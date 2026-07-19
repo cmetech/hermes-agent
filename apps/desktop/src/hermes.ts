@@ -58,9 +58,15 @@ import type {
   ToolsetInfo,
   ToolsetModelsResponse,
   WorkflowAttentionPage,
+  WorkflowCleanupPreview,
+  WorkflowCleanupResult,
   WorkflowEventPage,
+  WorkflowEvidenceKind,
+  WorkflowEvidencePage,
+  WorkflowNotificationPage,
   WorkflowRunPage,
-  WorkflowRunSnapshot
+  WorkflowRunSnapshot,
+  WorkflowRunView
 } from '@/types/hermes'
 
 // Desktop startup fires a burst of read-only data calls (config, profiles,
@@ -226,11 +232,54 @@ export async function listSessions(
   }
 }
 
-export function listWorkflowRuns(cursor?: string): Promise<WorkflowRunPage> {
-  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''
+export function listWorkflowRuns(cursor?: string, view: WorkflowRunView = 'board'): Promise<WorkflowRunPage> {
+  const query = new URLSearchParams({ view })
+
+  if (cursor) {query.set('cursor', cursor)}
 
   return window.hermesDesktop.api<WorkflowRunPage>({
-    path: `/api/plugins/workflow/runs${query}`,
+    path: `/api/plugins/workflow/runs?${query.toString()}`,
+    ...profileScoped()
+  })
+}
+
+export function previewWorkflowCleanup(olderThan = '7d'): Promise<WorkflowCleanupPreview> {
+  return window.hermesDesktop.api<WorkflowCleanupPreview>({
+    path: `/api/plugins/workflow/cleanup/preview?older_than=${encodeURIComponent(olderThan)}`,
+    ...profileScoped()
+  })
+}
+
+export function executeWorkflowCleanup(confirmationToken: string, olderThan = '7d'): Promise<WorkflowCleanupResult> {
+  return window.hermesDesktop.api<WorkflowCleanupResult>({
+    body: { confirmation_token: confirmationToken, older_than: olderThan },
+    method: 'POST',
+    path: '/api/plugins/workflow/cleanup/execute',
+    ...profileScoped()
+  })
+}
+
+export function leaseWorkflowNotifications(clientId: string): Promise<WorkflowNotificationPage> {
+  return window.hermesDesktop.api<WorkflowNotificationPage>({
+    path: `/api/plugins/workflow/notifications/lease?client_id=${encodeURIComponent(clientId)}`,
+    ...profileScoped()
+  })
+}
+
+export function acknowledgeWorkflowNotification(notificationId: string, clientId: string): Promise<unknown> {
+  return window.hermesDesktop.api({
+    body: { client_id: clientId },
+    method: 'POST',
+    path: `/api/plugins/workflow/notifications/${encodeURIComponent(notificationId)}/ack`,
+    ...profileScoped()
+  })
+}
+
+export function failWorkflowNotification(notificationId: string, clientId: string, error: string): Promise<unknown> {
+  return window.hermesDesktop.api({
+    body: { client_id: clientId, error },
+    method: 'POST',
+    path: `/api/plugins/workflow/notifications/${encodeURIComponent(notificationId)}/fail`,
     ...profileScoped()
   })
 }
@@ -251,8 +300,20 @@ export function listWorkflowAttention(): Promise<WorkflowAttentionPage> {
 
 export function listWorkflowEvents(runId: string, after = 0): Promise<WorkflowEventPage> {
   return window.hermesDesktop.api<WorkflowEventPage>({
-    path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/events?after=${after}&wait_seconds=20`,
-    timeoutMs: 25_000,
+    path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/events?after=${after}&wait_seconds=0`,
+    ...profileScoped()
+  })
+}
+
+export function getWorkflowEvidence(
+  runId: string,
+  kind: WorkflowEvidenceKind,
+  after = 0
+): Promise<WorkflowEvidencePage> {
+  const query = new URLSearchParams({ after: String(after), kind })
+
+  return window.hermesDesktop.api<WorkflowEvidencePage>({
+    path: `/api/plugins/workflow/runs/${encodeURIComponent(runId)}/evidence?${query}`,
     ...profileScoped()
   })
 }
@@ -280,9 +341,13 @@ export function getKanbanBoardSummary(board: string): Promise<KanbanBoardSummary
 export function listKanbanTasks(board: string, status?: string, cursor?: string): Promise<KanbanTaskPage> {
   const query = new URLSearchParams({ board })
 
-  if (status) {query.set('status', status)}
+  if (status) {
+    query.set('status', status)
+  }
 
-  if (cursor) {query.set('cursor', cursor)}
+  if (cursor) {
+    query.set('cursor', cursor)
+  }
 
   return window.hermesDesktop.api<KanbanTaskPage>({
     path: `/api/plugins/kanban/tasks?${query.toString()}`,

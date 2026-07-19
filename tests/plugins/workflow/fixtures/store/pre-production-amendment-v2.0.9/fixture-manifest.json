@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "source_commit": "c147d2ba81cdf45144112aae970b46363271c7d1",
+  "product_version": "2.0.9",
+  "legacy_run_directory_prefix": "/private/tmp/hermes-workflow-v209.A2htOZ/legacy-home/workflows",
+  "expected": {
+    "run_id": "migration-run",
+    "workflow": "migration-fixture",
+    "status": "succeeded",
+    "event_sequence": 7,
+    "state_version": 7,
+    "attempt_id": "legacy-attempt",
+    "idempotency_digest": "27bea5cf2ac5cde43d6b9a58ccedc0fdedabd34a836c2de1b7752f1999f7c48e"
+  },
+  "sha256": {
+    "admission.db": "6bee4b30a7567068ab39cbfe3e357244881789d7f1127f22e6eaee2a27083565",
+    "runs/migration-fixture/migration-run/definition.yaml": "b2434d5afccfeab1f1490b00aa6d99ecabf9bdb2b5a34ecad2b0f5f07356e38e",
+    "runs/migration-fixture/migration-run/events.jsonl": "5fe2ec0a781575535c49f0e6c2c556ba531765b7950bc1cb705ed9e7fe3db80f",
+    "runs/migration-fixture/migration-run/inputs.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "runs/migration-fixture/migration-run/nodes/start/legacy-attempt/stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "runs/migration-fixture/migration-run/nodes/start/legacy-attempt/stdout.txt": "087f2ddcd1d586a0690de6260a650b2f28d4b4afbd346953693f5280822cdb90",
+    "runs/migration-fixture/migration-run/policy.yaml": "7f6be1404cbd81bafe346345727a2b886ae7c81add9dcddec3737dd0c54782e7",
+    "runs/migration-fixture/migration-run/resources.json": "ab8f08a19dfdaec871ffc4e62d627883407b0cb11fb510f9ac5eaaebc43ee77b",
+    "runs/migration-fixture/migration-run/run.json": "23ce2409c237ecf64bbcf287c4443db8bbf93858b1f3936ebb9a76a7f97cc3b1"
+  }
+}

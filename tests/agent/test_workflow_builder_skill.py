@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow, validate_package
 from plugins.workflow.store import RunStore
@@ -86,15 +87,21 @@ def test_builder_minimal_fixture_runs_offline_through_ordinary_store(
     package = load_workflow(workflow)
     store = RunStore(tmp_path / "home")
     snapshot = store.prepare_run_snapshot(package)
+    intent_key = "builder-minimal-offline"
     admitted = store.start_run(
         RunAdmissionRequest(
             workflow_name=package.definition.name,
             definition_digest=snapshot.definition_digest,
             policy_digest=snapshot.policy_digest,
             input_manifest_digest=snapshot.input_manifest_digest,
-            trigger_source="test",
-            idempotency_key="builder-minimal-offline",
+            trigger_source="cli",
+            idempotency_key=intent_key,
             concurrency_key=package.definition.name,
+            provenance=TriggerProvenance.local_admin_claim(
+                source="cli",
+                intent_key=intent_key,
+                source_instance="workflow-builder-test",
+            ),
         ),
         immutable_snapshot=snapshot,
     )
@@ -103,3 +110,5 @@ def test_builder_minimal_fixture_runs_offline_through_ordinary_store(
 
     assert result["status"] == "succeeded"
     assert all(node["state"] == "succeeded" for node in result["nodes"].values())
+    assert result["provenance"]["source"] == "cli"
+    assert result["provenance"]["assurance"] == "local_admin_claim"

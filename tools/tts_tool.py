@@ -514,14 +514,11 @@ def _dispatch_to_plugin_provider(
         from agent.tts_registry import get_provider
         from hermes_cli.plugins import _ensure_plugins_discovered
 
-        _ensure_plugins_discovered()
+        manager = _ensure_plugins_discovered()
         plugin_provider = get_provider(key)
-        if plugin_provider is None:
-            # Long-lived sessions may have discovered plugins before the
-            # bundled backend was patched in or before config changed.
-            # Retry once with a forced refresh before surfacing fall-
-            # through. Mirrors the image_gen / browser dispatcher
-            # recovery pattern.
+        if plugin_provider is None and not bool(
+            getattr(manager, "has_bound_background_service_host", False)
+        ):
             _ensure_plugins_discovered(force=True)
             plugin_provider = get_provider(key)
     except Exception as exc:  # noqa: BLE001 — discovery failure is non-fatal

@@ -17,8 +17,10 @@ def test_workflow_skills_resolve_the_active_product_cli() -> None:
         router = (skill_root / "SKILL.md").read_text(encoding="utf-8")
         assert "PRODUCT_CLI" in router, skill_root
         assert "brand.json" in router, skill_root
-        assert "loop24" in router, skill_root
-        assert "otto" in router, skill_root
+        assert "literal" in router, skill_root
+        # Product resolution is data-driven. A brand list in a skill becomes
+        # stale and makes new branded installs execute the neutral binary.
+        assert "if slug ==" not in router, skill_root
 
 
 def test_workflow_skill_commands_never_hardcode_the_neutral_executable() -> None:

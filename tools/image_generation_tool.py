@@ -1305,21 +1305,20 @@ def _dispatch_to_plugin_provider(
         from agent.image_gen_registry import get_provider
         from hermes_cli.plugins import _ensure_plugins_discovered
 
-        _ensure_plugins_discovered()
+        manager = _ensure_plugins_discovered()
         provider = get_provider(configured)
     except Exception as exc:
         logger.debug("image_gen plugin dispatch skipped: %s", exc)
         return None
 
-    if provider is None:
+    if provider is None and not bool(
+        getattr(manager, "has_bound_background_service_host", False)
+    ):
         try:
-            # Long-lived sessions may have discovered plugins before a bundled
-            # backend was patched in or before config changed. Retry once with
-            # a forced refresh before surfacing a missing-provider error.
             _ensure_plugins_discovered(force=True)
             provider = get_provider(configured)
         except Exception as exc:
-            logger.debug("image_gen plugin force-refresh skipped: %s", exc)
+            logger.debug("image_gen plugin CLI refresh skipped: %s", exc)
 
     if provider is None:
         return json.dumps({

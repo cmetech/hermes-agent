@@ -95,6 +95,30 @@ def test_same_level_duplicate_names_are_errors(workflow_writer, tmp_path):
         discover_workflows(tmp_path / "repo", tmp_path / "profile", tmp_path / "home")
 
 
+def test_profile_catalog_ignores_workflow_owned_runtime_directories(
+    workflow_writer, tmp_path
+) -> None:
+    profile = tmp_path / "profile"
+    catalog = profile / "workflows"
+    workflow_writer(catalog, name="durable", filename="durable.yaml")
+    workflow_writer(catalog / "nested-package", name="nested", filename="nested.yaml")
+    for owned in ("runs", ".staging", ".quarantine", ".locks"):
+        workflow_writer(
+            catalog / owned / "durable" / "snapshot",
+            name="durable",
+            filename="definition.yaml",
+        )
+
+    packages = discover_workflows(
+        tmp_path / "repo",
+        profile,
+        tmp_path / "home",
+    )
+
+    assert [package.definition.name for package in packages] == ["durable", "nested"]
+    assert all("snapshot" not in str(package.workflow_path) for package in packages)
+
+
 def test_successful_parse_cache_invalidates_on_content_change(
     workflow_writer, tmp_path
 ):
