@@ -4,7 +4,8 @@
   "description": "Shared Ericsson coworker capabilities (OTTO + LOOP24)",
   "skills": [
     "skills/ericsson/opportunity-visuals",
-    "skills/ericsson/onboard-ericsson-capabilities"
+    "skills/ericsson/onboard-ericsson-capabilities",
+    "skills/ericsson/confluence-research"
   ],
   "plugins": [
     "plugins/workflow",
