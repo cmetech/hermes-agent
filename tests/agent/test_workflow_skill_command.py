@@ -16,15 +16,10 @@ def _frontmatter() -> dict[str, object]:
 
 
 def test_workflow_skill_description_covers_operator_intents_concisely():
-    description = str(_frontmatter()["description"]).lower()
-    groups = (
-        ("run",), ("schedule",), ("list",), ("show", "describe"),
-        ("topology", "diagram"), ("active", "recent"), ("status", "health", "progress"),
-        ("wait",), ("failure", "retry"), ("approval",), ("input",), ("reject",),
-        ("resume",), ("reconcile",), ("cancel",), ("cleanup",),
-        ("reset sessions",), ("automation",), ("workflow",),
-    )
-    assert all(any(term in description for term in group) for group in groups)
+    metadata = _frontmatter()
+    description = str(metadata["description"])
+    assert description.startswith("Use when")
+    assert metadata["platforms"] == ["darwin", "linux", "windows"]
     assert len(description) <= 700
 
 

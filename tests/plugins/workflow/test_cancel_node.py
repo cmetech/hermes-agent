@@ -194,6 +194,44 @@ def test_cancel_of_unknown_outward_outcome_requires_reconciliation(
     )
 
 
+def test_cancel_running_outward_attempt_stops_process_but_preserves_uncertainty(
+    tmp_path: Path, workflow_writer, monkeypatch
+) -> None:
+    package = load_workflow(workflow_writer(tmp_path / "package", name="active-outward"))
+    store = RunStore(tmp_path / "home")
+    admitted = _start(store, package)
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "worker",
+        executor_id="bash",
+        effect_classification="outward",
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+    identity = ProcessIdentity(pid=999_996, start_time=56789, group_id=999_996)
+    assert store.record_process_started(claim, identity)
+    monkeypatch.setattr(ProcessIdentity, "is_current", lambda self: True)
+    terminated = []
+    monkeypatch.setattr(
+        ManagedProcessTree,
+        "terminate_existing",
+        classmethod(
+            lambda cls, candidate, **kwargs: terminated.append(candidate) or True
+        ),
+    )
+
+    result = store.cancel_run(admitted.run_id)
+
+    assert terminated == [identity]
+    assert result["status"] == "paused"
+    assert result["cancellation_outcome"] == "reconciliation_required"
+    node = store.load_run(admitted.run_id)["nodes"]["start"]
+    assert node["pending_interaction"]["type"] == "reconcile"
+    assert node["recovery"]["termination_confirmed"] is True
+    assert node["attempts"][-1]["process_stop"]["cleaned"] is True
+
+
 def test_cancelled_queued_run_never_starts_a_process(
     tmp_path: Path, workflow_writer
 ) -> None:
@@ -242,6 +280,7 @@ def test_cancelled_paused_loop_releases_capacity_without_spawning(
         )
 
 
+@pytest.mark.live_system_guard_bypass
 def test_cancel_running_script_reaps_its_spawned_descendant(
     tmp_path: Path, workflow_writer
 ) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextvars import ContextVar
 import hashlib
 import json
 import os
@@ -10,10 +11,12 @@ import re
 import secrets
 import shutil
 import sys
+import time
 from collections import Counter
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MethodType
 from typing import AbstractSet, Iterable, Mapping
 
 import yaml
@@ -36,10 +39,33 @@ from plugins.workflow.models import (
     WorkflowRuntimeConfig,
     WorkflowValidationError,
 )
+from plugins.workflow.machine_contract import (
+    CoordinatorUnavailable,
+    EXIT_ACTION_FAILED,
+    EXIT_AUTHORIZATION,
+    EXIT_BLOCKING_FINDING,
+    EXIT_INTERNAL,
+    EXIT_INVOCATION,
+    MachineError,
+    WorkflowActionFailed,
+    WorkflowAuthorization,
+    WorkflowCommandError,
+    WorkflowConflict,
+    WorkflowNotFound,
+    error_envelope,
+    operator_command_contract,
+    projection_was_truncated,
+    success_envelope,
+)
+from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.schema import load_workflow, validate_package
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.sessions import NodeSessionRegistry
-from plugins.workflow.store import RunStore, StorageQuotaError
+from plugins.workflow.store import (
+    ForegroundExecutionConflict,
+    RunStore,
+    StorageQuotaError,
+)
 from plugins.workflow.topology import project_topology
 from plugins.workflow.trust import (
     WorkflowTrustError,
@@ -49,6 +75,47 @@ from plugins.workflow.trust import (
     preflight_execution,
 )
 from tools.managed_process import ProcessResourceLimits
+
+
+_MACHINE_COMMAND: ContextVar[str] = ContextVar(
+    "workflow_machine_command", default="workflow"
+)
+
+
+class _WorkflowArgumentParser(argparse.ArgumentParser):
+    """Keep argparse failures inside the JSON machine contract."""
+
+    _machine_mode = False
+
+    def parse_known_args(self, args=None, namespace=None):
+        arguments = list(args) if args is not None else sys.argv[1:]
+        self._machine_mode = "--json" in arguments
+        parsed, extras = argparse.ArgumentParser.parse_known_args(
+            self, arguments, namespace
+        )
+        if self._machine_mode and extras:
+            self.error(f"unrecognized arguments: {' '.join(extras)}")
+        return parsed, extras
+
+    def error(self, message: str) -> None:
+        if not self._machine_mode:
+            argparse.ArgumentParser.error(self, message)
+        parts = self.prog.split()
+        action = (
+            " ".join(parts[-2:])
+            if len(parts) >= 2 and parts[-2] == "showcase"
+            else parts[-1]
+        )
+        error = MachineError("invalid_request", message)
+        print(
+            json.dumps(
+                error_envelope(f"workflow {action}", error),
+                sort_keys=True,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        self.exit(EXIT_INVOCATION)
 
 
 def _compat_dict(report: CompatibilityReport) -> dict[str, object]:
@@ -287,11 +354,17 @@ def _json_flag(parser: argparse.ArgumentParser) -> None:
 
 
 def register_cli(subparser: argparse.ArgumentParser) -> None:
+    subparser.parse_known_args = MethodType(
+        _WorkflowArgumentParser.parse_known_args, subparser
+    )
+    subparser.error = MethodType(_WorkflowArgumentParser.error, subparser)
     subparser.add_argument("--workdir", default=os.getcwd(), help=argparse.SUPPRESS)
     subparser.add_argument(
         "--hermes-home", default=str(get_hermes_home()), help=argparse.SUPPRESS
     )
-    actions = subparser.add_subparsers(dest="workflow_action")
+    actions = subparser.add_subparsers(
+        dest="workflow_action", parser_class=_WorkflowArgumentParser
+    )
 
     list_parser = actions.add_parser(
         "list", aliases=["ls"], help="List discovered workflows"
@@ -316,6 +389,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     )
     doctor_parser.add_argument("name")
     doctor_parser.add_argument("--compat-report", action="store_true")
+    doctor_parser.add_argument("--mode", choices=("foreground", "background"))
     _json_flag(doctor_parser)
 
     trust_parser = actions.add_parser("trust", help="Trust the current package digest")
@@ -332,13 +406,30 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     run_parser.add_argument("--arguments", default="")
     run_parser.add_argument("--idempotency-key")
     run_parser.add_argument("--concurrency-key")
-    run_parser.add_argument("--no-wait", action="store_true")
+    run_parser.add_argument(
+        "--trigger-source",
+        choices=("cli", "chat", "background_agent", "cron"),
+        default="cli",
+        help="Local-admin-claimed origin for this shell admission",
+    )
+    run_parser.add_argument("--source-instance")
+    run_parser.add_argument("--claimed-actor")
+    execution = run_parser.add_mutually_exclusive_group()
+    execution.add_argument("--no-wait", action="store_true")
+    execution.add_argument(
+        "--foreground",
+        action="store_true",
+        help="Execute locally when no coordinator is available",
+    )
     _json_flag(run_parser)
 
     runs_parser = actions.add_parser("runs", help="List active and recent runs")
     runs_parser.add_argument("--workflow")
     runs_parser.add_argument("--status")
     runs_parser.add_argument("--limit", type=int, default=100)
+    runs_parser.add_argument(
+        "--view", choices=("all", "board", "history", "archive"), default="all"
+    )
     _json_flag(runs_parser)
 
     status_parser = actions.add_parser("status", help="Inspect a durable run")
@@ -355,12 +446,16 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     )
     approve_parser.add_argument("run_id")
     approve_parser.add_argument("--comment", default="")
+    approve_parser.add_argument("--interaction-id", required=True)
+    approve_parser.add_argument("--expected-version", type=int, required=True)
     approve_parser.add_argument("--continue", dest="continue_run", action="store_true")
     _json_flag(approve_parser)
 
     reject_parser = actions.add_parser("reject", help="Reject a paused workflow gate")
     reject_parser.add_argument("run_id")
     reject_parser.add_argument("--reason", default="")
+    reject_parser.add_argument("--interaction-id", required=True)
+    reject_parser.add_argument("--expected-version", type=int, required=True)
     reject_parser.add_argument("--continue", dest="continue_run", action="store_true")
     _json_flag(reject_parser)
 
@@ -389,7 +484,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         "outcome",
         choices=("confirmed-succeeded", "confirmed-failed", "safe-to-retry"),
     )
-    reconcile_parser.add_argument("--interaction-id")
+    reconcile_parser.add_argument("--interaction-id", required=True)
     reconcile_parser.add_argument("--expected-version", type=int)
     reconcile_parser.add_argument("--continue", dest="continue_run", action="store_true")
     _json_flag(reconcile_parser)
@@ -403,9 +498,19 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         parser.add_argument("run_id")
         _json_flag(parser)
 
+    for action, help_text in (
+        ("archive", "Reversibly hide terminal run evidence"),
+        ("restore", "Restore archived evidence to history"),
+    ):
+        parser = actions.add_parser(action, help=help_text)
+        parser.add_argument("run_id")
+        parser.add_argument("--expected-version", type=int, required=True)
+        _json_flag(parser)
+
     cleanup_parser = actions.add_parser("cleanup", help="Clean retained terminal runs")
     cleanup_parser.add_argument("--older-than", default="7d")
-    cleanup_parser.add_argument("--dry-run", action="store_true")
+    cleanup_parser.add_argument("--execute", action="store_true")
+    cleanup_parser.add_argument("--confirmation-token")
     _json_flag(cleanup_parser)
 
     reset_parser = actions.add_parser(
@@ -433,6 +538,13 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     showcase_run.add_argument("--confirmation-token")
     showcase_run.add_argument("--schedule-at")
     showcase_run.add_argument("--idempotency-key")
+    showcase_run.add_argument(
+        "--trigger-source",
+        choices=("cli", "chat", "background_agent", "cron"),
+        default="cli",
+    )
+    showcase_run.add_argument("--source-instance")
+    showcase_run.add_argument("--claimed-actor")
     showcase_run.add_argument("--no-wait", action="store_true")
     _json_flag(showcase_run)
     showcase_status = showcase_actions.add_parser("status")
@@ -447,6 +559,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     showcase_cleanup = showcase_actions.add_parser("cleanup")
     showcase_cleanup.add_argument("--older-than-days", type=int, default=7)
     showcase_cleanup.add_argument("--execute", action="store_true")
+    showcase_cleanup.add_argument("--confirmation-token")
     _json_flag(showcase_cleanup)
 
     subparser.set_defaults(func=workflow_command)
@@ -468,12 +581,13 @@ def _resolve(args: argparse.Namespace, name: str) -> WorkflowPackage:
     for package in packages:
         if package.definition.name == name:
             return package
-    raise WorkflowValidationError(
-        ValidationIssue(
-            path="name",
-            code="workflow_not_found",
-            message=f"workflow not found: {name}",
-        )
+    candidates = [
+        {"id": package.definition.name, "kind": "workflow", "label": package.definition.name}
+        for package in sorted(packages, key=lambda item: item.definition.name)[:10]
+    ]
+    raise WorkflowNotFound(
+        f"workflow not found: {name}",
+        details={"candidates": candidates},
     )
 
 
@@ -488,7 +602,15 @@ def _cron_jobs() -> Iterable[Mapping[str, object]]:
 
 def _emit(payload: object, *, as_json: bool) -> None:
     if as_json:
-        print(json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2))
+        command = _MACHINE_COMMAND.get()
+        print(
+            json.dumps(
+                success_envelope(command, payload),
+                sort_keys=True,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     elif isinstance(payload, str):
         print(payload)
     else:
@@ -514,11 +636,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
 def _cmd_show(args: argparse.Namespace) -> int:
     if args.json and args.topology is not None:
-        print(
+        raise WorkflowCommandError(
+            "invalid_request",
             "--topology cannot be combined with --json; JSON show always includes both projections",
-            file=sys.stderr,
+            exit_code=EXIT_INVOCATION,
         )
-        return 2
     detail = show_package(_resolve(args, args.name), cron_jobs=_cron_jobs())
     if args.json:
         _emit(detail, as_json=True)
@@ -562,6 +684,13 @@ def _cmd_validate(args: argparse.Namespace) -> int:
             for issue in issues
         ],
     }
+    if args.json and not payload["valid"]:
+        raise WorkflowCommandError(
+            "validation_failed",
+            "workflow validation found blocking issues",
+            exit_code=EXIT_BLOCKING_FINDING,
+            result=payload,
+        )
     if args.json:
         _emit(payload, as_json=True)
     else:
@@ -570,7 +699,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         )
         for issue in payload["issues"]:
             print(f"- {issue['severity']}: {issue['path']}: {issue['message']}")
-    return 0 if payload["valid"] else 1
+    return 0 if payload["valid"] else EXIT_BLOCKING_FINDING
 
 
 _MCP_ENV_REFERENCE = re.compile(
@@ -1054,6 +1183,7 @@ def _doctor_payload(
     *,
     hermes_home: str | Path,
     compat_report: bool,
+    mode: str | None = None,
 ) -> dict[str, object]:
     report = doctor_package(package, hermes_home=hermes_home)
     payload = report.to_dict()
@@ -1066,6 +1196,54 @@ def _doctor_payload(
             else "Review this risk summary, then trust the exact package digest before local execution."
         ),
     })
+    from plugins.workflow.coordinator_store import CoordinatorStore
+
+    runtime_store = RunStore(hermes_home)
+    coordinator = CoordinatorStore(runtime_store.database).health(
+        now=datetime.now(timezone.utc)
+    )
+    payload["machine_contract_schema_version"] = 1
+    payload["command_contract"] = operator_command_contract()
+    payload["supported_execution_modes"] = ["background", "foreground"]
+    payload["coordinator"] = {
+        "status": coordinator.status,
+        "reason_code": coordinator.reason_code,
+        "epoch": coordinator.lease.epoch if coordinator.lease else None,
+        "host_kind": coordinator.lease.host_kind if coordinator.lease else None,
+        "lease_expires_at": (
+            coordinator.lease.lease_expires_at.isoformat()
+            if coordinator.lease
+            else None
+        ),
+    }
+    mode_findings = []
+    if (
+        mode == "foreground"
+        and payload["risk_summary"]["execution_environment"]
+        == "isolated_backend_required"
+    ):
+        mode_findings.append({
+            "path": "sidecar.execution_environment",
+            "level": "unsupported",
+            "message": "foreground mode cannot satisfy isolated backend containment",
+            "blocking": True,
+            "code": "foreground_isolation_unavailable",
+        })
+    if mode == "background" and coordinator.status != "healthy":
+        mode_findings.append({
+            "path": "runtime.coordinator",
+            "level": "unsupported",
+            "message": "background mode requires a healthy workflow coordinator",
+            "blocking": True,
+            "code": "coordinator_unavailable",
+        })
+    if mode_findings:
+        payload["findings"] = [*payload.get("findings", []), *mode_findings]
+        payload["runnable"] = False
+        payload["compatibility"] = "unsupported"
+        payload["remediation"] = (
+            "Resolve blocking findings for the requested mode, then rerun doctor."
+        )
     if compat_report:
         payload["compatibility_findings"] = [
             {
@@ -1085,7 +1263,19 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         _resolve(args, args.name),
         hermes_home=args.hermes_home,
         compat_report=args.compat_report,
+        mode=args.mode,
     )
+    blocking = any(
+        isinstance(finding, Mapping) and bool(finding.get("blocking"))
+        for finding in payload.get("findings", [])
+    )
+    if args.json and blocking:
+        raise WorkflowCommandError(
+            "blocking_doctor_findings",
+            "workflow doctor found blocking compatibility or integrity findings",
+            exit_code=EXIT_BLOCKING_FINDING,
+            result=payload,
+        )
     if args.json:
         _emit(payload, as_json=True)
     else:
@@ -1098,17 +1288,18 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             f"{payload['risk_summary']['execution_environment']}"
         )
         print(f"Remediation: {payload['remediation']}")
-    return 0
+    return EXIT_BLOCKING_FINDING if blocking else 0
 
 
 def _cmd_trust(args: argparse.Namespace) -> int:
     package = _resolve(args, args.name)
     before = compute_package_digest(package)
     if args.digest != before.sha256:
-        print(
-            "supplied digest does not match the current package digest", file=sys.stderr
+        raise WorkflowCommandError(
+            "digest_mismatch",
+            "supplied digest does not match the current package digest",
+            exit_code=EXIT_INVOCATION,
         )
-        return 1
     compatibility = assess_compatibility(package)
     risk = build_risk_summary(package, compatibility)
     fresh_package = load_workflow(
@@ -1123,11 +1314,10 @@ def _cmd_trust(args: argparse.Namespace) -> int:
         or risk.package_digest != after.sha256
         or risk.risk_digest != fresh_risk.risk_digest
     ):
-        print(
+        raise WorkflowConflict(
             "package changed while trust was being recorded; rerun doctor",
-            file=sys.stderr,
+            code="package_changed",
         )
-        return 1
     WorkflowTrustStore(args.hermes_home).trust(
         after.sha256,
         actor="local-user",
@@ -1222,9 +1412,15 @@ def _scheduler(
     *,
     agent_runner=None,
     profile_name: str = "default",
+    owner_id: str | None = None,
+    execution_owner_id: str | None = None,
+    execution_owner_epoch: int | None = None,
 ) -> RunScheduler:
     return RunScheduler(
         store,
+        owner_id=owner_id,
+        execution_owner_id=execution_owner_id,
+        execution_owner_epoch=execution_owner_epoch,
         agent_runner=agent_runner,
         profile_name=profile_name,
         max_parallel_nodes=config.max_parallel_nodes,
@@ -1253,61 +1449,176 @@ def _cmd_run(
     runtime = _runtime_config(args.hermes_home, sidecar=package.sidecar)
     digest = compute_package_digest(package)
     risk = build_risk_summary(package, assess_compatibility(package))
-    if WorkflowTrustStore(args.hermes_home).check(
-        digest.sha256, risk_digest=risk.risk_digest
-    ) != "trusted":
-        print(
-            "workflow package is not trusted; run doctor and trust its exact digest",
-            file=sys.stderr,
+    if (
+        WorkflowTrustStore(args.hermes_home).check(
+            digest.sha256, risk_digest=risk.risk_digest
         )
-        return 1
-    try:
-        preflight_execution(risk, trusted=True)
-    except WorkflowTrustError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+        != "trusted"
+    ):
+        raise WorkflowAuthorization(
+            "workflow package is not trusted; run doctor and trust its exact digest",
+            code="trust_required",
+        )
+    preflight_execution(risk, trusted=True)
     store = _store(args, runtime)
+    from plugins.workflow.coordinator_store import CoordinatorStore
+
+    coordinator = CoordinatorStore(store.database).health(
+        now=datetime.now(timezone.utc)
+    )
+    execution_mode = "foreground" if args.foreground else "background"
+    if execution_mode == "background" and coordinator.status != "healthy":
+        raise CoordinatorUnavailable(
+            "background execution requires a healthy workflow coordinator; "
+            "use --foreground for explicit local execution"
+        )
+    if (args.json or args.no_wait) and not args.idempotency_key:
+        raise WorkflowCommandError(
+            "idempotency_key_required",
+            "--idempotency-key is required for JSON and background starts",
+            exit_code=EXIT_INVOCATION,
+        )
+    foreground_owner_id = (
+        f"foreground-{os.getpid()}-{secrets.token_hex(16)}"
+        if execution_mode == "foreground"
+        else None
+    )
     prepared = store.prepare_run_snapshot(
         package, values={"arguments": args.arguments} if args.arguments else None
     )
+    intent_key = args.idempotency_key or secrets.token_urlsafe(24)
     request = RunAdmissionRequest(
         workflow_name=package.definition.name,
         definition_digest=prepared.definition_digest,
         policy_digest=prepared.policy_digest,
         input_manifest_digest=prepared.input_manifest_digest,
-        trigger_source="cli",
-        idempotency_key=args.idempotency_key or secrets.token_urlsafe(24),
+        trigger_source=args.trigger_source,
+        idempotency_key=intent_key,
+        idempotency_namespace=f"profile-local:{args.trigger_source}",
         concurrency_key=args.concurrency_key
         or str(package.sidecar.get("concurrency_key") or package.definition.name),
         concurrency_policy=str(package.sidecar.get("overlap_policy") or "queue"),
+        execution_mode=execution_mode,
+        foreground_owner_id=foreground_owner_id,
+        provenance=TriggerProvenance.local_admin_claim(
+            source=args.trigger_source,
+            intent_key=intent_key,
+            source_instance=args.source_instance or f"cli:pid:{os.getpid()}",
+            claimed_actor=args.claimed_actor,
+        ),
     )
     admitted = store.start_run(request, immutable_snapshot=prepared)
     if admitted.run_id is None:
-        payload = {
-            "action": "run",
-            "admission_disposition": admitted.disposition,
-            "reason_code": admitted.reason_code,
-            "run_id": None,
-        }
-        _emit(payload, as_json=args.json)
-        return 1
-    if admitted.disposition == "created" and not args.no_wait:
-        _scheduler(
-            store,
-            runtime,
-            agent_runner=agent_runner,
-            profile_name=profile_name,
-        ).advance(admitted.run_id)
+        reason = admitted.reason_code or "admission_rejected"
+        if reason == "coordinator_unavailable":
+            raise CoordinatorUnavailable(
+                f"workflow admission was rejected: {reason}"
+            )
+        if reason in {"idempotency_conflict", "coordinator_active"}:
+            raise WorkflowConflict(
+                f"workflow admission was rejected: {reason}",
+                code=reason,
+                details={"admission_disposition": admitted.disposition},
+            )
+        raise WorkflowActionFailed(
+            f"workflow admission was rejected: {reason}",
+            code=reason,
+            details={"admission_disposition": admitted.disposition},
+        )
+    if admitted.disposition == "created" and execution_mode == "foreground":
+        try:
+            _scheduler(
+                store,
+                runtime,
+                agent_runner=agent_runner,
+                profile_name=profile_name,
+                owner_id=foreground_owner_id,
+                execution_owner_id=foreground_owner_id,
+                execution_owner_epoch=1,
+            ).advance(admitted.run_id)
+        finally:
+            store.release_foreground_execution(
+                admitted.run_id,
+                owner_id=foreground_owner_id,
+                epoch=1,
+                now=datetime.now(timezone.utc),
+            )
+    elif (
+        admitted.disposition == "created"
+        and execution_mode == "background"
+        and not args.no_wait
+    ):
+        while store.get_run_status(admitted.run_id)["status"] == "running":
+            time.sleep(0.1)
     payload = store.get_run_status(admitted.run_id)
     payload["action"] = "run"
     payload["admission_disposition"] = admitted.disposition
+    payload["truncated"] = projection_was_truncated(payload)
+    payload["next_cursor"] = None
+    if payload["status"] in {"failed", "cancelled", "abandoned"}:
+        raise WorkflowActionFailed(
+            f"workflow run entered terminal state: {payload['status']}",
+            code="run_failed",
+            result=payload,
+        )
+    handoff = payload.get("execution_handoff")
+    if (
+        not args.json
+        and isinstance(handoff, Mapping)
+        and handoff.get("transition") == "foreground_execution_adopted"
+    ):
+        print(
+            "This run was adopted by the background coordinator and continues; "
+            f"watch it with workflow status {admitted.run_id}."
+        )
     _emit(payload, as_json=args.json)
-    return 0 if payload["status"] in {"queued", "running", "succeeded"} else 1
+    return 0
+
+
+def _require_run(store: RunStore, run_id: str) -> dict[str, object]:
+    try:
+        return store.get_run_status(run_id)
+    except KeyError as exc:
+        raise WorkflowNotFound(
+            f"workflow run not found: {run_id}",
+            details={"run_id": run_id},
+        ) from exc
+
+
+def _run_page(
+    store: RunStore,
+    *,
+    workflow: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    view: str = "all",
+) -> dict[str, object]:
+    runs = store.list_runs(
+        workflow=workflow, status=status, limit=limit, view=view
+    )
+    next_cursor = None
+    if len(runs) == limit and runs:
+        keyset = (str(runs[-1]["updated_at"]), str(runs[-1]["run_id"]))
+        remainder = store.list_runs(
+            workflow=workflow,
+            status=status,
+            limit=1,
+            view=view,
+            after=keyset,
+        )
+        if remainder:
+            next_cursor = list(keyset)
+    return {
+        "runs": runs,
+        "truncated": next_cursor is not None or projection_was_truncated(runs),
+        "next_cursor": next_cursor,
+    }
 
 
 def _cmd_runs(args: argparse.Namespace) -> int:
-    payload = _store(args).list_runs(
-        workflow=args.workflow, status=args.status, limit=args.limit
+    payload = _run_page(
+        _store(args),
+        workflow=args.workflow, status=args.status, limit=args.limit, view=args.view
     )
     _emit(payload, as_json=args.json)
     return 0
@@ -1315,13 +1626,22 @@ def _cmd_runs(args: argparse.Namespace) -> int:
 
 def _cmd_status(args: argparse.Namespace) -> int:
     store = _store(args)
-    payload = store.get_run_status(args.run_id) if args.run_id else store.list_runs()
+    if args.run_id:
+        payload = _require_run(store, args.run_id)
+        payload["truncated"] = projection_was_truncated(payload)
+        payload["next_cursor"] = None
+    else:
+        payload = _run_page(store)
     _emit(payload, as_json=args.json)
     return 0
 
 
 def _cmd_events(args: argparse.Namespace) -> int:
-    payload = _store(args).tail_events(args.run_id, limit=args.tail)
+    if not 1 <= args.tail <= 200:
+        raise ValueError("limit must be between 1 and 200")
+    store = _store(args)
+    _require_run(store, args.run_id)
+    payload = store.latest_event_page(args.run_id, limit=args.tail)
     _emit(payload, as_json=args.json)
     return 0
 
@@ -1335,22 +1655,42 @@ def _cmd_approval_decision(
 ) -> int:
     runtime = _runtime_config(args.hermes_home)
     store = _store(args, runtime)
+    _require_run(store, args.run_id)
     if decision == "approved":
-        result = store.approve_run(args.run_id, comment=args.comment, channel="cli")
+        result = store.approve_run(
+            args.run_id,
+            comment=args.comment,
+            expected_state_version=args.expected_version,
+            interaction_id=args.interaction_id,
+            channel="cli",
+        )
     else:
-        result = store.reject_run(args.run_id, reason=args.reason, channel="cli")
-    if result.outcome == "applied" and args.continue_run:
-        _scheduler(
+        result = store.reject_run(
+            args.run_id,
+            reason=args.reason,
+            expected_state_version=args.expected_version,
+            interaction_id=args.interaction_id,
+            channel="cli",
+        )
+    if result.outcome == "applied":
+        _continue_if_requested(
+            args,
             store,
             runtime,
             agent_runner=agent_runner,
             profile_name=profile_name,
-        ).advance(args.run_id)
+        )
     payload = asdict(result)
     payload["action"] = "approve" if decision == "approved" else "reject"
     payload["run_status"] = store.get_run_status(args.run_id)["status"]
+    if result.outcome == "already_decided" and result.decision != decision:
+        raise WorkflowConflict(
+            "the interaction already has a different decision",
+            code="decision_conflict",
+            details={"interaction_id": result.interaction_id},
+        )
     _emit(payload, as_json=args.json)
-    return 0 if result.outcome == "applied" else 3
+    return 0
 
 
 def _cmd_resume(
@@ -1358,25 +1698,82 @@ def _cmd_resume(
 ) -> int:
     runtime = _runtime_config(args.hermes_home)
     store = _store(args, runtime)
-    store.resume_run(args.run_id)
-    _scheduler(
+    before = _require_run(store, args.run_id)
+    foreground_conflict = False
+    try:
+        store.resume_run(args.run_id)
+    except ForegroundExecutionConflict:
+        foreground_conflict = True
+    _continue_foreground_if_owned(
+        args.run_id,
         store,
         runtime,
         agent_runner=agent_runner,
         profile_name=profile_name,
-    ).advance(args.run_id)
-    _emit(store.get_run_status(args.run_id), as_json=args.json)
+    )
+    after = store.get_run_status(args.run_id)
+    if foreground_conflict and after["state_version"] == before["state_version"]:
+        raise WorkflowConflict(
+            "foreground owner conflict: resume made no durable transition",
+            details={"run_id": args.run_id},
+        )
+    _emit(after, as_json=args.json)
     return 0
 
 
 def _continue_if_requested(args, store, runtime, *, agent_runner, profile_name):
     if args.continue_run:
+        _continue_foreground_if_owned(
+            args.run_id,
+            store,
+            runtime,
+            agent_runner=agent_runner,
+            profile_name=profile_name,
+        )
+
+
+def _continue_foreground_if_owned(
+    run_id,
+    store,
+    runtime,
+    *,
+    agent_runner,
+    profile_name,
+):
+    projection = store.get_run_status(run_id)
+    if projection.get("execution_mode") != "foreground":
+        return
+    from plugins.workflow.coordinator_store import CoordinatorStore
+
+    health = CoordinatorStore(store.database).health(now=datetime.now(timezone.utc))
+    if health.status == "healthy":
+        return
+    owner_id = f"foreground-{os.getpid()}-{secrets.token_hex(16)}"
+    lease = store.claim_foreground_execution(
+        run_id,
+        owner_id=owner_id,
+        now=datetime.now(timezone.utc),
+        lease_seconds=runtime.lease_seconds,
+    )
+    if lease is None:
+        return
+    try:
         _scheduler(
             store,
             runtime,
             agent_runner=agent_runner,
             profile_name=profile_name,
-        ).advance(args.run_id)
+            owner_id=lease.owner_id,
+            execution_owner_id=lease.owner_id,
+            execution_owner_epoch=lease.epoch,
+        ).advance(run_id)
+    finally:
+        store.release_foreground_execution(
+            run_id,
+            owner_id=lease.owner_id,
+            epoch=lease.epoch,
+            now=datetime.now(timezone.utc),
+        )
 
 
 def _cmd_provide_input(
@@ -1384,7 +1781,7 @@ def _cmd_provide_input(
 ) -> int:
     runtime = _runtime_config(args.hermes_home)
     store = _store(args, runtime)
-    current = store.get_run_status(args.run_id)
+    current = _require_run(store, args.run_id)
     pending = current.get("pending_interaction")
     if isinstance(pending, Mapping):
         actual = pending.get("interaction_id") or pending.get("action_digest")
@@ -1394,6 +1791,7 @@ def _cmd_provide_input(
         args.run_id,
         args.value,
         expected_state_version=args.expected_version,
+        interaction_id=args.interaction_id,
     )
     _continue_if_requested(
         args, store, runtime, agent_runner=agent_runner, profile_name=profile_name
@@ -1409,6 +1807,7 @@ def _cmd_retry(
 ) -> int:
     runtime = _runtime_config(args.hermes_home)
     store = _store(args, runtime)
+    _require_run(store, args.run_id)
     store.retry_run(
         args.run_id,
         node_id=args.node_id,
@@ -1428,6 +1827,7 @@ def _cmd_reconcile(
 ) -> int:
     runtime = _runtime_config(args.hermes_home)
     store = _store(args, runtime)
+    _require_run(store, args.run_id)
     store.reconcile_run(
         args.run_id,
         args.outcome,
@@ -1445,6 +1845,7 @@ def _cmd_reconcile(
 
 def _cmd_cancel(args: argparse.Namespace) -> int:
     store = _store(args)
+    _require_run(store, args.run_id)
     store.cancel_run(args.run_id)
     _emit(store.get_run_status(args.run_id), as_json=args.json)
     return 0
@@ -1452,8 +1853,29 @@ def _cmd_cancel(args: argparse.Namespace) -> int:
 
 def _cmd_abandon(args: argparse.Namespace) -> int:
     store = _store(args)
+    _require_run(store, args.run_id)
     store.abandon_run(args.run_id)
     _emit(store.get_run_status(args.run_id), as_json=args.json)
+    return 0
+
+
+def _cmd_archive(args: argparse.Namespace) -> int:
+    store = _store(args)
+    _require_run(store, args.run_id)
+    payload = store.archive_run(
+        args.run_id, expected_state_version=args.expected_version
+    )
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    store = _store(args)
+    _require_run(store, args.run_id)
+    payload = store.restore_run(
+        args.run_id, expected_state_version=args.expected_version
+    )
+    _emit(payload, as_json=args.json)
     return 0
 
 
@@ -1473,7 +1895,9 @@ def _duration(value: str):
 
 def _cmd_cleanup(args: argparse.Namespace) -> int:
     payload = _store(args).cleanup_runs(
-        older_than=_duration(args.older_than), dry_run=args.dry_run
+        older_than=_duration(args.older_than),
+        execute=args.execute,
+        confirmation_token=args.confirmation_token,
     )
     _emit(payload, as_json=args.json)
     return 0
@@ -1481,8 +1905,11 @@ def _cmd_cleanup(args: argparse.Namespace) -> int:
 
 def _cmd_reset_sessions(args: argparse.Namespace) -> int:
     if args.scope is None and not args.yes:
-        print("cross-scope reset requires --yes", file=sys.stderr)
-        return 1
+        raise WorkflowCommandError(
+            "confirmation_required",
+            "cross-scope reset requires --yes",
+            exit_code=EXIT_INVOCATION,
+        )
     removed = NodeSessionRegistry(args.hermes_home).reset(
         args.name, scope=args.scope, node_id=args.node
     )
@@ -1511,13 +1938,30 @@ def _cmd_showcase(args: argparse.Namespace) -> int:
     )
 
     action = getattr(args, "showcase_action", None)
+    catalog = load_showcase_catalog()
+    if action in {"describe", "preflight", "run", "reset"} and args.showcase_id not in catalog:
+        raise WorkflowNotFound(
+            f"showcase not found: {args.showcase_id}",
+            details={
+                "candidates": [
+                    {"id": item.id, "kind": "showcase", "label": item.display_name}
+                    for item in sorted(catalog.values(), key=lambda item: item.id)[:10]
+                ]
+            },
+        )
     if action == "list":
-        payload = [asdict(item) for item in load_showcase_catalog().values()]
+        payload = [asdict(item) for item in catalog.values()]
     elif action == "describe":
-        payload = asdict(load_showcase_catalog()[args.showcase_id])
+        payload = asdict(catalog[args.showcase_id])
     elif action == "preflight":
         payload = preflight_showcase(args.showcase_id, hermes_home=args.hermes_home)
     elif action == "run":
+        if (args.json or args.no_wait) and not args.idempotency_key:
+            raise WorkflowCommandError(
+                "idempotency_key_required",
+                "--idempotency-key is required for JSON and background starts",
+                exit_code=EXIT_INVOCATION,
+            )
         payload = run_showcase(
             args.showcase_id,
             hermes_home=args.hermes_home,
@@ -1526,10 +1970,14 @@ def _cmd_showcase(args: argparse.Namespace) -> int:
             schedule_at=args.schedule_at,
             no_wait=args.no_wait,
             idempotency_key=args.idempotency_key,
+            trigger_source=args.trigger_source,
+            source_instance=args.source_instance,
+            claimed_actor=args.claimed_actor,
         )
     elif action == "status":
-        payload = _store(args).get_run_status(args.run_id)
+        payload = _require_run(_store(args), args.run_id)
     elif action == "report":
+        _require_run(_store(args), args.run_id)
         payload = report_to_dict(
             build_showcase_report(args.run_id, hermes_home=args.hermes_home)
         )
@@ -1538,7 +1986,8 @@ def _cmd_showcase(args: argparse.Namespace) -> int:
     elif action == "cleanup":
         payload = cleanup_showcases(
             hermes_home=args.hermes_home,
-            dry_run=not args.execute,
+            execute=args.execute,
+            confirmation_token=args.confirmation_token,
             older_than_days=args.older_than_days,
         )
     else:
@@ -1547,9 +1996,15 @@ def _cmd_showcase(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    _emit(payload, as_json=args.json)
     if isinstance(payload, Mapping) and payload.get("reason_code"):
-        return 3 if payload.get("status") in {"skipped", "input_required"} else 1
+        input_required = payload.get("status") == "input_required"
+        raise WorkflowCommandError(
+            str(payload["reason_code"]),
+            str(payload.get("message") or payload["reason_code"]),
+            exit_code=EXIT_INVOCATION if input_required else EXIT_ACTION_FAILED,
+            result=payload,
+        )
+    _emit(payload, as_json=args.json)
     return 0
 
 
@@ -1559,10 +2014,14 @@ def workflow_command(
     action = getattr(args, "workflow_action", None)
     if not action:
         print(
-            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|cleanup|reset-sessions|showcase}",
+            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|archive|restore|cleanup|reset-sessions|showcase}",
             file=sys.stderr,
         )
         return 2
+    command = f"workflow {action}"
+    if action == "showcase" and getattr(args, "showcase_action", None):
+        command += f" {args.showcase_action}"
+    _MACHINE_COMMAND.set(command)
     try:
         if action in {"list", "ls"}:
             return _cmd_list(args)
@@ -1618,6 +2077,10 @@ def workflow_command(
             return _cmd_cancel(args)
         if action == "abandon":
             return _cmd_abandon(args)
+        if action == "archive":
+            return _cmd_archive(args)
+        if action == "restore":
+            return _cmd_restore(args)
         if action == "cleanup":
             return _cmd_cleanup(args)
         if action == "reset-sessions":
@@ -1626,13 +2089,52 @@ def workflow_command(
             return _cmd_showcase(args)
         print(f"Unknown workflow action: {action}", file=sys.stderr)
         return 2
-    except (
-        KeyError,
-        OSError,
-        StorageQuotaError,
-        ValueError,
-        WorkflowTrustError,
-        WorkflowValidationError,
-    ) as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+    except WorkflowCommandError as exc:
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    error_envelope(command, exc.error, result=exc.result),
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(str(exc), file=sys.stderr)
+        return exc.exit_code
+    except WorkflowTrustError as exc:
+        error = MachineError("trust_required", str(exc))
+        if getattr(args, "json", False):
+            print(json.dumps(error_envelope(command, error), sort_keys=True, indent=2))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_AUTHORIZATION
+    except (ValueError, WorkflowValidationError) as exc:
+        error = MachineError("invalid_request", str(exc))
+        if getattr(args, "json", False):
+            print(json.dumps(error_envelope(command, error), sort_keys=True, indent=2))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_INVOCATION
+    except (OSError, StorageQuotaError) as exc:
+        error = MachineError(
+            "action_failed",
+            "workflow storage operation failed",
+            details={"exception_type": type(exc).__name__},
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(error_envelope(command, error), sort_keys=True, indent=2))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ACTION_FAILED
+    except Exception as exc:
+        error = MachineError(
+            "internal_error",
+            "workflow command failed unexpectedly",
+            details={"exception_type": type(exc).__name__},
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(error_envelope(command, error), sort_keys=True, indent=2))
+        else:
+            print(error.message, file=sys.stderr)
+        return EXIT_INTERNAL

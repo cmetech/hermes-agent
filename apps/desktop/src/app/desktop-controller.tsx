@@ -74,6 +74,7 @@ import { onSessionsChanged } from '../store/session-sync'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '../store/todos'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '../store/updates'
 import { isSecondaryWindow } from '../store/windows'
+import { startWorkflowNotificationDelivery } from '../store/workflow-notifications'
 
 import { ChatView } from './chat'
 import { requestComposerFocus, requestComposerInsert } from './chat/composer/focus'
@@ -186,6 +187,8 @@ export function DesktopController() {
   const busyRef = useRef(false)
   const creatingSessionRef = useRef(false)
   const messagingTranscriptSignatureRef = useRef(new Map<string, string>())
+
+  useEffect(() => startWorkflowNotificationDelivery(), [])
 
   const gatewayState = useStore($gatewayState)
   const activeSessionId = useStore($activeSessionId)

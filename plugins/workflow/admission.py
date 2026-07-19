@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Mapping
 
+from plugins.workflow.provenance import TriggerProvenance, TriggerSource
+
 
 @dataclass(frozen=True)
 class RunAdmissionRequest:
@@ -13,12 +15,25 @@ class RunAdmissionRequest:
     definition_digest: str
     policy_digest: str
     input_manifest_digest: str
-    trigger_source: Literal["chat", "desktop", "cli", "api", "cron"]
+    trigger_source: TriggerSource
     idempotency_key: str
     concurrency_key: str
+    idempotency_namespace: str = "profile-local:cli"
     concurrency_policy: Literal["queue", "allow", "forbid"] = "queue"
+    execution_mode: Literal["foreground", "background"] = "foreground"
+    foreground_owner_id: str | None = None
+    foreground_lease_seconds: float = 30.0
     operator_scope: str | None = None
     run_metadata: Mapping[str, str] | None = None
+    provenance: TriggerProvenance | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.idempotency_namespace, str)
+            or not self.idempotency_namespace.strip()
+            or len(self.idempotency_namespace) > 512
+        ):
+            raise ValueError("idempotency_namespace must be bounded non-empty text")
 
 
 @dataclass(frozen=True)
@@ -41,6 +56,7 @@ class PreparedRunSnapshot:
     workflow_version: str = "1"
     nodes: tuple[Mapping[str, object], ...] = ()
     input_digests: Mapping[str, str] = None  # type: ignore[assignment]
+    outward_action_nodes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.input_digests is None:

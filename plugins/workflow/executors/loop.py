@@ -233,9 +233,14 @@ class LoopExecutor:
                 cancelled = self._cancelled(context)
                 return replace(cancelled, artifacts=tuple(artifacts))
             if loop.get("interactive") is True:
+                message = str(loop.get("gate_message", ""))
+                identity = hashlib.sha256(
+                    f"{context.run_id}\0{context.node.id}\0{iteration}\0{message}".encode()
+                ).hexdigest()
                 interaction = {
                     "type": "loop_input",
-                    "message": str(loop.get("gate_message", "")),
+                    "interaction_id": identity,
+                    "message": message,
                     "iteration": iteration,
                 }
                 return NodeExecutionResult(

@@ -36,7 +36,26 @@ def test_catalog_has_four_safe_digest_verified_scenarios() -> None:
     assert catalog["ai-extensions"].requires_ai is True
     assert catalog["scheduling"].interaction_mode == "schedule"
     assert all(item.package_digest for item in catalog.values())
+    assert all(item.verified_bundled_provenance for item in catalog.values())
     assert all("destructive" not in item.safety_class for item in catalog.values())
+
+
+def test_explicit_catalog_copy_is_not_authenticated_as_bundled_distribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+
+    catalog = load_showcase_catalog(copied)
+
+    assert all(not item.verified_bundled_provenance for item in catalog.values())
+    monkeypatch.setattr(showcase_module, "load_showcase_catalog", lambda: catalog)
+    with pytest.raises(ShowcaseCatalogError, match="bundled distribution provenance"):
+        showcase_module.run_showcase(
+            "laptop-diagnostic",
+            hermes_home=tmp_path / "profile",
+            symptom="fictional slow startup",
+        )
 
 
 def test_default_catalog_repairs_crlf_only_managed_checkout(
@@ -208,6 +227,10 @@ def test_preflight_is_side_effect_free_and_reports_explicit_opt_ins(
     assert laptop["runnable"] is True
     assert laptop["offline"] is True
     assert laptop["requires_confirmation"] is False
+    assert laptop["input_requirements"] == [
+        {"name": "evidence", "kind": "file", "required": True, "max_bytes": 65536},
+        {"name": "symptom", "kind": "text", "required": True, "max_bytes": 4096},
+    ]
     assert ai["requires_confirmation"] is True
     assert ai["confirmation_kind"] == "ai"
     assert ai["confirmation_token"]
@@ -224,14 +247,48 @@ def test_showcase_cli_list_and_missing_input_have_stable_exit_categories(
         ["workflow", "--hermes-home", str(tmp_path), "showcase", "list", "--json"]
     )
     assert listed.func(listed) == 0
-    assert len(json.loads(capsys.readouterr().out)) == 4
+    listed_envelope = json.loads(capsys.readouterr().out)
+    assert listed_envelope["ok"] is True
+    assert len(listed_envelope["result"]) == 4
 
     missing = parser.parse_args(
         [
             "workflow", "--hermes-home", str(tmp_path), "showcase", "run",
-            "laptop-diagnostic", "--json",
+            "laptop-diagnostic", "--json", "--idempotency-key", "missing-input",
         ]
     )
-    assert missing.func(missing) == 3
+    assert missing.func(missing) == 2
     payload = json.loads(capsys.readouterr().out)
-    assert payload["reason_code"] == "showcase_input_required"
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "showcase_input_required"
+    assert payload["result"]["reason_code"] == "showcase_input_required"
+
+
+@pytest.mark.parametrize(
+    ("machine_flag", "json_output"),
+    [("--json", True), ("--no-wait", False)],
+)
+def test_showcase_machine_start_requires_caller_idempotency_key(
+    tmp_path: Path, capsys, machine_flag: str, json_output: bool
+) -> None:
+    parser = argparse.ArgumentParser()
+    command = parser.add_subparsers().add_parser("workflow")
+    register_cli(command)
+    args = parser.parse_args(
+        [
+            "workflow",
+            "--hermes-home",
+            str(tmp_path),
+            "showcase",
+            "run",
+            "laptop-diagnostic",
+            machine_flag,
+        ]
+    )
+
+    assert args.func(args) == 2
+    captured = capsys.readouterr()
+    if json_output:
+        assert json.loads(captured.out)["error"]["code"] == "idempotency_key_required"
+    else:
+        assert "--idempotency-key is required" in captured.err

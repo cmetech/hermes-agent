@@ -258,12 +258,18 @@ def test_cli_approve_and_reject_have_stable_codes_and_continue_is_opt_in(
         str(home),
         "approve",
         admitted.run_id,
+        "--interaction-id",
+        pending["interaction_id"],
+        "--expected-version",
+        str(paused["state_version"]),
         "--comment",
         "ok",
         "--json",
     ])
     assert args.func(args) == 0
-    payload = json.loads(capsys.readouterr().out)
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["ok"] is True
+    payload = envelope["result"]
     assert payload["outcome"] == "applied"
     assert store.load_run(admitted.run_id)["status"] == "running"
 
@@ -274,10 +280,16 @@ def test_cli_approve_and_reject_have_stable_codes_and_continue_is_opt_in(
         str(home),
         "reject",
         admitted.run_id,
+        "--interaction-id",
+        pending["interaction_id"],
+        "--expected-version",
+        str(store.load_run(admitted.run_id)["state_version"]),
         "--reason",
         "late",
         "--json",
     ])
-    assert args.func(args) == 3
-    assert json.loads(capsys.readouterr().out)["outcome"] == "already_decided"
+    assert args.func(args) == 5
+    conflict = json.loads(capsys.readouterr().out)
+    assert conflict["ok"] is False
+    assert conflict["error"]["code"] == "decision_conflict"
     assert pending["interaction_id"]

@@ -48,6 +48,13 @@ def test_two_dependent_bash_nodes_execute_and_persist_artifacts(
     result = RunScheduler(store).advance(admitted.run_id)
 
     assert result["status"] == "succeeded"
+    status = store.get_run_status(admitted.run_id)
+    assert status["previous_node"] == "second"
+    assert all(
+        attempt["started_at"] <= attempt["completed_at"]
+        for node in status["nodes"].values()
+        for attempt in node["attempts"]
+    )
     assert [result["nodes"][node]["state"] for node in ("first", "second")] == [
         "succeeded",
         "succeeded",

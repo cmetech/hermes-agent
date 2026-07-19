@@ -1,0 +1,54 @@
+{
+  "admission_disposition": "created",
+  "artifacts": [
+    {
+      "attempt_id": "legacy-attempt",
+      "media_type": "text/plain",
+      "node_id": "start",
+      "relative_path": "nodes/start/legacy-attempt/stdout.txt",
+      "sha256": "087f2ddcd1d586a0690de6260a650b2f28d4b4afbd346953693f5280822cdb90",
+      "size_bytes": 16
+    }
+  ],
+  "blocked_by_run_id": null,
+  "concurrency_key": "migration-fixture",
+  "created_at": "2026-07-18T18:28:48.365854+00:00",
+  "definition_digest": "7021c40b7f161711f89884200c30fae9c14fd2106a2c640bb1169ba852426948",
+  "event_sequence": 7,
+  "idempotency_key_digest": "27bea5cf2ac5cde43d6b9a58ccedc0fdedabd34a836c2de1b7752f1999f7c48e",
+  "input_manifest_digest": "ab8f08a19dfdaec871ffc4e62d627883407b0cb11fb510f9ac5eaaebc43ee77b",
+  "last_error": null,
+  "last_semantic_progress_at": null,
+  "nodes": {
+    "start": {
+      "attempts": [
+        {
+          "attempt_id": "legacy-attempt",
+          "error_code": null,
+          "error_message": null,
+          "metadata": {},
+          "state": "succeeded"
+        }
+      ],
+      "depends_on": [],
+      "id": "start",
+      "state": "succeeded",
+      "type": "bash"
+    }
+  },
+  "operator_scope_digest": null,
+  "pending_interaction": null,
+  "policy_digest": "7f6be1404cbd81bafe346345727a2b886ae7c81add9dcddec3737dd0c54782e7",
+  "queue_position": null,
+  "run_id": "migration-run",
+  "run_metadata": {},
+  "schema_version": 1,
+  "started_at": "2026-07-18T18:28:48.365854+00:00",
+  "state_version": 7,
+  "status": "succeeded",
+  "trigger": "cli",
+  "updated_at": "2026-07-18T18:28:48.416626+00:00",
+  "warnings": [],
+  "workflow": "migration-fixture",
+  "workflow_version": "1"
+}

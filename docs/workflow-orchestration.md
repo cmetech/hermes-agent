@@ -111,6 +111,8 @@ hermes workflow resume <run-id> --json
 hermes workflow reconcile <run-id> confirmed-succeeded --interaction-id <id> --expected-version <n> --continue --json
 hermes workflow cancel <run-id> --json
 hermes workflow abandon <run-id> --json
+hermes workflow archive <run-id> --expected-version <n> --json
+hermes workflow restore <run-id> --expected-version <n> --json
 ```
 
 Approval/input/reconciliation decisions are compare-and-set transitions. Only one concurrent decision wins. Workflow approval permits graph progression; it does not bypass terminal hardline rules or tool approval policy.
@@ -123,13 +125,52 @@ On renderer exit, the renderer stops its readers but does not silently cancel du
 
 Large outputs are stored beneath the run directory. Durable state contains only contained relative paths, media types, byte sizes, and SHA-256 digests. Reads revalidate containment, symlink policy, size, and digest. Prompts, reasoning, credentials, sudo values, and raw tool arguments are excluded from plugin-visible operational state.
 
+Terminal status, archive visibility, evidence retention, and destructive cleanup are
+separate state machines. The active board shows nonterminal work plus terminal runs
+updated within seven UTC days by default. Older terminal runs move to History without
+changing their execution state or deleting evidence. Archive is reversible visibility
+metadata; restoring an archived run always returns it to History, never execution or
+the active board.
+
+Cleanup always begins with a non-destructive impact preview. The preview reports exact
+run IDs, evidence kinds, files, bytes, integrity state, blocking claims/readers,
+reconciliation and notification dependencies, and a short-lived confirmation token.
+Execution requires that exact token; any evidence or safety-state change invalidates
+it. Eligible evidence is atomically quarantined and recorded in cleanup history.
+Missing, empty, corrupt, or uncertain admission authority never authorizes deletion.
+
 ```bash
-hermes workflow cleanup --older-than 7d --dry-run --json
 hermes workflow cleanup --older-than 7d --json
+hermes workflow cleanup --older-than 7d --execute \
+  --confirmation-token <exact-token-from-preview> --json
 hermes workflow reset-sessions my-workflow --scope <scope> --node <node-id> --yes --json
 ```
 
-Cleanup applies only to retained terminal runs and preserves bounded audit behavior. Persistent node sessions are reset separately and explicitly.
+Persistent node sessions are reset separately and explicitly. There is no bare
+destructive cleanup invocation and no piped confirmation contract.
+
+## Durable notifications
+
+Approval/input waits, failure, stall, completion, cancellation, and
+reconciliation-required transitions are durable notification facts in RunStore.
+External delivery uses a separate leased outbox: immutable transition identities
+deduplicate retries, while failure/stall/retry delivery summaries may coalesce per
+run and destination for 60 seconds without erasing individual facts. Human gates,
+reconciliation, cancellation, and completion are never coalesced together.
+
+Desktop delivery is leased for 30 seconds to a stable Electron client identity.
+The row becomes delivered only after the Electron projection call acknowledges;
+a renderer/backend crash before that acknowledgement returns the row to pending
+after lease expiry. Dismissing a presentation records only dismissal metadata and
+never approves, cancels, archives, or otherwise changes the workflow.
+
+The coordinator owns reconciliation, retry, backoff, and dead-letter policy.
+Desktop and future authenticated Gateway return-route adapters are projections,
+not authorities. Hermes does not infer a Gateway destination from client claims:
+Gateway delivery is created only when admission carries a verified stored return
+route. A CLI-only install has neither coordinator nor delivery owner. Foreground
+notification facts remain queryable but are delivery-suppressed; cron and other
+background admission requires a healthy long-lived Web/Desktop or Gateway host.
 
 Behavioral limits belong in `config.yaml`, not `.env`:
 
@@ -153,6 +194,8 @@ plugins:
           process_tree_rss_bytes: 2147483648
           process_tree_cpu_seconds: 900
           max_descendants: 32
+      retention:
+        terminal_board_days: 7
 ```
 
 A package sidecar may only tighten profile ceilings. Output, artifact, event, per-run/profile storage, retry, child-agent, and topology bounds are likewise hard-capped by validation/runtime policy.

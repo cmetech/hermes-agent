@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import os
 import threading
 import time
 
 from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.executors.base import NodeExecutionResult
+from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
+from tools.managed_process import ProcessIdentity
 
 
 def _start(store, package, key="shutdown"):
@@ -116,3 +121,42 @@ def test_shutdown_cancellation_reaches_isolated_agent_runner(tmp_path, workflow_
 
     assert not thread.is_alive()
     assert store.load_run(admitted.run_id)["status"] == "interrupted"
+
+
+def test_shutdown_does_not_interrupt_a_successor_epoch_claim(
+    tmp_path, workflow_writer
+) -> None:
+    package = load_workflow(workflow_writer(tmp_path / "package", name="successor"))
+    store = RunStore(tmp_path / "home")
+    admitted = _start(store, package, key="successor")
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="successor",
+        host_kind="gateway",
+        host_instance_id="successor-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    acquired = CoordinatorStore(store.database).try_acquire(
+        identity,
+        now=datetime.now(timezone.utc),
+        lease_seconds=30,
+    )
+    successor = ExecutionFence("successor", acquired.lease.epoch)
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        f"coordinator:successor:{successor.owner_epoch}",
+        execution_fence=successor,
+    )
+    assert claim is not None
+
+    stale = RunScheduler(store, execution_fence=ExecutionFence("stale", 1))
+    with stale._activity:
+        stale._active_runs.add(admitted.run_id)
+    before = store.load_run(admitted.run_id)["state_version"]
+    stale.shutdown(deadline_seconds=1)
+
+    projection = store.load_run(admitted.run_id)
+    assert projection["state_version"] == before
+    assert projection["nodes"]["start"]["claim"]["attempt_id"] == claim.attempt_id

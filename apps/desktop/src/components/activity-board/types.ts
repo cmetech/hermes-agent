@@ -1,4 +1,5 @@
 export interface ActivityBadge {
+  icon?: string
   label: string
   tone?: 'danger' | 'muted' | 'notice' | 'success'
 }

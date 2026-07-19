@@ -8,6 +8,52 @@ import subprocess
 
 ROOT = Path(__file__).parents[2]
 GATE = ROOT / "scripts/test_workflow_merge_gate.sh"
+CI = ROOT / ".github/workflows/ci.yml"
+WORKFLOW_GATE_OPTOUTS = {
+    path: "covered by the standard Python suite; outside the focused release gates"
+    for path in (
+        "tests/plugins/workflow/test_ai_e2e.py",
+        "tests/plugins/workflow/test_ai_executor.py",
+        "tests/plugins/workflow/test_api_runtime.py",
+        "tests/plugins/workflow/test_approval.py",
+        "tests/plugins/workflow/test_approval_races.py",
+        "tests/plugins/workflow/test_bash_e2e.py",
+        "tests/plugins/workflow/test_cancel_node.py",
+        "tests/plugins/workflow/test_catalog_cli.py",
+        "tests/plugins/workflow/test_cli.py",
+        "tests/plugins/workflow/test_compat_matrix.py",
+        "tests/plugins/workflow/test_crash_recovery.py",
+        "tests/plugins/workflow/test_deadlines.py",
+        "tests/plugins/workflow/test_discovery.py",
+        "tests/plugins/workflow/test_doctor.py",
+        "tests/plugins/workflow/test_loop_executor.py",
+        "tests/plugins/workflow/test_node_agents.py",
+        "tests/plugins/workflow/test_node_hooks.py",
+        "tests/plugins/workflow/test_node_mcp.py",
+        "tests/plugins/workflow/test_node_skills.py",
+        "tests/plugins/workflow/test_node_tool_policy.py",
+        "tests/plugins/workflow/test_operator_e2e.py",
+        "tests/plugins/workflow/test_operator_scope.py",
+        "tests/plugins/workflow/test_parallel_scheduler.py",
+        "tests/plugins/workflow/test_performance_bounds.py",
+        "tests/plugins/workflow/test_persisted_sessions.py",
+        "tests/plugins/workflow/test_provenance.py",
+        "tests/plugins/workflow/test_provider_compat.py",
+        "tests/plugins/workflow/test_provider_failures.py",
+        "tests/plugins/workflow/test_resources.py",
+        "tests/plugins/workflow/test_retry.py",
+        "tests/plugins/workflow/test_run_queries.py",
+        "tests/plugins/workflow/test_scheduler.py",
+        "tests/plugins/workflow/test_schema.py",
+        "tests/plugins/workflow/test_script_executor.py",
+        "tests/plugins/workflow/test_showcase_ai_e2e.py",
+        "tests/plugins/workflow/test_showcase_evidence.py",
+        "tests/plugins/workflow/test_showcase_offline_e2e.py",
+        "tests/plugins/workflow/test_showcase_schedule_e2e.py",
+        "tests/plugins/workflow/test_store.py",
+        "tests/plugins/workflow/test_topology.py",
+    )
+}
 
 
 def test_merge_gate_references_only_existing_invariant_tests() -> None:
@@ -17,6 +63,57 @@ def test_merge_gate_references_only_existing_invariant_tests() -> None:
 
     assert referenced
     assert not [path for path in sorted(referenced) if not (ROOT / path).is_file()]
+
+
+def test_merge_gate_enforces_async_reload_and_delivery_regressions() -> None:
+    source = GATE.read_text()
+
+    for required_test in (
+        "tests/gateway/test_plugin_background_services.py",
+        "tests/gateway/test_plugin_delivery.py",
+        "tests/hermes_cli/test_plugin_provider_hot_reload.py",
+        "tests/scripts/test_workflow_merge_gate.py",
+    ):
+        assert required_test in source
+
+
+def test_native_workflow_matrix_covers_every_release_gate() -> None:
+    source = CI.read_text()
+
+    assert "os: [ubuntu-latest, macos-latest, windows-latest]" in source
+    for required_test in (
+        "tests/plugins/workflow/test_desktop_api.py",
+        "tests/plugins/workflow/test_evidence_api.py",
+        "tests/plugins/workflow/test_idempotency_multiprocess.py",
+        "tests/plugins/workflow/test_coordinator.py",
+        "tests/plugins/workflow/test_coordinator_multiprocess.py",
+        "tests/plugins/workflow/test_schema_migrations.py",
+        "tests/plugins/workflow/test_notification_delivery.py",
+        "tests/plugins/workflow/test_notifications.py",
+        "tests/plugins/workflow/test_shutdown_recovery.py",
+        "tests/plugins/workflow/test_retention.py",
+    ):
+        assert required_test in source
+
+
+def test_every_workflow_test_is_selected_or_explicitly_opted_out() -> None:
+    inventory = {
+        path.relative_to(ROOT).as_posix()
+        for path in (ROOT / "tests/plugins/workflow").glob("test_*.py")
+    }
+    selected = set(
+        re.findall(
+            r"tests/plugins/workflow/test_[A-Za-z0-9_]+\.py",
+            GATE.read_text() + CI.read_text(),
+        )
+    )
+    opted_out = set(WORKFLOW_GATE_OPTOUTS)
+
+    assert all(reason.strip() for reason in WORKFLOW_GATE_OPTOUTS.values())
+    assert not any("*" in path for path in opted_out)
+    assert not (opted_out - inventory)
+    assert not (opted_out & selected)
+    assert not (inventory - selected - opted_out)
 
 
 def test_merge_gate_shares_workspace_root_dependencies_with_temp_worktrees() -> None:
@@ -43,7 +140,7 @@ def test_merge_gate_rejects_invalid_phase_and_unknown_brand() -> None:
 def test_base_gate_is_offline_and_reports_exact_tested_sha(monkeypatch) -> None:
     env = dict(**__import__("os").environ)
     env["WORKFLOW_MERGE_GATE_FAST"] = "1"
-    result = subprocess.run([GATE, "--phase", "base"], cwd=ROOT, text=True, capture_output=True, env=env)
+    result = subprocess.run([GATE], cwd=ROOT, text=True, capture_output=True, env=env)
     assert result.returncode == 0, result.stderr
     assert f"TESTED_BASE_SHA={subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()}" in result.stdout
 

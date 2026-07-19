@@ -9,6 +9,51 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionFence:
+    """Exact durable coordinator ownership required for background execution."""
+
+    owner_id: str
+    owner_epoch: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.owner_id, str) or not self.owner_id or len(self.owner_id) > 256:
+            raise ValueError("owner_id must be bounded non-empty text")
+        if (
+            isinstance(self.owner_epoch, bool)
+            or not isinstance(self.owner_epoch, int)
+            or self.owner_epoch <= 0
+        ):
+            raise ValueError("owner_epoch must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalJournalReserve:
+    """Durable capacity held for one attempt's terminal/recovery evidence."""
+
+    projection_limit_bytes: int
+    terminal_reserve_bytes: int
+
+    @classmethod
+    def for_projection(cls, projection_bytes: int) -> "TerminalJournalReserve":
+        if (
+            isinstance(projection_bytes, bool)
+            or not isinstance(projection_bytes, int)
+            or projection_bytes <= 0
+        ):
+            raise ValueError("projection_bytes must be a positive integer")
+        # Ordinary progress may grow the materialized projection, but only
+        # within this attempt-owned bound. Three full recovery frames cover
+        # node terminal evidence, run terminal/retry evidence, and one repair
+        # frame; duplicated bounded payload data is included conservatively.
+        projection_limit = projection_bytes + max(8 * 1024, projection_bytes)
+        terminal_reserve = 3 * (2 * projection_limit + 8 * 1024)
+        return cls(projection_limit, terminal_reserve)
+
+    def contains_projection(self, projection_bytes: int) -> bool:
+        return 0 < projection_bytes <= self.projection_limit_bytes
+
+
 def freeze_value(value: Any) -> Any:
     """Recursively freeze parsed YAML without changing scalar values."""
     if isinstance(value, Mapping):
@@ -214,6 +259,9 @@ class WorkflowRuntimeConfig:
     subprocess_timeout_seconds: float = 120.0
     heartbeat_seconds: float = 5.0
     lease_seconds: float = 30.0
+    coordinator_web_election_grace_seconds: float = 3.0
+    runnable_stall_seconds: float = 60.0
+    semantic_stall_seconds: float = 300.0
     cooperative_shutdown_seconds: float = 5.0
     term_grace_seconds: float = 5.0
     kill_reap_grace_seconds: float = 2.0
@@ -250,14 +298,17 @@ class WorkflowRuntimeConfig:
             "subprocess_timeout_seconds",
             "heartbeat_seconds",
             "lease_seconds",
+            "coordinator_web_election_grace_seconds",
+            "runnable_stall_seconds",
+            "semantic_stall_seconds",
             "cooperative_shutdown_seconds",
             "term_grace_seconds",
             "kill_reap_grace_seconds",
             "process_tree_cpu_seconds",
         ):
             _bounded_seconds(getattr(self, name), name)
-        if self.heartbeat_seconds >= self.lease_seconds:
-            raise ValueError("heartbeat_seconds must be shorter than lease_seconds")
+        if self.lease_seconds < 3 * self.heartbeat_seconds:
+            raise ValueError("lease_seconds must be at least three heartbeats")
         if self.ai_idle_timeout_seconds > self.ai_wall_timeout_seconds:
             raise ValueError("AI idle timeout cannot exceed AI wall timeout")
         if self.provider_request_timeout_seconds > self.ai_wall_timeout_seconds:

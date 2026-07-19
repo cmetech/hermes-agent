@@ -1,23 +1,47 @@
 ---
 name: workflow-showcase
-description: Use when the user asks for a workflow showcase, demo, tour, Laptop Diagnostic, resilience scenario, optional AI/extensions, scheduling, status, report, resume, reset, or cleanup.
+description: Use when explaining, running, resuming, reporting, resetting, or cleaning a bundled workflow showcase or resilience demonstration.
 ---
 
-# Workflow showcase
+<objective>
+Route showcase requests through digest-verified showcase discovery while using
+the reusable workflow operator contract for every general run action.
+</objective>
 
-Before any command, resolve `PRODUCT_CLI` once from the active product:
+<quick_start>
+Resolve `PRODUCT_CLI` once from the active `brand.json` slug, falling back to
+`hermes` only for a neutral install. Run `PRODUCT_CLI workflow showcase
+preflight ID --json`, then read `result.command_contract`. Use that exact
+contract; never speculate about flags or execute `PRODUCT_CLI` literally.
+</quick_start>
 
-- Read `$HERMES_HOME/brand.json` when available and use its `slug` as the executable name. For example, LOOP24 uses `loop24` and OTTO uses `otto`.
-- If there is no brand descriptor, use `hermes` only for a neutral Hermes Agent installation.
-- Every command template below uses `PRODUCT_CLI`. Replace that token with the resolved executable; do not execute it literally and do not substitute a different product's bare `hermes` command on a branded installation.
+<essential_principles>
+- Showcase catalog commands use a showcase ID. Once a run starts, status,
+  events, approve, reject, input, resume, reconcile, and cancel use its run ID.
+- Retain one stable intent key across retries. Execute one mutation at a time;
+  never parallel-probe variants, mask failure, or pipe approval.
+- Stop at human gates. Interpret `coordinator_unavailable`, stalled/no-progress,
+  conflict, waiting retry, and terminal outcomes from authoritative JSON.
+- Never promise a pass before reading the evidence report. Expected resilience
+  failures may validate a claim while the workflow remains truthfully failed.
+</essential_principles>
 
-Always call `PRODUCT_CLI workflow showcase ... --json` and interpret the returned evidence. Never promise a pass before reading the report, never approve an interaction for the user, and never invent consent.
+<routing>
+- Explanation/comparison: [workflows/explain-showcase.md](workflows/explain-showcase.md)
+- Run/tour/resilience/AI/scheduling: [workflows/run-showcase.md](workflows/run-showcase.md)
+- Status/gates/resume/report: [workflows/resume-and-report.md](workflows/resume-and-report.md)
+- Reset/cleanup: [workflows/reset-and-cleanup.md](workflows/reset-and-cleanup.md)
+</routing>
 
-- For an explanation or scenario comparison, read [workflows/explain-showcase.md](workflows/explain-showcase.md).
-- To run Laptop Diagnostic, the resilience lab (retry, timeout, or cancel), optional AI/extensions, or scheduling, read [workflows/run-showcase.md](workflows/run-showcase.md).
-- For status, report, resume, approval/rejection handoff, or “what is waiting?”, read [workflows/resume-and-report.md](workflows/resume-and-report.md).
-- For reset or cleanup, read [workflows/reset-and-cleanup.md](workflows/reset-and-cleanup.md).
+<reference_guides>
+Read [references/showcase-contract.md](references/showcase-contract.md) and
+[references/safety-and-interpretation.md](references/safety-and-interpretation.md)
+before interpreting a run or expected failure.
+</reference_guides>
 
-The Laptop Diagnostic is synthetic and offline: ask for one short symptom/focus, and explain that fictional evidence is used instead of inventorying the real laptop. The default showcase uses no model, network, or external integration. AI and scheduling require the exact confirmation token from preflight. Ask for only one missing input at a time.
-
-Read [references/showcase-contract.md](references/showcase-contract.md) for command/result contracts and [references/safety-and-interpretation.md](references/safety-and-interpretation.md) before interpreting expected failures.
+<success_criteria>
+- Preflight supplied exact syntax and the selected scenario's safety facts.
+- General actions used the run ID and current interaction/version fields.
+- No duplicate run, speculative mutation, hidden failure, or invented consent occurred.
+- The report cites durable evidence and preserves the true terminal outcome.
+</success_criteria>

@@ -18,6 +18,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Sequence
 from typing import Any, Callable
 
@@ -26,6 +27,285 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 
 logger = logging.getLogger(__name__)
 _IS_WINDOWS = platform.system() == "Windows"
+_JOB_OBJECT_QUERY = 0x0004
+_JOB_OBJECT_TERMINATE = 0x0008
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_CREATE_SUSPENDED = 0x00000004
+_TH32CS_SNAPTHREAD = 0x00000004
+_THREAD_SUSPEND_RESUME = 0x0002
+
+
+class _WindowsJob:
+    """Owned named Win32 Job Object with kill-on-last-handle-close."""
+
+    def __init__(self, handle: int, name: str) -> None:
+        self.handle = handle
+        self.name = name
+
+    @staticmethod
+    def _kernel32():
+        import ctypes
+
+        return ctypes.WinDLL("kernel32", use_last_error=True)
+
+    @staticmethod
+    def _raise_last_error(operation: str) -> None:
+        import ctypes
+
+        error = ctypes.get_last_error()
+        raise OSError(error, f"{operation} failed with Win32 error {error}")
+
+    @classmethod
+    def create(cls) -> "_WindowsJob":
+        import ctypes
+        from ctypes import wintypes
+
+        name = f"Local\\HermesManagedProcess-{uuid.uuid4().hex}"
+        kernel32 = cls._kernel32()
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        handle = kernel32.CreateJobObjectW(None, name)
+        if not handle:
+            cls._raise_last_error("CreateJobObjectW")
+        job = cls(int(handle), name)
+        try:
+            job._enable_kill_on_close()
+        except BaseException:
+            job.close()
+            raise
+        return job
+
+    @classmethod
+    def open(cls, name: str) -> "_WindowsJob | None":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = cls._kernel32()
+        kernel32.OpenJobObjectW.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        ]
+        kernel32.OpenJobObjectW.restype = wintypes.HANDLE
+        handle = kernel32.OpenJobObjectW(
+            _JOB_OBJECT_QUERY | _JOB_OBJECT_TERMINATE,
+            False,
+            name,
+        )
+        if handle:
+            return cls(int(handle), name)
+        if ctypes.get_last_error() == 2:
+            return None
+        cls._raise_last_error("OpenJobObjectW")
+
+    def _enable_kill_on_close(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimitInformation),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        information = ExtendedLimitInformation()
+        information.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        kernel32 = self._kernel32()
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        if not kernel32.SetInformationJobObject(
+            self.handle,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            self._raise_last_error("SetInformationJobObject")
+
+    def assign(self, process_handle: int) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = self._kernel32()
+        kernel32.AssignProcessToJobObject.argtypes = [
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+        ]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        if not kernel32.AssignProcessToJobObject(self.handle, process_handle):
+            self._raise_last_error("AssignProcessToJobObject")
+
+    @classmethod
+    def resume_process(cls, pid: int) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class ThreadEntry32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ThreadID", wintypes.DWORD),
+                ("th32OwnerProcessID", wintypes.DWORD),
+                ("tpBasePri", wintypes.LONG),
+                ("tpDeltaPri", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        kernel32 = cls._kernel32()
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+        if int(snapshot or 0) == ctypes.c_void_p(-1).value:
+            cls._raise_last_error("CreateToolhelp32Snapshot")
+        resumed = False
+        try:
+            kernel32.Thread32First.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(ThreadEntry32),
+            ]
+            kernel32.Thread32First.restype = wintypes.BOOL
+            kernel32.Thread32Next.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(ThreadEntry32),
+            ]
+            kernel32.Thread32Next.restype = wintypes.BOOL
+            kernel32.OpenThread.argtypes = [
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            ]
+            kernel32.OpenThread.restype = wintypes.HANDLE
+            kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+            kernel32.ResumeThread.restype = wintypes.DWORD
+            entry = ThreadEntry32()
+            entry.dwSize = ctypes.sizeof(entry)
+            present = bool(kernel32.Thread32First(snapshot, ctypes.byref(entry)))
+            while present:
+                if int(entry.th32OwnerProcessID) == pid:
+                    thread = kernel32.OpenThread(
+                        _THREAD_SUSPEND_RESUME,
+                        False,
+                        entry.th32ThreadID,
+                    )
+                    if not thread:
+                        cls._raise_last_error("OpenThread")
+                    try:
+                        if kernel32.ResumeThread(thread) == 0xFFFFFFFF:
+                            cls._raise_last_error("ResumeThread")
+                        resumed = True
+                    finally:
+                        kernel32.CloseHandle(thread)
+                    break
+                present = bool(kernel32.Thread32Next(snapshot, ctypes.byref(entry)))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        if not resumed:
+            raise OSError(f"no resumable primary thread found for pid {pid}")
+
+    def active_processes(self) -> int:
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicAccountingInformation(ctypes.Structure):
+            _fields_ = [
+                ("TotalUserTime", ctypes.c_longlong),
+                ("TotalKernelTime", ctypes.c_longlong),
+                ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+                ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+                ("TotalPageFaultCount", wintypes.DWORD),
+                ("TotalProcesses", wintypes.DWORD),
+                ("ActiveProcesses", wintypes.DWORD),
+                ("TotalTerminatedProcesses", wintypes.DWORD),
+            ]
+
+        information = BasicAccountingInformation()
+        returned = wintypes.DWORD()
+        kernel32 = self._kernel32()
+        kernel32.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+        if not kernel32.QueryInformationJobObject(
+            self.handle,
+            _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+            ctypes.byref(returned),
+        ):
+            self._raise_last_error("QueryInformationJobObject")
+        return int(information.ActiveProcesses)
+
+    def terminate_and_wait(self, timeout_seconds: float) -> bool:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = self._kernel32()
+        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        if not kernel32.TerminateJobObject(self.handle, 1):
+            self._raise_last_error("TerminateJobObject")
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while True:
+            if self.active_processes() == 0:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    def close(self) -> None:
+        if not self.handle:
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        handle = self.handle
+        self.handle = 0
+        kernel32 = self._kernel32()
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        if not kernel32.CloseHandle(handle):
+            self._raise_last_error("CloseHandle")
 
 
 @dataclass(frozen=True)
@@ -92,6 +372,7 @@ class ProcessIdentity:
     pid: int
     start_time: int | None
     group_id: int | None
+    job_name: str | None = None
 
     @classmethod
     def capture(cls, pid: int) -> "ProcessIdentity":
@@ -134,6 +415,7 @@ class ManagedProcessTree:
         identity: ProcessIdentity,
         *,
         policy: TerminationPolicy | None = None,
+        windows_job: _WindowsJob | None = None,
     ) -> None:
         self.process = process
         self.identity = identity
@@ -141,10 +423,22 @@ class ManagedProcessTree:
         self._lock = threading.Lock()
         self._reaped = False
         self._returncode: int | None = None
+        self._windows_job = windows_job
+        self._windows_tree_confirmed = False
 
     @property
     def reaped(self) -> bool:
         return self._reaped
+
+    def __del__(self) -> None:
+        job = getattr(self, "_windows_job", None)
+        if job is None:
+            return
+        self._windows_job = None
+        try:
+            job.close()
+        except Exception:
+            pass
 
     def resource_violation(self, limits: ProcessResourceLimits) -> str | None:
         """Return a typed aggregate limit violation, failing closed on metrics."""
@@ -205,23 +499,113 @@ class ManagedProcessTree:
         kwargs.setdefault("stdout", subprocess.PIPE)
         kwargs.setdefault("stderr", subprocess.STDOUT)
         if _IS_WINDOWS:
-            kwargs.setdefault("creationflags", windows_hide_flags())
+            kwargs["creationflags"] = (
+                int(kwargs.get("creationflags", windows_hide_flags()))
+                | _CREATE_SUSPENDED
+            )
         else:
             kwargs.setdefault("start_new_session", True)
 
-        process = subprocess.Popen(list(argv), **kwargs)
+        windows_job = _WindowsJob.create() if _IS_WINDOWS else None
+        process = None
         try:
+            process = subprocess.Popen(list(argv), **kwargs)
+            if windows_job is not None:
+                windows_job.assign(int(process._handle))
+                windows_job.resume_process(process.pid)
             identity = ProcessIdentity.capture(process.pid)
-            return cls(process, identity, policy=policy)
+            if windows_job is not None:
+                identity = ProcessIdentity(
+                    pid=identity.pid,
+                    start_time=identity.start_time,
+                    group_id=identity.group_id,
+                    job_name=windows_job.name,
+                )
+            return cls(
+                process,
+                identity,
+                policy=policy,
+                windows_job=windows_job,
+            )
         except BaseException:
-            try:
-                process.kill()
-            finally:
+            if process is not None:
+                try:
+                    process.kill()
+                except BaseException:
+                    pass
                 try:
                     process.wait(timeout=1)
-                except Exception:
+                except BaseException:
+                    pass
+            if windows_job is not None:
+                try:
+                    windows_job.close()
+                except BaseException:
                     pass
             raise
+
+    def tree_active(self) -> bool:
+        """Return true while any owned process is live or quiescence is uncertain."""
+        if _IS_WINDOWS:
+            if self._windows_job is None:
+                return not self._windows_tree_confirmed
+            try:
+                return self._windows_job.active_processes() > 0
+            except OSError:
+                return True
+        if self.process.poll() is None:
+            return True
+        group_id = self.identity.group_id
+        if group_id is None or group_id <= 0 or group_id == os.getpgrp():
+            return False
+        try:
+            os.killpg(group_id, 0)  # windows-footgun: ok - POSIX branch
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    @classmethod
+    def existing_tree_active(cls, identity: ProcessIdentity) -> bool | None:
+        """Query a persisted Windows job; return None when proof is unavailable."""
+        if not _IS_WINDOWS or not identity.job_name:
+            return None
+        try:
+            job = _WindowsJob.open(identity.job_name)
+        except OSError:
+            return None
+        if job is None:
+            return None if identity.is_current() else False
+        try:
+            return job.active_processes() > 0
+        except OSError:
+            return None
+        finally:
+            try:
+                job.close()
+            except OSError:
+                pass
+
+    def _terminate_owned_windows_job(self) -> bool:
+        job = self._windows_job
+        if job is None:
+            return self._windows_tree_confirmed
+        confirmed = False
+        try:
+            confirmed = job.terminate_and_wait(
+                self.policy.term_grace_seconds + self.policy.kill_grace_seconds
+            )
+            return confirmed
+        except OSError:
+            return False
+        finally:
+            self._windows_tree_confirmed = confirmed
+            self._windows_job = None
+            try:
+                job.close()
+            except OSError:
+                self._windows_tree_confirmed = False
 
     def terminate(self, reason: str = "shutdown") -> int | None:
         """Stop the owned tree and reap the direct child; safe to call twice."""
@@ -232,17 +616,14 @@ class ManagedProcessTree:
 
             if self.process.poll() is not None:
                 if _IS_WINDOWS:
-                    self.terminate_existing(
-                        self.identity,
-                        term_grace_seconds=self.policy.term_grace_seconds,
-                        kill_grace_seconds=self.policy.kill_grace_seconds,
-                    )
+                    cleaned = self._terminate_owned_windows_job()
                 else:
-                    if not self._terminate_owned_posix_group():
-                        raise RuntimeError(
-                            f"owned process group {self.identity.group_id} was not "
-                            "cleaned within the bounded termination policy"
-                        )
+                    cleaned = self._terminate_owned_posix_group()
+                if not cleaned:
+                    raise RuntimeError(
+                        f"owned process tree {self.identity.pid} was not proven "
+                        "quiescent within the bounded termination policy"
+                    )
                 return self._reap()
 
             # A PIPE-backed stdin is the coordinator lifeline used by isolated
@@ -263,13 +644,15 @@ class ManagedProcessTree:
                     pass
                 else:
                     self._returncode = returncode
-                    self._reaped = True
-                    return returncode
 
-            terminated = self.terminate_existing(
-                self.identity,
-                term_grace_seconds=self.policy.term_grace_seconds,
-                kill_grace_seconds=self.policy.kill_grace_seconds,
+            terminated = (
+                self._terminate_owned_windows_job()
+                if _IS_WINDOWS
+                else self.terminate_existing(
+                    self.identity,
+                    term_grace_seconds=self.policy.term_grace_seconds,
+                    kill_grace_seconds=self.policy.kill_grace_seconds,
+                )
             )
             if not terminated and self.process.poll() is None:
                 # A synthetic/non-enumerable child (not an identity mismatch)
@@ -305,6 +688,12 @@ class ManagedProcessTree:
                         f"owned process group {self.identity.group_id} was not "
                         "cleaned within the bounded termination policy"
                     )
+            elif not terminated:
+                self._reap()
+                raise RuntimeError(
+                    f"owned Windows job {self.identity.job_name or self.identity.pid} "
+                    "was not proven quiescent within the bounded termination policy"
+                )
             result = self._reap()
             if not self._reaped:
                 raise RuntimeError(
@@ -363,7 +752,9 @@ class ManagedProcessTree:
             self._returncode = self.process.wait(timeout=0)
         except subprocess.TimeoutExpired:
             self._returncode = self.process.poll()
-        self._reaped = self.process.poll() is not None
+        self._reaped = self.process.poll() is not None and (
+            not _IS_WINDOWS or self._windows_tree_confirmed
+        )
         return self._returncode
 
     @staticmethod
@@ -393,6 +784,26 @@ class ManagedProcessTree:
         Optional callables are compatibility seams for current registry tests;
         production callers use the defaults.
         """
+        windows = _IS_WINDOWS if is_windows is None else is_windows
+        if windows and identity.job_name:
+            try:
+                job = _WindowsJob.open(identity.job_name)
+            except OSError:
+                return False
+            if job is None:
+                return not identity.is_current()
+            try:
+                return job.terminate_and_wait(
+                    term_grace_seconds + kill_grace_seconds
+                )
+            except OSError:
+                return False
+            finally:
+                try:
+                    job.close()
+                except OSError:
+                    pass
+
         if identity.start_time is not None:
             current = ProcessIdentity.capture(identity.pid)
             if (
@@ -408,12 +819,11 @@ class ManagedProcessTree:
         # Hermes' prior best-effort behavior. The OS primitive below decides
         # whether the PID still exists.
 
-        windows = _IS_WINDOWS if is_windows is None else is_windows
         run = subprocess.run if subprocess_run is None else subprocess_run
         kill = os.kill if os_kill is None else os_kill
         if windows:
             try:
-                completed = run(
+                run(
                     ["taskkill", "/PID", str(identity.pid), "/T", "/F"],
                     capture_output=True,
                     text=True,
@@ -423,13 +833,12 @@ class ManagedProcessTree:
                     ),
                     stdin=subprocess.DEVNULL,
                 )
-                return completed.returncode == 0
             except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
                 try:
                     kill(identity.pid, signal.SIGTERM)
-                    return True
                 except (OSError, ProcessLookupError, PermissionError):
-                    return False
+                    pass
+            return False
 
         import psutil
 

@@ -28,4 +28,30 @@ describe('workflowBoardModel', () => {
     ])
     expect(model.columns[3]!.cards[0]!.badges[0]!.label).toBe('2/2')
   })
+
+  it('derives origin and coordinator attention from durable server fields', () => {
+    const model = workflowBoardModel([
+      run('running'),
+      {
+        ...run('stalled'),
+        coordinator: { reason_code: 'leader_lease_expired', status: 'unavailable' },
+        current_nodes: ['publish'],
+        health: 'coordinator_unavailable',
+        provenance: { assurance: 'verified_adapter', source: 'desktop' },
+        status: 'running'
+      }
+    ])
+
+    const attention = model.columns.find(column => column.id === 'attention')!
+    const card = attention.cards[0]!
+
+    expect(card.badges).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ icon: 'device-desktop', label: 'desktop' }),
+        expect.objectContaining({ label: 'coordinator unavailable', tone: 'danger' }),
+        expect.objectContaining({ label: 'publish' })
+      ])
+    )
+    expect(card.ariaDescription).toContain('verified_adapter')
+  })
 })

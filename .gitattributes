@@ -14,3 +14,7 @@ docker/entrypoint.sh text eol=lf
 # fail distribution digest verification before capability defaults are seeded.
 capabilities/workflow-packages/** text eol=lf
 plugins/workflow/showcases/** text eol=lf
+tests/plugins/workflow/fixtures/store/**/*.json text eol=lf
+tests/plugins/workflow/fixtures/store/**/*.jsonl text eol=lf
+tests/plugins/workflow/fixtures/store/**/*.yaml text eol=lf
+tests/plugins/workflow/fixtures/store/**/*.txt text eol=lf
