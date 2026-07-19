@@ -158,6 +158,31 @@ def test_explicit_retryable_failure_allows_one_safe_new_attempt(tmp_path) -> Non
     assert sends == ["attempt", "attempt"]
 
 
+def test_pre_send_storage_contention_is_retryable_without_transport_attempt(
+    tmp_path, monkeypatch
+) -> None:
+    sends = []
+    port = GatewayPluginDeliveryPort(
+        tmp_path,
+        profile="default",
+        sender=lambda _route, _text: sends.append("attempt")
+        or DeliveryReceipt(status="delivered"),
+    )
+    capability = port.mint_return_route(_source(), _invocation())
+
+    def locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(port, "_connect", locked)
+
+    receipt = port.deliver(capability, "workflow finished", "delivery-busy")
+
+    assert receipt == DeliveryReceipt(
+        status="retryable_failure", detail="delivery_store_unavailable"
+    )
+    assert sends == []
+
+
 def test_gateway_invocation_uses_only_verified_session_source() -> None:
     from gateway.run import GatewayRunner
 

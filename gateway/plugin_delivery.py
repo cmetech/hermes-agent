@@ -196,21 +196,12 @@ class GatewayPluginDeliveryPort:
                 ),
             )
 
-    def deliver(
-        self, capability: str, text: str, idempotency_key: str
-    ) -> DeliveryReceipt:
-        """Attempt one bounded send, never replaying an uncertain attempt."""
-        if not all(
-            isinstance(value, str)
-            and value
-            and len(value.encode("utf-8")) <= _MAX_ROUTE_VALUE_BYTES
-            for value in (capability, idempotency_key)
-        ):
-            return DeliveryReceipt(status="unauthorized")
-        if not isinstance(text, str) or len(text.encode("utf-8")) > _MAX_DELIVERY_TEXT_BYTES:
-            return DeliveryReceipt(status="permanent_failure", detail="invalid_text")
-        capability_digest = _digest(capability)
-        observed = self._now_utc()
+    def _begin_delivery(
+        self,
+        capability_digest: str,
+        idempotency_key: str,
+        observed: datetime,
+    ) -> DeliveryReceipt | Mapping[str, object]:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             route = connection.execute(
@@ -241,8 +232,6 @@ class GatewayPluginDeliveryPort:
                         idempotency_key,
                     ),
                 )
-                connection.commit()
-                normalized_route = json.loads(str(route["route_json"]))
             else:
                 timestamp = observed.isoformat()
                 connection.execute(
@@ -251,8 +240,35 @@ class GatewayPluginDeliveryPort:
                     "VALUES (?, ?, 'sending', ?, ?)",
                     (capability_digest, idempotency_key, timestamp, timestamp),
                 )
-                connection.commit()
-                normalized_route = json.loads(str(route["route_json"]))
+            connection.commit()
+            return json.loads(str(route["route_json"]))
+
+    def deliver(
+        self, capability: str, text: str, idempotency_key: str
+    ) -> DeliveryReceipt:
+        """Attempt one bounded send, never replaying an uncertain attempt."""
+        if not all(
+            isinstance(value, str)
+            and value
+            and len(value.encode("utf-8")) <= _MAX_ROUTE_VALUE_BYTES
+            for value in (capability, idempotency_key)
+        ):
+            return DeliveryReceipt(status="unauthorized")
+        if not isinstance(text, str) or len(text.encode("utf-8")) > _MAX_DELIVERY_TEXT_BYTES:
+            return DeliveryReceipt(status="permanent_failure", detail="invalid_text")
+        capability_digest = _digest(capability)
+        observed = self._now_utc()
+        try:
+            prepared = self._begin_delivery(
+                capability_digest, idempotency_key, observed
+            )
+        except sqlite3.Error:
+            return DeliveryReceipt(
+                status="retryable_failure", detail="delivery_store_unavailable"
+            )
+        if isinstance(prepared, DeliveryReceipt):
+            return prepared
+        normalized_route = prepared
         receipt = self.sender(normalized_route, text)
         if not isinstance(receipt, DeliveryReceipt):
             raise TypeError("Gateway plugin sender must return DeliveryReceipt")
