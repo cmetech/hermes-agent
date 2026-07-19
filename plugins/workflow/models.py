@@ -9,6 +9,24 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionFence:
+    """Exact durable coordinator ownership required for background execution."""
+
+    owner_id: str
+    owner_epoch: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.owner_id, str) or not self.owner_id or len(self.owner_id) > 256:
+            raise ValueError("owner_id must be bounded non-empty text")
+        if (
+            isinstance(self.owner_epoch, bool)
+            or not isinstance(self.owner_epoch, int)
+            or self.owner_epoch <= 0
+        ):
+            raise ValueError("owner_epoch must be a positive integer")
+
+
 def freeze_value(value: Any) -> Any:
     """Recursively freeze parsed YAML without changing scalar values."""
     if isinstance(value, Mapping):

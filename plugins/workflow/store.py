@@ -15,11 +15,11 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
 import yaml
 
@@ -30,7 +30,12 @@ from plugins.workflow.admission import (
     RunAdmissionResult,
 )
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
-from plugins.workflow.models import ApprovalDecision, WorkflowPackage
+from plugins.workflow.lease_clock import (
+    LeaseClockSample,
+    lease_is_fresh,
+    sample_lease_clock,
+)
+from plugins.workflow.models import ApprovalDecision, ExecutionFence, WorkflowPackage
 from plugins.workflow.provenance import (
     TriggerProvenance,
     legacy_projection_provenance,
@@ -68,6 +73,7 @@ class NodeClaim:
     attempt_id: str
     owner_id: str
     lease_expires_at: datetime
+    execution_fence: ExecutionFence | None = None
 
 
 @dataclass(frozen=True)
@@ -87,7 +93,7 @@ class ForegroundExecutionLease:
 
 _NONTERMINAL = {"queued", "running", "waiting_retry", "paused", "interrupted"}
 _EXECUTING = {"running"}
-_STORE_SCHEMA_VERSION = 7
+_STORE_SCHEMA_VERSION = 8
 # Direct RunStore/CLI access is already the profile-local filesystem admin
 # boundary. Network adapters must always pass their verified authority binding.
 _LOCAL_ADMIN_AUTHORITY_BINDING = "profile-local-runstore-admin"
@@ -292,6 +298,7 @@ class RunStore:
         max_run_bytes: int = 512 * 1024 * 1024,
         max_profile_bytes: int = 2 * 1024 * 1024 * 1024,
         max_journal_bytes: int | None = None,
+        lease_clock: Callable[[], LeaseClockSample] = sample_lease_clock,
     ) -> None:
         self.hermes_home = Path(hermes_home).resolve()
         self.root = self.hermes_home / "workflows"
@@ -306,6 +313,7 @@ class RunStore:
         self.max_input_bytes = max_input_bytes
         self.max_run_bytes = max_run_bytes
         self.max_profile_bytes = max_profile_bytes
+        self._lease_clock = lease_clock
         self.max_journal_bytes = (
             max_journal_bytes
             if max_journal_bytes is not None
@@ -585,6 +593,74 @@ class RunStore:
                     f"admission index schema is incomplete: {missing}"
                 )
             connection.execute(f"PRAGMA user_version={_STORE_SCHEMA_VERSION}")
+
+    def _fresh_coordinator_lease(
+        self,
+        connection: sqlite3.Connection,
+        sample: LeaseClockSample | None = None,
+    ):
+        from plugins.workflow.coordinator_store import CoordinatorStore
+
+        row = connection.execute(
+            "SELECT * FROM coordinator_lease WHERE singleton=1"
+        ).fetchone()
+        if row is None:
+            return None
+        lease = CoordinatorStore._lease(row)
+        observed = sample or self._lease_clock()
+        return lease if lease_is_fresh(lease, observed) else None
+
+    def assert_execution_fence(
+        self,
+        connection: sqlite3.Connection,
+        fence: ExecutionFence,
+        now: LeaseClockSample | None = None,
+    ) -> None:
+        """Reject a coordinator mutation unless its exact epoch remains fresh."""
+        lease = self._fresh_coordinator_lease(connection, now)
+        if (
+            lease is None
+            or lease.owner_id != fence.owner_id
+            or lease.epoch != fence.owner_epoch
+        ):
+            raise RuntimeError("stale coordinator execution fence")
+
+    def _assert_claim_execution_fence(
+        self, claim: NodeClaim, now: LeaseClockSample | None = None
+    ) -> None:
+        if claim.execution_fence is None:
+            return
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self.assert_execution_fence(
+                    connection, claim.execution_fence, now
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    @contextmanager
+    def _execution_fence_transaction(
+        self,
+        fence: ExecutionFence | None,
+        now: LeaseClockSample | None = None,
+    ):
+        if fence is None:
+            yield None
+            return
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self.assert_execution_fence(connection, fence, now)
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     @staticmethod
     def _migrate_runs_idempotency_namespace(
@@ -1957,12 +2033,11 @@ class RunStore:
                 return RunAdmissionResult(None, "rejected", "idempotency_conflict")
             if request.execution_mode not in {"foreground", "background"}:
                 raise ValueError("execution_mode must be foreground or background")
-            admission_now = datetime.now(timezone.utc)
-            fresh_leader = connection.execute(
-                "SELECT 1 FROM coordinator_lease WHERE singleton=1 "
-                "AND lease_expires_at>?",
-                (admission_now.isoformat(),),
-            ).fetchone()
+            admission_sample = self._lease_clock()
+            admission_now = admission_sample.utc_now.astimezone(timezone.utc)
+            fresh_leader = self._fresh_coordinator_lease(
+                connection, admission_sample
+            )
             if request.execution_mode == "background" and fresh_leader is None:
                 connection.rollback()
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
@@ -2893,11 +2968,7 @@ class RunStore:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                coordinator = connection.execute(
-                    "SELECT 1 FROM coordinator_lease WHERE singleton=1 "
-                    "AND lease_expires_at>?",
-                    (instant.isoformat(),),
-                ).fetchone()
+                coordinator = self._fresh_coordinator_lease(connection)
                 row = connection.execute(
                     "SELECT foreground_lease_expires_at, foreground_epoch "
                     "FROM runs WHERE run_id=? AND execution_mode='foreground' "
@@ -3254,6 +3325,7 @@ class RunStore:
         owner_epoch: str | None = None,
         effect_classification: str = "replay_safe",
         evidence_paths: Iterable[str] | None = None,
+        execution_fence: ExecutionFence | None = None,
     ) -> NodeClaim | None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -3287,6 +3359,8 @@ class RunStore:
                 connection = self._connect()
                 try:
                     connection.execute("BEGIN IMMEDIATE")
+                    if execution_fence is not None:
+                        self.assert_execution_fence(connection, execution_fence)
                     active_workers = connection.execute(
                         "SELECT COUNT(*) FROM worker_claims"
                     ).fetchone()[0]
@@ -3325,6 +3399,14 @@ class RunStore:
                         "owner_epoch": owner_epoch or owner_id,
                         "executor_id": executor_id,
                         "effect_classification": effect_classification,
+                        "execution_fence": (
+                            {
+                                "owner_id": execution_fence.owner_id,
+                                "owner_epoch": execution_fence.owner_epoch,
+                            }
+                            if execution_fence is not None
+                            else None
+                        ),
                     }
                     node["attempts"].append({
                         "attempt_id": attempt_id,
@@ -3334,6 +3416,14 @@ class RunStore:
                         "owner_epoch": owner_epoch or owner_id,
                         "executor_id": executor_id,
                         "effect_classification": effect_classification,
+                        "execution_fence": (
+                            {
+                                "owner_id": execution_fence.owner_id,
+                                "owner_epoch": execution_fence.owner_epoch,
+                            }
+                            if execution_fence is not None
+                            else None
+                        ),
                         "evidence_paths": resolved_evidence_paths,
                     })
                     self._append_locked(
@@ -3345,22 +3435,78 @@ class RunStore:
                         attempt_id=attempt_id,
                     )
                     connection.commit()
-                    return NodeClaim(run_id, node_id, attempt_id, owner_id, expires)
+                    return NodeClaim(
+                        run_id,
+                        node_id,
+                        attempt_id,
+                        owner_id,
+                        expires,
+                        execution_fence,
+                    )
                 except BaseException:
                     connection.rollback()
                     raise
                 finally:
                     connection.close()
 
-    def _release_worker_claim(self, attempt_id: str) -> None:
-        with self._connect() as connection:
+    def _release_worker_claim(
+        self,
+        attempt_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        with (
+            nullcontext(connection)
+            if connection is not None
+            else self._connect()
+        ) as connection:
             connection.execute(
                 "DELETE FROM worker_claims WHERE attempt_id=?", (attempt_id,)
             )
 
-    def mark_node_started(self, claim: NodeClaim) -> None:
+    def release_claim_before_execution(self, claim: NodeClaim) -> bool:
+        """Durably make a fenced claim retryable only when no executor ran."""
         directory = self.run_directory(claim.run_id)
         with workflow_lock(self._run_lock_path(claim.run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            node = projection["nodes"][claim.node_id]
+            active = node.get("claim", {})
+            if active.get("attempt_id") != claim.attempt_id:
+                return False
+            attempt = node.get("attempts", [])[-1]
+            if (
+                attempt.get("attempt_id") != claim.attempt_id
+                or attempt.get("process_identity") is not None
+                or active.get("process_identity") is not None
+            ):
+                return False
+            node.pop("claim", None)
+            node["state"] = "ready"
+            attempt.update({
+                "state": "interrupted",
+                "error_code": "coordinator_fence_lost_before_execution",
+                "completed_at": _utc_now(),
+            })
+            self._append_locked(
+                directory,
+                projection,
+                "node_fenced_before_execution",
+                {"retry_safe": True},
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+            )
+            self._release_worker_claim(claim.attempt_id)
+            return True
+
+    def mark_node_started(
+        self, claim: NodeClaim, *, now: LeaseClockSample | None = None
+    ) -> None:
+        directory = self.run_directory(claim.run_id)
+        with workflow_lock(
+            self._run_lock_path(claim.run_id)
+        ), self._execution_fence_transaction(
+            claim.execution_fence, now
+        ) as fence_connection:
             projection = json.loads((directory / "run.json").read_text())
             if (
                 projection["status"] != "running"
@@ -3380,40 +3526,55 @@ class RunStore:
                 "node_started",
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
+                defer_notification=fence_connection is not None,
             )
 
     def record_process_started(
-        self, claim: NodeClaim, identity: ProcessIdentity
+        self,
+        claim: NodeClaim,
+        identity: ProcessIdentity,
+        *,
+        now: LeaseClockSample | None = None,
     ) -> bool:
         """Durably bind an owned process identity to its active node claim."""
         directory = self.run_directory(claim.run_id)
-        with workflow_lock(self._run_lock_path(claim.run_id)):
-            projection = json.loads((directory / "run.json").read_text())
-            node = projection["nodes"][claim.node_id]
-            active = node.get("claim", {})
-            if (
-                projection["status"] != "running"
-                or projection.get("desired_status") is not None
-                or active.get("attempt_id") != claim.attempt_id
-            ):
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection["nodes"][claim.node_id]
+                active = node.get("claim", {})
+                if (
+                    projection["status"] != "running"
+                    or projection.get("desired_status") is not None
+                    or active.get("attempt_id") != claim.attempt_id
+                ):
+                    return False
+                serialized = {
+                    "pid": identity.pid,
+                    "start_time": identity.start_time,
+                    "group_id": identity.group_id,
+                }
+                active["process_identity"] = serialized
+                node["attempts"][-1]["process_identity"] = serialized
+                node["attempts"][-1]["process_started_at"] = _utc_now()
+                self._append_locked(
+                    directory,
+                    projection,
+                    "process_started",
+                    {"process_identity": serialized},
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
                 return False
-            serialized = {
-                "pid": identity.pid,
-                "start_time": identity.start_time,
-                "group_id": identity.group_id,
-            }
-            active["process_identity"] = serialized
-            node["attempts"][-1]["process_identity"] = serialized
-            node["attempts"][-1]["process_started_at"] = _utc_now()
-            self._append_locked(
-                directory,
-                projection,
-                "process_started",
-                {"process_identity": serialized},
-                node_id=claim.node_id,
-                attempt_id=claim.attempt_id,
-            )
-            return True
+            raise
 
     def record_process_stopped(
         self,
@@ -3421,58 +3582,71 @@ class RunStore:
         identity: ProcessIdentity,
         *,
         cleaned: bool,
+        now: LeaseClockSample | None = None,
     ) -> bool:
         """Record cleanup against the immutable attempt, including after expiry."""
         directory = self.run_directory(claim.run_id)
-        with workflow_lock(self._run_lock_path(claim.run_id)):
-            projection = json.loads((directory / "run.json").read_text())
-            node = projection["nodes"][claim.node_id]
-            active = node.get("claim", {})
-            attempt = next(
-                (
-                    candidate
-                    for candidate in node.get("attempts", [])
-                    if candidate.get("attempt_id") == claim.attempt_id
-                ),
-                None,
-            )
-            if not isinstance(attempt, dict):
-                return False
-            serialized = attempt.get("process_identity")
-            if (
-                not isinstance(serialized, dict)
-                or serialized.get("pid") != identity.pid
-                or serialized.get("start_time") != identity.start_time
-            ):
-                return False
-            event_type = "process_reaped" if cleaned else "cleanup_failed"
-            if active.get("attempt_id") == claim.attempt_id and cleaned:
-                active.pop("process_identity", None)
-            attempt["process_stop"] = {
-                "recorded_at": _utc_now(),
-                "cleaned": cleaned,
-                "identity_matched": True,
-            }
-            recovery = node.get("recovery")
-            if (
-                isinstance(recovery, dict)
-                and recovery.get("attempt_id") == claim.attempt_id
-            ):
-                recovery["termination_confirmed"] = cleaned
-                recovery["observation"] = (
-                    "known_stopped" if cleaned else "outcome_uncertain"
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection["nodes"][claim.node_id]
+                active = node.get("claim", {})
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in node.get("attempts", [])
+                        if candidate.get("attempt_id") == claim.attempt_id
+                    ),
+                    None,
                 )
-            self._append_locked(
-                directory,
-                projection,
-                event_type,
-                {"pid": identity.pid, "cleanup_complete": cleaned},
-                node_id=claim.node_id,
-                attempt_id=claim.attempt_id,
-            )
-            if cleaned:
-                self._release_worker_claim(claim.attempt_id)
-            return True
+                if not isinstance(attempt, dict):
+                    return False
+                serialized = attempt.get("process_identity")
+                if (
+                    not isinstance(serialized, dict)
+                    or serialized.get("pid") != identity.pid
+                    or serialized.get("start_time") != identity.start_time
+                ):
+                    return False
+                event_type = "process_reaped" if cleaned else "cleanup_failed"
+                if active.get("attempt_id") == claim.attempt_id and cleaned:
+                    active.pop("process_identity", None)
+                attempt["process_stop"] = {
+                    "recorded_at": _utc_now(),
+                    "cleaned": cleaned,
+                    "identity_matched": True,
+                }
+                recovery = node.get("recovery")
+                if (
+                    isinstance(recovery, dict)
+                    and recovery.get("attempt_id") == claim.attempt_id
+                ):
+                    recovery["termination_confirmed"] = cleaned
+                    recovery["observation"] = (
+                        "known_stopped" if cleaned else "outcome_uncertain"
+                    )
+                self._append_locked(
+                    directory,
+                    projection,
+                    event_type,
+                    {"pid": identity.pid, "cleanup_complete": cleaned},
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    defer_notification=fence_connection is not None,
+                )
+                if cleaned:
+                    self._release_worker_claim(
+                        claim.attempt_id, connection=fence_connection
+                    )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
 
     def complete_node(
         self,
@@ -3483,6 +3657,7 @@ class RunStore:
         error_code: str | None = None,
         error_message: str | None = None,
         metadata: Mapping[str, object] | None = None,
+        now: LeaseClockSample | None = None,
     ) -> None:
         if status not in {
             "succeeded",
@@ -3496,7 +3671,11 @@ class RunStore:
         capacity_guard = (
             workflow_lock(self.admission_lock) if status == "paused" else nullcontext()
         )
-        with capacity_guard, workflow_lock(self._run_lock_path(claim.run_id)):
+        with capacity_guard, workflow_lock(
+            self._run_lock_path(claim.run_id)
+        ), self._execution_fence_transaction(
+            claim.execution_fence, now
+        ) as fence_connection:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
@@ -3523,6 +3702,7 @@ class RunStore:
                         {"status": status, "error_code": error_code},
                         node_id=claim.node_id,
                         attempt_id=claim.attempt_id,
+                        defer_notification=fence_connection is not None,
                     )
                 raise RuntimeError("stale node completion")
             if (
@@ -3531,7 +3711,11 @@ class RunStore:
             ) and status != "cancelled":
                 raise RuntimeError("stale completion for terminal run")
             if status == "paused":
-                with self._connect() as connection:
+                with (
+                    nullcontext(fence_connection)
+                    if fence_connection is not None
+                    else self._connect()
+                ) as connection:
                     paused = connection.execute(
                         "SELECT COUNT(*) FROM runs WHERE status='paused' AND run_id<>?",
                         (claim.run_id,),
@@ -3622,6 +3806,7 @@ class RunStore:
                 },
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
+                defer_notification=fence_connection is not None,
             )
             states = {candidate["state"] for candidate in projection["nodes"].values()}
             terminal = None
@@ -3643,8 +3828,17 @@ class RunStore:
                 terminal = "failed" if "failed" in states else "succeeded"
             if terminal:
                 projection["status"] = terminal
-                self._append_locked(directory, projection, f"run_{terminal}")
-                with self._connect() as connection:
+                self._append_locked(
+                    directory,
+                    projection,
+                    f"run_{terminal}",
+                    defer_notification=fence_connection is not None,
+                )
+                with (
+                    nullcontext(fence_connection)
+                    if fence_connection is not None
+                    else self._connect()
+                ) as connection:
                     connection.execute(
                         "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
                         (terminal, projection["updated_at"], claim.run_id),
@@ -3665,8 +3859,17 @@ class RunStore:
                     "running",
                 }:
                     projection["status"] = "waiting_retry"
-                    self._append_locked(directory, projection, "run_retry_waiting")
-                    with self._connect() as connection:
+                    self._append_locked(
+                        directory,
+                        projection,
+                        "run_retry_waiting",
+                        defer_notification=fence_connection is not None,
+                    )
+                    with (
+                        nullcontext(fence_connection)
+                        if fence_connection is not None
+                        else self._connect()
+                    ) as connection:
                         connection.execute(
                             "UPDATE runs SET status='waiting_retry', updated_at=? "
                             "WHERE run_id=?",
@@ -3678,7 +3881,9 @@ class RunStore:
                             reason_code="retry_waiting",
                         )
                 _atomic_json(directory / "run.json", projection)
-            self._release_worker_claim(claim.attempt_id)
+            self._release_worker_claim(
+                claim.attempt_id, connection=fence_connection
+            )
             if terminal or projection["status"] == "waiting_retry":
                 self._notify_coordinator()
 
@@ -3688,10 +3893,15 @@ class RunStore:
         *,
         artifacts: Iterable[ArtifactRef],
         loop_state: Mapping[str, object],
+        now: LeaseClockSample | None = None,
     ) -> None:
         """Persist one completed loop iteration before evaluating continuation."""
         directory = self.run_directory(claim.run_id)
-        with workflow_lock(self._run_lock_path(claim.run_id)):
+        with workflow_lock(
+            self._run_lock_path(claim.run_id)
+        ), self._execution_fence_transaction(
+            claim.execution_fence, now
+        ) as fence_connection:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
@@ -3727,6 +3937,7 @@ class RunStore:
                 },
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
+                defer_notification=fence_connection is not None,
             )
 
     def block_cleanup_failed(
@@ -3735,10 +3946,15 @@ class RunStore:
         *,
         artifacts: Iterable[ArtifactRef] = (),
         error_message: str | None = None,
+        now: LeaseClockSample | None = None,
     ) -> None:
         """Keep ownership blocked when an executor cannot prove tree cleanup."""
         directory = self.run_directory(claim.run_id)
-        with workflow_lock(self._run_lock_path(claim.run_id)):
+        with workflow_lock(
+            self._run_lock_path(claim.run_id)
+        ), self._execution_fence_transaction(
+            claim.execution_fence, now
+        ) as fence_connection:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
@@ -3776,8 +3992,13 @@ class RunStore:
                 {"artifacts": refs, "cleanup_complete": False},
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
+                defer_notification=fence_connection is not None,
             )
-            with self._connect() as connection:
+            with (
+                nullcontext(fence_connection)
+                if fence_connection is not None
+                else self._connect()
+            ) as connection:
                 connection.execute(
                     "UPDATE runs SET desired_status='cleanup_failed', updated_at=? "
                     "WHERE run_id=?",
@@ -3800,6 +4021,7 @@ class RunStore:
         node_id: str | None = None,
         attempt_id: str | None = None,
         compact_recovery: bool = False,
+        defer_notification: bool = False,
     ) -> dict[str, object]:
         sequence = int(projection["event_sequence"]) + 1
         now = _utc_now()
@@ -3835,6 +4057,8 @@ class RunStore:
             handle.flush()
             os.fsync(handle.fileno())
         _atomic_json(directory / "run.json", projection)
+        if defer_notification:
+            return event
         # SQLite and the filesystem journal cannot share one transaction. The
         # journal is the transition authority; this idempotent outbox write is
         # reconciled by the coordinator after a crash between the two writes.
@@ -3951,11 +4175,16 @@ class RunStore:
         error_message: str | None = None,
         metadata: Mapping[str, object] | None = None,
         consumed_attempts: int = 1,
+        now: LeaseClockSample | None = None,
     ) -> None:
         if next_attempt_at.tzinfo is None:
             raise ValueError("next_attempt_at must be timezone-aware")
         directory = self.run_directory(claim.run_id)
-        with workflow_lock(self._run_lock_path(claim.run_id)):
+        with workflow_lock(
+            self._run_lock_path(claim.run_id)
+        ), self._execution_fence_transaction(
+            claim.execution_fence, now
+        ) as fence_connection:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             if node.get("claim", {}).get("attempt_id") != claim.attempt_id:
@@ -4004,8 +4233,13 @@ class RunStore:
                 },
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
+                defer_notification=fence_connection is not None,
             )
-            with self._connect() as connection:
+            with (
+                nullcontext(fence_connection)
+                if fence_connection is not None
+                else self._connect()
+            ) as connection:
                 connection.execute(
                     "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
                     (projection["status"], projection["updated_at"], claim.run_id),
@@ -4015,7 +4249,9 @@ class RunStore:
                     run_id=claim.run_id,
                     reason_code="retry_scheduled",
                 )
-            self._release_worker_claim(claim.attempt_id)
+            self._release_worker_claim(
+                claim.attempt_id, connection=fence_connection
+            )
             self._notify_coordinator()
 
     def wake_due_retries(
@@ -4139,65 +4375,92 @@ class RunStore:
         monotonic_now: float | None = None,
         lease_seconds: float = 30.0,
         heartbeat_interval_seconds: float = 5.0,
+        fence_now: LeaseClockSample | None = None,
     ) -> bool:
         if lease_seconds <= 0 or heartbeat_interval_seconds <= 0:
             raise ValueError("lease and heartbeat intervals must be positive")
+        try:
+            self._assert_claim_execution_fence(claim, fence_now)
+        except RuntimeError:
+            return False
         instant = now or datetime.now(timezone.utc)
         directory = self.run_directory(claim.run_id)
-        with workflow_lock(self._run_lock_path(claim.run_id)):
-            projection = json.loads((directory / "run.json").read_text())
-            node = projection["nodes"].get(claim.node_id)
-            active = node.get("claim", {}) if node else {}
-            if active.get("attempt_id") != claim.attempt_id:
-                return False
-            heartbeat_at = datetime.fromisoformat(active["heartbeat_at"])
-            utc_elapsed = (instant - heartbeat_at).total_seconds()
-            monotonic_instant = (
-                float(monotonic_now) if monotonic_now is not None else time.monotonic()
-            )
-            previous_monotonic = active.get("heartbeat_monotonic")
-            monotonic_elapsed = (
-                monotonic_instant - float(previous_monotonic)
-                if isinstance(previous_monotonic, int | float)
-                else utc_elapsed
-            )
-            active_lease_seconds = float(active.get("lease_seconds", lease_seconds))
-            if (
-                utc_elapsed < 0
-                or monotonic_elapsed < 0
-                or abs(utc_elapsed - monotonic_elapsed) > active_lease_seconds
-                or monotonic_elapsed >= active_lease_seconds
-                or datetime.fromisoformat(active["lease_expires_at"]) <= instant
-            ):
-                return False
-            if utc_elapsed < heartbeat_interval_seconds:
-                return True
-            active["heartbeat_at"] = instant.isoformat()
-            active["heartbeat_monotonic"] = monotonic_instant
-            active["lease_seconds"] = float(lease_seconds)
-            active["lease_expires_at"] = (
-                instant + timedelta(seconds=lease_seconds)
-            ).isoformat()
-            self._append_locked(
-                directory,
-                projection,
-                "node_heartbeat",
-                {
-                    "heartbeat_at": active["heartbeat_at"],
-                    "heartbeat_monotonic": active["heartbeat_monotonic"],
-                    "lease_expires_at": active["lease_expires_at"],
-                    "lease_seconds": active["lease_seconds"],
-                },
-                node_id=claim.node_id,
-                attempt_id=claim.attempt_id,
-                compact_recovery=True,
-            )
-            with self._connect() as connection:
-                connection.execute(
-                    "UPDATE worker_claims SET lease_expires_at=? WHERE attempt_id=?",
-                    (active["lease_expires_at"], claim.attempt_id),
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, fence_now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection["nodes"].get(claim.node_id)
+                active = node.get("claim", {}) if node else {}
+                if active.get("attempt_id") != claim.attempt_id:
+                    return False
+                heartbeat_at = datetime.fromisoformat(active["heartbeat_at"])
+                utc_elapsed = (instant - heartbeat_at).total_seconds()
+                monotonic_instant = (
+                    float(monotonic_now)
+                    if monotonic_now is not None
+                    else time.monotonic()
                 )
-            return True
+                previous_monotonic = active.get("heartbeat_monotonic")
+                monotonic_elapsed = (
+                    monotonic_instant - float(previous_monotonic)
+                    if isinstance(previous_monotonic, int | float)
+                    else utc_elapsed
+                )
+                active_lease_seconds = float(
+                    active.get("lease_seconds", lease_seconds)
+                )
+                if (
+                    utc_elapsed < 0
+                    or monotonic_elapsed < 0
+                    or abs(utc_elapsed - monotonic_elapsed) > active_lease_seconds
+                    or monotonic_elapsed >= active_lease_seconds
+                    or datetime.fromisoformat(active["lease_expires_at"]) <= instant
+                ):
+                    return False
+                if utc_elapsed < heartbeat_interval_seconds:
+                    return True
+                active["heartbeat_at"] = instant.isoformat()
+                active["heartbeat_monotonic"] = monotonic_instant
+                active["lease_seconds"] = float(lease_seconds)
+                active["lease_expires_at"] = (
+                    instant + timedelta(seconds=lease_seconds)
+                ).isoformat()
+                self._append_locked(
+                    directory,
+                    projection,
+                    "node_heartbeat",
+                    {
+                        "heartbeat_at": active["heartbeat_at"],
+                        "heartbeat_monotonic": active["heartbeat_monotonic"],
+                        "lease_expires_at": active["lease_expires_at"],
+                        "lease_seconds": active["lease_seconds"],
+                    },
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    compact_recovery=True,
+                    defer_notification=fence_connection is not None,
+                )
+                if fence_connection is not None:
+                    fence_connection.execute(
+                        "UPDATE worker_claims SET lease_expires_at=? "
+                        "WHERE attempt_id=?",
+                        (active["lease_expires_at"], claim.attempt_id),
+                    )
+                else:
+                    with self._connect() as connection:
+                        connection.execute(
+                            "UPDATE worker_claims SET lease_expires_at=? "
+                            "WHERE attempt_id=?",
+                            (active["lease_expires_at"], claim.attempt_id),
+                        )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
 
     def expire_stale_claims(
         self,
@@ -4409,17 +4672,18 @@ class RunStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            leader = connection.execute(
-                "SELECT 1 FROM coordinator_lease WHERE singleton=1 "
-                "AND owner_id=? AND epoch=? AND lease_expires_at>?",
-                (coordinator_owner, coordinator_epoch, instant.isoformat()),
-            ).fetchone()
+            leader = self._fresh_coordinator_lease(connection)
             worker = connection.execute(
                 "SELECT 1 FROM worker_claims WHERE attempt_id=? AND run_id=? "
                 "AND node_id=? AND owner_id=?",
                 (attempt_id, projection["run_id"], node_id, claim.get("owner_id")),
             ).fetchone()
-            if leader is None or worker is None:
+            if (
+                leader is None
+                or leader.owner_id != coordinator_owner
+                or leader.epoch != coordinator_epoch
+                or worker is None
+            ):
                 connection.rollback()
                 return False
             claim.update({
@@ -4495,12 +4759,23 @@ class RunStore:
         *,
         reason: str,
         lock_timeout_seconds: float = 5.0,
+        fence: ExecutionFence | None = None,
+        now: LeaseClockSample | None = None,
     ) -> tuple[str, ...]:
+        if fence is not None:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self.assert_execution_fence(connection, fence, now)
+                except RuntimeError:
+                    connection.rollback()
+                    return ()
+                connection.commit()
         directory = self.run_directory(run_id)
         interrupted = []
         with workflow_lock(
             self._run_lock_path(run_id), timeout_seconds=lock_timeout_seconds
-        ):
+        ), self._execution_fence_transaction(fence, now) as fence_connection:
             projection = json.loads((directory / "run.json").read_text())
             if projection.get("desired_status") == "cleanup_failed":
                 return ()
@@ -4514,9 +4789,16 @@ class RunStore:
                 return ()
             reconciliation_required = False
             for node_id, node in projection["nodes"].items():
-                claim = node.pop("claim", None)
+                claim = node.get("claim")
                 if not claim:
                     continue
+                claim_fence = claim.get("execution_fence")
+                if fence is not None and claim_fence != {
+                    "owner_id": fence.owner_id,
+                    "owner_epoch": fence.owner_epoch,
+                }:
+                    continue
+                node.pop("claim", None)
                 attempt = next(
                     (
                         candidate
@@ -4578,9 +4860,12 @@ class RunStore:
                     {"reason": reason, "observation": observation},
                     node_id=node_id,
                     attempt_id=claim["attempt_id"],
+                    defer_notification=fence_connection is not None,
                 )
                 if observation in {"known_stopped", "not_started"}:
-                    self._release_worker_claim(claim["attempt_id"])
+                    self._release_worker_claim(
+                        claim["attempt_id"], connection=fence_connection
+                    )
                 interrupted.append(node_id)
             if interrupted:
                 projection["status"] = (
@@ -4594,8 +4879,13 @@ class RunStore:
                         if reconciliation_required
                         else "run_interrupted"
                     ),
+                    defer_notification=fence_connection is not None,
                 )
-                with self._connect() as connection:
+                with (
+                    nullcontext(fence_connection)
+                    if fence_connection is not None
+                    else self._connect()
+                ) as connection:
                     connection.execute(
                         "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
                         (projection["status"], projection["updated_at"], run_id),
@@ -5329,10 +5619,16 @@ class RunStore:
                 state_version=int(projection["state_version"]),
             )
 
-    def consume_action_grant(self, claim: NodeClaim) -> str | None:
+    def consume_action_grant(
+        self, claim: NodeClaim, *, now: LeaseClockSample | None = None
+    ) -> str | None:
         """Remove one exact worker grant durably before spawning the worker."""
         directory = self.run_directory(claim.run_id)
-        with workflow_lock(self._run_lock_path(claim.run_id)):
+        with workflow_lock(
+            self._run_lock_path(claim.run_id)
+        ), self._execution_fence_transaction(
+            claim.execution_fence, now
+        ) as fence_connection:
             projection = json.loads((directory / "run.json").read_text())
             node = projection["nodes"][claim.node_id]
             active = node.get("claim", {})
@@ -5348,6 +5644,7 @@ class RunStore:
                 {"grant_consumed": True},
                 node_id=claim.node_id,
                 attempt_id=claim.attempt_id,
+                defer_notification=fence_connection is not None,
             )
             return str(digest)
 

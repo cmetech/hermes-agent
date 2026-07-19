@@ -10,7 +10,13 @@ import math
 from pathlib import Path
 import sqlite3
 import threading
-from typing import Iterator, Literal
+from typing import Callable, Iterator, Literal
+
+from plugins.workflow.lease_clock import (
+    LeaseClockSample,
+    lease_is_fresh,
+    sample_lease_clock,
+)
 
 
 CoordinatorHostKind = Literal["web", "gateway"]
@@ -84,6 +90,9 @@ class CoordinatorLease:
     acquired_at: datetime
     sweep_cursor: str | None
     last_progress_at: datetime | None
+    boot_id: str | None
+    heartbeat_monotonic: float | None
+    lease_seconds: float | None
 
     def matches(self, identity: CoordinatorIdentity) -> bool:
         return (
@@ -132,7 +141,10 @@ def install_coordinator_schema(connection: sqlite3.Connection) -> None:
             lease_expires_at TEXT NOT NULL,
             acquired_at TEXT NOT NULL,
             sweep_cursor TEXT,
-            last_progress_at TEXT
+            last_progress_at TEXT,
+            boot_id TEXT,
+            heartbeat_monotonic REAL,
+            lease_seconds REAL
         );
         CREATE TABLE IF NOT EXISTS coordinator_events (
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,6 +167,19 @@ def install_coordinator_schema(connection: sqlite3.Connection) -> None:
         ON coordinator_wakes(completed_at, generation);
         """
     )
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(coordinator_lease)")
+    }
+    for name, column_type in (
+        ("boot_id", "TEXT"),
+        ("heartbeat_monotonic", "REAL"),
+        ("lease_seconds", "REAL"),
+    ):
+        if name not in columns:
+            connection.execute(
+                f"ALTER TABLE coordinator_lease ADD COLUMN {name} {column_type}"
+            )
 
 
 def record_coordinator_wake(
@@ -182,7 +207,13 @@ def record_coordinator_wake(
 class CoordinatorStore:
     """SQLite authority for one workflow coordinator leader per profile."""
 
-    def __init__(self, database: str | Path, *, busy_timeout_seconds: float = 5.0):
+    def __init__(
+        self,
+        database: str | Path,
+        *,
+        busy_timeout_seconds: float = 5.0,
+        clock: Callable[[], LeaseClockSample] = sample_lease_clock,
+    ):
         self.database = Path(database)
         if (
             isinstance(busy_timeout_seconds, bool)
@@ -192,6 +223,12 @@ class CoordinatorStore:
         ):
             raise ValueError("busy_timeout_seconds must be positive and finite")
         self.busy_timeout_seconds = float(busy_timeout_seconds)
+        self._clock = clock
+
+    def _sample(self, now: datetime) -> LeaseClockSample:
+        instant = _instant(now, name="now")
+        sample = self._clock()
+        return LeaseClockSample(instant, sample.monotonic_now, sample.boot_id)
 
     def _condition(self) -> threading.Condition:
         key = str(self.database.resolve())
@@ -257,6 +294,17 @@ class CoordinatorStore:
             acquired_at=acquired_at,
             sweep_cursor=(str(row["sweep_cursor"]) if row["sweep_cursor"] else None),
             last_progress_at=_decoded(row["last_progress_at"]),
+            boot_id=(str(row["boot_id"]) if row["boot_id"] is not None else None),
+            heartbeat_monotonic=(
+                float(row["heartbeat_monotonic"])
+                if row["heartbeat_monotonic"] is not None
+                else None
+            ),
+            lease_seconds=(
+                float(row["lease_seconds"])
+                if row["lease_seconds"] is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -291,15 +339,20 @@ class CoordinatorStore:
         return self._lease(row) if row is not None else None
 
     def health(self, *, now: datetime) -> CoordinatorHealth:
-        instant = _instant(now, name="now")
-        lease = self.observe(now=instant)
+        requested_now = _instant(now, name="now")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM coordinator_lease WHERE singleton=1"
+            ).fetchone()
+            sample = self._sample(requested_now)
+        lease = self._lease(row) if row is not None else None
         if lease is None:
             return CoordinatorHealth(
                 status="unavailable",
                 reason_code="coordinator_missing",
                 lease=None,
             )
-        if lease.lease_expires_at <= instant:
+        if not lease_is_fresh(lease, sample):
             return CoordinatorHealth(
                 status="unavailable",
                 reason_code="coordinator_lease_expired",
@@ -318,18 +371,20 @@ class CoordinatorStore:
         now: datetime,
         lease_seconds: float,
     ) -> CoordinatorAcquisition:
-        instant = _instant(now, name="now")
+        requested_now = _instant(now, name="now")
         duration = _lease_seconds(lease_seconds)
-        expires = instant + timedelta(seconds=duration)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                sample = self._sample(requested_now)
+                instant = sample.utc_now
+                expires = instant + timedelta(seconds=duration)
                 row = connection.execute(
                     "SELECT * FROM coordinator_lease WHERE singleton=1"
                 ).fetchone()
                 if row is not None:
                     current = self._lease(row)
-                    if current.lease_expires_at > instant:
+                    if lease_is_fresh(current, sample):
                         connection.commit()
                         return CoordinatorAcquisition(
                             is_leader=current.matches(identity),
@@ -346,8 +401,9 @@ class CoordinatorStore:
                     "INSERT INTO coordinator_lease ("
                     "singleton, owner_id, host_kind, host_instance_id, pid, "
                     "process_start_time, epoch, heartbeat_at, lease_expires_at, "
-                    "acquired_at, sweep_cursor, last_progress_at) "
-                    "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "acquired_at, sweep_cursor, last_progress_at, boot_id, "
+                    "heartbeat_monotonic, lease_seconds) "
+                    "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(singleton) DO UPDATE SET "
                     "owner_id=excluded.owner_id, host_kind=excluded.host_kind, "
                     "host_instance_id=excluded.host_instance_id, pid=excluded.pid, "
@@ -356,7 +412,10 @@ class CoordinatorStore:
                     "lease_expires_at=excluded.lease_expires_at, "
                     "acquired_at=excluded.acquired_at, "
                     "sweep_cursor=excluded.sweep_cursor, "
-                    "last_progress_at=excluded.last_progress_at",
+                    "last_progress_at=excluded.last_progress_at, "
+                    "boot_id=excluded.boot_id, "
+                    "heartbeat_monotonic=excluded.heartbeat_monotonic, "
+                    "lease_seconds=excluded.lease_seconds",
                     (
                         identity.owner_id,
                         identity.host_kind,
@@ -369,6 +428,9 @@ class CoordinatorStore:
                         _encoded(instant),
                         sweep_cursor,
                         _encoded(last_progress_at) if last_progress_at else None,
+                        sample.boot_id,
+                        sample.monotonic_now,
+                        duration,
                     ),
                 )
                 self._event(
@@ -403,7 +465,7 @@ class CoordinatorStore:
         sweep_cursor: str | None = None,
         last_progress_at: datetime | None = None,
     ) -> bool:
-        instant = _instant(now, name="now")
+        requested_now = _instant(now, name="now")
         duration = _lease_seconds(lease_seconds)
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
             raise ValueError("epoch must be a positive integer")
@@ -417,27 +479,40 @@ class CoordinatorStore:
             else None
         )
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            sample = self._sample(requested_now)
+            instant = sample.utc_now
+            row = connection.execute(
+                "SELECT * FROM coordinator_lease WHERE singleton=1"
+            ).fetchone()
+            current = self._lease(row) if row is not None else None
+            if (
+                current is None
+                or not current.matches(identity)
+                or current.epoch != epoch
+                or not lease_is_fresh(current, sample)
+            ):
+                connection.rollback()
+                return False
             updated = connection.execute(
                 "UPDATE coordinator_lease SET heartbeat_at=?, lease_expires_at=?, "
                 "sweep_cursor=COALESCE(?, sweep_cursor), "
-                "last_progress_at=COALESCE(?, last_progress_at) "
-                "WHERE singleton=1 AND owner_id=? AND host_kind=? "
-                "AND host_instance_id=? AND pid=? "
-                "AND process_start_time IS ? AND epoch=? AND lease_expires_at>?",
+                "last_progress_at=COALESCE(?, last_progress_at), boot_id=?, "
+                "heartbeat_monotonic=?, lease_seconds=? "
+                "WHERE singleton=1 AND owner_id=? AND epoch=?",
                 (
                     _encoded(instant),
                     _encoded(instant + timedelta(seconds=duration)),
                     sweep_cursor,
                     _encoded(progress) if progress else None,
+                    sample.boot_id,
+                    sample.monotonic_now,
+                    duration,
                     identity.owner_id,
-                    identity.host_kind,
-                    identity.host_instance_id,
-                    identity.pid,
-                    identity.process_start_time,
                     epoch,
-                    _encoded(instant),
                 ),
             ).rowcount
+            connection.commit()
         return updated == 1
 
     def release(
@@ -447,20 +522,25 @@ class CoordinatorStore:
         epoch: int,
         now: datetime,
     ) -> bool:
-        instant = _instant(now, name="now")
+        requested_now = _instant(now, name="now")
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
             raise ValueError("epoch must be a positive integer")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                sample = self._sample(requested_now)
+                instant = sample.utc_now
                 updated = connection.execute(
-                    "UPDATE coordinator_lease SET heartbeat_at=?, lease_expires_at=? "
+                    "UPDATE coordinator_lease SET heartbeat_at=?, lease_expires_at=?, "
+                    "boot_id=?, heartbeat_monotonic=?, lease_seconds=0 "
                     "WHERE singleton=1 AND owner_id=? AND host_kind=? "
                     "AND host_instance_id=? AND pid=? "
                     "AND process_start_time IS ? AND epoch=?",
                     (
                         _encoded(instant),
                         _encoded(instant),
+                        sample.boot_id,
+                        sample.monotonic_now,
                         identity.owner_id,
                         identity.host_kind,
                         identity.host_instance_id,
@@ -491,25 +571,24 @@ class CoordinatorStore:
         now: datetime,
         limit: int = 100,
     ) -> tuple[CoordinatorWake, ...]:
-        instant = _instant(now, name="now")
+        requested_now = _instant(now, name="now")
         if not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
         with self._connect() as connection:
-            owner = connection.execute(
-                "SELECT 1 FROM coordinator_lease WHERE singleton=1 "
-                "AND owner_id=? AND host_kind=? AND host_instance_id=? AND pid=? "
-                "AND process_start_time IS ? AND epoch=? AND lease_expires_at>?",
-                (
-                    identity.owner_id,
-                    identity.host_kind,
-                    identity.host_instance_id,
-                    identity.pid,
-                    identity.process_start_time,
-                    epoch,
-                    _encoded(instant),
-                ),
+            connection.execute("BEGIN IMMEDIATE")
+            sample = self._sample(requested_now)
+            instant = sample.utc_now
+            row = connection.execute(
+                "SELECT * FROM coordinator_lease WHERE singleton=1"
             ).fetchone()
-            if owner is None:
+            owner = self._lease(row) if row is not None else None
+            if (
+                owner is None
+                or not owner.matches(identity)
+                or owner.epoch != epoch
+                or not lease_is_fresh(owner, sample)
+            ):
+                connection.rollback()
                 return ()
             rows = connection.execute(
                 "SELECT generation, run_id, reason_code, created_at "
@@ -517,6 +596,7 @@ class CoordinatorStore:
                 "ORDER BY generation LIMIT ?",
                 (limit,),
             ).fetchall()
+            connection.commit()
         return tuple(
             CoordinatorWake(
                 generation=int(row["generation"]),
@@ -536,7 +616,7 @@ class CoordinatorStore:
         now: datetime,
         outcome: str,
     ) -> bool:
-        instant = _instant(now, name="now")
+        requested_now = _instant(now, name="now")
         if isinstance(generation, bool) or not isinstance(generation, int):
             raise ValueError("generation must be an integer")
         if not isinstance(outcome, str) or not outcome or len(outcome) > 128:
@@ -544,23 +624,19 @@ class CoordinatorStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                owner = connection.execute(
-                    "SELECT 1 FROM coordinator_lease WHERE singleton=1 "
-                    "AND owner_id=? AND host_kind=? AND host_instance_id=? "
-                    "AND pid=? AND process_start_time IS ? AND epoch=? "
-                    "AND lease_expires_at>?",
-                    (
-                        identity.owner_id,
-                        identity.host_kind,
-                        identity.host_instance_id,
-                        identity.pid,
-                        identity.process_start_time,
-                        epoch,
-                        _encoded(instant),
-                    ),
+                sample = self._sample(requested_now)
+                instant = sample.utc_now
+                row = connection.execute(
+                    "SELECT * FROM coordinator_lease WHERE singleton=1"
                 ).fetchone()
+                owner = self._lease(row) if row is not None else None
                 updated = 0
-                if owner is not None:
+                if (
+                    owner is not None
+                    and owner.matches(identity)
+                    and owner.epoch == epoch
+                    and lease_is_fresh(owner, sample)
+                ):
                     updated = connection.execute(
                         "UPDATE coordinator_wakes SET completed_at=?, "
                         "completed_epoch=?, outcome=? "

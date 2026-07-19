@@ -26,7 +26,12 @@ from plugins.workflow.executors.cancel import CancelExecutor
 from plugins.workflow.executors.loop import LoopExecutor
 from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.locks import WorkflowLockTimeout
-from plugins.workflow.models import DeadlineBudget, RetryPolicy, WorkflowNode
+from plugins.workflow.models import (
+    DeadlineBudget,
+    ExecutionFence,
+    RetryPolicy,
+    WorkflowNode,
+)
 from plugins.workflow.resources import VariableContext
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.sessions import NodeSessionRegistry
@@ -197,6 +202,7 @@ class RunScheduler:
         owner_id: str | None = None,
         execution_owner_id: str | None = None,
         execution_owner_epoch: int | None = None,
+        execution_fence: ExecutionFence | None = None,
         agent_runner=None,
         session_registry: NodeSessionRegistry | None = None,
         profile_name: str = "default",
@@ -254,6 +260,7 @@ class RunScheduler:
             )
         self.execution_owner_id = execution_owner_id
         self.execution_owner_epoch = execution_owner_epoch
+        self.execution_fence = execution_fence
         self.max_parallel_nodes = min(max_parallel_nodes, store.limits["workers"])
         self.heartbeat_seconds = float(heartbeat_seconds)
         self.lease_seconds = float(lease_seconds)
@@ -299,6 +306,17 @@ class RunScheduler:
             })
 
     def _renew_execution_owner(self, run_id: str) -> bool:
+        if self.execution_fence is not None:
+            try:
+                with self.store._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    self.store.assert_execution_fence(
+                        connection, self.execution_fence
+                    )
+                    connection.commit()
+                return True
+            except RuntimeError:
+                return False
         if self.execution_owner_id is None:
             return True
         return self.store.renew_foreground_execution(
@@ -458,6 +476,7 @@ class RunScheduler:
             self._active_executions += 1
         try:
             if not self._renew_execution_owner(run_id):
+                self.store.release_claim_before_execution(claim)
                 return
             executor = self.executors.get(node.node_type)
             if executor is None:
@@ -542,6 +561,9 @@ class RunScheduler:
                                 self.store.run_directory(run_id) / loop_input
                             ),
                         )
+                    if not self._renew_execution_owner(run_id):
+                        self.store.release_claim_before_execution(claim)
+                        return
                     result = executor.execute(
                         NodeExecutionContext(
                             run_id=run_id,
@@ -605,8 +627,11 @@ class RunScheduler:
                     return
             self._persist_result(claim, node, result)
         except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                self.store.release_claim_before_execution(claim)
             if "stale" not in str(exc) and "terminal run" not in str(exc):
-                raise
+                if "execution fence" not in str(exc):
+                    raise
         finally:
             with self._activity:
                 self._active_executions -= 1
@@ -765,6 +790,7 @@ class RunScheduler:
                                 node_id,
                                 projection=projection,
                             ),
+                            execution_fence=self.execution_fence,
                         )
                     except StorageQuotaError as exc:
                         self.store.interrupt_for_host_pressure(run_id, message=str(exc))
@@ -891,6 +917,7 @@ class RunScheduler:
                                     node_id,
                                     projection=snapshots[run_id],
                                 ),
+                                execution_fence=self.execution_fence,
                             )
                         except StorageQuotaError as exc:
                             self.store.interrupt_for_host_pressure(
@@ -950,6 +977,10 @@ class RunScheduler:
         with self._activity:
             active = tuple(self._active_runs)
         for run_id in active:
+            if self.execution_fence is not None and not self._renew_execution_owner(
+                run_id
+            ):
+                continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self.store.record_cleanup_failed(
@@ -970,6 +1001,10 @@ class RunScheduler:
             while self._active_executions and time.monotonic() < deadline:
                 self._activity.wait(timeout=min(0.05, deadline - time.monotonic()))
         for run_id in active:
+            if self.execution_fence is not None and not self._renew_execution_owner(
+                run_id
+            ):
+                continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self.store.record_cleanup_failed(
@@ -981,7 +1016,10 @@ class RunScheduler:
                     run_id,
                     reason="shutdown",
                     lock_timeout_seconds=remaining,
+                    fence=self.execution_fence,
                 )
+            except RuntimeError:
+                continue
             except WorkflowLockTimeout:
                 self.store.record_cleanup_failed(run_id, reason="shutdown_lock_timeout")
 

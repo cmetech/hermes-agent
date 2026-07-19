@@ -8,12 +8,16 @@ import threading
 import time
 from unittest.mock import MagicMock
 
+import pytest
+
 from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import (
     CoordinatorIdentity,
     CoordinatorStore,
 )
+from plugins.workflow.lease_clock import LeaseClockSample
+from plugins.workflow.models import ExecutionFence
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
@@ -30,6 +34,231 @@ def _identity(name: str, *, host_kind: str = "gateway") -> CoordinatorIdentity:
         pid=process.pid,
         process_start_time=process.start_time,
     )
+
+
+class _LeaseClock:
+    def __init__(self, sample: LeaseClockSample) -> None:
+        self.sample = sample
+
+    def __call__(self) -> LeaseClockSample:
+        return self.sample
+
+
+def test_coordinator_lease_resists_backward_and_forward_wall_clock_steps(
+    tmp_path,
+) -> None:
+    run_store = RunStore(tmp_path)
+    utc = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(utc, 100.0, "boot-a"))
+    store = CoordinatorStore(run_store.database, clock=clock)
+    first = store.try_acquire(_identity("first"), now=utc, lease_seconds=30)
+    assert first.is_leader
+
+    clock.sample = LeaseClockSample(
+        utc - timedelta(days=1), 131.0, "boot-a"
+    )
+    takeover = store.try_acquire(
+        _identity("backward-step"), now=clock.sample.utc_now, lease_seconds=30
+    )
+    assert takeover.is_leader
+    assert takeover.lease.epoch == 2
+
+    clock.sample = LeaseClockSample(utc, 200.0, "boot-a")
+    store.release(
+        _identity("backward-step"),
+        epoch=takeover.lease.epoch,
+        now=clock.sample.utc_now,
+    )
+    leader = store.try_acquire(
+        _identity("forward-owner"), now=clock.sample.utc_now, lease_seconds=30
+    )
+    clock.sample = LeaseClockSample(utc + timedelta(days=1), 201.0, "boot-a")
+    standby = store.try_acquire(
+        _identity("forward-step"), now=clock.sample.utc_now, lease_seconds=30
+    )
+    assert not standby.is_leader
+    assert standby.lease.owner_id == leader.lease.owner_id
+    assert store.health(now=clock.sample.utc_now).status == "healthy"
+
+    clock.sample = LeaseClockSample(
+        utc + timedelta(days=1), 202.0, "boot-b"
+    )
+    after_reboot = store.try_acquire(
+        _identity("rebooted-host"), now=clock.sample.utc_now, lease_seconds=30
+    )
+    assert after_reboot.is_leader
+    assert after_reboot.lease.epoch == leader.lease.epoch + 1
+
+
+def test_legacy_clock_domain_fails_closed_until_utc_deadline(
+    tmp_path,
+) -> None:
+    run_store = RunStore(tmp_path)
+    utc = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(utc, 100.0, "boot-a"))
+    store = CoordinatorStore(run_store.database, clock=clock)
+    first = store.try_acquire(_identity("legacy"), now=utc, lease_seconds=30)
+    with run_store._connect() as connection:
+        connection.execute(
+            "UPDATE coordinator_lease SET boot_id=NULL, heartbeat_monotonic=NULL, "
+            "lease_seconds=NULL WHERE singleton=1"
+        )
+
+    clock.sample = LeaseClockSample(utc + timedelta(seconds=29), 10000.0, "boot-b")
+    refused = store.try_acquire(
+        _identity("contender"), now=clock.sample.utc_now, lease_seconds=30
+    )
+    assert not refused.is_leader
+    assert refused.lease.epoch == first.lease.epoch
+
+    clock.sample = LeaseClockSample(utc + timedelta(seconds=31), 10001.0, "boot-b")
+    acquired = store.try_acquire(
+        _identity("contender"), now=clock.sample.utc_now, lease_seconds=30
+    )
+    assert acquired.is_leader
+    assert acquired.lease.epoch == first.lease.epoch + 1
+
+
+def test_stale_execution_fence_cannot_mutate_or_interrupt_successor_claim(
+    tmp_path, workflow_writer
+) -> None:
+    utc = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(utc, 100.0, "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    first = coordinator.try_acquire(_identity("first"), now=utc, lease_seconds=30)
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="epoch-fence")
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="epoch-fence",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="epoch-fence",
+            concurrency_key="epoch-fence",
+            execution_mode="background",
+        ),
+        immutable_snapshot=prepared,
+    )
+    first_fence = ExecutionFence("first", first.lease.epoch)
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "coordinator:first:1",
+        now=utc,
+        monotonic_now=100.0,
+        execution_fence=first_fence,
+    )
+    assert claim is not None
+    assert claim.execution_fence == first_fence
+
+    clock.sample = LeaseClockSample(utc - timedelta(days=1), 131.0, "boot-a")
+    second = coordinator.try_acquire(
+        _identity("second"), now=clock.sample.utc_now, lease_seconds=30
+    )
+    assert second.is_leader and second.lease.epoch == 2
+
+    with pytest.raises(RuntimeError, match="execution fence"):
+        store.mark_node_started(claim, now=clock.sample)
+    with pytest.raises(RuntimeError, match="execution fence"):
+        store.complete_node(claim, status="succeeded", now=clock.sample)
+    with pytest.raises(RuntimeError, match="execution fence"):
+        store.schedule_retry(
+            claim,
+            next_attempt_at=utc + timedelta(minutes=1),
+            now=clock.sample,
+        )
+    assert store.interrupt_active_claims(
+        admitted.run_id,
+        reason="stale-shutdown",
+        fence=ExecutionFence("second", second.lease.epoch),
+        now=clock.sample,
+    ) == ()
+    assert store.load_run(admitted.run_id)["nodes"]["start"]["claim"][
+        "attempt_id"
+    ] == claim.attempt_id
+
+
+def test_claim_heartbeat_cannot_mutate_after_epoch_changes(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    utc = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(utc, 100.0, "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    first = coordinator.try_acquire(_identity("first"), now=utc, lease_seconds=30)
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="heartbeat-fence")
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="heartbeat-fence",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="heartbeat-fence",
+            concurrency_key="heartbeat-fence",
+            execution_mode="background",
+        ),
+        immutable_snapshot=prepared,
+    )
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "coordinator:first:1",
+        now=utc,
+        monotonic_now=100.0,
+        execution_fence=ExecutionFence("first", first.lease.epoch),
+    )
+    assert claim is not None
+    before = store.load_run(admitted.run_id)
+    checked = threading.Event()
+    continue_renewal = threading.Event()
+    original_check = store._assert_claim_execution_fence
+
+    def pause_after_initial_check(*args, **kwargs) -> None:
+        original_check(*args, **kwargs)
+        checked.set()
+        assert continue_renewal.wait(5)
+
+    monkeypatch.setattr(store, "_assert_claim_execution_fence", pause_after_initial_check)
+    outcome: list[bool | BaseException] = []
+
+    def renew() -> None:
+        try:
+            outcome.append(
+                store.renew_claim(
+                    claim,
+                    now=utc + timedelta(seconds=6),
+                    monotonic_now=106.0,
+                    fence_now=clock.sample,
+                )
+            )
+        except BaseException as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=renew)
+    thread.start()
+    assert checked.wait(5)
+    clock.sample = LeaseClockSample(utc - timedelta(days=1), 131.0, "boot-a")
+    second = coordinator.try_acquire(
+        _identity("second"), now=clock.sample.utc_now, lease_seconds=30
+    )
+    assert second.is_leader and second.lease.epoch == 2
+    continue_renewal.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    assert outcome == [False]
+    after = store.load_run(admitted.run_id)
+    assert after["state_version"] == before["state_version"]
+    assert after["nodes"]["start"]["claim"] == before["nodes"]["start"]["claim"]
 
 
 def _hold_coordinator_lease(database: str, ready, release) -> None:
@@ -101,12 +330,16 @@ def test_coordinator_lease_renews_releases_and_fences_stale_epoch(tmp_path) -> N
 
 def test_expired_lease_requires_reacquisition_and_increments_epoch(tmp_path) -> None:
     run_store = RunStore(tmp_path)
-    store = CoordinatorStore(run_store.database)
     now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "boot-a"))
+    store = CoordinatorStore(run_store.database, clock=clock)
     identity = _identity("laptop")
 
     first = store.try_acquire(identity, now=now, lease_seconds=30)
     assert first.is_leader is True
+    clock.sample = LeaseClockSample(
+        now + timedelta(minutes=5), 131.0, "boot-a"
+    )
     assert not store.renew(
         identity,
         epoch=first.lease.epoch,
@@ -125,13 +358,20 @@ def test_expired_lease_requires_reacquisition_and_increments_epoch(tmp_path) -> 
 
 def test_coordinator_health_distinguishes_missing_fresh_and_stale(tmp_path) -> None:
     run_store = RunStore(tmp_path)
-    store = CoordinatorStore(run_store.database)
     now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "boot-a"))
+    store = CoordinatorStore(run_store.database, clock=clock)
 
     assert store.health(now=now).status == "unavailable"
     acquired = store.try_acquire(_identity("owner"), now=now, lease_seconds=30)
     assert acquired.is_leader is True
+    clock.sample = LeaseClockSample(
+        now + timedelta(seconds=1), 101.0, "boot-a"
+    )
     assert store.health(now=now + timedelta(seconds=1)).status == "healthy"
+    clock.sample = LeaseClockSample(
+        now + timedelta(seconds=31), 131.0, "boot-a"
+    )
     stale = store.health(now=now + timedelta(seconds=31))
     assert stale.status == "unavailable"
     assert stale.reason_code == "coordinator_lease_expired"

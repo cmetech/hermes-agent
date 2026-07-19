@@ -21,6 +21,12 @@ from plugins.workflow.coordinator_store import (
     CoordinatorLease,
     CoordinatorStore,
 )
+from plugins.workflow.lease_clock import (
+    LeaseClockSample,
+    current_boot_id,
+    lease_is_fresh,
+)
+from plugins.workflow.models import ExecutionFence
 from tools.managed_process import ProcessIdentity
 
 
@@ -71,6 +77,7 @@ class WorkflowCoordinatorService:
         self.sweep_backoff_seconds = tuple(float(value) for value in sweep_backoff_seconds)
         self._utcnow = utcnow or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic
+        self._boot_id = current_boot_id()
         self._health_lock = threading.Lock()
         self._health = BackgroundServiceHealth(
             state="starting",
@@ -106,6 +113,13 @@ class WorkflowCoordinatorService:
 
         return get_hermes_home().resolve()
 
+    def _lease_clock(self) -> LeaseClockSample:
+        return LeaseClockSample(
+            self._utcnow().astimezone(timezone.utc),
+            self._monotonic(),
+            self._boot_id,
+        )
+
     def _identity(self) -> CoordinatorIdentity:
         process = ProcessIdentity.capture(os.getpid())
         return CoordinatorIdentity(
@@ -140,14 +154,14 @@ class WorkflowCoordinatorService:
     ) -> tuple[bool, float | None]:
         if self.context.host_kind != "web":
             return True, None
-        if lease is not None and lease.lease_expires_at > now:
+        if lease is not None and lease_is_fresh(lease, self._lease_clock()):
             return False, None
         if eligible_at is None:
             eligible_at = self._monotonic() + self.web_election_grace_seconds
         return self._monotonic() >= eligible_at, eligible_at
 
     @staticmethod
-    def _scheduler(run_store, *, owner_id: str):
+    def _scheduler(run_store, *, fence: ExecutionFence):
         from agent.plugin_agent import PluginAgentRunner
         from hermes_cli.profiles import get_active_profile_name
         from plugins.workflow.cli import _runtime_config, _scheduler
@@ -158,8 +172,9 @@ class WorkflowCoordinatorService:
             runtime,
             agent_runner=PluginAgentRunner(plugin_id="workflow"),
             profile_name=get_active_profile_name(),
+            owner_id=f"coordinator:{fence.owner_id}:{fence.owner_epoch}",
         )
-        scheduler.owner_id = owner_id
+        scheduler.execution_fence = fence
         return scheduler
 
     def _sweep_once(
@@ -172,6 +187,11 @@ class WorkflowCoordinatorService:
     ) -> tuple[bool, str | None, datetime | None]:
         from plugins.workflow.notifications import NotificationOutbox
 
+        fence = ExecutionFence(identity.owner_id, epoch)
+        with run_store._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run_store.assert_execution_fence(connection, fence)
+            connection.commit()
         NotificationOutbox(run_store).reconcile_journal(limit_runs=200)
         now = self._utcnow().astimezone(timezone.utc)
         wakes = coordinator_store.pending_wakes(
@@ -231,7 +251,7 @@ class WorkflowCoordinatorService:
     ) -> bool:
         scheduler = self._scheduler(
             run_store,
-            owner_id=f"coordinator:{identity.owner_id}:{epoch}",
+            fence=ExecutionFence(identity.owner_id, epoch),
         )
         pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="workflow-sweep")
         future: Future | None = None
@@ -336,8 +356,12 @@ class WorkflowCoordinatorService:
                     if coordinator_store is None:
                         from plugins.workflow.store import RunStore
 
-                        run_store = RunStore(self._home())
-                        coordinator_store = CoordinatorStore(run_store.database)
+                        run_store = RunStore(
+                            self._home(), lease_clock=self._lease_clock
+                        )
+                        coordinator_store = CoordinatorStore(
+                            run_store.database, clock=self._lease_clock
+                        )
                     now = self._utcnow().astimezone(timezone.utc)
                     if leader_epoch is not None:
                         leadership_current = self._lead(
@@ -358,7 +382,9 @@ class WorkflowCoordinatorService:
                         eligible_at=web_eligible_at,
                     )
                     if not may_contend:
-                        if lease is not None and lease.lease_expires_at > now:
+                        if lease is not None and lease_is_fresh(
+                            lease, self._lease_clock()
+                        ):
                             self._set_health(
                                 state="healthy",
                                 code="standby",

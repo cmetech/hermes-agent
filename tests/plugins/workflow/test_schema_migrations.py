@@ -160,6 +160,15 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             for row in connection.execute("PRAGMA table_info(cleanup_previews)")
         }
         assert "authority_binding_digest" in cleanup_preview_columns
+        coordinator_lease_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(coordinator_lease)")
+        }
+        assert {
+            "boot_id",
+            "heartbeat_monotonic",
+            "lease_seconds",
+        } <= coordinator_lease_columns
         indexes = {
             row["name"]
             for row in connection.execute(
