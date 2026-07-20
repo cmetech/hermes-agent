@@ -1177,3 +1177,27 @@ upstream_changes:
     reproducible Desktop approval and topology-omission fixtures, and a complete
     independently reproducible verification record for the same feature.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-desktop-run-phase1
+  change_class: workflow-design
+  owner: workflow-orchestration
+  files:
+  - docs/superpowers/specs/2026-07-20-workflow-showcase-desktop-run-design.md
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  owned_symbols:
+  - workflow showcase Desktop run v3.0.2 security design
+  - workflow showcase Desktop run v3.0.2 TDD implementation plan
+  tests:
+  - scripts/test_workflow_merge_gate.sh
+  expected_commit_subject: 'docs(workflow): design bundled Desktop showcase runs'
+  upstream_candidate: true
+  merge_guidance: Preserve the approved source-aware catalog identity,
+    rootless digest-verified showcase loader, read-only no-repair HTTP path,
+    background-only admission, server-derived trigger provenance, bundled
+    trust semantics, server-enforced consent-sensitive CLI-only run support,
+    additive parameterless approval showcase, strict TDD task boundaries, and
+    full verification/review completion bar when
+    implementing the plan. Stop for renewed design approval if any of these
+    boundaries resists clean reuse.
+  removal_condition: Remove after this design and plan are superseded by an
+    equivalent implemented and independently verified upstream feature.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
