@@ -54,9 +54,7 @@ function serverErrorFields(body: unknown): ServerErrorFields | undefined {
   return undefined
 }
 
-function profileScoped(): { profile?: string } {
-  const profile = getApiRequestProfile()
-
+function profileScoped(profile: string | null = getApiRequestProfile()): { profile?: string } {
   return profile ? { profile } : {}
 }
 
@@ -70,21 +68,27 @@ async function requestWorkflowApi<T>(request: Parameters<Window['hermesDesktop']
   throw new WorkflowApiError(response, serverErrorFields(response.body))
 }
 
-export function listWorkflowDefinitions(): Promise<WorkflowCatalogPage> {
+export function listWorkflowDefinitions(profile: string | null = getApiRequestProfile()): Promise<WorkflowCatalogPage> {
   return requestWorkflowApi<WorkflowCatalogPage>({
     path: '/api/plugins/workflow/workflows',
-    ...profileScoped()
+    ...profileScoped(profile)
   })
 }
 
-export function preflightWorkflow(name: string): Promise<WorkflowDetail> {
+export function preflightWorkflow(
+  name: string,
+  profile: string | null = getApiRequestProfile()
+): Promise<WorkflowDetail> {
   return requestWorkflowApi<WorkflowDetail>({
     path: `/api/plugins/workflow/workflows/${encodeURIComponent(name)}`,
-    ...profileScoped()
+    ...profileScoped(profile)
   })
 }
 
-export async function startWorkflowRun(request: StartWorkflowRunRequest): Promise<WorkflowStartResponse> {
+export async function startWorkflowRun(
+  request: StartWorkflowRunRequest,
+  profile: string | null = getApiRequestProfile()
+): Promise<WorkflowStartResponse> {
   if (!request.idempotencyKey.trim()) {
     throw new TypeError('idempotencyKey must not be empty')
   }
@@ -98,6 +102,6 @@ export async function startWorkflowRun(request: StartWorkflowRunRequest): Promis
     },
     method: 'POST',
     path: '/api/plugins/workflow/runs',
-    ...profileScoped()
+    ...profileScoped(profile)
   })
 }

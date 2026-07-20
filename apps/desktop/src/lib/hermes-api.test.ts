@@ -1,16 +1,20 @@
+// @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { setApiRequestProfile } from '@/hermes'
 
 interface WorkflowApiModule {
-  listWorkflowDefinitions: () => Promise<unknown>
-  preflightWorkflow: (name: string) => Promise<unknown>
-  startWorkflowRun: (request: {
-    concurrencyPolicy: 'allow' | 'forbid' | 'queue'
-    idempotencyKey: string
-    values: Record<string, string>
-    workflow: string
-  }) => Promise<unknown>
+  listWorkflowDefinitions: (profile?: string | null) => Promise<unknown>
+  preflightWorkflow: (name: string, profile?: string | null) => Promise<unknown>
+  startWorkflowRun: (
+    request: {
+      concurrencyPolicy: 'allow' | 'forbid' | 'queue'
+      idempotencyKey: string
+      values: Record<string, string>
+      workflow: string
+    },
+    profile?: string | null
+  ) => Promise<unknown>
 }
 
 async function workflowApi(): Promise<WorkflowApiModule> {
@@ -45,6 +49,29 @@ describe('workflow catalog authenticated API', () => {
       path: '/api/plugins/workflow/workflows',
       profile: 'remote-profile'
     })
+  })
+
+  it('uses an explicitly captured profile instead of mutable ambient profile state', async () => {
+    setApiRequestProfile('profile-b')
+    const { listWorkflowDefinitions, preflightWorkflow, startWorkflowRun } = await workflowApi()
+
+    await listWorkflowDefinitions('profile-a')
+    await preflightWorkflow('deploy', 'profile-a')
+    await startWorkflowRun(
+      {
+        concurrencyPolicy: 'queue',
+        idempotencyKey: 'captured-profile',
+        values: {},
+        workflow: 'deploy'
+      },
+      'profile-a'
+    )
+
+    expect(apiStructured.mock.calls.map(([request]) => request.profile)).toEqual([
+      'profile-a',
+      'profile-a',
+      'profile-a'
+    ])
   })
 
   it('preflights an encoded workflow name with GET semantics', async () => {

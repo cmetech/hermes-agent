@@ -900,3 +900,49 @@ upstream_changes:
     profile-aware workflow catalog, detail, and admission wrappers without
     changing existing REST bridge error semantics.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-catalog-datagrid
+  change_class: desktop-workflow-ui
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
+  - apps/desktop/src/lib/hermes-api.ts
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - website/docs/user-guide/features/workflows.md
+  - tests/test_desktop_workflow_test_gate.py
+  owned_symbols:
+  - WorkflowCatalog
+  - WorkflowCatalogProps
+  - WorkflowsView workflow catalog tab
+  - listWorkflowDefinitions explicit profile binding
+  - preflightWorkflow explicit profile binding
+  - startWorkflowRun explicit profile binding
+  - operations.workflowCatalog translations
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - tests/test_desktop_workflow_test_gate.py
+  expected_commit_subject: 'feat(desktop): Task 5 add workflow catalog datagrid'
+  upstream_candidate: true
+  merge_guidance: Preserve the Workflows-first catalog entry point, explicit-profile
+    request binding paired with its React Query cache key, native tokenized table,
+    localized explicit loading/error/empty states, shared semantic warning Alert
+    for partial results, semantic Badge variants without call-site color chrome,
+    and typed corrupt-entry rows. Keep View enabled for every valid entry, and
+    keep Run fail-closed with a keyboard-reachable non-action explanation when
+    inputs are unsupported or trust verification fails. Keep the exact published
+    operator-doc destination accurate to the currently mounted Desktop behavior,
+    do not let the catalog navigation view reach the workflow run-list endpoint,
+    and do not add modal behavior here.
+  removal_condition: Remove when upstream Desktop provides an equivalent native
+    workflow catalog with the same query isolation, typed failure states, action
+    safety, accessibility, and four-locale coverage.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

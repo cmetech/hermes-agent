@@ -1378,6 +1378,36 @@ export interface Translations {
   operations: {
     workflows: string
     workflowViews: string
+    workflowCatalog: string
+    workflowCatalogLoading: string
+    workflowCatalogErrorTitle: string
+    workflowCatalogErrorDescription: string
+    workflowCatalogRetry: string
+    workflowCatalogEmptyTitle: string
+    workflowCatalogEmptyDescription: string
+    workflowCatalogDocs: string
+    workflowCatalogPartialLabel: string
+    workflowCatalogPartialDescription: string
+    workflowCatalogCapacityError: string
+    workflowCatalogInvalidDefinition: string
+    workflowColumnName: string
+    workflowColumnVersion: string
+    workflowColumnDescription: string
+    workflowColumnTrust: string
+    workflowColumnInputs: string
+    workflowColumnSource: string
+    workflowColumnActions: string
+    workflowTrusted: string
+    workflowUntrusted: string
+    workflowNoInputs: string
+    workflowInputCount: (count: number) => string
+    workflowSourceProfile: string
+    workflowSourceProject: string
+    workflowView: string
+    workflowRun: string
+    workflowRunUnavailable: string
+    workflowRunUnsupportedInputs: string
+    workflowRunUntrusted: string
     activeBoard: string
     history: string
     archive: string

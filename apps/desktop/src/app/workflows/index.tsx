@@ -22,6 +22,7 @@ import { PAGE_INSET_X } from '../layout-constants'
 
 import { workflowBoardModel } from './adapter'
 import { AttentionInbox } from './attention-inbox'
+import { WorkflowCatalog } from './catalog'
 import { RunInspector } from './run-inspector'
 import { $workflowSelectedRunId, selectWorkflowRun } from './store'
 
@@ -49,7 +50,7 @@ export function WorkflowsView() {
   const actionInFlight = useRef(false)
   const [actionPending, setActionPending] = useState(false)
   const [isVisible, setIsVisible] = useState(() => document.visibilityState === 'visible')
-  const [view, setView] = useState<WorkflowRunView>('board')
+  const [view, setView] = useState<WorkflowRunView>('workflows')
 
   useEffect(() => {
     const onVisibilityChange = () => setIsVisible(document.visibilityState === 'visible')
@@ -69,25 +70,23 @@ export function WorkflowsView() {
   })
 
   const attention = useQuery({
+    enabled: view !== 'workflows',
     queryFn: listWorkflowAttention,
     queryKey: ['workflow-attention', profile],
     refetchInterval: () => (isVisible ? 20_000 : false)
   })
 
   const selected = useQuery({
-    enabled: Boolean(selectedRunId),
+    enabled: view !== 'workflows' && Boolean(selectedRunId),
     queryFn: () => getWorkflowRun(selectedRunId!),
     queryKey: ['workflow-run', profile, selectedRunId],
     refetchInterval: () => (isVisible ? 20_000 : false)
   })
 
-  const eventQueryKey = useMemo(
-    () => ['workflow-events', profile, selectedRunId] as const,
-    [profile, selectedRunId]
-  )
+  const eventQueryKey = useMemo(() => ['workflow-events', profile, selectedRunId] as const, [profile, selectedRunId])
 
   const events = useQuery({
-    enabled: Boolean(selectedRunId) && isVisible,
+    enabled: view !== 'workflows' && Boolean(selectedRunId) && isVisible,
     queryFn: async () => {
       const previous = queryClient.getQueryData<WorkflowEventPage>(eventQueryKey)
       const page = await listWorkflowEvents(selectedRunId!, previous?.next_cursor ?? 0)
@@ -178,11 +177,11 @@ export function WorkflowsView() {
     [nextCursor, runItems, runs.isError, t.operations.workflows]
   )
 
-  if (runs.isLoading) {
+  if (view !== 'workflows' && runs.isLoading) {
     return <PageLoader />
   }
 
-  if (runs.isError && !runs.data) {
+  if (view !== 'workflows' && runs.isError && !runs.data) {
     return <p className={PAGE_INSET_X}>{t.operations.workflowUnavailable}</p>
   }
 
@@ -200,7 +199,7 @@ export function WorkflowsView() {
     >
       <h1 className="mb-4 text-lg font-medium">{t.operations.workflows}</h1>
       <div aria-label={t.operations.workflowViews} className="mb-4 flex gap-2" role="tablist">
-        {(['board', 'history', 'archive'] as const).map(candidate => (
+        {(['workflows', 'board', 'history', 'archive'] as const).map(candidate => (
           <Button
             aria-selected={view === candidate}
             key={candidate}
@@ -212,27 +211,35 @@ export function WorkflowsView() {
             size="sm"
             variant={view === candidate ? 'default' : 'secondary'}
           >
-            {candidate === 'board'
-              ? t.operations.activeBoard
-              : candidate === 'history'
-                ? t.operations.history
-                : t.operations.archive}
+            {candidate === 'workflows'
+              ? t.operations.workflows
+              : candidate === 'board'
+                ? t.operations.activeBoard
+                : candidate === 'history'
+                  ? t.operations.history
+                  : t.operations.archive}
           </Button>
         ))}
       </div>
-      <AttentionInbox items={attention.data?.items ?? []} onOpenRun={selectWorkflowRun} />
-      <ActivityBoard
-        model={model}
-        onLoadMore={() => void runs.fetchNextPage()}
-        onOpenCard={card => selectWorkflowRun(card.id)}
-      />
-      {selected.data && (
-        <RunInspector
-          actionsDisabled={actionPending || mutation.isPending || selected.isError}
-          events={events.data?.events}
-          onAction={mutateRun}
-          run={selected.data}
-        />
+      {view === 'workflows' ? (
+        <WorkflowCatalog />
+      ) : (
+        <>
+          <AttentionInbox items={attention.data?.items ?? []} onOpenRun={selectWorkflowRun} />
+          <ActivityBoard
+            model={model}
+            onLoadMore={() => void runs.fetchNextPage()}
+            onOpenCard={card => selectWorkflowRun(card.id)}
+          />
+          {selected.data && (
+            <RunInspector
+              actionsDisabled={actionPending || mutation.isPending || selected.isError}
+              events={events.data?.events}
+              onAction={mutateRun}
+              run={selected.data}
+            />
+          )}
+        </>
       )}
       {(view === 'history' || view === 'archive') && (
         <section aria-label={t.operations.cleanup} className="mt-6 border-t border-(--ui-border) pt-4">
