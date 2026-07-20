@@ -1318,3 +1318,29 @@ upstream_changes:
   removal_condition: Remove when upstream exposes equivalent source-aware,
     honestly compatible verified showcase list and detail APIs.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-api-admission
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  owned_symbols:
+  - StartRunRequest.catalog_source
+  - start_api_run showcase branch
+  - verified bundled showcase run metadata
+  tests:
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_provenance.py
+  expected_commit_subject: 'feat(workflow): admit verified showcases in background'
+  upstream_candidate: true
+  merge_guidance: Preserve fresh rootless bundle verification on every
+    showcase admission, shared run-support derivation, strict compatibility and
+    execution preflight, digest/risk/snapshot equality, coordinator gating,
+    server-derived API/Desktop provenance, stable idempotency, showcase-only
+    metadata, and background-only execution. A caller-provided path, trust
+    boolean, scenario record, or provenance claim must never establish bundled
+    trust.
+  removal_condition: Remove when upstream admits authenticated bundled
+    showcases through an equivalent fail-closed background API path.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

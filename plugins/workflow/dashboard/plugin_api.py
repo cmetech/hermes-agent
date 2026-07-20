@@ -848,6 +848,7 @@ class StartRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     workflow: str = Field(..., min_length=1, max_length=256)
+    catalog_source: Literal["project", "profile", "showcase"] | None = None
     values: dict[str, str] = Field(default_factory=dict)
     idempotency_key: str = Field(..., min_length=1, max_length=512)
     concurrency_policy: Literal["queue", "allow", "forbid"] = "queue"
@@ -912,6 +913,7 @@ def post_runs(
                 workdir=Path.cwd(),
                 user_home=Path.home(),
                 workflow_name=request.workflow,
+                catalog_source=request.catalog_source,
                 values=request.values,
                 idempotency_key=request.idempotency_key,
                 concurrency_policy=request.concurrency_policy,
