@@ -29,6 +29,8 @@ coverage:
     reason: Separate user-requested v2.0.9 release preparation.
   - commit: fd11bee92a581b8aa22838b31a10ff59ceeaeb77
     reason: Separate user-requested v3.0.0 release preparation.
+  - commit: 144a4ce981040001445cd918e3cfa9f99fdb2b58
+    reason: Separate user-requested v3.0.1 release preparation.
 upstream_changes:
 - id: brand-aware-version-label
   change_class: branding-generic
