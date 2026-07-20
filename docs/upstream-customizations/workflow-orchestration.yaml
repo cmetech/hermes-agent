@@ -920,6 +920,7 @@ upstream_changes:
   owned_symbols:
   - WorkflowCatalog
   - WorkflowCatalogProps
+  - WORKFLOW_DOCS_URL fork-owned base documentation link
   - WorkflowsView workflow catalog tab
   - listWorkflowDefinitions explicit profile binding
   - preflightWorkflow explicit profile binding
@@ -938,8 +939,11 @@ upstream_changes:
     for partial results, semantic Badge variants without call-site color chrome,
     and typed corrupt-entry rows. Keep View enabled for every valid entry, and
     keep Run fail-closed with a keyboard-reachable non-action explanation when
-    inputs are unsupported or trust verification fails. Keep the exact published
-    operator-doc destination accurate to the currently mounted Desktop behavior,
+    inputs are unsupported or trust verification fails. Keep the empty-state
+    operator-doc destination on the cmetech-owned base documentation page shared
+    by OTTO and LOOP24; do not restore the upstream Nous Research domain or rely
+    on title-case build substitution to rewrite a lowercase URL. Keep that page
+    accurate to the currently mounted Desktop behavior,
     do not let the catalog navigation view reach the workflow run-list endpoint,
     and do not add modal behavior here.
   removal_condition: Remove when upstream Desktop provides an equivalent native

@@ -15,7 +15,8 @@ import { listWorkflowDefinitions } from '@/lib/hermes-api'
 import { Eye, Play } from '@/lib/icons'
 import type { WorkflowDefinition, WorkflowDefinitionError } from '@/types/hermes'
 
-const WORKFLOW_DOCS_URL = 'https://hermes-agent.nousresearch.com/docs/user-guide/features/workflows'
+const WORKFLOW_DOCS_URL =
+  'https://github.com/cmetech/hermes-agent/blob/base/website/docs/user-guide/features/workflows.md'
 
 export interface WorkflowCatalogProps {
   onRunWorkflow?: (workflow: WorkflowDefinition) => void

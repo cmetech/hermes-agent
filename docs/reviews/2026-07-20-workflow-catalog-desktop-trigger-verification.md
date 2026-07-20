@@ -360,5 +360,35 @@ bound, and Catalog/Detail/POST parity remediations remain intact. Its focused
 accumulated boundary selection passed 31/31, `git diff --check` passed, and all
 nine tasks were rescanned without edits.
 
+## Four-reviewer disposition and CF-2 remediation
+
+The final four-reviewer report at
+`docs/reviews/2026-07-20-workflow-catalog-desktop-trigger-adversarial-review.md`
+gave a **READY FOR MERGE** verdict with no Critical, High, or Important finding.
+It identified CF-2 as a release-blocking branding Minor: the empty-catalog Docs
+link used the lowercase upstream Nous Research host, which the Desktop build
+transform cannot rebrand.
+
+CF-2 was remediated in a separate post-review commit so the nine required task
+commits and their replay evidence remain intact. The link now targets the
+cmetech-owned `base` source for the committed operator page:
+`https://github.com/cmetech/hermes-agent/blob/base/website/docs/user-guide/features/workflows.md`.
+The brand descriptors and releases-only OTTO/LOOP24 repositories expose no
+separate documentation host, so one fork-owned page is the durable destination
+for both release brands and does not depend on build-time name substitution.
+
+Strict TDD evidence for CF-2:
+
+- RED: the focused `index.test.tsx` run failed 1 and passed 25 because the
+  renderer still emitted the upstream Nous URL;
+- GREEN: the focused file passed 26/26;
+- `npm run test:workflow-ui` passed 110/110 across 15 files;
+- renderer `npx tsc --noEmit` exited 0;
+- scoped ESLint on `catalog.tsx` and `index.test.tsx` reported zero errors; and
+- the full merge gate passed 745/1 Python, installed-distribution 1, Desktop
+  51/51 across 9 files, and TypeScript exit 0. This assertion replacement adds
+  no test-count delta, so the existing +77 Python and +34 Desktop reconciliation
+  remains exact.
+
 Nothing was merged, pushed, tagged, released, deployed, or published. No pull
 request was opened. The branch is left solely for maintainer merge review.

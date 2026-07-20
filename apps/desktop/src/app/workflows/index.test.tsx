@@ -319,7 +319,7 @@ describe('WorkflowsView', () => {
     expect(within(row).queryByRole('button', { name: 'Run' })).toBeNull()
   })
 
-  it('renders the shared empty state with a workflow documentation pointer', async () => {
+  it('renders the shared empty state with a fork-owned workflow documentation pointer', async () => {
     $workflowSelectedRunId.set(null)
     listWorkflowDefinitions.mockResolvedValue({ items: [], truncated: false })
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -328,7 +328,7 @@ describe('WorkflowsView', () => {
 
     expect(await screen.findByText('No workflows installed')).toBeTruthy()
     expect(screen.getByRole('link', { name: 'Workflow documentation' }).getAttribute('href')).toBe(
-      'https://hermes-agent.nousresearch.com/docs/user-guide/features/workflows'
+      'https://github.com/cmetech/hermes-agent/blob/base/website/docs/user-guide/features/workflows.md'
     )
   })
 
