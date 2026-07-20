@@ -170,6 +170,7 @@ jobs:
             tests/plugins/workflow/test_coordinator.py \
             tests/plugins/workflow/test_coordinator_multiprocess.py \
             tests/plugins/workflow/test_desktop_api.py \
+            tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py \
             tests/plugins/workflow/test_schema_migrations.py \
             tests/plugins/workflow/test_notification_delivery.py \
             tests/plugins/workflow/test_notifications.py \

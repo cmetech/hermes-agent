@@ -95,6 +95,13 @@ def test_merge_gate_pins_workflow_catalog_desktop_e2e_contract() -> None:
     assert "tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py" in source
 
 
+def test_showcase_desktop_e2e_is_in_merge_gate_and_native_matrix() -> None:
+    path = "tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py"
+
+    assert path in GATE.read_text()
+    assert path in CI.read_text()
+
+
 def test_merge_gate_pins_desktop_review_run_contract() -> None:
     source = GATE.read_text()
 

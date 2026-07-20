@@ -1419,3 +1419,26 @@ upstream_changes:
   removal_condition: Remove when upstream Desktop presents and runs verified
     bundled showcases with equivalent source identity and fail-closed policy.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-desktop-real-middleware-e2e
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - bundled showcase Desktop real-middleware contract
+  - native showcase admission matrix membership
+  tests:
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'test(workflow): prove bundled Desktop admission end to end'
+  upstream_candidate: true
+  merge_guidance: Preserve the authenticated real middleware proof across
+    catalog, source-exact detail, background-only admission, verified-bundle
+    metadata, server-derived Desktop provenance, and board visibility. List and
+    detail must remain byte-read-only for the store and trust store.
+  removal_condition: Remove when upstream has equivalent real-middleware
+    coverage in both the focused fork gate and native three-OS CI matrix.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
