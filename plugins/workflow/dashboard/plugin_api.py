@@ -81,6 +81,7 @@ class WorkflowAuthority:
     source_instance: str = "api:local-admin"
     channel: str = "api:local-admin"
     assurance: Literal["verified_adapter", "local_admin_claim"] = "local_admin_claim"
+    trigger_source: Literal["desktop", "api"] = "api"
     return_route: str | None = None
 
     @property
@@ -156,6 +157,7 @@ def _verified_operator(
             source_instance=f"api:session:{provider}",
             channel=f"api:{provider}",
             assurance="verified_adapter",
+            trigger_source="desktop",
         )
     if token is not None and getattr(request.state, "token_authenticated", False):
         provider = getattr(token, "provider", "unknown")
@@ -186,8 +188,188 @@ def _verified_operator(
             source_instance="api:local-admin",
             channel="api:local-admin",
             assurance="local_admin_claim",
+            trigger_source="desktop",
         )
     raise HTTPException(status_code=401, detail={"code": "authentication_required"})
+
+
+class WorkflowCatalogInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=128)
+    type: str = Field(..., min_length=1, max_length=64)
+    required: bool
+
+
+class WorkflowCatalogInputSupport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    supported: bool
+    reason: Literal[
+        "parameterless",
+        "flat_inputs",
+        "unsupported_input_type",
+        "unsupported_input_shape",
+    ]
+
+
+class WorkflowCatalogEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=128)
+    version: str = Field(..., min_length=1, max_length=32)
+    description: str = Field(..., max_length=16_400)
+    source: Literal["project", "profile"]
+    precedence: Literal[1, 2]
+    trust_state: Literal["trusted", "untrusted"]
+    inputs: list[WorkflowCatalogInput] = Field(..., max_length=64)
+    supported_inputs: WorkflowCatalogInputSupport
+
+
+class WorkflowCatalogErrorEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=128)
+    error: Literal["invalid_definition", "catalog_capacity"]
+
+
+class WorkflowCatalogResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[WorkflowCatalogEntry | WorkflowCatalogErrorEntry] = Field(
+        ..., max_length=500
+    )
+    truncated: bool
+
+
+class WorkflowTopologyResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., max_length=16_384)
+    mermaid: str | None = Field(None, max_length=65_536)
+    warnings: list[str] = Field(..., max_length=8)
+    omitted: str | None = Field(None, max_length=256)
+
+
+class WorkflowCoordinatorResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    healthy: bool
+    status: str = Field(..., max_length=64)
+    reason: str = Field(..., max_length=128)
+
+
+class WorkflowDetailResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=128)
+    version: str = Field(..., min_length=1, max_length=32)
+    description: str = Field(..., max_length=16_384)
+    source: str = Field(..., min_length=1, max_length=64)
+    precedence: int
+    trust_state: Literal["trusted", "untrusted"]
+    inputs: list[WorkflowCatalogInput] = Field(..., max_length=64)
+    supported_inputs: WorkflowCatalogInputSupport
+    risk_summary: dict[str, object]
+    compatibility: dict[str, object]
+    coordinator: WorkflowCoordinatorResponse
+    topology: WorkflowTopologyResponse
+    definition: dict[str, object]
+
+
+@router.get("/workflows", response_model=WorkflowCatalogResponse)
+def list_workflows(
+    request: Request,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request, operator_scope)
+    operator.require("read")
+    from plugins.workflow.catalog_api import (
+        WorkflowCatalogCapacityError,
+        WorkflowCatalogTrustUnavailableError,
+        WorkflowCatalogUnavailableError,
+        build_workflow_catalog,
+    )
+
+    try:
+        items, truncated = build_workflow_catalog(
+            hermes_home=get_hermes_home(), workdir=Path.cwd()
+        )
+    except WorkflowCatalogCapacityError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "workflow_catalog_capacity", "retryable": True},
+        ) from exc
+    except WorkflowCatalogUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "workflow_catalog_unavailable", "retryable": True},
+        ) from exc
+    except WorkflowCatalogTrustUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "workflow_trust_unavailable", "retryable": True},
+        ) from exc
+    return {
+        "items": [sanitize_projection(item) for item in items],
+        "truncated": truncated,
+    }
+
+
+@router.get("/workflows/{name}", response_model=WorkflowDetailResponse)
+def workflow_detail(
+    name: str,
+    request: Request,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request, operator_scope)
+    operator.require("read")
+    from plugins.workflow.catalog_api import (
+        WorkflowCatalogCapacityError,
+        WorkflowCatalogInvalidDefinitionError,
+        WorkflowCatalogTrustUnavailableError,
+        WorkflowCatalogUnavailableError,
+        WorkflowDetailNotFoundError,
+        build_workflow_detail,
+    )
+
+    try:
+        detail = build_workflow_detail(
+            name, hermes_home=get_hermes_home(), workdir=Path.cwd()
+        )
+    except WorkflowDetailNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail={"code": "workflow_not_found"}
+        ) from exc
+    except WorkflowCatalogCapacityError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "workflow_catalog_capacity", "retryable": True},
+        ) from exc
+    except WorkflowCatalogInvalidDefinitionError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "workflow_invalid_definition",
+                "retryable": False,
+            },
+        ) from exc
+    except WorkflowCatalogUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "workflow_catalog_unavailable", "retryable": True},
+        ) from exc
+    except WorkflowCatalogTrustUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "workflow_trust_unavailable", "retryable": True},
+        ) from exc
+    sanitized = sanitize_projection(detail)
+    assert isinstance(sanitized, dict)
+    # build_workflow_detail already supplies the shared semantically redacted,
+    # byte-bounded definition; generic list limits must not silently clip it.
+    sanitized["definition"] = detail["definition"]
+    return sanitized
 
 
 @contextmanager
@@ -648,8 +830,16 @@ class StartRunRequest(BaseModel):
         if len(self.values) > 64:
             raise ValueError("values contains too many entries")
         total = 0
+        from plugins.workflow.catalog_api import (
+            desktop_input_name_is_representable,
+        )
+        from plugins.workflow.sanitize import workflow_input_names_are_portable
+
+        if not workflow_input_names_are_portable(self.values):
+            raise ValueError("value names must be portable and distinct")
+
         for key, value in self.values.items():
-            if not key.strip() or len(key) > 128:
+            if not desktop_input_name_is_representable(key):
                 raise ValueError("value names must be bounded non-empty text")
             encoded = value.encode("utf-8")
             if len(encoded) > 64 * 1024:
@@ -680,6 +870,7 @@ def post_runs(
         operator_scope=None if operator.unrestricted else operator.scope,
         source_instance=operator.source_instance,
         assurance=operator.assurance,
+        trigger_source=operator.trigger_source,
         return_route=operator.return_route,
     )
     try:

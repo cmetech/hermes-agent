@@ -21,7 +21,9 @@ _ASSURANCES = frozenset(
 _ASSURANCE_SOURCES = {
     "verified_adapter": frozenset({"desktop", "chat", "background_agent", "api"}),
     "system_schedule": frozenset({"cron"}),
-    "local_admin_claim": frozenset({"cli", "chat", "background_agent", "cron", "api"}),
+    "local_admin_claim": frozenset(
+        {"desktop", "cli", "chat", "background_agent", "cron", "api"}
+    ),
     "legacy_unknown": _SOURCES,
 }
 
@@ -79,7 +81,7 @@ class TriggerProvenance:
     def local_admin_claim(
         cls,
         *,
-        source: Literal["cli", "chat", "background_agent", "cron", "api"],
+        source: Literal["desktop", "cli", "chat", "background_agent", "cron", "api"],
         intent_key: str,
         source_instance: str | None = None,
         claimed_actor: str | None = None,
@@ -102,6 +104,7 @@ class TriggerProvenance:
     def authenticated_api(
         cls,
         *,
+        source: Literal["desktop", "api"] = "api",
         assurance: Literal["verified_adapter", "local_admin_claim"],
         intent_key: str,
         source_instance: str,
@@ -109,11 +112,13 @@ class TriggerProvenance:
         return_route: str | None = None,
     ) -> "TriggerProvenance":
         """Build API provenance only from an authenticated server authority."""
+        if source not in {"api", "desktop"}:
+            raise ValueError("authenticated API source must be api or desktop")
         if assurance == "local_admin_claim":
             if return_route is not None:
                 raise ValueError("local admin API claims cannot carry return routes")
             return cls.local_admin_claim(
-                source="api",
+                source=source,
                 intent_key=intent_key,
                 source_instance=source_instance,
                 claimed_actor=principal,
@@ -121,7 +126,7 @@ class TriggerProvenance:
         if assurance != "verified_adapter":
             raise ValueError("unsupported authenticated API assurance")
         return cls(
-            source="api",
+            source=source,
             assurance="verified_adapter",
             intent_key=intent_key,
             source_instance=source_instance,

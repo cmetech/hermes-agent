@@ -1378,6 +1378,71 @@ export interface Translations {
   operations: {
     workflows: string
     workflowViews: string
+    workflowCatalog: string
+    workflowCatalogLoading: string
+    workflowCatalogErrorTitle: string
+    workflowCatalogErrorDescription: string
+    workflowCatalogRetry: string
+    workflowCatalogEmptyTitle: string
+    workflowCatalogEmptyDescription: string
+    workflowCatalogDocs: string
+    workflowCatalogPartialLabel: string
+    workflowCatalogPartialDescription: string
+    workflowCatalogCapacityError: string
+    workflowCatalogInvalidDefinition: string
+    workflowColumnName: string
+    workflowColumnVersion: string
+    workflowColumnDescription: string
+    workflowColumnTrust: string
+    workflowColumnInputs: string
+    workflowColumnSource: string
+    workflowColumnActions: string
+    workflowTrusted: string
+    workflowUntrusted: string
+    workflowNoInputs: string
+    workflowInputCount: (count: number) => string
+    workflowSourceProfile: string
+    workflowSourceProject: string
+    workflowView: string
+    workflowViewTitle: (workflow: string) => string
+    workflowViewDescription: string
+    workflowViewDiagram: string
+    workflowViewDefinition: string
+    workflowViewLoading: string
+    workflowViewErrorTitle: string
+    workflowViewErrorDescription: string
+    workflowViewNotFound: string
+    workflowViewDiagramTooLarge: string
+    workflowViewDiagramOmitted: string
+    workflowViewDefinitionTitle: string
+    workflowViewDefinitionCaption: string
+    workflowViewCopyDefinition: string
+    workflowViewRunLoading: string
+    workflowViewRunError: string
+    workflowRun: string
+    workflowRunUnavailable: string
+    workflowRunUnsupportedInputs: string
+    workflowRunUntrusted: string
+    workflowReviewRunTitle: (workflow: string) => string
+    workflowReviewRunDescription: string
+    workflowRunPreflightLoading: string
+    workflowRunPreflightErrorTitle: string
+    workflowRunPreflightErrorDescription: string
+    workflowRunTrust: string
+    workflowRunRisk: string
+    workflowRunInputs: string
+    workflowRunStart: string
+    workflowRunRetry: string
+    workflowRunStarted: string
+    workflowRunAlreadyRunning: string
+    workflowRunConflict: string
+    workflowRunCoordinatorUnavailable: string
+    workflowRunIncompatible: string
+    workflowRunNetworkError: string
+    workflowRunProfileUnavailable: string
+    workflowRunValidationError: string
+    workflowRunRequiredInput: (input: string) => string
+    workflowRunUnsupportedCommand: (workflow: string) => string
     activeBoard: string
     history: string
     archive: string

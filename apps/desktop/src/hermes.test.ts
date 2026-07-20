@@ -24,6 +24,9 @@ import {
   setApiRequestProfile
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
+import type { WorkflowRunListView } from './types/hermes'
+
+const serverWorkflowRunViews = ['board', 'history', 'archive'] satisfies WorkflowRunListView[]
 
 const emptySessionsResponse = {
   limit: 0,
@@ -133,6 +136,21 @@ describe('Hermes REST session helpers', () => {
         path: '/api/plugins/workflow/runs/run%201/cancel'
       })
     )
+  })
+
+  it.each(serverWorkflowRunViews)('sends the supported %s run-list view without changing its meaning', async view => {
+    api.mockResolvedValue({ next_cursor: null, runs: [], schema_version: 1 })
+
+    await listWorkflowRuns(undefined, view)
+
+    expect(api).toHaveBeenCalledWith(expect.objectContaining({ path: `/api/plugins/workflow/runs?view=${view}` }))
+  })
+
+  it('keeps the navigation-only workflows view out of the run-list parameter type', () => {
+    type WorkflowsIsAccepted = 'workflows' extends NonNullable<Parameters<typeof listWorkflowRuns>[1]> ? true : false
+    const workflowsIsAccepted: WorkflowsIsAccepted = false
+
+    expect(workflowsIsAccepted).toBe(false)
   })
 
   it('uses a non-blocking events request so hidden inspectors cannot retain server permits', async () => {

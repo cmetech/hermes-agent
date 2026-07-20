@@ -68,6 +68,13 @@ export interface KeybindRuntimeDeps {
 
 type HandlerMap = Record<string, () => void>
 
+// An open modal owns keyboard interaction until it settles or closes. Keep
+// global navigation/session/view shortcuts from tearing down the owning route;
+// returning without preventing propagation still lets Radix receive Escape.
+export function openModalOwnsKeyboard(): boolean {
+  return document.querySelector('[role="dialog"][aria-modal="true"], [role="dialog"][data-state="open"]') !== null
+}
+
 // Mount once near the top of the app. Owns the single global keydown listener
 // for every rebindable hotkey: it runs the matched action, or — while capture
 // mode is active (edit overlay / panel rebind) — records the pressed combo.
@@ -216,6 +223,10 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
         return
       }
 
+      if (openModalOwnsKeyboard()) {
+        return
+      }
+
       // While the session switcher is up, Esc abandons it (stay put) before any
       // combo dispatch — ⌃Tab keeps stepping through the existing handler.
       if (switcherActive() && event.key === 'Escape') {
@@ -256,6 +267,10 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     // highlighted session. A window blur (Cmd+Tab away mid-switch) cancels so
     // the overlay never gets stranded waiting for a keyup that never comes.
     const onKeyUp = (event: KeyboardEvent) => {
+      if (openModalOwnsKeyboard()) {
+        return
+      }
+
       if (event.key === 'Tab') {
         onSwitcherTabUp()
       }

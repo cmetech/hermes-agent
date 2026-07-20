@@ -1,0 +1,107 @@
+import { getApiRequestProfile } from '@/hermes'
+import type { WorkflowCatalogPage, WorkflowDetail, WorkflowStartResponse } from '@/types/hermes'
+
+export interface StartWorkflowRunRequest {
+  concurrencyPolicy: 'allow' | 'forbid' | 'queue'
+  idempotencyKey: string
+  values: Record<string, string>
+  workflow: string
+}
+
+interface ServerErrorFields {
+  code: string
+  message?: string
+  retryable?: boolean
+}
+
+export class WorkflowApiError extends Error {
+  readonly body: unknown
+  readonly code: string
+  readonly retryable: boolean
+  readonly status: number
+
+  constructor(response: { body: unknown; status: number }, fields?: ServerErrorFields) {
+    super(fields?.message || `HTTP ${response.status}`)
+    this.name = 'WorkflowApiError'
+    this.body = response.body
+    this.code = fields?.code || String(response.status)
+    this.retryable = fields?.retryable ?? response.status >= 500
+    this.status = response.status
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : null
+}
+
+function serverErrorFields(body: unknown): ServerErrorFields | undefined {
+  const record = asRecord(body)
+
+  for (const key of ['detail', 'error']) {
+    const envelope = asRecord(record?.[key])
+
+    if (typeof envelope?.code !== 'string' || !envelope.code) {
+      continue
+    }
+
+    return {
+      code: envelope.code,
+      ...(typeof envelope.message === 'string' && envelope.message ? { message: envelope.message } : {}),
+      ...(typeof envelope.retryable === 'boolean' ? { retryable: envelope.retryable } : {})
+    }
+  }
+
+  return undefined
+}
+
+function profileScoped(profile: string | null = getApiRequestProfile()): { profile?: string } {
+  return profile ? { profile } : {}
+}
+
+async function requestWorkflowApi<T>(request: Parameters<Window['hermesDesktop']['apiStructured']>[0]): Promise<T> {
+  const response = await window.hermesDesktop.apiStructured<T>(request)
+
+  if (response.ok) {
+    return response.value
+  }
+
+  throw new WorkflowApiError(response, serverErrorFields(response.body))
+}
+
+export function listWorkflowDefinitions(profile: string | null = getApiRequestProfile()): Promise<WorkflowCatalogPage> {
+  return requestWorkflowApi<WorkflowCatalogPage>({
+    path: '/api/plugins/workflow/workflows',
+    ...profileScoped(profile)
+  })
+}
+
+export function preflightWorkflow(
+  name: string,
+  profile: string | null = getApiRequestProfile()
+): Promise<WorkflowDetail> {
+  return requestWorkflowApi<WorkflowDetail>({
+    path: `/api/plugins/workflow/workflows/${encodeURIComponent(name)}`,
+    ...profileScoped(profile)
+  })
+}
+
+export async function startWorkflowRun(
+  request: StartWorkflowRunRequest,
+  profile: string | null = getApiRequestProfile()
+): Promise<WorkflowStartResponse> {
+  if (!request.idempotencyKey.trim()) {
+    throw new TypeError('idempotencyKey must not be empty')
+  }
+
+  return requestWorkflowApi<WorkflowStartResponse>({
+    body: {
+      concurrency_policy: request.concurrencyPolicy,
+      idempotency_key: request.idempotencyKey,
+      values: request.values,
+      workflow: request.workflow
+    },
+    method: 'POST',
+    path: '/api/plugins/workflow/runs',
+    ...profileScoped(profile)
+  })
+}
