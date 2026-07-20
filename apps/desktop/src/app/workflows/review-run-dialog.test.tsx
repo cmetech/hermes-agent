@@ -614,6 +614,7 @@ describe('Review & Run workflow dialog', () => {
         coordinator: { healthy: false, reason: 'coordinator_missing', status: 'unavailable' },
         definition: { inputs: { mode: { required: false, type: 'enum' } } },
         inputs: [{ name: 'mode', required: false, type: 'enum' }],
+        run_support: { reason: 'unsupported_inputs', supported: false },
         supported_inputs: { reason: 'unsupported_input_shape', supported: false }
       })
     })
@@ -628,6 +629,27 @@ describe('Review & Run workflow dialog', () => {
     expect(within(dialog).getByText("The background coordinator isn't running — try again shortly.")).toBeTruthy()
     expect(within(dialog).queryByRole('combobox', { name: 'mode' })).toBeNull()
     expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('trusts verified bundles but blocks a showcase when authoritative detail requires the CLI', async () => {
+    catalogDefinition = definition({ source: 'showcase', trust_state: 'verified_bundled' })
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        run_support: { reason: 'showcase_cli_required', supported: false },
+        source: 'showcase',
+        trust_state: 'verified_bundled'
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(within(dialog).getByText('Verified bundle')).toBeTruthy()
+    expect(within(dialog).getByText('Run this bundled showcase from the CLI.')).toBeTruthy()
+    expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
+      0
+    )
   })
 
   it('shows blocking compatibility findings and refuses to POST a non-runnable workflow', async () => {

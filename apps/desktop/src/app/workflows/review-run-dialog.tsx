@@ -22,6 +22,7 @@ import { startWorkflowRun, WorkflowApiError } from '@/lib/hermes-api'
 import { Play } from '@/lib/icons'
 import type { WorkflowDefinition, WorkflowDefinitionInput, WorkflowDetail } from '@/types/hermes'
 
+import { workflowTrustAllowsRun } from './catalog-run-policy'
 import { workflowDetailQueryOptions } from './detail-query'
 
 type FlatInputValue = boolean | number | string | undefined
@@ -427,9 +428,16 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
     !detail ||
     !detail.coordinator.healthy ||
     detail.compatibility.runnable !== true ||
-    !detail.supported_inputs.supported ||
-    detail.trust_state !== 'trusted' ||
+    !detail.run_support.supported ||
+    !workflowTrustAllowsRun(detail.trust_state) ||
     detail.inputs.some(input => input.type === 'enum' && enumValues(detail, input.name).length === 0)
+
+  const runSupportMessage =
+    detail && !detail.run_support.supported
+      ? detail.source === 'showcase'
+        ? copy.workflowRunShowcaseFromCli
+        : copy.workflowRunUnsupportedCommand(workflow.name)
+      : null
 
   const errorMessage =
     error && !(error.kind === 'validation' && error.field)
@@ -475,8 +483,12 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
             <p className="text-sm leading-relaxed text-(--ui-text-secondary)">{detail.description}</p>
             <section className="grid gap-2 border-t border-(--ui-stroke-tertiary) pt-3">
               <h2 className="text-xs font-medium text-(--ui-text-primary)">{copy.workflowRunTrust}</h2>
-              <Badge variant={detail.trust_state === 'trusted' ? 'default' : 'destructive'}>
-                {detail.trust_state === 'trusted' ? copy.workflowTrusted : copy.workflowUntrusted}
+              <Badge variant={workflowTrustAllowsRun(detail.trust_state) ? 'default' : 'destructive'}>
+                {detail.trust_state === 'verified_bundled'
+                  ? copy.workflowVerifiedBundle
+                  : detail.trust_state === 'trusted'
+                    ? copy.workflowTrusted
+                    : copy.workflowUntrusted}
               </Badge>
             </section>
             <section className="grid gap-2 border-t border-(--ui-stroke-tertiary) pt-3">
@@ -507,9 +519,9 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
                 ))}
               </fieldset>
             ) : null}
-            {!detail.supported_inputs.supported ? (
+            {runSupportMessage ? (
               <Alert variant="warning">
-                <AlertDescription>{copy.workflowRunUnsupportedCommand(workflow.name)}</AlertDescription>
+                <AlertDescription>{runSupportMessage}</AlertDescription>
               </Alert>
             ) : null}
             {!detail.coordinator.healthy ? (

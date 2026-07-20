@@ -20,6 +20,7 @@ import { WorkflowApiError } from '@/lib/hermes-api'
 import { Eye, Play } from '@/lib/icons'
 import type { WorkflowDefinition } from '@/types/hermes'
 
+import { workflowTrustAllowsRun } from './catalog-run-policy'
 import { useWorkflowDetailQuery } from './detail-query'
 
 const MermaidRenderer = lazy(() => import('@/components/assistant-ui/embeds/mermaid-embed'))
@@ -101,10 +102,12 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
     ? copy.workflowViewRunError
     : !detail.data
       ? copy.workflowViewRunLoading
-      : detail.data.trust_state !== 'trusted'
+      : !workflowTrustAllowsRun(detail.data.trust_state)
         ? copy.workflowRunUntrusted
-        : !detail.data.supported_inputs.supported
-          ? copy.workflowRunUnsupportedInputs
+        : !detail.data.run_support.supported
+          ? detail.data.source === 'showcase'
+            ? copy.workflowRunShowcaseFromCli
+            : copy.workflowRunUnsupportedInputs
           : detail.data.compatibility.runnable !== true
             ? copy.workflowRunIncompatible
             : !detail.data.coordinator.healthy

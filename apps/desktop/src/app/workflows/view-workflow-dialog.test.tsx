@@ -318,7 +318,10 @@ describe('workflow View dialog', () => {
     ],
     [
       'unsupported inputs',
-      { supported_inputs: { reason: 'unsupported_input_shape' as const, supported: false } },
+      {
+        run_support: { reason: 'unsupported_inputs' as const, supported: false },
+        supported_inputs: { reason: 'unsupported_input_shape' as const, supported: false }
+      },
       'Run is unavailable because this workflow uses unsupported input fields.'
     ],
     [
@@ -348,6 +351,30 @@ describe('workflow View dialog', () => {
 
     await within(dialog).findByTestId('shared-mermaid-renderer')
     expect(within(dialog).getByRole('button', { name: 'Run' }).hasAttribute('disabled')).toBe(false)
+  })
+
+  it('allows verified bundled detail to Run', async () => {
+    currentCatalogDefinition = definition({ source: 'showcase', trust_state: 'verified_bundled' })
+    currentDetail = detail({ source: 'showcase', trust_state: 'verified_bundled' })
+    renderView()
+    const dialog = await openView()
+
+    await within(dialog).findByTestId('shared-mermaid-renderer')
+    expect(within(dialog).getByRole('button', { name: 'Run' }).hasAttribute('disabled')).toBe(false)
+  })
+
+  it('obeys authoritative showcase eligibility from fetched detail', async () => {
+    currentCatalogDefinition = definition({ source: 'showcase', trust_state: 'verified_bundled' })
+    currentDetail = detail({
+      run_support: { reason: 'showcase_cli_required', supported: false },
+      source: 'showcase',
+      trust_state: 'verified_bundled'
+    })
+    renderView()
+    const dialog = await openView()
+
+    await within(dialog).findByTestId('shared-mermaid-renderer')
+    expectDisabledRunReason(dialog, 'Run this bundled showcase from the CLI.')
   })
 
   it('shows recursively stable redacted JSON read-only, copies it, and never refetches on toggles', async () => {

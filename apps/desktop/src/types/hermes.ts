@@ -144,6 +144,7 @@ export interface WorkflowRunSupport {
 }
 
 export interface WorkflowDefinition {
+  compatibility?: { level: string; runnable?: boolean }
   description: string
   inputs: WorkflowDefinitionInput[]
   name: string

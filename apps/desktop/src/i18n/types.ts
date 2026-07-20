@@ -1399,10 +1399,13 @@ export interface Translations {
     workflowColumnActions: string
     workflowTrusted: string
     workflowUntrusted: string
+    workflowVerifiedBundle: string
+    workflowIncompatible: string
     workflowNoInputs: string
     workflowInputCount: (count: number) => string
     workflowSourceProfile: string
     workflowSourceProject: string
+    workflowSourceBundled: string
     workflowView: string
     workflowViewTitle: (workflow: string) => string
     workflowViewDescription: string
@@ -1422,6 +1425,7 @@ export interface Translations {
     workflowRun: string
     workflowRunUnavailable: string
     workflowRunUnsupportedInputs: string
+    workflowRunShowcaseFromCli: string
     workflowRunUntrusted: string
     workflowReviewRunTitle: (workflow: string) => string
     workflowReviewRunDescription: string

@@ -259,6 +259,7 @@ upstream_changes:
   - apps/desktop/src/i18n/en.ts
   - apps/desktop/src/i18n/ja.ts
   - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/types/hermes.ts
   - apps/desktop/src/i18n/zh-hant.ts
   owned_symbols:
   - WORKFLOWS_ROUTE
@@ -859,7 +860,6 @@ upstream_changes:
   - apps/desktop/src/lib/hermes-api.ts
   - apps/desktop/src/lib/hermes-api.test.ts
   - apps/desktop/src/types/hermes.ts
-  - tests/test_desktop_workflow_test_gate.py
   owned_symbols:
   - hermes:api:structured
   - apiStructured
@@ -1377,4 +1377,45 @@ upstream_changes:
     row and never claims trigger provenance.
   removal_condition: Remove when upstream carries exact source identity from
     catalog selection through detail caching and background admission.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-showcase-catalog-ui
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/package.json
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/catalog-run-policy.ts
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - apps/desktop/src/i18n/zh.ts
+  - scripts/test_workflow_merge_gate.sh
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - workflowTrustAllowsRun
+  - bundled showcase source and verified bundle trust badges
+  - authoritative showcase Run support presentation
+  - honest per-scenario compatibility badge
+  tests:
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(desktop): surface verified bundled workflows'
+  upstream_candidate: true
+  merge_guidance: Preserve one shared trust predicate, server-authoritative
+    run_support decisions, distinct source/trust badges, source-exact View and
+    Review targeting, accessible disabled-run explanations, and all-locale
+    parity. Verified bundles may run without user trust-store mutation only
+    when the server declares them supported.
+  removal_condition: Remove when upstream Desktop presents and runs verified
+    bundled showcases with equivalent source identity and fail-closed policy.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

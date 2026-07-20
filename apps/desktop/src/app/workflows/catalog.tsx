@@ -15,6 +15,8 @@ import { listWorkflowDefinitions } from '@/lib/hermes-api'
 import { Eye, Play } from '@/lib/icons'
 import type { WorkflowDefinition, WorkflowDefinitionError } from '@/types/hermes'
 
+import { workflowTrustAllowsRun } from './catalog-run-policy'
+
 const WORKFLOW_DOCS_URL =
   'https://github.com/cmetech/hermes-agent/blob/base/website/docs/user-guide/features/workflows.md'
 
@@ -57,9 +59,11 @@ function CatalogRow({
   const { t } = useI18n()
   const runReasonId = useId()
 
-  const runDisabledReason = !item.supported_inputs.supported
-    ? t.operations.workflowRunUnsupportedInputs
-    : item.trust_state !== 'trusted'
+  const runDisabledReason = !item.run_support.supported
+    ? item.source === 'showcase'
+      ? t.operations.workflowRunShowcaseFromCli
+      : t.operations.workflowRunUnsupportedInputs
+    : !workflowTrustAllowsRun(item.trust_state)
       ? t.operations.workflowRunUntrusted
       : null
 
@@ -75,8 +79,12 @@ function CatalogRow({
         </span>
       </td>
       <td className="px-2.5 py-2 align-middle">
-        <Badge variant={item.trust_state === 'trusted' ? 'default' : 'destructive'}>
-          {item.trust_state === 'trusted' ? t.operations.workflowTrusted : t.operations.workflowUntrusted}
+        <Badge variant={workflowTrustAllowsRun(item.trust_state) ? 'default' : 'destructive'}>
+          {item.trust_state === 'verified_bundled'
+            ? t.operations.workflowVerifiedBundle
+            : item.trust_state === 'trusted'
+              ? t.operations.workflowTrusted
+              : t.operations.workflowUntrusted}
         </Badge>
       </td>
       <td className="px-2.5 py-2 align-middle">
@@ -85,7 +93,18 @@ function CatalogRow({
         </Badge>
       </td>
       <td className="px-2.5 py-2 align-middle text-(--ui-text-secondary)">
-        {item.source === 'profile' ? t.operations.workflowSourceProfile : t.operations.workflowSourceProject}
+        <div className="flex flex-wrap items-center gap-1">
+          <span>
+            {item.source === 'showcase'
+              ? t.operations.workflowSourceBundled
+              : item.source === 'profile'
+                ? t.operations.workflowSourceProfile
+                : t.operations.workflowSourceProject}
+          </span>
+          {item.compatibility?.runnable === false ? (
+            <Badge variant="warn">{t.operations.workflowIncompatible}</Badge>
+          ) : null}
+        </div>
       </td>
       <td className="px-2.5 py-2 align-middle">
         <div className="flex items-center gap-1">

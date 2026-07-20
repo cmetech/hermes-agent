@@ -96,6 +96,8 @@ if [[ "$PHASE" == "base" ]]; then
       src/components/activity-board/activity-board.performance.test.tsx \
       src/components/assistant-ui/embeds/workflow-topology.test.tsx \
       src/app/workflows/adapter.test.ts \
+      src/app/workflows/catalog-run-policy.test.ts \
+      src/app/workflows/index.test.tsx \
       src/app/workflows/review-run-dialog.test.tsx \
       src/app/workflows/view-workflow-dialog.test.tsx \
       src/app/workflows/workflow-operations.e2e.test.tsx \

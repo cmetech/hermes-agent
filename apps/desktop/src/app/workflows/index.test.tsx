@@ -239,6 +239,67 @@ describe('WorkflowsView', () => {
     expect(onRunWorkflow).toHaveBeenCalledWith(item)
   })
 
+  it('keeps colliding bundled showcases distinct and presents their authoritative Run support honestly', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowDefinitions.mockResolvedValue({
+      items: [
+        definition({ name: 'approval-gate', source: 'project' }),
+        definition({
+          name: 'approval-gate',
+          precedence: 3,
+          source: 'showcase',
+          trust_state: 'verified_bundled'
+        }),
+        definition({
+          name: 'laptop-diagnostic',
+          precedence: 3,
+          run_support: { reason: 'unsupported_inputs', supported: false },
+          source: 'showcase',
+          supported_inputs: { reason: 'unsupported_input_shape', supported: false },
+          trust_state: 'verified_bundled'
+        }),
+        definition({
+          compatibility: { level: 'unsupported', runnable: false },
+          name: 'ai-extensions',
+          precedence: 3,
+          run_support: { reason: 'showcase_cli_required', supported: false },
+          source: 'showcase',
+          trust_state: 'verified_bundled'
+        }),
+        definition({
+          name: 'scheduling',
+          precedence: 3,
+          run_support: { reason: 'showcase_cli_required', supported: false },
+          source: 'showcase',
+          trust_state: 'verified_bundled'
+        })
+      ],
+      truncated: false
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    const rows = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row').slice(1)
+    expect(rows).toHaveLength(5)
+    expect(rows[0]?.textContent).toContain('Project')
+    expect(rows[1]?.textContent).toContain('Bundled showcase')
+    expect(rows[1]?.textContent).toContain('Verified bundle')
+    expect((within(rows[1]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
+    expect(rows[3]?.textContent).toContain('Incompatible')
+
+    for (const row of rows.slice(2)) {
+      expect(row.textContent).toContain('Bundled showcase')
+      expect(row.textContent).toContain('Verified bundle')
+      const runButton = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
+      expect(runButton.disabled).toBe(true)
+      expect(document.getElementById(runButton.getAttribute('aria-describedby')!)?.textContent).toBe(
+        'Run this bundled showcase from the CLI.'
+      )
+      expect((within(row).getByRole('button', { name: 'View' }) as HTMLButtonElement).disabled).toBe(false)
+    }
+  })
+
   it('opens the workflow View dialog from the catalog action', async () => {
     $workflowSelectedRunId.set(null)
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -283,6 +344,7 @@ describe('WorkflowsView', () => {
         definition({
           inputs: [{ name: 'nested', required: true, type: 'object' }],
           name: 'Unsupported inputs',
+          run_support: { reason: 'unsupported_inputs', supported: false },
           supported_inputs: { reason: 'unsupported_input_shape', supported: false }
         })
       ],
@@ -370,6 +432,7 @@ describe('WorkflowsView', () => {
         definition({
           inputs: [{ name: 'matrix', required: true, type: 'object' }],
           name: 'Unsupported inputs',
+          run_support: { reason: 'unsupported_inputs', supported: false },
           supported_inputs: { reason: 'unsupported_input_shape', supported: false }
         }),
         definition({
