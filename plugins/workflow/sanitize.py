@@ -62,6 +62,23 @@ def workflow_input_names_are_portable(names: object) -> bool:
     return True
 
 
+def workflow_filename_components_are_distinct(components: object) -> bool:
+    """Reject generated filename components that alias case-insensitively."""
+    try:
+        iterator = iter(components)
+    except TypeError:
+        return False
+    seen: set[str] = set()
+    for component in iterator:
+        if not isinstance(component, str):
+            return False
+        folded = component.casefold()
+        if folded in seen:
+            return False
+        seen.add(folded)
+    return True
+
+
 def projection_key_is_secret(key: str) -> bool:
     """Return whether a projection key names operator-sensitive content."""
     return bool(_SECRET_KEY.search(key))
@@ -117,6 +134,7 @@ __all__ = [
     "sanitize_evidence_bytes",
     "sanitize_projection",
     "sanitize_text",
+    "workflow_filename_components_are_distinct",
     "workflow_input_name_is_portable",
     "workflow_input_names_are_portable",
 ]

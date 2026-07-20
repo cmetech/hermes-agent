@@ -1084,3 +1084,58 @@ upstream_changes:
     caching, honest bounded fallbacks, read-only redacted definition copy, and a
     non-stacking handoff to its native review-and-run flow.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-catalog-desktop-trigger-e2e
+  change_class: workflow-rest-adapter
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/store.py
+  - plugins/workflow/trust.py
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_store.py
+  - tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - resolve_workflow_catalog_package
+  - _catalog_package failure-isolated admission resolution
+  - bounded cached admission resource snapshot
+  - sealed cache-only immutable package snapshot
+  - trusted package-to-immutable snapshot digest comparison
+  - workflow_filename_components_are_distinct
+  - test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary
+  - test_merge_gate_pins_workflow_catalog_desktop_e2e_contract
+  tests:
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_store.py
+  - tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'test(workflow): Task 8 add Desktop catalog trigger e2e'
+  upstream_candidate: true
+  merge_guidance: Preserve the end-to-end contract through the real dashboard
+    session-token middleware and mounted workflow router, covering authenticated local
+    Desktop catalog and detail reads, topology projection, background-only 202
+    admission with a caller-minted idempotency key, server-derived desktop
+    provenance, an unexecuted node at response time, and board visibility from
+    the same real store. List, detail, and admission must share the same bounded
+    precedence resolver and per-package executable-resource budget; total list
+    work must remain separately bounded and report truncation rather than
+    reclassifying a later valid package. Corrupt or duplicate neighbors cannot block a valid
+    visible row, while a requested invalid/capacity row, including a package
+    beyond the shared redacted-definition projection bound, must return the
+    typed 422/503 envelope without persistence. Snapshot from the exact bounded bytes
+    that passed trust verification, seal the cache before authorization, perform
+    immutable snapshot copying without resolving or rereading package paths, and
+    discard a snapshot whose package digest differs before admission. Preserve
+    the portable input-name set invariant, including generated-component
+    UTF-8/UTF-16 limits, superscript device aliases, and case-insensitive
+    collision rejection, in direct store callers as well as REST validation.
+    Store must compare actual generated targets consisting of raw file-input
+    names and text-input names with the `.txt` suffix before writing either
+    channel.
+    Keep this pure-API test in the focused
+    merge gate and out of the native portability matrix.
+  removal_condition: Remove when upstream provides equivalent real-middleware
+    coverage for the complete Desktop workflow catalog-to-board contract.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

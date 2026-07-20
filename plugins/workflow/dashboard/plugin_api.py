@@ -833,6 +833,10 @@ class StartRunRequest(BaseModel):
         from plugins.workflow.catalog_api import (
             desktop_input_name_is_representable,
         )
+        from plugins.workflow.sanitize import workflow_input_names_are_portable
+
+        if not workflow_input_names_are_portable(self.values):
+            raise ValueError("value names must be portable and distinct")
 
         for key, value in self.values.items():
             if not desktop_input_name_is_representable(key):

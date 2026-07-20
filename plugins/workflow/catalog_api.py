@@ -278,6 +278,34 @@ def _discover_catalog(
     )
 
 
+def resolve_workflow_catalog_package(
+    name: str, *, hermes_home: str | Path, workdir: str | Path
+) -> WorkflowPackage | None:
+    """Resolve one runnable catalog entry with list/detail failure isolation."""
+    if not isinstance(name, str) or not name.strip() or len(name) > 128:
+        return None
+    discovered, _truncated = _discover_catalog(
+        Path(workdir).expanduser().resolve(),
+        Path(hermes_home).expanduser().resolve(),
+    )
+    for item in discovered:
+        if isinstance(item, WorkflowPackage) and item.definition.name == name:
+            qualify_workflow_catalog_package(
+                item,
+                compatibility=assess_compatibility(item),
+            )
+            return item
+        if isinstance(item, dict) and item.get("name") == name:
+            if item.get("error") == "catalog_capacity":
+                raise WorkflowCatalogCapacityError(
+                    "workflow catalog entry exceeds a fixed capacity"
+                )
+            raise WorkflowCatalogInvalidDefinitionError(
+                "workflow catalog entry is invalid"
+            )
+    return None
+
+
 def _input_projection(
     package: WorkflowPackage,
 ) -> tuple[list[CatalogInput], SupportedInputs]:
@@ -655,4 +683,5 @@ __all__ = [
     "build_workflow_detail",
     "desktop_input_name_is_representable",
     "qualify_workflow_catalog_package",
+    "resolve_workflow_catalog_package",
 ]

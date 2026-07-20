@@ -55,6 +55,50 @@ def test_prepare_snapshot_captures_text_arguments_without_projecting_values(
     assert captured.read_text() == "private argument"
 
 
+def test_prepare_snapshot_rejects_nonportable_input_filename_segments(
+    tmp_path, workflow_writer
+) -> None:
+    package = load_workflow(workflow_writer(tmp_path / "package"))
+    store = RunStore(tmp_path / "home")
+
+    for name in (
+        "CON",
+        "nul.txt",
+        "COM1",
+        "foo:bar",
+        "a?b",
+        "a*b",
+        "<x>",
+        "a|b",
+        "trailing.",
+        "trailing ",
+        "😀" * 64,
+        "COM¹",
+        "COM².txt",
+        "com³",
+        "LPT¹",
+        "lpt².log",
+        "LPT³",
+    ):
+        with pytest.raises(InputSnapshotError, match="invalid.*input name"):
+            store.prepare_run_snapshot(package, values={name: "value"})
+
+    with pytest.raises(InputSnapshotError, match="invalid.*input name"):
+        store.prepare_run_snapshot(
+            package,
+            values={"Mode": "first", "mode": "second"},
+        )
+
+    source = tmp_path / "report.txt"
+    source.write_text("FILE", encoding="utf-8")
+    with pytest.raises(InputSnapshotError, match="invalid.*input name"):
+        store.prepare_run_snapshot(
+            package,
+            inputs={"report.txt": source},
+            values={"report": "TEXT"},
+        )
+
+
 def test_prepare_snapshot_copies_digest_covered_package_resources(
     tmp_path, workflow_writer
 ):

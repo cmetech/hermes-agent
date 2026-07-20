@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 import sys
 from pathlib import Path
@@ -31,6 +32,7 @@ from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
 from plugins.workflow.showcase import run_showcase
 from plugins.workflow.trust import (
+    WorkflowResourceReadBudget,
     WorkflowTrustStore,
     build_risk_summary,
     compute_package_digest,
@@ -600,9 +602,292 @@ def test_post_runs_api_admission_rejects_unbounded_or_caller_auth_fields(
             "return_route": "caller-route",
         },
     )
+    unsafe_names = [
+        "foo/bar",
+        "foo\\bar",
+        "mode\x1b[31m",
+        "api_token",
+        "CON",
+        "nul.txt",
+        "COM1",
+        "foo:bar",
+        "a?b",
+        "a*b",
+        "<x>",
+        "a|b",
+        "trailing.",
+        "trailing ",
+        "😀" * 64,
+        "COM¹",
+        "COM².txt",
+        "com³",
+        "LPT¹",
+        "lpt².log",
+        "LPT³",
+    ]
+    unsafe_values = [
+        client.post(
+            "/api/plugins/workflow/runs",
+            json={**base, "values": {name: "value"}},
+        )
+        for name in unsafe_names
+    ]
+    colliding_values = client.post(
+        "/api/plugins/workflow/runs",
+        json={**base, "values": {"Mode": "first", "mode": "second"}},
+    )
 
     assert oversized.status_code == 422
     assert caller_identity.status_code == 422
+    assert [response.status_code for response in unsafe_values] == [422] * len(
+        unsafe_names
+    )
+    assert colliding_values.status_code == 422
+
+
+def test_post_runs_applies_catalog_resource_bounds_before_admission(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    commands = home / "commands"
+    commands.mkdir(parents=True)
+    (commands / "oversized.md").write_bytes(b"x" * (1024 * 1024 + 1))
+    oversized = _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="api-oversized-resource",
+        nodes=[{"id": "oversized", "command": "oversized"}],
+    )
+    aggregate_nodes = []
+    for index in range(9):
+        resource_name = f"aggregate-{index}"
+        (commands / f"{resource_name}.md").write_bytes(b"x" * 1024 * 1024)
+        aggregate_nodes.append({"id": resource_name, "command": resource_name})
+    aggregate = _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="api-aggregate-resource",
+        nodes=aggregate_nodes,
+    )
+    assert compute_package_digest(oversized).sha256
+    assert compute_package_digest(aggregate).sha256
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    client = TestClient(_app(_router()))
+
+    responses = [
+        client.post(
+            "/api/plugins/workflow/runs",
+            json={
+                "workflow": workflow,
+                "values": {},
+                "idempotency_key": f"resource-bound-{index}",
+                "concurrency_policy": "queue",
+            },
+        )
+        for index, workflow in enumerate(
+            ("api-oversized-resource", "api-aggregate-resource")
+        )
+    ]
+
+    assert [response.status_code for response in responses] == [503, 503]
+    assert [response.json() for response in responses] == [
+        {
+            "detail": {
+                "code": "workflow_catalog_capacity",
+                "retryable": True,
+            }
+        },
+        {
+            "detail": {
+                "code": "workflow_catalog_capacity",
+                "retryable": True,
+            }
+        },
+    ]
+    assert list(store.runs_root.iterdir()) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
+def test_post_runs_applies_catalog_projection_bounds_before_admission(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="api-projection-capacity",
+        nodes=[
+            {"id": f"node-{index:03d}", "bash": "true"}
+            for index in range(513)
+        ],
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+
+    response = TestClient(_app(_router())).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "api-projection-capacity",
+            "values": {},
+            "idempotency_key": "projection-capacity",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "workflow_catalog_capacity", "retryable": True}
+    }
+    assert list(store.runs_root.iterdir()) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
+def test_post_runs_discards_snapshot_that_does_not_match_trusted_package(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, workflow_writer, name="api-package-change")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    original_prepare = RunStore.prepare_run_snapshot
+
+    def mismatched_prepare(self, *args, **kwargs):
+        prepared = original_prepare(self, *args, **kwargs)
+        return replace(prepared, definition_digest="0" * 64)
+
+    monkeypatch.setattr(RunStore, "prepare_run_snapshot", mismatched_prepare)
+    response = TestClient(_app(_router())).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "api-package-change",
+            "values": {},
+            "idempotency_key": "package-change",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {"code": "workflow_package_changed", "retryable": False}
+    }
+    assert list(store.runs_root.iterdir()) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
+def test_catalog_detail_and_admission_agree_after_cross_entry_resource_reads(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    commands = home / "commands"
+    commands.mkdir(parents=True)
+
+    def command_nodes(prefix: str, count: int):
+        nodes = []
+        for index in range(count):
+            name = f"{prefix}-{index}"
+            (commands / f"{name}.md").write_bytes(b"x" * 1024 * 1024)
+            nodes.append({"id": name, "command": name})
+        return nodes
+
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="cross-entry-alpha",
+        nodes=command_nodes("alpha", 7),
+    )
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="cross-entry-beta",
+        nodes=command_nodes("beta", 2),
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    client = TestClient(_app(_router()))
+
+    catalog = client.get("/api/plugins/workflow/workflows")
+    detail = client.get("/api/plugins/workflow/workflows/cross-entry-beta")
+    admitted = client.post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "cross-entry-beta",
+            "values": {},
+            "idempotency_key": "cross-entry-beta",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert catalog.status_code == 200
+    assert catalog.json()["truncated"] is False
+    assert [item["name"] for item in catalog.json()["items"]] == [
+        "cross-entry-alpha",
+        "cross-entry-beta",
+    ]
+    assert all("error" not in item for item in catalog.json()["items"])
+    assert detail.status_code == 200
+    assert admitted.status_code == 202
+    assert admitted.json()["result"]["admission_disposition"] == "created"
+
+
+@pytest.mark.parametrize("mutation", ["delete", "symlink"])
+def test_post_runs_snapshots_only_sealed_trusted_resource_bytes(
+    tmp_path, monkeypatch, workflow_writer, mutation
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    commands = home / "commands"
+    commands.mkdir(parents=True)
+    resource = commands / "sealed.md"
+    resource.write_text("TRUSTED_RESOURCE", encoding="utf-8")
+    external = tmp_path / "external.md"
+    external.write_text("UNTRUSTED_EXTERNAL_RESOURCE", encoding="utf-8")
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name=f"sealed-resource-{mutation}",
+        nodes=[{"id": "sealed", "command": "sealed"}],
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    original_read = WorkflowResourceReadBudget.read
+    canonical_resource = resource.resolve()
+    trusted_reads = 0
+
+    def mutate_after_trusted_read(self, path):
+        nonlocal trusted_reads
+        data = original_read(self, path)
+        if path == canonical_resource:
+            trusted_reads += 1
+            if trusted_reads == 2:
+                resource.unlink()
+                if mutation == "symlink":
+                    try:
+                        resource.symlink_to(external)
+                    except OSError:
+                        pytest.skip("symlinks unavailable")
+        return data
+
+    monkeypatch.setattr(WorkflowResourceReadBudget, "read", mutate_after_trusted_read)
+    response = TestClient(_app(_router()), raise_server_exceptions=False).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": f"sealed-resource-{mutation}",
+            "values": {},
+            "idempotency_key": f"sealed-resource-{mutation}",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 202
+    run_id = response.json()["result"]["run_id"]
+    captured = store.run_directory(run_id) / "commands" / "sealed.md"
+    assert captured.read_text(encoding="utf-8") == "TRUSTED_RESOURCE"
+    assert external.read_text(encoding="utf-8") == "UNTRUSTED_EXTERNAL_RESOURCE"
 
 
 def test_runs_are_bounded_cursor_paginated_and_scope_authorized(

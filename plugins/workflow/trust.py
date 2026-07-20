@@ -9,7 +9,7 @@ import re
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Literal, Mapping
@@ -41,6 +41,10 @@ class WorkflowResourceCapacityError(WorkflowTrustError):
     """A bounded package-resource read budget was exhausted."""
 
 
+class WorkflowResourceCacheMissError(WorkflowTrustError):
+    """A sealed package-resource cache did not contain a requested path."""
+
+
 @dataclass(slots=True)
 class WorkflowResourceReadBudget:
     max_file_bytes: int
@@ -48,6 +52,9 @@ class WorkflowResourceReadBudget:
     max_files: int
     bytes_read: int = 0
     files_read: int = 0
+    _contents: dict[Path, bytes] = field(default_factory=dict, init=False, repr=False)
+    _aliases: dict[Path, Path] = field(default_factory=dict, init=False, repr=False)
+    _sealed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         for name in ("max_file_bytes", "max_total_bytes", "max_files"):
@@ -56,6 +63,11 @@ class WorkflowResourceReadBudget:
                 raise ValueError(f"{name} must be a positive integer")
 
     def read(self, path: Path) -> bytes:
+        if self._sealed:
+            return self.read_cached(path)
+        cached = self._contents.get(path)
+        if cached is not None:
+            return cached
         if self.files_read >= self.max_files:
             raise WorkflowResourceCapacityError("package resource file limit exceeded")
         remaining = self.max_total_bytes - self.bytes_read
@@ -68,7 +80,32 @@ class WorkflowResourceReadBudget:
         self.bytes_read += len(data)
         if len(data) > read_limit:
             raise WorkflowResourceCapacityError("package resource byte limit exceeded")
+        self._contents[path] = data
         return data
+
+    @staticmethod
+    def _logical_key(path: Path) -> Path:
+        return Path(os.path.abspath(path))
+
+    def remember_alias(self, logical_path: Path, canonical_path: Path) -> None:
+        if self._sealed:
+            raise WorkflowResourceCacheMissError(
+                "package resource cache aliases are sealed"
+            )
+        self._aliases[self._logical_key(logical_path)] = canonical_path
+
+    def seal(self) -> None:
+        self._sealed = True
+
+    def read_cached(self, logical_path: Path) -> bytes:
+        key = self._logical_key(logical_path)
+        canonical = self._aliases.get(key, key)
+        try:
+            return self._contents[canonical]
+        except KeyError as exc:
+            raise WorkflowResourceCacheMissError(
+                "sealed package resource is unavailable"
+            ) from exc
 
 
 @dataclass(frozen=True)
@@ -136,9 +173,11 @@ def _contained_resource(
             f"workflow resource is not a readable file: {path}",
         )
     try:
-        data = (
-            resolved.read_bytes() if read_budget is None else read_budget.read(resolved)
-        )
+        if read_budget is None:
+            data = resolved.read_bytes()
+        else:
+            data = read_budget.read(resolved)
+            read_budget.remember_alias(path, resolved)
     except OSError as exc:
         raise _validation_error(
             str(path),
