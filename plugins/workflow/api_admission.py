@@ -30,6 +30,7 @@ class ApiAdmissionAuthority:
     source_instance: str
     assurance: Literal["verified_adapter", "local_admin_claim"]
     return_route: str | None = None
+    trigger_source: Literal["desktop", "api"] = "api"
 
 
 class ApiAdmissionError(RuntimeError):
@@ -77,6 +78,14 @@ def start_api_run(
 ) -> dict[str, object]:
     """Admit one trusted catalog workflow without executing any workflow node."""
     home = Path(hermes_home).resolve()
+    provenance = TriggerProvenance.authenticated_api(
+        source=authority.trigger_source,
+        assurance=authority.assurance,
+        intent_key=idempotency_key,
+        source_instance=authority.source_instance,
+        principal=authority.principal,
+        return_route=authority.return_route,
+    )
     package = _catalog_package(
         workflow_name,
         hermes_home=home,
@@ -113,20 +122,13 @@ def start_api_run(
         )
 
     prepared = store.prepare_run_snapshot(package, values=values or None)
-    provenance = TriggerProvenance.authenticated_api(
-        assurance=authority.assurance,
-        intent_key=idempotency_key,
-        source_instance=authority.source_instance,
-        principal=authority.principal,
-        return_route=authority.return_route,
-    )
     admitted = store.start_run(
         RunAdmissionRequest(
             workflow_name=package.definition.name,
             definition_digest=prepared.definition_digest,
             policy_digest=prepared.policy_digest,
             input_manifest_digest=prepared.input_manifest_digest,
-            trigger_source="api",
+            trigger_source=authority.trigger_source,
             idempotency_key=idempotency_key,
             idempotency_namespace=authority.namespace,
             concurrency_key=str(

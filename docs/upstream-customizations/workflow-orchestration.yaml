@@ -799,3 +799,43 @@ upstream_changes:
   removal_condition: Remove when upstream provides an equivalent authenticated,
     bounded, redacted, mutation-free workflow detail and preflight API.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-desktop-provenance-derivation
+  change_class: workflow-rest-adapter
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/provenance.py
+  owned_symbols:
+  - ApiAdmissionAuthority.trigger_source
+  - WorkflowAuthority.trigger_source
+  - _verified_operator authenticated session provenance selection
+  - TriggerProvenance.authenticated_api server-derived source vocabulary
+  - authenticated API source runtime validation before persistence
+  - StartRunRequest Desktop input-name validation
+  - ApiAdmissionAuthority positional constructor compatibility
+  - byte-stable CLI, chat, cron, remote-token, local Desktop, and legacy API
+    admission digest fixtures
+  tests:
+  - tests/hermes_cli/test_workflow_dashboard_auth.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_operator_e2e.py
+  - tests/plugins/workflow/test_provenance.py
+  expected_commit_subject: 'feat(workflow): Task 3 derive Desktop provenance'
+  upstream_candidate: true
+  merge_guidance: Preserve server-only provenance derivation at the verified
+    principal boundary. Authenticated local Desktop/dashboard sessions,
+    including local-admin sessions, record desktop while remote bearer-token
+    principals retain api; caller fields and headers never select the source.
+    Keep the independently truthful decision channel unchanged, do not execute
+    workflow nodes in POST /runs, reject every non-REST source before catalog
+    discovery or staging, preserve the pre-Task-3 positional return-route
+    constructor slot, retain real gated-session plus registered bearer-token
+    middleware integration coverage, and preserve all recorded admission digest
+    fixtures byte-for-byte so no unintended idempotency migration is introduced.
+    Reject caller-forged value names that cannot be represented unchanged by the
+    Desktop detail projection and immutable input snapshot before catalog lookup.
+  removal_condition: Remove when upstream provides equivalent authenticated
+    Desktop-versus-token provenance derivation without caller authority or
+    admission digest migration.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

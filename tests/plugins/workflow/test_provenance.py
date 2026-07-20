@@ -218,6 +218,142 @@ def test_semantic_provenance_excludes_volatile_audit_and_delivery_fields() -> No
     }
 
 
+@pytest.mark.parametrize("source", ["desktop", "api"])
+def test_authenticated_api_preserves_server_derived_source(source) -> None:
+    provenance = TriggerProvenance.authenticated_api(
+        source=source,
+        assurance="verified_adapter",
+        intent_key="intent",
+        source_instance="verified-instance",
+        principal="verified-principal",
+    )
+
+    assert provenance.source == source
+
+
+def test_authenticated_api_accepts_desktop_local_admin_claim() -> None:
+    provenance = TriggerProvenance.authenticated_api(
+        source="desktop",
+        assurance="local_admin_claim",
+        intent_key="intent",
+        source_instance="api:local-admin",
+        principal="profile-local-dashboard",
+    )
+
+    assert provenance.source == "desktop"
+    assert provenance.assurance == "local_admin_claim"
+    assert provenance.claimed_actor == "profile-local-dashboard"
+
+
+@pytest.mark.parametrize("source", ["chat", "background_agent"])
+def test_authenticated_api_rejects_non_rest_source_vocabulary(source) -> None:
+    with pytest.raises(
+        ValueError,
+        match="authenticated API source must be api or desktop",
+    ):
+        TriggerProvenance.authenticated_api(
+            source=source,
+            assurance="verified_adapter",
+            intent_key="intent",
+            source_instance="verified-instance",
+            principal="verified-principal",
+        )
+
+
+@pytest.mark.parametrize(
+    ("source", "assurance", "namespace", "expected"),
+    [
+        (
+            "cli",
+            "local_admin_claim",
+            "profile-local:cli",
+            "c92576387ecd9ecbcacf78f6ec3d941a7a475d208493a6578ca3670cd0017242",
+        ),
+        (
+            "chat",
+            "verified_adapter",
+            "gateway:test:user",
+            "e9e30271519cdd3d618c2f1f2d9669b460d3b98758136c5abde67e31da630b6f",
+        ),
+        (
+            "cron",
+            "system_schedule",
+            "profile-local:cron",
+            "1fb21de7f341635623d64d3e40a0e68ffaefecdb4a52c368e7df6753d7bebdb7",
+        ),
+        (
+            "api",
+            "verified_adapter",
+            "api:service:test:writer",
+            "70a542d1f8dd40dc360756ed5c9a68dc9a197643f6e75eed15e829ed5dc2b3e8",
+        ),
+        (
+            "desktop",
+            "local_admin_claim",
+            "api:profile-local-dashboard",
+            "e83faa3f8e0a03c54110fd8a660c4609240a4e5242807512df88515b680aa4c6",
+        ),
+    ],
+)
+def test_existing_start_digest_fixtures_are_byte_stable(
+    source, assurance, namespace, expected
+) -> None:
+    if source in {"api", "desktop"}:
+        provenance = TriggerProvenance.authenticated_api(
+            source=source,
+            assurance=assurance,
+            intent_key=f"intent-{source}",
+            source_instance=f"{source}-instance",
+            principal=f"{source}-principal",
+        )
+    else:
+        provenance = TriggerProvenance(
+            source=source,
+            assurance=assurance,
+            intent_key=f"intent-{source}",
+            source_instance=f"{source}-instance",
+        )
+    request = RunAdmissionRequest(
+        workflow_name="digest-fixture",
+        definition_digest="1" * 64,
+        policy_digest="2" * 64,
+        input_manifest_digest="3" * 64,
+        trigger_source=source,
+        idempotency_key=f"intent-{source}",
+        idempotency_namespace=namespace,
+        concurrency_key="digest-fixture",
+        run_metadata={"zeta": "last", "alpha": "one"},
+        provenance=provenance,
+    )
+
+    assert RunStore._start_digest(request) == expected
+
+
+def test_existing_api_start_digest_fixture_is_byte_stable() -> None:
+    request = RunAdmissionRequest(
+        workflow_name="digest-fixture",
+        definition_digest="1" * 64,
+        policy_digest="2" * 64,
+        input_manifest_digest="3" * 64,
+        trigger_source="api",
+        idempotency_key="intent-api",
+        idempotency_namespace="api:service:test:writer",
+        concurrency_key="digest-fixture",
+        operator_scope="service:test:writer",
+        run_metadata={"zeta": "last", "alpha": "one"},
+        provenance=TriggerProvenance.authenticated_api(
+            assurance="verified_adapter",
+            intent_key="intent-api",
+            source_instance="api:token:test",
+            principal="service:test:writer",
+        ),
+    )
+
+    assert RunStore._start_digest(request) == (
+        "2432809a726b15ac48c7a0ccc7c2c7ed122fe79c8d68f0c85ecc862f8d91e475"
+    )
+
+
 def test_missing_legacy_trigger_is_unknown_not_cli() -> None:
     provenance = legacy_projection_provenance({})
 

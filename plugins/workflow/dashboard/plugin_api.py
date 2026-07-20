@@ -81,6 +81,7 @@ class WorkflowAuthority:
     source_instance: str = "api:local-admin"
     channel: str = "api:local-admin"
     assurance: Literal["verified_adapter", "local_admin_claim"] = "local_admin_claim"
+    trigger_source: Literal["desktop", "api"] = "api"
     return_route: str | None = None
 
     @property
@@ -156,6 +157,7 @@ def _verified_operator(
             source_instance=f"api:session:{provider}",
             channel=f"api:{provider}",
             assurance="verified_adapter",
+            trigger_source="desktop",
         )
     if token is not None and getattr(request.state, "token_authenticated", False):
         provider = getattr(token, "provider", "unknown")
@@ -186,6 +188,7 @@ def _verified_operator(
             source_instance="api:local-admin",
             channel="api:local-admin",
             assurance="local_admin_claim",
+            trigger_source="desktop",
         )
     raise HTTPException(status_code=401, detail={"code": "authentication_required"})
 
@@ -827,8 +830,12 @@ class StartRunRequest(BaseModel):
         if len(self.values) > 64:
             raise ValueError("values contains too many entries")
         total = 0
+        from plugins.workflow.catalog_api import (
+            desktop_input_name_is_representable,
+        )
+
         for key, value in self.values.items():
-            if not key.strip() or len(key) > 128:
+            if not desktop_input_name_is_representable(key):
                 raise ValueError("value names must be bounded non-empty text")
             encoded = value.encode("utf-8")
             if len(encoded) > 64 * 1024:
@@ -859,6 +866,7 @@ def post_runs(
         operator_scope=None if operator.unrestricted else operator.scope,
         source_instance=operator.source_instance,
         assurance=operator.assurance,
+        trigger_source=operator.trigger_source,
         return_route=operator.return_route,
     )
     try:

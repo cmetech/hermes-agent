@@ -17,6 +17,7 @@ import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.api_admission import ApiAdmissionAuthority, start_api_run
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.notifications import NotificationOutbox
@@ -186,7 +187,7 @@ def test_post_runs_api_admission_requires_write_and_server_derived_provenance(
         "/api/plugins/workflow/runs",
         json=body,
         headers={
-            "X-Hermes-Workflow-Source": "cron",
+            "X-Hermes-Workflow-Source": "desktop",
             "X-Hermes-Principal": "forged-admin",
             "X-Hermes-Source-Instance": "forged-instance",
             "X-Hermes-Channel": "forged-channel",
@@ -202,6 +203,7 @@ def test_post_runs_api_admission_requires_write_and_server_derived_provenance(
     result = admitted.json()["result"]
     assert result["admission_disposition"] == "created"
     run = store.get_run_status(result["run_id"], operator_scope="service:test:writer")
+    assert run["trigger"] == "api"
     assert run["execution_mode"] == "background"
     assert run["provenance"]["source"] == "api"
     assert run["provenance"]["assurance"] == "verified_adapter"
@@ -209,6 +211,96 @@ def test_post_runs_api_admission_requires_write_and_server_derived_provenance(
     assert run["provenance"]["source_instance"] == "api:token:test"
     assert run["provenance"]["return_route"] is None
     assert "forged" not in str(run["provenance"])
+
+
+def test_post_runs_authenticated_session_middleware_records_desktop_source(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, workflow_writer, name="desktop-admission")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    session = SimpleNamespace(
+        provider="test",
+        org_id="org",
+        user_id="desktop-user",
+    )
+    scope = "dashboard:test:org:desktop-user"
+    module = _module()
+    client = TestClient(_app(module.router, session=session))
+
+    admitted = client.post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "desktop-admission",
+            "values": {},
+            "idempotency_key": "desktop-request",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert admitted.status_code == 202
+    run_id = admitted.json()["result"]["run_id"]
+    run = store.get_run_status(run_id, operator_scope=scope)
+    assert run["trigger"] == "desktop"
+    assert run["execution_mode"] == "background"
+    assert run["provenance"]["source"] == "desktop"
+    assert run["provenance"]["assurance"] == "verified_adapter"
+    assert run["provenance"]["actor_id"] == scope
+    assert run["provenance"]["source_instance"] == "api:session:test"
+
+
+def test_api_admission_authority_preserves_legacy_positional_return_route() -> None:
+    authority = ApiAdmissionAuthority(
+        "verified-principal",
+        "api:verified-principal",
+        None,
+        "api:token:test",
+        "verified_adapter",
+        "opaque-return-route",
+    )
+
+    assert authority.return_route == "opaque-return-route"
+    assert authority.trigger_source == "api"
+
+
+@pytest.mark.parametrize("source", ["chat", "background_agent"])
+def test_api_admission_rejects_non_rest_sources_without_persistence(
+    tmp_path, monkeypatch, workflow_writer, source
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, workflow_writer, name="invalid-api-source")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    authority = ApiAdmissionAuthority(
+        principal="service:test:writer",
+        namespace="api:service:test:writer",
+        operator_scope="service:test:writer",
+        source_instance="api:token:test",
+        assurance="verified_adapter",
+        trigger_source=source,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="authenticated API source must be api or desktop",
+    ):
+        start_api_run(
+            store,
+            hermes_home=home,
+            workdir=tmp_path,
+            user_home=tmp_path,
+            workflow_name="invalid-api-source",
+            values={},
+            idempotency_key=f"invalid-{source}",
+            concurrency_policy="queue",
+            authority=authority,
+        )
+
+    assert list(store.runs_root.rglob("run.json")) == []
+    assert list(store.staging_root.iterdir()) == []
 
 
 def test_post_runs_api_admission_requires_healthy_coordinator_without_run(
