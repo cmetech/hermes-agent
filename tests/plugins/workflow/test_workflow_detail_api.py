@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
@@ -8,6 +9,7 @@ import importlib.util
 import json
 import os
 import sqlite3
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -26,6 +28,7 @@ from plugins.workflow.coordinator_store import (
     install_coordinator_schema,
 )
 from plugins.workflow.schema import load_workflow
+import plugins.workflow.showcase as showcase_module
 from plugins.workflow.topology import sanitize_topology_label
 from plugins.workflow.trust import (
     WorkflowTrustStore,
@@ -64,13 +67,26 @@ def _reader() -> TokenPrincipal:
     )
 
 
-def _detail_get(router, name: str, *, token=None, raise_server_exceptions=True):
+def _detail_get(
+    router,
+    name: str,
+    *,
+    token=None,
+    catalog_source: str | None = None,
+    raise_server_exceptions=True,
+):
     return TestClient(
         _app(router, token=token),
         raise_server_exceptions=raise_server_exceptions,
     ).get(
-        f"/api/plugins/workflow/workflows/{name}"
+        f"/api/plugins/workflow/workflows/{name}",
+        params={"catalog_source": catalog_source} if catalog_source else None,
     )
+
+
+@contextmanager
+def _test_bundle_path(root: Path):
+    yield root.resolve()
 
 
 def _cli_show_json(
@@ -145,6 +161,139 @@ def test_workflow_detail_unknown_name_is_typed_not_found(
 
     assert response.status_code == 404
     assert response.json() == {"detail": {"code": "workflow_not_found"}}
+
+
+def test_workflow_detail_source_disambiguates_user_and_verified_showcase(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.chdir(workdir)
+    workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="approval-gate",
+        description="User-authored collision",
+    )
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    router = _module().router
+
+    catalog = TestClient(_app(router, token=_reader())).get(
+        "/api/plugins/workflow/workflows"
+    )
+
+    bare = _detail_get(router, "approval-gate", token=_reader())
+    selected_user = _detail_get(
+        router, "approval-gate", token=_reader(), catalog_source="project"
+    )
+    selected_showcase = _detail_get(
+        router, "approval-gate", token=_reader(), catalog_source="showcase"
+    )
+
+    assert bare.status_code == selected_user.status_code == 200
+    assert catalog.status_code == 200
+    assert sum(
+        item.get("name") == "approval-gate"
+        and item.get("source") in {"project", "showcase"}
+        for item in catalog.json()["items"]
+    ) == 2
+    assert bare.json()["source"] == selected_user.json()["source"] == "project"
+    assert bare.json()["description"] == "User-authored collision"
+    assert selected_showcase.status_code == 200
+    assert selected_showcase.json()["source"] == "showcase"
+    assert selected_showcase.json()["trust_state"] == "verified_bundled"
+    assert selected_showcase.json()["run_support"] == {
+        "supported": True,
+        "reason": "supported",
+    }
+
+
+def test_workflow_detail_omitted_or_wrong_source_never_falls_through_to_showcase(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    router = _module().router
+
+    omitted = _detail_get(router, "resilience", token=_reader())
+    wrong = _detail_get(
+        router, "resilience", token=_reader(), catalog_source="project"
+    )
+
+    assert omitted.status_code == wrong.status_code == 404
+    assert omitted.json() == wrong.json() == {
+        "detail": {"code": "workflow_not_found"}
+    }
+
+
+def test_workflow_detail_showcase_integrity_failure_is_typed_and_read_only(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    trust = home / "workflow" / "trust.json"
+    trust.parent.mkdir()
+    trust.write_text('{"version":1,"entries":{}}\n', encoding="utf-8")
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
+    workflow = (
+        copied
+        / "packages"
+        / "approval-gate"
+        / "workflows"
+        / "approval-gate.yaml"
+    )
+    workflow.write_text(workflow.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(copied),
+    )
+    before_home = _tree_snapshot(home)
+    before_bundle = _tree_snapshot(copied)
+
+    response = _detail_get(
+        _module().router,
+        "approval-gate",
+        token=_reader(),
+        catalog_source="showcase",
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "workflow_showcase_verification_failed",
+            "retryable": False,
+        }
+    }
+    assert _tree_snapshot(home) == before_home
+    assert _tree_snapshot(copied) == before_bundle
+
+
+def test_workflow_detail_showcase_verification_budget_is_typed_capacity(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    import plugins.workflow.catalog_api as catalog_api
+
+    monkeypatch.setattr(catalog_api, "CATALOG_MAX_RESOURCE_FILE_BYTES", 1)
+
+    response = _detail_get(
+        _module().router,
+        "approval-gate",
+        token=_reader(),
+        catalog_source="showcase",
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "workflow_catalog_capacity", "retryable": True}
+    }
 
 
 def test_first_workflow_detail_read_creates_no_profile_state(

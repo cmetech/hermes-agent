@@ -1286,3 +1286,35 @@ upstream_changes:
   removal_condition: Remove when upstream has an equivalent bounded cached
     authenticated showcase loader with the same integrity/compatibility split.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-catalog-projection
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - docs/superpowers/specs/2026-07-20-workflow-showcase-desktop-run-design.md
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  owned_symbols:
+  - CatalogSource
+  - CatalogTrustState
+  - CatalogRunSupport
+  - workflow_catalog_run_support
+  - source-aware workflow catalog detail
+  - verified showcase catalog projection
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  - tests/plugins/workflow/test_catalog_cli.py
+  expected_commit_subject: 'feat(workflow): list verified bundled showcases'
+  upstream_candidate: true
+  merge_guidance: Preserve source-and-scenario-ID catalog identity, user
+    project-over-profile precedence, rootless digest-verified showcase loading,
+    atomic bundle-integrity omission, per-scenario compatibility visibility,
+    verified-bundle trust, shared server-derived run support, no-repair
+    read-only HTTP behavior, and source-exact detail targeting. Never let an
+    incompatible scenario suppress its verified siblings or let an omitted
+    source silently select a showcase.
+  removal_condition: Remove when upstream exposes equivalent source-aware,
+    honestly compatible verified showcase list and detail APIs.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

@@ -118,6 +118,13 @@ where `source` is `project`, `profile`, or `showcase`. The server and Desktop
 call the request field `catalog_source`/`catalogSource`; they do not call it
 `source` in admission because provenance source remains server-owned.
 
+For the showcase source, the public `name` is the digest-authenticated scenario
+ID from `catalog.yaml`. This matters for `scheduling`, whose internal workflow
+definition is named `scheduled-check`: View and Run resolve the authenticated
+scenario ID, while the redacted definition continues to show the workflow's
+own name. Using the scenario ID keeps catalog, detail, CLI terminology, and
+the rootless verified-loader key identical.
+
 ### Precedence
 
 The existing user-workflow resolution policy remains unchanged:

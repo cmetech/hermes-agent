@@ -213,17 +213,30 @@ class WorkflowCatalogInputSupport(BaseModel):
     ]
 
 
+class WorkflowCatalogRunSupport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    supported: bool
+    reason: Literal[
+        "supported",
+        "unsupported_inputs",
+        "showcase_cli_required",
+    ]
+
+
 class WorkflowCatalogEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(..., min_length=1, max_length=128)
     version: str = Field(..., min_length=1, max_length=32)
     description: str = Field(..., max_length=16_400)
-    source: Literal["project", "profile"]
-    precedence: Literal[1, 2]
-    trust_state: Literal["trusted", "untrusted"]
+    source: Literal["project", "profile", "showcase"]
+    precedence: Literal[1, 2, 3]
+    trust_state: Literal["trusted", "untrusted", "verified_bundled"]
     inputs: list[WorkflowCatalogInput] = Field(..., max_length=64)
     supported_inputs: WorkflowCatalogInputSupport
+    run_support: WorkflowCatalogRunSupport
+    compatibility: dict[str, object] | None = None
 
 
 class WorkflowCatalogErrorEntry(BaseModel):
@@ -267,9 +280,10 @@ class WorkflowDetailResponse(BaseModel):
     description: str = Field(..., max_length=16_384)
     source: str = Field(..., min_length=1, max_length=64)
     precedence: int
-    trust_state: Literal["trusted", "untrusted"]
+    trust_state: Literal["trusted", "untrusted", "verified_bundled"]
     inputs: list[WorkflowCatalogInput] = Field(..., max_length=64)
     supported_inputs: WorkflowCatalogInputSupport
+    run_support: WorkflowCatalogRunSupport
     risk_summary: dict[str, object]
     compatibility: dict[str, object]
     coordinator: WorkflowCoordinatorResponse
@@ -277,7 +291,11 @@ class WorkflowDetailResponse(BaseModel):
     definition: dict[str, object]
 
 
-@router.get("/workflows", response_model=WorkflowCatalogResponse)
+@router.get(
+    "/workflows",
+    response_model=WorkflowCatalogResponse,
+    response_model_exclude_none=True,
+)
 def list_workflows(
     request: Request,
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
@@ -320,6 +338,7 @@ def list_workflows(
 def workflow_detail(
     name: str,
     request: Request,
+    catalog_source: Literal["project", "profile", "showcase"] | None = Query(None),
     operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
 ):
     operator = _verified_operator(request, operator_scope)
@@ -330,12 +349,16 @@ def workflow_detail(
         WorkflowCatalogTrustUnavailableError,
         WorkflowCatalogUnavailableError,
         WorkflowDetailNotFoundError,
+        WorkflowShowcaseVerificationError,
         build_workflow_detail,
     )
 
     try:
         detail = build_workflow_detail(
-            name, hermes_home=get_hermes_home(), workdir=Path.cwd()
+            name,
+            hermes_home=get_hermes_home(),
+            workdir=Path.cwd(),
+            catalog_source=catalog_source,
         )
     except WorkflowDetailNotFoundError as exc:
         raise HTTPException(
@@ -363,6 +386,14 @@ def workflow_detail(
         raise HTTPException(
             status_code=503,
             detail={"code": "workflow_trust_unavailable", "retryable": True},
+        ) from exc
+    except WorkflowShowcaseVerificationError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workflow_showcase_verification_failed",
+                "retryable": False,
+            },
         ) from exc
     sanitized = sanitize_projection(detail)
     assert isinstance(sanitized, dict)
