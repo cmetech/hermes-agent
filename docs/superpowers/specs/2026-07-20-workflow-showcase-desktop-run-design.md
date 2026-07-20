@@ -186,7 +186,9 @@ They construct records only through the existing showcase verification path:
    `precedence=3` for catalog use.
 6. `_verified_distribution_risk()` rechecks the package tree after catalog
    verification, assesses ordinary compatibility, builds the normal risk
-   summary, and runs `preflight_execution(..., trusted=True)`.
+   summary, and runs `preflight_execution(..., trusted=True)`. Catalog loading
+   retains an incompatible scenario for honest projection; CLI execution and
+   API admission additionally require `compatibility.runnable`.
 7. The record captures the verified bundle digest and cannot carry an
    arbitrary filesystem root.
 
@@ -245,6 +247,27 @@ boundary independent of list latency optimization. Tests count full-tree
 digest/read calls across repeated list requests, mutate a package after a cache
 hit to prove invalidation and fail-closed omission, and prove showcase bytes do
 not incorrectly consume the user-catalog aggregate on cache hits.
+
+### Approved plan deviation: compatibility projection
+
+The initial plan applied execution-strict `compatibility.runnable` rejection
+while constructing every verified catalog record. That conflicts with the
+established v3.0.1 user-workflow behavior: visibility is permissive and honest,
+while execution is fail-closed. It would also let one optional environment
+dependency, such as unavailable MCP support for `ai-extensions`, suppress the
+entire otherwise-authentic bundle.
+
+The corrected boundary is:
+
+- bundle integrity remains atomic and strict: catalog digest, every package
+  tree digest, path/symlink safety, and bundled provenance must all verify or
+  no showcase is trusted/listed;
+- per-scenario environment compatibility is projected honestly through the
+  existing `qualify_workflow_catalog_package(package, compatibility=...)`
+  path and never suppresses sibling scenarios;
+- View remains available for incompatible scenarios;
+- CLI execution and API admission retain strict compatibility and ordinary
+  execution preflight before any run is persisted.
 
 ### Standard admission flow
 

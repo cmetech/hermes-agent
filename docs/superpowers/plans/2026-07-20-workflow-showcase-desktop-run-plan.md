@@ -273,10 +273,13 @@ Implement `load_verified_showcase_packages(*, read_budget)` and
 `load_verified_showcase_package(showcase_id, *, read_budget)` without any
 bundle-root or scenario parameter. Each opens `_bundle_path()` once, invokes
 the same catalog/digest/safety implementation with repair disabled, loads the
-workflow from that same verified root, rechecks its tree digest, runs ordinary
-compatibility/preflight, and returns the immutable record. Keep the existing
-false-provenance guard in `_verified_distribution_risk`. Never infer trust from
-a caller-constructed dataclass or boolean. Add a pure
+workflow from that same verified root, rechecks its tree digest, builds
+ordinary risk, runs ordinary risk preflight, and returns the immutable record.
+Do not reject a verified record merely because its current environment is
+incompatible; Task 3 projects that state honestly. Keep the existing strict
+compatibility default for CLI execution and the false-provenance guard in
+`_verified_distribution_risk`. Never infer trust from a caller-constructed
+dataclass or boolean. Add a pure
 `showcase_background_api_eligible(scenario)` helper; both catalog projection
 and admission must call it rather than duplicating consent rules.
 
@@ -337,7 +340,7 @@ assert approval["supported_inputs"] == {"supported": True, "reason": "parameterl
 assert approval["run_support"] == {"supported": True, "reason": "supported"}
 ```
 
-Create a project workflow also named `approval-gate`; assert both rows appear, bare detail resolves project, and `catalog_source=showcase` resolves the bundle. With no user collision, assert bare detail remains project/profile-only rather than silently opting into a showcase. Explicitly request `catalog_source=project` for a showcase-only name and require typed 404. Assert laptop has `unsupported_inputs`, while ai-extensions and scheduling have `showcase_cli_required`. Add CF-1 POSIX/Windows path-in-description parity. Tamper the default-bundle harness and assert list omits every showcase without invoking checkout repair, exact detail returns typed verification failure, and store/trust byte snapshots do not change. Make the default bundle missing/unreadable and assert list still returns 200 with user rows and zero showcases. Rewrite existing list tests to select user rows by `(source, name)`, retaining all prior assertions and adding their input-derived run support.
+Create a project workflow also named `approval-gate`; assert both rows appear, bare detail resolves project, and `catalog_source=showcase` resolves the bundle. With no user collision, assert bare detail remains project/profile-only rather than silently opting into a showcase. Explicitly request `catalog_source=project` for a showcase-only name and require typed 404. Assert laptop has `unsupported_inputs`, while ai-extensions and scheduling have `showcase_cli_required`. With MCP unavailable, assert ai-extensions remains visible with honest incompatible state and every other showcase remains visible. Add CF-1 POSIX/Windows path-in-description parity. Tamper the default-bundle harness and assert list omits every showcase without invoking checkout repair, exact detail returns typed verification failure, and store/trust byte snapshots do not change. Make the default bundle missing/unreadable and assert list still returns 200 with user rows and zero showcases. Rewrite existing list tests to select user rows by `(source, name)`, retaining all prior assertions and adding their input-derived run support.
 
 Add a measured hot-path test: call `build_workflow_catalog` twice, count
 full-tree digest/read operations, require only the first stable request to pay
@@ -418,7 +421,7 @@ git commit -m "feat(workflow): list verified bundled showcases"
 
 - [ ] **Step 1: Write RED tests**
 
-POST `approval-gate` with `catalog_source=showcase`; assert 202, server-derived Desktop provenance, background execution, `showcase_id`, `showcase_provenance=verified_bundled`, and ready nodes at response time. Monkeypatch `RunScheduler.advance` to raise. Repeat the same showcase admission with the same idempotency key and assert the same start digest/run ID with `existing` disposition; bundle/risk content digests must be stable. Add copied-bundle, post-verification mutation, unsupported laptop (422 `workflow_inputs_unsupported`), AI-consent/scheduling (409 `workflow_showcase_cli_required`), unhealthy coordinator, forged provenance, omitted-source, and same-name user/showcase targeting cases; every failure leaves no run/staging residue. Run existing user-source golden start-digest tests unchanged.
+POST `approval-gate` with `catalog_source=showcase`; assert 202, server-derived Desktop provenance, background execution, `showcase_id`, `showcase_provenance=verified_bundled`, and ready nodes at response time. Monkeypatch `RunScheduler.advance` to raise. Repeat the same showcase admission with the same idempotency key and assert the same start digest/run ID with `existing` disposition; bundle/risk content digests must be stable. Add copied-bundle, post-verification mutation, unsupported laptop (422 `workflow_inputs_unsupported`), AI-consent/scheduling (409 `workflow_showcase_cli_required`), an environment-incompatible selected showcase (typed nonretryable compatibility failure), unhealthy coordinator, forged provenance, omitted-source, and same-name user/showcase targeting cases; every failure leaves no run/staging residue. Run existing user-source golden start-digest tests unchanged.
 
 - [ ] **Step 2: Verify RED**
 

@@ -1255,3 +1255,34 @@ upstream_changes:
   removal_condition: Remove when upstream ships an equivalent digest-verified
     parameterless approval showcase with durable evidence reporting.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-bounded-verification
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  - docs/superpowers/specs/2026-07-20-workflow-showcase-desktop-run-design.md
+  - plugins/workflow/showcase.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_showcase_ai_e2e.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  owned_symbols:
+  - VerifiedShowcasePackage
+  - load_verified_showcase_package
+  - load_verified_showcase_packages
+  - showcase_background_api_eligible
+  - bounded verified showcase cache and tree signature
+  - visibility-permissive execution-strict compatibility deviation
+  tests:
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_showcase_ai_e2e.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  expected_commit_subject: 'fix(workflow): bound verified showcase loading'
+  upstream_candidate: true
+  merge_guidance: Preserve rootless bundled loading, no-repair HTTP semantics,
+    strict atomic bundle integrity, bounded digest reads, signature-invalidated
+    process caching, coalesced misses, and fresh admission re-verification.
+    Environment incompatibility must remain a per-scenario projection concern,
+    while CLI execution and API admission remain compatibility-strict.
+  removal_condition: Remove when upstream has an equivalent bounded cached
+    authenticated showcase loader with the same integrity/compatibility split.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
