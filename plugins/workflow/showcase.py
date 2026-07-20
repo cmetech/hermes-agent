@@ -41,6 +41,7 @@ _ALLOWED_CLAIMS = frozenset({
     "typed-timeout", "process-cleanup", "explicit-ai-consent",
     "scoped-extensions", "persistent-session", "local-mcp-cleanup",
     "explicit-schedule-consent", "one-shot-ownership", "cron-recovery",
+    "operator-approval",
 })
 _FORBIDDEN_TEXT = (
     "get-ciminstance", "get-computerinfo", "wmic ", "system_profiler",
@@ -633,6 +634,16 @@ def build_showcase_report(run_id: str, *, hermes_home: str | Path) -> ShowcaseRe
             approvals = by_type.get("interaction_approved", [])
             if rejections and approvals:
                 outcome, reason, refs = "passed", "rework_and_approval_observed", tuple(_event_ref(e) for e in (rejections[-1], approvals[-1]))
+            elif projection["status"] == "paused":
+                outcome, reason = "skipped", "awaiting_operator_decision"
+        elif capability == "operator-approval":
+            approvals = by_type.get("interaction_approved", [])
+            if approvals:
+                outcome, reason, refs = (
+                    "passed",
+                    "operator_approval_observed",
+                    (_event_ref(approvals[-1]),),
+                )
             elif projection["status"] == "paused":
                 outcome, reason = "skipped", "awaiting_operator_decision"
         elif capability == "artifact-verification":

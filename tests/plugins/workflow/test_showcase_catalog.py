@@ -22,15 +22,15 @@ import plugins.workflow.showcase as showcase_module
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def test_catalog_has_four_safe_digest_verified_scenarios() -> None:
+def test_catalog_has_safe_digest_verified_scenarios() -> None:
     catalog = load_showcase_catalog()
 
-    assert tuple(catalog) == (
+    assert {
         "ai-extensions",
         "laptop-diagnostic",
         "resilience",
         "scheduling",
-    )
+    } <= set(catalog)
     assert catalog["laptop-diagnostic"].offline is True
     assert catalog["laptop-diagnostic"].requires_ai is False
     assert catalog["ai-extensions"].requires_ai is True
@@ -38,6 +38,20 @@ def test_catalog_has_four_safe_digest_verified_scenarios() -> None:
     assert all(item.package_digest for item in catalog.values())
     assert all(item.verified_bundled_provenance for item in catalog.values())
     assert all("destructive" not in item.safety_class for item in catalog.values())
+
+
+def test_bundled_approval_gate_is_verified_parameterless_and_portable() -> None:
+    catalog = load_showcase_catalog()
+    scenario = catalog["approval-gate"]
+    package = showcase_module._scenario_package(scenario)
+    preflight = preflight_showcase("approval-gate", hermes_home=REPO_ROOT)
+
+    assert scenario.verified_bundled_provenance is True
+    assert scenario.requires_ai is False
+    assert scenario.requires_network is False
+    assert "operator-approval" in scenario.capability_claims
+    assert [node.node_type for node in package.definition.nodes] == ["approval"]
+    assert preflight["input_requirements"] == []
 
 
 def test_explicit_catalog_copy_is_not_authenticated_as_bundled_distribution(
@@ -249,7 +263,12 @@ def test_showcase_cli_list_and_missing_input_have_stable_exit_categories(
     assert listed.func(listed) == 0
     listed_envelope = json.loads(capsys.readouterr().out)
     assert listed_envelope["ok"] is True
-    assert len(listed_envelope["result"]) == 4
+    assert {
+        "ai-extensions",
+        "laptop-diagnostic",
+        "resilience",
+        "scheduling",
+    } <= {item["id"] for item in listed_envelope["result"]}
 
     missing = parser.parse_args(
         [

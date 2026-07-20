@@ -126,7 +126,10 @@ if [[ "${WORKFLOW_MERGE_GATE_FAST:-0}" != "1" ]]; then
   node scripts/brand/generate.mjs "$BRAND" --check
   "$PYTHON_BIN" - <<'PY'
 from plugins.workflow.showcase import load_showcase_catalog
-assert len(load_showcase_catalog()) == 4
+catalog = load_showcase_catalog()
+assert "approval-gate" in catalog
+assert all(item.package_digest for item in catalog.values())
+assert all(item.verified_bundled_provenance for item in catalog.values())
 PY
 fi
 echo "TESTED_BRAND_SHA=$(git rev-parse HEAD)"

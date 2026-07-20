@@ -1,0 +1,7 @@
+name: approval-gate
+description: Pause for explicit operator approval before completing the bundled tour
+nodes:
+  - id: operator-approval
+    approval:
+      message: Approve completion of this bundled, offline workflow tour.
+      capture_response: true
