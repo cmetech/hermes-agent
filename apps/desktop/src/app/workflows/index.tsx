@@ -25,9 +25,11 @@ import { PAGE_INSET_X } from '../layout-constants'
 import { workflowBoardModel } from './adapter'
 import { AttentionInbox } from './attention-inbox'
 import { WorkflowCatalog } from './catalog'
+import { cancelPendingWorkflowDetailQuery } from './detail-query'
 import { ReviewRunDialog } from './review-run-dialog'
 import { RunInspector } from './run-inspector'
 import { $workflowSelectedRunId, selectWorkflowRun } from './store'
+import { ViewWorkflowDialog } from './view-workflow-dialog'
 
 function isConflict(error: unknown): boolean {
   if (typeof error === 'object' && error !== null && 'statusCode' in error) {
@@ -58,20 +60,54 @@ export function WorkflowsView() {
   const [isVisible, setIsVisible] = useState(() => document.visibilityState === 'visible')
   const [view, setView] = useState<WorkflowRunView>('workflows')
 
+  const [viewIntent, setViewIntent] = useState<null | {
+    profile: string
+    returnFocusTo: HTMLElement | null
+    workflow: WorkflowDefinition
+  }>(null)
+
   const [reviewIntent, setReviewIntent] = useState<null | {
     generation: number
     profile: string
+    returnFocusTo: HTMLElement | null
     workflow: WorkflowDefinition
   }>(null)
 
   const closeReview = () => {
     reviewGeneration.current += 1
+
+    if (reviewIntent) {
+      cancelPendingWorkflowDetailQuery(queryClient, reviewIntent.workflow.name, reviewIntent.profile)
+    }
+
     setReviewIntent(null)
   }
 
-  const openReview = (workflow: WorkflowDefinition) => {
+  const activeElement = () => (document.activeElement instanceof HTMLElement ? document.activeElement : null)
+
+  const openReviewForProfile = (
+    workflow: WorkflowDefinition,
+    intentProfile: string,
+    returnFocusTo = activeElement()
+  ) => {
     reviewGeneration.current += 1
-    setReviewIntent({ generation: reviewGeneration.current, profile, workflow })
+    setViewIntent(null)
+    setReviewIntent({ generation: reviewGeneration.current, profile: intentProfile, returnFocusTo, workflow })
+  }
+
+  const openReview = (workflow: WorkflowDefinition) => openReviewForProfile(workflow, profile)
+
+  const openView = (workflow: WorkflowDefinition) => {
+    setReviewIntent(null)
+    setViewIntent({ profile, returnFocusTo: activeElement(), workflow })
+  }
+
+  const closeView = () => {
+    if (viewIntent) {
+      cancelPendingWorkflowDetailQuery(queryClient, viewIntent.workflow.name, viewIntent.profile)
+    }
+
+    setViewIntent(null)
   }
 
   useEffect(() => {
@@ -253,7 +289,7 @@ export function WorkflowsView() {
         ))}
       </div>
       {view === 'workflows' ? (
-        <WorkflowCatalog onRunWorkflow={openReview} />
+        <WorkflowCatalog onRunWorkflow={openReview} onViewWorkflow={openView} />
       ) : (
         <>
           <AttentionInbox items={attention.data?.items ?? []} onOpenRun={selectWorkflowRun} />
@@ -328,7 +364,16 @@ export function WorkflowsView() {
             closeReview()
           }}
           profile={reviewIntent.profile}
+          returnFocusTo={reviewIntent.returnFocusTo}
           workflow={reviewIntent.workflow}
+        />
+      ) : null}
+      {viewIntent ? (
+        <ViewWorkflowDialog
+          onClose={closeView}
+          onRun={() => openReviewForProfile(viewIntent.workflow, viewIntent.profile, viewIntent.returnFocusTo)}
+          profile={viewIntent.profile}
+          workflow={viewIntent.workflow}
         />
       ) : null}
     </main>

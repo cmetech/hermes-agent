@@ -93,8 +93,10 @@ if [[ "$PHASE" == "base" ]]; then
     (cd apps/desktop && npx vitest run \
       src/components/activity-board/activity-board.test.tsx \
       src/components/activity-board/activity-board.performance.test.tsx \
+      src/components/assistant-ui/embeds/workflow-topology.test.tsx \
       src/app/workflows/adapter.test.ts \
       src/app/workflows/review-run-dialog.test.tsx \
+      src/app/workflows/view-workflow-dialog.test.tsx \
       src/app/workflows/workflow-operations.e2e.test.tsx \
       src/app/kanban/adapter.test.ts \
       src/app/kanban/kanban-operations.e2e.test.tsx)

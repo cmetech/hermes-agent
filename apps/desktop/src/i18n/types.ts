@@ -1404,6 +1404,21 @@ export interface Translations {
     workflowSourceProfile: string
     workflowSourceProject: string
     workflowView: string
+    workflowViewTitle: (workflow: string) => string
+    workflowViewDescription: string
+    workflowViewDiagram: string
+    workflowViewDefinition: string
+    workflowViewLoading: string
+    workflowViewErrorTitle: string
+    workflowViewErrorDescription: string
+    workflowViewNotFound: string
+    workflowViewDiagramTooLarge: string
+    workflowViewDiagramOmitted: string
+    workflowViewDefinitionTitle: string
+    workflowViewDefinitionCaption: string
+    workflowViewCopyDefinition: string
+    workflowViewRunLoading: string
+    workflowViewRunError: string
     workflowRun: string
     workflowRunUnavailable: string
     workflowRunUnsupportedInputs: string

@@ -1,3 +1,4 @@
+import { useQueryClient } from '@tanstack/react-query'
 import { useEffect, useId, useRef, useState } from 'react'
 
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -17,9 +18,11 @@ import { Input } from '@/components/ui/input'
 import { Loader } from '@/components/ui/loader'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useI18n } from '@/i18n'
-import { preflightWorkflow, startWorkflowRun, WorkflowApiError } from '@/lib/hermes-api'
+import { startWorkflowRun, WorkflowApiError } from '@/lib/hermes-api'
 import { Play } from '@/lib/icons'
 import type { WorkflowDefinition, WorkflowDefinitionInput, WorkflowDetail } from '@/types/hermes'
+
+import { workflowDetailQueryOptions } from './detail-query'
 
 type FlatInputValue = boolean | number | string | undefined
 
@@ -38,6 +41,7 @@ export interface ReviewRunDialogProps {
   onClose: () => void
   onRunLocated: (runId: string, disposition: string) => Promise<void> | void
   profile: null | string
+  returnFocusTo?: HTMLElement | null
   workflow: WorkflowDefinition
 }
 
@@ -267,9 +271,10 @@ function InputField({
   )
 }
 
-export function ReviewRunDialog({ onClose, onRunLocated, profile, workflow }: ReviewRunDialogProps) {
+export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo, workflow }: ReviewRunDialogProps) {
   const { t } = useI18n()
   const copy = t.operations
+  const queryClient = useQueryClient()
   const [detail, setDetail] = useState<WorkflowDetail | null>(null)
   const [preflightError, setPreflightError] = useState(false)
   const [preflightAttempt, setPreflightAttempt] = useState(0)
@@ -278,8 +283,12 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, workflow }: Re
   const [error, setError] = useState<AdmissionError | null>(null)
   const [admittedRun, setAdmittedRun] = useState<AdmittedRun | null>(null)
   const [submitting, setSubmitting] = useState(false)
+
   const active = useRef(true)
-  const focusTarget = useRef(document.activeElement instanceof HTMLElement ? document.activeElement : null)
+  const focusTarget = useRef(
+    returnFocusTo ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null)
+  )
+
   const submitInFlight = useRef(false)
   const [idempotencyKey] = useState(() => globalThis.crypto.randomUUID())
 
@@ -289,7 +298,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, workflow }: Re
     setPreflightError(false)
     let current = true
 
-    void preflightWorkflow(workflow.name, profile).then(
+    void queryClient.fetchQuery(workflowDetailQueryOptions(workflow.name, profile)).then(
       next => {
         if (!current || !active.current) {
           return
@@ -309,7 +318,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, workflow }: Re
       current = false
       active.current = false
     }
-  }, [preflightAttempt, profile, workflow.name])
+  }, [preflightAttempt, profile, queryClient, workflow.name])
 
   const submit = async () => {
     if (!detail || submitInFlight.current) {

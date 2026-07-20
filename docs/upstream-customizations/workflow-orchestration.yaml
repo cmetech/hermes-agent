@@ -1015,3 +1015,72 @@ upstream_changes:
     idempotency, structured errors, accessible focus/error behavior, and the
     same four-locale coverage.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-view-modal
+  change_class: desktop-workflow-ui
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/package.json
+  - apps/desktop/src/app/workflows/detail-query.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/components/assistant-ui/embeds/workflow-topology.test.tsx
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - scripts/test_workflow_merge_gate.sh
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - ViewWorkflowDialog
+  - ViewWorkflowDialogProps
+  - stableWorkflowDefinitionJson
+  - cancelPendingWorkflowDetailQuery
+  - workflowDetailQueryKey
+  - workflowDetailQueryOptions
+  - useWorkflowDetailQuery
+  - WorkflowsView profile-bound view intent and non-stacking run handoff
+  - ReviewRunDialog explicit catalog return-focus target
+  - operations.workflowView translations
+  - workflow topology shared-renderer contract
+  - desktop workflow view-modal test gate
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/components/assistant-ui/embeds/workflow-topology.test.tsx
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(desktop): Task 7 add workflow view modal'
+  upstream_candidate: true
+  merge_guidance: Preserve one profile-keyed workflow detail query contract for
+    both View and Review & Run. Retain resolved detail long enough for View to
+    hand off to Review without refetching or stacking dialogs, while canceling
+    data-less in-flight queries on explicit View or Review close so a late
+    preflight cannot populate a reopened modal. Keep detail fetches one-shot
+    until the user explicitly retries. Keep the Mermaid default export lazy,
+    routed through the existing RichBoundary, and securityLevel strict in the shared renderer;
+    never add a second generator, initializer, dependency, or security policy.
+    Preserve the shared dialog's vertical scrolling while bounding horizontal
+    and inner Diagram/Definition overflow, render typed
+    omission codes as localized outline fallbacks, and keep fetch failures
+    retryable without exposing raw server codes. Definition must remain a
+    recursively code-unit-sorted, two-space JSON projection of the server's
+    redacted normalized definition, selectable and copyable through shared
+    CodeCard and CopyButton primitives, with no editable control. Keep the Run
+    action visible in both sub-views and fail closed until fetched detail proves
+    the workflow trusted, input-supported, compatible, and coordinator-healthy;
+    never authorize from a stale catalog row. Every disabled Run state must have
+    a visible localized reason associated through aria-describedby rather than
+    relying on an inaccessible disabled-button tooltip. Bind handoff and
+    admission to the profile captured when View opened. On View-to-Review handoff,
+    retain the stable catalog trigger as the explicit close-focus target rather
+    than focusing the detached View action. Preserve the generic open-dialog
+    keybind guard from Task 6.
+  removal_condition: Remove when upstream Desktop provides an equivalent secure
+    workflow topology/definition modal with shared profile-scoped preflight
+    caching, honest bounded fallbacks, read-only redacted definition copy, and a
+    non-stacking handoff to its native review-and-run flow.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

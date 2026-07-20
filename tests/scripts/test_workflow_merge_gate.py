@@ -93,6 +93,8 @@ def test_merge_gate_pins_desktop_review_run_contract() -> None:
     source = GATE.read_text()
 
     assert "src/app/workflows/review-run-dialog.test.tsx" in source
+    assert "src/app/workflows/view-workflow-dialog.test.tsx" in source
+    assert "src/components/assistant-ui/embeds/workflow-topology.test.tsx" in source
 
 
 def test_native_workflow_matrix_covers_every_release_gate() -> None:

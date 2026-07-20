@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { WorkflowDefinition, WorkflowRunSnapshot } from '@/types/hermes'
+import type { WorkflowDefinition, WorkflowDetail, WorkflowRunSnapshot } from '@/types/hermes'
 
 import { WorkflowCatalog } from './catalog'
 import { $workflowSelectedRunId } from './store'
@@ -14,6 +14,7 @@ const listWorkflowAttention = vi.fn()
 const listWorkflowEvents = vi.fn()
 const listWorkflowRuns = vi.fn()
 const listWorkflowDefinitions = vi.fn()
+const preflightWorkflow = vi.fn()
 const mutateWorkflowRun = vi.fn()
 const previewWorkflowCleanup = vi.fn()
 const executeWorkflowCleanup = vi.fn()
@@ -33,7 +34,9 @@ vi.mock('@/hermes', () => ({
 }))
 
 vi.mock('@/lib/hermes-api', () => ({
-  listWorkflowDefinitions: (...args: unknown[]) => listWorkflowDefinitions(...args)
+  listWorkflowDefinitions: (...args: unknown[]) => listWorkflowDefinitions(...args),
+  preflightWorkflow: (...args: unknown[]) => preflightWorkflow(...args),
+  WorkflowApiError: class WorkflowApiError extends Error {}
 }))
 
 vi.mock('@/store/profile', () => ({ ensureGatewayProfile: profileRouting.ensureGatewayProfile }))
@@ -80,6 +83,18 @@ function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefini
   }
 }
 
+function detail(overrides: Partial<WorkflowDetail> = {}): WorkflowDetail {
+  return {
+    ...definition(),
+    compatibility: { findings: [], level: 'supported', runnable: true },
+    coordinator: { healthy: true, reason: 'ready', status: 'healthy' },
+    definition: { inputs: {}, name: 'Laptop diagnostic' },
+    risk_summary: { execution_environment: 'local', risk_level: 'low' },
+    topology: { mermaid: null, omitted: null, text: 'start', warnings: [] },
+    ...overrides
+  }
+}
+
 async function renderView(client: QueryClient, initialTab: 'board' | 'workflows' = 'board') {
   const selectedRunId = $workflowSelectedRunId.get()
 
@@ -121,6 +136,7 @@ beforeEach(() => {
     listWorkflowEvents,
     listWorkflowRuns,
     listWorkflowDefinitions,
+    preflightWorkflow,
     mutateWorkflowRun,
     previewWorkflowCleanup,
     executeWorkflowCleanup
@@ -142,6 +158,7 @@ beforeEach(() => {
   listWorkflowEvents.mockResolvedValue({ cursor_reset: false, events: [], next_cursor: 0, schema_version: 1 })
   listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run()], schema_version: 1 })
   listWorkflowDefinitions.mockResolvedValue({ items: [definition()], truncated: false })
+  preflightWorkflow.mockRejectedValue(new Error('detail unavailable'))
 })
 
 afterEach(() => {
@@ -219,6 +236,33 @@ describe('WorkflowsView', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Run' }))
     expect(onViewWorkflow).toHaveBeenCalledWith(item)
     expect(onRunWorkflow).toHaveBeenCalledWith(item)
+  })
+
+  it('opens the workflow View dialog from the catalog action', async () => {
+    $workflowSelectedRunId.set(null)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+    fireEvent.click(await screen.findByRole('button', { name: 'View' }))
+
+    expect(await screen.findByRole('dialog', { name: 'View Laptop diagnostic' })).toBeTruthy()
+  })
+
+  it('restores catalog focus after View transitions to Review and closes', async () => {
+    $workflowSelectedRunId.set(null)
+    preflightWorkflow.mockResolvedValue(detail())
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+    const viewTrigger = await screen.findByRole('button', { name: 'View' })
+    viewTrigger.focus()
+    fireEvent.click(viewTrigger)
+    const viewDialog = await screen.findByRole('dialog', { name: 'View Laptop diagnostic' })
+    fireEvent.click(await within(viewDialog).findByRole('button', { name: 'Run' }))
+    const reviewDialog = await screen.findByRole('dialog', { name: 'Review & Run Laptop diagnostic' })
+    fireEvent.click(within(reviewDialog).getByRole('button', { name: 'Close' }))
+
+    await waitFor(() => expect(document.activeElement).toBe(viewTrigger))
   })
 
   it('derives semantic input badges and explains unsupported input shapes accessibly', async () => {
