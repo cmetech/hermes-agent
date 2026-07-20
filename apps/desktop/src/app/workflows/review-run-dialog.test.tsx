@@ -49,6 +49,7 @@ function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefini
     inputs: [],
     name: WORKFLOW_NAME,
     precedence: 2,
+    run_support: { reason: 'supported', supported: true },
     source: 'profile',
     supported_inputs: { reason: 'parameterless', supported: true },
     trust_state: 'trusted',
@@ -188,7 +189,7 @@ describe('Review & Run workflow dialog', () => {
         return { ok: true, value: { items: [catalogDefinition], truncated: false } }
       }
 
-      if (request.path === `/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`) {
+      if (request.path.startsWith(`/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`)) {
         return preflightHandler(request)
       }
 
@@ -224,6 +225,7 @@ describe('Review & Run workflow dialog', () => {
     await waitFor(() => {
       expect(apiStructured).toHaveBeenCalledWith({
         body: {
+          catalog_source: 'profile',
           concurrency_policy: 'queue',
           idempotency_key: IDEMPOTENCY_KEY,
           values: {},
@@ -240,6 +242,10 @@ describe('Review & Run workflow dialog', () => {
 
     expect(postBody).not.toHaveProperty('provenance')
     expect(postBody).not.toHaveProperty('source')
+    expect(apiStructured).toHaveBeenCalledWith({
+      path: `/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}?catalog_source=profile`,
+      profile: 'profile-a'
+    })
     expect((await screen.findByRole('tab', { name: 'Active board' })).getAttribute('aria-selected')).toBe('true')
     expect($workflowSelectedRunId.get()).toBe('run-created')
     expect($notifications.get()[0]?.message).toBe('Started')
@@ -289,6 +295,7 @@ describe('Review & Run workflow dialog', () => {
     expect(requests.find(request => request.path.includes('/workflows/Portable%20contract'))?.profile).toBe('profile-a')
     expect(requests.find(request => request.path === '/api/plugins/workflow/runs')).toMatchObject({
       body: {
+        catalog_source: 'profile',
         concurrency_policy: 'queue',
         idempotency_key: IDEMPOTENCY_KEY,
         values: { count: '3', enabled: 'false', mode: 'safe', title: 'release' },

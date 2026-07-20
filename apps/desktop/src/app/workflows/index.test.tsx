@@ -75,6 +75,7 @@ function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefini
     inputs: [],
     name: 'Laptop diagnostic',
     precedence: 1,
+    run_support: { reason: 'supported', supported: true },
     source: 'profile',
     supported_inputs: { reason: 'parameterless', supported: true },
     trust_state: 'trusted',

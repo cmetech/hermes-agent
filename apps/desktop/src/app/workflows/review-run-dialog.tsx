@@ -298,7 +298,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
     setPreflightError(false)
     let current = true
 
-    void queryClient.fetchQuery(workflowDetailQueryOptions(workflow.name, profile)).then(
+    void queryClient.fetchQuery(workflowDetailQueryOptions(workflow.name, workflow.source, profile)).then(
       next => {
         if (!current || !active.current) {
           return
@@ -318,7 +318,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
       current = false
       active.current = false
     }
-  }, [preflightAttempt, profile, queryClient, workflow.name])
+  }, [preflightAttempt, profile, queryClient, workflow.name, workflow.source])
 
   const submit = async () => {
     if (!detail || submitInFlight.current) {
@@ -363,6 +363,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
       if (!run) {
         const response = await startWorkflowRun(
           {
+            catalogSource: workflow.source,
             concurrencyPolicy: 'queue',
             idempotencyKey,
             values: wireValues,

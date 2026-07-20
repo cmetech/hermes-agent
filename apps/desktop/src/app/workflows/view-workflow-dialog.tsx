@@ -82,7 +82,7 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
   const copy = t.operations
   const runReasonId = useId()
   const [mode, setMode] = useState<ViewMode>('diagram')
-  const detail = useWorkflowDetailQuery(workflow.name, profile)
+  const detail = useWorkflowDetailQuery(workflow.name, workflow.source, profile)
 
   const definitionJson = useMemo(
     () => (detail.data ? stableWorkflowDefinitionJson(detail.data.definition) : ''),

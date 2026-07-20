@@ -1,7 +1,8 @@
 import { getApiRequestProfile } from '@/hermes'
-import type { WorkflowCatalogPage, WorkflowDetail, WorkflowStartResponse } from '@/types/hermes'
+import type { WorkflowCatalogPage, WorkflowCatalogSource, WorkflowDetail, WorkflowStartResponse } from '@/types/hermes'
 
 export interface StartWorkflowRunRequest {
+  catalogSource: WorkflowCatalogSource
   concurrencyPolicy: 'allow' | 'forbid' | 'queue'
   idempotencyKey: string
   values: Record<string, string>
@@ -77,10 +78,13 @@ export function listWorkflowDefinitions(profile: string | null = getApiRequestPr
 
 export function preflightWorkflow(
   name: string,
+  source: WorkflowCatalogSource,
   profile: string | null = getApiRequestProfile()
 ): Promise<WorkflowDetail> {
+  const query = new URLSearchParams({ catalog_source: source })
+
   return requestWorkflowApi<WorkflowDetail>({
-    path: `/api/plugins/workflow/workflows/${encodeURIComponent(name)}`,
+    path: `/api/plugins/workflow/workflows/${encodeURIComponent(name)}?${query}`,
     ...profileScoped(profile)
   })
 }
@@ -95,6 +99,7 @@ export async function startWorkflowRun(
 
   return requestWorkflowApi<WorkflowStartResponse>({
     body: {
+      catalog_source: request.catalogSource,
       concurrency_policy: request.concurrencyPolicy,
       idempotency_key: request.idempotencyKey,
       values: request.values,

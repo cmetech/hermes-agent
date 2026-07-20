@@ -1344,3 +1344,37 @@ upstream_changes:
   removal_condition: Remove when upstream admits authenticated bundled
     showcases through an equivalent fail-closed background API path.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-showcase-source-identity
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/detail-query.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - apps/desktop/src/lib/hermes-api.ts
+  - apps/desktop/src/types/hermes.ts
+  owned_symbols:
+  - WorkflowCatalogSource
+  - WorkflowTrustState
+  - WorkflowRunSupport
+  - StartWorkflowRunRequest.catalogSource
+  - source-aware workflow detail query key
+  tests:
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  expected_commit_subject: 'feat(desktop): preserve workflow catalog source identity'
+  upstream_candidate: true
+  merge_guidance: Preserve catalog source in the encoded detail query, React
+    Query cache identity, modal transitions, cancellation, and POST body. Keep
+    the captured request profile and one modal-lifetime idempotency UUID
+    independent from mutable ambient profile state; catalog source targets a
+    row and never claims trigger provenance.
+  removal_condition: Remove when upstream carries exact source identity from
+    catalog selection through detail caching and background admission.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

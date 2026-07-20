@@ -8,7 +8,7 @@ import { openModalOwnsKeyboard } from '@/app/hooks/use-keybinds'
 import { setApiRequestProfile } from '@/hermes'
 import type { WorkflowDefinition, WorkflowDetail } from '@/types/hermes'
 
-import { workflowDetailQueryOptions } from './detail-query'
+import { workflowDetailQueryKey, workflowDetailQueryOptions } from './detail-query'
 
 import { WorkflowsView } from './index'
 
@@ -56,6 +56,7 @@ function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefini
     inputs: [],
     name: WORKFLOW_NAME,
     precedence: 2,
+    run_support: { reason: 'supported', supported: true },
     source: 'profile',
     supported_inputs: { reason: 'parameterless', supported: true },
     trust_state: 'trusted',
@@ -162,7 +163,7 @@ describe('workflow View dialog', () => {
         return { ok: true, value: { items: [currentCatalogDefinition], truncated: false } }
       }
 
-      if (request.path === `/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`) {
+      if (request.path.startsWith(`/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`)) {
         return detailResponses.shift() ?? { ok: true, value: currentDetail }
       }
 
@@ -187,7 +188,10 @@ describe('workflow View dialog', () => {
   })
 
   it('configures workflow detail requests as one-shot until explicit Retry', () => {
-    expect(workflowDetailQueryOptions(WORKFLOW_NAME, 'profile-a').retry).toBe(false)
+    expect(workflowDetailQueryOptions(WORKFLOW_NAME, 'profile', 'profile-a').retry).toBe(false)
+    expect(workflowDetailQueryKey(WORKFLOW_NAME, 'project', 'profile-a')).not.toEqual(
+      workflowDetailQueryKey(WORKFLOW_NAME, 'showcase', 'profile-a')
+    )
   })
 
   it('fetches the captured profile and renders topology through the shared Mermaid component', async () => {
@@ -197,12 +201,12 @@ describe('workflow View dialog', () => {
     expect((await within(dialog).findByTestId('shared-mermaid-renderer')).textContent).toBe(MERMAID_SOURCE)
     expect(renderer.calls).toHaveBeenCalledWith(MERMAID_SOURCE)
     expect(apiStructured).toHaveBeenCalledWith({
-      path: `/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`,
+      path: `/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}?catalog_source=profile`,
       profile: 'profile-a'
     })
     expect(
-      apiStructured.mock.calls.filter(
-        ([request]) => request.path === `/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`
+      apiStructured.mock.calls.filter(([request]) =>
+        request.path.startsWith(`/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`)
       )
     ).toHaveLength(1)
     expect(openModalOwnsKeyboard()).toBe(true)
@@ -270,8 +274,8 @@ describe('workflow View dialog', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Retry' }))
     expect(await within(dialog).findByTestId('shared-mermaid-renderer')).toBeTruthy()
     expect(
-      apiStructured.mock.calls.filter(
-        ([request]) => request.path === `/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`
+      apiStructured.mock.calls.filter(([request]) =>
+        request.path.startsWith(`/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`)
       )
     ).toHaveLength(2)
   })
@@ -377,8 +381,8 @@ describe('workflow View dialog', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Diagram' }))
     fireEvent.click(within(dialog).getByRole('button', { name: 'Definition' }))
     expect(
-      apiStructured.mock.calls.filter(
-        ([request]) => request.path === `/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`
+      apiStructured.mock.calls.filter(([request]) =>
+        request.path.startsWith(`/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`)
       )
     ).toHaveLength(1)
   })
@@ -395,8 +399,8 @@ describe('workflow View dialog', () => {
     expect(screen.queryByRole('dialog', { name: `View ${WORKFLOW_NAME}` })).toBeNull()
     expect(within(review).getByText('Checks a release before deployment.')).toBeTruthy()
     expect(
-      apiStructured.mock.calls.filter(
-        ([request]) => request.path === `/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`
+      apiStructured.mock.calls.filter(([request]) =>
+        request.path.startsWith(`/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`)
       )
     ).toHaveLength(1)
     fireEvent.click(within(review).getByRole('button', { name: 'Start workflow' }))

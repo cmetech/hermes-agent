@@ -5,9 +5,14 @@ import { setApiRequestProfile } from '@/hermes'
 
 interface WorkflowApiModule {
   listWorkflowDefinitions: (profile?: string | null) => Promise<unknown>
-  preflightWorkflow: (name: string, profile?: string | null) => Promise<unknown>
+  preflightWorkflow: (
+    name: string,
+    source: 'profile' | 'project' | 'showcase',
+    profile?: string | null
+  ) => Promise<unknown>
   startWorkflowRun: (
     request: {
+      catalogSource: 'profile' | 'project' | 'showcase'
       concurrencyPolicy: 'allow' | 'forbid' | 'queue'
       idempotencyKey: string
       values: Record<string, string>
@@ -56,9 +61,10 @@ describe('workflow catalog authenticated API', () => {
     const { listWorkflowDefinitions, preflightWorkflow, startWorkflowRun } = await workflowApi()
 
     await listWorkflowDefinitions('profile-a')
-    await preflightWorkflow('deploy', 'profile-a')
+    await preflightWorkflow('deploy', 'project', 'profile-a')
     await startWorkflowRun(
       {
+        catalogSource: 'project',
         concurrencyPolicy: 'queue',
         idempotencyKey: 'captured-profile',
         values: {},
@@ -79,9 +85,9 @@ describe('workflow catalog authenticated API', () => {
     apiStructured.mockResolvedValue({ ok: true, value: detail })
     const { preflightWorkflow } = await workflowApi()
 
-    await expect(preflightWorkflow('deploy safe/blue')).resolves.toBe(detail)
+    await expect(preflightWorkflow('deploy safe/blue', 'showcase')).resolves.toBe(detail)
     expect(apiStructured).toHaveBeenCalledWith({
-      path: '/api/plugins/workflow/workflows/deploy%20safe%2Fblue'
+      path: '/api/plugins/workflow/workflows/deploy%20safe%2Fblue?catalog_source=showcase'
     })
   })
 
@@ -93,6 +99,7 @@ describe('workflow catalog authenticated API', () => {
 
     await expect(
       startWorkflowRun({
+        catalogSource: 'showcase',
         concurrencyPolicy: 'forbid',
         idempotencyKey: 'desktop-request-1',
         values: { subject: 'safe' },
@@ -102,6 +109,7 @@ describe('workflow catalog authenticated API', () => {
 
     expect(apiStructured).toHaveBeenCalledWith({
       body: {
+        catalog_source: 'showcase',
         concurrency_policy: 'forbid',
         idempotency_key: 'desktop-request-1',
         values: { subject: 'safe' },
@@ -118,6 +126,7 @@ describe('workflow catalog authenticated API', () => {
 
     await expect(
       startWorkflowRun({
+        catalogSource: 'project',
         concurrencyPolicy: 'queue',
         idempotencyKey,
         values: {},
@@ -139,6 +148,7 @@ describe('workflow catalog authenticated API', () => {
 
     await expect(
       startWorkflowRun({
+        catalogSource: 'project',
         concurrencyPolicy: 'queue',
         idempotencyKey: 'duplicate',
         values: {},
@@ -181,7 +191,7 @@ describe('workflow catalog authenticated API', () => {
     })
     const { preflightWorkflow } = await workflowApi()
 
-    await expect(preflightWorkflow('deploy')).rejects.toMatchObject({
+    await expect(preflightWorkflow('deploy', 'project')).rejects.toMatchObject({
       code: 'detail_code',
       message: 'Detail message',
       retryable: false
@@ -199,10 +209,10 @@ describe('workflow catalog authenticated API', () => {
         error: { code: 'plugin_conflict', message: 'Plugin conflict', retryable: false }
       }
     })
-    await expect(preflightWorkflow('deploy')).rejects.toMatchObject({ code: 'plugin_conflict' })
+    await expect(preflightWorkflow('deploy', 'project')).rejects.toMatchObject({ code: 'plugin_conflict' })
 
     apiStructured.mockResolvedValueOnce({ ok: false, status: 429, body: { detail: { message: 'Slow down' } } })
-    await expect(preflightWorkflow('deploy')).rejects.toMatchObject({
+    await expect(preflightWorkflow('deploy', 'project')).rejects.toMatchObject({
       code: '429',
       message: 'HTTP 429',
       retryable: false,
