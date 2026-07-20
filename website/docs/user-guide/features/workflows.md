@@ -12,7 +12,28 @@ Hermes workflows are durable, resumable packages that coordinate commands, promp
 
 Open **Workflows** in the Desktop sidebar to see the catalog for the selected profile. Each row shows the package name, version, description, trust state, supported inputs, and whether it came from the profile or the current project.
 
-The Desktop catalog currently provides discovery only. **Review & Run arrives with the Task 6 trigger flow.** Until then, use the CLI to inspect and start workflows. The catalog still shows its safety gates: an untrusted package or unsupported input shape has a disabled Run affordance with a focusable explanation. A partial-catalog warning means Hermes reached a safety or capacity limit; visible rows are still valid, but the list is incomplete.
+Select **View** to inspect a workflow without changing it. The Diagram view uses the normalized workflow topology. If the diagram exceeds a safety bound, Desktop shows the bounded text outline and explains why the diagram was omitted. The Definition view shows stable, read-only JSON derived from the normalized redacted definition—not raw YAML—and provides a copy action.
+
+Select **Run** to open **Review & Run**. Desktop fetches a fresh preflight and requires that exact package to be trusted, compatible, supported by the flat-input form, and backed by a healthy coordinator. Review the trust verdict, risk summary, and inputs before selecting **Start workflow**. Parameterless workflows and flat `string`, `number`, `boolean`, and `enum` inputs are supported in this version. Other input shapes remain available through the CLI.
+
+Enums must publish a bounded non-empty list of string choices; incomplete or
+non-string enum metadata is treated as unsupported instead of rendering an
+empty or ambiguous form. Untouched optional inputs are omitted from admission
+so package defaults retain their meaning.
+Optional booleans use an explicit **Not set / On / Off** control.
+Desktop input names must also be portable filename segments: Windows device
+names, path separators, control characters, and characters rejected by Windows
+filenames are classified unsupported rather than failing during admission. The
+generated text-input component (the name plus `.txt`) must fit both the 255-byte
+UTF-8 and 255-code-unit UTF-16 filename limits. This includes Windows'
+superscript device aliases (`COM¹`–`COM³`, `LPT¹`–`LPT³`), and names must remain
+distinct under case-insensitive filename matching. File and text inputs must
+also produce distinct targets—for example, file `report.txt` conflicts with
+text input `report` because text values receive a `.txt` suffix.
+
+After admission, Desktop opens the run on the **Active board**. A workflow waiting for approval or input appears in the **Attention** inbox. Opening that item shows the authoritative run state and available action. Starting a workflow only persists and queues it; execution happens in the background coordinator, outside the HTTP request.
+
+A partial-catalog warning means Hermes reached a safety or capacity limit; visible rows remain valid, but the list is incomplete. A corrupt package appears as a typed per-entry error so valid neighboring workflows stay usable.
 
 The CLI exposes the same discovery path:
 
@@ -23,6 +44,27 @@ hermes workflow doctor NAME
 ```
 
 Add `--json` for automation-safe output.
+
+### Desktop state and recovery guide
+
+| State                                     | What Desktop shows                                                        | Operator action                                                             |
+| ----------------------------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| Catalog unavailable                       | “Could not load workflows” with **Retry**                                 | Check the Desktop backend, then retry.                                      |
+| Empty catalog                             | “No workflows installed” and a documentation link                         | Install a package under the project or profile workflows directory.         |
+| Partial catalog                           | Warning above the valid rows                                              | Use the visible rows or reduce catalog size before relying on completeness. |
+| Invalid or over-capacity entry            | Error in that workflow's row; neighboring rows remain available           | Validate or reduce that package with the CLI.                               |
+| Detail missing or unavailable             | Typed View error with **Retry**                                           | Confirm the package still exists; retry transient failures.                 |
+| Diagram omitted                           | Explanation plus bounded text outline                                     | Review the outline or inspect the workflow with the CLI.                    |
+| Untrusted workflow                        | Run stays disabled with an associated explanation                         | Review and trust the current digest through the CLI.                        |
+| Unsupported inputs                        | Run stays disabled; the dialog points to `hermes workflow run NAME`       | Run it through the CLI; Desktop v1 does not build rich or file-input forms. |
+| Incompatible workflow                     | Blocking findings; no admission request is sent                           | Resolve the reported runtime or package incompatibility.                    |
+| Coordinator unavailable / HTTP 503        | Warning and retry path; no run is created                                 | Start or repair the coordinator host, then retry from the same review.      |
+| Validation failure / HTTP 422             | Field-level message when possible, otherwise a general validation error   | Correct the rejected values and submit again.                               |
+| Idempotency conflict / HTTP 409           | Conflict message instructing a fresh review                               | Close the modal, review current inputs, and start a new intent.             |
+| Network failure                           | Connection error with **Retry**                                           | Retry in the same modal; Desktop reuses that modal's idempotency key.       |
+| Created admission                         | “Started,” then the new run opens on the Active board                     | Monitor the run and respond to Attention items.                             |
+| Existing admission                        | “Already running—showing you that run”                                    | Continue with the previously admitted run; no duplicate is created.         |
+| Run admitted but profile activation fails | The run is retained and a retry offers to locate it without posting again | Retry locating the admitted run.                                            |
 
 ## Validate and trust a package
 

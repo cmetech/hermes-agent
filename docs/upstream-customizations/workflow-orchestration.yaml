@@ -1139,3 +1139,33 @@ upstream_changes:
   removal_condition: Remove when upstream provides equivalent real-middleware
     coverage for the complete Desktop workflow catalog-to-board contract.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-catalog-desktop-trigger-verification
+  change_class: workflow-verification
+  owner: workflow-orchestration
+  files:
+  - docs/reviews/2026-07-20-workflow-catalog-desktop-trigger-verification.md
+  - tests/plugins/workflow/fixtures/desktop-catalog-trigger/workflows/desktop-approval-uat.hermes.yaml
+  - tests/plugins/workflow/fixtures/desktop-catalog-trigger/workflows/desktop-approval-uat.yaml
+  - tests/plugins/workflow/fixtures/desktop-catalog-trigger/workflows/desktop-topology-omitted-uat.yaml
+  - website/docs/user-guide/features/workflows.md
+  owned_symbols:
+  - desktop-approval-uat reproducible Desktop approval fixture
+  - desktop-topology-omitted-uat reproducible bounded-fallback fixture
+  - workflow catalog and Desktop state operator guide
+  - workflow catalog Desktop trigger verification record
+  tests:
+  - tests/plugins/workflow/fixtures/desktop-catalog-trigger/workflows/desktop-approval-uat.yaml
+  - tests/plugins/workflow/fixtures/desktop-catalog-trigger/workflows/desktop-topology-omitted-uat.yaml
+  expected_commit_subject: 'docs(workflow): Task 9 verify catalog desktop trigger'
+  upstream_candidate: true
+  merge_guidance: Preserve the operator-facing catalog, secure View, and Review
+    and Run guidance with its honest error-state matrix. Keep both fixtures as
+    reproducible UAT inputs. Install them into a real project catalog and trust
+    the approval fixture through the ordinary digest-bound trust flow. The
+    verification record must continue to label this as fixture-based rather
+    than a bundled-showcase walkthrough and retain known limitations L-A and
+    L-B until those deliberate v1 boundaries change separately.
+  removal_condition: Remove when upstream provides equivalent operator docs,
+    reproducible Desktop approval and topology-omission fixtures, and a complete
+    independently reproducible verification record for the same feature.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
