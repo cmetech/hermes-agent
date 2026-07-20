@@ -1,0 +1,13 @@
+name: desktop-approval-uat
+description: Reproducible Desktop approval workflow for catalog trigger UAT
+nodes:
+  - id: prepare-review
+    bash: "printf 'prepared for approval'"
+  - id: operator-approval
+    approval:
+      message: Approve the deterministic Desktop UAT completion step.
+      capture_response: true
+    depends_on: [prepare-review]
+  - id: finish-after-approval
+    bash: "printf 'desktop approval workflow complete'"
+    depends_on: [operator-approval]

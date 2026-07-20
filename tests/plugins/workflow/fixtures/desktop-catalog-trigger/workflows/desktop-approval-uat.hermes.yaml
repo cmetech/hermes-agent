@@ -1,0 +1,9 @@
+overlap_policy: queue
+execution_environment: trusted_local
+limits:
+  max_parallel_nodes: 1
+  max_total_workers: 1
+  subprocess_timeout_seconds: 30
+resource_limits:
+  max_descendants: 2
+outward_action_nodes: []

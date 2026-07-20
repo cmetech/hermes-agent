@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -19,10 +20,21 @@ from hermes_cli.dashboard_auth import (
     register_provider,
 )
 from hermes_cli.dashboard_auth import token_auth
+from hermes_cli.dashboard_auth.middleware import gated_auth_middleware
+from hermes_cli.dashboard_auth.routes import router as dashboard_auth_router
 from plugins.workflow.actions import MUTATION_ACTIONS
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.schema import load_workflow
+from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
+from plugins.workflow.trust import (
+    WorkflowTrustStore,
+    build_risk_summary,
+    compute_package_digest,
+)
+from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
 
 class _WorkflowTokenProvider(DashboardAuthProvider):
@@ -120,11 +132,78 @@ def _real_token_app(*, paths: set[str], principals: dict[str, TokenPrincipal]):
     for path in paths:
         token_auth.register_token_route(path)
     app = FastAPI()
-    app.state.auth_required = False
+    app.state.auth_required = True
+    app.middleware("http")(gated_auth_middleware)
     app.middleware("http")(web_server.auth_middleware)
     app.middleware("http")(token_auth.token_auth_middleware)
     app.include_router(_workflow_router(), prefix="/api/plugins/workflow")
     return app
+
+
+def _real_session_app():
+    from hermes_cli import web_server
+
+    app = FastAPI()
+    app.state.auth_required = True
+    app.middleware("http")(gated_auth_middleware)
+    app.middleware("http")(web_server.auth_middleware)
+    app.middleware("http")(token_auth.token_auth_middleware)
+    app.include_router(_workflow_router(), prefix="/api/plugins/workflow")
+    app.include_router(dashboard_auth_router)
+    return app
+
+
+def _write_workflow(root: Path, *, name: str, nodes=None):
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{name}.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "name": name,
+                "description": "Real dashboard authentication fixture",
+                "nodes": nodes or [{"id": "start", "bash": "true"}],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return load_workflow(path)
+
+
+def _trusted_catalog_workflow(home: Path, *, name: str) -> None:
+    package = _write_workflow(home / "workflows", name=name)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(home).trust(
+        compute_package_digest(package).sha256,
+        actor="real-auth-test",
+        risk_digest=risk.risk_digest,
+    )
+
+
+def _healthy_coordinator(store: RunStore) -> None:
+    acquired = CoordinatorStore(store.database).try_acquire(
+        CoordinatorIdentity(
+            owner_id="real-auth-test",
+            host_kind="web",
+            host_instance_id="real-auth-test",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=datetime.now(timezone.utc),
+        lease_seconds=60,
+    )
+    assert acquired.is_leader
+
+
+def _complete_stub_login(client: TestClient) -> None:
+    started = client.get("/auth/login?provider=stub", follow_redirects=False)
+    assert started.status_code == 302
+    state = started.headers["location"].split("state=")[1]
+    completed = client.get(
+        f"/auth/callback?code=stub_code&state={state}",
+        follow_redirects=False,
+    )
+    assert completed.status_code == 302
 
 
 def test_real_dashboard_token_middleware_is_workflow_identity_boundary(
@@ -248,3 +327,128 @@ def test_post_runs_real_middleware_requires_workflow_write_scope(
     assert denied.json()["detail"]["code"] == "workflow_write_required"
     assert allowed_to_resolve.status_code == 404
     assert allowed_to_resolve.json()["detail"]["code"] == "workflow_not_found"
+
+
+def test_post_runs_real_gated_session_records_desktop_and_truthful_channel(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    register_provider(StubAuthProvider())
+    client = TestClient(
+        _real_session_app(),
+        base_url="https://workflow.test",
+    )
+    _complete_stub_login(client)
+    scope = "dashboard:stub:stub-org-1:stub-user-1"
+    store = RunStore(home)
+
+    decision_package = _write_workflow(
+        tmp_path / "decision",
+        name="real-session-decision",
+        nodes=[{"id": "review", "approval": {"message": "Approve?"}}],
+    )
+    decision_snapshot = store.prepare_run_snapshot(decision_package)
+    decision = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=decision_package.definition.name,
+            definition_digest=decision_snapshot.definition_digest,
+            policy_digest=decision_snapshot.policy_digest,
+            input_manifest_digest=decision_snapshot.input_manifest_digest,
+            trigger_source="desktop",
+            idempotency_key="real-session-decision",
+            concurrency_key="real-session-decision",
+            concurrency_policy="allow",
+            operator_scope=scope,
+        ),
+        immutable_snapshot=decision_snapshot,
+    )
+    paused = RunScheduler(store).advance(decision.run_id)
+    interaction_id = paused["nodes"]["review"]["pending_interaction"][
+        "interaction_id"
+    ]
+    approved = client.post(
+        f"/api/plugins/workflow/runs/{decision.run_id}/approve",
+        json={
+            "expected_version": paused["state_version"],
+            "interaction_id": interaction_id,
+            "comment": "approved through the real session gate",
+        },
+    )
+    assert approved.status_code == 200
+    decision_event = next(
+        event
+        for event in store.tail_events(decision.run_id)
+        if event["event_type"] == "interaction_approved"
+    )
+    assert decision_event["payload"]["actor"] == scope
+    assert decision_event["payload"]["channel"] == "api:stub"
+    RunScheduler(store).advance(decision.run_id)
+
+    _trusted_catalog_workflow(home, name="real-session-start")
+    _healthy_coordinator(store)
+    admitted = client.post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "real-session-start",
+            "values": {},
+            "idempotency_key": "real-session-start",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert admitted.status_code == 202
+    run = store.get_run_status(
+        admitted.json()["result"]["run_id"],
+        operator_scope=scope,
+    )
+    assert run["trigger"] == "desktop"
+    assert run["provenance"]["source"] == "desktop"
+    assert run["provenance"]["actor_id"] == scope
+    assert run["provenance"]["source_instance"] == "api:session:stub"
+
+
+def test_post_runs_real_token_middleware_ignores_forged_desktop_source(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, name="real-token-start")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    path = "/api/plugins/workflow/runs"
+    app = _real_token_app(
+        paths={path},
+        principals={
+            "write-secret": TokenPrincipal(
+                principal="writer",
+                provider="workflow-token",
+                scopes=("workflow:write",),
+            )
+        },
+    )
+
+    admitted = TestClient(app).post(
+        path,
+        headers={
+            "Authorization": "Bearer write-secret",
+            "X-Hermes-Workflow-Source": "desktop",
+        },
+        json={
+            "workflow": "real-token-start",
+            "values": {},
+            "idempotency_key": "real-token-start",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert admitted.status_code == 202
+    scope = "service:workflow-token:writer"
+    run = store.get_run_status(
+        admitted.json()["result"]["run_id"],
+        operator_scope=scope,
+    )
+    assert run["trigger"] == "api"
+    assert run["provenance"]["source"] == "api"
+    assert run["provenance"]["actor_id"] == scope
+    assert run["provenance"]["source_instance"] == "api:token:workflow-token"

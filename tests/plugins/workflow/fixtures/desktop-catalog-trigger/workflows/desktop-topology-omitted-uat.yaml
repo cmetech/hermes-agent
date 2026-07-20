@@ -1,0 +1,305 @@
+name: desktop-topology-omitted-uat
+description: Reproducible Desktop fixture whose Mermaid topology exceeds the v1 node bound
+nodes:
+  - id: outline-001
+    bash: "printf 'outline 001'"
+  - id: outline-002
+    bash: "printf 'outline 002'"
+    depends_on: [outline-001]
+  - id: outline-003
+    bash: "printf 'outline 003'"
+    depends_on: [outline-002]
+  - id: outline-004
+    bash: "printf 'outline 004'"
+    depends_on: [outline-003]
+  - id: outline-005
+    bash: "printf 'outline 005'"
+    depends_on: [outline-004]
+  - id: outline-006
+    bash: "printf 'outline 006'"
+    depends_on: [outline-005]
+  - id: outline-007
+    bash: "printf 'outline 007'"
+    depends_on: [outline-006]
+  - id: outline-008
+    bash: "printf 'outline 008'"
+    depends_on: [outline-007]
+  - id: outline-009
+    bash: "printf 'outline 009'"
+    depends_on: [outline-008]
+  - id: outline-010
+    bash: "printf 'outline 010'"
+    depends_on: [outline-009]
+  - id: outline-011
+    bash: "printf 'outline 011'"
+    depends_on: [outline-010]
+  - id: outline-012
+    bash: "printf 'outline 012'"
+    depends_on: [outline-011]
+  - id: outline-013
+    bash: "printf 'outline 013'"
+    depends_on: [outline-012]
+  - id: outline-014
+    bash: "printf 'outline 014'"
+    depends_on: [outline-013]
+  - id: outline-015
+    bash: "printf 'outline 015'"
+    depends_on: [outline-014]
+  - id: outline-016
+    bash: "printf 'outline 016'"
+    depends_on: [outline-015]
+  - id: outline-017
+    bash: "printf 'outline 017'"
+    depends_on: [outline-016]
+  - id: outline-018
+    bash: "printf 'outline 018'"
+    depends_on: [outline-017]
+  - id: outline-019
+    bash: "printf 'outline 019'"
+    depends_on: [outline-018]
+  - id: outline-020
+    bash: "printf 'outline 020'"
+    depends_on: [outline-019]
+  - id: outline-021
+    bash: "printf 'outline 021'"
+    depends_on: [outline-020]
+  - id: outline-022
+    bash: "printf 'outline 022'"
+    depends_on: [outline-021]
+  - id: outline-023
+    bash: "printf 'outline 023'"
+    depends_on: [outline-022]
+  - id: outline-024
+    bash: "printf 'outline 024'"
+    depends_on: [outline-023]
+  - id: outline-025
+    bash: "printf 'outline 025'"
+    depends_on: [outline-024]
+  - id: outline-026
+    bash: "printf 'outline 026'"
+    depends_on: [outline-025]
+  - id: outline-027
+    bash: "printf 'outline 027'"
+    depends_on: [outline-026]
+  - id: outline-028
+    bash: "printf 'outline 028'"
+    depends_on: [outline-027]
+  - id: outline-029
+    bash: "printf 'outline 029'"
+    depends_on: [outline-028]
+  - id: outline-030
+    bash: "printf 'outline 030'"
+    depends_on: [outline-029]
+  - id: outline-031
+    bash: "printf 'outline 031'"
+    depends_on: [outline-030]
+  - id: outline-032
+    bash: "printf 'outline 032'"
+    depends_on: [outline-031]
+  - id: outline-033
+    bash: "printf 'outline 033'"
+    depends_on: [outline-032]
+  - id: outline-034
+    bash: "printf 'outline 034'"
+    depends_on: [outline-033]
+  - id: outline-035
+    bash: "printf 'outline 035'"
+    depends_on: [outline-034]
+  - id: outline-036
+    bash: "printf 'outline 036'"
+    depends_on: [outline-035]
+  - id: outline-037
+    bash: "printf 'outline 037'"
+    depends_on: [outline-036]
+  - id: outline-038
+    bash: "printf 'outline 038'"
+    depends_on: [outline-037]
+  - id: outline-039
+    bash: "printf 'outline 039'"
+    depends_on: [outline-038]
+  - id: outline-040
+    bash: "printf 'outline 040'"
+    depends_on: [outline-039]
+  - id: outline-041
+    bash: "printf 'outline 041'"
+    depends_on: [outline-040]
+  - id: outline-042
+    bash: "printf 'outline 042'"
+    depends_on: [outline-041]
+  - id: outline-043
+    bash: "printf 'outline 043'"
+    depends_on: [outline-042]
+  - id: outline-044
+    bash: "printf 'outline 044'"
+    depends_on: [outline-043]
+  - id: outline-045
+    bash: "printf 'outline 045'"
+    depends_on: [outline-044]
+  - id: outline-046
+    bash: "printf 'outline 046'"
+    depends_on: [outline-045]
+  - id: outline-047
+    bash: "printf 'outline 047'"
+    depends_on: [outline-046]
+  - id: outline-048
+    bash: "printf 'outline 048'"
+    depends_on: [outline-047]
+  - id: outline-049
+    bash: "printf 'outline 049'"
+    depends_on: [outline-048]
+  - id: outline-050
+    bash: "printf 'outline 050'"
+    depends_on: [outline-049]
+  - id: outline-051
+    bash: "printf 'outline 051'"
+    depends_on: [outline-050]
+  - id: outline-052
+    bash: "printf 'outline 052'"
+    depends_on: [outline-051]
+  - id: outline-053
+    bash: "printf 'outline 053'"
+    depends_on: [outline-052]
+  - id: outline-054
+    bash: "printf 'outline 054'"
+    depends_on: [outline-053]
+  - id: outline-055
+    bash: "printf 'outline 055'"
+    depends_on: [outline-054]
+  - id: outline-056
+    bash: "printf 'outline 056'"
+    depends_on: [outline-055]
+  - id: outline-057
+    bash: "printf 'outline 057'"
+    depends_on: [outline-056]
+  - id: outline-058
+    bash: "printf 'outline 058'"
+    depends_on: [outline-057]
+  - id: outline-059
+    bash: "printf 'outline 059'"
+    depends_on: [outline-058]
+  - id: outline-060
+    bash: "printf 'outline 060'"
+    depends_on: [outline-059]
+  - id: outline-061
+    bash: "printf 'outline 061'"
+    depends_on: [outline-060]
+  - id: outline-062
+    bash: "printf 'outline 062'"
+    depends_on: [outline-061]
+  - id: outline-063
+    bash: "printf 'outline 063'"
+    depends_on: [outline-062]
+  - id: outline-064
+    bash: "printf 'outline 064'"
+    depends_on: [outline-063]
+  - id: outline-065
+    bash: "printf 'outline 065'"
+    depends_on: [outline-064]
+  - id: outline-066
+    bash: "printf 'outline 066'"
+    depends_on: [outline-065]
+  - id: outline-067
+    bash: "printf 'outline 067'"
+    depends_on: [outline-066]
+  - id: outline-068
+    bash: "printf 'outline 068'"
+    depends_on: [outline-067]
+  - id: outline-069
+    bash: "printf 'outline 069'"
+    depends_on: [outline-068]
+  - id: outline-070
+    bash: "printf 'outline 070'"
+    depends_on: [outline-069]
+  - id: outline-071
+    bash: "printf 'outline 071'"
+    depends_on: [outline-070]
+  - id: outline-072
+    bash: "printf 'outline 072'"
+    depends_on: [outline-071]
+  - id: outline-073
+    bash: "printf 'outline 073'"
+    depends_on: [outline-072]
+  - id: outline-074
+    bash: "printf 'outline 074'"
+    depends_on: [outline-073]
+  - id: outline-075
+    bash: "printf 'outline 075'"
+    depends_on: [outline-074]
+  - id: outline-076
+    bash: "printf 'outline 076'"
+    depends_on: [outline-075]
+  - id: outline-077
+    bash: "printf 'outline 077'"
+    depends_on: [outline-076]
+  - id: outline-078
+    bash: "printf 'outline 078'"
+    depends_on: [outline-077]
+  - id: outline-079
+    bash: "printf 'outline 079'"
+    depends_on: [outline-078]
+  - id: outline-080
+    bash: "printf 'outline 080'"
+    depends_on: [outline-079]
+  - id: outline-081
+    bash: "printf 'outline 081'"
+    depends_on: [outline-080]
+  - id: outline-082
+    bash: "printf 'outline 082'"
+    depends_on: [outline-081]
+  - id: outline-083
+    bash: "printf 'outline 083'"
+    depends_on: [outline-082]
+  - id: outline-084
+    bash: "printf 'outline 084'"
+    depends_on: [outline-083]
+  - id: outline-085
+    bash: "printf 'outline 085'"
+    depends_on: [outline-084]
+  - id: outline-086
+    bash: "printf 'outline 086'"
+    depends_on: [outline-085]
+  - id: outline-087
+    bash: "printf 'outline 087'"
+    depends_on: [outline-086]
+  - id: outline-088
+    bash: "printf 'outline 088'"
+    depends_on: [outline-087]
+  - id: outline-089
+    bash: "printf 'outline 089'"
+    depends_on: [outline-088]
+  - id: outline-090
+    bash: "printf 'outline 090'"
+    depends_on: [outline-089]
+  - id: outline-091
+    bash: "printf 'outline 091'"
+    depends_on: [outline-090]
+  - id: outline-092
+    bash: "printf 'outline 092'"
+    depends_on: [outline-091]
+  - id: outline-093
+    bash: "printf 'outline 093'"
+    depends_on: [outline-092]
+  - id: outline-094
+    bash: "printf 'outline 094'"
+    depends_on: [outline-093]
+  - id: outline-095
+    bash: "printf 'outline 095'"
+    depends_on: [outline-094]
+  - id: outline-096
+    bash: "printf 'outline 096'"
+    depends_on: [outline-095]
+  - id: outline-097
+    bash: "printf 'outline 097'"
+    depends_on: [outline-096]
+  - id: outline-098
+    bash: "printf 'outline 098'"
+    depends_on: [outline-097]
+  - id: outline-099
+    bash: "printf 'outline 099'"
+    depends_on: [outline-098]
+  - id: outline-100
+    bash: "printf 'outline 100'"
+    depends_on: [outline-099]
+  - id: outline-101
+    bash: "printf 'outline 101'"
+    depends_on: [outline-100]

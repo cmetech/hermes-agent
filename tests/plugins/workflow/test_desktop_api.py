@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 import sys
 from pathlib import Path
@@ -17,6 +18,12 @@ import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
+import plugins.workflow.api_admission as api_admission_module
+from plugins.workflow.api_admission import (
+    ApiAdmissionAuthority,
+    ApiAdmissionError,
+    start_api_run,
+)
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.notifications import NotificationOutbox
@@ -25,6 +32,7 @@ from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
 from plugins.workflow.showcase import run_showcase
 from plugins.workflow.trust import (
+    WorkflowResourceReadBudget,
     WorkflowTrustStore,
     build_risk_summary,
     compute_package_digest,
@@ -186,7 +194,7 @@ def test_post_runs_api_admission_requires_write_and_server_derived_provenance(
         "/api/plugins/workflow/runs",
         json=body,
         headers={
-            "X-Hermes-Workflow-Source": "cron",
+            "X-Hermes-Workflow-Source": "desktop",
             "X-Hermes-Principal": "forged-admin",
             "X-Hermes-Source-Instance": "forged-instance",
             "X-Hermes-Channel": "forged-channel",
@@ -202,6 +210,7 @@ def test_post_runs_api_admission_requires_write_and_server_derived_provenance(
     result = admitted.json()["result"]
     assert result["admission_disposition"] == "created"
     run = store.get_run_status(result["run_id"], operator_scope="service:test:writer")
+    assert run["trigger"] == "api"
     assert run["execution_mode"] == "background"
     assert run["provenance"]["source"] == "api"
     assert run["provenance"]["assurance"] == "verified_adapter"
@@ -209,6 +218,96 @@ def test_post_runs_api_admission_requires_write_and_server_derived_provenance(
     assert run["provenance"]["source_instance"] == "api:token:test"
     assert run["provenance"]["return_route"] is None
     assert "forged" not in str(run["provenance"])
+
+
+def test_post_runs_authenticated_session_middleware_records_desktop_source(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, workflow_writer, name="desktop-admission")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    session = SimpleNamespace(
+        provider="test",
+        org_id="org",
+        user_id="desktop-user",
+    )
+    scope = "dashboard:test:org:desktop-user"
+    module = _module()
+    client = TestClient(_app(module.router, session=session))
+
+    admitted = client.post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "desktop-admission",
+            "values": {},
+            "idempotency_key": "desktop-request",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert admitted.status_code == 202
+    run_id = admitted.json()["result"]["run_id"]
+    run = store.get_run_status(run_id, operator_scope=scope)
+    assert run["trigger"] == "desktop"
+    assert run["execution_mode"] == "background"
+    assert run["provenance"]["source"] == "desktop"
+    assert run["provenance"]["assurance"] == "verified_adapter"
+    assert run["provenance"]["actor_id"] == scope
+    assert run["provenance"]["source_instance"] == "api:session:test"
+
+
+def test_api_admission_authority_preserves_legacy_positional_return_route() -> None:
+    authority = ApiAdmissionAuthority(
+        "verified-principal",
+        "api:verified-principal",
+        None,
+        "api:token:test",
+        "verified_adapter",
+        "opaque-return-route",
+    )
+
+    assert authority.return_route == "opaque-return-route"
+    assert authority.trigger_source == "api"
+
+
+@pytest.mark.parametrize("source", ["chat", "background_agent"])
+def test_api_admission_rejects_non_rest_sources_without_persistence(
+    tmp_path, monkeypatch, workflow_writer, source
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, workflow_writer, name="invalid-api-source")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    authority = ApiAdmissionAuthority(
+        principal="service:test:writer",
+        namespace="api:service:test:writer",
+        operator_scope="service:test:writer",
+        source_instance="api:token:test",
+        assurance="verified_adapter",
+        trigger_source=source,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="authenticated API source must be api or desktop",
+    ):
+        start_api_run(
+            store,
+            hermes_home=home,
+            workdir=tmp_path,
+            user_home=tmp_path,
+            workflow_name="invalid-api-source",
+            values={},
+            idempotency_key=f"invalid-{source}",
+            concurrency_policy="queue",
+            authority=authority,
+        )
+
+    assert list(store.runs_root.rglob("run.json")) == []
+    assert list(store.staging_root.iterdir()) == []
 
 
 def test_post_runs_api_admission_requires_healthy_coordinator_without_run(
@@ -234,6 +333,107 @@ def test_post_runs_api_admission_requires_healthy_coordinator_without_run(
 
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "coordinator_unavailable"
+    assert list(store.runs_root.rglob("run.json")) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
+def test_direct_api_admission_rejects_incompatible_workflow_before_persistence(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="api-incompatible-direct",
+        nodes=[
+            {
+                "id": "shell",
+                "bash": "true",
+                "allowed_tools": ["Read"],
+            }
+        ],
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    original_assess = api_admission_module.assess_compatibility
+    assessments = 0
+
+    def counted_assess(package):
+        nonlocal assessments
+        assessments += 1
+        return original_assess(package)
+
+    monkeypatch.setattr(api_admission_module, "assess_compatibility", counted_assess)
+
+    with pytest.raises(ApiAdmissionError) as caught:
+        start_api_run(
+            store,
+            hermes_home=home,
+            workdir=tmp_path,
+            user_home=tmp_path,
+            workflow_name="api-incompatible-direct",
+            values={},
+            idempotency_key="incompatible-direct",
+            concurrency_policy="queue",
+            authority=ApiAdmissionAuthority(
+                principal="desktop:test",
+                namespace="desktop:test",
+                operator_scope=None,
+                source_instance="api:session:test",
+                assurance="verified_adapter",
+                trigger_source="desktop",
+            ),
+        )
+
+    assert caught.value.code == "workflow_compatibility_blocked"
+    assert caught.value.status_code == 409
+    assert caught.value.retryable is False
+    assert assessments == 1
+    assert list(store.runs_root.rglob("run.json")) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
+def test_post_runs_rejects_incompatible_workflow_without_run_or_execution(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="api-incompatible-http",
+        nodes=[
+            {
+                "id": "shell",
+                "bash": "true",
+                "allowed_tools": ["Read"],
+            }
+        ],
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    writer = TokenPrincipal(
+        principal="writer", provider="test", scopes=("workflow:write",)
+    )
+
+    response = TestClient(_app(_router(), token=writer)).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "api-incompatible-http",
+            "values": {},
+            "idempotency_key": "incompatible-http",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "workflow_compatibility_blocked",
+            "retryable": False,
+        }
+    }
     assert list(store.runs_root.rglob("run.json")) == []
     assert list(store.staging_root.iterdir()) == []
 
@@ -402,9 +602,292 @@ def test_post_runs_api_admission_rejects_unbounded_or_caller_auth_fields(
             "return_route": "caller-route",
         },
     )
+    unsafe_names = [
+        "foo/bar",
+        "foo\\bar",
+        "mode\x1b[31m",
+        "api_token",
+        "CON",
+        "nul.txt",
+        "COM1",
+        "foo:bar",
+        "a?b",
+        "a*b",
+        "<x>",
+        "a|b",
+        "trailing.",
+        "trailing ",
+        "😀" * 64,
+        "COM¹",
+        "COM².txt",
+        "com³",
+        "LPT¹",
+        "lpt².log",
+        "LPT³",
+    ]
+    unsafe_values = [
+        client.post(
+            "/api/plugins/workflow/runs",
+            json={**base, "values": {name: "value"}},
+        )
+        for name in unsafe_names
+    ]
+    colliding_values = client.post(
+        "/api/plugins/workflow/runs",
+        json={**base, "values": {"Mode": "first", "mode": "second"}},
+    )
 
     assert oversized.status_code == 422
     assert caller_identity.status_code == 422
+    assert [response.status_code for response in unsafe_values] == [422] * len(
+        unsafe_names
+    )
+    assert colliding_values.status_code == 422
+
+
+def test_post_runs_applies_catalog_resource_bounds_before_admission(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    commands = home / "commands"
+    commands.mkdir(parents=True)
+    (commands / "oversized.md").write_bytes(b"x" * (1024 * 1024 + 1))
+    oversized = _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="api-oversized-resource",
+        nodes=[{"id": "oversized", "command": "oversized"}],
+    )
+    aggregate_nodes = []
+    for index in range(9):
+        resource_name = f"aggregate-{index}"
+        (commands / f"{resource_name}.md").write_bytes(b"x" * 1024 * 1024)
+        aggregate_nodes.append({"id": resource_name, "command": resource_name})
+    aggregate = _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="api-aggregate-resource",
+        nodes=aggregate_nodes,
+    )
+    assert compute_package_digest(oversized).sha256
+    assert compute_package_digest(aggregate).sha256
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    client = TestClient(_app(_router()))
+
+    responses = [
+        client.post(
+            "/api/plugins/workflow/runs",
+            json={
+                "workflow": workflow,
+                "values": {},
+                "idempotency_key": f"resource-bound-{index}",
+                "concurrency_policy": "queue",
+            },
+        )
+        for index, workflow in enumerate(
+            ("api-oversized-resource", "api-aggregate-resource")
+        )
+    ]
+
+    assert [response.status_code for response in responses] == [503, 503]
+    assert [response.json() for response in responses] == [
+        {
+            "detail": {
+                "code": "workflow_catalog_capacity",
+                "retryable": True,
+            }
+        },
+        {
+            "detail": {
+                "code": "workflow_catalog_capacity",
+                "retryable": True,
+            }
+        },
+    ]
+    assert list(store.runs_root.iterdir()) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
+def test_post_runs_applies_catalog_projection_bounds_before_admission(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="api-projection-capacity",
+        nodes=[
+            {"id": f"node-{index:03d}", "bash": "true"}
+            for index in range(513)
+        ],
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+
+    response = TestClient(_app(_router())).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "api-projection-capacity",
+            "values": {},
+            "idempotency_key": "projection-capacity",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "workflow_catalog_capacity", "retryable": True}
+    }
+    assert list(store.runs_root.iterdir()) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
+def test_post_runs_discards_snapshot_that_does_not_match_trusted_package(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, workflow_writer, name="api-package-change")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    original_prepare = RunStore.prepare_run_snapshot
+
+    def mismatched_prepare(self, *args, **kwargs):
+        prepared = original_prepare(self, *args, **kwargs)
+        return replace(prepared, definition_digest="0" * 64)
+
+    monkeypatch.setattr(RunStore, "prepare_run_snapshot", mismatched_prepare)
+    response = TestClient(_app(_router())).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "api-package-change",
+            "values": {},
+            "idempotency_key": "package-change",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {"code": "workflow_package_changed", "retryable": False}
+    }
+    assert list(store.runs_root.iterdir()) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
+def test_catalog_detail_and_admission_agree_after_cross_entry_resource_reads(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    commands = home / "commands"
+    commands.mkdir(parents=True)
+
+    def command_nodes(prefix: str, count: int):
+        nodes = []
+        for index in range(count):
+            name = f"{prefix}-{index}"
+            (commands / f"{name}.md").write_bytes(b"x" * 1024 * 1024)
+            nodes.append({"id": name, "command": name})
+        return nodes
+
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="cross-entry-alpha",
+        nodes=command_nodes("alpha", 7),
+    )
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="cross-entry-beta",
+        nodes=command_nodes("beta", 2),
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    client = TestClient(_app(_router()))
+
+    catalog = client.get("/api/plugins/workflow/workflows")
+    detail = client.get("/api/plugins/workflow/workflows/cross-entry-beta")
+    admitted = client.post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "cross-entry-beta",
+            "values": {},
+            "idempotency_key": "cross-entry-beta",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert catalog.status_code == 200
+    assert catalog.json()["truncated"] is False
+    assert [item["name"] for item in catalog.json()["items"]] == [
+        "cross-entry-alpha",
+        "cross-entry-beta",
+    ]
+    assert all("error" not in item for item in catalog.json()["items"])
+    assert detail.status_code == 200
+    assert admitted.status_code == 202
+    assert admitted.json()["result"]["admission_disposition"] == "created"
+
+
+@pytest.mark.parametrize("mutation", ["delete", "symlink"])
+def test_post_runs_snapshots_only_sealed_trusted_resource_bytes(
+    tmp_path, monkeypatch, workflow_writer, mutation
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    commands = home / "commands"
+    commands.mkdir(parents=True)
+    resource = commands / "sealed.md"
+    resource.write_text("TRUSTED_RESOURCE", encoding="utf-8")
+    external = tmp_path / "external.md"
+    external.write_text("UNTRUSTED_EXTERNAL_RESOURCE", encoding="utf-8")
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name=f"sealed-resource-{mutation}",
+        nodes=[{"id": "sealed", "command": "sealed"}],
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    original_read = WorkflowResourceReadBudget.read
+    canonical_resource = resource.resolve()
+    trusted_reads = 0
+
+    def mutate_after_trusted_read(self, path):
+        nonlocal trusted_reads
+        data = original_read(self, path)
+        if path == canonical_resource:
+            trusted_reads += 1
+            if trusted_reads == 2:
+                resource.unlink()
+                if mutation == "symlink":
+                    try:
+                        resource.symlink_to(external)
+                    except OSError:
+                        pytest.skip("symlinks unavailable")
+        return data
+
+    monkeypatch.setattr(WorkflowResourceReadBudget, "read", mutate_after_trusted_read)
+    response = TestClient(_app(_router()), raise_server_exceptions=False).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": f"sealed-resource-{mutation}",
+            "values": {},
+            "idempotency_key": f"sealed-resource-{mutation}",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 202
+    run_id = response.json()["result"]["run_id"]
+    captured = store.run_directory(run_id) / "commands" / "sealed.md"
+    assert captured.read_text(encoding="utf-8") == "TRUSTED_RESOURCE"
+    assert external.read_text(encoding="utf-8") == "UNTRUSTED_EXTERNAL_RESOURCE"
 
 
 def test_runs_are_bounded_cursor_paginated_and_scope_authorized(

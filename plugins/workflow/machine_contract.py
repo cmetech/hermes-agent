@@ -146,6 +146,15 @@ def projection_was_truncated(value: object, *, depth: int = 0) -> bool:
 def _sanitize_success_result(command: str, result: object) -> object:
     sanitized = sanitize_projection(result)
     if (
+        command == "workflow show"
+        and isinstance(result, Mapping)
+        and isinstance(sanitized, dict)
+        and isinstance(result.get("definition"), Mapping)
+    ):
+        # show_package already emits a semantically redacted, byte-bounded,
+        # complete definition; generic projection list limits must not clip it.
+        sanitized["definition"] = dict(result["definition"])
+    if (
         command in _CONFIRMATION_CAPABILITY_COMMANDS
         and isinstance(result, Mapping)
         and isinstance(sanitized, dict)

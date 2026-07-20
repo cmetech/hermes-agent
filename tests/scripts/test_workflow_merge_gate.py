@@ -77,6 +77,32 @@ def test_merge_gate_enforces_async_reload_and_delivery_regressions() -> None:
         assert required_test in source
 
 
+def test_merge_gate_pins_workflow_catalog_api_contract() -> None:
+    source = GATE.read_text()
+
+    assert "tests/plugins/workflow/test_catalog_api.py" in source
+
+
+def test_merge_gate_pins_workflow_detail_api_contract() -> None:
+    source = GATE.read_text()
+
+    assert "tests/plugins/workflow/test_workflow_detail_api.py" in source
+
+
+def test_merge_gate_pins_workflow_catalog_desktop_e2e_contract() -> None:
+    source = GATE.read_text()
+
+    assert "tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py" in source
+
+
+def test_merge_gate_pins_desktop_review_run_contract() -> None:
+    source = GATE.read_text()
+
+    assert "src/app/workflows/review-run-dialog.test.tsx" in source
+    assert "src/app/workflows/view-workflow-dialog.test.tsx" in source
+    assert "src/components/assistant-ui/embeds/workflow-topology.test.tsx" in source
+
+
 def test_native_workflow_matrix_covers_every_release_gate() -> None:
     source = CI.read_text()
 

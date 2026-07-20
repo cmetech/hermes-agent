@@ -104,6 +104,7 @@ import {
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
+import { collectStructuredJsonResponse } from './structured-api-response'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
 import { readLiveUpdateMarker, writeUpdateMarker } from './update-marker'
@@ -3993,6 +3994,12 @@ function fetchJson(url, token, options: any = {}) {
         }
       },
       res => {
+        if (options.structured) {
+          collectStructuredJsonResponse(res, { url }, resolve, reject)
+
+          return
+        }
+
         const chunks = []
         res.on('error', reject)
         res.on('data', chunk => chunks.push(chunk))
@@ -4030,7 +4037,8 @@ function fetchJson(url, token, options: any = {}) {
           }
 
           try {
-            resolve(JSON.parse(text))
+            const value = JSON.parse(text)
+            resolve(value)
           } catch {
             reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
           }
@@ -5603,12 +5611,32 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
     }, timeoutMs)
 
     request.on('response', res => {
+      if (options.structured) {
+        collectStructuredJsonResponse(
+          res,
+          { isTimedOut: () => timedOut, onSettled: () => clearTimeout(timer), url },
+          resolve,
+          reject
+        )
+
+        return
+      }
+
       const chunks = []
+      res.on('error', error => {
+        if (timedOut) {
+          return
+        }
+
+        clearTimeout(timer)
+        reject(error)
+      })
       res.on('data', chunk => chunks.push(Buffer.from(chunk)))
       res.on('end', () => {
         if (timedOut) {
           return
         }
+
         clearTimeout(timer)
         const text = Buffer.concat(chunks).toString('utf8')
         const statusCode = res.statusCode || 500
@@ -5637,7 +5665,8 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
         }
 
         try {
-          resolve(JSON.parse(text))
+          const value = JSON.parse(text)
+          resolve(value)
         } catch {
           reject(new Error(`Invalid JSON from ${url} (status ${statusCode}): ${text.slice(0, 200)}`))
         }
@@ -8190,6 +8219,35 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
 
   return { ...(base as any), sessions: merged.slice(offset, offset + limit), total, profile_totals: profileTotals }
 }
+
+ipcMain.handle('hermes:api:structured', async (_event, request) => {
+  const profile = request?.profile
+  const connection = await ensureBackend(profile)
+  const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+
+  const requestPath = pathWithGlobalRemoteProfile(request.path, profile, {
+    globalRemote: globalRemoteActive(),
+    profileRemoteOverride: profileHasRemoteOverride(profile)
+  })
+
+  const url = `${connection.baseUrl}${requestPath}`
+
+  if (connection.authMode === 'oauth') {
+    return fetchJsonViaOauthSession(url, {
+      method: request?.method,
+      body: request?.body,
+      timeoutMs,
+      structured: true
+    })
+  }
+
+  return fetchJson(url, connection.token, {
+    method: request?.method,
+    body: request?.body,
+    timeoutMs,
+    structured: true
+  })
+})
 
 ipcMain.handle('hermes:api', async (_event, request) => {
   // Remote-profile session requests would otherwise hit the local primary off
