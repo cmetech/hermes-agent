@@ -221,6 +221,31 @@ the existing `CATALOG_MAX_RESOURCE_REQUEST_BYTES` aggregate before projecting
 user packages. Showcases therefore do not create a second unaccounted request
 budget.
 
+### Process-lifetime verification cache
+
+The list/detail hot path memoizes successful verified-bundle records for the
+process lifetime. The cache is keyed first by `_bundle_digest()` (the digest of
+the authenticated catalog and digest manifest) and stores a bounded tree
+signature for every expected package file: relative path, file type,
+device/inode where available, size, `mtime_ns`, and `ctime_ns`. A cache hit must
+match both the bundle digest and the complete current signature. Missing,
+added, replaced, resized, retimed, or symlinked content invalidates the entry
+and runs the full digest/safety verification again. Platforms unable to supply
+the full signature disable the fast path and reverify.
+
+The signature is only an invalidation mechanism; it never establishes trust.
+The first load and every invalidated load still use the existing SHA-256
+catalog/package verification. Metadata reads and signature enumeration remain
+bounded. A lock coalesces concurrent cache misses so two tab refetches do not
+digest the bundle simultaneously. Failures are not cached.
+
+Admission bypasses the memoized fast path and performs a fresh full verified
+load before sealing the executable-resource cache. This keeps the execution
+boundary independent of list latency optimization. Tests count full-tree
+digest/read calls across repeated list requests, mutate a package after a cache
+hit to prove invalidation and fail-closed omission, and prove showcase bytes do
+not incorrectly consume the user-catalog aggregate on cache hits.
+
 ### Standard admission flow
 
 `start_api_run` gains optional `catalog_source`. Its user-workflow branch is
@@ -314,14 +339,18 @@ non-AI, non-networked, and have supported flat/no inputs. Admission re-derives
 and enforces the same policy; it never trusts the client field.
 
 A forged admission for unsupported inputs returns typed nonretryable 422
-`workflow_inputs_unsupported`. A consent/scheduling showcase returns typed
-nonretryable 409 `workflow_showcase_cli_required`. Neither prepares a snapshot
-or persists admission state.
+`workflow_inputs_unsupported`. An AI- or architecture-only showcase returns
+typed nonretryable 409 `workflow_showcase_cli_required`. Neither prepares a
+snapshot or persists admission state.
 
-This keeps `ai-extensions` and `scheduling` CLI-only. Although they are
-parameterless, their foreground paths carry explicit AI-consent and scheduling
-semantics that ordinary background admission must not bypass. `resilience` is
-guided/offline/non-AI and remains eligible.
+This keeps `ai-extensions` CLI-only because AI remains the hard consent gate.
+It also keeps `scheduling` CLI-only for an architectural reason: cron creation,
+`schedule_at`, and exact-ID/nonce ownership live in the `run_showcase` CLI
+wrapper, while its workflow package contains only the scheduled checkpoint.
+Ordinary background `POST /runs` admission therefore cannot reproduce the
+showcase's scheduling contract. `approval-gate` and `resilience` are Desktop-
+runnable; `ai-extensions`, `scheduling`, and `laptop-diagnostic` remain
+CLI-only.
 
 `laptop-diagnostic` remains `verified_bundled` but has unsupported legacy
 `file`/`text` inputs. View stays enabled; Run stays disabled with
@@ -410,7 +439,7 @@ Mermaid labels retain the v3.0.1 redaction and sanitization behavior.
 | Copied explicit bundle | never used by list | typed 409 if injected/tested | typed 409 | none |
 | Bundle read budget exhausted | omit showcases, `truncated=true` | typed retryable 503 | typed retryable 503 | none |
 | Unsupported showcase inputs | visible | 200, unsupported reason | typed 422 | none |
-| Consent/schedule showcase | visible, CLI-only | 200, CLI-only reason | typed 409 | none |
+| AI/architecture-only showcase | visible, CLI-only | 200, CLI-only reason | typed 409 | none |
 | Unhealthy coordinator | visible | 200, unhealthy | typed retryable 503 | none |
 | Missing read/write capability | 401/403 before discovery | 401/403 before discovery | 401/403 before resolution | none |
 
@@ -448,6 +477,16 @@ post-admission profile activation remain unchanged.
 - Existing CLI showcase commands and foreground advancement retain their
   signatures and default behavior.
 
+## Known and accepted constraints
+
+- Showcase runs use `concurrency_key=f"showcase:{scenario.id}"`. A deliberately
+  authored user sidecar can choose the same string and contend on that lane.
+  This creates contention only, not identity or execution confusion, and is
+  accepted for v3.0.2.
+- After v3.0.2, two of five showcases run from Desktop. `ai-extensions` awaits
+  a reviewed AI-consent/architecture pass; `scheduling` awaits a background
+  schedule-creation design; `laptop-diagnostic` awaits rich file/text inputs.
+
 ## Verification strategy
 
 Strict TDD applies to every behavior change: write one focused failing test,
@@ -461,7 +500,8 @@ Coverage includes:
 2. list/detail auth, `(source, name)` collisions, total row bounds, CF-1
    description redaction, shared definition/topology projection, and read-only
    byte snapshots;
-3. admission trust and run-support branching (including AI/schedule refusal),
+3. admission trust and run-support branching (including AI and architectural
+   scheduling refusal),
    sealed snapshot bytes, typed failures, unchanged golden idempotency digests,
    202/background/coordinator behavior, and no scheduler reachability;
 4. Desktop transport/query identity, badges, disabled reasons, Review & Run

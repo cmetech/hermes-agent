@@ -20,13 +20,48 @@
 - HTTP is background-only. `RunScheduler.advance`, `run_showcase`, and `_advance_until_wait` remain unreachable.
 - Reuse `show_package`, `_complete_projection`, and `sanitize_projection`; add no redactor or Mermaid generator.
 - Keep `laptop-diagnostic` Run-disabled because legacy file/text inputs remain outside flat v1 input support.
-- Keep `ai-extensions` and `scheduling` Run-disabled because background API admission must not bypass their CLI consent/scheduling semantics.
+- Keep `ai-extensions` Run-disabled because AI consent remains a hard cost/data-egress gate. Keep `scheduling` CLI-only because cron creation, schedule time, and exact-ID/nonce ownership live outside its workflow package in the CLI wrapper.
 - Keep `_STORE_SCHEMA_VERSION == 13`; touch no generic host file and add no config or environment variable.
 - Put each new `tests/plugins/workflow/test_*.py` file in the merge gate, native CI matrix, or explicit opt-out map in the same commit.
 - Add every new i18n key to `types.ts` and en/ja/zh/zh-hant.
 - Record every touched file in `docs/upstream-customizations/workflow-orchestration.yaml` in the same commit.
 - Before each commit run the task GREEN selection, customization checker, and `git diff --check`.
 - Before Task 8's commit, run the full merge gate and reconcile exact counts against the v3.0.1 baseline: Python 745 passed/1 skipped, installed distribution 1 passed, Desktop 51 passed/9 files, TypeScript exit 0.
+
+---
+
+### Task 0: Record approval amendments and deferred architecture
+
+**Files:**
+
+- Modify: `docs/superpowers/specs/2026-07-20-workflow-showcase-desktop-run-design.md`
+- Modify: `docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md`
+- Create: `docs/backlog/v3.0.2-workflow-showcase-desktop-run.md`
+- Modify: `docs/upstream-customizations/workflow-orchestration.yaml`
+
+**Interfaces:**
+
+- Records the process-lifetime verified-bundle cache, three explicit regression tests, accepted concurrency contention, corrected scheduling architecture, and two deferred designs.
+- Gate/matrix: documentation-only; customization checker and `git diff --check`.
+- Ledger: add `workflow-showcase-desktop-run-approved-amendments`.
+
+This task adds no production behavior, so no synthetic RED applies. The
+maintainer's approval and contradiction resolution are the documentation
+acceptance boundary.
+
+- [ ] **Step 1: Update design, plan, and backlog**
+
+Record Desktop coverage as two of five. Keep scheduling CLI-only because its
+cron operation lives outside the package. Backlog background schedule creation
+and a separately reviewed AI-consent/architecture pass.
+
+- [ ] **Step 2: Verify and commit**
+
+```bash
+/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/check_upstream_customizations.py --manifest docs/upstream-customizations/workflow-orchestration.yaml
+git diff --check
+git commit -m "docs(workflow): record showcase run amendments"
+```
 
 ---
 
@@ -156,7 +191,7 @@ git commit -m "feat(workflow): add bundled approval gate showcase"
 
 **Interfaces:**
 
-- Produces `VerifiedShowcasePackage`, rootless `load_verified_showcase_package(s)` APIs, optional `read_budget`/`allow_repair` on `load_showcase_catalog`, and one pure background-API eligibility helper.
+- Produces `VerifiedShowcasePackage`, rootless `load_verified_showcase_package(s)` APIs, optional `read_budget`/`allow_repair` on `load_showcase_catalog`, a process-lifetime verified-bundle cache, and one pure background-API eligibility helper.
 - Gate: catalog/distribution tests are merge gate + native matrix; installed distribution stays in its integration gate.
 - Ledger: add `workflow-showcase-bounded-verification`.
 
@@ -196,6 +231,12 @@ guided, offline, non-AI, and non-networked are background-policy eligible;
 specifically approval-gate/resilience pass while ai-extensions/scheduling do
 not. Input support remains a separate catalog check, so laptop still fails the
 combined policy later.
+
+Add cache tests that count `_tree_digest` calls: two unchanged cached loads
+perform one full verification, while a package mutation after the first load
+invalidates the entry and fails closed. Assert failures are not cached and a
+concurrent-miss test produces only one successful verification. Reset the
+process cache explicitly between tests.
 
 - [ ] **Step 2: Verify RED**
 
@@ -238,6 +279,14 @@ false-provenance guard in `_verified_distribution_risk`. Never infer trust from
 a caller-constructed dataclass or boolean. Add a pure
 `showcase_background_api_eligible(scenario)` helper; both catalog projection
 and admission must call it rather than duplicating consent rules.
+
+Memoize successful rootless list/detail loads by `_bundle_digest()` plus a
+bounded complete tree signature (relative path/type, device/inode when
+available, size, mtime_ns, ctime_ns). The signature invalidates only; SHA-256
+remains authoritative. Disable the fast path if the platform cannot supply the
+signature, lock concurrent misses, never cache failures, and expose only a
+private test reset. Admission passes `force_reverify=True` and never uses the
+fast path.
 
 - [ ] **Step 4: Verify GREEN and installed wheel**
 
@@ -288,7 +337,13 @@ assert approval["supported_inputs"] == {"supported": True, "reason": "parameterl
 assert approval["run_support"] == {"supported": True, "reason": "supported"}
 ```
 
-Create a project workflow also named `approval-gate`; assert both rows appear, bare detail resolves project, and `catalog_source=showcase` resolves the bundle. With no user collision, assert bare detail remains project/profile-only rather than silently opting into a showcase. Assert laptop has `unsupported_inputs`, while ai-extensions and scheduling have `showcase_cli_required`. Add CF-1 POSIX/Windows path-in-description parity. Tamper the default-bundle harness and assert list omits every showcase without invoking checkout repair, exact detail returns typed verification failure, and store/trust byte snapshots do not change. Rewrite existing list tests to select user rows by `(source, name)`, retaining all prior assertions and adding their input-derived run support.
+Create a project workflow also named `approval-gate`; assert both rows appear, bare detail resolves project, and `catalog_source=showcase` resolves the bundle. With no user collision, assert bare detail remains project/profile-only rather than silently opting into a showcase. Explicitly request `catalog_source=project` for a showcase-only name and require typed 404. Assert laptop has `unsupported_inputs`, while ai-extensions and scheduling have `showcase_cli_required`. Add CF-1 POSIX/Windows path-in-description parity. Tamper the default-bundle harness and assert list omits every showcase without invoking checkout repair, exact detail returns typed verification failure, and store/trust byte snapshots do not change. Make the default bundle missing/unreadable and assert list still returns 200 with user rows and zero showcases. Rewrite existing list tests to select user rows by `(source, name)`, retaining all prior assertions and adding their input-derived run support.
+
+Add a measured hot-path test: call `build_workflow_catalog` twice, count
+full-tree digest/read operations, require only the first stable request to pay
+the full verification cost, and prove a normal user row remains present with
+`truncated=False` on both calls. Mutate the bundle and require the next list to
+invalidate the cache and omit showcases rather than serve stale trust.
 
 - [ ] **Step 2: Verify RED**
 
@@ -312,7 +367,7 @@ CatalogRunSupportReason = Literal[
 ]
 ```
 
-Keep user precedence collapse unchanged. Build showcase targets only from `load_verified_showcase_packages(...)` with repair disabled, charge its actual bytes against the existing aggregate request budget, assign source/precedence `showcase`/3, reserve verified showcase rows inside the 500-row limit, and sort by `(name, precedence, source)`. Verification failure emits no showcase row; only a genuine capacity omission changes `truncated`. Set all valid list descriptions from:
+Keep user precedence collapse unchanged. Build showcase targets only from cached `load_verified_showcase_packages(...)` with repair disabled, charge actual bytes read on that request against the existing aggregate request budget, assign source/precedence `showcase`/3, reserve verified showcase rows inside the 500-row limit, and sort by `(name, precedence, source)`. Missing/unreadable/verification-failed bundles degrade to no showcase rows without failing user rows; only a genuine capacity omission changes `truncated`. Set all valid list descriptions from:
 
 ```python
 "description": str(shown["definition"]["description"])
@@ -320,7 +375,7 @@ Keep user precedence collapse unchanged. Build showcase targets only from `load_
 
 Project `run_support` on every list/detail result. Users mirror existing input
 support. Showcases require Task 2's scenario policy and supported inputs;
-consent/scheduling failures use `showcase_cli_required`, while laptop uses
+AI/architecture-only failures use `showcase_cli_required`, while laptop uses
 `unsupported_inputs`. Put that composition in public pure
 `workflow_catalog_run_support(package, *, showcase_scenario=None)` so admission
 can re-derive the exact policy instead of trusting a response or duplicating
@@ -363,7 +418,7 @@ git commit -m "feat(workflow): list verified bundled showcases"
 
 - [ ] **Step 1: Write RED tests**
 
-POST `approval-gate` with `catalog_source=showcase`; assert 202, server-derived Desktop provenance, background execution, `showcase_id`, `showcase_provenance=verified_bundled`, and ready nodes at response time. Monkeypatch `RunScheduler.advance` to raise. Add copied-bundle, post-verification mutation, unsupported laptop (422 `workflow_inputs_unsupported`), AI-consent/scheduling (409 `workflow_showcase_cli_required`), unhealthy coordinator, forged provenance, omitted-source, and same-name user/showcase targeting cases; every failure leaves no run/staging residue. Run existing golden start-digest tests unchanged.
+POST `approval-gate` with `catalog_source=showcase`; assert 202, server-derived Desktop provenance, background execution, `showcase_id`, `showcase_provenance=verified_bundled`, and ready nodes at response time. Monkeypatch `RunScheduler.advance` to raise. Repeat the same showcase admission with the same idempotency key and assert the same start digest/run ID with `existing` disposition; bundle/risk content digests must be stable. Add copied-bundle, post-verification mutation, unsupported laptop (422 `workflow_inputs_unsupported`), AI-consent/scheduling (409 `workflow_showcase_cli_required`), unhealthy coordinator, forged provenance, omitted-source, and same-name user/showcase targeting cases; every failure leaves no run/staging residue. Run existing user-source golden start-digest tests unchanged.
 
 - [ ] **Step 2: Verify RED**
 
@@ -705,7 +760,7 @@ scripts/run_tests.sh tests/test_desktop_workflow_test_gate.py -q
 
 - [ ] **Step 3: Update docs minimally**
 
-Document badges, source collisions, no trust action for verified bundles, approval-gate walkthrough, CLI-only laptop inputs, and retained CLI consent/scheduling paths. Remove L-A/L-B wording without claiming rich Desktop inputs or background admission for consent-sensitive tours.
+Document badges, source collisions, no trust action for verified bundles, approval-gate walkthrough, CLI-only laptop inputs, the retained AI-consent path, and scheduling's wrapper/package architecture boundary. Remove L-A/L-B wording without claiming rich Desktop inputs or background admission for CLI-only tours.
 
 - [ ] **Step 4: Run real Desktop UAT**
 
@@ -719,7 +774,7 @@ Use fresh temporary Hermes/profile/project state and the real Desktop app/backen
 6. real Attention Approve completes the run;
 7. durable projection says desktop, background, verified_bundled;
 8. laptop View works but Run is disabled with CLI guidance;
-9. ai-extensions and scheduling also remain CLI-only, preserving their consent semantics.
+9. ai-extensions remains CLI-only for AI consent and scheduling remains CLI-only because cron creation is outside its workflow package.
 
 Do not use `run_showcase`, direct advance, copied packages, trust injection, or mocked middleware.
 

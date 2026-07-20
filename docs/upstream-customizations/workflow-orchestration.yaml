@@ -1201,3 +1201,29 @@ upstream_changes:
   removal_condition: Remove after this design and plan are superseded by an
     equivalent implemented and independently verified upstream feature.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-desktop-run-approved-amendments
+  change_class: workflow-design
+  owner: workflow-orchestration
+  files:
+  - docs/backlog/v3.0.2-workflow-showcase-desktop-run.md
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  - docs/superpowers/specs/2026-07-20-workflow-showcase-desktop-run-design.md
+  owned_symbols:
+  - process-lifetime verified showcase bundle cache design
+  - two-of-five Desktop showcase coverage contract
+  - v3.0.2 workflow showcase follow-up backlog
+  tests:
+  - scripts/test_workflow_merge_gate.sh
+  expected_commit_subject: 'docs(workflow): record showcase run amendments'
+  upstream_candidate: true
+  merge_guidance: Preserve full digest verification on cache misses and every
+    admission, signature-based cache invalidation, graceful list degradation,
+    stable showcase idempotency, source-exact 404 behavior, and the accepted
+    concurrency-lane contention note. Keep scheduling CLI-only until cron
+    creation is part of a separately designed background operation, and keep
+    AI extensions CLI-only until consent and wrapper/package architecture are
+    independently reviewed.
+  removal_condition: Remove when upstream implements equivalent verified
+    showcase caching and Desktop admission while carrying or resolving every
+    recorded follow-up.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
