@@ -156,10 +156,33 @@ enrolled profile — that distinction is the entire reason mTLS works.
   `browser_session_manager.py`) → cannot conflict with upstream.
 - `browser_tool.py` / `browser_supervisor.py` get only small additive hooks
   (profile lookup at connect; route enrolled launches to the manager). These
-  are flagged medium/higher conflict risk in the surface table, so keep the
-  edits minimal and union-resolvable.
+  are currently PURE UPSTREAM (no OTTO rows today) → Option B is the FIRST OTTO
+  edit to them, so registration is mandatory (see §6a).
 - No brand emitter touched → `generate <brand> --check` stays 8/8.
 - config additive (`browser.profiles`); absent → today's behaviour exactly.
+- **Supervisor unchanged.** It is keyed by `(task_id, cdp_url)` and is browser
+  -identity-agnostic (confirmed from the internals doc), so the enrolled launch
+  sits BELOW it. Per-profile eval trust is enforced in the `browser_cdp` tool
+  wrapper (maps `cdp_url → profile`), NOT in the supervisor.
+
+## 6a. Required merge-governance artifacts (MANDATORY, same commit)
+
+Without these, a future `main → base` merge silently reverts the hooks. All
+three ship in the SAME commit as the code:
+
+1. **Workspace `CLAUDE.md` surface-table rows** for the two edited shared files
+   (`browser_tool.py` hooks, `browser_supervisor.py` if touched) AND the two new
+   modules — nature of change, conflict risk, union-on-merge note.
+2. **Paired `AGENTS.md`** updated byte-identically (`cmp CLAUDE.md AGENTS.md`).
+3. **`otto-upstream-merge` skill silent-revert greps** — a grep per hook that
+   proves the OTTO logic survived the merge (e.g. `git grep -c
+   'browser_session_manager\|browser.profiles' -- tools/browser_tool.py`).
+
+**Backfill owed NOW (pre-existing, not Option B):** the merged
+`confluence-research` skill has no surface-table row. Add one for
+`skills/ericsson/confluence-research/**` + the `capabilities/ericsson.json`
+registration (low risk — new files + additive line — but the golden rule
+requires it). Update `CLAUDE.md` + `AGENTS.md` together.
 
 ## 7. Migration path for the confluence skill
 
@@ -179,8 +202,10 @@ Staged; the skill keeps working throughout.
 
 1. Enrolled-Edge headless reuse vs Conditional Access re-checks, and cookie
    lifetime — unmeasured (also open for the skill). Validate before unattended.
-2. Does the supervisor's raw-CDP dialog handling need per-profile awareness, or
-   is it profile-agnostic? (Likely agnostic — it keys on cdp_url.)
+2. ~~Does the supervisor need per-profile awareness?~~ RESOLVED: no. The
+   internals doc confirms it is keyed by `(task_id, cdp_url)` and is
+   browser-identity-agnostic. No supervisor change; per-profile eval trust is
+   enforced in the `browser_cdp` tool wrapper.
 3. Windows daemon hygiene: is `close --all` on acquire sufficient, or does the
    manager need a health-probe + relaunch loop? Testing suggested the latter
    may be needed.
