@@ -9,7 +9,7 @@ import re
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Literal, Mapping
@@ -35,6 +35,77 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 class WorkflowTrustError(RuntimeError):
     pass
+
+
+class WorkflowResourceCapacityError(WorkflowTrustError):
+    """A bounded package-resource read budget was exhausted."""
+
+
+class WorkflowResourceCacheMissError(WorkflowTrustError):
+    """A sealed package-resource cache did not contain a requested path."""
+
+
+@dataclass(slots=True)
+class WorkflowResourceReadBudget:
+    max_file_bytes: int
+    max_total_bytes: int
+    max_files: int
+    bytes_read: int = 0
+    files_read: int = 0
+    _contents: dict[Path, bytes] = field(default_factory=dict, init=False, repr=False)
+    _aliases: dict[Path, Path] = field(default_factory=dict, init=False, repr=False)
+    _sealed: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        for name in ("max_file_bytes", "max_total_bytes", "max_files"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+    def read(self, path: Path) -> bytes:
+        if self._sealed:
+            return self.read_cached(path)
+        cached = self._contents.get(path)
+        if cached is not None:
+            return cached
+        if self.files_read >= self.max_files:
+            raise WorkflowResourceCapacityError("package resource file limit exceeded")
+        remaining = self.max_total_bytes - self.bytes_read
+        if remaining <= 0:
+            raise WorkflowResourceCapacityError("package resource byte limit exceeded")
+        read_limit = min(self.max_file_bytes, remaining)
+        with path.open("rb") as stream:
+            data = stream.read(read_limit + 1)
+        self.files_read += 1
+        self.bytes_read += len(data)
+        if len(data) > read_limit:
+            raise WorkflowResourceCapacityError("package resource byte limit exceeded")
+        self._contents[path] = data
+        return data
+
+    @staticmethod
+    def _logical_key(path: Path) -> Path:
+        return Path(os.path.abspath(path))
+
+    def remember_alias(self, logical_path: Path, canonical_path: Path) -> None:
+        if self._sealed:
+            raise WorkflowResourceCacheMissError(
+                "package resource cache aliases are sealed"
+            )
+        self._aliases[self._logical_key(logical_path)] = canonical_path
+
+    def seal(self) -> None:
+        self._sealed = True
+
+    def read_cached(self, logical_path: Path) -> bytes:
+        key = self._logical_key(logical_path)
+        canonical = self._aliases.get(key, key)
+        try:
+            return self._contents[canonical]
+        except KeyError as exc:
+            raise WorkflowResourceCacheMissError(
+                "sealed package resource is unavailable"
+            ) from exc
 
 
 @dataclass(frozen=True)
@@ -72,7 +143,12 @@ def _validation_error(path: str, code: str, message: str) -> WorkflowValidationE
     )
 
 
-def _contained_resource(root: Path, path: Path) -> tuple[str, bytes]:
+def _contained_resource(
+    root: Path,
+    path: Path,
+    *,
+    read_budget: WorkflowResourceReadBudget | None = None,
+) -> tuple[str, bytes]:
     try:
         if path.is_symlink():
             raise _validation_error(
@@ -97,7 +173,11 @@ def _contained_resource(root: Path, path: Path) -> tuple[str, bytes]:
             f"workflow resource is not a readable file: {path}",
         )
     try:
-        data = resolved.read_bytes()
+        if read_budget is None:
+            data = resolved.read_bytes()
+        else:
+            data = read_budget.read(resolved)
+            read_budget.remember_alias(path, resolved)
     except OSError as exc:
         raise _validation_error(
             str(path),
@@ -160,13 +240,17 @@ def _walk_strings(value: object) -> Iterable[str]:
             yield from _walk_strings(item)
 
 
-def compute_package_digest(package: WorkflowPackage) -> WorkflowPackageDigest:
+def compute_package_digest(
+    package: WorkflowPackage,
+    *,
+    read_budget: WorkflowResourceReadBudget | None = None,
+) -> WorkflowPackageDigest:
     """Hash the portable document and all executable package resources."""
     root = package.root.resolve(strict=True)
     resources: dict[str, bytes] = {}
 
     def add(path: Path) -> tuple[str, bytes]:
-        relative, data = _contained_resource(root, path)
+        relative, data = _contained_resource(root, path, read_budget=read_budget)
         resources[relative] = data
         return relative, data
 
@@ -234,9 +318,12 @@ def _tuple_strings(value: object) -> tuple[str, ...]:
 
 
 def build_risk_summary(
-    package: WorkflowPackage, compatibility: CompatibilityReport
+    package: WorkflowPackage,
+    compatibility: CompatibilityReport,
+    *,
+    read_budget: WorkflowResourceReadBudget | None = None,
 ) -> WorkflowRiskSummary:
-    package_digest = compute_package_digest(package).sha256
+    package_digest = compute_package_digest(package, read_budget=read_budget).sha256
     shell_nodes = tuple(
         node.id
         for node in package.definition.nodes
@@ -395,7 +482,9 @@ class WorkflowTrustStore:
         self.path = Path(hermes_home).expanduser() / "workflow" / "trust.json"
         self.lock_path = self.path.with_suffix(".lock")
 
-    def _read(self, *, mutation: bool) -> dict[str, object]:
+    def _read(
+        self, *, mutation: bool, max_bytes: int | None = None
+    ) -> dict[str, object]:
         if not self.path.exists():
             return {"version": 1, "records": {}}
         if self.path.is_symlink():
@@ -405,13 +494,29 @@ class WorkflowTrustStore:
                 )
             return {"version": 1, "records": {}}
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-            if payload.get("version") != 1 or not isinstance(
-                payload.get("records"), dict
+            if max_bytes is None:
+                text = self.path.read_text(encoding="utf-8")
+            else:
+                if (
+                    not isinstance(max_bytes, int)
+                    or isinstance(max_bytes, bool)
+                    or max_bytes <= 0
+                ):
+                    raise ValueError("trust-store read limit must be positive")
+                with self.path.open("rb") as stream:
+                    encoded = stream.read(max_bytes + 1)
+                if len(encoded) > max_bytes:
+                    raise ValueError("trust store exceeds the read limit")
+                text = encoded.decode("utf-8")
+            payload = json.loads(text)
+            if (
+                not isinstance(payload, dict)
+                or payload.get("version") != 1
+                or not isinstance(payload.get("records"), dict)
             ):
                 raise ValueError("unsupported trust-store shape")
             return payload
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
             if mutation:
                 raise WorkflowTrustError(
                     f"workflow trust store is corrupt: {exc}"
@@ -487,13 +592,45 @@ class WorkflowTrustStore:
         self, package_digest: str, *, risk_digest: str | None = None
     ) -> Literal["trusted", "untrusted"]:
         with _locked(self.lock_path):
-            payload = self._read(mutation=False)
-            records = payload["records"]
-            if not isinstance(records, dict):
-                return "untrusted"
-            record = records.get(package_digest)
-            if not isinstance(record, dict):
-                return "untrusted"
-            if risk_digest is not None and record.get("risk_digest") != risk_digest:
-                return "untrusted"
-            return "trusted"
+            return self._classify(
+                self._read(mutation=False), package_digest, risk_digest=risk_digest
+            )
+
+    def snapshot_read_only(self, *, max_bytes: int) -> dict[str, object]:
+        """Load one bounded trust snapshot without locks or filesystem writes."""
+        return self._read(mutation=False, max_bytes=max_bytes)
+
+    def check_snapshot(
+        self,
+        snapshot: Mapping[str, object],
+        package_digest: str,
+        *,
+        risk_digest: str | None = None,
+    ) -> Literal["trusted", "untrusted"]:
+        """Classify one digest from a previously loaded read-only snapshot."""
+        return self._classify(snapshot, package_digest, risk_digest=risk_digest)
+
+    def check_read_only(
+        self, package_digest: str, *, risk_digest: str | None = None
+    ) -> Literal["trusted", "untrusted"]:
+        """Classify trust without creating locks, directories, or store files."""
+        return self._classify(
+            self._read(mutation=False), package_digest, risk_digest=risk_digest
+        )
+
+    @staticmethod
+    def _classify(
+        payload: Mapping[str, object],
+        package_digest: str,
+        *,
+        risk_digest: str | None,
+    ) -> Literal["trusted", "untrusted"]:
+        records = payload.get("records")
+        if not isinstance(records, dict):
+            return "untrusted"
+        record = records.get(package_digest)
+        if not isinstance(record, dict):
+            return "untrusted"
+        if risk_digest is not None and record.get("risk_digest") != risk_digest:
+            return "untrusted"
+        return "trusted"

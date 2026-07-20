@@ -29,19 +29,22 @@ function snapshot(overrides: Partial<WorkflowRunSnapshot> = {}): WorkflowRunSnap
 
 describe('workflow operations mounted adapter flow', () => {
   const api = vi.fn()
+  const apiStructured = vi.fn()
 
   beforeEach(() => {
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
-      value: { api }
+      value: { api, apiStructured }
     })
+    apiStructured.mockResolvedValue({ ok: true, value: { items: [], truncated: false } })
     $workflowSelectedRunId.set('run-1')
   })
 
   afterEach(() => {
     cleanup()
     api.mockReset()
+    apiStructured.mockReset()
     $workflowSelectedRunId.set(null)
     Reflect.deleteProperty(window, 'hermesDesktop')
   })
@@ -87,6 +90,8 @@ describe('workflow operations mounted adapter flow', () => {
         <WorkflowsView />
       </QueryClientProvider>
     )
+    fireEvent.click(await screen.findByRole('tab', { name: 'Active board' }))
+    $workflowSelectedRunId.set('run-1')
     fireEvent.click(await screen.findByRole('button', { name: 'Approve' }))
 
     await waitFor(() =>

@@ -15,7 +15,7 @@ import time
 from collections import Counter
 from dataclasses import asdict
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MethodType
 from typing import AbstractSet, Iterable, Mapping
 
@@ -60,6 +60,10 @@ from plugins.workflow.machine_contract import (
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.schema import load_workflow, validate_package
 from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.sanitize import (
+    projection_key_is_secret,
+    sanitize_projection,
+)
 from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.store import (
     ForegroundExecutionConflict,
@@ -80,6 +84,15 @@ from tools.managed_process import ProcessResourceLimits
 _MACHINE_COMMAND: ContextVar[str] = ContextVar(
     "workflow_machine_command", default="workflow"
 )
+_DEFINITION_MAX_NODES = 512
+_DEFINITION_MAX_EDGES = 4_096
+_DEFINITION_MAX_BYTES = 512 * 1024
+_DEFINITION_MAX_CONTAINER_ITEMS = 512
+_BENIGN_POLICY_FIELDS = frozenset({"modelReasoningEffort"})
+
+
+class WorkflowDefinitionProjectionCapacityError(ValueError):
+    """A complete safe definition cannot fit within the public contract."""
 
 
 class _WorkflowArgumentParser(argparse.ArgumentParser):
@@ -250,6 +263,222 @@ def _related_cron(
     return sorted(related, key=lambda entry: str(entry["id"]))
 
 
+def _absolute_projection_path(value: str) -> bool:
+    return (
+        value.startswith("~")
+        or PurePosixPath(value).is_absolute()
+        or PureWindowsPath(value).is_absolute()
+    )
+
+
+def _complete_projection(
+    value: object,
+    *,
+    key: str = "",
+    depth: int = 0,
+) -> object:
+    """Sanitize a semantic definition without silently dropping members."""
+    if depth > 12:
+        raise WorkflowDefinitionProjectionCapacityError(
+            "workflow definition nesting limit exceeded"
+        )
+    if projection_key_is_secret(key):
+        return "[REDACTED]"
+    if isinstance(value, Mapping):
+        if len(value) > _DEFINITION_MAX_CONTAINER_ITEMS:
+            raise WorkflowDefinitionProjectionCapacityError(
+                "workflow definition mapping limit exceeded"
+            )
+        return {
+            str(child): _complete_projection(
+                item,
+                key=str(child),
+                depth=depth + 1,
+            )
+            for child, item in value.items()
+            if str(child).lower()
+            not in {"operator_scope_digest", "idempotency_key_digest"}
+        }
+    if isinstance(value, (list, tuple)):
+        if len(value) > _DEFINITION_MAX_CONTAINER_ITEMS:
+            raise WorkflowDefinitionProjectionCapacityError(
+                "workflow definition sequence limit exceeded"
+            )
+        return [
+            _complete_projection(
+                item,
+                key=key,
+                depth=depth + 1,
+            )
+            for item in value
+        ]
+    if isinstance(value, str):
+        if _absolute_projection_path(value):
+            return "[REDACTED]"
+        return sanitize_projection(value, key=key, depth=depth)
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    return _complete_projection(str(value), key=key, depth=depth + 1)
+
+
+def _hook_projection(hooks: object) -> object:
+    if not isinstance(hooks, Mapping):
+        return {}
+    projected: dict[str, object] = {}
+    for event, raw_entries in hooks.items():
+        if not isinstance(raw_entries, (list, tuple)):
+            continue
+        entries: list[object] = []
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, Mapping):
+                continue
+            entry: dict[str, object] = {}
+            for field in ("matcher", "timeout"):
+                if field in raw_entry:
+                    entry[field] = _complete_projection(
+                        raw_entry[field], key=field
+                    )
+            raw_response = raw_entry.get("response")
+            if isinstance(raw_response, Mapping):
+                response: dict[str, object] = {}
+                for field in ("continue", "suppressOutput", "decision"):
+                    if field in raw_response:
+                        response[field] = _complete_projection(
+                            raw_response[field], key=field
+                        )
+                for field in ("systemMessage", "stopReason"):
+                    if field in raw_response:
+                        response[field] = "[REDACTED]"
+                specific = raw_response.get("hookSpecificOutput")
+                if isinstance(specific, Mapping):
+                    safe_specific: dict[str, object] = {}
+                    for field, item in specific.items():
+                        if field in {
+                            "hookEventName",
+                            "permissionDecision",
+                            "action",
+                        }:
+                            safe_specific[str(field)] = _complete_projection(
+                                item, key=str(field)
+                            )
+                        else:
+                            safe_specific[str(field)] = "[REDACTED]"
+                    response["hookSpecificOutput"] = safe_specific
+                entry["response"] = response
+            entries.append(entry)
+        projected[str(event)] = entries
+    return projected
+
+
+def _options_projection(options: Mapping[str, object]) -> dict[str, object]:
+    projected: dict[str, object] = {}
+    for key, value in options.items():
+        if key == "hooks":
+            projected[key] = _hook_projection(value)
+        elif key == "sandbox":
+            projected[key] = _complete_projection(value, key=key)
+        elif key in _BENIGN_POLICY_FIELDS:
+            projected[key] = _complete_projection(value)
+        else:
+            projected[key] = _complete_projection(value, key=key)
+    return projected
+
+
+def _definition_projection(package: WorkflowPackage) -> dict[str, object]:
+    """Return the bounded, body-free normalized definition used by show APIs."""
+    definition = package.definition
+    if len(definition.nodes) > _DEFINITION_MAX_NODES:
+        raise WorkflowDefinitionProjectionCapacityError(
+            "workflow definition node limit exceeded"
+        )
+    edge_count = sum(len(node.depends_on) for node in definition.nodes)
+    if edge_count > _DEFINITION_MAX_EDGES:
+        raise WorkflowDefinitionProjectionCapacityError(
+            "workflow definition edge limit exceeded"
+        )
+    delivery = package.sidecar.get("delivery_defaults", {})
+    raw_inputs = delivery.get("inputs", {}) if isinstance(delivery, Mapping) else {}
+    inputs = (
+        {
+            name: (
+                {
+                    field: (
+                        "[REDACTED]"
+                        if str(field).lower() == "default"
+                        else _complete_projection(value, key=str(field))
+                    )
+                    for field, value in specification.items()
+                }
+                if isinstance(specification, Mapping)
+                else _complete_projection(specification, key=str(name))
+            )
+            for name, specification in raw_inputs.items()
+        }
+        if isinstance(raw_inputs, Mapping)
+        else {}
+    )
+    delivery_policy = (
+        {
+            key: _complete_projection(value, key=str(key))
+            for key, value in delivery.items()
+            if key != "inputs"
+        }
+        if isinstance(delivery, Mapping)
+        else {}
+    )
+    sensitive_node_types = {
+        "prompt",
+        "bash",
+        "script",
+        "loop",
+        "approval",
+        "cancel",
+    }
+    projection = {
+        "name": definition.name,
+        "description": _complete_projection(
+            definition.description, key="description"
+        ),
+        "nodes": [
+            {
+                "id": node.id,
+                "type": node.node_type,
+                "value": (
+                    "[REDACTED]"
+                    if node.node_type in sensitive_node_types
+                    else _complete_projection(node.value, key="value")
+                ),
+                "depends_on": list(node.depends_on),
+                "options": _options_projection(node.options),
+            }
+            for node in definition.nodes
+        ],
+        "edges": [
+            {"from": dependency, "to": node.id}
+            for node in definition.nodes
+            for dependency in node.depends_on
+        ],
+        "inputs": inputs,
+        "policies": {
+            "workflow": _options_projection(definition.options),
+            "sidecar": {
+                key: _complete_projection(value, key=str(key))
+                for key, value in package.sidecar.items()
+                if key != "delivery_defaults"
+            },
+            "delivery": delivery_policy,
+        },
+    }
+    encoded = json.dumps(
+        projection, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if len(encoded) > _DEFINITION_MAX_BYTES:
+        raise WorkflowDefinitionProjectionCapacityError(
+            "workflow definition byte limit exceeded"
+        )
+    return projection
+
+
 def show_package(
     package: WorkflowPackage,
     *,
@@ -259,8 +488,10 @@ def show_package(
     isolated_workdir: bool = False,
     mcp_available: bool = False,
     cron_jobs: Iterable[Mapping[str, object]] = (),
+    compatibility_report: CompatibilityReport | None = None,
+    include_argument_hints: bool = True,
 ) -> dict[str, object]:
-    report = assess_compatibility(
+    report = compatibility_report or assess_compatibility(
         package,
         available_tools=available_tools,
         available_services=available_services,
@@ -307,7 +538,8 @@ def show_package(
     }
     result.update({
         "action": "show",
-        "argument_hints": _argument_hints(package),
+        "definition": _definition_projection(package),
+        "argument_hints": _argument_hints(package) if include_argument_hints else {},
         "topology_text": topology.text,
         "topology_mermaid": topology.mermaid,
         "topology_warnings": list(topology.warnings),

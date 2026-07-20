@@ -46,8 +46,17 @@ from plugins.workflow.provenance import (
     TriggerProvenance,
     legacy_projection_provenance,
 )
-from plugins.workflow.sanitize import sanitize_projection
-from plugins.workflow.trust import compute_package_digest
+from plugins.workflow.sanitize import (
+    sanitize_projection,
+    workflow_filename_components_are_distinct,
+    workflow_input_name_is_portable,
+    workflow_input_names_are_portable,
+)
+from plugins.workflow.trust import (
+    WorkflowPackageDigest,
+    WorkflowResourceReadBudget,
+    compute_package_digest,
+)
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
@@ -2112,29 +2121,38 @@ class RunStore:
         *,
         inputs: Mapping[str, str | Path] | None = None,
         values: Mapping[str, str] | None = None,
+        resource_read_budget: WorkflowResourceReadBudget | None = None,
+        trusted_package_digest: WorkflowPackageDigest | None = None,
     ) -> PreparedRunSnapshot:
         self._ensure_free_disk()
         with workflow_lock(self.admission_lock):
             staging = Path(tempfile.mkdtemp(prefix="run-", dir=self.staging_root))
             self._write_snapshot_owner(staging)
         try:
-            package_digest = compute_package_digest(package)
-            definition_data = package.workflow_path.read_bytes()
+            package_digest = trusted_package_digest or compute_package_digest(
+                package, read_budget=resource_read_budget
+            )
+
+            def read_package_file(path: Path) -> bytes:
+                if resource_read_budget is None:
+                    return path.read_bytes()
+                return resource_read_budget.read_cached(path)
+
+            definition_data = read_package_file(package.workflow_path)
             (staging / "definition.yaml").write_bytes(definition_data)
             policy_data = b"{}\n"
             if package.sidecar_path is not None:
-                policy_data = package.sidecar_path.read_bytes()
+                policy_data = read_package_file(package.sidecar_path)
                 (staging / "policy.yaml").write_bytes(policy_data)
+            package_root = Path(os.path.abspath(package.root))
             workflow_relative = (
-                package.workflow_path
-                .resolve()
-                .relative_to(package.root.resolve())
+                Path(os.path.abspath(package.workflow_path))
+                .relative_to(package_root)
                 .as_posix()
             )
             sidecar_relative = (
-                package.sidecar_path
-                .resolve()
-                .relative_to(package.root.resolve())
+                Path(os.path.abspath(package.sidecar_path))
+                .relative_to(package_root)
                 .as_posix()
                 if package.sidecar_path is not None
                 else None
@@ -2145,7 +2163,7 @@ class RunStore:
                 source = package.root / relative
                 target = staging / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(source.read_bytes())
+                target.write_bytes(read_package_file(source))
             node_skill_digests: dict[str, str] = {}
             node_agent_skill_digests: dict[str, str] = {}
             for node in package.definition.nodes:
@@ -2191,8 +2209,19 @@ class RunStore:
             input_manifest: dict[str, dict[str, object]] = {}
             input_digests: dict[str, str] = {}
             input_root = staging / "inputs"
+            if not workflow_input_names_are_portable(
+                [*(inputs or {}).keys(), *(values or {}).keys()]
+            ):
+                raise InputSnapshotError("invalid or colliding input name")
+            if not workflow_filename_components_are_distinct(
+                [
+                    *(inputs or {}).keys(),
+                    *(f"{name}.txt" for name in (values or {})),
+                ]
+            ):
+                raise InputSnapshotError("invalid or colliding input name")
             for name, source_value in sorted((inputs or {}).items()):
-                if not name or "/" in name or "\\" in name or name in {".", ".."}:
+                if not workflow_input_name_is_portable(name):
                     raise InputSnapshotError(f"invalid input name: {name}")
                 source = Path(source_value)
                 if source.is_symlink():
@@ -2235,7 +2264,7 @@ class RunStore:
                     "sha256": digest,
                 }
             for name, value in sorted((values or {}).items()):
-                if name in input_manifest or not name or "/" in name or "\\" in name:
+                if name in input_manifest or not workflow_input_name_is_portable(name):
                     raise InputSnapshotError(f"invalid or duplicate input name: {name}")
                 data = value.encode("utf-8")
                 if len(data) > self.max_input_bytes:

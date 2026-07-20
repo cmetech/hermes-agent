@@ -16,14 +16,20 @@ import {
   previewWorkflowCleanup
 } from '@/hermes'
 import { useI18n } from '@/i18n'
-import type { WorkflowEventPage, WorkflowRunPage, WorkflowRunView } from '@/types/hermes'
+import { notify } from '@/store/notifications'
+import { ensureGatewayProfile } from '@/store/profile'
+import type { WorkflowDefinition, WorkflowEventPage, WorkflowRunPage, WorkflowRunView } from '@/types/hermes'
 
 import { PAGE_INSET_X } from '../layout-constants'
 
 import { workflowBoardModel } from './adapter'
 import { AttentionInbox } from './attention-inbox'
+import { WorkflowCatalog } from './catalog'
+import { cancelPendingWorkflowDetailQuery } from './detail-query'
+import { ReviewRunDialog } from './review-run-dialog'
 import { RunInspector } from './run-inspector'
 import { $workflowSelectedRunId, selectWorkflowRun } from './store'
+import { ViewWorkflowDialog } from './view-workflow-dialog'
 
 function isConflict(error: unknown): boolean {
   if (typeof error === 'object' && error !== null && 'statusCode' in error) {
@@ -33,15 +39,85 @@ function isConflict(error: unknown): boolean {
   return error instanceof Error && /^409(?:\D|$)/.test(error.message)
 }
 
+export function loadWorkflowRunPage(view: WorkflowRunView, cursor?: string): Promise<WorkflowRunPage> {
+  if (view === 'workflows') {
+    return Promise.reject(new Error('The workflows catalog view does not list workflow runs.'))
+  }
+
+  return listWorkflowRuns(cursor, view)
+}
+
 export function WorkflowsView() {
   const { t } = useI18n()
-  const profile = getApiRequestProfile() ?? 'default'
+  const requestProfile = getApiRequestProfile()
+  const profile = requestProfile ?? 'default'
   const queryClient = useQueryClient()
   const selectedRunId = useStore($workflowSelectedRunId)
   const actionInFlight = useRef(false)
+  const mounted = useRef(true)
+  const reviewGeneration = useRef(0)
   const [actionPending, setActionPending] = useState(false)
   const [isVisible, setIsVisible] = useState(() => document.visibilityState === 'visible')
-  const [view, setView] = useState<WorkflowRunView>('board')
+  const [view, setView] = useState<WorkflowRunView>('workflows')
+
+  const [viewIntent, setViewIntent] = useState<null | {
+    profile: string
+    returnFocusTo: HTMLElement | null
+    workflow: WorkflowDefinition
+  }>(null)
+
+  const [reviewIntent, setReviewIntent] = useState<null | {
+    generation: number
+    profile: string
+    returnFocusTo: HTMLElement | null
+    workflow: WorkflowDefinition
+  }>(null)
+
+  const closeReview = () => {
+    reviewGeneration.current += 1
+
+    if (reviewIntent) {
+      cancelPendingWorkflowDetailQuery(queryClient, reviewIntent.workflow.name, reviewIntent.profile)
+    }
+
+    setReviewIntent(null)
+  }
+
+  const activeElement = () => (document.activeElement instanceof HTMLElement ? document.activeElement : null)
+
+  const openReviewForProfile = (
+    workflow: WorkflowDefinition,
+    intentProfile: string,
+    returnFocusTo = activeElement()
+  ) => {
+    reviewGeneration.current += 1
+    setViewIntent(null)
+    setReviewIntent({ generation: reviewGeneration.current, profile: intentProfile, returnFocusTo, workflow })
+  }
+
+  const openReview = (workflow: WorkflowDefinition) => openReviewForProfile(workflow, profile)
+
+  const openView = (workflow: WorkflowDefinition) => {
+    setReviewIntent(null)
+    setViewIntent({ profile, returnFocusTo: activeElement(), workflow })
+  }
+
+  const closeView = () => {
+    if (viewIntent) {
+      cancelPendingWorkflowDetailQuery(queryClient, viewIntent.workflow.name, viewIntent.profile)
+    }
+
+    setViewIntent(null)
+  }
+
+  useEffect(() => {
+    mounted.current = true
+
+    return () => {
+      mounted.current = false
+      reviewGeneration.current += 1
+    }
+  }, [])
 
   useEffect(() => {
     const onVisibilityChange = () => setIsVisible(document.visibilityState === 'visible')
@@ -52,33 +128,32 @@ export function WorkflowsView() {
   }, [])
 
   const runs = useInfiniteQuery({
+    enabled: view !== 'workflows',
     getNextPageParam: (page: WorkflowRunPage) => page.next_cursor ?? undefined,
     initialPageParam: undefined as string | undefined,
-    queryFn: ({ pageParam }) => listWorkflowRuns(pageParam as string | undefined, view),
+    queryFn: ({ pageParam }) => loadWorkflowRunPage(view, pageParam as string | undefined),
     queryKey: ['workflow-runs', profile, view],
     refetchInterval: () => (isVisible ? 20_000 : false)
   })
 
   const attention = useQuery({
+    enabled: view !== 'workflows',
     queryFn: listWorkflowAttention,
     queryKey: ['workflow-attention', profile],
     refetchInterval: () => (isVisible ? 20_000 : false)
   })
 
   const selected = useQuery({
-    enabled: Boolean(selectedRunId),
+    enabled: view !== 'workflows' && Boolean(selectedRunId),
     queryFn: () => getWorkflowRun(selectedRunId!),
     queryKey: ['workflow-run', profile, selectedRunId],
     refetchInterval: () => (isVisible ? 20_000 : false)
   })
 
-  const eventQueryKey = useMemo(
-    () => ['workflow-events', profile, selectedRunId] as const,
-    [profile, selectedRunId]
-  )
+  const eventQueryKey = useMemo(() => ['workflow-events', profile, selectedRunId] as const, [profile, selectedRunId])
 
   const events = useQuery({
-    enabled: Boolean(selectedRunId) && isVisible,
+    enabled: view !== 'workflows' && Boolean(selectedRunId) && isVisible,
     queryFn: async () => {
       const previous = queryClient.getQueryData<WorkflowEventPage>(eventQueryKey)
       const page = await listWorkflowEvents(selectedRunId!, previous?.next_cursor ?? 0)
@@ -169,11 +244,11 @@ export function WorkflowsView() {
     [nextCursor, runItems, runs.isError, t.operations.workflows]
   )
 
-  if (runs.isLoading) {
+  if (view !== 'workflows' && runs.isLoading) {
     return <PageLoader />
   }
 
-  if (runs.isError && !runs.data) {
+  if (view !== 'workflows' && runs.isError && !runs.data) {
     return <p className={PAGE_INSET_X}>{t.operations.workflowUnavailable}</p>
   }
 
@@ -191,7 +266,7 @@ export function WorkflowsView() {
     >
       <h1 className="mb-4 text-lg font-medium">{t.operations.workflows}</h1>
       <div aria-label={t.operations.workflowViews} className="mb-4 flex gap-2" role="tablist">
-        {(['board', 'history', 'archive'] as const).map(candidate => (
+        {(['workflows', 'board', 'history', 'archive'] as const).map(candidate => (
           <Button
             aria-selected={view === candidate}
             key={candidate}
@@ -203,27 +278,35 @@ export function WorkflowsView() {
             size="sm"
             variant={view === candidate ? 'default' : 'secondary'}
           >
-            {candidate === 'board'
-              ? t.operations.activeBoard
-              : candidate === 'history'
-                ? t.operations.history
-                : t.operations.archive}
+            {candidate === 'workflows'
+              ? t.operations.workflows
+              : candidate === 'board'
+                ? t.operations.activeBoard
+                : candidate === 'history'
+                  ? t.operations.history
+                  : t.operations.archive}
           </Button>
         ))}
       </div>
-      <AttentionInbox items={attention.data?.items ?? []} onOpenRun={selectWorkflowRun} />
-      <ActivityBoard
-        model={model}
-        onLoadMore={() => void runs.fetchNextPage()}
-        onOpenCard={card => selectWorkflowRun(card.id)}
-      />
-      {selected.data && (
-        <RunInspector
-          actionsDisabled={actionPending || mutation.isPending || selected.isError}
-          events={events.data?.events}
-          onAction={mutateRun}
-          run={selected.data}
-        />
+      {view === 'workflows' ? (
+        <WorkflowCatalog onRunWorkflow={openReview} onViewWorkflow={openView} />
+      ) : (
+        <>
+          <AttentionInbox items={attention.data?.items ?? []} onOpenRun={selectWorkflowRun} />
+          <ActivityBoard
+            model={model}
+            onLoadMore={() => void runs.fetchNextPage()}
+            onOpenCard={card => selectWorkflowRun(card.id)}
+          />
+          {selected.data && (
+            <RunInspector
+              actionsDisabled={actionPending || mutation.isPending || selected.isError}
+              events={events.data?.events}
+              onAction={mutateRun}
+              run={selected.data}
+            />
+          )}
+        </>
       )}
       {(view === 'history' || view === 'archive') && (
         <section aria-label={t.operations.cleanup} className="mt-6 border-t border-(--ui-border) pt-4">
@@ -258,6 +341,41 @@ export function WorkflowsView() {
           )}
         </section>
       )}
+      {reviewIntent ? (
+        <ReviewRunDialog
+          onClose={closeReview}
+          onRunLocated={async (runId, disposition) => {
+            await ensureGatewayProfile(reviewIntent.profile)
+
+            if (!mounted.current || reviewGeneration.current !== reviewIntent.generation) {
+              return
+            }
+
+            notify({
+              kind: 'success',
+              message:
+                disposition === 'existing' ? t.operations.workflowRunAlreadyRunning : t.operations.workflowRunStarted
+            })
+            selectWorkflowRun(runId)
+            setView('board')
+            void queryClient.invalidateQueries({
+              queryKey: ['workflow-runs', reviewIntent.profile]
+            })
+            closeReview()
+          }}
+          profile={reviewIntent.profile}
+          returnFocusTo={reviewIntent.returnFocusTo}
+          workflow={reviewIntent.workflow}
+        />
+      ) : null}
+      {viewIntent ? (
+        <ViewWorkflowDialog
+          onClose={closeView}
+          onRun={() => openReviewForProfile(viewIntent.workflow, viewIntent.profile, viewIntent.returnFocusTo)}
+          profile={viewIntent.profile}
+          workflow={viewIntent.workflow}
+        />
+      ) : null}
     </main>
   )
 }

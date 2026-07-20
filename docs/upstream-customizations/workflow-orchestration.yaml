@@ -29,6 +29,8 @@ coverage:
     reason: Separate user-requested v2.0.9 release preparation.
   - commit: fd11bee92a581b8aa22838b31a10ff59ceeaeb77
     reason: Separate user-requested v3.0.0 release preparation.
+  - commit: 144a4ce981040001445cd918e3cfa9f99fdb2b58
+    reason: Separate user-requested v3.0.1 release preparation.
 upstream_changes:
 - id: brand-aware-version-label
   change_class: branding-generic
@@ -697,4 +699,481 @@ upstream_changes:
   removal_condition: Remove when Hermes upstream binds an equivalent generic
     plugin service host in Gateway with the same readiness, provider-publication,
     failure-isolation, and pre-resource-teardown shutdown ordering.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-catalog-read-api
+  change_class: workflow-rest-adapter
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/cli.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/sanitize.py
+  - plugins/workflow/trust.py
+  - scripts/test_workflow_merge_gate.sh
+  owned_symbols:
+  - CATALOG_LIMIT
+  - CATALOG_MAX_SCAN_ENTRIES
+  - CATALOG_MAX_TRUST_STORE_BYTES
+  - build_workflow_catalog
+  - show_package
+  - WorkflowResourceReadBudget
+  - WorkflowCatalogCapacityError
+  - WorkflowCatalogUnavailableError
+  - WorkflowCatalogTrustUnavailableError
+  - WorkflowTrustStore.snapshot_read_only
+  - WorkflowTrustStore.check_snapshot
+  - Desktop enum-choice support classification
+  - desktop_input_name_is_representable
+  - workflow_input_name_is_portable
+  - workflow_input_names_are_portable
+  - CATALOG_MAX_RESOURCE_REQUEST_BYTES
+  - WorkflowCatalogResponse
+  - list_workflows
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(workflow): Task 1 add catalog endpoint'
+  upstream_candidate: true
+  merge_guidance: Preserve the authenticated workflow:read boundary, server-derived
+    trust and Desktop input-support classification, body/default-free CLI show
+    projection, per-entry invalid-definition isolation, stable ordering, the finite
+    deterministic filesystem scan budget with typed retryable capacity/unavailable
+    errors, bounded definition and digest-resource reads, one byte-bounded,
+    shape-validated, nonmutating trust snapshot per request, trust-store failure
+    isolation, cross-platform storage-safe and sanitizer-stable Desktop input
+    names bounded as generated UTF-8 and UTF-16 filename components, including
+    superscript Windows device aliases and case-insensitive collisions,
+    per-package resource classification with a separately bounded
+    request-work truncation signal, honest
+    unsupported classification for enums without usable string choices,
+    and the explicit 500-entry truncation signal. Keep discovery inside the
+    workflow plugin and do not add execution authority to this read route.
+  removal_condition: Remove when upstream provides an equivalent authenticated,
+    bounded, sanitized, failure-isolated workflow catalog for generic clients.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-detail-preflight-api
+  change_class: workflow-rest-adapter
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/cli.py
+  - plugins/workflow/coordinator_store.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/machine_contract.py
+  - plugins/workflow/sanitize.py
+  - plugins/workflow/trust.py
+  - scripts/test_workflow_merge_gate.sh
+  owned_symbols:
+  - _definition_projection
+  - WorkflowDefinitionProjectionCapacityError
+  - qualify_workflow_catalog_package
+  - build_workflow_detail
+  - WorkflowCatalogInvalidDefinitionError
+  - WorkflowDetailNotFoundError
+  - CoordinatorStore.health_read_only
+  - CoordinatorHealthSnapshotError
+  - bounded stable coordinator DB/WAL snapshot contract
+  - consecutive full-pair SHA-256 generation verification
+  - WorkflowTrustStore.check_read_only
+  - projection_key_is_secret
+  - suffix-bounded sanitize_projection strings
+  - workflow show complete definition preservation
+  - WorkflowDetailResponse
+  - workflow_detail
+  tests:
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(workflow): Task 2 add detail preflight endpoint'
+  upstream_candidate: true
+  merge_guidance: Preserve the authenticated workflow:read boundary, bounded
+    catalog and package-resource reads, shared CLI/REST redacted normalized
+    definition and topology values, one shared list/detail/admission qualifier
+    for explicit complete-definition node/edge/byte bounds, ordered Mermaid
+    warning preservation, cancel/hook/body redaction with
+    benign policy preservation, nonmutating trust classification from the same
+    byte-bounded shape-validated snapshot contract as the catalog, WAL-aware
+    coordinator health from two consecutive bounded SHA-256-verified temporary
+    DB/WAL generations per attempt, including same-metadata overwrite detection,
+    without ever opening authoritative SQLite files; typed invalid-resource
+    failure isolation; and byte-stable profile state. Keep all workflow imports
+    lazy in the generic dashboard host and do not add execution, admission,
+    staging, or trust mutation authority.
+  removal_condition: Remove when upstream provides an equivalent authenticated,
+    bounded, redacted, mutation-free workflow detail and preflight API.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-desktop-provenance-derivation
+  change_class: workflow-rest-adapter
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/provenance.py
+  owned_symbols:
+  - ApiAdmissionAuthority.trigger_source
+  - WorkflowAuthority.trigger_source
+  - _verified_operator authenticated session provenance selection
+  - TriggerProvenance.authenticated_api server-derived source vocabulary
+  - authenticated API source runtime validation before persistence
+  - StartRunRequest Desktop input-name validation
+  - ApiAdmissionAuthority positional constructor compatibility
+  - byte-stable CLI, chat, cron, remote-token, local Desktop, and legacy API
+    admission digest fixtures
+  tests:
+  - tests/hermes_cli/test_workflow_dashboard_auth.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_operator_e2e.py
+  - tests/plugins/workflow/test_provenance.py
+  expected_commit_subject: 'feat(workflow): Task 3 derive Desktop provenance'
+  upstream_candidate: true
+  merge_guidance: Preserve server-only provenance derivation at the verified
+    principal boundary. Authenticated local Desktop/dashboard sessions,
+    including local-admin sessions, record desktop while remote bearer-token
+    principals retain api; caller fields and headers never select the source.
+    Keep the independently truthful decision channel unchanged, do not execute
+    workflow nodes in POST /runs, reject every non-REST source before catalog
+    discovery or staging, preserve the pre-Task-3 positional return-route
+    constructor slot, retain real gated-session plus registered bearer-token
+    middleware integration coverage, and preserve all recorded admission digest
+    fixtures byte-for-byte so no unintended idempotency migration is introduced.
+    Reject caller-forged value names that cannot be represented unchanged by the
+    Desktop detail projection and immutable input snapshot before catalog lookup.
+  removal_condition: Remove when upstream provides equivalent authenticated
+    Desktop-versus-token provenance derivation without caller authority or
+    admission digest migration.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-catalog-trigger-bridge
+  change_class: desktop-workflow-adapter
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/electron/main.ts
+  - apps/desktop/electron/preload.ts
+  - apps/desktop/electron/structured-api-channel.test.ts
+  - apps/desktop/electron/structured-api-response.ts
+  - apps/desktop/electron/structured-api-response.test.ts
+  - apps/desktop/package.json
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/global.d.ts
+  - apps/desktop/src/hermes.ts
+  - apps/desktop/src/hermes.test.ts
+  - apps/desktop/src/lib/hermes-api.ts
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - apps/desktop/src/types/hermes.ts
+  - tests/test_desktop_workflow_test_gate.py
+  owned_symbols:
+  - hermes:api:structured
+  - apiStructured
+  - collectStructuredJsonResponse
+  - single structured-response collector branch per authenticated transport
+  - HermesStructuredApiResponse
+  - WorkflowApiError
+  - listWorkflowDefinitions
+  - preflightWorkflow
+  - startWorkflowRun
+  - WorkflowDefinition
+  - WorkflowCatalogPage
+  - WorkflowDetail
+  - WorkflowRunView workflows value
+  - WorkflowRunListView
+  - loadWorkflowRunPage
+  tests:
+  - apps/desktop/electron/structured-api-channel.test.ts
+  - apps/desktop/electron/structured-api-response.test.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/hermes.test.ts
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - tests/test_desktop_workflow_test_gate.py
+  expected_commit_subject: 'feat(desktop): Task 4 add workflow catalog bridge'
+  upstream_candidate: true
+  merge_guidance: Preserve the additive structured authenticated IPC channel
+    without changing legacy hermes:api callers or authentication headers. Both
+    local/token and OAuth transports must return structured-clone-safe success
+    and JSON HTTP-failure envelopes only for opted-in requests while transport,
+    timeout, response-stream, HTML, and non-JSON failures still reject. Keep the
+    shared collector as the only structured branch in each transport; legacy
+    response collection must remain free of unreachable structured fallbacks.
+    Keep the
+    navigation-only workflows view outside the server run-list view union and
+    prevent it from reaching the run-list endpoint. Keep workflow error
+    normalization in the renderer with detail before error before HTTP status,
+    require a nonblank idempotency key before sending, and never accept client
+    provenance fields in the run body.
+  removal_condition: Remove when upstream Desktop exposes equivalent typed,
+    profile-aware workflow catalog, detail, and admission wrappers without
+    changing existing REST bridge error semantics.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-catalog-datagrid
+  change_class: desktop-workflow-ui
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
+  - apps/desktop/src/lib/hermes-api.ts
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - website/docs/user-guide/features/workflows.md
+  - tests/test_desktop_workflow_test_gate.py
+  owned_symbols:
+  - WorkflowCatalog
+  - WorkflowCatalogProps
+  - WORKFLOW_DOCS_URL fork-owned base documentation link
+  - WorkflowsView workflow catalog tab
+  - listWorkflowDefinitions explicit profile binding
+  - preflightWorkflow explicit profile binding
+  - startWorkflowRun explicit profile binding
+  - operations.workflowCatalog translations
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - tests/test_desktop_workflow_test_gate.py
+  expected_commit_subject: 'feat(desktop): Task 5 add workflow catalog datagrid'
+  upstream_candidate: true
+  merge_guidance: Preserve the Workflows-first catalog entry point, explicit-profile
+    request binding paired with its React Query cache key, native tokenized table,
+    localized explicit loading/error/empty states, shared semantic warning Alert
+    for partial results, semantic Badge variants without call-site color chrome,
+    and typed corrupt-entry rows. Keep View enabled for every valid entry, and
+    keep Run fail-closed with a keyboard-reachable non-action explanation when
+    inputs are unsupported or trust verification fails. Keep the empty-state
+    operator-doc destination on the cmetech-owned base documentation page shared
+    by OTTO and LOOP24; do not restore the upstream Nous Research domain or rely
+    on title-case build substitution to rewrite a lowercase URL. Keep that page
+    accurate to the currently mounted Desktop behavior,
+    do not let the catalog navigation view reach the workflow run-list endpoint,
+    and do not add modal behavior here.
+  removal_condition: Remove when upstream Desktop provides an equivalent native
+    workflow catalog with the same query isolation, typed failure states, action
+    safety, accessibility, and four-locale coverage.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-review-run
+  change_class: desktop-workflow-ui
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/package.json
+  - apps/desktop/src/app/hooks/use-keybinds.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - apps/desktop/src/types/hermes.ts
+  - plugins/workflow/api_admission.py
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - openModalOwnsKeyboard
+  - useKeybinds open-modal dispatch guard
+  - ReviewRunDialog
+  - ReviewRunDialogProps
+  - ReviewRunDialog optional-input omission and tri-state boolean control
+  - WorkflowsView review intent generation and guarded run-location transition
+  - WorkflowDetail compatibility contract
+  - start_api_run compatibility admission boundary
+  - ApiAdmissionError workflow_compatibility_blocked response
+  - operations.workflowReviewRun translations
+  - desktop review-run workflow UI test gate
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(desktop): Task 6 add workflow review and run'
+  upstream_candidate: true
+  merge_guidance: Preserve a fresh idempotency key for each modal lifetime and
+    reuse it for admission retries and coalesced submits in that lifetime. Once
+    admission succeeds, retain the admitted run in modal state; profile recovery
+    must retry location only, never POST again or permit input edits. Keep
+    preflight and admission bound to the profile captured when Run was selected,
+    then await canonical activation of that profile before any board/detail/event
+    query or cache invalidation, with mounted/intent-generation checks before
+    every parent side effect. Keep the modal non-dismissible while either
+    admission or profile activation is unresolved, and preserve the generic
+    open-dialog guard in the global keybind capture dispatcher so navigation,
+    session, and view shortcuts cannot unmount any modal-owning route; Escape
+    must propagate to the modal. Report post-admission profile failures honestly
+    and retry location for the saved run. Serialize the four
+    supported flat control types to string wire values, omit every untouched
+    optional control so package defaults retain their meaning, keep optional
+    booleans explicitly tri-state (unset/on/off), and send an empty values object
+    for parameterless workflows. Fail closed in both UI and server
+    admission on untrusted, incompatible, unsupported, unhealthy, or incomplete
+    enum metadata; assess compatibility once and persist no run for a blocking
+    report. Keep structured 409, 422, 503, network, and post-admission profile
+    outcomes distinct, map FastAPI validation detail only to a rendered field
+    through accessible error ids, show unseen field failures globally, restore
+    focus on close, ignore stale preflight responses, and route both created and
+    existing outcomes to the selected run on the active board without adding
+    caller-controlled provenance.
+  removal_condition: Remove when upstream Desktop provides an equivalent native
+    review-and-run flow with profile-stable admission, modal-lifetime
+    idempotency, structured errors, accessible focus/error behavior, and the
+    same four-locale coverage.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-view-modal
+  change_class: desktop-workflow-ui
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/package.json
+  - apps/desktop/src/app/workflows/detail-query.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/components/assistant-ui/embeds/workflow-topology.test.tsx
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - scripts/test_workflow_merge_gate.sh
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - ViewWorkflowDialog
+  - ViewWorkflowDialogProps
+  - stableWorkflowDefinitionJson
+  - cancelPendingWorkflowDetailQuery
+  - workflowDetailQueryKey
+  - workflowDetailQueryOptions
+  - useWorkflowDetailQuery
+  - WorkflowsView profile-bound view intent and non-stacking run handoff
+  - ReviewRunDialog explicit catalog return-focus target
+  - operations.workflowView translations
+  - workflow topology shared-renderer contract
+  - desktop workflow view-modal test gate
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/components/assistant-ui/embeds/workflow-topology.test.tsx
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(desktop): Task 7 add workflow view modal'
+  upstream_candidate: true
+  merge_guidance: Preserve one profile-keyed workflow detail query contract for
+    both View and Review & Run. Retain resolved detail long enough for View to
+    hand off to Review without refetching or stacking dialogs, while canceling
+    data-less in-flight queries on explicit View or Review close so a late
+    preflight cannot populate a reopened modal. Keep detail fetches one-shot
+    until the user explicitly retries. Keep the Mermaid default export lazy,
+    routed through the existing RichBoundary, and securityLevel strict in the shared renderer;
+    never add a second generator, initializer, dependency, or security policy.
+    Preserve the shared dialog's vertical scrolling while bounding horizontal
+    and inner Diagram/Definition overflow, render typed
+    omission codes as localized outline fallbacks, and keep fetch failures
+    retryable without exposing raw server codes. Definition must remain a
+    recursively code-unit-sorted, two-space JSON projection of the server's
+    redacted normalized definition, selectable and copyable through shared
+    CodeCard and CopyButton primitives, with no editable control. Keep the Run
+    action visible in both sub-views and fail closed until fetched detail proves
+    the workflow trusted, input-supported, compatible, and coordinator-healthy;
+    never authorize from a stale catalog row. Every disabled Run state must have
+    a visible localized reason associated through aria-describedby rather than
+    relying on an inaccessible disabled-button tooltip. Bind handoff and
+    admission to the profile captured when View opened. On View-to-Review handoff,
+    retain the stable catalog trigger as the explicit close-focus target rather
+    than focusing the detached View action. Preserve the generic open-dialog
+    keybind guard from Task 6.
+  removal_condition: Remove when upstream Desktop provides an equivalent secure
+    workflow topology/definition modal with shared profile-scoped preflight
+    caching, honest bounded fallbacks, read-only redacted definition copy, and a
+    non-stacking handoff to its native review-and-run flow.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-catalog-desktop-trigger-e2e
+  change_class: workflow-rest-adapter
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/store.py
+  - plugins/workflow/trust.py
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_store.py
+  - tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - resolve_workflow_catalog_package
+  - _catalog_package failure-isolated admission resolution
+  - bounded cached admission resource snapshot
+  - sealed cache-only immutable package snapshot
+  - trusted package-to-immutable snapshot digest comparison
+  - workflow_filename_components_are_distinct
+  - test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary
+  - test_merge_gate_pins_workflow_catalog_desktop_e2e_contract
+  tests:
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_store.py
+  - tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'test(workflow): Task 8 add Desktop catalog trigger e2e'
+  upstream_candidate: true
+  merge_guidance: Preserve the end-to-end contract through the real dashboard
+    session-token middleware and mounted workflow router, covering authenticated local
+    Desktop catalog and detail reads, topology projection, background-only 202
+    admission with a caller-minted idempotency key, server-derived desktop
+    provenance, an unexecuted node at response time, and board visibility from
+    the same real store. List, detail, and admission must share the same bounded
+    precedence resolver and per-package executable-resource budget; total list
+    work must remain separately bounded and report truncation rather than
+    reclassifying a later valid package. Corrupt or duplicate neighbors cannot block a valid
+    visible row, while a requested invalid/capacity row, including a package
+    beyond the shared redacted-definition projection bound, must return the
+    typed 422/503 envelope without persistence. Snapshot from the exact bounded bytes
+    that passed trust verification, seal the cache before authorization, perform
+    immutable snapshot copying without resolving or rereading package paths, and
+    discard a snapshot whose package digest differs before admission. Preserve
+    the portable input-name set invariant, including generated-component
+    UTF-8/UTF-16 limits, superscript device aliases, and case-insensitive
+    collision rejection, in direct store callers as well as REST validation.
+    Store must compare actual generated targets consisting of raw file-input
+    names and text-input names with the `.txt` suffix before writing either
+    channel.
+    Keep this pure-API test in the focused
+    merge gate and out of the native portability matrix.
+  removal_condition: Remove when upstream provides equivalent real-middleware
+    coverage for the complete Desktop workflow catalog-to-board contract.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-catalog-desktop-trigger-verification
+  change_class: workflow-verification
+  owner: workflow-orchestration
+  files:
+  - docs/reviews/2026-07-20-workflow-catalog-desktop-trigger-adversarial-review.md
+  - docs/reviews/2026-07-20-workflow-catalog-desktop-trigger-verification.md
+  - tests/plugins/workflow/fixtures/desktop-catalog-trigger/workflows/desktop-approval-uat.hermes.yaml
+  - tests/plugins/workflow/fixtures/desktop-catalog-trigger/workflows/desktop-approval-uat.yaml
+  - tests/plugins/workflow/fixtures/desktop-catalog-trigger/workflows/desktop-topology-omitted-uat.yaml
+  - website/docs/user-guide/features/workflows.md
+  owned_symbols:
+  - desktop-approval-uat reproducible Desktop approval fixture
+  - desktop-topology-omitted-uat reproducible bounded-fallback fixture
+  - workflow catalog and Desktop state operator guide
+  - workflow catalog Desktop trigger final adversarial review
+  - workflow catalog Desktop trigger verification record
+  tests:
+  - tests/plugins/workflow/fixtures/desktop-catalog-trigger/workflows/desktop-approval-uat.yaml
+  - tests/plugins/workflow/fixtures/desktop-catalog-trigger/workflows/desktop-topology-omitted-uat.yaml
+  expected_commit_subject: 'docs(workflow): Task 9 verify catalog desktop trigger'
+  upstream_candidate: true
+  merge_guidance: Preserve the operator-facing catalog, secure View, and Review
+    and Run guidance with its honest error-state matrix. Keep both fixtures as
+    reproducible UAT inputs. Install them into a real project catalog and trust
+    the approval fixture through the ordinary digest-bound trust flow. The
+    verification record must continue to label this as fixture-based rather
+    than a bundled-showcase walkthrough and retain known limitations L-A and
+    L-B until those deliberate v1 boundaries change separately.
+  removal_condition: Remove when upstream provides equivalent operator docs,
+    reproducible Desktop approval and topology-omission fixtures, and a complete
+    independently reproducible verification record for the same feature.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

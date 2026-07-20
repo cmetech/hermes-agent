@@ -1,0 +1,4 @@
+# Only the Playwright engine needs a Python dependency. The agent-browser
+# engine uses the CLI vendored in the repo (node_modules/agent-browser) and
+# needs nothing here. storage_to_md / artifacts / confluence_api are stdlib-only.
+playwright>=1.40
