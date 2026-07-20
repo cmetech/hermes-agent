@@ -156,8 +156,20 @@ export interface WorkflowCatalogPage {
   truncated: boolean
 }
 
+export interface WorkflowCompatibilityFinding {
+  blocking: boolean
+  code: string
+  level: string
+  message: string
+  path: string
+}
+
 export interface WorkflowDetail extends WorkflowDefinition {
-  compatibility: Record<string, unknown>
+  compatibility: Record<string, unknown> & {
+    findings?: WorkflowCompatibilityFinding[]
+    level: string
+    runnable?: boolean
+  }
   coordinator: {
     healthy: boolean
     reason: string

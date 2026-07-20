@@ -16,13 +16,16 @@ import {
   previewWorkflowCleanup
 } from '@/hermes'
 import { useI18n } from '@/i18n'
-import type { WorkflowEventPage, WorkflowRunPage, WorkflowRunView } from '@/types/hermes'
+import { notify } from '@/store/notifications'
+import { ensureGatewayProfile } from '@/store/profile'
+import type { WorkflowDefinition, WorkflowEventPage, WorkflowRunPage, WorkflowRunView } from '@/types/hermes'
 
 import { PAGE_INSET_X } from '../layout-constants'
 
 import { workflowBoardModel } from './adapter'
 import { AttentionInbox } from './attention-inbox'
 import { WorkflowCatalog } from './catalog'
+import { ReviewRunDialog } from './review-run-dialog'
 import { RunInspector } from './run-inspector'
 import { $workflowSelectedRunId, selectWorkflowRun } from './store'
 
@@ -44,13 +47,41 @@ export function loadWorkflowRunPage(view: WorkflowRunView, cursor?: string): Pro
 
 export function WorkflowsView() {
   const { t } = useI18n()
-  const profile = getApiRequestProfile() ?? 'default'
+  const requestProfile = getApiRequestProfile()
+  const profile = requestProfile ?? 'default'
   const queryClient = useQueryClient()
   const selectedRunId = useStore($workflowSelectedRunId)
   const actionInFlight = useRef(false)
+  const mounted = useRef(true)
+  const reviewGeneration = useRef(0)
   const [actionPending, setActionPending] = useState(false)
   const [isVisible, setIsVisible] = useState(() => document.visibilityState === 'visible')
   const [view, setView] = useState<WorkflowRunView>('workflows')
+
+  const [reviewIntent, setReviewIntent] = useState<null | {
+    generation: number
+    profile: string
+    workflow: WorkflowDefinition
+  }>(null)
+
+  const closeReview = () => {
+    reviewGeneration.current += 1
+    setReviewIntent(null)
+  }
+
+  const openReview = (workflow: WorkflowDefinition) => {
+    reviewGeneration.current += 1
+    setReviewIntent({ generation: reviewGeneration.current, profile, workflow })
+  }
+
+  useEffect(() => {
+    mounted.current = true
+
+    return () => {
+      mounted.current = false
+      reviewGeneration.current += 1
+    }
+  }, [])
 
   useEffect(() => {
     const onVisibilityChange = () => setIsVisible(document.visibilityState === 'visible')
@@ -222,7 +253,7 @@ export function WorkflowsView() {
         ))}
       </div>
       {view === 'workflows' ? (
-        <WorkflowCatalog />
+        <WorkflowCatalog onRunWorkflow={openReview} />
       ) : (
         <>
           <AttentionInbox items={attention.data?.items ?? []} onOpenRun={selectWorkflowRun} />
@@ -274,6 +305,32 @@ export function WorkflowsView() {
           )}
         </section>
       )}
+      {reviewIntent ? (
+        <ReviewRunDialog
+          onClose={closeReview}
+          onRunLocated={async (runId, disposition) => {
+            await ensureGatewayProfile(reviewIntent.profile)
+
+            if (!mounted.current || reviewGeneration.current !== reviewIntent.generation) {
+              return
+            }
+
+            notify({
+              kind: 'success',
+              message:
+                disposition === 'existing' ? t.operations.workflowRunAlreadyRunning : t.operations.workflowRunStarted
+            })
+            selectWorkflowRun(runId)
+            setView('board')
+            void queryClient.invalidateQueries({
+              queryKey: ['workflow-runs', reviewIntent.profile]
+            })
+            closeReview()
+          }}
+          profile={reviewIntent.profile}
+          workflow={reviewIntent.workflow}
+        />
+      ) : null}
     </main>
   )
 }

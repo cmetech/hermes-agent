@@ -849,8 +849,8 @@ upstream_changes:
   - apps/desktop/electron/structured-api-response.ts
   - apps/desktop/electron/structured-api-response.test.ts
   - apps/desktop/package.json
-  - apps/desktop/src/app/workflows/index.tsx
   - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/index.tsx
   - apps/desktop/src/global.d.ts
   - apps/desktop/src/hermes.ts
   - apps/desktop/src/hermes.test.ts
@@ -945,4 +945,73 @@ upstream_changes:
   removal_condition: Remove when upstream Desktop provides an equivalent native
     workflow catalog with the same query isolation, typed failure states, action
     safety, accessibility, and four-locale coverage.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-review-run
+  change_class: desktop-workflow-ui
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/package.json
+  - apps/desktop/src/app/hooks/use-keybinds.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - apps/desktop/src/types/hermes.ts
+  - plugins/workflow/api_admission.py
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - openModalOwnsKeyboard
+  - useKeybinds open-modal dispatch guard
+  - ReviewRunDialog
+  - ReviewRunDialogProps
+  - ReviewRunDialog optional-input omission and tri-state boolean control
+  - WorkflowsView review intent generation and guarded run-location transition
+  - WorkflowDetail compatibility contract
+  - start_api_run compatibility admission boundary
+  - ApiAdmissionError workflow_compatibility_blocked response
+  - operations.workflowReviewRun translations
+  - desktop review-run workflow UI test gate
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(desktop): Task 6 add workflow review and run'
+  upstream_candidate: true
+  merge_guidance: Preserve a fresh idempotency key for each modal lifetime and
+    reuse it for admission retries and coalesced submits in that lifetime. Once
+    admission succeeds, retain the admitted run in modal state; profile recovery
+    must retry location only, never POST again or permit input edits. Keep
+    preflight and admission bound to the profile captured when Run was selected,
+    then await canonical activation of that profile before any board/detail/event
+    query or cache invalidation, with mounted/intent-generation checks before
+    every parent side effect. Keep the modal non-dismissible while either
+    admission or profile activation is unresolved, and preserve the generic
+    open-dialog guard in the global keybind capture dispatcher so navigation,
+    session, and view shortcuts cannot unmount any modal-owning route; Escape
+    must propagate to the modal. Report post-admission profile failures honestly
+    and retry location for the saved run. Serialize the four
+    supported flat control types to string wire values, omit every untouched
+    optional control so package defaults retain their meaning, keep optional
+    booleans explicitly tri-state (unset/on/off), and send an empty values object
+    for parameterless workflows. Fail closed in both UI and server
+    admission on untrusted, incompatible, unsupported, unhealthy, or incomplete
+    enum metadata; assess compatibility once and persist no run for a blocking
+    report. Keep structured 409, 422, 503, network, and post-admission profile
+    outcomes distinct, map FastAPI validation detail only to a rendered field
+    through accessible error ids, show unseen field failures globally, restore
+    focus on close, ignore stale preflight responses, and route both created and
+    existing outcomes to the selected run on the active board without adding
+    caller-controlled provenance.
+  removal_condition: Remove when upstream Desktop provides an equivalent native
+    review-and-run flow with profile-stable admission, modal-lifetime
+    idempotency, structured errors, accessible focus/error behavior, and the
+    same four-locale coverage.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

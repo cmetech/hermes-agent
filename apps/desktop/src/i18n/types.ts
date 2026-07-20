@@ -1408,6 +1408,26 @@ export interface Translations {
     workflowRunUnavailable: string
     workflowRunUnsupportedInputs: string
     workflowRunUntrusted: string
+    workflowReviewRunTitle: (workflow: string) => string
+    workflowReviewRunDescription: string
+    workflowRunPreflightLoading: string
+    workflowRunPreflightErrorTitle: string
+    workflowRunPreflightErrorDescription: string
+    workflowRunTrust: string
+    workflowRunRisk: string
+    workflowRunInputs: string
+    workflowRunStart: string
+    workflowRunRetry: string
+    workflowRunStarted: string
+    workflowRunAlreadyRunning: string
+    workflowRunConflict: string
+    workflowRunCoordinatorUnavailable: string
+    workflowRunIncompatible: string
+    workflowRunNetworkError: string
+    workflowRunProfileUnavailable: string
+    workflowRunValidationError: string
+    workflowRunRequiredInput: (input: string) => string
+    workflowRunUnsupportedCommand: (workflow: string) => string
     activeBoard: string
     history: string
     archive: string

@@ -89,6 +89,12 @@ def test_merge_gate_pins_workflow_detail_api_contract() -> None:
     assert "tests/plugins/workflow/test_workflow_detail_api.py" in source
 
 
+def test_merge_gate_pins_desktop_review_run_contract() -> None:
+    source = GATE.read_text()
+
+    assert "src/app/workflows/review-run-dialog.test.tsx" in source
+
+
 def test_native_workflow_matrix_covers_every_release_gate() -> None:
     source = CI.read_text()
 

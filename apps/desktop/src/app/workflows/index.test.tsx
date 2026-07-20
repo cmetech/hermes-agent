@@ -18,6 +18,7 @@ const mutateWorkflowRun = vi.fn()
 const previewWorkflowCleanup = vi.fn()
 const executeWorkflowCleanup = vi.fn()
 const apiRequestState = vi.hoisted(() => ({ profile: 'default' as string | null }))
+const profileRouting = vi.hoisted(() => ({ ensureGatewayProfile: vi.fn() }))
 
 vi.mock('@/hermes', () => ({
   getApiRequestProfile: () => apiRequestState.profile,
@@ -34,6 +35,8 @@ vi.mock('@/hermes', () => ({
 vi.mock('@/lib/hermes-api', () => ({
   listWorkflowDefinitions: (...args: unknown[]) => listWorkflowDefinitions(...args)
 }))
+
+vi.mock('@/store/profile', () => ({ ensureGatewayProfile: profileRouting.ensureGatewayProfile }))
 
 function deferred<T>() {
   let reject!: (reason?: unknown) => void
@@ -109,6 +112,7 @@ function setVisibility(value: 'hidden' | 'visible') {
 
 beforeEach(() => {
   apiRequestState.profile = 'default'
+  profileRouting.ensureGatewayProfile.mockResolvedValue(undefined)
 
   for (const mock of [
     getWorkflowEvidence,
@@ -142,6 +146,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  profileRouting.ensureGatewayProfile.mockReset()
   $workflowSelectedRunId.set(null)
   vi.clearAllMocks()
 })

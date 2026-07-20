@@ -17,7 +17,12 @@ import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
-from plugins.workflow.api_admission import ApiAdmissionAuthority, start_api_run
+import plugins.workflow.api_admission as api_admission_module
+from plugins.workflow.api_admission import (
+    ApiAdmissionAuthority,
+    ApiAdmissionError,
+    start_api_run,
+)
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.notifications import NotificationOutbox
@@ -326,6 +331,107 @@ def test_post_runs_api_admission_requires_healthy_coordinator_without_run(
 
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "coordinator_unavailable"
+    assert list(store.runs_root.rglob("run.json")) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
+def test_direct_api_admission_rejects_incompatible_workflow_before_persistence(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="api-incompatible-direct",
+        nodes=[
+            {
+                "id": "shell",
+                "bash": "true",
+                "allowed_tools": ["Read"],
+            }
+        ],
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    original_assess = api_admission_module.assess_compatibility
+    assessments = 0
+
+    def counted_assess(package):
+        nonlocal assessments
+        assessments += 1
+        return original_assess(package)
+
+    monkeypatch.setattr(api_admission_module, "assess_compatibility", counted_assess)
+
+    with pytest.raises(ApiAdmissionError) as caught:
+        start_api_run(
+            store,
+            hermes_home=home,
+            workdir=tmp_path,
+            user_home=tmp_path,
+            workflow_name="api-incompatible-direct",
+            values={},
+            idempotency_key="incompatible-direct",
+            concurrency_policy="queue",
+            authority=ApiAdmissionAuthority(
+                principal="desktop:test",
+                namespace="desktop:test",
+                operator_scope=None,
+                source_instance="api:session:test",
+                assurance="verified_adapter",
+                trigger_source="desktop",
+            ),
+        )
+
+    assert caught.value.code == "workflow_compatibility_blocked"
+    assert caught.value.status_code == 409
+    assert caught.value.retryable is False
+    assert assessments == 1
+    assert list(store.runs_root.rglob("run.json")) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
+def test_post_runs_rejects_incompatible_workflow_without_run_or_execution(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(
+        home,
+        workflow_writer,
+        name="api-incompatible-http",
+        nodes=[
+            {
+                "id": "shell",
+                "bash": "true",
+                "allowed_tools": ["Read"],
+            }
+        ],
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    writer = TokenPrincipal(
+        principal="writer", provider="test", scopes=("workflow:write",)
+    )
+
+    response = TestClient(_app(_router(), token=writer)).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "api-incompatible-http",
+            "values": {},
+            "idempotency_key": "incompatible-http",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "workflow_compatibility_blocked",
+            "retryable": False,
+        }
+    }
     assert list(store.runs_root.rglob("run.json")) == []
     assert list(store.staging_root.iterdir()) == []
 

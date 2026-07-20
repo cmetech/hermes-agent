@@ -96,7 +96,8 @@ def start_api_run(
         raise ApiAdmissionError("workflow_not_found", status_code=404)
 
     digest = compute_package_digest(package)
-    risk = build_risk_summary(package, assess_compatibility(package))
+    compatibility = assess_compatibility(package)
+    risk = build_risk_summary(package, compatibility)
     trusted = (
         WorkflowTrustStore(home).check(
             digest.sha256,
@@ -106,6 +107,11 @@ def start_api_run(
     )
     if not trusted:
         raise ApiAdmissionError("workflow_trust_required", status_code=403)
+    if not compatibility.runnable:
+        raise ApiAdmissionError(
+            "workflow_compatibility_blocked",
+            status_code=409,
+        )
     try:
         preflight_execution(risk, trusted=True)
     except WorkflowTrustError as exc:

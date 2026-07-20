@@ -46,7 +46,7 @@
     "fmt": "prettier --write 'src/**/*.{ts,tsx}' 'electron/**/*.ts' 'vite.config.ts'",
     "fix": "npm run lint:fix && npm run fmt",
     "test:ui": "vitest run --environment jsdom",
-    "test:workflow-ui": "vitest run --environment jsdom src/hermes.test.ts src/lib/hermes-api.test.ts src/components/activity-board/activity-board.test.tsx src/components/activity-board/activity-board.performance.test.tsx src/app/workflows/adapter.test.ts src/app/workflows/index.test.tsx src/app/workflows/workflow-operations.e2e.test.tsx src/app/kanban/adapter.test.ts src/app/kanban/index.test.tsx src/app/kanban/kanban-operations.e2e.test.tsx src/app/routes.test.ts src/i18n/languages.test.ts",
+    "test:workflow-ui": "vitest run --environment jsdom src/hermes.test.ts src/lib/hermes-api.test.ts src/components/activity-board/activity-board.test.tsx src/components/activity-board/activity-board.performance.test.tsx src/app/workflows/adapter.test.ts src/app/workflows/index.test.tsx src/app/workflows/review-run-dialog.test.tsx src/app/workflows/workflow-operations.e2e.test.tsx src/app/kanban/adapter.test.ts src/app/kanban/index.test.tsx src/app/kanban/kanban-operations.e2e.test.tsx src/app/routes.test.ts src/i18n/languages.test.ts",
     "preview": "node scripts/assert-root-install.mjs && vite preview --host 127.0.0.1 --port 4174"
   },
   "dependencies": {
