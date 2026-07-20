@@ -1147,6 +1147,7 @@ upstream_changes:
   change_class: workflow-verification
   owner: workflow-orchestration
   files:
+  - docs/reviews/2026-07-20-workflow-catalog-desktop-trigger-adversarial-review.md
   - docs/reviews/2026-07-20-workflow-catalog-desktop-trigger-verification.md
   - tests/plugins/workflow/fixtures/desktop-catalog-trigger/workflows/desktop-approval-uat.hermes.yaml
   - tests/plugins/workflow/fixtures/desktop-catalog-trigger/workflows/desktop-approval-uat.yaml
@@ -1156,6 +1157,7 @@ upstream_changes:
   - desktop-approval-uat reproducible Desktop approval fixture
   - desktop-topology-omitted-uat reproducible bounded-fallback fixture
   - workflow catalog and Desktop state operator guide
+  - workflow catalog Desktop trigger final adversarial review
   - workflow catalog Desktop trigger verification record
   tests:
   - tests/plugins/workflow/fixtures/desktop-catalog-trigger/workflows/desktop-approval-uat.yaml
