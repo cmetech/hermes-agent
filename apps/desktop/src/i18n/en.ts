@@ -1722,6 +1722,7 @@ export const en: Translations = {
     workflowRunUnavailable: 'Run unavailable',
     workflowRunUnsupportedInputs: 'Run is unavailable because this workflow uses unsupported input fields.',
     workflowRunShowcaseFromCli: 'Run this bundled showcase from the CLI.',
+    workflowRunShowcaseVerificationFailed: 'The bundled showcase could not be verified and was not started.',
     workflowRunSupportUnavailable:
       'Run is unavailable until the Hermes backend supports this workflow catalog version.',
     workflowRunUntrusted: 'Run is unavailable because this workflow failed trust verification.',
@@ -1738,6 +1739,8 @@ export const en: Translations = {
     workflowRunStarted: 'Started',
     workflowRunAlreadyRunning: 'Already running — showing you that run',
     workflowRunConflict: 'These inputs changed after this run intent was created. Close this review and try again.',
+    workflowRunCatalogSourceInvalid:
+      'This workflow source is no longer available. Close this review and select it again.',
     workflowRunCoordinatorUnavailable: "The background coordinator isn't running — try again shortly.",
     workflowRunIncompatible: 'This workflow is not compatible with the current Hermes runtime and cannot start.',
     workflowRunNetworkError: 'The run could not be started because the connection failed.',

@@ -29,7 +29,16 @@ type FlatInputValue = boolean | number | string | undefined
 
 interface AdmissionError {
   field?: string
-  kind: 'compatibility' | 'conflict' | 'coordinator' | 'network' | 'profile' | 'validation'
+  kind:
+    | 'catalog_source'
+    | 'compatibility'
+    | 'conflict'
+    | 'coordinator'
+    | 'network'
+    | 'profile'
+    | 'showcase_cli'
+    | 'showcase_verification'
+    | 'validation'
   message?: string
 }
 
@@ -89,6 +98,18 @@ function admissionError(error: unknown): AdmissionError {
 
   if (error.code === 'workflow_compatibility_blocked') {
     return { kind: 'compatibility' }
+  }
+
+  if (error.code === 'workflow_showcase_cli_required') {
+    return { kind: 'showcase_cli' }
+  }
+
+  if (error.code === 'workflow_showcase_verification_failed') {
+    return { kind: 'showcase_verification' }
+  }
+
+  if (error.code === 'workflow_catalog_source_invalid') {
+    return { kind: 'catalog_source' }
   }
 
   return {
@@ -442,19 +463,19 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
           : copy.workflowRunUnsupportedCommand(workflow.name)
         : null
 
+  const admissionErrorMessages: Partial<Record<AdmissionError['kind'], string>> = {
+    catalog_source: copy.workflowRunCatalogSourceInvalid,
+    compatibility: copy.workflowRunIncompatible,
+    conflict: copy.workflowRunConflict,
+    coordinator: copy.workflowRunCoordinatorUnavailable,
+    network: copy.workflowRunNetworkError,
+    profile: copy.workflowRunProfileUnavailable,
+    showcase_cli: copy.workflowRunShowcaseFromCli,
+    showcase_verification: copy.workflowRunShowcaseVerificationFailed
+  }
   const errorMessage =
     error && !(error.kind === 'validation' && error.field)
-      ? error.kind === 'conflict'
-        ? copy.workflowRunConflict
-        : error.kind === 'compatibility'
-          ? copy.workflowRunIncompatible
-          : error.kind === 'coordinator'
-            ? copy.workflowRunCoordinatorUnavailable
-            : error.kind === 'profile'
-              ? copy.workflowRunProfileUnavailable
-              : error.kind === 'network'
-                ? copy.workflowRunNetworkError
-                : error.message || copy.workflowRunValidationError
+      ? admissionErrorMessages[error.kind] || error.message || copy.workflowRunValidationError
       : null
 
   return (

@@ -534,6 +534,21 @@ describe('Review & Run workflow dialog', () => {
       body: { detail: { code: 'idempotency_conflict', message: 'changed intent', retryable: false } },
       copy: 'These inputs changed after this run intent was created. Close this review and try again.',
       status: 409
+    },
+    {
+      body: { detail: { code: 'workflow_showcase_cli_required', retryable: false } },
+      copy: 'Run this bundled showcase from the CLI.',
+      status: 409
+    },
+    {
+      body: { detail: { code: 'workflow_showcase_verification_failed', retryable: false } },
+      copy: 'The bundled showcase could not be verified and was not started.',
+      status: 409
+    },
+    {
+      body: { detail: { code: 'workflow_catalog_source_invalid', retryable: false } },
+      copy: 'This workflow source is no longer available. Close this review and select it again.',
+      status: 422
     }
   ])('shows the distinct $status admission failure without navigating', async ({ body, copy, status }) => {
     startHandler = async () => ({ body, ok: false, status })
@@ -543,6 +558,8 @@ describe('Review & Run workflow dialog', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start workflow' }))
 
     expect(await within(dialog).findByText(copy)).toBeTruthy()
+    expect(within(dialog).queryByText('The workflow inputs were not accepted.')).toBeNull()
+    expect(within(dialog).queryByRole('button', { name: 'Retry' })).toBeNull()
     expect(screen.getByRole('tab', { hidden: true, name: 'Workflows' }).getAttribute('aria-selected')).toBe('true')
     expect($workflowSelectedRunId.get()).toBeNull()
   })
@@ -658,9 +675,7 @@ describe('Review & Run workflow dialog', () => {
 
     const dialog = await openReviewDialog()
     expect(
-      within(dialog).getByText(
-        'Run is unavailable until the Hermes backend supports this workflow catalog version.'
-      )
+      within(dialog).getByText('Run is unavailable until the Hermes backend supports this workflow catalog version.')
     ).toBeTruthy()
     expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
     expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(

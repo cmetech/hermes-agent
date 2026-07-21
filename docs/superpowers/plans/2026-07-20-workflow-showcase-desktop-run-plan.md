@@ -1073,6 +1073,34 @@ the Desktop merge gate. Locale completeness is typechecked. Ledger entry:
 
 ---
 
+### Task 9.3: Render typed showcase refusals honestly
+
+**Plan deviation:** The independent review found that three new authoritative
+admission codes reached the renderer intact but fell through to the generic
+input-validation message. This preserved refusal safety but obscured whether
+the cause was CLI-only policy, bundle verification, or stale source identity.
+
+**Files:**
+
+- Modify: `apps/desktop/src/app/workflows/review-run-dialog.tsx`
+- Modify: `apps/desktop/src/app/workflows/review-run-dialog.test.tsx`
+- Modify: all four locale files and `apps/desktop/src/i18n/types.ts`
+- Modify: `docs/upstream-customizations/workflow-orchestration.yaml`
+
+**Gate/matrix:** Review dialog tests are selected by the Desktop merge gate;
+locale completeness is typechecked. Ledger entry:
+`desktop-workflow-showcase-admission-errors`.
+
+- [x] **RED:** Table-driven 409/422 cases for
+  `workflow_showcase_cli_required`,
+  `workflow_showcase_verification_failed`, and
+  `workflow_catalog_source_invalid` all rendered the generic input rejection.
+- [x] **GREEN:** Map each typed code to distinct, non-retrying operator copy;
+  reuse the established CLI guidance and add verification/source messages in
+  all four locales.
+
+---
+
 ## Plan self-review checklist
 
 - Every design requirement has a task owner.

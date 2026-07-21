@@ -1663,6 +1663,7 @@ export const ja = defineLocale({
     workflowRunUnavailable: '実行できません',
     workflowRunUnsupportedInputs: 'このワークフローには未対応の入力フィールドがあるため実行できません。',
     workflowRunShowcaseFromCli: 'このバンドル済みショーケースは CLI から実行してください。',
+    workflowRunShowcaseVerificationFailed: 'バンドル済みショーケースを検証できなかったため、開始しませんでした。',
     workflowRunSupportUnavailable:
       'Hermes バックエンドがこのワークフローカタログのバージョンに対応するまで、実行できません。',
     workflowRunUntrusted: 'このワークフローは信頼性の検証に失敗したため実行できません。',
@@ -1679,6 +1680,8 @@ export const ja = defineLocale({
     workflowRunStarted: '開始しました',
     workflowRunAlreadyRunning: 'すでに実行中です — その実行を表示します',
     workflowRunConflict: 'この実行リクエストの作成後に入力が変更されました。確認画面を閉じて再試行してください。',
+    workflowRunCatalogSourceInvalid:
+      'このワークフローのソースは利用できなくなりました。確認画面を閉じて、もう一度選択してください。',
     workflowRunCoordinatorUnavailable:
       'バックグラウンドコーディネーターが動作していません。しばらくしてから再試行してください。',
     workflowRunIncompatible: 'このワークフローは現在の Hermes ランタイムと互換性がないため開始できません。',

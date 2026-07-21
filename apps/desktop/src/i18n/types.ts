@@ -1426,6 +1426,7 @@ export interface Translations {
     workflowRunUnavailable: string
     workflowRunUnsupportedInputs: string
     workflowRunShowcaseFromCli: string
+    workflowRunShowcaseVerificationFailed: string
     workflowRunSupportUnavailable: string
     workflowRunUntrusted: string
     workflowReviewRunTitle: (workflow: string) => string
@@ -1441,6 +1442,7 @@ export interface Translations {
     workflowRunStarted: string
     workflowRunAlreadyRunning: string
     workflowRunConflict: string
+    workflowRunCatalogSourceInvalid: string
     workflowRunCoordinatorUnavailable: string
     workflowRunIncompatible: string
     workflowRunNetworkError: string
