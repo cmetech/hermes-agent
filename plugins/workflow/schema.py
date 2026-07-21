@@ -771,15 +771,14 @@ def _validate_graph(nodes: tuple[WorkflowNode, ...]) -> None:
         raise WorkflowValidationError(upstream_issues)
 
 
-def _load_sidecar(
-    path: Path, node_ids: frozenset[str]
-) -> tuple[Path | None, Mapping[str, Any]]:
-    sidecar_path = path.with_name(f"{path.stem}.hermes.yaml")
-    if not sidecar_path.is_file():
-        return None, freeze_value({})
+def _parse_sidecar(
+    sidecar_path: Path,
+    node_ids: frozenset[str],
+    data: bytes,
+) -> tuple[Path, Mapping[str, Any]]:
     try:
-        raw = yaml.safe_load(sidecar_path.read_text(encoding="utf-8")) or {}
-    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raw = yaml.safe_load(data.decode("utf-8")) or {}
+    except (UnicodeError, yaml.YAMLError) as exc:
         _fail("sidecar", "invalid_sidecar", f"invalid workflow sidecar: {exc}")
     sidecar = _mapping(raw, "sidecar")
     forbidden = {
@@ -855,6 +854,19 @@ def _load_sidecar(
     return sidecar_path, freeze_value(sidecar)
 
 
+def _load_sidecar(
+    path: Path, node_ids: frozenset[str]
+) -> tuple[Path | None, Mapping[str, Any]]:
+    sidecar_path = path.with_name(f"{path.stem}.hermes.yaml")
+    if not sidecar_path.is_file():
+        return None, freeze_value({})
+    try:
+        data = sidecar_path.read_bytes()
+    except OSError as exc:
+        _fail("sidecar", "invalid_sidecar", f"invalid workflow sidecar: {exc}")
+    return _parse_sidecar(sidecar_path, node_ids, data)
+
+
 def _package_root(path: Path) -> Path:
     for parent in path.parents:
         if parent.name == "workflows":
@@ -897,17 +909,17 @@ def _validate_workflow_options(document: Mapping[str, Any]) -> None:
         _mapping(document["sandbox"], "sandbox")
 
 
-def load_workflow(
-    path: str | Path, *, source: str = "explicit", precedence: int = 0
+_READ_SIDECAR_FROM_DISK = object()
+
+
+def _load_workflow_bytes(
+    workflow_path: Path,
+    data: bytes,
+    *,
+    sidecar_bytes: bytes | None | object,
+    source: str,
+    precedence: int,
 ) -> WorkflowPackage:
-    """Load a portable workflow into immutable, validated contracts."""
-    workflow_path = Path(path).expanduser().resolve(strict=True)
-    if not workflow_path.is_file() or workflow_path.suffix.lower() not in {
-        ".yaml",
-        ".yml",
-    }:
-        _fail("path", "invalid_workflow_path", "workflow path must be a YAML file")
-    data = workflow_path.read_bytes()
     if len(data) > _MAX_YAML_BYTES:
         _fail(
             "path",
@@ -978,9 +990,18 @@ def load_workflow(
         options=freeze_value(options),
         source_path=workflow_path,
     )
-    sidecar_path, sidecar = _load_sidecar(
-        workflow_path, frozenset(node.id for node in nodes)
-    )
+    node_ids = frozenset(node.id for node in nodes)
+    if sidecar_bytes is _READ_SIDECAR_FROM_DISK:
+        sidecar_path, sidecar = _load_sidecar(workflow_path, node_ids)
+    elif sidecar_bytes is None:
+        sidecar_path, sidecar = None, freeze_value({})
+    else:
+        assert isinstance(sidecar_bytes, bytes)
+        sidecar_path, sidecar = _parse_sidecar(
+            workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml"),
+            node_ids,
+            sidecar_bytes,
+        )
     return WorkflowPackage(
         definition=definition,
         root=_package_root(workflow_path),
@@ -990,6 +1011,46 @@ def load_workflow(
         source=source,
         precedence=precedence,
         validation_issues=issues,
+    )
+
+
+def load_workflow(
+    path: str | Path, *, source: str = "explicit", precedence: int = 0
+) -> WorkflowPackage:
+    """Load a portable workflow into immutable, validated contracts."""
+    workflow_path = Path(path).expanduser().resolve(strict=True)
+    if not workflow_path.is_file() or workflow_path.suffix.lower() not in {
+        ".yaml",
+        ".yml",
+    }:
+        _fail("path", "invalid_workflow_path", "workflow path must be a YAML file")
+    return _load_workflow_bytes(
+        workflow_path,
+        workflow_path.read_bytes(),
+        sidecar_bytes=_READ_SIDECAR_FROM_DISK,
+        source=source,
+        precedence=precedence,
+    )
+
+
+def load_workflow_snapshot(
+    path: str | Path,
+    *,
+    workflow_bytes: bytes,
+    sidecar_bytes: bytes | None,
+    source: str = "explicit",
+    precedence: int = 0,
+) -> WorkflowPackage:
+    """Parse caller-authenticated bytes without reopening definition files."""
+    workflow_path = Path(path).expanduser().absolute()
+    if workflow_path.suffix.lower() not in {".yaml", ".yml"}:
+        _fail("path", "invalid_workflow_path", "workflow path must be a YAML file")
+    return _load_workflow_bytes(
+        workflow_path,
+        workflow_bytes,
+        sidecar_bytes=sidecar_bytes,
+        source=source,
+        precedence=precedence,
     )
 
 

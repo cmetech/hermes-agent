@@ -49,6 +49,7 @@ function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefini
     inputs: [],
     name: WORKFLOW_NAME,
     precedence: 2,
+    run_support: { reason: 'supported', supported: true },
     source: 'profile',
     supported_inputs: { reason: 'parameterless', supported: true },
     trust_state: 'trusted',
@@ -188,7 +189,7 @@ describe('Review & Run workflow dialog', () => {
         return { ok: true, value: { items: [catalogDefinition], truncated: false } }
       }
 
-      if (request.path === `/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`) {
+      if (request.path.startsWith(`/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`)) {
         return preflightHandler(request)
       }
 
@@ -224,6 +225,7 @@ describe('Review & Run workflow dialog', () => {
     await waitFor(() => {
       expect(apiStructured).toHaveBeenCalledWith({
         body: {
+          catalog_source: 'profile',
           concurrency_policy: 'queue',
           idempotency_key: IDEMPOTENCY_KEY,
           values: {},
@@ -240,6 +242,10 @@ describe('Review & Run workflow dialog', () => {
 
     expect(postBody).not.toHaveProperty('provenance')
     expect(postBody).not.toHaveProperty('source')
+    expect(apiStructured).toHaveBeenCalledWith({
+      path: `/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}?catalog_source=profile`,
+      profile: 'profile-a'
+    })
     expect((await screen.findByRole('tab', { name: 'Active board' })).getAttribute('aria-selected')).toBe('true')
     expect($workflowSelectedRunId.get()).toBe('run-created')
     expect($notifications.get()[0]?.message).toBe('Started')
@@ -289,6 +295,7 @@ describe('Review & Run workflow dialog', () => {
     expect(requests.find(request => request.path.includes('/workflows/Portable%20contract'))?.profile).toBe('profile-a')
     expect(requests.find(request => request.path === '/api/plugins/workflow/runs')).toMatchObject({
       body: {
+        catalog_source: 'profile',
         concurrency_policy: 'queue',
         idempotency_key: IDEMPOTENCY_KEY,
         values: { count: '3', enabled: 'false', mode: 'safe', title: 'release' },
@@ -527,6 +534,21 @@ describe('Review & Run workflow dialog', () => {
       body: { detail: { code: 'idempotency_conflict', message: 'changed intent', retryable: false } },
       copy: 'These inputs changed after this run intent was created. Close this review and try again.',
       status: 409
+    },
+    {
+      body: { detail: { code: 'workflow_showcase_cli_required', retryable: false } },
+      copy: 'Run this bundled showcase from the CLI.',
+      status: 409
+    },
+    {
+      body: { detail: { code: 'workflow_showcase_verification_failed', retryable: false } },
+      copy: 'The bundled showcase could not be verified and was not started.',
+      status: 409
+    },
+    {
+      body: { detail: { code: 'workflow_catalog_source_invalid', retryable: false } },
+      copy: 'This workflow source is no longer available. Close this review and select it again.',
+      status: 422
     }
   ])('shows the distinct $status admission failure without navigating', async ({ body, copy, status }) => {
     startHandler = async () => ({ body, ok: false, status })
@@ -536,6 +558,8 @@ describe('Review & Run workflow dialog', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start workflow' }))
 
     expect(await within(dialog).findByText(copy)).toBeTruthy()
+    expect(within(dialog).queryByText('The workflow inputs were not accepted.')).toBeNull()
+    expect(within(dialog).queryByRole('button', { name: 'Retry' })).toBeNull()
     expect(screen.getByRole('tab', { hidden: true, name: 'Workflows' }).getAttribute('aria-selected')).toBe('true')
     expect($workflowSelectedRunId.get()).toBeNull()
   })
@@ -607,6 +631,7 @@ describe('Review & Run workflow dialog', () => {
         coordinator: { healthy: false, reason: 'coordinator_missing', status: 'unavailable' },
         definition: { inputs: { mode: { required: false, type: 'enum' } } },
         inputs: [{ name: 'mode', required: false, type: 'enum' }],
+        run_support: { reason: 'unsupported_inputs', supported: false },
         supported_inputs: { reason: 'unsupported_input_shape', supported: false }
       })
     })
@@ -621,6 +646,41 @@ describe('Review & Run workflow dialog', () => {
     expect(within(dialog).getByText("The background coordinator isn't running — try again shortly.")).toBeTruthy()
     expect(within(dialog).queryByRole('combobox', { name: 'mode' })).toBeNull()
     expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('trusts verified bundles but blocks a showcase when authoritative detail requires the CLI', async () => {
+    catalogDefinition = definition({ source: 'showcase', trust_state: 'verified_bundled' })
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        run_support: { reason: 'showcase_cli_required', supported: false },
+        source: 'showcase',
+        trust_state: 'verified_bundled'
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(within(dialog).getByText('Verified bundle')).toBeTruthy()
+    expect(within(dialog).getByText('Run this bundled showcase from the CLI.')).toBeTruthy()
+    expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
+      0
+    )
+  })
+
+  it('fails closed without crashing when an older backend omits detail run support', async () => {
+    preflightHandler = async () => ({ ok: true, value: detail({ run_support: undefined as never }) })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(
+      within(dialog).getByText('Run is unavailable until the Hermes backend supports this workflow catalog version.')
+    ).toBeTruthy()
+    expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
+      0
+    )
   })
 
   it('shows blocking compatibility findings and refuses to POST a non-runnable workflow', async () => {

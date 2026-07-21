@@ -13,6 +13,7 @@ from pathlib import Path
 import secrets
 import shutil
 import tempfile
+import threading
 import time
 from typing import Iterator, Literal, Mapping
 
@@ -22,13 +23,22 @@ from agent.plugin_agent import PluginAgentRunResult
 from cron.jobs import create_job, list_jobs, use_cron_store
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import _input_requirements, _runtime_config, _scheduler
-from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.compat import (
+    CompatibilityFinding,
+    CompatibilityLevel,
+    CompatibilityReport,
+    assess_compatibility,
+)
 from plugins.workflow.machine_contract import operator_command_contract
 from plugins.workflow.provenance import TriggerProvenance
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.models import WorkflowPackage
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import (
     WorkflowRiskSummary,
+    WorkflowResourceCapacityError,
+    WorkflowResourceCacheMissError,
+    WorkflowResourceReadBudget,
     WorkflowTrustError,
     build_risk_summary,
     preflight_execution,
@@ -41,6 +51,7 @@ _ALLOWED_CLAIMS = frozenset({
     "typed-timeout", "process-cleanup", "explicit-ai-consent",
     "scoped-extensions", "persistent-session", "local-mcp-cleanup",
     "explicit-schedule-consent", "one-shot-ownership", "cron-recovery",
+    "operator-approval",
 })
 _FORBIDDEN_TEXT = (
     "get-ciminstance", "get-computerinfo", "wmic ", "system_profiler",
@@ -77,6 +88,26 @@ class ShowcaseScenario:
     verified_bundled_provenance: bool
 
 
+@dataclass(frozen=True, slots=True)
+class VerifiedShowcasePackage:
+    scenario: ShowcaseScenario
+    package: WorkflowPackage
+    risk: WorkflowRiskSummary
+    compatibility: CompatibilityReport
+    bundle_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedShowcaseCacheEntry:
+    root: Path
+    tree_signature: tuple[tuple[object, ...], ...]
+    packages: Mapping[str, VerifiedShowcasePackage]
+
+
+_VERIFIED_SHOWCASE_CACHE: dict[str, _VerifiedShowcaseCacheEntry] = {}
+_VERIFIED_SHOWCASE_CACHE_LOCK = threading.Lock()
+
+
 @dataclass(frozen=True)
 class ShowcaseClaimResult:
     capability: str
@@ -105,15 +136,56 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _tree_digest(root: Path) -> str:
+def _read_verified_bytes(
+    path: Path,
+    read_budget: WorkflowResourceReadBudget | None = None,
+) -> bytes:
+    if path.is_symlink():
+        raise ShowcaseCatalogError(f"showcase bundle symlink is forbidden: {path}")
+    resolved = path.resolve(strict=True)
+    if read_budget is None:
+        return resolved.read_bytes()
+    return read_budget.read(resolved)
+
+
+def _tree_entries(
+    root: Path,
+    read_budget: WorkflowResourceReadBudget | None = None,
+) -> tuple[Path, ...]:
+    if root.is_symlink():
+        raise ShowcaseCatalogError(f"showcase bundle symlink is forbidden: {root}")
+    entries: list[Path] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as children:
+            for child in children:
+                if (
+                    read_budget is not None
+                    and len(entries) >= read_budget.max_files
+                ):
+                    raise WorkflowResourceCapacityError(
+                        "showcase package entry limit exceeded"
+                    )
+                path = Path(child.path)
+                entries.append(path)
+                if child.is_dir(follow_symlinks=False):
+                    pending.append(path)
+    return tuple(sorted(entries))
+
+
+def _tree_digest(
+    root: Path,
+    read_budget: WorkflowResourceReadBudget | None = None,
+) -> str:
     digest = hashlib.sha256()
-    for path in sorted(root.rglob("*")):
+    for path in _tree_entries(root, read_budget):
         if path.is_symlink() or not path.is_file():
             if path.is_symlink():
                 raise ShowcaseCatalogError(f"showcase bundle symlink is forbidden: {path}")
             continue
         relative = path.relative_to(root).as_posix()
-        data = path.read_bytes()
+        data = _read_verified_bytes(path, read_budget)
         digest.update(relative.encode())
         digest.update(b"\0")
         digest.update(str(len(data)).encode())
@@ -123,8 +195,12 @@ def _tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_package_safety(root: Path, scenario_id: str) -> None:
-    for path in sorted(root.rglob("*")):
+def _validate_package_safety(
+    root: Path,
+    scenario_id: str,
+    read_budget: WorkflowResourceReadBudget | None = None,
+) -> None:
+    for path in _tree_entries(root, read_budget):
         if path.is_symlink():
             raise ShowcaseCatalogError(
                 f"showcase safety contract rejects symlink: {scenario_id}"
@@ -132,7 +208,7 @@ def _validate_package_safety(root: Path, scenario_id: str) -> None:
         if not path.is_file():
             continue
         try:
-            text = path.read_text(encoding="utf-8").lower()
+            text = _read_verified_bytes(path, read_budget).decode("utf-8").lower()
         except UnicodeError as exc:
             raise ShowcaseCatalogError(
                 f"showcase safety contract rejects binary resource: {scenario_id}"
@@ -157,9 +233,12 @@ def _contained(root: Path, relative: str) -> Path:
     path = Path(relative)
     if path.is_absolute() or ".." in path.parts:
         raise ShowcaseCatalogError(f"showcase path escapes bundle: {relative}")
+    ancestor = root
+    for part in path.parts:
+        ancestor /= part
+        if ancestor.is_symlink():
+            raise ShowcaseCatalogError(f"showcase path is a symlink: {relative}")
     candidate = root / path
-    if candidate.is_symlink():
-        raise ShowcaseCatalogError(f"showcase path is a symlink: {relative}")
     try:
         candidate.resolve(strict=True).relative_to(root.resolve(strict=True))
     except (OSError, ValueError) as exc:
@@ -167,15 +246,83 @@ def _contained(root: Path, relative: str) -> Path:
     return candidate
 
 
-def _bundle_digest(root: Path) -> str:
-    return _sha256((root / "catalog.yaml").read_bytes() + b"\0" + (root / "digests.json").read_bytes())
+def _bundle_digest(
+    root: Path,
+    read_budget: WorkflowResourceReadBudget | None = None,
+) -> str:
+    return _sha256(
+        _read_verified_bytes(root / "catalog.yaml", read_budget)
+        + b"\0"
+        + _read_verified_bytes(root / "digests.json", read_budget)
+    )
 
 
-def load_showcase_catalog(bundle_root: Path | None = None) -> dict[str, ShowcaseScenario]:
+def _bundle_tree_signature(
+    root: Path,
+    read_budget: WorkflowResourceReadBudget,
+) -> tuple[tuple[object, ...], ...]:
+    packages = root / "packages"
+    signature: list[tuple[object, ...]] = []
+    for path in _tree_entries(packages, read_budget):
+        metadata = path.lstat()
+        signature.append(
+            (
+                path.relative_to(packages).as_posix(),
+                path.is_file(),
+                path.is_dir(),
+                path.is_symlink(),
+                getattr(metadata, "st_dev", None),
+                getattr(metadata, "st_ino", None),
+                metadata.st_size,
+                getattr(metadata, "st_mtime_ns", None),
+                getattr(metadata, "st_ctime_ns", None),
+            )
+        )
+    if any(item[-2] is None or item[-1] is None for item in signature):
+        return ()
+    return tuple(signature)
+
+
+def _fresh_read_budget(
+    read_budget: WorkflowResourceReadBudget | None,
+) -> WorkflowResourceReadBudget | None:
+    if read_budget is None:
+        return None
+    return WorkflowResourceReadBudget(
+        max_file_bytes=read_budget.max_file_bytes,
+        max_total_bytes=read_budget.max_total_bytes,
+        max_files=read_budget.max_files,
+    )
+
+
+def _charge_read_budget(
+    read_budget: WorkflowResourceReadBudget,
+    additional: WorkflowResourceReadBudget,
+) -> None:
+    if (
+        read_budget.bytes_read + additional.bytes_read
+        > read_budget.max_total_bytes
+        or read_budget.files_read + additional.files_read > read_budget.max_files
+    ):
+        raise WorkflowResourceCapacityError(
+            "showcase verification aggregate limit exceeded"
+        )
+    read_budget.bytes_read += additional.bytes_read
+    read_budget.files_read += additional.files_read
+
+
+def load_showcase_catalog(
+    bundle_root: Path | None = None,
+    *,
+    read_budget: WorkflowResourceReadBudget | None = None,
+    allow_repair: bool = True,
+) -> dict[str, ShowcaseScenario]:
     with _bundle_path(bundle_root) as root:
         try:
-            raw = yaml.safe_load((root / "catalog.yaml").read_text(encoding="utf-8"))
-            manifest = json.loads((root / "digests.json").read_text(encoding="utf-8"))
+            catalog_bytes = _read_verified_bytes(root / "catalog.yaml", read_budget)
+            digest_bytes = _read_verified_bytes(root / "digests.json", read_budget)
+            raw = yaml.safe_load(catalog_bytes.decode("utf-8"))
+            manifest = json.loads(digest_bytes.decode("utf-8"))
         except (OSError, ValueError, yaml.YAMLError, json.JSONDecodeError) as exc:
             raise ShowcaseCatalogError(f"invalid showcase bundle metadata: {exc}") from exc
         if not isinstance(raw, Mapping) or raw.get("schema_version") != 1:
@@ -183,14 +330,18 @@ def load_showcase_catalog(bundle_root: Path | None = None) -> dict[str, Showcase
         if not isinstance(manifest, Mapping) or manifest.get("schema_version") != 1:
             raise ShowcaseCatalogError("unsupported showcase digest schema")
         catalog_digest = manifest.get("catalog_sha256")
-        if catalog_digest != _sha256((root / "catalog.yaml").read_bytes()):
-            if bundle_root is None:
+        if catalog_digest != _sha256(catalog_bytes):
+            if bundle_root is None and allow_repair:
                 from hermes_cli.capability_staging import (
                     repair_authenticated_resource_checkout,
                 )
 
                 if repair_authenticated_resource_checkout(root):
-                    repaired = load_showcase_catalog(root)
+                    repaired = load_showcase_catalog(
+                        root,
+                        read_budget=_fresh_read_budget(read_budget),
+                        allow_repair=False,
+                    )
                     return {
                         key: replace(value, verified_bundled_provenance=True)
                         for key, value in repaired.items()
@@ -219,8 +370,8 @@ def load_showcase_catalog(bundle_root: Path | None = None) -> dict[str, Showcase
             workflow_path = str(item["workflow_path"])
             workflow = _contained(root, workflow_path)
             package_root = workflow.parent.parent
-            _validate_package_safety(package_root, scenario_id)
-            actual_digest = _tree_digest(package_root)
+            _validate_package_safety(package_root, scenario_id, read_budget)
+            actual_digest = _tree_digest(package_root, read_budget)
             if package_digests.get(scenario_id) != actual_digest:
                 raise ShowcaseCatalogError(f"showcase package digest mismatch: {scenario_id}")
             claims = tuple(str(value) for value in item["capability_claims"])
@@ -236,7 +387,10 @@ def load_showcase_catalog(bundle_root: Path | None = None) -> dict[str, Showcase
                 or any(token in text for token in _FORBIDDEN_TEXT)
             ):
                 raise ShowcaseCatalogError(f"showcase safety contract rejected: {scenario_id}")
-            load_workflow(workflow)
+            _load_workflow_from_verified_bytes(
+                workflow,
+                read_budget=read_budget,
+            )
             result[scenario_id] = ShowcaseScenario(
                 **{key: str(item[key]) for key in ("id", "display_name", "purpose", "bundle_version", "package_version", "workflow_path", "interaction_mode", "safety_class", "cleanup_ownership")},
                 offline=bool(item["offline"]), requires_ai=bool(item["requires_ai"]),
@@ -253,38 +407,238 @@ def load_showcase_catalog(bundle_root: Path | None = None) -> dict[str, Showcase
         return dict(sorted(result.items()))
 
 
-def _scenario_package(scenario: ShowcaseScenario):
+def _load_workflow_from_verified_bytes(
+    workflow: Path,
+    *,
+    read_budget: WorkflowResourceReadBudget | None,
+    source: str = "explicit",
+    precedence: int = 0,
+) -> WorkflowPackage:
+    if read_budget is None:
+        return load_workflow(
+            workflow,
+            source=source,
+            precedence=precedence,
+        )
+    try:
+        workflow_bytes = read_budget.read_cached(workflow)
+    except WorkflowResourceCacheMissError as exc:
+        raise ShowcaseCatalogError(
+            f"verified workflow bytes are unavailable: {workflow.name}"
+        ) from exc
+    sidecar = workflow.with_name(f"{workflow.stem}.hermes.yaml")
+    try:
+        sidecar_bytes = read_budget.read_cached(sidecar)
+    except WorkflowResourceCacheMissError:
+        sidecar_bytes = None
+    return load_workflow_snapshot(
+        workflow,
+        workflow_bytes=workflow_bytes,
+        sidecar_bytes=sidecar_bytes,
+        source=source,
+        precedence=precedence,
+    )
+
+
+def _scenario_package(
+    scenario: ShowcaseScenario,
+    *,
+    source: str = "explicit",
+    precedence: int = 0,
+    bundle_root: Path | None = None,
+    read_budget: WorkflowResourceReadBudget | None = None,
+) -> WorkflowPackage:
+    if bundle_root is not None:
+        return _load_workflow_from_verified_bytes(
+            _contained(bundle_root, scenario.workflow_path),
+            read_budget=read_budget,
+            source=source,
+            precedence=precedence,
+        )
     with _bundle_path() as root:
-        return load_workflow(_contained(root, scenario.workflow_path))
+        return _load_workflow_from_verified_bytes(
+            _contained(root, scenario.workflow_path),
+            read_budget=read_budget,
+            source=source,
+            precedence=precedence,
+        )
 
 
 def _verified_distribution_risk(
-    scenario: ShowcaseScenario, package
+    scenario: ShowcaseScenario,
+    package: WorkflowPackage,
+    read_budget: WorkflowResourceReadBudget | None = None,
+    *,
+    enforce_runnable: bool = True,
 ) -> WorkflowRiskSummary:
+    risk, _compatibility = _verified_distribution_assessment(
+        scenario,
+        package,
+        read_budget,
+        enforce_runnable=enforce_runnable,
+    )
+    return risk
+
+
+def _verified_distribution_assessment(
+    scenario: ShowcaseScenario,
+    package: WorkflowPackage,
+    read_budget: WorkflowResourceReadBudget | None = None,
+    *,
+    enforce_runnable: bool = True,
+) -> tuple[WorkflowRiskSummary, CompatibilityReport]:
     if not scenario.verified_bundled_provenance:
         raise ShowcaseCatalogError(
             "showcase lacks verified bundled distribution provenance"
         )
-    if _tree_digest(package.root) != scenario.package_digest:
+    if _tree_digest(package.root, read_budget) != scenario.package_digest:
         raise ShowcaseCatalogError(
             f"showcase package changed after catalog verification: {scenario.id}"
         )
     compatibility = assess_compatibility(package)
-    if not compatibility.runnable:
+    if enforce_runnable and not compatibility.runnable:
         raise ShowcaseCatalogError(
             f"showcase package is not runnable under ordinary compatibility policy: {scenario.id}"
         )
-    risk = build_risk_summary(package, compatibility)
+    risk = build_risk_summary(
+        package,
+        compatibility,
+        read_budget=read_budget,
+    )
     try:
         preflight_execution(
             risk,
             trusted=scenario.verified_bundled_provenance,
         )
     except WorkflowTrustError as exc:
-        raise ShowcaseCatalogError(
-            f"showcase package failed ordinary execution-risk policy: {exc}"
-        ) from exc
-    return risk
+        if enforce_runnable:
+            raise ShowcaseCatalogError(
+                f"showcase package failed ordinary execution-risk policy: {exc}"
+            ) from exc
+        compatibility = CompatibilityReport(
+            level=CompatibilityLevel.UNSUPPORTED,
+            findings=(
+                *compatibility.findings,
+                CompatibilityFinding(
+                    path="sidecar.execution_environment",
+                    level=CompatibilityLevel.UNSUPPORTED,
+                    message="workflow requires a configured isolated backend",
+                    blocking=True,
+                    code="execution_environment_unavailable",
+                ),
+            ),
+            runnable=False,
+        )
+    return risk, compatibility
+
+
+def showcase_background_api_eligible(scenario: ShowcaseScenario) -> bool:
+    """Return whether ordinary background admission preserves scenario intent."""
+    return (
+        scenario.interaction_mode == "guided"
+        and scenario.offline
+        and not scenario.requires_ai
+        and not scenario.requires_network
+    )
+
+
+def _clear_verified_showcase_cache_for_tests() -> None:
+    with _VERIFIED_SHOWCASE_CACHE_LOCK:
+        _VERIFIED_SHOWCASE_CACHE.clear()
+
+
+def load_verified_showcase_packages(
+    *,
+    read_budget: WorkflowResourceReadBudget,
+    force_reverify: bool = False,
+) -> dict[str, VerifiedShowcasePackage]:
+    """Load only the authenticated bundled distribution, with bounded caching."""
+    if not isinstance(read_budget, WorkflowResourceReadBudget):
+        raise TypeError("read_budget must be a WorkflowResourceReadBudget")
+    with _VERIFIED_SHOWCASE_CACHE_LOCK:
+        with _bundle_path() as root:
+            resolved_root = root.resolve(strict=True)
+            bundle_digest = _bundle_digest(resolved_root, read_budget)
+            before_signature = _bundle_tree_signature(resolved_root, read_budget)
+            cached = _VERIFIED_SHOWCASE_CACHE.get(bundle_digest)
+            if (
+                not force_reverify
+                and before_signature
+                and cached is not None
+                and cached.root == resolved_root
+                and cached.tree_signature == before_signature
+            ):
+                return dict(cached.packages)
+
+            catalog = load_showcase_catalog(
+                read_budget=read_budget,
+                allow_repair=False,
+            )
+            verified: dict[str, VerifiedShowcasePackage] = {}
+            for scenario_id, scenario in catalog.items():
+                if not scenario.verified_bundled_provenance:
+                    raise ShowcaseCatalogError(
+                        "showcase lacks verified bundled distribution provenance"
+                    )
+                package = _scenario_package(
+                    scenario,
+                    source="showcase",
+                    precedence=3,
+                    bundle_root=resolved_root,
+                    read_budget=read_budget,
+                )
+                risk, compatibility = _verified_distribution_assessment(
+                    scenario,
+                    package,
+                    read_budget,
+                    enforce_runnable=False,
+                )
+                verified[scenario_id] = VerifiedShowcasePackage(
+                    scenario=scenario,
+                    package=package,
+                    risk=risk,
+                    compatibility=compatibility,
+                    bundle_digest=bundle_digest,
+                )
+
+            after_signature = _bundle_tree_signature(resolved_root, read_budget)
+            postcheck_budget = _fresh_read_budget(read_budget)
+            assert postcheck_budget is not None
+            current_bundle_digest = _bundle_digest(resolved_root, postcheck_budget)
+            _charge_read_budget(read_budget, postcheck_budget)
+            if (
+                before_signature != after_signature
+                or bundle_digest != current_bundle_digest
+            ):
+                raise ShowcaseCatalogError(
+                    "showcase bundle changed during verified loading"
+                )
+            if after_signature:
+                _VERIFIED_SHOWCASE_CACHE.clear()
+                _VERIFIED_SHOWCASE_CACHE[bundle_digest] = (
+                    _VerifiedShowcaseCacheEntry(
+                        root=resolved_root,
+                        tree_signature=after_signature,
+                        packages=dict(verified),
+                    )
+                )
+            return verified
+
+
+def load_verified_showcase_package(
+    showcase_id: str,
+    *,
+    read_budget: WorkflowResourceReadBudget,
+    force_reverify: bool = False,
+) -> VerifiedShowcasePackage:
+    verified = load_verified_showcase_packages(
+        read_budget=read_budget,
+        force_reverify=force_reverify,
+    )
+    try:
+        return verified[showcase_id]
+    except KeyError as exc:
+        raise ShowcaseCatalogError(f"unknown showcase: {showcase_id}") from exc
 
 
 def preflight_showcase(showcase_id: str, *, hermes_home: str | Path) -> dict[str, object]:
@@ -635,6 +989,16 @@ def build_showcase_report(run_id: str, *, hermes_home: str | Path) -> ShowcaseRe
                 outcome, reason, refs = "passed", "rework_and_approval_observed", tuple(_event_ref(e) for e in (rejections[-1], approvals[-1]))
             elif projection["status"] == "paused":
                 outcome, reason = "skipped", "awaiting_operator_decision"
+        elif capability == "operator-approval":
+            approvals = by_type.get("interaction_approved", [])
+            if approvals:
+                outcome, reason, refs = (
+                    "passed",
+                    "operator_approval_observed",
+                    (_event_ref(approvals[-1]),),
+                )
+            elif projection["status"] == "paused":
+                outcome, reason = "skipped", "awaiting_operator_decision"
         elif capability == "artifact-verification":
             if set(scenario.expected_artifacts) <= names:
                 outcome, reason, refs = "passed", "expected_artifacts_verified", tuple(str(a["ref"]) for a in verified_artifacts if a["name"] in scenario.expected_artifacts)
@@ -718,6 +1082,9 @@ def report_to_dict(report: ShowcaseReport) -> dict[str, object]:
 
 __all__ = [
     "ShowcaseCatalogError", "ShowcaseClaimResult", "ShowcaseReport", "ShowcaseScenario",
+    "VerifiedShowcasePackage",
     "approve_showcase", "build_showcase_report", "cleanup_showcases", "load_showcase_catalog",
+    "load_verified_showcase_package", "load_verified_showcase_packages",
     "preflight_showcase", "reject_showcase", "report_to_dict", "reset_showcase", "run_showcase",
+    "showcase_background_api_eligible",
 ]

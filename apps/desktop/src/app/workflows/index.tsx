@@ -77,7 +77,12 @@ export function WorkflowsView() {
     reviewGeneration.current += 1
 
     if (reviewIntent) {
-      cancelPendingWorkflowDetailQuery(queryClient, reviewIntent.workflow.name, reviewIntent.profile)
+      cancelPendingWorkflowDetailQuery(
+        queryClient,
+        reviewIntent.workflow.name,
+        reviewIntent.workflow.source,
+        reviewIntent.profile
+      )
     }
 
     setReviewIntent(null)
@@ -104,7 +109,12 @@ export function WorkflowsView() {
 
   const closeView = () => {
     if (viewIntent) {
-      cancelPendingWorkflowDetailQuery(queryClient, viewIntent.workflow.name, viewIntent.profile)
+      cancelPendingWorkflowDetailQuery(
+        queryClient,
+        viewIntent.workflow.name,
+        viewIntent.workflow.source,
+        viewIntent.profile
+      )
     }
 
     setViewIntent(null)

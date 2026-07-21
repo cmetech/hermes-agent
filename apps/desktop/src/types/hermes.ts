@@ -135,14 +135,24 @@ export interface WorkflowDefinitionInputSupport {
   supported: boolean
 }
 
+export type WorkflowCatalogSource = 'profile' | 'project' | 'showcase'
+export type WorkflowTrustState = 'trusted' | 'untrusted' | 'verified_bundled'
+
+export interface WorkflowRunSupport {
+  reason: 'showcase_cli_required' | 'supported' | 'unsupported_inputs'
+  supported: boolean
+}
+
 export interface WorkflowDefinition {
+  compatibility?: { level: string; runnable?: boolean }
   description: string
   inputs: WorkflowDefinitionInput[]
   name: string
-  precedence: 1 | 2
-  source: 'profile' | 'project'
+  precedence: 1 | 2 | 3
+  run_support?: WorkflowRunSupport
+  source: WorkflowCatalogSource
   supported_inputs: WorkflowDefinitionInputSupport
-  trust_state: 'trusted' | 'untrusted'
+  trust_state: WorkflowTrustState
   version: string
 }
 

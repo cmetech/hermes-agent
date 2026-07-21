@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from contextlib import contextmanager
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -13,6 +15,7 @@ import pytest
 import yaml
 
 from plugins.workflow.compat import assess_compatibility
+import plugins.workflow.showcase as showcase_module
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.trust import (
     WorkflowTrustError,
@@ -56,6 +59,31 @@ def _catalog_get(router, *, token=None):
     return TestClient(_app(router, token=token)).get("/api/plugins/workflow/workflows")
 
 
+def _user_items(response) -> list[dict[str, object]]:
+    return [
+        item
+        for item in response.json()["items"]
+        if item.get("source") != "showcase"
+    ]
+
+
+@contextmanager
+def _test_bundle_path(root: Path):
+    yield root.resolve()
+
+
+def _restamp_showcase_package(root: Path, showcase_id: str) -> None:
+    manifest_path = root / "digests.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["packages"][showcase_id] = showcase_module._tree_digest(
+        root / "packages" / showcase_id
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def test_workflow_catalog_requires_verified_authentication() -> None:
     response = _catalog_get(_module().router)
 
@@ -70,6 +98,251 @@ def test_workflow_catalog_requires_read_capability() -> None:
 
     assert response.status_code == 403
     assert response.json() == {"detail": {"code": "workflow_read_required"}}
+
+
+def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compatibility(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="ordinary-user-workflow")
+    showcase_module._clear_verified_showcase_cache_for_tests()
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    payload = response.json()
+    rows = {
+        (item.get("source"), item.get("name")): item
+        for item in payload["items"]
+    }
+    assert ("profile", "ordinary-user-workflow") in rows
+    showcase_rows = {
+        name: row for (source, name), row in rows.items() if source == "showcase"
+    }
+    assert set(showcase_rows) == {
+        "ai-extensions",
+        "approval-gate",
+        "laptop-diagnostic",
+        "resilience",
+        "scheduling",
+    }
+    approval = showcase_rows["approval-gate"]
+    assert approval["trust_state"] == "verified_bundled"
+    assert approval["supported_inputs"] == {
+        "supported": True,
+        "reason": "parameterless",
+    }
+    assert approval["run_support"] == {
+        "supported": True,
+        "reason": "supported",
+    }
+    assert showcase_rows["resilience"]["run_support"]["supported"] is True
+    assert showcase_rows["laptop-diagnostic"]["run_support"] == {
+        "supported": False,
+        "reason": "unsupported_inputs",
+    }
+    for name in ("ai-extensions", "scheduling"):
+        assert showcase_rows[name]["run_support"] == {
+            "supported": False,
+            "reason": "showcase_cli_required",
+        }
+    assert showcase_rows["ai-extensions"]["compatibility"]["runnable"] is False
+    assert payload["truncated"] is False
+
+
+def test_workflow_catalog_keeps_isolation_incompatibility_scenario_local(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="ordinary-user-workflow")
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
+    sidecar = (
+        copied
+        / "packages"
+        / "approval-gate"
+        / "workflows"
+        / "approval-gate.hermes.yaml"
+    )
+    sidecar.write_text(
+        sidecar.read_text(encoding="utf-8").replace(
+            "execution_environment: trusted_local",
+            "execution_environment: isolated_backend_required",
+        ),
+        encoding="utf-8",
+    )
+    _restamp_showcase_package(copied, "approval-gate")
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(copied),
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    rows = {
+        item["name"]: item
+        for item in response.json()["items"]
+        if item.get("source") == "showcase"
+    }
+    assert set(rows) == {
+        "ai-extensions",
+        "approval-gate",
+        "laptop-diagnostic",
+        "resilience",
+        "scheduling",
+    }
+    assert rows["approval-gate"]["compatibility"]["runnable"] is False
+    assert rows["approval-gate"]["compatibility"]["findings"] == [
+        {
+            "blocking": True,
+            "code": "execution_environment_unavailable",
+            "level": "unsupported",
+            "message": "workflow requires a configured isolated backend",
+            "path": "sidecar.execution_environment",
+        }
+    ]
+
+
+def test_workflow_catalog_cached_showcase_verification_preserves_user_budget(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="ordinary-user-workflow")
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    calls = 0
+    original = showcase_module._tree_digest
+
+    def counted_tree_digest(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(showcase_module, "_tree_digest", counted_tree_digest)
+
+    first = _catalog_get(_module().router, token=_reader())
+    calls_after_first = calls
+    second = _catalog_get(_module().router, token=_reader())
+
+    assert first.status_code == second.status_code == 200
+    assert calls_after_first > 0
+    assert calls == calls_after_first
+    for response in (first, second):
+        payload = response.json()
+        assert payload["truncated"] is False
+        assert any(
+            item.get("source") == "profile"
+            and item.get("name") == "ordinary-user-workflow"
+            for item in payload["items"]
+        )
+
+
+def test_workflow_catalog_missing_bundle_degrades_to_user_rows(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="ordinary-user-workflow")
+    missing = tmp_path / "missing-showcases"
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(missing),
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    assert [
+        item["name"]
+        for item in response.json()["items"]
+        if item.get("source") == "profile"
+    ] == ["ordinary-user-workflow"]
+    assert not any(
+        item.get("source") == "showcase" for item in response.json()["items"]
+    )
+
+
+def test_workflow_catalog_tamper_invalidates_cache_and_omits_entire_bundle(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="ordinary-user-workflow")
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(copied),
+    )
+    import hermes_cli.capability_staging as capability_staging
+
+    monkeypatch.setattr(
+        capability_staging,
+        "repair_authenticated_resource_checkout",
+        lambda *_args, **_kwargs: pytest.fail("HTTP catalog attempted checkout repair"),
+    )
+
+    first = _catalog_get(_module().router, token=_reader())
+    assert first.status_code == 200
+    assert sum(
+        item.get("source") == "showcase" for item in first.json()["items"]
+    ) == 5
+    workflow = (
+        copied
+        / "packages"
+        / "approval-gate"
+        / "workflows"
+        / "approval-gate.yaml"
+    )
+    workflow.write_text(workflow.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    second = _catalog_get(_module().router, token=_reader())
+
+    assert second.status_code == 200
+    assert not any(
+        item.get("source") == "showcase" for item in second.json()["items"]
+    )
+    assert any(
+        item.get("source") == "profile"
+        and item.get("name") == "ordinary-user-workflow"
+        for item in second.json()["items"]
+    )
+
+
+@pytest.mark.parametrize(
+    "description",
+    ["/Users/example/private/workflow", r"C:\Users\example\private\workflow"],
+)
+def test_workflow_catalog_description_uses_definition_path_redaction(
+    tmp_path, monkeypatch, workflow_writer, description
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(
+        home / "workflows",
+        name="path-description",
+        description=description,
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    row = next(
+        item
+        for item in response.json()["items"]
+        if item.get("source") == "profile" and item.get("name") == "path-description"
+    )
+    assert row["description"] == "[REDACTED]"
+    assert description.encode() not in response.content
 
 
 def test_workflow_catalog_returns_stable_redacted_server_classification(
@@ -132,8 +405,9 @@ def test_workflow_catalog_returns_stable_redacted_server_classification(
     assert response.status_code == 200
     payload = response.json()
     assert payload["truncated"] is False
-    assert [item["name"] for item in payload["items"]] == ["alpha", "beta"]
-    assert payload["items"][0] == {
+    user_items = _user_items(response)
+    assert [item["name"] for item in user_items] == ["alpha", "beta"]
+    assert user_items[0] == {
         "name": "alpha",
         "version": "1",
         "description": "Typed workflow",
@@ -147,12 +421,17 @@ def test_workflow_catalog_returns_stable_redacted_server_classification(
             {"name": "title", "type": "string", "required": True},
         ],
         "supported_inputs": {"supported": True, "reason": "flat_inputs"},
+        "run_support": {"supported": True, "reason": "supported"},
     }
-    assert payload["items"][1]["trust_state"] == "untrusted"
-    assert payload["items"][1]["inputs"] == []
-    assert payload["items"][1]["supported_inputs"] == {
+    assert user_items[1]["trust_state"] == "untrusted"
+    assert user_items[1]["inputs"] == []
+    assert user_items[1]["supported_inputs"] == {
         "supported": True,
         "reason": "parameterless",
+    }
+    assert user_items[1]["run_support"] == {
+        "supported": True,
+        "reason": "supported",
     }
     assert b"SECRET_NUMERIC_DEFAULT" not in response.content
     assert b"SECRET_TITLE_DEFAULT" not in response.content
@@ -187,7 +466,7 @@ def test_workflow_catalog_marks_legacy_and_rich_input_kinds_unsupported(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    item = response.json()["items"][0]
+    item = _user_items(response)[0]
     assert item["inputs"] == [
         {"name": "attachment", "type": "file", "required": True},
         {"name": "metadata", "type": "object", "required": False},
@@ -195,6 +474,10 @@ def test_workflow_catalog_marks_legacy_and_rich_input_kinds_unsupported(
     assert item["supported_inputs"] == {
         "supported": False,
         "reason": "unsupported_input_type",
+    }
+    assert item["run_support"] == {
+        "supported": False,
+        "reason": "unsupported_inputs",
     }
     assert b"properties" not in response.content
     assert b"secret" not in response.content
@@ -226,11 +509,15 @@ def test_workflow_catalog_marks_enum_without_usable_choices_unsupported(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    item = response.json()["items"][0]
+    item = _user_items(response)[0]
     assert item["inputs"] == [{"name": "mode", "type": "enum", "required": False}]
     assert item["supported_inputs"] == {
         "supported": False,
         "reason": "unsupported_input_shape",
+    }
+    assert item["run_support"] == {
+        "supported": False,
+        "reason": "unsupported_inputs",
     }
 
 
@@ -285,11 +572,15 @@ def test_workflow_catalog_rejects_unrepresentable_input_names_without_renaming(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    item = response.json()["items"][0]
+    item = _user_items(response)[0]
     assert item["inputs"] == []
     assert item["supported_inputs"] == {
         "supported": False,
         "reason": "unsupported_input_shape",
+    }
+    assert item["run_support"] == {
+        "supported": False,
+        "reason": "unsupported_inputs",
     }
 
 
@@ -317,7 +608,7 @@ def test_workflow_catalog_rejects_case_insensitive_input_name_collisions(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    item = response.json()["items"][0]
+    item = _user_items(response)[0]
     assert item["supported_inputs"] == {
         "supported": False,
         "reason": "unsupported_input_shape",
@@ -358,7 +649,7 @@ def test_workflow_catalog_rejects_enum_choices_that_collapse_on_the_json_wire(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    item = response.json()["items"][0]
+    item = _user_items(response)[0]
     assert item["inputs"] == [{"name": "mode", "type": "enum", "required": True}]
     assert item["supported_inputs"] == {
         "supported": False,
@@ -392,7 +683,7 @@ def test_workflow_catalog_degrades_unrepresentable_workflow_name_per_entry(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    assert response.json()["items"] == [
+    assert _user_items(response) == [
         {
             "name": "normal",
             "version": "1",
@@ -405,6 +696,7 @@ def test_workflow_catalog_degrades_unrepresentable_workflow_name_per_entry(
                 "supported": True,
                 "reason": "parameterless",
             },
+            "run_support": {"supported": True, "reason": "supported"},
         },
         {"name": "x" * 128, "error": "invalid_definition"},
     ]
@@ -416,7 +708,8 @@ def test_workflow_catalog_empty_is_not_an_error(tmp_path, monkeypatch) -> None:
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    assert response.json() == {"items": [], "truncated": False}
+    assert _user_items(response) == []
+    assert response.json()["truncated"] is False
 
 
 def test_workflow_catalog_isolates_invalid_definition(
@@ -432,7 +725,7 @@ def test_workflow_catalog_isolates_invalid_definition(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    assert response.json()["items"] == [
+    assert _user_items(response) == [
         {"name": "broken", "error": "invalid_definition"},
         {
             "name": "valid",
@@ -446,6 +739,7 @@ def test_workflow_catalog_isolates_invalid_definition(
                 "supported": True,
                 "reason": "parameterless",
             },
+            "run_support": {"supported": True, "reason": "supported"},
         },
     ]
     assert response.json()["truncated"] is False
@@ -485,10 +779,12 @@ def test_workflow_catalog_caps_items_and_reports_truncation(
 
     assert response.status_code == 200
     payload = response.json()
+    user_items = _user_items(response)
     assert len(payload["items"]) == 500
+    assert len(user_items) == 495
     assert payload["truncated"] is True
-    assert payload["items"][0]["name"] == "workflow-000"
-    assert payload["items"][-1]["name"] == "workflow-499"
+    assert user_items[0]["name"] == "workflow-000"
+    assert user_items[-1]["name"] == "workflow-494"
     assert loaded == 500
     assert trust_reads == 1
     assert not (home / "workflow" / "trust.lock").exists()
@@ -538,7 +834,7 @@ def test_workflow_catalog_bounds_one_trust_snapshot_read(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    assert response.json()["items"][0]["trust_state"] == "untrusted"
+    assert _user_items(response)[0]["trust_state"] == "untrusted"
     assert read_sizes == [catalog_api.CATALOG_MAX_TRUST_STORE_BYTES + 1]
     assert not WorkflowTrustStore(home).lock_path.exists()
 
@@ -556,7 +852,7 @@ def test_workflow_catalog_treats_non_object_trust_json_as_untrusted(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    assert response.json()["items"][0]["trust_state"] == "untrusted"
+    assert _user_items(response)[0]["trust_state"] == "untrusted"
     assert not WorkflowTrustStore(home).lock_path.exists()
 
 
@@ -601,7 +897,7 @@ def test_workflow_catalog_rejects_oversized_resource_without_reading_it_all(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    assert response.json()["items"] == [
+    assert _user_items(response) == [
         {"name": "oversized-resource", "error": "catalog_capacity"}
     ]
     assert read_sizes
@@ -629,7 +925,7 @@ def test_workflow_catalog_enforces_aggregate_resource_budget(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    assert response.json()["items"] == [
+    assert _user_items(response) == [
         {"name": "aggregate-resource-budget", "error": "catalog_capacity"}
     ]
 
@@ -654,7 +950,7 @@ def test_workflow_catalog_truncates_before_global_resource_work_bound(
 
     assert response.status_code == 200
     assert response.json()["truncated"] is True
-    assert [item["name"] for item in response.json()["items"]] == ["alpha"]
+    assert [item["name"] for item in _user_items(response)] == ["alpha"]
 
 
 def test_workflow_catalog_stops_directory_enumeration_at_scan_budget(
@@ -763,7 +1059,7 @@ def test_workflow_catalog_enforces_definition_file_budget_per_entry(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    items = response.json()["items"]
+    items = _user_items(response)
     assert {item["name"] for item in items} == {"oversized", "valid"}
     assert next(item for item in items if item["name"] == "oversized") == {
         "name": "oversized",
@@ -790,7 +1086,7 @@ def test_workflow_catalog_enforces_aggregate_definition_budget_per_entry(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    items = response.json()["items"]
+    items = _user_items(response)
     assert "error" not in next(item for item in items if item["name"] == "alpha")
     assert next(item for item in items if item["name"] == "bravo") == {
         "name": "bravo",
@@ -815,7 +1111,7 @@ def test_workflow_catalog_classifies_projection_exhaustion_as_capacity(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    assert response.json()["items"] == [
+    assert _user_items(response) == [
         {"name": "projection-capacity", "error": "catalog_capacity"}
     ]
 
@@ -844,7 +1140,7 @@ def test_workflow_catalog_project_definition_overrides_profile(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    assert response.json()["items"] == [
+    assert _user_items(response) == [
         {
             "name": "shared",
             "version": "1",
@@ -857,6 +1153,7 @@ def test_workflow_catalog_project_definition_overrides_profile(
                 "supported": True,
                 "reason": "parameterless",
             },
+            "run_support": {"supported": True, "reason": "supported"},
         }
     ]
 
@@ -873,7 +1170,7 @@ def test_workflow_catalog_isolates_same_precedence_duplicate_names(
     response = _catalog_get(_module().router, token=_reader())
 
     assert response.status_code == 200
-    items = response.json()["items"]
+    items = _user_items(response)
     assert items[0] == {"name": "duplicate", "error": "invalid_definition"}
     assert items[1]["name"] == "valid"
     assert "error" not in items[1]

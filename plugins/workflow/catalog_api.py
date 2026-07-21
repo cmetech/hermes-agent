@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Literal, TypedDict
+from typing import TYPE_CHECKING, Iterator, Literal, NotRequired, TypedDict
 
 from plugins.workflow.cli import (
     WorkflowDefinitionProjectionCapacityError,
@@ -32,6 +32,9 @@ from plugins.workflow.trust import (
     build_risk_summary,
 )
 
+if TYPE_CHECKING:
+    from plugins.workflow.showcase import ShowcaseScenario, VerifiedShowcasePackage
+
 
 CATALOG_LIMIT = 500
 CATALOG_MAX_SCAN_ENTRIES = 4096
@@ -48,6 +51,14 @@ _RICH_INPUT_FIELDS = frozenset({"items", "properties", "schema"})
 _ENUM_INPUT_FIELDS = ("values", "enum", "options", "choices")
 _ENUM_MAX_CHOICES = 128
 _ENUM_MAX_CHOICE_LENGTH = 512
+
+CatalogSource = Literal["project", "profile", "showcase"]
+CatalogTrustState = Literal["trusted", "untrusted", "verified_bundled"]
+CatalogRunSupportReason = Literal[
+    "supported",
+    "unsupported_inputs",
+    "showcase_cli_required",
+]
 
 
 class CatalogInput(TypedDict):
@@ -66,15 +77,22 @@ class SupportedInputs(TypedDict):
     ]
 
 
+class CatalogRunSupport(TypedDict):
+    supported: bool
+    reason: CatalogRunSupportReason
+
+
 class CatalogEntry(TypedDict):
     name: str
     version: str
     description: str
-    source: str
+    source: CatalogSource
     precedence: int
-    trust_state: Literal["trusted", "untrusted"]
+    trust_state: CatalogTrustState
     inputs: list[CatalogInput]
     supported_inputs: SupportedInputs
+    run_support: CatalogRunSupport
+    compatibility: NotRequired[dict[str, object]]
 
 
 class InvalidCatalogEntry(TypedDict):
@@ -103,6 +121,10 @@ class WorkflowCatalogInvalidDefinitionError(RuntimeError):
 
 class WorkflowDetailNotFoundError(LookupError):
     """The requested workflow is absent from the bounded catalog."""
+
+
+class WorkflowShowcaseVerificationError(RuntimeError):
+    """The authenticated bundled showcase distribution failed verification."""
 
 
 @dataclass(slots=True)
@@ -279,7 +301,11 @@ def _discover_catalog(
 
 
 def resolve_workflow_catalog_package(
-    name: str, *, hermes_home: str | Path, workdir: str | Path
+    name: str,
+    *,
+    hermes_home: str | Path,
+    workdir: str | Path,
+    catalog_source: Literal["project", "profile"] | None = None,
 ) -> WorkflowPackage | None:
     """Resolve one runnable catalog entry with list/detail failure isolation."""
     if not isinstance(name, str) or not name.strip() or len(name) > 128:
@@ -290,6 +316,8 @@ def resolve_workflow_catalog_package(
     )
     for item in discovered:
         if isinstance(item, WorkflowPackage) and item.definition.name == name:
+            if catalog_source is not None and item.source != catalog_source:
+                return None
             qualify_workflow_catalog_package(
                 item,
                 compatibility=assess_compatibility(item),
@@ -372,6 +400,40 @@ def _input_projection(
     return inputs, classification
 
 
+def workflow_catalog_run_support(
+    package: WorkflowPackage,
+    *,
+    showcase_scenario: "ShowcaseScenario | None" = None,
+) -> CatalogRunSupport:
+    """Derive Desktop background-run support from authenticated server data."""
+    _inputs, input_support = _input_projection(package)
+    if not input_support["supported"]:
+        return {"supported": False, "reason": "unsupported_inputs"}
+    if showcase_scenario is not None:
+        from plugins.workflow.showcase import showcase_background_api_eligible
+
+        if not showcase_background_api_eligible(showcase_scenario):
+            return {"supported": False, "reason": "showcase_cli_required"}
+    return {"supported": True, "reason": "supported"}
+
+
+def _compatibility_projection(compatibility) -> dict[str, object]:
+    return {
+        "level": compatibility.level.value,
+        "runnable": compatibility.runnable,
+        "findings": [
+            {
+                "path": finding.path,
+                "level": finding.level.value,
+                "message": finding.message,
+                "blocking": finding.blocking,
+                "code": finding.code,
+            }
+            for finding in compatibility.findings
+        ],
+    }
+
+
 def qualify_workflow_catalog_package(
     package: WorkflowPackage, *, compatibility
 ) -> dict[str, object]:
@@ -427,33 +489,58 @@ def desktop_input_name_is_representable(name: object) -> bool:
 
 def _catalog_entry(
     package: WorkflowPackage,
-    trust_store: WorkflowTrustStore,
-    trust_snapshot: Mapping[str, object],
+    trust_store: WorkflowTrustStore | None,
+    trust_snapshot: Mapping[str, object] | None,
     resource_budget: WorkflowResourceReadBudget,
+    *,
+    verified_showcase: "VerifiedShowcasePackage | None" = None,
 ) -> CatalogEntry:
     # The CLI show projection is the established body-free catalog contract.
-    compatibility = assess_compatibility(package)
+    compatibility = (
+        verified_showcase.compatibility
+        if verified_showcase is not None
+        else assess_compatibility(package)
+    )
     shown = qualify_workflow_catalog_package(
         package,
         compatibility=compatibility,
     )
-    risk = build_risk_summary(package, compatibility, read_budget=resource_budget)
-    trust_state = trust_store.check_snapshot(
-        trust_snapshot,
-        risk.package_digest,
-        risk_digest=risk.risk_digest,
-    )
+    if verified_showcase is None:
+        assert trust_store is not None and trust_snapshot is not None
+        risk = build_risk_summary(package, compatibility, read_budget=resource_budget)
+        trust_state: CatalogTrustState = trust_store.check_snapshot(
+            trust_snapshot,
+            risk.package_digest,
+            risk_digest=risk.risk_digest,
+        )
+        version = "1"
+        showcase_scenario = None
+    else:
+        trust_state = "verified_bundled"
+        version = str(verified_showcase.scenario.package_version)
+        showcase_scenario = verified_showcase.scenario
     inputs, supported_inputs = _input_projection(package)
-    return {
-        "name": str(shown["name"]),
-        "version": "1",
-        "description": str(shown["description"]),
+    entry: CatalogEntry = {
+        "name": (
+            str(verified_showcase.scenario.id)
+            if verified_showcase is not None
+            else str(shown["name"])
+        ),
+        "version": version,
+        "description": str(shown["definition"]["description"]),
         "source": str(shown["source"]),
         "precedence": int(shown["precedence"]),
         "trust_state": trust_state,
         "inputs": inputs,
         "supported_inputs": supported_inputs,
+        "run_support": workflow_catalog_run_support(
+            package,
+            showcase_scenario=showcase_scenario,
+        ),
     }
+    if verified_showcase is not None:
+        entry["compatibility"] = _compatibility_projection(compatibility)
+    return entry
 
 
 def build_workflow_catalog(
@@ -464,6 +551,24 @@ def build_workflow_catalog(
     discovered, truncated = _discover_catalog(
         Path(workdir).expanduser().resolve(), home
     )
+    showcase_budget = WorkflowResourceReadBudget(
+        max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
+        max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
+        max_files=CATALOG_MAX_RESOURCE_FILES,
+    )
+    verified_showcases = {}
+    try:
+        from plugins.workflow.showcase import load_verified_showcase_packages
+
+        verified_showcases = load_verified_showcase_packages(
+            read_budget=showcase_budget,
+        )
+    except WorkflowResourceCapacityError:
+        truncated = True
+    except (OSError, UnicodeError, ValueError):
+        # A stripped or integrity-failed distribution is trusted for nothing,
+        # but it must not suppress independently discovered user workflows.
+        verified_showcases = {}
     trust_store = WorkflowTrustStore(home)
     try:
         trust_snapshot = trust_store.snapshot_read_only(
@@ -473,12 +578,33 @@ def build_workflow_catalog(
         raise WorkflowCatalogTrustUnavailableError(
             "workflow catalog trust classification is unavailable"
         ) from exc
+    showcase_items: list[CatalogEntry] = []
+    for verified in verified_showcases.values():
+        projection_budget = WorkflowResourceReadBudget(
+            max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
+            max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
+            max_files=CATALOG_MAX_RESOURCE_FILES,
+        )
+        showcase_items.append(
+            _catalog_entry(
+                verified.package,
+                None,
+                None,
+                projection_budget,
+                verified_showcase=verified,
+            )
+        )
+
+    user_limit = max(0, CATALOG_LIMIT - len(showcase_items))
+    if len(discovered) > user_limit:
+        truncated = True
     items: list[CatalogItem] = []
-    resource_bytes_read = 0
-    for discovered_item in discovered:
+    resource_bytes_read = showcase_budget.bytes_read
+    for discovered_item in discovered[:user_limit]:
         if (
             resource_bytes_read + CATALOG_MAX_RESOURCE_TOTAL_BYTES
             > CATALOG_MAX_RESOURCE_REQUEST_BYTES
+            and items
         ):
             truncated = True
             break
@@ -513,6 +639,14 @@ def build_workflow_catalog(
             )
         finally:
             resource_bytes_read += resource_budget.bytes_read
+    items.extend(showcase_items)
+    items.sort(
+        key=lambda item: (
+            item["name"],
+            item.get("precedence", 0),
+            item.get("source", ""),
+        )
+    )
     return items, truncated
 
 
@@ -553,69 +687,112 @@ def _coordinator_projection(hermes_home: Path) -> dict[str, object]:
 
 
 def build_workflow_detail(
-    name: str, *, hermes_home: str | Path, workdir: str | Path
+    name: str,
+    *,
+    hermes_home: str | Path,
+    workdir: str | Path,
+    catalog_source: CatalogSource | None = None,
 ) -> dict[str, object]:
     """Return one bounded, redacted, read-only workflow preflight projection."""
     if not isinstance(name, str) or not name.strip() or len(name) > 128:
         raise WorkflowDetailNotFoundError(name)
-    home = Path(hermes_home).expanduser().resolve()
-    discovered, _truncated = _discover_catalog(
-        Path(workdir).expanduser().resolve(), home
-    )
-    package = next(
-        (
-            item
-            for item in discovered
-            if isinstance(item, WorkflowPackage) and item.definition.name == name
-        ),
-        None,
-    )
-    if package is None:
-        if any(
-            isinstance(item, dict)
-            and item.get("name") == name
-            and item.get("error") == "catalog_capacity"
-            for item in discovered
-        ):
-            raise WorkflowCatalogCapacityError(
-                "workflow detail definition limit exceeded"
-            )
+    if catalog_source not in {None, "project", "profile", "showcase"}:
         raise WorkflowDetailNotFoundError(name)
-
+    home = Path(hermes_home).expanduser().resolve()
     resource_budget = WorkflowResourceReadBudget(
         max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
         max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
         max_files=CATALOG_MAX_RESOURCE_FILES,
     )
-    compatibility = assess_compatibility(package)
+    verified_showcase = None
+    if catalog_source == "showcase":
+        try:
+            from plugins.workflow.showcase import load_verified_showcase_packages
+
+            verified_showcase = load_verified_showcase_packages(
+                read_budget=resource_budget,
+            ).get(name)
+        except WorkflowResourceCapacityError as exc:
+            raise WorkflowCatalogCapacityError(
+                "workflow showcase detail verification limit exceeded"
+            ) from exc
+        except (OSError, UnicodeError, WorkflowValidationError, ValueError) as exc:
+            raise WorkflowShowcaseVerificationError(
+                "workflow showcase distribution verification failed"
+            ) from exc
+        if verified_showcase is None:
+            raise WorkflowDetailNotFoundError(name)
+        package = verified_showcase.package
+    else:
+        user_source = catalog_source if catalog_source in {"project", "profile"} else None
+        discovered, _truncated = _discover_catalog(
+            Path(workdir).expanduser().resolve(), home
+        )
+        package = next(
+            (
+                item
+                for item in discovered
+                if isinstance(item, WorkflowPackage)
+                and item.definition.name == name
+                and (user_source is None or item.source == user_source)
+            ),
+            None,
+        )
+        if package is None:
+            if any(
+                isinstance(item, dict)
+                and item.get("name") == name
+                and item.get("error") == "catalog_capacity"
+                for item in discovered
+            ):
+                raise WorkflowCatalogCapacityError(
+                    "workflow detail definition limit exceeded"
+                )
+            raise WorkflowDetailNotFoundError(name)
+
+    compatibility = (
+        verified_showcase.compatibility
+        if verified_showcase is not None
+        else assess_compatibility(package)
+    )
     shown = qualify_workflow_catalog_package(
         package,
         compatibility=compatibility,
     )
-    try:
-        risk = build_risk_summary(package, compatibility, read_budget=resource_budget)
-    except WorkflowResourceCapacityError as exc:
-        raise WorkflowCatalogCapacityError(
-            "workflow detail resource limit exceeded"
-        ) from exc
-    except WorkflowValidationError as exc:
-        raise WorkflowCatalogInvalidDefinitionError(
-            "workflow detail contains an invalid package resource"
-        ) from exc
-    try:
-        trust_store = WorkflowTrustStore(home)
-        trust_snapshot = trust_store.snapshot_read_only(
-            max_bytes=CATALOG_MAX_TRUST_STORE_BYTES
-        )
-        trust_state = trust_store.check_snapshot(
-            trust_snapshot,
-            risk.package_digest,
-            risk_digest=risk.risk_digest,
-        )
-    except WorkflowTrustError as exc:
-        raise WorkflowCatalogTrustUnavailableError(
-            "workflow trust classification is unavailable"
-        ) from exc
+    if verified_showcase is None:
+        try:
+            risk = build_risk_summary(
+                package, compatibility, read_budget=resource_budget
+            )
+        except WorkflowResourceCapacityError as exc:
+            raise WorkflowCatalogCapacityError(
+                "workflow detail resource limit exceeded"
+            ) from exc
+        except WorkflowValidationError as exc:
+            raise WorkflowCatalogInvalidDefinitionError(
+                "workflow detail contains an invalid package resource"
+            ) from exc
+        try:
+            trust_store = WorkflowTrustStore(home)
+            trust_snapshot = trust_store.snapshot_read_only(
+                max_bytes=CATALOG_MAX_TRUST_STORE_BYTES
+            )
+            trust_state: CatalogTrustState = trust_store.check_snapshot(
+                trust_snapshot,
+                risk.package_digest,
+                risk_digest=risk.risk_digest,
+            )
+        except WorkflowTrustError as exc:
+            raise WorkflowCatalogTrustUnavailableError(
+                "workflow trust classification is unavailable"
+            ) from exc
+        version = "1"
+        showcase_scenario = None
+    else:
+        risk = verified_showcase.risk
+        trust_state = "verified_bundled"
+        version = str(verified_showcase.scenario.package_version)
+        showcase_scenario = verified_showcase.scenario
     inputs, supported_inputs = _input_projection(package)
     warnings = [str(item) for item in shown["topology_warnings"]]
     mermaid = shown["topology_mermaid"]
@@ -630,29 +807,24 @@ def build_workflow_detail(
             "topology_mermaid_omitted",
         )
     return {
-        "name": str(shown["name"]),
-        "version": "1",
+        "name": (
+            str(verified_showcase.scenario.id)
+            if verified_showcase is not None
+            else str(shown["name"])
+        ),
+        "version": version,
         "description": str(shown["definition"]["description"]),
         "source": str(shown["source"]),
         "precedence": int(shown["precedence"]),
         "trust_state": trust_state,
         "inputs": inputs,
         "supported_inputs": supported_inputs,
+        "run_support": workflow_catalog_run_support(
+            package,
+            showcase_scenario=showcase_scenario,
+        ),
         "risk_summary": risk.to_dict(),
-        "compatibility": {
-            "level": compatibility.level.value,
-            "runnable": compatibility.runnable,
-            "findings": [
-                {
-                    "path": finding.path,
-                    "level": finding.level.value,
-                    "message": finding.message,
-                    "blocking": finding.blocking,
-                    "code": finding.code,
-                }
-                for finding in compatibility.findings
-            ],
-        },
+        "compatibility": _compatibility_projection(compatibility),
         "coordinator": _coordinator_projection(home),
         "topology": {
             "text": shown["topology_text"],
@@ -665,6 +837,9 @@ def build_workflow_detail(
 
 
 __all__ = [
+    "CatalogRunSupport",
+    "CatalogSource",
+    "CatalogTrustState",
     "CATALOG_LIMIT",
     "CATALOG_MAX_SCAN_ENTRIES",
     "CATALOG_MAX_DEFINITION_FILE_BYTES",
@@ -679,9 +854,11 @@ __all__ = [
     "WorkflowCatalogTrustUnavailableError",
     "WorkflowCatalogUnavailableError",
     "WorkflowDetailNotFoundError",
+    "WorkflowShowcaseVerificationError",
     "build_workflow_catalog",
     "build_workflow_detail",
     "desktop_input_name_is_representable",
     "qualify_workflow_catalog_package",
     "resolve_workflow_catalog_package",
+    "workflow_catalog_run_support",
 ]

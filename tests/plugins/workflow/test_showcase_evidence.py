@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from plugins.workflow.showcase import build_showcase_report, run_showcase
+from plugins.workflow.showcase import approve_showcase, build_showcase_report, run_showcase
 from plugins.workflow.store import RunStore
 
 
@@ -37,6 +37,28 @@ def test_missing_catalog_evidence_fails_instead_of_declaring_pass(tmp_path) -> N
         claim.outcome != "passed" and claim.reason_code
         for claim in report.claims
     )
+
+
+def test_operator_approval_claim_uses_durable_approval_evidence(tmp_path) -> None:
+    started = run_showcase("approval-gate", hermes_home=tmp_path)
+    assert started["status"] == "paused"
+
+    paused = build_showcase_report(started["run_id"], hermes_home=tmp_path)
+    paused_claim = next(
+        claim for claim in paused.claims if claim.capability == "operator-approval"
+    )
+    assert paused_claim.outcome == "skipped"
+    assert paused_claim.reason_code == "awaiting_operator_decision"
+
+    completed = approve_showcase(started["run_id"], hermes_home=tmp_path)
+    assert completed["status"] == "succeeded"
+    report = build_showcase_report(started["run_id"], hermes_home=tmp_path)
+    claim = next(
+        item for item in report.claims if item.capability == "operator-approval"
+    )
+    assert claim.outcome == "passed"
+    assert claim.reason_code == "operator_approval_observed"
+    assert claim.evidence_refs
 
 
 def test_cleanup_summary_fails_closed_on_unreaped_identity_and_owned_staging(
