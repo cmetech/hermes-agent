@@ -806,8 +806,10 @@ OTTO_REHEARSAL="$SHOWCASE_BRAND_REHEARSAL/otto"
 LOOP24_REHEARSAL="$SHOWCASE_BRAND_REHEARSAL/loop24"
 git worktree add --detach "$OTTO_REHEARSAL" "$TESTED_FEATURE_SHA"
 git worktree add --detach "$LOOP24_REHEARSAL" "$TESTED_FEATURE_SHA"
-(cd "$OTTO_REHEARSAL" && node scripts/brand/generate.mjs otto)
-(cd "$LOOP24_REHEARSAL" && node scripts/brand/generate.mjs loop24)
+(cd "$OTTO_REHEARSAL" && node scripts/brand/generate.mjs otto --write)
+(cd "$OTTO_REHEARSAL" && node scripts/brand/generate.mjs otto --check)
+(cd "$LOOP24_REHEARSAL" && node scripts/brand/generate.mjs loop24 --write)
+(cd "$LOOP24_REHEARSAL" && node scripts/brand/generate.mjs loop24 --check)
 PYTHON_BIN=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python "$OTTO_REHEARSAL/scripts/test_workflow_merge_gate.sh" --repo "$OTTO_REHEARSAL" --phase brand --brand otto --tested-base-sha "$TESTED_FEATURE_SHA"
 PYTHON_BIN=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python "$LOOP24_REHEARSAL/scripts/test_workflow_merge_gate.sh" --repo "$LOOP24_REHEARSAL" --phase brand --brand loop24 --tested-base-sha "$TESTED_FEATURE_SHA"
 git worktree remove --force "$OTTO_REHEARSAL"

@@ -1442,3 +1442,30 @@ upstream_changes:
   removal_condition: Remove when upstream has equivalent real-middleware
     coverage in both the focused fork gate and native three-OS CI matrix.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-desktop-run-verification
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-verification.md
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
+  - tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py
+  - tests/test_desktop_workflow_test_gate.py
+  - website/docs/user-guide/features/workflows.md
+  owned_symbols:
+  - v3.0.2 bundled showcase user guidance
+  - bundled Desktop approval Electron UAT
+  - gate baseline reconciliation
+  - paired-brand materialization rehearsal
+  tests:
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
+  - tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py
+  - tests/test_desktop_workflow_test_gate.py
+  expected_commit_subject: 'docs(workflow): verify bundled Desktop showcase runs'
+  upstream_candidate: true
+  merge_guidance: Preserve honest 2-of-5 Desktop coverage, bundle trust and
+    collision guidance, invariant-based catalog tests, exact gate arithmetic,
+    real Electron approval UAT, and write-then-check paired-brand rehearsal.
+  removal_condition: Remove when upstream ships equivalent bundled Desktop
+    workflow documentation, UAT, and release-gate evidence.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

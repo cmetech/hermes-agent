@@ -81,24 +81,34 @@ def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
         catalog_response = client.get("/api/plugins/workflow/workflows")
         assert catalog_response.status_code == 200
         catalog_items = catalog_response.json()["items"]
-        assert [item["name"] for item in catalog_items] == [
+        user_items = [
+            item for item in catalog_items if item.get("source") != "showcase"
+        ]
+        assert [item["name"] for item in user_items] == [
             "broken-neighbor",
             "desktop-catalog-e2e",
             "duplicate-neighbor",
             "oversized-neighbor",
         ]
-        assert catalog_items[0] == {
+        assert user_items[0] == {
             "name": "broken-neighbor",
             "error": "invalid_definition",
         }
-        assert catalog_items[2] == {
+        assert user_items[2] == {
             "name": "duplicate-neighbor",
             "error": "invalid_definition",
         }
-        assert catalog_items[3] == {
+        assert user_items[3] == {
             "name": "oversized-neighbor",
             "error": "catalog_capacity",
         }
+        approval_showcase = next(
+            item
+            for item in catalog_items
+            if item.get("source") == "showcase"
+            and item.get("name") == "approval-gate"
+        )
+        assert approval_showcase["trust_state"] == "verified_bundled"
 
         detail_response = client.get(
             "/api/plugins/workflow/workflows/desktop-catalog-e2e"

@@ -10,11 +10,27 @@ Hermes workflows are durable, resumable packages that coordinate commands, promp
 
 ## Browse the catalog
 
-Open **Workflows** in the Desktop sidebar to see the catalog for the selected profile. Each row shows the package name, version, description, trust state, supported inputs, and whether it came from the profile or the current project.
+Open **Workflows** in the Desktop sidebar to see the catalog for the selected profile. Each row shows the package name, version, description, trust state, supported inputs, and whether it came from the profile, current project, or the bundled showcase collection. A user workflow and a showcase with the same name remain separate rows; **Project**, **Profile**, and **Bundled showcase** identify which package View and Run target.
+
+Bundled rows are loaded only after the installed showcase catalog and package trees pass digest and path-safety verification. A bundle integrity failure omits the entire bundled collection rather than treating tampered content as trusted. A safe package that is incompatible with the current environment remains visible with an **Incompatible** badge so other verified showcases are not suppressed. **Verified bundle** is distribution trust, not a user trust-store grant, so no trust action is offered for these rows.
 
 Select **View** to inspect a workflow without changing it. The Diagram view uses the normalized workflow topology. If the diagram exceeds a safety bound, Desktop shows the bounded text outline and explains why the diagram was omitted. The Definition view shows stable, read-only JSON derived from the normalized redacted definition—not raw YAML—and provides a copy action.
 
 Select **Run** to open **Review & Run**. Desktop fetches a fresh preflight and requires that exact package to be trusted, compatible, supported by the flat-input form, and backed by a healthy coordinator. Review the trust verdict, risk summary, and inputs before selecting **Start workflow**. Parameterless workflows and flat `string`, `number`, `boolean`, and `enum` inputs are supported in this version. Other input shapes remain available through the CLI.
+
+### Bundled showcase coverage
+
+All five bundled showcases are visible and View remains available even when Run is not. Two are admitted through Desktop's standard background-only path:
+
+| Showcase | Desktop Run | Why |
+| --- | --- | --- |
+| `approval-gate` | Available | Parameterless, offline approval workflow. |
+| `resilience` | Available | Flat inputs and background-safe package behavior. |
+| `laptop-diagnostic` | CLI only | Its file/text inputs are outside Desktop's flat-input form; use `hermes workflow showcase run laptop-diagnostic`. |
+| `ai-extensions` | CLI only | AI authorization still requires the showcase consent flow; use `hermes workflow showcase run ai-extensions`. |
+| `scheduling` | CLI only | Schedule creation and exact-ID/nonce cleanup live in the showcase CLI wrapper rather than its workflow package; use `hermes workflow showcase run scheduling`. |
+
+For the marquee walkthrough, select `approval-gate`, inspect Diagram and the redacted Definition, then choose **Run** and **Start workflow**; when `approval-gate` reaches **Attention**, open it and select **Approve** to let the background coordinator complete the run.
 
 Enums must publish a bounded non-empty list of string choices; incomplete or
 non-string enum metadata is treated as unsupported instead of rendering an
