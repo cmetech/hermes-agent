@@ -971,11 +971,11 @@ This audit adds no production behavior, so there is no synthetic RED step. Its
 fail-closed review verdict and fresh verification gate are the test-first
 boundary for the documentation-only commit.
 
-- [ ] **Step 1: Review exact `origin/base...HEAD` diff**
+- [x] **Step 1: Review exact `origin/base...HEAD` diff**
 
 Threat-check raw scans/arbitrary roots, digest/budget/TOCTOU, copied-bundle confusion, collision ambiguity, caller provenance, existing digest drift, user-trust conflation, AI-consent/scheduling bypass, request-time execution, snapshot-byte drift, auth ordering, read mutation, redaction/Mermaid bypass, laptop enablement, i18n/gate/matrix/ledger/wheel gaps, CLI regressions, schema/host drift, and paired-brand scope.
 
-- [ ] **Step 2: Reproduce decisive tests**
+- [x] **Step 2: Reproduce decisive tests**
 
 ```bash
 scripts/run_tests.sh tests/plugins/workflow/test_showcase_catalog.py tests/plugins/workflow/test_catalog_api.py tests/plugins/workflow/test_workflow_detail_api.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py tests/plugins/workflow/test_provenance.py -q
@@ -984,11 +984,11 @@ npx vitest run src/lib/hermes-api.test.ts src/app/workflows/catalog-run-policy.t
 cd ../..
 ```
 
-- [ ] **Step 3: Enforce finding gate**
+- [x] **Step 3: Enforce finding gate**
 
 If any Critical or High exists, stop without a completion verdict. Add a new red-green remediation task/commit, rerun Task 8, and restart review at the new SHA. Important/Medium requires maintainer disposition. Only zero Critical/High permits the final review doc.
 
-- [ ] **Step 4: Rerun the full gate at the reviewed tree**
+- [x] **Step 4: Rerun the full gate at the reviewed tree**
 
 ```bash
 PYTHON_BIN=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/test_workflow_merge_gate.sh --phase base
@@ -998,7 +998,7 @@ Require the same reconciled counts as Task 8 plus only explicitly counted test
 additions. Record this fresh run in the adversarial review so the last commit
 is preceded by a full green gate.
 
-- [ ] **Step 5: Ledger and commit review**
+- [x] **Step 5: Ledger and commit review**
 
 ```bash
 /Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/check_upstream_customizations.py --manifest docs/upstream-customizations/workflow-orchestration.yaml

@@ -1543,10 +1543,11 @@ upstream_changes:
   - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
   expected_commit_subject: 'docs(workflow): record bundled Desktop showcase review'
   upstream_candidate: true
-  merge_guidance: Preserve the zero-open-finding final review together with the
-    historical RED reproductions and exact-SHA verification evidence. Do not
-    erase the resolved TOCTOU, eager-enumeration, or ancestor-symlink findings
-    when replaying the security boundary upstream.
+  merge_guidance: Preserve the original review together with the historical RED
+    reproductions and exact-SHA verification evidence. Reconcile it with the
+    later independent review and do not erase the resolved TOCTOU,
+    eager-enumeration, or ancestor-symlink findings when replaying the security
+    boundary upstream.
   removal_condition: Remove when upstream carries equivalent final adversarial
     evidence for verified bundled Desktop workflow visibility and admission.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
@@ -1638,4 +1639,34 @@ upstream_changes:
     expose raw server error detail.
   removal_condition: Remove when upstream Desktop maps equivalent typed
     workflow admission failures to honest localized operator guidance.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-independent-review-reconciliation
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - docs/backlog/v3.0.2-workflow-showcase-desktop-run.md
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-adversarial-review.md
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-independent-adversarial-review.md
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-verification.md
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  owned_symbols:
+  - independent five-reviewer adversarial report
+  - three-Medium remediation disposition
+  - acknowledged Low and informational finding backlog
+  - post-review exact-SHA base and paired-brand evidence
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  expected_commit_subject: 'docs(workflow): reconcile independent showcase review'
+  upstream_candidate: true
+  merge_guidance: Preserve the independent finding register verbatim alongside
+    the remediation disposition. Do not restore the superseded claim of zero
+    open findings or the incorrect assertion that showcase verification and
+    rows consume none of the shared catalog budgets.
+  removal_condition: Remove when upstream carries equivalent independent
+    adversarial evidence, Medium-finding remediations, and explicit lower-
+    severity follow-up disposition.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

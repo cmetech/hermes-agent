@@ -33,6 +33,9 @@ or publication was introduced.
 | 8 — docs/UAT | this document's commit | The docs gate failed because bundled source/trust, exact CLI-only coverage, and the approval walkthrough were absent. The first full gate also found two stale v3.0.1 assertions. | Docs gate passed; stale exact-list and four-showcase count assertions became behavioral user-row and verified-package invariants; full gates and real Electron UAT passed. |
 | 8.5 — adversarial remediation | remediation commit | A transient parser-reopen test accepted definition/sidecar state that differed from authenticated bytes, and an instrumented overlong tree proved the entry bound ran after eager enumeration. | Parsing now consumes the authenticated byte snapshot and incremental non-following enumeration stops at the configured entry bound; the focused schema/showcase/admission/E2E selection passed 109 tests. |
 | 8.6 — symlink remediation | remediation commit | Four package/`packages` ancestor cases showed CLI acceptance or late generic verified rejection rather than uniform symlink refusal. | Both shared loaders now reject every selected-path symlink component before digest/parse; 86 focused CLI/distribution/admission/E2E tests passed. |
+| 9.1 — environment projection | `c7e3a03ae` | An integrity-valid isolated-backend sidecar caused list-time preflight to suppress all five showcases; the paired CLI strict test already passed. | All five remain visible, only the affected scenario is incompatible, and CLI/API execution remain strict; 159 backend tests passed. |
+| 9.2 — version skew | `60949ffc8` | Old-backend responses without `run_support` crashed catalog, View, and Review independently. | View remains available and every Run path fails closed with an all-locale backend-version explanation; 65 UI tests and TypeScript passed. |
+| 9.3 — refusal copy | `7a1eec0e6` | Three typed showcase/source refusals rendered as generic input validation. | CLI-only, bundle-verification, and invalid-source refusals now have distinct localized, non-retrying messages; 22 Review tests and TypeScript passed. |
 
 The stale test updates removed no behavior. The renamed “four showcases” test
 now proves named verified packages rather than freezing a count, and the
@@ -49,7 +52,9 @@ the verified approval showcase.
 - Environment incompatibility is scenario-local. With MCP unavailable,
   `ai-extensions` remained visible as **Incompatible** while
   `approval-gate`, `resilience`, `scheduling`, and `laptop-diagnostic`
-  remained visible.
+  remained visible. With an integrity-valid `isolated_backend_required`
+  sidecar, only that scenario became incompatible; strict CLI/API execution
+  still rejected it.
 - Catalog verification is cached by bundle digest plus a tree signature and
   invalidated by changed bytes. Admission forces fresh verification.
 - Definition and sidecar parsing consume the exact bytes authenticated by the
@@ -187,6 +192,18 @@ commit, `65e54b784f423d7943892e6cfd660b02741ba6e9`:
 - Desktop merge selection: **84 passed across 11 files in 2.20s**;
 - gate marker: `TESTED_BASE_SHA=65e54b784f423d7943892e6cfd660b02741ba6e9`.
 
+After resolving the independent review's three Medium findings, the full base
+gate was repeated on exact code SHA
+`7a1eec0e64791ac2189d4c58396f1b681a87ded2`:
+
+- Python: **775 passed, 1 skipped in 65.07s** — exactly 773/1 plus the two
+  execution-environment visibility/CLI-direction cases;
+- installed-distribution integration: **1 passed in 4.48s**;
+- Desktop merge selection: **90 passed across 11 files in 2.21s** — exactly
+  84 plus three missing-`run_support` surface cases and three additional typed
+  refusal table cases; and
+- gate marker: `TESTED_BASE_SHA=7a1eec0e64791ac2189d4c58396f1b681a87ded2`.
+
 ## Paired-brand rehearsal
 
 Two temporary detached worktrees were created at the tested feature SHA. For
@@ -206,6 +223,13 @@ was repeated at exact SHA
 reported **8/8 emitters OK**, and the brand gate reported the same exact
 `TESTED_BRAND_SHA`. Both detached worktrees were removed again without
 creating or updating a ref.
+
+After the independent-review remediation commits, the full rehearsal was
+repeated again at exact SHA
+`7a1eec0e64791ac2189d4c58396f1b681a87ded2`. OTTO and LOOP24 each passed
+`--write`, explicit `--check` with **8/8 emitters OK**, and the brand gate with
+the same `TESTED_BRAND_SHA`. Both detached worktrees were removed without
+creating or updating refs.
 
 ## Plan deviations and accepted notes
 
@@ -231,6 +255,17 @@ creating or updating a ref.
   rejected late by Desktop verification but accepted by the CLI catalog
   loader. Task 8.6 made early symlink refusal uniform without loosening either
   path.
+- A later independent review found three non-blocking Mediums: list-time
+  isolation preflight suppressed all showcase rows, old-backend responses
+  without `run_support` crashed the renderer, and three new typed refusals used
+  generic input copy. Tasks 9.1–9.3 reproduced and fixed each in its own TDD
+  commit. Its ten Low and seven informational findings remain preserved in the
+  independent report and follow-up backlog.
+- The earlier adversarial document's “zero open findings” and generalized
+  scenario-local/budget wording were overstated. They are corrected in place:
+  the three Mediums are resolved, the remaining Lows are acknowledged, and
+  showcase rows/verification consume their documented bounded portions of the
+  row and byte budgets.
 - `concurrency_key = "showcase:<id>"` shares the user-authored concurrency-key
   namespace. Deliberate collision can cause contention only, not source
   confusion or incorrect execution; this remains accepted awareness.

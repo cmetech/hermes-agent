@@ -2,19 +2,22 @@
 
 Date: 2026-07-20
 Target: `base`
-Reviewed range: `origin/base..65e54b784f423d7943892e6cfd660b02741ba6e9`
+Original reviewed range: `origin/base..65e54b784f423d7943892e6cfd660b02741ba6e9`
+Post-review remediation SHA: `7a1eec0e64791ac2189d4c58396f1b681a87ded2`
 Release intent: v3.0.2 for OTTO and LOOP24
 
 ## Verdict
 
-**READY FOR MAINTAINER REVIEW — zero Critical, High, Medium, or Low open
-findings.**
+**READY FOR MAINTAINER REVIEW — zero Critical or High findings; all three
+independently reported Mediums are remediated.**
 
 The review was restarted after each security remediation rather than treating
-the original findings as waived. The final clean pass found no remaining
-security, correctness, or merge-blocking issue. Nothing was pushed, merged,
-tagged, released, or written to `main`, `base`, a brand branch, or a release
-branch.
+the original findings as waived. A subsequent independent five-reviewer pass
+found three Mediums, ten Lows, and seven informational notes. The Mediums were
+reproduced and fixed in separate TDD commits; the Lows remain accepted or
+deferred and are preserved in the independent report and backlog. Nothing was
+pushed, merged, tagged, released, or written to `main`, `base`, a brand branch,
+or a release branch.
 
 ## Scope and method
 
@@ -109,6 +112,38 @@ outside this feature's threat model.
 - Verification: the four-case regression at
   `tests/plugins/workflow/test_showcase_catalog.py:314-355` passes.
 
+### IR-M1 — execution-environment incompatibility suppressed the bundle (resolved)
+
+- Independent severity: Medium; latent with the shipped sidecars.
+- Reproduction: an integrity-valid copied bundle with only `approval-gate`
+  changed to `isolated_backend_required` returned zero showcase rows.
+- Remediation: `c7e3a03ae` separates the digest-authenticated risk summary
+  from the display compatibility report. Read-only loading projects a blocking
+  `execution_environment_unavailable` finding on only the affected scenario;
+  CLI and API execution preflight remain strict.
+- Verification: the real catalog returns all five showcase rows with only the
+  altered scenario incompatible, while the paired CLI run still fails closed.
+
+### IR-M2 — missing `run_support` crashed the renderer (resolved)
+
+- Independent severity: Medium.
+- Reproduction: catalog, View, and Review each threw while rendering an
+  old-backend response without `run_support`.
+- Remediation: `60949ffc8` makes the client compatibility field optional,
+  preserves View, and disables every Run entry point unless support is
+  explicitly true. All four locales explain the backend-version mismatch.
+- Verification: three surface-specific regressions pass and TypeScript
+  compilation succeeds.
+
+### IR-M3 — typed showcase refusals rendered as input failures (resolved)
+
+- Independent severity: Medium.
+- Reproduction: CLI-only, bundle-verification, and invalid-source admission
+  codes all displayed the generic input rejection.
+- Remediation: `7a1eec0e6` maps each code to distinct localized, non-retrying
+  guidance without exposing raw server detail.
+- Verification: four table-driven typed-refusal cases pass.
+
 ## Final STRIDE review
 
 | Category | Result | Evidence |
@@ -117,7 +152,7 @@ outside this feature's threat model.
 | Tampering | Closed | Catalog, package tree, path/symlink safety, exact authenticated parse bytes, package/risk digest re-derivation, sealed resource budget, and immutable snapshot digest are checked before persistence (`plugins/workflow/showcase.py:133-251,404-489`; `plugins/workflow/api_admission.py:171-250`). |
 | Repudiation | Closed | Durable metadata separates `trigger=desktop` from `showcase_provenance=verified_bundled` and records bundle/risk digests (`plugins/workflow/api_admission.py:257-280`). Existing trigger-source digest goldens stayed byte-stable. |
 | Information disclosure | Closed | Showcase list/detail reuse the catalog qualification and complete projection redactor; definition secrets/paths and hostile Mermaid labels remain redacted. The real middleware E2E asserts `[REDACTED]` (`tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py:89-98`). |
-| Denial of service | Closed | Showcase verification has per-file, aggregate-byte, file-count, and incremental traversal bounds; cache hits are keyed by authenticated bundle digest plus tree signature. Showcase bytes do not consume the user-row truncation allowance (`plugins/workflow/catalog_api.py:550-638`). |
+| Denial of service | Closed for the feature boundary | Showcase verification has per-file, aggregate-byte, file-count, and incremental traversal bounds; cache hits are keyed by authenticated bundle digest plus tree signature. Cold showcase verification is intentionally charged to the shared 16 MiB request budget, and five showcase rows reserve five of the 500 catalog slots (`plugins/workflow/catalog_api.py:550-638`). |
 | Elevation of privilege | Closed | Verified bundles bypass user trust actions only after bundled provenance verification. API admission independently enforces background eligibility, compatibility, preflight, coordinator health, and immutable snapshot identity before `start_run` (`plugins/workflow/api_admission.py:160-283`). |
 
 ## Required invariants
@@ -127,8 +162,9 @@ outside this feature's threat model.
   typed verification failure. It never becomes an “incompatible” row.
 - **Compatibility is scenario-local.** With MCP unavailable,
   `ai-extensions` remains visible and honestly incompatible while the other
-  four showcase rows remain visible. CLI execution and API admission still
-  reject an incompatible scenario.
+  four showcase rows remain visible. An integrity-valid scenario requiring an
+  unavailable isolated backend is likewise the only incompatible row. CLI
+  execution and API admission still reject either incompatible scenario.
 - **Visibility is read-only.** List/detail require read authority and tests
   prove byte-identical run and trust stores before/after. View remains enabled
   for an incompatible or run-disabled verified row.
@@ -171,6 +207,24 @@ then the brand gate with
 `TESTED_BRAND_SHA=65e54b784f423d7943892e6cfd660b02741ba6e9`.
 Both rehearsal worktrees were removed.
 
+After the independent-review remediations, the full gate was rerun on exact
+code SHA `7a1eec0e64791ac2189d4c58396f1b681a87ded2`:
+
+- full base Python gate: **775 passed, 1 skipped in 65.07s** — the prior 773/1
+  plus the two execution-environment direction tests;
+- installed-distribution integration: **1 passed in 4.48s**;
+- Desktop merge selection: **90 passed across 11 files in 2.21s** — the prior
+  84 plus three missing-`run_support` cases and three additional typed-refusal
+  table cases; and
+- gate marker:
+  `TESTED_BASE_SHA=7a1eec0e64791ac2189d4c58396f1b681a87ded2`.
+
+Fresh detached rehearsals for both OTTO and LOOP24 at the same SHA each ran
+`--write`, reported **8/8 emitters OK** under `--check`, and passed the brand
+gate with
+`TESTED_BRAND_SHA=7a1eec0e64791ac2189d4c58396f1b681a87ded2`.
+Both temporary worktrees were removed without creating or updating refs.
+
 The real Electron UAT was completed before the two filesystem-verification
 remediations and is recorded in the verification document. It exercised the
 actual renderer, authenticated backend, coordinator, approval action, and
@@ -192,12 +246,21 @@ does not misstate the Electron session as rerun at the final SHA.
   confirmation-token UX.
 - Rich Desktop inputs remain deferred; `laptop-diagnostic` is honestly
   CLI-only.
+- The independent report's ten Low and seven informational findings remain
+  part of the review record. They concern pre-existing coordinator exception
+  handling, legacy name-only source selection, omission observability, bounded
+  budget/cache tradeoffs, test-count strictness and matrix placement, future
+  disable-copy/compatibility UX, no-budget CLI read-once hardening, and minor
+  efficiency/documentation details. None changes the shipped bundle's trust or
+  execution direction.
 
 ## Completion assessment
 
-The final clean review found no Critical, High, Medium, or Low finding. The
+The independent review found zero Critical and zero High findings. Its three
+Mediums are resolved and regression-tested; ten Lows and seven informational
+notes remain explicitly recorded rather than being described as absent. The
 digest-verification boundary, visibility/execution distinction, auth and
 redaction invariants, background-only admission, exact source identity,
 idempotency, gate membership, installed distribution, paired-brand rehearsal,
-and 2-of-5 run policy are all evidence-backed. The branch is ready for the
+and 2-of-5 run policy are evidence-backed. The branch is ready for the
 maintainer's review against `base`.
