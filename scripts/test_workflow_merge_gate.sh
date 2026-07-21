@@ -67,6 +67,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_catalog_api.py \
       tests/plugins/workflow/test_workflow_detail_api.py \
       tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py \
+      tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py \
       tests/plugins/workflow/test_showcase_catalog.py \
       tests/plugins/workflow/test_showcase_distribution_e2e.py \
       tests/plugins/workflow/test_portable_compatibility_e2e.py \
@@ -96,6 +97,8 @@ if [[ "$PHASE" == "base" ]]; then
       src/components/activity-board/activity-board.performance.test.tsx \
       src/components/assistant-ui/embeds/workflow-topology.test.tsx \
       src/app/workflows/adapter.test.ts \
+      src/app/workflows/catalog-run-policy.test.ts \
+      src/app/workflows/index.test.tsx \
       src/app/workflows/review-run-dialog.test.tsx \
       src/app/workflows/view-workflow-dialog.test.tsx \
       src/app/workflows/workflow-operations.e2e.test.tsx \
@@ -126,7 +129,10 @@ if [[ "${WORKFLOW_MERGE_GATE_FAST:-0}" != "1" ]]; then
   node scripts/brand/generate.mjs "$BRAND" --check
   "$PYTHON_BIN" - <<'PY'
 from plugins.workflow.showcase import load_showcase_catalog
-assert len(load_showcase_catalog()) == 4
+catalog = load_showcase_catalog()
+assert "approval-gate" in catalog
+assert all(item.package_digest for item in catalog.values())
+assert all(item.verified_bundled_provenance for item in catalog.values())
 PY
 fi
 echo "TESTED_BRAND_SHA=$(git rev-parse HEAD)"

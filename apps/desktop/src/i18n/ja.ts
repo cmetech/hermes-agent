@@ -1636,10 +1636,13 @@ export const ja = defineLocale({
     workflowColumnActions: '操作',
     workflowTrusted: '信頼済み',
     workflowUntrusted: '未信頼',
+    workflowVerifiedBundle: '検証済みバンドル',
+    workflowIncompatible: '非互換',
     workflowNoInputs: '入力なし',
     workflowInputCount: count => `${count} 件の入力`,
     workflowSourceProfile: 'プロファイル',
     workflowSourceProject: 'プロジェクト',
+    workflowSourceBundled: 'バンドル済みショーケース',
     workflowView: '表示',
     workflowViewTitle: workflow => `${workflow} を表示`,
     workflowViewDescription: 'ワークフローを変更・開始せずに確認します。',
@@ -1659,6 +1662,10 @@ export const ja = defineLocale({
     workflowRun: '実行',
     workflowRunUnavailable: '実行できません',
     workflowRunUnsupportedInputs: 'このワークフローには未対応の入力フィールドがあるため実行できません。',
+    workflowRunShowcaseFromCli: 'このバンドル済みショーケースは CLI から実行してください。',
+    workflowRunShowcaseVerificationFailed: 'バンドル済みショーケースを検証できなかったため、開始しませんでした。',
+    workflowRunSupportUnavailable:
+      'Hermes バックエンドがこのワークフローカタログのバージョンに対応するまで、実行できません。',
     workflowRunUntrusted: 'このワークフローは信頼性の検証に失敗したため実行できません。',
     workflowReviewRunTitle: workflow => `${workflow} を確認して実行`,
     workflowReviewRunDescription: '実行前に信頼性、リスク、入力内容を確認してください。',
@@ -1673,6 +1680,8 @@ export const ja = defineLocale({
     workflowRunStarted: '開始しました',
     workflowRunAlreadyRunning: 'すでに実行中です — その実行を表示します',
     workflowRunConflict: 'この実行リクエストの作成後に入力が変更されました。確認画面を閉じて再試行してください。',
+    workflowRunCatalogSourceInvalid:
+      'このワークフローのソースは利用できなくなりました。確認画面を閉じて、もう一度選択してください。',
     workflowRunCoordinatorUnavailable:
       'バックグラウンドコーディネーターが動作していません。しばらくしてから再試行してください。',
     workflowRunIncompatible: 'このワークフローは現在の Hermes ランタイムと互換性がないため開始できません。',

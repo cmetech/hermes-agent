@@ -107,6 +107,29 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     assert isinstance(envelope["result"], list)
     assert home.is_dir()
 
+    showcase_probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from plugins.workflow.showcase import "
+                "load_verified_showcase_package; "
+                "from plugins.workflow.trust import WorkflowResourceReadBudget; "
+                "record=load_verified_showcase_package("
+                "'approval-gate', read_budget=WorkflowResourceReadBudget("
+                "max_file_bytes=1048576, max_total_bytes=8388608, max_files=512)); "
+                "print(record.scenario.id, record.scenario.verified_bundled_provenance)"
+            ),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert showcase_probe.returncode == 0, showcase_probe.stderr
+    assert showcase_probe.stdout.strip() == "approval-gate True"
+
     fixture = (
         REPO_ROOT
         / "tests"

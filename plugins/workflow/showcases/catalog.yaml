@@ -1,10 +1,28 @@
 schema_version: 1
-bundle_version: "2.0.0"
+bundle_version: "2.1.0"
 scenarios:
+  - id: approval-gate
+    display_name: Approval Gate Tour
+    purpose: Demonstrate a durable operator approval from Desktop Attention.
+    bundle_version: "2.1.0"
+    package_version: "1"
+    workflow_path: packages/approval-gate/workflows/approval-gate.yaml
+    interaction_mode: guided
+    offline: true
+    requires_ai: false
+    requires_network: false
+    safety_class: synthetic-read-only
+    supported_platforms: [linux, macos, windows]
+    expected_checkpoints: [approval]
+    expected_terminal_outcomes: [paused, succeeded]
+    expected_artifacts: []
+    capability_claims: [operator-approval]
+    limits: {wall_seconds: 60, max_parallel_nodes: 1, max_descendants: 1}
+    cleanup_ownership: immutable-run-metadata
   - id: laptop-diagnostic
     display_name: Laptop Diagnostic Tour
     purpose: Demonstrate an offline workflow using sanitized fictional laptop evidence.
-    bundle_version: "2.0.0"
+    bundle_version: "2.1.0"
     package_version: "1"
     workflow_path: packages/laptop-diagnostic/workflows/laptop-diagnostic.yaml
     interaction_mode: guided
@@ -22,7 +40,7 @@ scenarios:
   - id: resilience
     display_name: Controlled Resilience Lab
     purpose: Demonstrate bounded retry, timeout, cancellation, and process cleanup.
-    bundle_version: "2.0.0"
+    bundle_version: "2.1.0"
     package_version: "1"
     workflow_path: packages/resilience/workflows/resilience.yaml
     interaction_mode: guided
@@ -40,7 +58,7 @@ scenarios:
   - id: ai-extensions
     display_name: Optional AI and Extensions Tour
     purpose: Demonstrate explicitly authorized AI, skill, hook, inline-agent, and local MCP scope.
-    bundle_version: "2.0.0"
+    bundle_version: "2.1.0"
     package_version: "1"
     workflow_path: packages/ai-extensions/workflows/ai-extensions.yaml
     interaction_mode: consent
@@ -58,7 +76,7 @@ scenarios:
   - id: scheduling
     display_name: Optional Scheduling Tour
     purpose: Create one explicitly confirmed Hermes repeat=1 cron delivery.
-    bundle_version: "2.0.0"
+    bundle_version: "2.1.0"
     package_version: "1"
     workflow_path: packages/scheduling/workflows/scheduled-check.yaml
     interaction_mode: schedule

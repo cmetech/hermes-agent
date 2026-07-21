@@ -259,6 +259,7 @@ upstream_changes:
   - apps/desktop/src/i18n/en.ts
   - apps/desktop/src/i18n/ja.ts
   - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/types/hermes.ts
   - apps/desktop/src/i18n/zh-hant.ts
   owned_symbols:
   - WORKFLOWS_ROUTE
@@ -859,7 +860,6 @@ upstream_changes:
   - apps/desktop/src/lib/hermes-api.ts
   - apps/desktop/src/lib/hermes-api.test.ts
   - apps/desktop/src/types/hermes.ts
-  - tests/test_desktop_workflow_test_gate.py
   owned_symbols:
   - hermes:api:structured
   - apiStructured
@@ -1176,4 +1176,497 @@ upstream_changes:
   removal_condition: Remove when upstream provides equivalent operator docs,
     reproducible Desktop approval and topology-omission fixtures, and a complete
     independently reproducible verification record for the same feature.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-desktop-run-phase1
+  change_class: workflow-design
+  owner: workflow-orchestration
+  files:
+  - docs/superpowers/specs/2026-07-20-workflow-showcase-desktop-run-design.md
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  owned_symbols:
+  - workflow showcase Desktop run v3.0.2 security design
+  - workflow showcase Desktop run v3.0.2 TDD implementation plan
+  tests:
+  - scripts/test_workflow_merge_gate.sh
+  expected_commit_subject: 'docs(workflow): design bundled Desktop showcase runs'
+  upstream_candidate: true
+  merge_guidance: Preserve the approved source-aware catalog identity,
+    rootless digest-verified showcase loader, read-only no-repair HTTP path,
+    background-only admission, server-derived trigger provenance, bundled
+    trust semantics, server-enforced consent-sensitive CLI-only run support,
+    additive parameterless approval showcase, strict TDD task boundaries, and
+    full verification/review completion bar when
+    implementing the plan. Stop for renewed design approval if any of these
+    boundaries resists clean reuse.
+  removal_condition: Remove after this design and plan are superseded by an
+    equivalent implemented and independently verified upstream feature.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-desktop-run-approved-amendments
+  change_class: workflow-design
+  owner: workflow-orchestration
+  files:
+  - docs/backlog/v3.0.2-workflow-showcase-desktop-run.md
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  - docs/superpowers/specs/2026-07-20-workflow-showcase-desktop-run-design.md
+  owned_symbols:
+  - process-lifetime verified showcase bundle cache design
+  - two-of-five Desktop showcase coverage contract
+  - v3.0.2 workflow showcase follow-up backlog
+  tests:
+  - scripts/test_workflow_merge_gate.sh
+  expected_commit_subject: 'docs(workflow): record showcase run amendments'
+  upstream_candidate: true
+  merge_guidance: Preserve full digest verification on cache misses and every
+    admission, signature-based cache invalidation, graceful list degradation,
+    stable showcase idempotency, source-exact 404 behavior, and the accepted
+    concurrency-lane contention note. Keep scheduling CLI-only until cron
+    creation is part of a separately designed background operation, and keep
+    AI extensions CLI-only until consent and wrapper/package architecture are
+    independently reviewed.
+  removal_condition: Remove when upstream implements equivalent verified
+    showcase caching and Desktop admission while carrying or resolving every
+    recorded follow-up.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-desktop-approval-package
+  change_class: workflow-showcase
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/showcase.py
+  - plugins/workflow/showcases/catalog.yaml
+  - plugins/workflow/showcases/digests.json
+  - plugins/workflow/showcases/packages/approval-gate/workflows/approval-gate.hermes.yaml
+  - plugins/workflow/showcases/packages/approval-gate/workflows/approval-gate.yaml
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_showcase_evidence.py
+  owned_symbols:
+  - approval-gate bundled showcase package
+  - operator-approval capability claim
+  - invariant-based showcase bundle gate
+  tests:
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_showcase_evidence.py
+  expected_commit_subject: 'feat(workflow): add bundled approval gate showcase'
+  upstream_candidate: true
+  merge_guidance: Preserve the no-input, offline, non-AI single approval node,
+    its digest registration, durable interaction_approved evidence, and
+    relation-based catalog/brand assertions. Do not weaken laptop-diagnostic or
+    repurpose its richer approval/rework tour.
+  removal_condition: Remove when upstream ships an equivalent digest-verified
+    parameterless approval showcase with durable evidence reporting.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-bounded-verification
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  - docs/superpowers/specs/2026-07-20-workflow-showcase-desktop-run-design.md
+  - plugins/workflow/showcase.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_showcase_ai_e2e.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  owned_symbols:
+  - VerifiedShowcasePackage
+  - load_verified_showcase_package
+  - load_verified_showcase_packages
+  - showcase_background_api_eligible
+  - bounded verified showcase cache and tree signature
+  - visibility-permissive execution-strict compatibility deviation
+  tests:
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_showcase_ai_e2e.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  expected_commit_subject: 'fix(workflow): bound verified showcase loading'
+  upstream_candidate: true
+  merge_guidance: Preserve rootless bundled loading, no-repair HTTP semantics,
+    strict atomic bundle integrity, bounded digest reads, signature-invalidated
+    process caching, coalesced misses, and fresh admission re-verification.
+    Environment incompatibility must remain a per-scenario projection concern,
+    while CLI execution and API admission remain compatibility-strict.
+  removal_condition: Remove when upstream has an equivalent bounded cached
+    authenticated showcase loader with the same integrity/compatibility split.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-catalog-projection
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - docs/superpowers/specs/2026-07-20-workflow-showcase-desktop-run-design.md
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  owned_symbols:
+  - CatalogSource
+  - CatalogTrustState
+  - CatalogRunSupport
+  - workflow_catalog_run_support
+  - source-aware workflow catalog detail
+  - verified showcase catalog projection
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  - tests/plugins/workflow/test_catalog_cli.py
+  expected_commit_subject: 'feat(workflow): list verified bundled showcases'
+  upstream_candidate: true
+  merge_guidance: Preserve source-and-scenario-ID catalog identity, user
+    project-over-profile precedence, rootless digest-verified showcase loading,
+    atomic bundle-integrity omission, per-scenario compatibility visibility,
+    verified-bundle trust, shared server-derived run support, no-repair
+    read-only HTTP behavior, and source-exact detail targeting. Never let an
+    incompatible scenario suppress its verified siblings or let an omitted
+    source silently select a showcase.
+  removal_condition: Remove when upstream exposes equivalent source-aware,
+    honestly compatible verified showcase list and detail APIs.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-api-admission
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  owned_symbols:
+  - StartRunRequest.catalog_source
+  - start_api_run showcase branch
+  - verified bundled showcase run metadata
+  tests:
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_provenance.py
+  expected_commit_subject: 'feat(workflow): admit verified showcases in background'
+  upstream_candidate: true
+  merge_guidance: Preserve fresh rootless bundle verification on every
+    showcase admission, shared run-support derivation, strict compatibility and
+    execution preflight, digest/risk/snapshot equality, coordinator gating,
+    server-derived API/Desktop provenance, stable idempotency, showcase-only
+    metadata, and background-only execution. A caller-provided path, trust
+    boolean, scenario record, or provenance claim must never establish bundled
+    trust.
+  removal_condition: Remove when upstream admits authenticated bundled
+    showcases through an equivalent fail-closed background API path.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-showcase-source-identity
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/detail-query.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - apps/desktop/src/lib/hermes-api.ts
+  - apps/desktop/src/types/hermes.ts
+  owned_symbols:
+  - WorkflowCatalogSource
+  - WorkflowTrustState
+  - WorkflowRunSupport
+  - StartWorkflowRunRequest.catalogSource
+  - source-aware workflow detail query key
+  tests:
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  expected_commit_subject: 'feat(desktop): preserve workflow catalog source identity'
+  upstream_candidate: true
+  merge_guidance: Preserve catalog source in the encoded detail query, React
+    Query cache identity, modal transitions, cancellation, and POST body. Keep
+    the captured request profile and one modal-lifetime idempotency UUID
+    independent from mutable ambient profile state; catalog source targets a
+    row and never claims trigger provenance.
+  removal_condition: Remove when upstream carries exact source identity from
+    catalog selection through detail caching and background admission.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-showcase-catalog-ui
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/package.json
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/catalog-run-policy.ts
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - apps/desktop/src/i18n/zh.ts
+  - scripts/test_workflow_merge_gate.sh
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - workflowTrustAllowsRun
+  - bundled showcase source and verified bundle trust badges
+  - authoritative showcase Run support presentation
+  - honest per-scenario compatibility badge
+  tests:
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(desktop): surface verified bundled workflows'
+  upstream_candidate: true
+  merge_guidance: Preserve one shared trust predicate, server-authoritative
+    run_support decisions, distinct source/trust badges, source-exact View and
+    Review targeting, accessible disabled-run explanations, and all-locale
+    parity. Verified bundles may run without user trust-store mutation only
+    when the server declares them supported.
+  removal_condition: Remove when upstream Desktop presents and runs verified
+    bundled showcases with equivalent source identity and fail-closed policy.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-desktop-real-middleware-e2e
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - bundled showcase Desktop real-middleware contract
+  - native showcase admission matrix membership
+  tests:
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'test(workflow): prove bundled Desktop admission end to end'
+  upstream_candidate: true
+  merge_guidance: Preserve the authenticated real middleware proof across
+    catalog, source-exact detail, background-only admission, verified-bundle
+    metadata, server-derived Desktop provenance, and board visibility. List and
+    detail must remain byte-read-only for the store and trust store.
+  removal_condition: Remove when upstream has equivalent real-middleware
+    coverage in both the focused fork gate and native three-OS CI matrix.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-desktop-run-verification
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-verification.md
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
+  - tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py
+  - tests/test_desktop_workflow_test_gate.py
+  - website/docs/user-guide/features/workflows.md
+  owned_symbols:
+  - v3.0.2 bundled showcase user guidance
+  - bundled Desktop approval Electron UAT
+  - gate baseline reconciliation
+  - paired-brand materialization rehearsal
+  tests:
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
+  - tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py
+  - tests/test_desktop_workflow_test_gate.py
+  expected_commit_subject: 'docs(workflow): verify bundled Desktop showcase runs'
+  upstream_candidate: true
+  merge_guidance: Preserve honest 2-of-5 Desktop coverage, bundle trust and
+    collision guidance, invariant-based catalog tests, exact gate arithmetic,
+    real Electron approval UAT, and write-then-check paired-brand rehearsal.
+  removal_condition: Remove when upstream ships equivalent bundled Desktop
+    workflow documentation, UAT, and release-gate evidence.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-verified-byte-remediation
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-verification.md
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  - plugins/workflow/schema.py
+  - plugins/workflow/showcase.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  owned_symbols:
+  - load_workflow_snapshot
+  - authenticated showcase package parsing
+  - incrementally bounded showcase tree enumeration
+  tests:
+  - tests/plugins/workflow/test_schema.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
+  expected_commit_subject: 'fix(workflow): bind showcase parsing to verified bytes'
+  upstream_candidate: true
+  merge_guidance: Preserve byte identity between showcase digest authentication,
+    definition and sidecar parsing, risk calculation, and immutable admission
+    snapshots. Directory enumeration must stop at the configured entry bound
+    before complete traversal or materialization and must not follow symlinks.
+  removal_condition: Remove when upstream parses bundled showcase packages only
+    from authenticated byte snapshots and enforces tree-entry bounds during
+    enumeration rather than afterward.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-package-ancestor-symlink-remediation
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-verification.md
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  - plugins/workflow/showcase.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  owned_symbols:
+  - showcase ancestor-component symlink refusal
+  - showcase scan-root symlink refusal
+  tests:
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_showcase_distribution_e2e.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
+  expected_commit_subject: 'fix(workflow): reject showcase ancestor symlinks'
+  upstream_candidate: true
+  merge_guidance: Preserve early, uniform symlink rejection for every lexical
+    component from the authenticated bundle root through a selected package and
+    workflow. CLI and rootless verified loading must enforce the same rule.
+  removal_condition: Remove when upstream rejects package-ancestor and scan-root
+    symlinks before digesting or parsing any showcase workflow.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-desktop-run-adversarial-review
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-adversarial-review.md
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-verification.md
+  owned_symbols:
+  - v3.0.2 bundled Desktop showcase final adversarial review
+  - resolved verified-byte, enumeration-bound, and ancestor-symlink findings
+  - exact-SHA base and paired-brand completion evidence
+  tests:
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  expected_commit_subject: 'docs(workflow): record bundled Desktop showcase review'
+  upstream_candidate: true
+  merge_guidance: Preserve the original review together with the historical RED
+    reproductions and exact-SHA verification evidence. Reconcile it with the
+    later independent review and do not erase the resolved TOCTOU,
+    eager-enumeration, or ancestor-symlink findings when replaying the security
+    boundary upstream.
+  removal_condition: Remove when upstream carries equivalent final adversarial
+    evidence for verified bundled Desktop workflow visibility and admission.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-execution-environment-projection
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/showcase.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  owned_symbols:
+  - VerifiedShowcasePackage.compatibility
+  - _verified_distribution_assessment
+  - scenario-local execution-environment compatibility projection
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  expected_commit_subject: 'fix(workflow): isolate showcase environment incompatibility'
+  upstream_candidate: true
+  merge_guidance: Keep bundle integrity failures atomic while projecting an
+    unavailable isolated execution environment as a blocking incompatibility
+    on only the affected showcase. CLI and API execution must retain strict
+    preflight enforcement, and admission risk digests must remain derived from
+    the authenticated package rather than the display-only finding.
+  removal_condition: Remove when upstream distinguishes per-scenario execution
+    environment availability from bundled-distribution integrity during
+    read-only catalog projection.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-run-support-version-skew
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/types/hermes.ts
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  owned_symbols:
+  - optional WorkflowDefinition.run_support compatibility contract
+  - fail-closed missing-run-support catalog, View, and Review behavior
+  - workflowRunSupportUnavailable locale copy
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  expected_commit_subject: 'fix(desktop): fail closed on missing workflow run support'
+  upstream_candidate: true
+  merge_guidance: Preserve compatibility with an older backend that omits
+    run_support. View must remain usable, while every Run entry point stays
+    disabled unless authoritative support is explicitly true and explains the
+    backend-version mismatch without crashing the renderer.
+  removal_condition: Remove when every supported Desktop/backend pairing has a
+    negotiated workflow catalog schema that makes missing run support
+    impossible before rendering.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-showcase-admission-errors
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - apps/desktop/src/i18n/zh.ts
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  owned_symbols:
+  - typed showcase admission error presentation
+  - workflowRunShowcaseVerificationFailed locale copy
+  - workflowRunCatalogSourceInvalid locale copy
+  tests:
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  expected_commit_subject: 'fix(desktop): explain bundled workflow admission refusals'
+  upstream_candidate: true
+  merge_guidance: Preserve distinct non-retrying presentation for CLI-only
+    showcase policy, failed bundle verification, and invalid catalog source.
+    Never collapse these authoritative refusal codes into input validation or
+    expose raw server error detail.
+  removal_condition: Remove when upstream Desktop maps equivalent typed
+    workflow admission failures to honest localized operator guidance.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-independent-review-reconciliation
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - docs/backlog/v3.0.2-workflow-showcase-desktop-run.md
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-adversarial-review.md
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-independent-adversarial-review.md
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-verification.md
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  owned_symbols:
+  - independent five-reviewer adversarial report
+  - three-Medium remediation disposition
+  - acknowledged Low and informational finding backlog
+  - post-review exact-SHA base and paired-brand evidence
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  expected_commit_subject: 'docs(workflow): reconcile independent showcase review'
+  upstream_candidate: true
+  merge_guidance: Preserve the independent finding register verbatim alongside
+    the remediation disposition. Do not restore the superseded claim of zero
+    open findings or the incorrect assertion that showcase verification and
+    rows consume none of the shared catalog budgets.
+  removal_condition: Remove when upstream carries equivalent independent
+    adversarial evidence, Medium-finding remediations, and explicit lower-
+    severity follow-up disposition.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

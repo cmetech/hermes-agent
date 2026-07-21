@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 import asyncio
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 import sys
 from pathlib import Path
+import shutil
 import threading
 import time
 from types import SimpleNamespace
@@ -24,12 +26,18 @@ from plugins.workflow.api_admission import (
     ApiAdmissionError,
     start_api_run,
 )
-from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.compat import (
+    CompatibilityFinding,
+    CompatibilityLevel,
+    CompatibilityReport,
+    assess_compatibility,
+)
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
+import plugins.workflow.showcase as showcase_module
 from plugins.workflow.showcase import run_showcase
 from plugins.workflow.trust import (
     WorkflowResourceReadBudget,
@@ -129,6 +137,16 @@ def _healthy_coordinator(store):
         lease_seconds=60,
     )
     assert acquired.is_leader
+
+
+@contextmanager
+def _test_bundle_path(root: Path):
+    yield root.resolve()
+
+
+def _assert_no_admission_residue(store: RunStore) -> None:
+    assert list(store.runs_root.rglob("run.json")) == []
+    assert list(store.staging_root.iterdir()) == []
 
 
 class _LoopRunner:
@@ -256,6 +274,310 @@ def test_post_runs_authenticated_session_middleware_records_desktop_source(
     assert run["provenance"]["assurance"] == "verified_adapter"
     assert run["provenance"]["actor_id"] == scope
     assert run["provenance"]["source_instance"] == "api:session:test"
+
+
+def test_post_runs_admits_verified_showcase_in_background_and_joins_stably(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    session = SimpleNamespace(
+        provider="test",
+        org_id="org",
+        user_id="desktop-user",
+    )
+    scope = "dashboard:test:org:desktop-user"
+    module = _module()
+    client = TestClient(_app(module.router, session=session))
+    monkeypatch.setattr(
+        RunScheduler,
+        "advance",
+        lambda *_args, **_kwargs: pytest.fail("request path executed a workflow"),
+    )
+    body = {
+        "workflow": "approval-gate",
+        "catalog_source": "showcase",
+        "values": {},
+        "idempotency_key": "showcase-stable-request",
+        "concurrency_policy": "allow",
+    }
+
+    first = client.post(
+        "/api/plugins/workflow/runs",
+        json=body,
+        headers={
+            "X-Hermes-Workflow-Source": "api",
+            "X-Hermes-Principal": "forged-admin",
+        },
+    )
+    duplicate = client.post("/api/plugins/workflow/runs", json=body)
+
+    assert first.status_code == duplicate.status_code == 202
+    first_result = first.json()["result"]
+    duplicate_result = duplicate.json()["result"]
+    assert first_result["admission_disposition"] == "created"
+    assert duplicate_result["admission_disposition"] == "existing"
+    assert first_result["run_id"] == duplicate_result["run_id"]
+    first_status = store.get_run_status(first_result["run_id"], operator_scope=scope)
+    duplicate_status = store.get_run_status(
+        duplicate_result["run_id"], operator_scope=scope
+    )
+    assert first_status["trigger"] == "desktop"
+    assert first_status["execution_mode"] == "background"
+    assert first_status["provenance"]["source"] == "desktop"
+    assert first_status["provenance"]["assurance"] == "verified_adapter"
+    assert first_status["provenance"]["actor_id"] == scope
+    assert "forged" not in str(first_status["provenance"])
+    assert first_status["run_metadata"]["showcase_id"] == "approval-gate"
+    assert first_status["run_metadata"]["showcase_provenance"] == "verified_bundled"
+    assert len(first_status["run_metadata"]["bundle_digest"]) == 64
+    assert len(first_status["run_metadata"]["risk_digest"]) == 64
+    assert first_status["nodes"]["operator-approval"]["state"] == "ready"
+    assert RunStore._start_digest_from_projection(first_status) == (
+        RunStore._start_digest_from_projection(duplicate_status)
+    )
+    assert first_status["run_metadata"]["bundle_digest"] == (
+        duplicate_status["run_metadata"]["bundle_digest"]
+    )
+    assert first_status["run_metadata"]["risk_digest"] == (
+        duplicate_status["run_metadata"]["risk_digest"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("showcase_id", "status_code", "reason"),
+    [
+        ("laptop-diagnostic", 422, "workflow_inputs_unsupported"),
+        ("ai-extensions", 409, "workflow_showcase_cli_required"),
+        ("scheduling", 409, "workflow_showcase_cli_required"),
+    ],
+)
+def test_post_runs_rederives_showcase_run_support_without_persistence(
+    tmp_path, monkeypatch, showcase_id, status_code, reason
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    store = RunStore(home)
+    _healthy_coordinator(store)
+
+    response = TestClient(_app(_router())).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": showcase_id,
+            "catalog_source": "showcase",
+            "values": {},
+            "idempotency_key": f"unsupported-{showcase_id}",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == status_code
+    assert response.json() == {
+        "detail": {"code": reason, "retryable": False}
+    }
+    _assert_no_admission_residue(store)
+
+
+def test_post_runs_rejects_environment_incompatible_showcase_before_persistence(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    store = RunStore(home)
+    _healthy_coordinator(store)
+
+    def incompatible(_package):
+        return CompatibilityReport(
+            level=CompatibilityLevel.UNSUPPORTED,
+            findings=(
+                CompatibilityFinding(
+                    path="environment.optional_service",
+                    level=CompatibilityLevel.UNSUPPORTED,
+                    message="optional service unavailable",
+                    blocking=True,
+                ),
+            ),
+            runnable=False,
+        )
+
+    monkeypatch.setattr(api_admission_module, "assess_compatibility", incompatible)
+    monkeypatch.setattr(showcase_module, "assess_compatibility", incompatible)
+
+    response = TestClient(_app(_router())).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "approval-gate",
+            "catalog_source": "showcase",
+            "values": {},
+            "idempotency_key": "incompatible-showcase",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "workflow_compatibility_blocked",
+            "retryable": False,
+        }
+    }
+    _assert_no_admission_residue(store)
+
+
+def test_post_runs_showcase_enforces_execution_preflight_without_persistence(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    store = RunStore(home)
+    _healthy_coordinator(store)
+
+    def fail_preflight(*_args, **_kwargs):
+        from plugins.workflow.trust import WorkflowTrustError
+
+        raise WorkflowTrustError("showcase preflight rejected")
+
+    monkeypatch.setattr(api_admission_module, "preflight_execution", fail_preflight)
+
+    response = TestClient(_app(_router())).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "approval-gate",
+            "catalog_source": "showcase",
+            "values": {},
+            "idempotency_key": "showcase-preflight",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {"code": "workflow_preflight_failed", "retryable": False}
+    }
+    _assert_no_admission_residue(store)
+
+
+def test_post_runs_showcase_force_reverification_rejects_cached_bundle_mutation(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(copied),
+    )
+    budget = WorkflowResourceReadBudget(
+        max_file_bytes=1024 * 1024,
+        max_total_bytes=8 * 1024 * 1024,
+        max_files=512,
+    )
+    showcase_module.load_verified_showcase_packages(read_budget=budget)
+    workflow = (
+        copied
+        / "packages"
+        / "approval-gate"
+        / "workflows"
+        / "approval-gate.yaml"
+    )
+    workflow.write_text(workflow.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+
+    response = TestClient(_app(_router())).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "approval-gate",
+            "catalog_source": "showcase",
+            "values": {},
+            "idempotency_key": "mutated-showcase",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "workflow_showcase_verification_failed",
+            "retryable": False,
+        }
+    }
+    _assert_no_admission_residue(store)
+
+
+def test_post_runs_showcase_omission_and_unhealthy_coordinator_fail_without_residue(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    store = RunStore(home)
+    client = TestClient(_app(_router()))
+    body = {
+        "workflow": "approval-gate",
+        "values": {},
+        "idempotency_key": "showcase-source-required",
+        "concurrency_policy": "queue",
+    }
+
+    omitted = client.post("/api/plugins/workflow/runs", json=body)
+    unavailable = client.post(
+        "/api/plugins/workflow/runs",
+        json={**body, "catalog_source": "showcase", "idempotency_key": "unhealthy"},
+    )
+
+    assert omitted.status_code == 404
+    assert omitted.json()["detail"]["code"] == "workflow_not_found"
+    assert unavailable.status_code == 503
+    assert unavailable.json()["detail"]["code"] == "coordinator_unavailable"
+    _assert_no_admission_residue(store)
+
+
+def test_post_runs_same_name_user_and_showcase_target_exact_sources(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, workflow_writer, name="approval-gate")
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    client = TestClient(_app(_router()))
+    base = {
+        "workflow": "approval-gate",
+        "values": {},
+        "concurrency_policy": "allow",
+    }
+
+    user = client.post(
+        "/api/plugins/workflow/runs",
+        json={**base, "idempotency_key": "colliding-user"},
+    )
+    showcase = client.post(
+        "/api/plugins/workflow/runs",
+        json={
+            **base,
+            "catalog_source": "showcase",
+            "idempotency_key": "colliding-showcase",
+        },
+    )
+
+    assert user.status_code == showcase.status_code == 202
+    user_status = store.get_run_status(user.json()["result"]["run_id"])
+    showcase_status = store.get_run_status(showcase.json()["result"]["run_id"])
+    assert user_status["run_metadata"] == {}
+    assert showcase_status["run_metadata"]["showcase_id"] == "approval-gate"
+    assert user_status["concurrency_key"] == "approval-gate"
+    assert showcase_status["concurrency_key"] == "showcase:approval-gate"
 
 
 def test_api_admission_authority_preserves_legacy_positional_return_route() -> None:
@@ -824,7 +1146,11 @@ def test_catalog_detail_and_admission_agree_after_cross_entry_resource_reads(
 
     assert catalog.status_code == 200
     assert catalog.json()["truncated"] is False
-    assert [item["name"] for item in catalog.json()["items"]] == [
+    assert [
+        item["name"]
+        for item in catalog.json()["items"]
+        if item.get("source") != "showcase"
+    ] == [
         "cross-entry-alpha",
         "cross-entry-beta",
     ]
