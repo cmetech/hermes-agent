@@ -27,15 +27,21 @@ def test_desktop_default_test_covers_workflow_renderer_and_platform_contracts() 
     ]
 
 
-def test_task5_workflow_docs_do_not_promise_the_unmounted_desktop_trigger() -> None:
+def test_workflow_docs_describe_bundled_showcase_desktop_policy() -> None:
     docs = (
         Path(__file__).parents[1]
         / "website/docs/user-guide/features/workflows.md"
     ).read_text(encoding="utf-8")
 
-    assert re.search(r"Desktop catalog[^.]*discovery only", docs, re.IGNORECASE)
-    assert re.search(r"Review & Run[^.]*Task 6 trigger flow", docs, re.IGNORECASE)
-    assert "Use the Desktop **Run** action" not in docs
+    assert "Bundled showcase" in docs
+    assert "Verified bundle" in docs
+    assert re.search(
+        r"approval-gate[^.]*Attention[^.]*Approve", docs, re.IGNORECASE
+    )
+    assert re.search(r"laptop-diagnostic[^.]*CLI", docs, re.IGNORECASE)
+    assert re.search(r"ai-extensions[^.]*CLI", docs, re.IGNORECASE)
+    assert re.search(r"scheduling[^.]*CLI", docs, re.IGNORECASE)
+    assert "trust the bundled showcase" not in docs.lower()
     assert re.search(
         r"Approval and rejection[^.]*input require an expected state version",
         docs,

@@ -57,6 +57,7 @@ def _catalog_package(
     hermes_home: Path,
     workdir: Path,
     user_home: Path,
+    catalog_source: Literal["project", "profile"] | None = None,
 ):
     del user_home  # Catalog locations are project/profile scoped in Desktop v1.
     from plugins.workflow.catalog_api import (
@@ -71,6 +72,7 @@ def _catalog_package(
             workflow_name,
             hermes_home=hermes_home,
             workdir=workdir,
+            catalog_source=catalog_source,
         )
     except WorkflowCatalogCapacityError as exc:
         raise ApiAdmissionError(
@@ -95,6 +97,7 @@ def start_api_run(
     idempotency_key: str,
     concurrency_policy: Literal["queue", "allow", "forbid"],
     authority: ApiAdmissionAuthority,
+    catalog_source: Literal["project", "profile", "showcase"] | None = None,
 ) -> dict[str, object]:
     """Admit one trusted catalog workflow without executing any workflow node."""
     home = Path(hermes_home).resolve()
@@ -106,21 +109,12 @@ def start_api_run(
         principal=authority.principal,
         return_route=authority.return_route,
     )
-    package = _catalog_package(
-        workflow_name,
-        hermes_home=home,
-        workdir=Path(workdir).resolve(),
-        user_home=Path(user_home).resolve(),
-    )
-    if package is None:
-        raise ApiAdmissionError("workflow_not_found", status_code=404)
-
-    compatibility = assess_compatibility(package)
     from plugins.workflow.catalog_api import (
         CATALOG_MAX_RESOURCE_FILE_BYTES,
         CATALOG_MAX_RESOURCE_FILES,
         CATALOG_MAX_RESOURCE_TOTAL_BYTES,
         CATALOG_MAX_TRUST_STORE_BYTES,
+        workflow_catalog_run_support,
     )
 
     resource_budget = WorkflowResourceReadBudget(
@@ -128,6 +122,53 @@ def start_api_run(
         max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
         max_files=CATALOG_MAX_RESOURCE_FILES,
     )
+    verified_showcase = None
+    if catalog_source == "showcase":
+        from plugins.workflow.showcase import (
+            ShowcaseCatalogError,
+            load_verified_showcase_package,
+        )
+
+        try:
+            verified_showcase = load_verified_showcase_package(
+                workflow_name,
+                read_budget=resource_budget,
+                force_reverify=True,
+            )
+        except WorkflowResourceCapacityError as exc:
+            raise ApiAdmissionError(
+                "workflow_catalog_capacity", status_code=503, retryable=True
+            ) from exc
+        except (ShowcaseCatalogError, OSError, UnicodeError, ValueError) as exc:
+            raise ApiAdmissionError(
+                "workflow_showcase_verification_failed", status_code=409
+            ) from exc
+        package = verified_showcase.package
+    else:
+        if catalog_source not in {None, "project", "profile"}:
+            raise ApiAdmissionError("workflow_catalog_source_invalid", status_code=422)
+        package = _catalog_package(
+            workflow_name,
+            hermes_home=home,
+            workdir=Path(workdir).resolve(),
+            user_home=Path(user_home).resolve(),
+            catalog_source=catalog_source,
+        )
+        if package is None:
+            raise ApiAdmissionError("workflow_not_found", status_code=404)
+
+    run_support = workflow_catalog_run_support(
+        package,
+        showcase_scenario=(
+            verified_showcase.scenario if verified_showcase is not None else None
+        ),
+    )
+    if not run_support["supported"]:
+        if run_support["reason"] == "unsupported_inputs":
+            raise ApiAdmissionError("workflow_inputs_unsupported", status_code=422)
+        raise ApiAdmissionError("workflow_showcase_cli_required", status_code=409)
+
+    compatibility = assess_compatibility(package)
     try:
         package_digest = compute_package_digest(
             package, read_budget=resource_budget
@@ -143,20 +184,30 @@ def start_api_run(
         raise ApiAdmissionError("workflow_invalid_definition", status_code=422) from exc
     if package_digest.sha256 != risk.package_digest:
         raise ApiAdmissionError("workflow_package_changed", status_code=409)
+    if verified_showcase is not None and (
+        package_digest.sha256 != verified_showcase.risk.package_digest
+        or risk.risk_digest != verified_showcase.risk.risk_digest
+    ):
+        raise ApiAdmissionError(
+            "workflow_showcase_verification_failed", status_code=409
+        )
     resource_budget.seal()
 
-    trust_store = WorkflowTrustStore(home)
-    trust_snapshot = trust_store.snapshot_read_only(
-        max_bytes=CATALOG_MAX_TRUST_STORE_BYTES
-    )
-    trusted = (
-        trust_store.check_snapshot(
-            trust_snapshot,
-            risk.package_digest,
-            risk_digest=risk.risk_digest,
+    if verified_showcase is None:
+        trust_store = WorkflowTrustStore(home)
+        trust_snapshot = trust_store.snapshot_read_only(
+            max_bytes=CATALOG_MAX_TRUST_STORE_BYTES
         )
-        == "trusted"
-    )
+        trusted = (
+            trust_store.check_snapshot(
+                trust_snapshot,
+                risk.package_digest,
+                risk_digest=risk.risk_digest,
+            )
+            == "trusted"
+        )
+    else:
+        trusted = True
     if not trusted:
         raise ApiAdmissionError("workflow_trust_required", status_code=403)
     if not compatibility.runnable:
@@ -197,6 +248,21 @@ def start_api_run(
     if prepared.definition_digest != risk.package_digest:
         shutil.rmtree(prepared.staging_directory, ignore_errors=True)
         raise ApiAdmissionError("workflow_package_changed", status_code=409)
+    if verified_showcase is None:
+        run_metadata = None
+        concurrency_key = str(
+            package.sidecar.get("concurrency_key") or package.definition.name
+        )
+    else:
+        run_metadata = {
+            "showcase_id": verified_showcase.scenario.id,
+            "showcase_version": verified_showcase.scenario.package_version,
+            "bundle_digest": verified_showcase.bundle_digest,
+            "risk_digest": risk.risk_digest,
+            "showcase_provenance": "verified_bundled",
+        }
+        concurrency_key = f"showcase:{verified_showcase.scenario.id}"
+
     admitted = store.start_run(
         RunAdmissionRequest(
             workflow_name=package.definition.name,
@@ -206,12 +272,11 @@ def start_api_run(
             trigger_source=authority.trigger_source,
             idempotency_key=idempotency_key,
             idempotency_namespace=authority.namespace,
-            concurrency_key=str(
-                package.sidecar.get("concurrency_key") or package.definition.name
-            ),
+            concurrency_key=concurrency_key,
             concurrency_policy=concurrency_policy,
             execution_mode="background",
             operator_scope=authority.operator_scope,
+            run_metadata=run_metadata,
             provenance=provenance,
         ),
         immutable_snapshot=prepared,

@@ -27,6 +27,13 @@ def test_archon_shape_and_installed_offline_showcases_need_no_yaml_rewrite(
     assert package.definition.name == "portable-contract"
     assert report.runnable
     assert [node.node_type for node in package.definition.nodes] == ["bash", "script", "approval", "cancel"]
-    assert len(load_showcase_catalog()) == 4
+    showcase_catalog = load_showcase_catalog()
+    assert {"approval-gate", "laptop-diagnostic", "resilience", "scheduling"} <= set(
+        showcase_catalog
+    )
+    assert all(
+        showcase_catalog[name].verified_bundled_provenance
+        for name in ("approval-gate", "laptop-diagnostic", "resilience")
+    )
     offline = run_showcase("resilience", hermes_home=tmp_path / "home", symptom="retry")
     assert offline["status"] == "succeeded"

@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from plugins.workflow.showcase import preflight_showcase, run_showcase
+import pytest
+
+from plugins.workflow.showcase import (
+    ShowcaseCatalogError,
+    preflight_showcase,
+    run_showcase,
+)
 
 
 def test_ai_tour_skips_cleanly_without_explicit_digest_bound_consent(tmp_path) -> None:
@@ -21,3 +27,17 @@ def test_ai_preflight_lists_bounded_extensions_without_connecting(tmp_path) -> N
     assert result["local_mcp_servers"] == ["mcp/echo.yaml"]
     assert result["inline_agent_limit"] == 1
     assert result["wall_seconds"] <= 600
+
+
+def test_cli_run_still_rejects_environment_incompatible_showcase(tmp_path) -> None:
+    preflight = preflight_showcase("ai-extensions", hermes_home=tmp_path)
+
+    with pytest.raises(
+        ShowcaseCatalogError,
+        match="not runnable under ordinary compatibility policy",
+    ):
+        run_showcase(
+            "ai-extensions",
+            hermes_home=tmp_path,
+            confirmation_token=preflight["confirmation_token"],
+        )
