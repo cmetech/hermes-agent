@@ -146,6 +146,8 @@ def _tree_entries(
     root: Path,
     read_budget: WorkflowResourceReadBudget | None = None,
 ) -> tuple[Path, ...]:
+    if root.is_symlink():
+        raise ShowcaseCatalogError(f"showcase bundle symlink is forbidden: {root}")
     entries: list[Path] = []
     pending = [root]
     while pending:
@@ -225,9 +227,12 @@ def _contained(root: Path, relative: str) -> Path:
     path = Path(relative)
     if path.is_absolute() or ".." in path.parts:
         raise ShowcaseCatalogError(f"showcase path escapes bundle: {relative}")
+    ancestor = root
+    for part in path.parts:
+        ancestor /= part
+        if ancestor.is_symlink():
+            raise ShowcaseCatalogError(f"showcase path is a symlink: {relative}")
     candidate = root / path
-    if candidate.is_symlink():
-        raise ShowcaseCatalogError(f"showcase path is a symlink: {relative}")
     try:
         candidate.resolve(strict=True).relative_to(root.resolve(strict=True))
     except (OSError, ValueError) as exc:

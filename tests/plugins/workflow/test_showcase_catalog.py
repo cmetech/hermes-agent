@@ -311,6 +311,48 @@ def test_tree_entry_budget_stops_before_unbounded_rglob_materialization(
     assert scanned == 4
 
 
+@pytest.mark.parametrize("ancestor", ["package", "packages"])
+@pytest.mark.parametrize("loader", ["cli", "verified"])
+def test_showcase_loaders_reject_symlinked_package_ancestors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ancestor: str,
+    loader: str,
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+    original = (
+        copied / "packages" / "approval-gate"
+        if ancestor == "package"
+        else copied / "packages"
+    )
+    target = (
+        copied / "packages" / "approval-gate-target"
+        if ancestor == "package"
+        else copied / "packages-target"
+    )
+    original.rename(target)
+    original.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ShowcaseCatalogError, match="symlink"):
+        if loader == "cli":
+            load_showcase_catalog(copied)
+        else:
+            @contextmanager
+            def installed_bundle(_explicit=None):
+                yield copied
+
+            monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+            showcase_module._clear_verified_showcase_cache_for_tests()
+            showcase_module.load_verified_showcase_packages(
+                read_budget=WorkflowResourceReadBudget(
+                    max_file_bytes=1024 * 1024,
+                    max_total_bytes=8 * 1024 * 1024,
+                    max_files=512,
+                )
+            )
+
+
 def test_bounded_catalog_refuses_oversized_tampering(tmp_path: Path) -> None:
     copied = tmp_path / "showcases"
     shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)

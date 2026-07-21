@@ -32,6 +32,7 @@ or publication was introduced.
 | 7 — real middleware | `dee1904f6` | Structural membership failed because the prospective E2E was absent from both gates. | The unmocked middleware E2E passed and its membership test pinned the focused gate and native matrix. |
 | 8 — docs/UAT | this document's commit | The docs gate failed because bundled source/trust, exact CLI-only coverage, and the approval walkthrough were absent. The first full gate also found two stale v3.0.1 assertions. | Docs gate passed; stale exact-list and four-showcase count assertions became behavioral user-row and verified-package invariants; full gates and real Electron UAT passed. |
 | 8.5 — adversarial remediation | remediation commit | A transient parser-reopen test accepted definition/sidecar state that differed from authenticated bytes, and an instrumented overlong tree proved the entry bound ran after eager enumeration. | Parsing now consumes the authenticated byte snapshot and incremental non-following enumeration stops at the configured entry bound; the focused schema/showcase/admission/E2E selection passed 109 tests. |
+| 8.6 — symlink remediation | remediation commit | Four package/`packages` ancestor cases showed CLI acceptance or late generic verified rejection rather than uniform symlink refusal. | Both shared loaders now reject every selected-path symlink component before digest/parse; 86 focused CLI/distribution/admission/E2E tests passed. |
 
 The stale test updates removed no behavior. The renamed “four showcases” test
 now proves named verified packages rather than freezing a count, and the
@@ -167,6 +168,17 @@ The remediation-focused schema/showcase/admission/real-middleware selection
 also passed **109 tests across 4 files in 33.8s**. No test was removed or
 rewritten to reduce coverage.
 
+After Task 8.6, the full base gate was repeated on the working tree based at
+`2a51f157d6a75bbf35f256158eab90f64b32b1be`:
+
+- Python: **773 passed, 1 skipped in 60.95s** — exactly the prior 769/1 plus
+  four CLI/verified package-ancestor symlink cases;
+- installed-distribution integration: **1 passed in 3.85s**;
+- Desktop merge selection: **84 passed across 11 files in 2.03s**.
+
+No selected behavior test was removed; the focused eight-file showcase CLI,
+distribution, admission, and real-middleware selection passed **86 tests**.
+
 ## Paired-brand rehearsal
 
 Two temporary detached worktrees were created at the tested feature SHA. For
@@ -199,6 +211,10 @@ branch ref was created or updated.
 - The first adversarial review found a verified-byte/parser TOCTOU gap and a
   post-materialization tree-entry bound. Task 8.5 reproduced both with RED
   tests and corrected them before restarting the completion review.
+- The post-8.5 review found that in-bundle package-ancestor symlinks were
+  rejected late by Desktop verification but accepted by the CLI catalog
+  loader. Task 8.6 made early symlink refusal uniform without loosening either
+  path.
 - `concurrency_key = "showcase:<id>"` shares the user-authored concurrency-key
   namespace. Deliberate collision can cause contention only, not source
   confusion or incorrect execution; this remains accepted awareness.

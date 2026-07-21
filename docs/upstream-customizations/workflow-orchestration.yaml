@@ -1497,3 +1497,27 @@ upstream_changes:
     from authenticated byte snapshots and enforces tree-entry bounds during
     enumeration rather than afterward.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-package-ancestor-symlink-remediation
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-verification.md
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  - plugins/workflow/showcase.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  owned_symbols:
+  - showcase ancestor-component symlink refusal
+  - showcase scan-root symlink refusal
+  tests:
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_showcase_distribution_e2e.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
+  expected_commit_subject: 'fix(workflow): reject showcase ancestor symlinks'
+  upstream_candidate: true
+  merge_guidance: Preserve early, uniform symlink rejection for every lexical
+    component from the authenticated bundle root through a selected package and
+    workflow. CLI and rootless verified loading must enforce the same rule.
+  removal_condition: Remove when upstream rejects package-ancestor and scan-root
+    symlinks before digesting or parsing any showcase workflow.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

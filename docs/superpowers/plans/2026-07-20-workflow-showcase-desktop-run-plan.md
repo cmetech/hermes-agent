@@ -900,6 +900,60 @@ Task 9 review from that exact tree.
 
 ---
 
+### Task 8.6: Make package-ancestor symlink refusal uniform
+
+**Plan deviation:** The post-8.5 fresh review found that the budgeted Desktop
+loader failed closed on an in-bundle package-ancestor symlink, but the shared
+unbudgeted CLI catalog loader accepted the same tree. This Medium finding does
+not bypass Desktop admission, yet it contradicts the shared symlink-safety
+contract and therefore receives its own red/green remediation commit before a
+second Task 9 restart.
+
+**Files:**
+
+- Modify: `plugins/workflow/showcase.py`
+- Modify: `tests/plugins/workflow/test_showcase_catalog.py`
+- Modify: `docs/reviews/2026-07-20-workflow-showcase-desktop-run-verification.md`
+- Modify: `docs/upstream-customizations/workflow-orchestration.yaml`
+
+**Interfaces:**
+
+- `_contained(...)` rejects any symlink component from the bundle root through
+  the selected workflow, not only a symlink at the final path.
+- `_tree_entries(...)` also rejects a symlink scan root defensively.
+- Gate: `test_showcase_catalog.py` is merge-gate/native-matrix selected; the
+  focused CLI/verified/admission E2Es pin non-regression.
+- Ledger: add `workflow-showcase-package-ancestor-symlink-remediation`.
+
+- [x] **Step 1: Write and observe RED tests**
+
+For both a symlinked `packages/` directory and a symlinked scenario package,
+assert that the CLI catalog loader and rootless verified loader reject with a
+symlink safety error. All four parameter cases failed: CLI accepted both and
+the verified loader rejected only later with a cache-miss reason.
+
+- [x] **Step 2: Implement and focus-verify**
+
+Reject each lexical path component before resolution and reject a symlinked
+tree root before enumeration. Keep in-bundle regular directories and existing
+CLI behavior byte-equivalent. The four regression cases pass, and 86 tests
+across the showcase CLI, distribution, admission, and real middleware paths
+pass.
+
+- [x] **Step 3: Full gate, commit, brands, and review restart**
+
+```bash
+PYTHON_BIN=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/test_workflow_merge_gate.sh --phase base
+/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/check_upstream_customizations.py --manifest docs/upstream-customizations/workflow-orchestration.yaml
+git diff --check
+git commit -m "fix(workflow): reject showcase ancestor symlinks"
+```
+
+Repeat Task 8's detached OTTO and LOOP24 `--write` → `--check` → brand-gate
+sequence at the new remediation SHA, then restart Task 9 from that exact tree.
+
+---
+
 ### Task 9: Perform the fresh adversarial review
 
 **Files:**
