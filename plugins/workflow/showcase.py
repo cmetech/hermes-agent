@@ -27,11 +27,12 @@ from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.machine_contract import operator_command_contract
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.models import WorkflowPackage
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import (
     WorkflowRiskSummary,
     WorkflowResourceCapacityError,
+    WorkflowResourceCacheMissError,
     WorkflowResourceReadBudget,
     WorkflowTrustError,
     build_risk_summary,
@@ -145,12 +146,24 @@ def _tree_entries(
     root: Path,
     read_budget: WorkflowResourceReadBudget | None = None,
 ) -> tuple[Path, ...]:
-    entries = tuple(sorted(root.rglob("*")))
-    if read_budget is not None and len(entries) > read_budget.max_files:
-        raise WorkflowResourceCapacityError(
-            "showcase package entry limit exceeded"
-        )
-    return entries
+    entries: list[Path] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as children:
+            for child in children:
+                if (
+                    read_budget is not None
+                    and len(entries) >= read_budget.max_files
+                ):
+                    raise WorkflowResourceCapacityError(
+                        "showcase package entry limit exceeded"
+                    )
+                path = Path(child.path)
+                entries.append(path)
+                if child.is_dir(follow_symlinks=False):
+                    pending.append(path)
+    return tuple(sorted(entries))
 
 
 def _tree_digest(
@@ -363,7 +376,10 @@ def load_showcase_catalog(
                 or any(token in text for token in _FORBIDDEN_TEXT)
             ):
                 raise ShowcaseCatalogError(f"showcase safety contract rejected: {scenario_id}")
-            load_workflow(workflow)
+            _load_workflow_from_verified_bytes(
+                workflow,
+                read_budget=read_budget,
+            )
             result[scenario_id] = ShowcaseScenario(
                 **{key: str(item[key]) for key in ("id", "display_name", "purpose", "bundle_version", "package_version", "workflow_path", "interaction_mode", "safety_class", "cleanup_ownership")},
                 offline=bool(item["offline"]), requires_ai=bool(item["requires_ai"]),
@@ -380,22 +396,58 @@ def load_showcase_catalog(
         return dict(sorted(result.items()))
 
 
+def _load_workflow_from_verified_bytes(
+    workflow: Path,
+    *,
+    read_budget: WorkflowResourceReadBudget | None,
+    source: str = "explicit",
+    precedence: int = 0,
+) -> WorkflowPackage:
+    if read_budget is None:
+        return load_workflow(
+            workflow,
+            source=source,
+            precedence=precedence,
+        )
+    try:
+        workflow_bytes = read_budget.read_cached(workflow)
+    except WorkflowResourceCacheMissError as exc:
+        raise ShowcaseCatalogError(
+            f"verified workflow bytes are unavailable: {workflow.name}"
+        ) from exc
+    sidecar = workflow.with_name(f"{workflow.stem}.hermes.yaml")
+    try:
+        sidecar_bytes = read_budget.read_cached(sidecar)
+    except WorkflowResourceCacheMissError:
+        sidecar_bytes = None
+    return load_workflow_snapshot(
+        workflow,
+        workflow_bytes=workflow_bytes,
+        sidecar_bytes=sidecar_bytes,
+        source=source,
+        precedence=precedence,
+    )
+
+
 def _scenario_package(
     scenario: ShowcaseScenario,
     *,
     source: str = "explicit",
     precedence: int = 0,
     bundle_root: Path | None = None,
+    read_budget: WorkflowResourceReadBudget | None = None,
 ) -> WorkflowPackage:
     if bundle_root is not None:
-        return load_workflow(
+        return _load_workflow_from_verified_bytes(
             _contained(bundle_root, scenario.workflow_path),
+            read_budget=read_budget,
             source=source,
             precedence=precedence,
         )
     with _bundle_path() as root:
-        return load_workflow(
+        return _load_workflow_from_verified_bytes(
             _contained(root, scenario.workflow_path),
+            read_budget=read_budget,
             source=source,
             precedence=precedence,
         )
@@ -491,6 +543,7 @@ def load_verified_showcase_packages(
                     source="showcase",
                     precedence=3,
                     bundle_root=resolved_root,
+                    read_budget=read_budget,
                 )
                 risk = _verified_distribution_risk(
                     scenario,

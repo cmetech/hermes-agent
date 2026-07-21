@@ -1,8 +1,8 @@
 # Workflow Showcase Desktop Run Verification
 
-Date: 2026-07-20  
-Target: `base`  
-Feature branch: `feat/workflow-showcase-desktop-run`  
+Date: 2026-07-20
+Target: `base`
+Feature branch: `feat/workflow-showcase-desktop-run`
 Release intent: v3.0.2 for both OTTO and LOOP24
 
 ## Result
@@ -31,6 +31,7 @@ or publication was introduced.
 | 6 — Desktop policy | `603a58b2b` | The policy module was missing and verified bundles rendered as untrusted Project rows; four UI suites failed at the new assertions. | 69 focused tests, then 117 workflow UI tests, passed with one shared trust predicate, authoritative `run_support`, all-locale labels, incompatibility badge, and accessible CLI guidance. |
 | 7 — real middleware | `dee1904f6` | Structural membership failed because the prospective E2E was absent from both gates. | The unmocked middleware E2E passed and its membership test pinned the focused gate and native matrix. |
 | 8 — docs/UAT | this document's commit | The docs gate failed because bundled source/trust, exact CLI-only coverage, and the approval walkthrough were absent. The first full gate also found two stale v3.0.1 assertions. | Docs gate passed; stale exact-list and four-showcase count assertions became behavioral user-row and verified-package invariants; full gates and real Electron UAT passed. |
+| 8.5 — adversarial remediation | remediation commit | A transient parser-reopen test accepted definition/sidecar state that differed from authenticated bytes, and an instrumented overlong tree proved the entry bound ran after eager enumeration. | Parsing now consumes the authenticated byte snapshot and incremental non-following enumeration stops at the configured entry bound; the focused schema/showcase/admission/E2E selection passed 109 tests. |
 
 The stale test updates removed no behavior. The renamed “four showcases” test
 now proves named verified packages rather than freezing a count, and the
@@ -50,6 +51,10 @@ the verified approval showcase.
   remained visible.
 - Catalog verification is cached by bundle digest plus a tree signature and
   invalidated by changed bytes. Admission forces fresh verification.
+- Definition and sidecar parsing consume the exact bytes authenticated by the
+  verification budget; they are not reopened between digest verification and
+  risk/snapshot construction. Tree enumeration is bounded while walking, not
+  after full recursive materialization.
 - List/detail byte snapshots proved no mutation of the run store or trust
   store. A verified bundle requires no user trust action and never writes a
   user trust record.
@@ -150,6 +155,18 @@ Additional verification:
 - docs/production-gate contract: **2 passed in 0.3s**;
 - customization ledger validation and `git diff --check`: passed.
 
+After Task 8.5 remediation, the full base gate was repeated on the working
+tree based at `89a21ac2ad734183002a02e2256e219874e05597`:
+
+- Python: **769 passed, 1 skipped in 60.44s** — exactly the prior 767/1 plus
+  the two authenticated-byte/enumeration regression tests;
+- installed-distribution integration: **1 passed in 3.97s**;
+- Desktop merge selection: **84 passed across 11 files in 2.06s**.
+
+The remediation-focused schema/showcase/admission/real-middleware selection
+also passed **109 tests across 4 files in 33.8s**. No test was removed or
+rewritten to reduce coverage.
+
 ## Paired-brand rehearsal
 
 Two temporary detached worktrees were created at the tested feature SHA. For
@@ -179,6 +196,9 @@ branch ref was created or updated.
 - The full gate exposed two stale v3.0.1 change-detector assertions. They were
   converted to relationship/invariant assertions rather than weakening or
   deleting coverage.
+- The first adversarial review found a verified-byte/parser TOCTOU gap and a
+  post-materialization tree-entry bound. Task 8.5 reproduced both with RED
+  tests and corrected them before restarting the completion review.
 - `concurrency_key = "showcase:<id>"` shares the user-authored concurrency-key
   namespace. Deliberate collision can cause contention only, not source
   confusion or incorrect execution; this remains accepted awareness.

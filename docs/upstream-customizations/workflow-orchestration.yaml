@@ -1469,3 +1469,31 @@ upstream_changes:
   removal_condition: Remove when upstream ships equivalent bundled Desktop
     workflow documentation, UAT, and release-gate evidence.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-verified-byte-remediation
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-verification.md
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  - plugins/workflow/schema.py
+  - plugins/workflow/showcase.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  owned_symbols:
+  - load_workflow_snapshot
+  - authenticated showcase package parsing
+  - incrementally bounded showcase tree enumeration
+  tests:
+  - tests/plugins/workflow/test_schema.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
+  expected_commit_subject: 'fix(workflow): bind showcase parsing to verified bytes'
+  upstream_candidate: true
+  merge_guidance: Preserve byte identity between showcase digest authentication,
+    definition and sidecar parsing, risk calculation, and immutable admission
+    snapshots. Directory enumeration must stop at the configured entry bound
+    before complete traversal or materialization and must not follow symlinks.
+  removal_condition: Remove when upstream parses bundled showcase packages only
+    from authenticated byte snapshots and enforces tree-entry bounds during
+    enumeration rather than afterward.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

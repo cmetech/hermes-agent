@@ -185,6 +185,132 @@ def test_verified_loader_coalesces_concurrent_cache_misses(
     assert concurrent_calls == digest_calls
 
 
+def test_verified_loader_parses_only_digest_authenticated_package_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield copied
+
+    original_load_workflow = showcase_module.load_workflow
+
+    def transient_unverified_parse(path, **kwargs):
+        workflow = Path(path)
+        if workflow.name != "approval-gate.yaml":
+            return original_load_workflow(workflow, **kwargs)
+        authenticated = workflow.read_bytes()
+        sidecar = workflow.with_name("approval-gate.hermes.yaml")
+        authenticated_sidecar = sidecar.read_bytes()
+        workflow.write_text(
+            "name: approval-gate\n"
+            "description: TRANSIENT UNVERIFIED\n"
+            "nodes:\n"
+            "  - id: operator-approval\n"
+            "    approval:\n"
+            "      message: changed\n",
+            encoding="utf-8",
+        )
+        sidecar.write_text(
+            "overlap_policy: queue\n"
+            "execution_environment: trusted_local\n"
+            "outward_action_nodes: [operator-approval]\n",
+            encoding="utf-8",
+        )
+        try:
+            return original_load_workflow(workflow, **kwargs)
+        finally:
+            workflow.write_bytes(authenticated)
+            sidecar.write_bytes(authenticated_sidecar)
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+    monkeypatch.setattr(showcase_module, "load_workflow", transient_unverified_parse)
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_tree_signature",
+        lambda *_args, **_kwargs: (("stable-platform-signature",),),
+    )
+    showcase_module._clear_verified_showcase_cache_for_tests()
+
+    verified = showcase_module.load_verified_showcase_packages(
+        read_budget=WorkflowResourceReadBudget(
+            max_file_bytes=1024 * 1024,
+            max_total_bytes=8 * 1024 * 1024,
+            max_files=512,
+        )
+    )
+
+    assert verified["approval-gate"].package.definition.description == (
+        "Pause for explicit operator approval before completing the bundled tour"
+    )
+    assert verified["approval-gate"].package.sidecar["outward_action_nodes"] == ()
+
+
+def test_tree_entry_budget_stops_before_unbounded_rglob_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "package"
+    root.mkdir()
+    entries = []
+    for index in range(10):
+        entry = root / f"{index:02d}.txt"
+        entry.write_text("x", encoding="utf-8")
+        entries.append(entry)
+    yielded = 0
+    scanned = 0
+    original_scandir = showcase_module.os.scandir
+
+    def overlong_rglob(path: Path, _pattern: str):
+        nonlocal yielded
+        assert path == root
+        for entry in entries:
+            yielded += 1
+            if yielded > 4:
+                raise AssertionError("enumerated beyond the bounded prefix")
+            yield entry
+
+    class CountingScandir:
+        def __init__(self, path):
+            self._inner = original_scandir(path)
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal scanned
+            child = next(self._inner)
+            scanned += 1
+            if scanned > 4:
+                raise AssertionError("scanned beyond the bounded prefix")
+            return child
+
+    monkeypatch.setattr(Path, "rglob", overlong_rglob)
+    monkeypatch.setattr(showcase_module.os, "scandir", CountingScandir)
+    budget = WorkflowResourceReadBudget(
+        max_file_bytes=16,
+        max_total_bytes=64,
+        max_files=3,
+    )
+
+    with pytest.raises(
+        WorkflowResourceCapacityError,
+        match="showcase package entry limit exceeded",
+    ):
+        showcase_module._tree_entries(root, budget)
+
+    assert yielded == 0
+    assert scanned == 4
+
+
 def test_bounded_catalog_refuses_oversized_tampering(tmp_path: Path) -> None:
     copied = tmp_path / "showcases"
     shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)

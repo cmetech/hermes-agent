@@ -841,6 +841,65 @@ git commit -m "docs(workflow): verify bundled Desktop showcase runs"
 
 ---
 
+### Task 8.5: Remediate adversarial verified-byte and enumeration findings
+
+**Plan deviation:** The first Task 9 review found two Important security-boundary
+gaps that the original test plan did not model: workflow/sidecar parsing could
+reopen bytes after digest authentication, and tree entry limits were enforced
+after eager `rglob` materialization. Task 9's finding gate requires a separate
+red/green remediation commit and a fresh Task 8/Task 9 cycle.
+
+**Files:**
+
+- Modify: `plugins/workflow/schema.py`
+- Modify: `plugins/workflow/showcase.py`
+- Modify: `tests/plugins/workflow/test_showcase_catalog.py`
+- Modify: `docs/reviews/2026-07-20-workflow-showcase-desktop-run-verification.md`
+- Modify: `docs/upstream-customizations/workflow-orchestration.yaml`
+
+**Interfaces:**
+
+- Produces `load_workflow_snapshot(...)`, which validates caller-authenticated
+  definition/sidecar bytes without reopening them.
+- Replaces eager recursive enumeration with an incremental, non-symlink-
+  following walk that consumes the entry bound before retaining more paths.
+- Gate: `test_showcase_catalog.py` remains in the merge gate and native matrix;
+  `test_schema.py`, admission, and real middleware E2E cover the shared seam.
+- Ledger: add `workflow-showcase-verified-byte-remediation`.
+
+- [x] **Step 1: Write and observe RED tests**
+
+Force valid transient definition and sidecar bytes during the parser reopen
+while holding the metadata signature stable; require the returned package to
+contain only digest-authenticated bytes. Instrument an overlong `rglob`
+iterator and require capacity failure before it can enumerate beyond the
+bounded prefix. Both tests failed on the reviewed implementation for their
+intended reasons.
+
+- [x] **Step 2: Implement the smallest boundary fix**
+
+Parse definition and sidecar state from the resource budget's authenticated
+byte snapshot. Keep source paths and all existing schema validation behavior.
+Walk with `os.scandir(..., follow_symlinks=False)`, stop before retaining entry
+`max_files + 1`, and sort only the bounded collection. Do not weaken digest,
+safety, compatibility, preflight, cache, or CLI behavior.
+
+- [x] **Step 3: Reverify and commit**
+
+```bash
+scripts/run_tests.sh tests/plugins/workflow/test_schema.py tests/plugins/workflow/test_showcase_catalog.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py -q
+PYTHON_BIN=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/test_workflow_merge_gate.sh --phase base
+/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python scripts/check_upstream_customizations.py --manifest docs/upstream-customizations/workflow-orchestration.yaml
+git diff --check
+git commit -m "fix(workflow): bind showcase parsing to verified bytes"
+```
+
+After the commit, repeat Task 8's detached OTTO and LOOP24
+`--write` → `--check` → brand-gate sequence at the remediation SHA, then restart
+Task 9 review from that exact tree.
+
+---
+
 ### Task 9: Perform the fresh adversarial review
 
 **Files:**
