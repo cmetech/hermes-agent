@@ -72,6 +72,18 @@ def _test_bundle_path(root: Path):
     yield root.resolve()
 
 
+def _restamp_showcase_package(root: Path, showcase_id: str) -> None:
+    manifest_path = root / "digests.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["packages"][showcase_id] = showcase_module._tree_digest(
+        root / "packages" / showcase_id
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def test_workflow_catalog_requires_verified_authentication() -> None:
     response = _catalog_get(_module().router)
 
@@ -137,6 +149,63 @@ def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compa
         }
     assert showcase_rows["ai-extensions"]["compatibility"]["runnable"] is False
     assert payload["truncated"] is False
+
+
+def test_workflow_catalog_keeps_isolation_incompatibility_scenario_local(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="ordinary-user-workflow")
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
+    sidecar = (
+        copied
+        / "packages"
+        / "approval-gate"
+        / "workflows"
+        / "approval-gate.hermes.yaml"
+    )
+    sidecar.write_text(
+        sidecar.read_text(encoding="utf-8").replace(
+            "execution_environment: trusted_local",
+            "execution_environment: isolated_backend_required",
+        ),
+        encoding="utf-8",
+    )
+    _restamp_showcase_package(copied, "approval-gate")
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(copied),
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    rows = {
+        item["name"]: item
+        for item in response.json()["items"]
+        if item.get("source") == "showcase"
+    }
+    assert set(rows) == {
+        "ai-extensions",
+        "approval-gate",
+        "laptop-diagnostic",
+        "resilience",
+        "scheduling",
+    }
+    assert rows["approval-gate"]["compatibility"]["runnable"] is False
+    assert rows["approval-gate"]["compatibility"]["findings"] == [
+        {
+            "blocking": True,
+            "code": "execution_environment_unavailable",
+            "level": "unsupported",
+            "message": "workflow requires a configured isolated backend",
+            "path": "sidecar.execution_environment",
+        }
+    ]
 
 
 def test_workflow_catalog_cached_showcase_verification_preserves_user_budget(

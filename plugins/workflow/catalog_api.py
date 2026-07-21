@@ -496,7 +496,11 @@ def _catalog_entry(
     verified_showcase: "VerifiedShowcasePackage | None" = None,
 ) -> CatalogEntry:
     # The CLI show projection is the established body-free catalog contract.
-    compatibility = assess_compatibility(package)
+    compatibility = (
+        verified_showcase.compatibility
+        if verified_showcase is not None
+        else assess_compatibility(package)
+    )
     shown = qualify_workflow_catalog_package(
         package,
         compatibility=compatibility,
@@ -746,7 +750,11 @@ def build_workflow_detail(
                 )
             raise WorkflowDetailNotFoundError(name)
 
-    compatibility = assess_compatibility(package)
+    compatibility = (
+        verified_showcase.compatibility
+        if verified_showcase is not None
+        else assess_compatibility(package)
+    )
     shown = qualify_workflow_catalog_package(
         package,
         compatibility=compatibility,

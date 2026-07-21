@@ -23,7 +23,12 @@ from agent.plugin_agent import PluginAgentRunResult
 from cron.jobs import create_job, list_jobs, use_cron_store
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import _input_requirements, _runtime_config, _scheduler
-from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.compat import (
+    CompatibilityFinding,
+    CompatibilityLevel,
+    CompatibilityReport,
+    assess_compatibility,
+)
 from plugins.workflow.machine_contract import operator_command_contract
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.models import WorkflowPackage
@@ -88,6 +93,7 @@ class VerifiedShowcasePackage:
     scenario: ShowcaseScenario
     package: WorkflowPackage
     risk: WorkflowRiskSummary
+    compatibility: CompatibilityReport
     bundle_digest: str
 
 
@@ -465,6 +471,22 @@ def _verified_distribution_risk(
     *,
     enforce_runnable: bool = True,
 ) -> WorkflowRiskSummary:
+    risk, _compatibility = _verified_distribution_assessment(
+        scenario,
+        package,
+        read_budget,
+        enforce_runnable=enforce_runnable,
+    )
+    return risk
+
+
+def _verified_distribution_assessment(
+    scenario: ShowcaseScenario,
+    package: WorkflowPackage,
+    read_budget: WorkflowResourceReadBudget | None = None,
+    *,
+    enforce_runnable: bool = True,
+) -> tuple[WorkflowRiskSummary, CompatibilityReport]:
     if not scenario.verified_bundled_provenance:
         raise ShowcaseCatalogError(
             "showcase lacks verified bundled distribution provenance"
@@ -489,10 +511,25 @@ def _verified_distribution_risk(
             trusted=scenario.verified_bundled_provenance,
         )
     except WorkflowTrustError as exc:
-        raise ShowcaseCatalogError(
-            f"showcase package failed ordinary execution-risk policy: {exc}"
-        ) from exc
-    return risk
+        if enforce_runnable:
+            raise ShowcaseCatalogError(
+                f"showcase package failed ordinary execution-risk policy: {exc}"
+            ) from exc
+        compatibility = CompatibilityReport(
+            level=CompatibilityLevel.UNSUPPORTED,
+            findings=(
+                *compatibility.findings,
+                CompatibilityFinding(
+                    path="sidecar.execution_environment",
+                    level=CompatibilityLevel.UNSUPPORTED,
+                    message="workflow requires a configured isolated backend",
+                    blocking=True,
+                    code="execution_environment_unavailable",
+                ),
+            ),
+            runnable=False,
+        )
+    return risk, compatibility
 
 
 def showcase_background_api_eligible(scenario: ShowcaseScenario) -> bool:
@@ -550,7 +587,7 @@ def load_verified_showcase_packages(
                     bundle_root=resolved_root,
                     read_budget=read_budget,
                 )
-                risk = _verified_distribution_risk(
+                risk, compatibility = _verified_distribution_assessment(
                     scenario,
                     package,
                     read_budget,
@@ -560,6 +597,7 @@ def load_verified_showcase_packages(
                     scenario=scenario,
                     package=package,
                     risk=risk,
+                    compatibility=compatibility,
                     bundle_digest=bundle_digest,
                 )
 

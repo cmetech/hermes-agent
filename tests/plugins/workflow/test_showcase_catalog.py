@@ -390,6 +390,51 @@ def test_http_style_catalog_verification_never_repairs_checkout(
         load_showcase_catalog(allow_repair=False)
 
 
+def test_cli_run_still_rejects_isolated_backend_showcase_without_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+    sidecar = (
+        copied
+        / "packages"
+        / "approval-gate"
+        / "workflows"
+        / "approval-gate.hermes.yaml"
+    )
+    sidecar.write_text(
+        sidecar.read_text(encoding="utf-8").replace(
+            "execution_environment: trusted_local",
+            "execution_environment: isolated_backend_required",
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = copied / "digests.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["packages"]["approval-gate"] = showcase_module._tree_digest(
+        copied / "packages" / "approval-gate"
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield copied
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+
+    with pytest.raises(
+        ShowcaseCatalogError,
+        match="failed ordinary execution-risk policy",
+    ):
+        showcase_module.run_showcase(
+            "approval-gate",
+            hermes_home=tmp_path / "home",
+        )
+
+
 @pytest.mark.parametrize(
     ("showcase_id", "eligible"),
     [

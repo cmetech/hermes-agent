@@ -1550,3 +1550,30 @@ upstream_changes:
   removal_condition: Remove when upstream carries equivalent final adversarial
     evidence for verified bundled Desktop workflow visibility and admission.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-execution-environment-projection
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/showcase.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  owned_symbols:
+  - VerifiedShowcasePackage.compatibility
+  - _verified_distribution_assessment
+  - scenario-local execution-environment compatibility projection
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  expected_commit_subject: 'fix(workflow): isolate showcase environment incompatibility'
+  upstream_candidate: true
+  merge_guidance: Keep bundle integrity failures atomic while projecting an
+    unavailable isolated execution environment as a blocking incompatibility
+    on only the affected showcase. CLI and API execution must retain strict
+    preflight enforcement, and admission risk digests must remain derived from
+    the authenticated package rather than the display-only finding.
+  removal_condition: Remove when upstream distinguishes per-scenario execution
+    environment availability from bundled-distribution integrity during
+    read-only catalog projection.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

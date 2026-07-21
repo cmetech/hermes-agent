@@ -1011,6 +1011,37 @@ Expected final state: clean local branch; nine planned commits plus explicitly d
 
 ---
 
+### Task 9.1: Keep execution-environment incompatibility scenario-local
+
+**Plan deviation:** The independent review reproduced a latent Medium finding:
+an integrity-valid showcase with `isolated_backend_required` was rejected by
+list-time execution preflight, causing the catalog boundary to omit every
+showcase. This contradicts the approved distinction between atomic bundle
+integrity and scenario-local environment incompatibility.
+
+**Files:**
+
+- Modify: `plugins/workflow/showcase.py`
+- Modify: `plugins/workflow/catalog_api.py`
+- Modify: `tests/plugins/workflow/test_showcase_catalog.py`
+- Modify: `tests/plugins/workflow/test_catalog_api.py`
+- Modify: `docs/upstream-customizations/workflow-orchestration.yaml`
+
+**Gate/matrix:** Both Python test files are selected by the base merge gate and
+native CI matrix. Ledger entry:
+`workflow-showcase-execution-environment-projection`.
+
+- [x] **RED:** Re-stamp an integrity-valid copied bundle after making only
+  `approval-gate` require an isolated backend. The real catalog returned zero
+  showcase rows instead of five with one incompatible row. A paired CLI-run
+  regression already passed, pinning strict execution behavior.
+- [x] **GREEN:** Preserve the digest-authenticated risk summary, project the
+  failed execution-environment preflight as a blocking compatibility finding
+  only when loading for visibility, and feed that report through the existing
+  catalog qualification path. Keep CLI and API execution preflight strict.
+
+---
+
 ## Plan self-review checklist
 
 - Every design requirement has a task owner.
