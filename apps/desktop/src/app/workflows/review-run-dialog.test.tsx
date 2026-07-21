@@ -652,6 +652,22 @@ describe('Review & Run workflow dialog', () => {
     )
   })
 
+  it('fails closed without crashing when an older backend omits detail run support', async () => {
+    preflightHandler = async () => ({ ok: true, value: detail({ run_support: undefined as never }) })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(
+      within(dialog).getByText(
+        'Run is unavailable until the Hermes backend supports this workflow catalog version.'
+      )
+    ).toBeTruthy()
+    expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
+      0
+    )
+  })
+
   it('shows blocking compatibility findings and refuses to POST a non-runnable workflow', async () => {
     preflightHandler = async () => ({
       ok: true,

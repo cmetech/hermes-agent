@@ -104,15 +104,17 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
       ? copy.workflowViewRunLoading
       : !workflowTrustAllowsRun(detail.data.trust_state)
         ? copy.workflowRunUntrusted
-        : !detail.data.run_support.supported
-          ? detail.data.source === 'showcase'
-            ? copy.workflowRunShowcaseFromCli
-            : copy.workflowRunUnsupportedInputs
-          : detail.data.compatibility.runnable !== true
-            ? copy.workflowRunIncompatible
-            : !detail.data.coordinator.healthy
-              ? copy.workflowRunCoordinatorUnavailable
-              : null
+        : !detail.data.run_support
+          ? copy.workflowRunSupportUnavailable
+          : !detail.data.run_support.supported
+            ? detail.data.source === 'showcase'
+              ? copy.workflowRunShowcaseFromCli
+              : copy.workflowRunUnsupportedInputs
+            : detail.data.compatibility.runnable !== true
+              ? copy.workflowRunIncompatible
+              : !detail.data.coordinator.healthy
+                ? copy.workflowRunCoordinatorUnavailable
+                : null
 
   const errorDescription =
     detail.error instanceof WorkflowApiError && detail.error.code === 'workflow_not_found'

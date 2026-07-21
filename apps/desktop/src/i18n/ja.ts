@@ -1663,6 +1663,8 @@ export const ja = defineLocale({
     workflowRunUnavailable: '実行できません',
     workflowRunUnsupportedInputs: 'このワークフローには未対応の入力フィールドがあるため実行できません。',
     workflowRunShowcaseFromCli: 'このバンドル済みショーケースは CLI から実行してください。',
+    workflowRunSupportUnavailable:
+      'Hermes バックエンドがこのワークフローカタログのバージョンに対応するまで、実行できません。',
     workflowRunUntrusted: 'このワークフローは信頼性の検証に失敗したため実行できません。',
     workflowReviewRunTitle: workflow => `${workflow} を確認して実行`,
     workflowReviewRunDescription: '実行前に信頼性、リスク、入力内容を確認してください。',

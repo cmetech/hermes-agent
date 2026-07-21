@@ -149,7 +149,7 @@ export interface WorkflowDefinition {
   inputs: WorkflowDefinitionInput[]
   name: string
   precedence: 1 | 2 | 3
-  run_support: WorkflowRunSupport
+  run_support?: WorkflowRunSupport
   source: WorkflowCatalogSource
   supported_inputs: WorkflowDefinitionInputSupport
   trust_state: WorkflowTrustState

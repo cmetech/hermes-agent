@@ -1722,6 +1722,8 @@ export const en: Translations = {
     workflowRunUnavailable: 'Run unavailable',
     workflowRunUnsupportedInputs: 'Run is unavailable because this workflow uses unsupported input fields.',
     workflowRunShowcaseFromCli: 'Run this bundled showcase from the CLI.',
+    workflowRunSupportUnavailable:
+      'Run is unavailable until the Hermes backend supports this workflow catalog version.',
     workflowRunUntrusted: 'Run is unavailable because this workflow failed trust verification.',
     workflowReviewRunTitle: workflow => `Review & Run ${workflow}`,
     workflowReviewRunDescription: 'Review trust, risk, and inputs before starting this workflow.',

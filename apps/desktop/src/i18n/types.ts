@@ -1426,6 +1426,7 @@ export interface Translations {
     workflowRunUnavailable: string
     workflowRunUnsupportedInputs: string
     workflowRunShowcaseFromCli: string
+    workflowRunSupportUnavailable: string
     workflowRunUntrusted: string
     workflowReviewRunTitle: (workflow: string) => string
     workflowReviewRunDescription: string

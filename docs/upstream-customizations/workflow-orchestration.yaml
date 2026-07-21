@@ -1577,3 +1577,38 @@ upstream_changes:
     environment availability from bundled-distribution integrity during
     read-only catalog projection.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-run-support-version-skew
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/types/hermes.ts
+  - docs/superpowers/plans/2026-07-20-workflow-showcase-desktop-run-plan.md
+  owned_symbols:
+  - optional WorkflowDefinition.run_support compatibility contract
+  - fail-closed missing-run-support catalog, View, and Review behavior
+  - workflowRunSupportUnavailable locale copy
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  expected_commit_subject: 'fix(desktop): fail closed on missing workflow run support'
+  upstream_candidate: true
+  merge_guidance: Preserve compatibility with an older backend that omits
+    run_support. View must remain usable, while every Run entry point stays
+    disabled unless authoritative support is explicitly true and explains the
+    backend-version mismatch without crashing the renderer.
+  removal_condition: Remove when every supported Desktop/backend pairing has a
+    negotiated workflow catalog schema that makes missing run support
+    impossible before rendering.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

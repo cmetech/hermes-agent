@@ -1612,6 +1612,7 @@ export const zhHant = defineLocale({
     workflowRunUnavailable: '無法執行',
     workflowRunUnsupportedInputs: '此工作流程使用不支援的輸入欄位，因此無法執行。',
     workflowRunShowcaseFromCli: '請從 CLI 執行此內建展示。',
+    workflowRunSupportUnavailable: '在 Hermes 後端支援此工作流程目錄版本之前，無法執行。',
     workflowRunUntrusted: '此工作流程未通過信任驗證，因此無法執行。',
     workflowReviewRunTitle: workflow => `檢查並執行 ${workflow}`,
     workflowReviewRunDescription: '啟動工作流程前，請檢查信任、風險與輸入。',

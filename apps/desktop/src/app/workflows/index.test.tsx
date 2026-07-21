@@ -365,6 +365,25 @@ describe('WorkflowsView', () => {
     )
   })
 
+  it('fails closed without crashing when an older backend omits catalog run support', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowDefinitions.mockResolvedValue({
+      items: [definition({ run_support: undefined as never })],
+      truncated: false
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    const row = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row')[1]!
+    expect(within(row).getByRole('button', { name: 'View' })).toBeTruthy()
+    const run = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
+    expect(run.disabled).toBe(true)
+    expect(document.getElementById(run.getAttribute('aria-describedby')!)?.textContent).toBe(
+      'Run is unavailable until the Hermes backend supports this workflow catalog version.'
+    )
+  })
+
   it('renders a typed error row for a corrupt catalog entry without actions', async () => {
     $workflowSelectedRunId.set(null)
     listWorkflowDefinitions.mockResolvedValue({

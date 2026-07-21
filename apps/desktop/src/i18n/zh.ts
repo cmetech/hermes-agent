@@ -1897,6 +1897,7 @@ export const zh: Translations = {
     workflowRunUnavailable: '无法运行',
     workflowRunUnsupportedInputs: '此工作流使用不受支持的输入字段，因此无法运行。',
     workflowRunShowcaseFromCli: '请从 CLI 运行此捆绑展示。',
+    workflowRunSupportUnavailable: '在 Hermes 后端支持此工作流目录版本之前，无法运行。',
     workflowRunUntrusted: '此工作流未通过信任验证，因此无法运行。',
     workflowReviewRunTitle: workflow => `检查并运行 ${workflow}`,
     workflowReviewRunDescription: '启动工作流前，请检查信任、风险和输入。',

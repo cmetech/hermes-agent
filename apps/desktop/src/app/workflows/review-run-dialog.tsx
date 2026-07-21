@@ -428,16 +428,19 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
     !detail ||
     !detail.coordinator.healthy ||
     detail.compatibility.runnable !== true ||
-    !detail.run_support.supported ||
+    detail.run_support?.supported !== true ||
     !workflowTrustAllowsRun(detail.trust_state) ||
     detail.inputs.some(input => input.type === 'enum' && enumValues(detail, input.name).length === 0)
 
+  const runSupport = detail?.run_support
   const runSupportMessage =
-    detail && !detail.run_support.supported
-      ? detail.source === 'showcase'
-        ? copy.workflowRunShowcaseFromCli
-        : copy.workflowRunUnsupportedCommand(workflow.name)
-      : null
+    detail && !runSupport
+      ? copy.workflowRunSupportUnavailable
+      : detail && runSupport?.supported === false
+        ? detail.source === 'showcase'
+          ? copy.workflowRunShowcaseFromCli
+          : copy.workflowRunUnsupportedCommand(workflow.name)
+        : null
 
   const errorMessage =
     error && !(error.kind === 'validation' && error.field)

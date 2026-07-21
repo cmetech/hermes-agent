@@ -59,13 +59,15 @@ function CatalogRow({
   const { t } = useI18n()
   const runReasonId = useId()
 
-  const runDisabledReason = !item.run_support.supported
-    ? item.source === 'showcase'
-      ? t.operations.workflowRunShowcaseFromCli
-      : t.operations.workflowRunUnsupportedInputs
-    : !workflowTrustAllowsRun(item.trust_state)
-      ? t.operations.workflowRunUntrusted
-      : null
+  const runDisabledReason = !item.run_support
+    ? t.operations.workflowRunSupportUnavailable
+    : !item.run_support.supported
+      ? item.source === 'showcase'
+        ? t.operations.workflowRunShowcaseFromCli
+        : t.operations.workflowRunUnsupportedInputs
+      : !workflowTrustAllowsRun(item.trust_state)
+        ? t.operations.workflowRunUntrusted
+        : null
 
   const inputCount = item.inputs.length
 

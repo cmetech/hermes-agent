@@ -377,6 +377,18 @@ describe('workflow View dialog', () => {
     expectDisabledRunReason(dialog, 'Run this bundled showcase from the CLI.')
   })
 
+  it('fails closed without crashing when an older backend omits detail run support', async () => {
+    currentDetail = detail({ run_support: undefined as never })
+    renderView()
+    const dialog = await openView()
+
+    await within(dialog).findByTestId('shared-mermaid-renderer')
+    expectDisabledRunReason(
+      dialog,
+      'Run is unavailable until the Hermes backend supports this workflow catalog version.'
+    )
+  })
+
   it('shows recursively stable redacted JSON read-only, copies it, and never refetches on toggles', async () => {
     renderView()
     const dialog = await openView()

@@ -1042,6 +1042,37 @@ native CI matrix. Ledger entry:
 
 ---
 
+### Task 9.2: Fail closed across old-backend/new-renderer version skew
+
+**Plan deviation:** The independent review identified a Medium renderer crash
+when a supported legacy backend omits the v3.0.1 `run_support` projection. The
+Desktop backend fallback makes this a real compatibility boundary, so the new
+renderer must preserve View and fail Run closed rather than dereference an
+absent field.
+
+**Files:**
+
+- Modify: `apps/desktop/src/types/hermes.ts`
+- Modify: `apps/desktop/src/app/workflows/catalog.tsx`
+- Modify: `apps/desktop/src/app/workflows/view-workflow-dialog.tsx`
+- Modify: `apps/desktop/src/app/workflows/review-run-dialog.tsx`
+- Modify: the three colocated test files
+- Modify: all four locale files and `apps/desktop/src/i18n/types.ts`
+- Modify: `docs/upstream-customizations/workflow-orchestration.yaml`
+
+**Gate/matrix:** Existing catalog, View, and Review test files are selected by
+the Desktop merge gate. Locale completeness is typechecked. Ledger entry:
+`desktop-workflow-run-support-version-skew`.
+
+- [x] **RED:** Each of the three renderer surfaces crashed with
+  `Cannot read properties of undefined (reading 'supported')` when its real
+  response object omitted `run_support`.
+- [x] **GREEN:** Model the field as optional at the client compatibility
+  boundary, disable Run unless support is explicitly true, keep View usable,
+  and show a dedicated backend-version explanation in all four locales.
+
+---
+
 ## Plan self-review checklist
 
 - Every design requirement has a task owner.
