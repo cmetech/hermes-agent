@@ -1521,3 +1521,32 @@ upstream_changes:
   removal_condition: Remove when upstream rejects package-ancestor and scan-root
     symlinks before digesting or parsing any showcase workflow.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-desktop-run-adversarial-review
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-adversarial-review.md
+  - docs/reviews/2026-07-20-workflow-showcase-desktop-run-verification.md
+  owned_symbols:
+  - v3.0.2 bundled Desktop showcase final adversarial review
+  - resolved verified-byte, enumeration-bound, and ancestor-symlink findings
+  - exact-SHA base and paired-brand completion evidence
+  tests:
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  expected_commit_subject: 'docs(workflow): record bundled Desktop showcase review'
+  upstream_candidate: true
+  merge_guidance: Preserve the zero-open-finding final review together with the
+    historical RED reproductions and exact-SHA verification evidence. Do not
+    erase the resolved TOCTOU, eager-enumeration, or ancestor-symlink findings
+    when replaying the security boundary upstream.
+  removal_condition: Remove when upstream carries equivalent final adversarial
+    evidence for verified bundled Desktop workflow visibility and admission.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

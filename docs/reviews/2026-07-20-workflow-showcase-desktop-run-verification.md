@@ -179,6 +179,14 @@ After Task 8.6, the full base gate was repeated on the working tree based at
 No selected behavior test was removed; the focused eight-file showcase CLI,
 distribution, admission, and real-middleware selection passed **86 tests**.
 
+The full base gate was then repeated once more on the exact reviewed Task 8.6
+commit, `65e54b784f423d7943892e6cfd660b02741ba6e9`:
+
+- Python: **773 passed, 1 skipped in 59.77s**;
+- installed-distribution integration: **1 passed in 3.78s**;
+- Desktop merge selection: **84 passed across 11 files in 2.20s**;
+- gate marker: `TESTED_BASE_SHA=65e54b784f423d7943892e6cfd660b02741ba6e9`.
+
 ## Paired-brand rehearsal
 
 Two temporary detached worktrees were created at the tested feature SHA. For
@@ -190,6 +198,14 @@ reported all eight emitters `OK`, and the brand merge gate passed:
 
 Both detached worktrees were removed. No OTTO, LOOP24, base, release, or other
 branch ref was created or updated.
+
+After the final Task 8.6 remediation commit, the complete detached rehearsal
+was repeated at exact SHA
+`65e54b784f423d7943892e6cfd660b02741ba6e9`. For each brand,
+`generate.mjs <brand> --write` materialized the brand, the following `--check`
+reported **8/8 emitters OK**, and the brand gate reported the same exact
+`TESTED_BRAND_SHA`. Both detached worktrees were removed again without
+creating or updating a ref.
 
 ## Plan deviations and accepted notes
 
