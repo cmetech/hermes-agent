@@ -9,7 +9,11 @@ from typing import Mapping
 
 from agent.plugin_agent import PluginAgentRunRequest
 from plugins.workflow.compat import resolve_tool_name
-from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
+from plugins.workflow.executors.base import (
+    NodeExecutionContext,
+    NodeExecutionResult,
+    validated_provider_retry_count,
+)
 from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
 from plugins.workflow.store import ArtifactRef
@@ -208,10 +212,13 @@ class AgentNodeExecutor:
 
         try:
             execution_limits = context.execution_limits
-            granted_provider_attempts = (
-                execution_limits.combined_retries
-                if execution_limits is not None
-                else context.max_provider_attempts
+            granted_provider_attempts = min(
+                context.max_provider_attempts,
+                (
+                    execution_limits.combined_retries
+                    if execution_limits is not None
+                    else context.max_provider_attempts
+                ),
             )
             wall_timeout = (
                 context.deadline_budget.remaining_wall(context.monotonic())
@@ -375,11 +382,12 @@ class AgentNodeExecutor:
             "cache_fingerprint": fingerprint,
             "warnings": warnings,
         }
-        provider_attempts = result.audit.get("provider_attempts")
-        if isinstance(provider_attempts, int) and not isinstance(
-            provider_attempts, bool
-        ):
-            metadata["provider_attempts"] = max(0, provider_attempts)
+        provider_attempts = validated_provider_retry_count(
+            result.audit.get("provider_attempts"),
+            granted_attempts=granted_provider_attempts,
+        )
+        if provider_attempts is not None:
+            metadata["provider_attempts"] = provider_attempts
         if result.status == "paused":
             metadata["pending_interaction"] = dict(result.pending_interaction or {})
             return NodeExecutionResult("paused", metadata=metadata)

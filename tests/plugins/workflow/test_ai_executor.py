@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext
@@ -339,3 +341,35 @@ def test_provider_failure_charges_run_scoped_retry_allowance(tmp_path):
 
     assert result.error_code == "provider_timeout"
     assert result.metadata["provider_attempts"] == 1
+
+
+@pytest.mark.parametrize("reported", [-1, 3, 99, True, "1"])
+def test_malformed_provider_attempt_count_is_charged_conservatively(
+    tmp_path, reported
+) -> None:
+    class MalformedAuditRunner:
+        def run(self, request, **_kwargs):
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="",
+                provider=request.provider or "fake",
+                model=request.model or "fake",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit={
+                    "failure_kind": "provider_timeout",
+                    "provider_attempts": reported,
+                },
+            )
+
+    result = AgentNodeExecutor(MalformedAuditRunner()).execute(
+        _context(
+            tmp_path,
+            _node("malformed-provider-attempts", "work"),
+            execution_limits=RunExecutionLimits(combined_retries=3),
+        )
+    )
+
+    assert result.error_code == "provider_timeout"
+    assert result.metadata["provider_attempts"] == 2

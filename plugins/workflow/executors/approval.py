@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Mapping
 
 from agent.plugin_agent import PluginAgentRunRequest
-from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
+from plugins.workflow.executors.base import (
+    NodeExecutionContext,
+    NodeExecutionResult,
+    validated_provider_retry_count,
+)
 from plugins.workflow.resources import VariableContext
 from plugins.workflow.store import ArtifactRef
 
@@ -120,10 +124,13 @@ class ApprovalExecutor:
                 )
             ),
         )
-        granted_provider_attempts = (
-            execution_limits.combined_retries
-            if execution_limits is not None
-            else context.max_provider_attempts
+        granted_provider_attempts = min(
+            context.max_provider_attempts,
+            (
+                execution_limits.combined_retries
+                if execution_limits is not None
+                else context.max_provider_attempts
+            ),
         )
         request = PluginAgentRunRequest(
             prompt=prompt,
@@ -183,11 +190,12 @@ class ApprovalExecutor:
             return NodeExecutionResult("cancelled", error_code="cancelled")
         if result.status != "completed":
             metadata: dict[str, object] = {"audit": dict(result.audit)}
-            provider_attempts = result.audit.get("provider_attempts")
-            if isinstance(provider_attempts, int) and not isinstance(
-                provider_attempts, bool
-            ):
-                metadata["provider_attempts"] = max(0, provider_attempts)
+            provider_attempts = validated_provider_retry_count(
+                result.audit.get("provider_attempts"),
+                granted_attempts=granted_provider_attempts,
+            )
+            if provider_attempts is not None:
+                metadata["provider_attempts"] = provider_attempts
             else:
                 # The worker did not report its exact provider retry count.
                 # Charge the full grant so workflow retries cannot multiply it.

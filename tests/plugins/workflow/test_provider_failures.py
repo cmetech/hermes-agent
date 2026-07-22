@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import threading
 
 import pytest
@@ -92,6 +93,131 @@ def test_run_combined_retries_bound_provider_and_workflow_attempts(
     assert len(runner.requests) == 1
     assert runner.requests[0].max_api_attempts == 2
     assert result["nodes"]["work"]["retry_consumed"] == 2
+
+
+def test_partial_provider_count_reduces_next_request_grant(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "remaining-budget",
+        name="remaining-budget",
+        nodes=[{
+            "id": "work",
+            "prompt": "work",
+            "retry": {"max_attempts": 5, "delay_ms": 1000},
+        }],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "limits: {combined_retries: 3}\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "remaining-budget-home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="remaining-budget",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+
+    class PartiallyConsumedRunner:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            provider_retries = 1 if len(self.requests) == 1 else 0
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="",
+                provider="fake",
+                model="fake",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit={
+                    "failure_kind": "provider_timeout",
+                    "provider_attempts": provider_retries,
+                },
+            )
+
+    now = datetime(2026, 7, 17, tzinfo=timezone.utc)
+    runner = PartiallyConsumedRunner()
+    scheduler = RunScheduler(
+        store,
+        agent_runner=runner,
+        utcnow=lambda: now,
+        jitter=lambda: 0.5,
+    )
+    assert scheduler.advance(admitted.run_id)["status"] == "waiting_retry"
+    now += timedelta(seconds=1)
+
+    result = scheduler.advance(admitted.run_id)
+
+    assert [request.max_api_attempts for request in runner.requests] == [3, 1]
+    assert result["status"] == "failed"
+    assert result["nodes"]["work"]["retry_consumed"] == 3
+
+
+def test_lower_node_retry_cap_controls_first_provider_grant(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "node-budget",
+        name="node-budget",
+        nodes=[{
+            "id": "work",
+            "prompt": "work",
+            "retry": {"max_attempts": 2, "delay_ms": 1000},
+        }],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "limits: {combined_retries: 5}\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "node-budget-home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="node-budget",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+
+    class SuccessfulRunner:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            return PluginAgentRunResult(
+                final_response="done",
+                session_id="node-budget",
+                provider="fake",
+                model="fake",
+                status="completed",
+                pending_interaction=None,
+                usage={},
+                audit={},
+            )
+
+    runner = SuccessfulRunner()
+    result = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+
+    assert result["status"] == "succeeded"
+    assert runner.requests[0].max_api_attempts == 2
 
 
 def test_host_pressure_refuses_before_worker_allocation(

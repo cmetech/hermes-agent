@@ -68,6 +68,27 @@ class NodeExecutionResult:
     metadata: Mapping[str, object] = field(default_factory=dict)
 
 
+def validated_provider_retry_count(
+    value: object,
+    *,
+    granted_attempts: int,
+) -> int | None:
+    """Return an exact internal retry count only when it fits the grant."""
+    if (
+        isinstance(granted_attempts, bool)
+        or not isinstance(granted_attempts, int)
+        or granted_attempts <= 0
+    ):
+        raise ValueError("granted provider attempts must be a positive integer")
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value < granted_attempts
+    ):
+        return value
+    return None
+
+
 class BoundedProcessOutput:
     """File-backed subprocess output without inherited-pipe reader threads."""
 
@@ -127,4 +148,5 @@ __all__ = [
     "NodeExecutionResult",
     "NodeExecutor",
     "process_tree_active",
+    "validated_provider_retry_count",
 ]

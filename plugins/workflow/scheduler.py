@@ -537,6 +537,23 @@ class RunScheduler:
             float(limits.subprocess_timeout_seconds),
         )
 
+    @staticmethod
+    def _effective_retry_policy(
+        node: WorkflowNode,
+        execution_limits: RunExecutionLimits,
+    ) -> RetryPolicy:
+        policy = RetryPolicy.from_mapping(
+            node.options.get("retry"),
+            default_max_attempts=execution_limits.combined_retries,
+        )
+        return replace(
+            policy,
+            max_attempts=min(
+                policy.max_attempts,
+                execution_limits.combined_retries,
+            ),
+        )
+
     def _heartbeat_journal_reserve(
         self,
         node: WorkflowNode,
@@ -583,6 +600,23 @@ class RunScheduler:
                     )
                     return
                 node_state = dict(projection["nodes"][node.id])
+                retry_policy = self._effective_retry_policy(node, execution_limits)
+                consumed_attempts = max(
+                    0, int(node_state.get("retry_consumed", 0))
+                )
+                remaining_attempts = retry_policy.max_attempts - consumed_attempts
+                if remaining_attempts <= 0:
+                    self._persist_result(
+                        claim,
+                        node,
+                        NodeExecutionResult(
+                            "failed",
+                            error_code="retry_budget_exhausted",
+                            error_message="combined retry budget is exhausted",
+                        ),
+                        execution_limits,
+                    )
+                    return
                 approved_action_digest = self.store.consume_action_grant(claim)
                 node_state.pop("action_grant", None)
                 if approved_action_digest is not None:
@@ -684,7 +718,7 @@ class RunScheduler:
                             deadline_budget=deadline_budget,
                             # Provider and workflow attempts draw from the same
                             # frozen per-run allowance, so the retry layers do not multiply.
-                            max_provider_attempts=execution_limits.combined_retries,
+                            max_provider_attempts=remaining_attempts,
                             cancellation_reason=lambda: self._cancellation_reason(
                                 run_id
                             ),
@@ -777,17 +811,7 @@ class RunScheduler:
                 metadata=result.metadata,
             )
             return
-        policy = RetryPolicy.from_mapping(
-            node.options.get("retry"),
-            default_max_attempts=execution_limits.combined_retries,
-        )
-        policy = replace(
-            policy,
-            max_attempts=min(
-                policy.max_attempts,
-                execution_limits.combined_retries,
-            ),
-        )
+        policy = self._effective_retry_policy(node, execution_limits)
         projection = self.store.load_run(claim.run_id)
         node_state = projection["nodes"][claim.node_id]
         consumed_before = int(node_state.get("retry_consumed", 0))

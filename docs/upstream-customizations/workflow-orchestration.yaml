@@ -1775,10 +1775,13 @@ upstream_changes:
   - NodeExecutionContext.execution_limits
   - RunScheduler._load_run_package
   - RunScheduler._run_execution_limits
+  - RunScheduler._effective_retry_policy
   - RunScheduler._persist_result combined retry cap
+  - NodeExecutionContext.max_provider_attempts remaining-budget grant
   - RunStore.claim_node max_run_workers composition
   - exact PluginAgentRunRequest execution-limit mapping
   - ApprovalExecutor failed provider-attempt accounting
+  - validated_provider_retry_count
   tests:
   - tests/plugins/workflow/test_ai_e2e.py
   - tests/plugins/workflow/test_ai_executor.py
@@ -1789,7 +1792,7 @@ upstream_changes:
   - tests/plugins/workflow/test_retry.py
   - tests/plugins/workflow/test_schema.py
   - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
-  expected_commit_subject: 'fix(workflow): cap combined execution retries'
+  expected_commit_subject: 'fix(workflow): enforce remaining retry budget'
   upstream_candidate: true
   merge_guidance: Preserve one frozen execution-limit record resolved from the
     immutable run snapshot, with element-wise profile tightening at each claim
@@ -1799,6 +1802,9 @@ upstream_changes:
     node retry policies must remain min-capped by the run allowance, and failed
     approval rework must preserve exact provider-attempt accounting or
     conservatively consume the unknown granted remainder before workflow retry.
+    Each later workflow attempt receives only the effective node/run allowance
+    left after durable prior consumption. Accept reported provider retries only
+    as non-boolean integers in the inclusive zero to grant-minus-one range.
   removal_condition: Remove when upstream enforces equivalent immutable per-run
     concurrency, worker, deadline, retry, resource-tree, and termination-grace
     ceilings without resizing or retiming shared coordinator infrastructure.

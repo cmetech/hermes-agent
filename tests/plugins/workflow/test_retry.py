@@ -362,20 +362,20 @@ def test_provider_attempts_are_cumulative_and_unknown_outcome_still_reconciles(
     admitted = _start(store, package)
     now = datetime(2026, 7, 17, tzinfo=timezone.utc)
     calls = 0
+    grants = []
 
     class ProviderRetries:
         def execute(self, context):
             nonlocal calls
             calls += 1
             assert context.execution_limits is not None
-            assert (
-                context.max_provider_attempts
-                == context.execution_limits.combined_retries
-                == 5
-            )
+            assert context.execution_limits.combined_retries == 5
+            grants.append(context.max_provider_attempts)
             code = "provider_timeout" if calls == 1 else "unknown_side_effect"
             return NodeExecutionResult(
-                "failed", error_code=code, metadata={"provider_attempts": 2}
+                "failed",
+                error_code=code,
+                metadata={"provider_attempts": 2 if calls == 1 else 1},
             )
 
     scheduler = RunScheduler(store, utcnow=lambda: now, jitter=lambda: 0.5)
@@ -384,6 +384,7 @@ def test_provider_attempts_are_cumulative_and_unknown_outcome_still_reconciles(
     now += timedelta(seconds=1)
     result = scheduler.advance(admitted.run_id)
     assert result["status"] == "paused"
+    assert grants == [5, 2]
     assert result["nodes"]["work"]["retry_consumed"] == 5
 
 

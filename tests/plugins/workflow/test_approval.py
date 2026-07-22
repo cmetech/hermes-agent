@@ -4,6 +4,8 @@ import argparse
 import json
 import time
 
+import pytest
+
 from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import register_cli
@@ -312,8 +314,13 @@ def test_scheduler_uses_ai_deadline_for_approval_rework(
     assert request.provider_request_timeout_seconds == 7
 
 
-def test_failed_approval_rework_consumes_unknown_provider_attempts(
-    tmp_path, workflow_writer
+@pytest.mark.parametrize(
+    "reported_provider_attempts",
+    [None, -1],
+    ids=["missing", "negative"],
+)
+def test_failed_approval_rework_conservatively_accounts_provider_attempts(
+    tmp_path, workflow_writer, reported_provider_attempts
 ) -> None:
     workflow = workflow_writer(
         tmp_path / "failed-rework",
@@ -340,6 +347,9 @@ def test_failed_approval_rework_consumes_unknown_provider_attempts(
 
         def run(self, request, **_kwargs):
             self.requests.append(request)
+            audit = {"failure_kind": "provider_timeout"}
+            if reported_provider_attempts is not None:
+                audit["provider_attempts"] = reported_provider_attempts
             return PluginAgentRunResult(
                 final_response="",
                 session_id="failed-rework",
@@ -348,7 +358,7 @@ def test_failed_approval_rework_consumes_unknown_provider_attempts(
                 status="failed",
                 pending_interaction=None,
                 usage={},
-                audit={"failure_kind": "provider_timeout"},
+                audit=audit,
             )
 
     runner = FailedReworkRunner()
