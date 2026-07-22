@@ -438,11 +438,16 @@ def _load_workflow_from_verified_bytes(
 ) -> WorkflowPackage:
     if read_budget is None:
         authenticated_snapshot = verified_bytes is not None
-        if not authenticated_snapshot:
+        workflow_key = workflow.absolute()
+        if authenticated_snapshot:
+            try:
+                workflow_bytes = verified_bytes[workflow_key]
+            except KeyError as exc:
+                raise ShowcaseCatalogError(
+                    f"verified workflow bytes are unavailable: {workflow.name}"
+                ) from exc
+        else:
             verified_bytes = {}
-        try:
-            workflow_bytes = verified_bytes[workflow.resolve(strict=True)]
-        except KeyError:
             try:
                 workflow_bytes = _read_verified_bytes(
                     workflow, verified_bytes=verified_bytes
@@ -451,13 +456,18 @@ def _load_workflow_from_verified_bytes(
                 raise ShowcaseCatalogError(
                     f"verified workflow bytes are unavailable: {workflow.name}"
                 ) from exc
-        sidecar = workflow.with_name(f"{workflow.stem}.hermes.yaml")
+        sidecar_key = workflow_key.with_name(f"{workflow.stem}.hermes.yaml")
         if authenticated_snapshot:
-            sidecar_bytes = verified_bytes.get(sidecar.resolve())
+            try:
+                sidecar_bytes = verified_bytes[sidecar_key]
+            except KeyError as exc:
+                raise ShowcaseCatalogError(
+                    f"verified workflow sidecar bytes are unavailable: {workflow.name}"
+                ) from exc
         else:
             try:
                 sidecar_bytes = _read_verified_bytes(
-                    sidecar, verified_bytes=verified_bytes
+                    sidecar_key, verified_bytes=verified_bytes
                 )
             except FileNotFoundError:
                 sidecar_bytes = None

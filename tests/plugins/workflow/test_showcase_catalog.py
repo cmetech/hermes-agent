@@ -424,8 +424,17 @@ def test_no_budget_catalog_parses_digest_authenticated_package_bytes_once(
     copied = tmp_path / "showcases"
     shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
     workflow = copied / "packages/approval-gate/workflows/approval-gate.yaml"
+    sidecar = workflow.with_name("approval-gate.hermes.yaml")
+    replacement_sidecar = tmp_path / "replacement.hermes.yaml"
+    replacement_sidecar.write_text(
+        "overlap_policy: queue\n"
+        "execution_environment: trusted_local\n"
+        "outward_action_nodes: [operator-approval]\n",
+        encoding="utf-8",
+    )
     original_tree_digest = showcase_module._tree_digest
     parsed_descriptions: list[str] = []
+    parsed_outward_action_nodes: list[tuple[str, ...] | None] = []
 
     def mutate_after_authenticated_digest(root, *args, **kwargs):
         digest = original_tree_digest(root, *args, **kwargs)
@@ -439,6 +448,8 @@ def test_no_budget_catalog_parses_digest_authenticated_package_bytes_once(
                 "      message: changed\n",
                 encoding="utf-8",
             )
+            sidecar.unlink()
+            sidecar.symlink_to(replacement_sidecar)
         return digest
 
     original_load_workflow = showcase_module.load_workflow
@@ -448,12 +459,18 @@ def test_no_budget_catalog_parses_digest_authenticated_package_bytes_once(
         package = original_load_workflow(path, **kwargs)
         if Path(path).name == "approval-gate.yaml":
             parsed_descriptions.append(package.definition.description)
+            parsed_outward_action_nodes.append(
+                package.sidecar.get("outward_action_nodes")
+            )
         return package
 
     def record_snapshot_parse(path, **kwargs):
         package = original_load_snapshot(path, **kwargs)
         if Path(path).name == "approval-gate.yaml":
             parsed_descriptions.append(package.definition.description)
+            parsed_outward_action_nodes.append(
+                package.sidecar.get("outward_action_nodes")
+            )
         return package
 
     monkeypatch.setattr(showcase_module, "_tree_digest", mutate_after_authenticated_digest)
@@ -465,6 +482,7 @@ def test_no_budget_catalog_parses_digest_authenticated_package_bytes_once(
     assert parsed_descriptions == [
         "Pause for explicit operator approval before completing the bundled tour"
     ]
+    assert parsed_outward_action_nodes == [()]
 
 
 def test_tree_entry_budget_stops_before_unbounded_rglob_materialization(
