@@ -180,6 +180,12 @@ class ApprovalExecutor:
         )
         try:
             result = self.agent_runner.run(request, is_cancelled=context.is_cancelled)
+        except PermissionError as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="authorization",
+                error_message=str(exc),
+            )
         except OSError as exc:
             return NodeExecutionResult(
                 "failed",

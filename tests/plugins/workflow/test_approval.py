@@ -450,6 +450,61 @@ def test_approval_runner_exception_consumes_grant_without_refresh(
     assert attempt["metadata"]["retry_consumed"] == 2
 
 
+def test_approval_permission_error_stays_authorization_without_provider_charge(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "denied-rework",
+        name="denied-rework",
+        nodes=[{
+            "id": "review",
+            "approval": {
+                "message": "Approve?",
+                "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+            },
+            "retry": {"max_attempts": 5, "delay_ms": 1000, "on_error": "all"},
+        }],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "limits: {combined_retries: 3}\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "denied-rework-home")
+    admitted = _start(store, package, key="denied-rework")
+
+    class DeniedReworkRunner:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            raise PermissionError("workflow provider override is not authorized")
+
+    runner = DeniedReworkRunner()
+    scheduler = RunScheduler(store, agent_runner=runner)
+    first_pause = scheduler.advance(admitted.run_id)
+    pending = first_pause["nodes"]["review"]["pending_interaction"]
+    store.reject_run(
+        admitted.run_id,
+        reason="missing evidence",
+        expected_state_version=first_pause["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+
+    failed = scheduler.advance(admitted.run_id)
+    replay = scheduler.advance(admitted.run_id)
+
+    assert failed["status"] == "failed"
+    assert replay["status"] == "failed"
+    assert [request.max_api_attempts for request in runner.requests] == [3]
+    assert failed["last_error"]["code"] == "authorization"
+    assert failed["nodes"]["review"]["retry_consumed"] == 1
+    attempt = failed["nodes"]["review"]["attempts"][-1]
+    assert attempt["error_code"] == "authorization"
+    assert "provider_attempts" not in attempt["metadata"]
+    assert attempt["metadata"]["retry_consumed"] == 1
+
+
 class ToolApprovalRunner:
     def __init__(self):
         self.requests = []
