@@ -2358,6 +2358,8 @@ upstream_changes:
   - runs_scheduled_queue partial index
   - scheduled projection/index parity recovery
   - scheduled namespace and journal reconstruction
+  - reserved scheduled migration composition
+  - namespace migration run-before-SQL lock order
   tests:
   - tests/plugins/workflow/test_installed_distribution_e2e.py
   - tests/plugins/workflow/test_schedule_store_identity.py
@@ -2371,6 +2373,13 @@ upstream_changes:
     publication, schema backfill, namespace migration, admission-row rebuild,
     integrity synchronization, damaged-index reconstruction, and journal-only
     recovery. Namespace rebuilds must never copy a source SQL scheduled_at value.
+    Backfill corroborated final evidence for both published and reserved rows,
+    while leaving incomplete reserved rows for normal reservation reconciliation.
+    Namespace migration must acquire and pin all run evidence before opening its
+    SQLite write transaction, then revalidate the exact source rows, store
+    generation, and evidence digests before rebuilding. Retry bounded source
+    drift and never acquire or reacquire a run lock while holding SQLite write
+    authority.
     Detect projection/index disagreement, repair only from corroborated evidence,
     and leave the run queued and the store fail-closed for operator repair.
     Unscheduled run projections and start digests must remain byte-identical.

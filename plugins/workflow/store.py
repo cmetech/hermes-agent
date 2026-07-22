@@ -905,81 +905,60 @@ class RunStore:
             "integrity_verified_at",
         )
         source_columns = set(columns)
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            source_rows = connection.execute(
-                "SELECT * FROM runs ORDER BY run_id"
-            ).fetchall()
-            connection.execute("DROP TABLE IF EXISTS runs_namespace_migration")
-            connection.execute(
-                """
-                CREATE TABLE runs_namespace_migration (
-                    run_id TEXT PRIMARY KEY,
-                    workflow_name TEXT NOT NULL,
-                    trigger_source TEXT NOT NULL,
-                    idempotency_namespace_digest TEXT NOT NULL,
-                    idempotency_digest TEXT NOT NULL,
-                    start_digest TEXT NOT NULL,
-                    concurrency_key TEXT NOT NULL,
-                    concurrency_policy TEXT NOT NULL,
-                    disposition TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    scheduled_at TEXT,
-                    queue_position INTEGER,
-                    queue_sequence INTEGER,
-                    blocked_by_run_id TEXT,
-                    pause_lane_policy TEXT NOT NULL DEFAULT 'hold',
-                    lane_state TEXT NOT NULL DEFAULT 'released',
-                    run_directory TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    archived_at TEXT,
-                    restored_to_history INTEGER NOT NULL DEFAULT 0,
-                    admission_state TEXT NOT NULL DEFAULT 'published',
-                    desired_status TEXT,
-                    staging_directory TEXT,
-                    operator_scope_digest TEXT,
-                    provenance_json TEXT,
-                    execution_mode TEXT NOT NULL DEFAULT 'foreground',
-                    foreground_owner_id TEXT,
-                    foreground_lease_expires_at TEXT,
-                    foreground_epoch INTEGER,
-                    foreground_boot_id TEXT,
-                    foreground_heartbeat_monotonic REAL,
-                    foreground_lease_seconds REAL,
-                    projection_schema_version INTEGER NOT NULL DEFAULT 1,
-                    projection_state_version INTEGER,
-                    projection_sha256 TEXT,
-                    journal_sequence INTEGER,
-                    journal_sha256 TEXT,
-                    integrity_verified_at TEXT,
-                    UNIQUE(
-                        idempotency_namespace_digest,
-                        workflow_name,
-                        idempotency_digest
-                    )
-                )
-                """
-            )
-            placeholders = ", ".join("?" for _ in target_columns)
-            column_sql = ", ".join(target_columns)
-            for row in source_rows:
-                namespace_digest = (
-                    row["idempotency_namespace_digest"]
-                    if "idempotency_namespace_digest" in source_columns
-                    and row["idempotency_namespace_digest"]
-                    else _sha256(
-                        f"profile-local:{row['trigger_source']}".encode()
-                    )
-                )
+        placeholders = ", ".join("?" for _ in target_columns)
+        column_sql = ", ".join(target_columns)
+
+        def source_generation() -> str | None:
+            row = connection.execute(
+                "SELECT value FROM store_metadata WHERE key='generation'"
+            ).fetchone()
+            return str(row["value"]) if row is not None else None
+
+        def source_signature(rows: Iterable[sqlite3.Row]) -> tuple[tuple[object, ...], ...]:
+            return tuple(tuple(row[name] for name in columns) for row in rows)
+
+        for _attempt in range(3):
+            locks = ExitStack()
+            transaction_started = False
+            try:
+                candidate_rows = connection.execute(
+                    "SELECT run_id FROM runs ORDER BY run_id"
+                ).fetchall()
+                candidate_ids = tuple(str(row["run_id"]) for row in candidate_rows)
+                for run_id in candidate_ids:
+                    locks.enter_context(workflow_lock(self._run_lock_path(run_id)))
+
+                source_rows = connection.execute(
+                    "SELECT * FROM runs ORDER BY run_id"
+                ).fetchall()
+                if tuple(str(row["run_id"]) for row in source_rows) != candidate_ids:
+                    continue
+                pinned_source = source_signature(source_rows)
+                pinned_generation = source_generation()
+                pinned_evidence: dict[
+                    str, tuple[dict[str, object], Path, str, str]
+                ] = {}
                 try:
-                    projection, _, _ = self._corroborate_run_evidence(
-                        Path(row["run_directory"]), run_id=str(row["run_id"])
-                    )
-                    start_digest = RunStore._start_digest_from_projection(
-                        projection
-                    )
-                    scheduled_at = self._scheduled_at_from_projection(projection)
+                    for row in source_rows:
+                        run_id = str(row["run_id"])
+                        directory = Path(row["run_directory"])
+                        projection, projection_sha256, journal_sha256 = (
+                            self._corroborate_run_evidence_locked(
+                                directory, run_id=run_id
+                            )
+                        )
+                        if projection_sha256 is None or journal_sha256 is None:
+                            raise JournalRecoveryError(
+                                "run evidence digests are unavailable"
+                            )
+                        RunStore._start_digest_from_projection(projection)
+                        self._scheduled_at_from_projection(projection)
+                        pinned_evidence[run_id] = (
+                            projection,
+                            directory,
+                            projection_sha256,
+                            journal_sha256,
+                        )
                 except (
                     OSError,
                     TypeError,
@@ -990,50 +969,150 @@ class RunStore:
                     raise sqlite3.DatabaseError(
                         "runs namespace migration evidence is uncorroborated"
                     ) from exc
-                values = [
-                    namespace_digest
-                    if name == "idempotency_namespace_digest"
-                    else start_digest
-                    if name == "start_digest"
-                    else scheduled_at
-                    if name == "scheduled_at"
-                    else row[name]
-                    for name in target_columns
-                ]
+
+                connection.execute("BEGIN IMMEDIATE")
+                transaction_started = True
+                current_rows = connection.execute(
+                    "SELECT * FROM runs ORDER BY run_id"
+                ).fetchall()
+                evidence_still_pinned = all(
+                    _sha256((directory / "run.json").read_bytes())
+                    == projection_sha256
+                    and _sha256((directory / "events.jsonl").read_bytes())
+                    == journal_sha256
+                    for (
+                        _projection,
+                        directory,
+                        projection_sha256,
+                        journal_sha256,
+                    ) in pinned_evidence.values()
+                )
+                if (
+                    source_signature(current_rows) != pinned_source
+                    or source_generation() != pinned_generation
+                    or not evidence_still_pinned
+                ):
+                    connection.rollback()
+                    transaction_started = False
+                    continue
+
+                connection.execute("DROP TABLE IF EXISTS runs_namespace_migration")
                 connection.execute(
-                    f"INSERT INTO runs_namespace_migration ({column_sql}) "
-                    f"VALUES ({placeholders})",
-                    values,
+                    """
+                    CREATE TABLE runs_namespace_migration (
+                        run_id TEXT PRIMARY KEY,
+                        workflow_name TEXT NOT NULL,
+                        trigger_source TEXT NOT NULL,
+                        idempotency_namespace_digest TEXT NOT NULL,
+                        idempotency_digest TEXT NOT NULL,
+                        start_digest TEXT NOT NULL,
+                        concurrency_key TEXT NOT NULL,
+                        concurrency_policy TEXT NOT NULL,
+                        disposition TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        scheduled_at TEXT,
+                        queue_position INTEGER,
+                        queue_sequence INTEGER,
+                        blocked_by_run_id TEXT,
+                        pause_lane_policy TEXT NOT NULL DEFAULT 'hold',
+                        lane_state TEXT NOT NULL DEFAULT 'released',
+                        run_directory TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        archived_at TEXT,
+                        restored_to_history INTEGER NOT NULL DEFAULT 0,
+                        admission_state TEXT NOT NULL DEFAULT 'published',
+                        desired_status TEXT,
+                        staging_directory TEXT,
+                        operator_scope_digest TEXT,
+                        provenance_json TEXT,
+                        execution_mode TEXT NOT NULL DEFAULT 'foreground',
+                        foreground_owner_id TEXT,
+                        foreground_lease_expires_at TEXT,
+                        foreground_epoch INTEGER,
+                        foreground_boot_id TEXT,
+                        foreground_heartbeat_monotonic REAL,
+                        foreground_lease_seconds REAL,
+                        projection_schema_version INTEGER NOT NULL DEFAULT 1,
+                        projection_state_version INTEGER,
+                        projection_sha256 TEXT,
+                        journal_sequence INTEGER,
+                        journal_sha256 TEXT,
+                        integrity_verified_at TEXT,
+                        UNIQUE(
+                            idempotency_namespace_digest,
+                            workflow_name,
+                            idempotency_digest
+                        )
+                    )
+                    """
                 )
-            copied = connection.execute(
-                "SELECT COUNT(*) FROM runs_namespace_migration"
-            ).fetchone()[0]
-            if copied != len(source_rows):
-                raise sqlite3.DatabaseError("runs namespace migration lost rows")
-            connection.execute("DROP TABLE runs")
-            connection.execute("ALTER TABLE runs_namespace_migration RENAME TO runs")
-            connection.execute(
-                "CREATE INDEX runs_concurrency "
-                "ON runs(workflow_name, concurrency_key, status)"
-            )
-            if connection.execute("PRAGMA foreign_key_check").fetchall():
-                raise sqlite3.DatabaseError(
-                    "runs namespace migration violated foreign keys"
+                for row in source_rows:
+                    namespace_digest = (
+                        row["idempotency_namespace_digest"]
+                        if "idempotency_namespace_digest" in source_columns
+                        and row["idempotency_namespace_digest"]
+                        else _sha256(
+                            f"profile-local:{row['trigger_source']}".encode()
+                        )
+                    )
+                    projection = pinned_evidence[str(row["run_id"])][0]
+                    start_digest = RunStore._start_digest_from_projection(projection)
+                    scheduled_at = self._scheduled_at_from_projection(projection)
+                    values = [
+                        namespace_digest
+                        if name == "idempotency_namespace_digest"
+                        else start_digest
+                        if name == "start_digest"
+                        else scheduled_at
+                        if name == "scheduled_at"
+                        else row[name]
+                        for name in target_columns
+                    ]
+                    connection.execute(
+                        f"INSERT INTO runs_namespace_migration ({column_sql}) "
+                        f"VALUES ({placeholders})",
+                        values,
+                    )
+                copied = connection.execute(
+                    "SELECT COUNT(*) FROM runs_namespace_migration"
+                ).fetchone()[0]
+                if copied != len(source_rows):
+                    raise sqlite3.DatabaseError("runs namespace migration lost rows")
+                connection.execute("DROP TABLE runs")
+                connection.execute(
+                    "ALTER TABLE runs_namespace_migration RENAME TO runs"
                 )
-            if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                raise sqlite3.DatabaseError(
-                    "runs namespace migration failed integrity check"
+                connection.execute(
+                    "CREATE INDEX runs_concurrency "
+                    "ON runs(workflow_name, concurrency_key, status)"
                 )
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
+                if connection.execute("PRAGMA foreign_key_check").fetchall():
+                    raise sqlite3.DatabaseError(
+                        "runs namespace migration violated foreign keys"
+                    )
+                if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise sqlite3.DatabaseError(
+                        "runs namespace migration failed integrity check"
+                    )
+                connection.commit()
+                transaction_started = False
+                return
+            except BaseException:
+                if transaction_started:
+                    connection.rollback()
+                raise
+            finally:
+                locks.close()
+        raise sqlite3.DatabaseError(
+            "runs namespace migration source changed during migration"
+        )
 
     def _migrate_scheduled_at(self, connection: sqlite3.Connection) -> None:
         """Backfill the v14 query column from corroborated durable evidence."""
         rows = connection.execute(
-            "SELECT run_id, run_directory FROM runs "
-            "WHERE admission_state='published' ORDER BY run_id"
+            "SELECT run_id, run_directory, admission_state FROM runs "
+            "WHERE admission_state IN ('published','reserved') ORDER BY run_id"
         ).fetchall()
         for row in rows:
             try:
@@ -1048,6 +1127,8 @@ class RunStore:
                 json.JSONDecodeError,
                 JournalRecoveryError,
             ) as exc:
+                if row["admission_state"] == "reserved":
+                    continue
                 raise sqlite3.DatabaseError(
                     "scheduled run migration evidence is uncorroborated"
                 ) from exc

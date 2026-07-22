@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import sqlite3
+import threading
 
 import pytest
 
@@ -14,6 +17,7 @@ import plugins.workflow.store as store_module
 
 SCHEDULE_AT = "2099-01-02T03:04:05Z"
 CORRUPT_SCHEDULE_AT = "2098-01-02T03:04:05Z"
+CONCURRENT_SCHEDULE_AT = "2099-02-03T04:05:06Z"
 
 
 def _scheduled_snapshot(store: RunStore, workflow_writer, tmp_path: Path, *, name: str):
@@ -147,6 +151,80 @@ def test_reserved_scheduled_publication_recovers_from_projection(
     assert indexed["admission_state"] == "published"
     assert indexed["status"] == "queued"
     assert indexed["scheduled_at"] == SCHEDULE_AT
+
+
+def test_genuine_v13_migration_backfills_reserved_schedule_before_recovery(
+    tmp_path: Path, workflow_writer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home, max_executing_runs=0)
+    snapshot = _scheduled_snapshot(
+        store, workflow_writer, tmp_path, name="scheduled-v13-reservation"
+    )
+    request = _scheduled_request(snapshot, name="scheduled-v13-reservation")
+
+    def crash_before_publication(*_args, **_kwargs):
+        raise RuntimeError("injected publication crash")
+
+    monkeypatch.setattr(store, "_mark_reservation_published", crash_before_publication)
+    with pytest.raises(RuntimeError, match="injected publication crash"):
+        store.start_run(request, immutable_snapshot=snapshot)
+    with store._connect() as connection:
+        reserved = connection.execute(
+            "SELECT run_id, admission_state, scheduled_at FROM runs"
+        ).fetchone()
+    assert reserved["admission_state"] == "reserved"
+    assert reserved["scheduled_at"] == SCHEDULE_AT
+
+    _downgrade_to_v13_without_schedule(store)
+
+    restarted = RunStore(home, max_executing_runs=0)
+
+    indexed = _indexed_run(restarted, str(reserved["run_id"]))
+    assert indexed["admission_state"] == "published"
+    assert indexed["status"] == "queued"
+    assert indexed["scheduled_at"] == SCHEDULE_AT
+
+
+def test_genuine_v13_migration_leaves_incomplete_reservation_for_cleanup(
+    tmp_path: Path, workflow_writer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home, max_executing_runs=0)
+    snapshot = _scheduled_snapshot(
+        store, workflow_writer, tmp_path, name="scheduled-v13-incomplete"
+    )
+    request = _scheduled_request(snapshot, name="scheduled-v13-incomplete")
+
+    def crash_before_durable_publication(*_args, **_kwargs):
+        raise RuntimeError("injected pre-publication crash")
+
+    monkeypatch.setattr(
+        store, "_publish_reserved_run", crash_before_durable_publication
+    )
+    with pytest.raises(RuntimeError, match="injected pre-publication crash"):
+        store.start_run(request, immutable_snapshot=snapshot)
+    with store._connect() as connection:
+        reserved = connection.execute(
+            "SELECT run_id, run_directory, staging_directory, admission_state FROM runs"
+        ).fetchone()
+    assert reserved["admission_state"] == "reserved"
+    assert not Path(reserved["run_directory"]).exists()
+    assert Path(reserved["staging_directory"]).is_dir()
+
+    _downgrade_to_v13_without_schedule(store)
+
+    restarted = RunStore(home, max_executing_runs=0)
+
+    with restarted._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+        event = connection.execute(
+            "SELECT event_type, reason_code FROM admission_events "
+            "WHERE run_id=? ORDER BY sequence DESC LIMIT 1",
+            (reserved["run_id"],),
+        ).fetchone()
+    assert tuple(event) == ("admission_reservation_released", "incomplete_publication")
+    assert restarted.storage_health()["status"] == "healthy"
 
 
 def test_projection_schedule_derivation_rejects_noncanonical_metadata() -> None:
@@ -290,6 +368,96 @@ def test_v13_namespace_migration_derives_schedule_without_trusting_source_column
     assert indexed["scheduled_at"] == SCHEDULE_AT
     assert indexed["idempotency_namespace_digest"]
     assert migrated.load_run(run_id)["status"] == "queued"
+
+
+def test_namespace_migration_obeys_run_then_sqlite_lock_order_and_uses_fresh_evidence(
+    tmp_path: Path, workflow_writer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home, max_executing_runs=0)
+    run_id = _admit_scheduled(
+        store, workflow_writer, tmp_path, name="scheduled-namespace-lock-order"
+    )
+    directory = store.run_directory(run_id)
+    _downgrade_to_v13_legacy_namespace(store)
+    with sqlite3.connect(store.database) as connection:
+        assert "idempotency_namespace_digest" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(runs)")
+        }
+
+    original_workflow_lock = store_module.workflow_lock
+    target_lock = store._run_lock_path(run_id).resolve()
+    migration_waiting_for_run = threading.Event()
+    migration_thread: dict[str, int] = {}
+
+    @contextmanager
+    def bounded_observed_lock(path: Path, *, timeout_seconds: float = 5.0):
+        if (
+            threading.get_ident() == migration_thread.get("ident")
+            and Path(path).resolve() == target_lock
+        ):
+            migration_waiting_for_run.set()
+            probe = sqlite3.connect(store.database, timeout=0, isolation_level=None)
+            try:
+                probe.execute("BEGIN IMMEDIATE")
+                probe.rollback()
+            except sqlite3.OperationalError as exc:
+                raise AssertionError(
+                    "namespace migration acquired SQLite before the run lock"
+                ) from exc
+            finally:
+                probe.close()
+            timeout_seconds = min(timeout_seconds, 0.25)
+        with original_workflow_lock(path, timeout_seconds=timeout_seconds):
+            yield
+
+    monkeypatch.setattr(store_module, "workflow_lock", bounded_observed_lock)
+
+    def migrate() -> RunStore:
+        migration_thread["ident"] = threading.get_ident()
+        return RunStore(home, max_executing_runs=0)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with original_workflow_lock(target_lock):
+            migration = pool.submit(migrate)
+            assert migration_waiting_for_run.wait(timeout=2)
+            connection = sqlite3.connect(
+                store.database, timeout=1.0, isolation_level=None
+            )
+            try:
+                connection.execute("PRAGMA busy_timeout=1000")
+                connection.execute("BEGIN IMMEDIATE")
+                projection = json.loads(
+                    (directory / "run.json").read_text(encoding="utf-8")
+                )
+                projection["run_metadata"]["schedule_at"] = CONCURRENT_SCHEDULE_AT
+                store._append_locked(
+                    directory,
+                    projection,
+                    "schedule_revised",
+                    {"schedule_at": CONCURRENT_SCHEDULE_AT},
+                    defer_notification=True,
+                    reserve_connection=connection,
+                )
+                connection.execute(
+                    "UPDATE runs SET start_digest=?, updated_at=? WHERE run_id=?",
+                    (
+                        RunStore._start_digest_from_projection(projection),
+                        projection["updated_at"],
+                        run_id,
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+        migrated = migration.result(timeout=2)
+
+    indexed = _indexed_run(migrated, run_id)
+    projection = migrated.load_run(run_id)
+    assert indexed["scheduled_at"] == CONCURRENT_SCHEDULE_AT
+    assert indexed["start_digest"] == RunStore._start_digest_from_projection(projection)
+    assert projection["run_metadata"]["schedule_at"] == CONCURRENT_SCHEDULE_AT
+    assert projection["event_sequence"] == 2
 
 
 @pytest.mark.parametrize(
