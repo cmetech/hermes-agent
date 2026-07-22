@@ -10,8 +10,10 @@ from importlib import resources
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import secrets
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -32,11 +34,19 @@ from plugins.workflow.entitlement import (
     validate_showcase_ai_contract,
     verified_showcase_run_metadata,
 )
+from plugins.workflow.input_contract import (
+    WorkflowInputContractError,
+    workflow_input_declarations,
+)
 from plugins.workflow.machine_contract import operator_command_contract
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.models import WorkflowPackage
 from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import RunStore
+from plugins.workflow.sanitize import (
+    workflow_filename_components_are_distinct,
+    workflow_input_names_are_portable,
+)
 from plugins.workflow.trust import (
     WorkflowRiskSummary,
     WorkflowResourceCapacityError,
@@ -89,6 +99,8 @@ class ShowcaseScenario:
     cleanup_ownership: str
     package_digest: str
     verified_bundled_provenance: bool
+    input_fixtures: Mapping[str, str]
+    input_value_bindings: Mapping[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +276,118 @@ def _contained(root: Path, relative: str) -> Path:
     return candidate
 
 
+def _fixture_path(package_root: Path, relative: object) -> Path:
+    if not isinstance(relative, str) or not relative or len(relative) > 1024:
+        raise ShowcaseCatalogError("showcase fixture path must be bounded text")
+    parts = relative.split("/")
+    portable = PurePosixPath(relative)
+    if (
+        portable.is_absolute()
+        or "\\" in relative
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise ShowcaseCatalogError(f"showcase fixture path is unsafe: {relative}")
+    fixture = _contained(package_root, relative)
+    try:
+        metadata = fixture.lstat()
+    except OSError as exc:
+        raise ShowcaseCatalogError(
+            f"showcase fixture resource is unreadable: {relative}"
+        ) from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ShowcaseCatalogError(
+            f"showcase fixture resource is not a regular file: {relative}"
+        )
+    return fixture
+
+
+def _authenticated_input_mappings(
+    item: Mapping[object, object],
+    *,
+    package: WorkflowPackage,
+) -> tuple[dict[str, str], dict[str, str]]:
+    raw_fixtures = item.get("input_fixtures", {})
+    raw_bindings = item.get("input_value_bindings", {})
+    if (
+        not isinstance(raw_fixtures, Mapping)
+        or not isinstance(raw_bindings, Mapping)
+        or len(raw_fixtures) > 64
+        or len(raw_bindings) > 64
+    ):
+        raise ShowcaseCatalogError(
+            "showcase input fixtures and bindings must be bounded mappings"
+        )
+    if not workflow_input_names_are_portable(raw_fixtures) or not (
+        workflow_input_names_are_portable(raw_bindings)
+    ):
+        raise ShowcaseCatalogError("showcase input names must be portable")
+
+    fixtures: dict[str, str] = {}
+    bindings: dict[str, str] = {}
+    for raw_name, raw_path in raw_fixtures.items():
+        if not isinstance(raw_name, str) or not isinstance(raw_path, str):
+            raise ShowcaseCatalogError("showcase fixture mapping is invalid")
+        _fixture_path(package.root, raw_path)
+        fixtures[raw_name] = raw_path
+    for raw_public, raw_target in raw_bindings.items():
+        if not isinstance(raw_public, str) or not isinstance(raw_target, str):
+            raise ShowcaseCatalogError("showcase input binding is invalid")
+        bindings[raw_public] = raw_target
+
+    try:
+        declarations = workflow_input_declarations(package)
+    except WorkflowInputContractError as exc:
+        raise ShowcaseCatalogError("showcase input declarations are invalid") from exc
+
+    targets = list(bindings.values())
+    if not workflow_input_names_are_portable(targets):
+        raise ShowcaseCatalogError("showcase input binding targets must be one-to-one")
+    fixture_targets = {name.casefold() for name in fixtures}
+    binding_targets = {target.casefold() for target in targets}
+    public_sources = {name.casefold() for name in bindings}
+    if fixture_targets & binding_targets:
+        raise ShowcaseCatalogError("showcase binding and fixture targets overlap")
+    if public_sources & {name.casefold() for name in declarations}:
+        raise ShowcaseCatalogError(
+            "showcase public input names must not alias internal targets"
+        )
+    if not workflow_filename_components_are_distinct(
+        [
+            *fixtures,
+            *(
+                f"{name}.txt"
+                for name, declaration in declarations.items()
+                if declaration.accepts_api_value
+            ),
+        ]
+    ):
+        raise ShowcaseCatalogError("showcase input targets collide after staging")
+    if len({path.casefold() for path in fixtures.values()}) != len(fixtures):
+        raise ShowcaseCatalogError("showcase fixture paths must be one-to-one")
+
+    for target in targets:
+        declaration = declarations.get(target)
+        if declaration is None:
+            raise ShowcaseCatalogError(
+                f"showcase binding target is undeclared: {target}"
+            )
+        if declaration.kind != "text":
+            raise ShowcaseCatalogError(
+                f"showcase binding target must declare text kind: {target}"
+            )
+    for target in fixtures:
+        declaration = declarations.get(target)
+        if declaration is None:
+            raise ShowcaseCatalogError(
+                f"showcase fixture target is undeclared: {target}"
+            )
+        if declaration.kind != "file":
+            raise ShowcaseCatalogError(
+                f"showcase fixture target must declare file kind: {target}"
+            )
+    return dict(sorted(fixtures.items())), dict(sorted(bindings.items()))
+
+
 def _bundle_digest(
     root: Path,
     read_budget: WorkflowResourceReadBudget | None = None,
@@ -420,6 +544,10 @@ def load_showcase_catalog(
                 requires_ai=bool(item["requires_ai"]),
                 definition=package.definition,
             )
+            input_fixtures, input_value_bindings = _authenticated_input_mappings(
+                item,
+                package=package,
+            )
             result[scenario_id] = ShowcaseScenario(
                 **{key: str(item[key]) for key in ("id", "display_name", "purpose", "bundle_version", "package_version", "workflow_path", "interaction_mode", "safety_class", "cleanup_ownership")},
                 offline=bool(item["offline"]), requires_ai=bool(item["requires_ai"]),
@@ -432,6 +560,8 @@ def load_showcase_catalog(
                 limits={str(key): int(value) for key, value in limits.items()},
                 package_digest=actual_digest,
                 verified_bundled_provenance=bundle_root is None,
+                input_fixtures=input_fixtures,
+                input_value_bindings=input_value_bindings,
             )
         return dict(sorted(result.items()))
 
@@ -784,7 +914,13 @@ def preflight_showcase(showcase_id: str, *, hermes_home: str | Path) -> dict[str
         (len(node.options.get("agents", {})) for node in package.definition.nodes),
         default=0,
     )
-    input_requirements = _input_requirements(package, [])
+    input_requirements = {
+        item.name: asdict(item) for item in _input_requirements(package, [])
+    }
+    for public_name, internal_name in scenario.input_value_bindings.items():
+        requirement = input_requirements.pop(internal_name)
+        requirement["name"] = public_name
+        input_requirements[public_name] = requirement
     return {
         "schema_version": 1, "showcase_id": scenario.id, "display_name": scenario.display_name,
         "purpose": scenario.purpose, "runnable": True, "offline": scenario.offline,
@@ -794,7 +930,9 @@ def preflight_showcase(showcase_id: str, *, hermes_home: str | Path) -> dict[str
         "package_digest": scenario.package_digest, "bundle_digest": bundle_digest,
         "requested_skills": requested_skills, "local_mcp_servers": [f"mcp/{value}" for value in local_mcp],
         "inline_agent_limit": inline_agents, "wall_seconds": scenario.limits["wall_seconds"],
-        "input_requirements": [asdict(item) for item in input_requirements],
+        "input_requirements": [
+            input_requirements[name] for name in sorted(input_requirements)
+        ],
         "side_effects_initialized": False,
         "command_contract": operator_command_contract(),
     }

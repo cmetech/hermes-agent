@@ -1281,6 +1281,55 @@ upstream_changes:
     catalog/detail projection and authenticated background admission without
     changing legacy projection shapes.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-authenticated-showcase-inputs
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/showcase.py
+  - plugins/workflow/showcases/catalog.schema.json
+  - plugins/workflow/showcases/catalog.yaml
+  - plugins/workflow/showcases/digests.json
+  - plugins/workflow/showcases/packages/laptop-diagnostic/workflows/laptop-diagnostic.hermes.yaml
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_store.py
+  owned_symbols:
+  - ShowcaseScenario.input_fixtures
+  - ShowcaseScenario.input_value_bindings
+  - _fixture_path
+  - _authenticated_input_mappings
+  - _showcase_input_projection
+  - authenticated showcase public-value translation
+  - authenticated fixture read-once staging
+  - laptop-diagnostic three-of-five Desktop run support
+  - ai-extensions Revision 7 authenticated metadata
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_store.py
+  expected_commit_subject: 'feat(workflow): authenticate showcase inputs'
+  upstream_candidate: true
+  merge_guidance: Preserve fixture and binding mappings only as authenticated
+    catalog data. Reject unsafe, escaping, symlinked, non-regular, colliding,
+    undeclared, and kind-mismatched targets before admission. Translate public
+    values only after forced verification and pass only digest-manifest-covered
+    cached fixture bytes plus their expected SHA-256 through the verified-input
+    snapshot channel; never reopen the fixture in REST admission. Reserve every
+    internal target from callers, keep ordinary legacy and local-file channels
+    unchanged, and include only sealed input-manifest identity in durable run
+    state and idempotency material. Keep laptop-diagnostic as the third supported
+    bundled Desktop workflow and retain the guided ai-extensions metadata while
+    leaving its explicit CLI AI confirmation contract intact.
+  removal_condition: Remove when upstream provides equivalent authenticated
+    showcase binding, read-once fixture staging, run-support, isolation, and
+    installed-distribution guarantees.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-catalog-desktop-trigger-verification
   change_class: workflow-verification
   owner: workflow-orchestration

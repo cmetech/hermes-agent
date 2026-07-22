@@ -432,7 +432,12 @@ def workflow_catalog_run_support(
 ) -> CatalogRunSupport:
     """Derive Desktop background-run support from authenticated server data."""
     if input_support is None:
-        _inputs, input_support = _input_projection(package)
+        if showcase_scenario is None:
+            _inputs, input_support = _input_projection(package)
+        else:
+            _inputs, input_support = _showcase_input_projection(
+                package, showcase_scenario
+            )
     if not input_support["supported"]:
         return {"supported": False, "reason": "unsupported_inputs"}
     if showcase_scenario is not None:
@@ -441,6 +446,42 @@ def workflow_catalog_run_support(
         if not showcase_background_api_eligible(showcase_scenario):
             return {"supported": False, "reason": "showcase_cli_required"}
     return {"supported": True, "reason": "supported"}
+
+
+def _showcase_input_projection(
+    package: WorkflowPackage,
+    scenario: "ShowcaseScenario",
+) -> tuple[list[CatalogInput], SupportedInputs]:
+    """Project only digest-authenticated public fields and bundled fixtures."""
+    inputs, support = _input_projection(package)
+    bindings = dict(scenario.input_value_bindings)
+    fixtures = frozenset(scenario.input_fixtures)
+    target_to_public = {target: public for public, target in bindings.items()}
+    projected: list[CatalogInput] = []
+    unsupported = support["reason"] == "unsupported_input_shape"
+    for item in inputs:
+        rendered = dict(item)
+        internal_name = rendered["name"]
+        rendered["name"] = target_to_public.get(internal_name, internal_name)
+        if (
+            rendered["type"] not in _SUPPORTED_INPUT_TYPES
+            and not (internal_name in fixtures and rendered["type"] == "file")
+        ):
+            unsupported = True
+        projected.append(rendered)
+    if unsupported:
+        return projected, {
+            "supported": False,
+            "reason": (
+                "unsupported_input_shape"
+                if support["reason"] == "unsupported_input_shape"
+                else "unsupported_input_type"
+            ),
+        }
+    return sorted(projected, key=lambda item: item["name"]), {
+        "supported": True,
+        "reason": "flat_inputs" if projected else "parameterless",
+    }
 
 
 def _compatibility_projection(compatibility) -> dict[str, object]:
@@ -545,7 +586,12 @@ def _catalog_entry(
         trust_state = "verified_bundled"
         version = str(verified_showcase.scenario.package_version)
         showcase_scenario = verified_showcase.scenario
-    inputs, supported_inputs = _input_projection(package)
+    if showcase_scenario is None:
+        inputs, supported_inputs = _input_projection(package)
+    else:
+        inputs, supported_inputs = _showcase_input_projection(
+            package, showcase_scenario
+        )
     entry: CatalogEntry = {
         "name": (
             str(verified_showcase.scenario.id)
@@ -832,7 +878,12 @@ def build_workflow_detail(
         trust_state = "verified_bundled"
         version = str(verified_showcase.scenario.package_version)
         showcase_scenario = verified_showcase.scenario
-    inputs, supported_inputs = _input_projection(package)
+    if showcase_scenario is None:
+        inputs, supported_inputs = _input_projection(package)
+    else:
+        inputs, supported_inputs = _showcase_input_projection(
+            package, showcase_scenario
+        )
     warnings = [str(item) for item in shown["topology_warnings"]]
     mermaid = shown["topology_mermaid"]
     omitted = None

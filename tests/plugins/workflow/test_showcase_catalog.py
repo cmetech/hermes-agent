@@ -31,6 +31,48 @@ import plugins.workflow.showcase as showcase_module
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
+def _restamp_showcase_copy(root: Path, showcase_id: str = "laptop-diagnostic") -> None:
+    catalog_path = root / "catalog.yaml"
+    manifest_path = root / "digests.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["catalog_sha256"] = sha256(catalog_path.read_bytes()).hexdigest()
+    manifest["packages"][showcase_id] = showcase_module._tree_digest(
+        root / "packages" / showcase_id
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _authenticated_input_catalog_copy(tmp_path: Path) -> tuple[Path, dict]:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+    sidecar = (
+        copied
+        / "packages/laptop-diagnostic/workflows/laptop-diagnostic.hermes.yaml"
+    )
+    sidecar.write_text(
+        sidecar.read_text(encoding="utf-8").replace(
+            "    symptom: {kind: text, required: true, max_bytes: 4096}",
+            "    arguments: {kind: text, required: true, max_bytes: 4096}",
+        ),
+        encoding="utf-8",
+    )
+    catalog_path = copied / "catalog.yaml"
+    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    laptop = next(
+        item for item in raw["scenarios"] if item["id"] == "laptop-diagnostic"
+    )
+    laptop["input_fixtures"] = {
+        "evidence": "fixtures/laptop-snapshot.json",
+    }
+    laptop["input_value_bindings"] = {"symptom": "arguments"}
+    catalog_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _restamp_showcase_copy(copied)
+    return copied, laptop
+
+
 def test_catalog_has_safe_digest_verified_scenarios() -> None:
     catalog = load_showcase_catalog()
 
@@ -48,6 +90,281 @@ def test_catalog_has_safe_digest_verified_scenarios() -> None:
     assert all(item.package_digest for item in catalog.values())
     assert all(item.verified_bundled_provenance for item in catalog.values())
     assert all("destructive" not in item.safety_class for item in catalog.values())
+
+
+def test_catalog_authenticates_laptop_input_bindings_and_fixture_path() -> None:
+    scenario = load_showcase_catalog()["laptop-diagnostic"]
+
+    assert scenario.input_value_bindings == {"symptom": "arguments"}
+    assert scenario.input_fixtures == {
+        "evidence": "fixtures/laptop-snapshot.json"
+    }
+
+
+def test_catalog_restamps_ai_extension_metadata_without_consent_vocabulary() -> None:
+    scenario = load_showcase_catalog()["ai-extensions"]
+
+    assert scenario.interaction_mode == "guided"
+    assert scenario.requires_ai is True
+    assert scenario.expected_checkpoints == ("extension-resolution", "cleanup")
+    assert scenario.expected_terminal_outcomes == ("succeeded", "failed")
+    assert scenario.capability_claims == (
+        "scoped-extensions",
+        "persistent-session",
+        "local-mcp-cleanup",
+    )
+    assert scenario.purpose == (
+        "Demonstrate AI, skill, hook, inline-agent, and local MCP extension "
+        "integration."
+    )
+    assert "consent" not in json.dumps(
+        {
+            "purpose": scenario.purpose,
+            "checkpoints": scenario.expected_checkpoints,
+            "outcomes": scenario.expected_terminal_outcomes,
+            "claims": scenario.capability_claims,
+        },
+        sort_keys=True,
+    ).lower()
+
+
+@pytest.mark.parametrize(
+    ("case", "fixture_path"),
+    [
+        ("absolute", "/private/laptop-snapshot.json"),
+        ("parent", "fixtures/../laptop-snapshot.json"),
+        ("lexical-escape", "../../../outside.json"),
+        ("empty-component", "fixtures//laptop-snapshot.json"),
+        ("nonregular", "fixtures"),
+    ],
+)
+def test_authenticated_fixture_paths_reject_unsafe_or_nonregular_targets(
+    tmp_path: Path,
+    case: str,
+    fixture_path: str,
+) -> None:
+    copied, laptop = _authenticated_input_catalog_copy(tmp_path)
+    laptop["input_fixtures"]["evidence"] = fixture_path
+    catalog_path = copied / "catalog.yaml"
+    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    next(
+        item for item in raw["scenarios"] if item["id"] == "laptop-diagnostic"
+    )["input_fixtures"] = laptop["input_fixtures"]
+    catalog_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _restamp_showcase_copy(copied)
+
+    with pytest.raises(ShowcaseCatalogError, match="fixture|path|resource"):
+        load_showcase_catalog(copied)
+
+
+def test_authenticated_fixture_path_rejects_resolved_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    copied, laptop = _authenticated_input_catalog_copy(tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"private": true}\n', encoding="utf-8")
+    fixture_link = (
+        copied / "packages/laptop-diagnostic/fixtures/escaped-snapshot.json"
+    )
+    try:
+        fixture_link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    laptop["input_fixtures"]["evidence"] = "fixtures/escaped-snapshot.json"
+    catalog_path = copied / "catalog.yaml"
+    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    next(
+        item for item in raw["scenarios"] if item["id"] == "laptop-diagnostic"
+    )["input_fixtures"] = laptop["input_fixtures"]
+    catalog_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    manifest_path = copied / "digests.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["catalog_sha256"] = sha256(catalog_path.read_bytes()).hexdigest()
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ShowcaseCatalogError, match="symlink"):
+        load_showcase_catalog(copied)
+
+
+@pytest.mark.parametrize(
+    ("case", "fixtures", "bindings"),
+    [
+        (
+            "duplicate-public-casefold",
+            {"evidence": "fixtures/laptop-snapshot.json"},
+            {"symptom": "arguments", "Symptom": "arguments"},
+        ),
+        (
+            "duplicate-binding-target",
+            {"evidence": "fixtures/laptop-snapshot.json"},
+            {"symptom": "arguments", "issue": "arguments"},
+        ),
+        (
+            "binding-fixture-overlap",
+            {"evidence": "fixtures/laptop-snapshot.json"},
+            {"symptom": "evidence"},
+        ),
+        (
+            "public-aliases-fixture-target",
+            {"evidence": "fixtures/laptop-snapshot.json"},
+            {"evidence": "arguments"},
+        ),
+        (
+            "public-aliases-binding-target",
+            {"evidence": "fixtures/laptop-snapshot.json"},
+            {"arguments": "arguments"},
+        ),
+        (
+            "undeclared-binding-target",
+            {"evidence": "fixtures/laptop-snapshot.json"},
+            {"symptom": "missing"},
+        ),
+        (
+            "binding-kind-mismatch",
+            {"evidence": "fixtures/laptop-snapshot.json"},
+            {"symptom": "evidence"},
+        ),
+        (
+            "fixture-kind-mismatch",
+            {"arguments": "fixtures/laptop-snapshot.json"},
+            {"symptom": "arguments"},
+        ),
+    ],
+)
+def test_authenticated_input_mappings_reject_collisions_and_kind_mismatches(
+    tmp_path: Path,
+    case: str,
+    fixtures: dict[str, str],
+    bindings: dict[str, str],
+) -> None:
+    copied, _laptop = _authenticated_input_catalog_copy(tmp_path)
+    catalog_path = copied / "catalog.yaml"
+    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    laptop = next(
+        item for item in raw["scenarios"] if item["id"] == "laptop-diagnostic"
+    )
+    laptop["input_fixtures"] = fixtures
+    laptop["input_value_bindings"] = bindings
+    catalog_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _restamp_showcase_copy(copied)
+
+    with pytest.raises(ShowcaseCatalogError, match="input|fixture|binding"):
+        load_showcase_catalog(copied)
+
+
+def test_authenticated_input_mappings_reject_generated_filename_collision(
+    tmp_path: Path,
+) -> None:
+    copied, _laptop = _authenticated_input_catalog_copy(tmp_path)
+    sidecar = (
+        copied
+        / "packages/laptop-diagnostic/workflows/laptop-diagnostic.hermes.yaml"
+    )
+    sidecar.write_text(
+        sidecar.read_text(encoding="utf-8").replace(
+            "    evidence: {kind: file, required: true, max_bytes: 65536}",
+            "    arguments.txt: {kind: file, required: true, max_bytes: 65536}",
+        ),
+        encoding="utf-8",
+    )
+    catalog_path = copied / "catalog.yaml"
+    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    laptop = next(
+        item for item in raw["scenarios"] if item["id"] == "laptop-diagnostic"
+    )
+    laptop["input_fixtures"] = {
+        "arguments.txt": "fixtures/laptop-snapshot.json"
+    }
+    laptop["input_value_bindings"] = {"symptom": "arguments"}
+    catalog_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _restamp_showcase_copy(copied)
+
+    with pytest.raises(ShowcaseCatalogError, match="input|fixture|binding|collid"):
+        load_showcase_catalog(copied)
+
+
+def test_authenticated_binding_public_name_cannot_alias_direct_declaration(
+    tmp_path: Path,
+) -> None:
+    copied, _laptop = _authenticated_input_catalog_copy(tmp_path)
+    sidecar = (
+        copied
+        / "packages/laptop-diagnostic/workflows/laptop-diagnostic.hermes.yaml"
+    )
+    sidecar.write_text(
+        sidecar.read_text(encoding="utf-8").replace(
+            "    arguments: {kind: text, required: true, max_bytes: 4096}",
+            "    arguments: {kind: text, required: true, max_bytes: 4096}\n"
+            "    symptom: {kind: text, required: true, max_bytes: 4096}",
+        ),
+        encoding="utf-8",
+    )
+    _restamp_showcase_copy(copied)
+
+    with pytest.raises(ShowcaseCatalogError, match="public|alias|input"):
+        load_showcase_catalog(copied)
+
+
+def test_authenticated_fixture_cannot_collide_with_direct_text_filename(
+    tmp_path: Path,
+) -> None:
+    copied, _laptop = _authenticated_input_catalog_copy(tmp_path)
+    sidecar = (
+        copied
+        / "packages/laptop-diagnostic/workflows/laptop-diagnostic.hermes.yaml"
+    )
+    sidecar.write_text(
+        sidecar.read_text(encoding="utf-8")
+        .replace(
+            "    evidence: {kind: file, required: true, max_bytes: 65536}",
+            "    notes.txt: {kind: file, required: true, max_bytes: 65536}",
+        )
+        .replace(
+            "    arguments: {kind: text, required: true, max_bytes: 4096}",
+            "    arguments: {kind: text, required: true, max_bytes: 4096}\n"
+            "    notes: {kind: text, required: false, max_bytes: 4096}",
+        ),
+        encoding="utf-8",
+    )
+    catalog_path = copied / "catalog.yaml"
+    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    laptop = next(
+        item for item in raw["scenarios"] if item["id"] == "laptop-diagnostic"
+    )
+    laptop["input_fixtures"] = {"notes.txt": "fixtures/laptop-snapshot.json"}
+    catalog_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _restamp_showcase_copy(copied)
+
+    with pytest.raises(ShowcaseCatalogError, match="input|fixture|collid"):
+        load_showcase_catalog(copied)
+
+
+def test_authenticated_fixture_tamper_fails_verified_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied, _laptop = _authenticated_input_catalog_copy(tmp_path)
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield copied
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    fixture = copied / "packages/laptop-diagnostic/fixtures/laptop-snapshot.json"
+    fixture.write_text('{"tampered": true}\n', encoding="utf-8")
+
+    with pytest.raises(ShowcaseCatalogError, match="package digest mismatch"):
+        showcase_module.load_verified_showcase_packages(
+            read_budget=WorkflowResourceReadBudget(
+                max_file_bytes=1024 * 1024,
+                max_total_bytes=8 * 1024 * 1024,
+                max_files=512,
+            ),
+            force_reverify=True,
+        )
 
 
 @pytest.mark.parametrize(

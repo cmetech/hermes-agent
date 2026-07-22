@@ -5,6 +5,9 @@ import asyncio
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
+from hashlib import sha256
+import json
+import logging
 import sqlite3
 import sys
 from pathlib import Path
@@ -18,6 +21,7 @@ from fastapi.testclient import TestClient
 import httpx
 from hermes_cli.dashboard_auth.base import TokenPrincipal
 import pytest
+import yaml
 
 from agent.plugin_agent import PluginAgentRunner, PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
@@ -183,6 +187,20 @@ def _test_bundle_path(root: Path):
 def _assert_no_admission_residue(store: RunStore) -> None:
     assert list(store.runs_root.rglob("run.json")) == []
     assert list(store.staging_root.iterdir()) == []
+
+
+def _restamp_showcase_copy(root: Path, showcase_id: str) -> None:
+    catalog_path = root / "catalog.yaml"
+    manifest_path = root / "digests.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["catalog_sha256"] = sha256(catalog_path.read_bytes()).hexdigest()
+    manifest["packages"][showcase_id] = showcase_module._tree_digest(
+        root / "packages" / showcase_id
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
 
 
 class _LoopRunner:
@@ -386,7 +404,6 @@ def test_post_runs_admits_verified_showcase_in_background_and_joins_stably(
 @pytest.mark.parametrize(
     ("showcase_id", "status_code", "reason"),
     [
-        ("laptop-diagnostic", 422, "workflow_inputs_unsupported"),
         ("ai-extensions", 409, "workflow_showcase_cli_required"),
         ("scheduling", 409, "workflow_showcase_cli_required"),
     ],
@@ -416,6 +433,271 @@ def test_post_runs_rederives_showcase_run_support_without_persistence(
         "detail": {"code": reason, "retryable": False}
     }
     _assert_no_admission_residue(store)
+
+
+def test_post_runs_translates_authenticated_laptop_inputs_and_stages_fixture(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    symptom = "fictional startup delay"
+
+    response = TestClient(_app(_router())).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "laptop-diagnostic",
+            "catalog_source": "showcase",
+            "values": {"symptom": symptom},
+            "idempotency_key": "laptop-authenticated-inputs",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 202
+    run_id = response.json()["result"]["run_id"]
+    run_directory = store.run_directory(run_id)
+    manifest = json.loads((run_directory / "inputs.json").read_text())
+    assert set(manifest) == {"arguments", "evidence"}
+    assert symptom not in json.dumps(manifest)
+    assert (run_directory / manifest["arguments"]["relative_path"]).read_text() == (
+        symptom
+    )
+    assert (
+        run_directory / manifest["evidence"]["relative_path"]
+    ).read_bytes() == (
+        Path(showcase_module.__file__).with_name("showcases")
+        / "packages/laptop-diagnostic/fixtures/laptop-snapshot.json"
+    ).read_bytes()
+
+
+def test_post_runs_uses_once_verified_fixture_bytes_after_source_mutation(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(copied),
+    )
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    fixture = copied / "packages/laptop-diagnostic/fixtures/laptop-snapshot.json"
+    authenticated = fixture.read_bytes()
+    authenticated_digest = sha256(authenticated).hexdigest()
+    mutated = b'{"MUTATED_AFTER_VERIFICATION":true}\n'
+    observed_verified_inputs = None
+    original_prepare = RunStore.prepare_run_snapshot
+
+    def mutate_before_snapshot(self, package, *args, **kwargs):
+        nonlocal observed_verified_inputs
+        observed_verified_inputs = kwargs.get("verified_inputs")
+        fixture.write_bytes(mutated)
+        return original_prepare(self, package, *args, **kwargs)
+
+    monkeypatch.setattr(RunStore, "prepare_run_snapshot", mutate_before_snapshot)
+    store = RunStore(home)
+    _healthy_coordinator(store)
+
+    response = TestClient(_app(_router()), raise_server_exceptions=False).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "laptop-diagnostic",
+            "catalog_source": "showcase",
+            "values": {"symptom": "fictional slow startup"},
+            "idempotency_key": "laptop-read-once",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 202
+    assert observed_verified_inputs == {
+        "evidence": (authenticated, authenticated_digest)
+    }
+    run_directory = store.run_directory(response.json()["result"]["run_id"])
+    manifest = json.loads((run_directory / "inputs.json").read_text())
+    sealed_fixture = run_directory / manifest["evidence"]["relative_path"]
+    assert sealed_fixture.read_bytes() == authenticated
+    assert manifest["evidence"]["sha256"] == authenticated_digest
+    assert mutated not in sealed_fixture.read_bytes()
+    assert fixture.read_bytes() == mutated
+
+
+@pytest.mark.parametrize("reserved_name", ["arguments", "evidence"])
+def test_post_runs_refuses_authenticated_internal_or_fixture_owned_names(
+    tmp_path, monkeypatch, reserved_name
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    canary = "RESERVED-INPUT-CANARY"
+
+    response = TestClient(_app(_router())).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "laptop-diagnostic",
+            "catalog_source": "showcase",
+            "values": {reserved_name: canary},
+            "idempotency_key": f"reserved-{reserved_name}",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "workflow_inputs_invalid"
+    assert canary not in response.text
+    _assert_no_admission_residue(store)
+
+
+def test_post_runs_legacy_flat_workflow_still_accepts_arguments(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, workflow_writer, name="legacy-arguments")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+
+    response = TestClient(_app(_router())).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "legacy-arguments",
+            "values": {"arguments": "ordinary portable input"},
+            "idempotency_key": "legacy-arguments",
+            "concurrency_policy": "allow",
+        },
+    )
+
+    assert response.status_code == 202
+
+
+def test_post_runs_authenticated_input_identity_joins_and_conflicts(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    client = TestClient(_app(_router()))
+    body = {
+        "workflow": "laptop-diagnostic",
+        "catalog_source": "showcase",
+        "values": {"symptom": "same fictional symptom"},
+        "idempotency_key": "laptop-input-identity",
+        "concurrency_policy": "queue",
+    }
+
+    created = client.post("/api/plugins/workflow/runs", json=body)
+    joined = client.post("/api/plugins/workflow/runs", json=body)
+    changed = client.post(
+        "/api/plugins/workflow/runs",
+        json={**body, "values": {"symptom": "changed fictional symptom"}},
+    )
+
+    assert created.status_code == joined.status_code == 202
+    assert created.json()["result"]["admission_disposition"] == "created"
+    assert joined.json()["result"]["admission_disposition"] == "existing"
+    assert changed.status_code == 409
+    assert changed.json()["detail"]["code"] == "idempotency_conflict"
+
+
+def test_post_runs_changed_authenticated_fixture_identity_conflicts_without_raw_data(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    home = tmp_path / "home"
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(copied),
+    )
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    client = TestClient(_app(_router()))
+    symptom_canary = "SYMPTOM-CANARY-4f81e6"
+    fixture_canary = "FIXTURE-CANARY-9a2d73"
+    body = {
+        "workflow": "laptop-diagnostic",
+        "catalog_source": "showcase",
+        "values": {"symptom": symptom_canary},
+        "idempotency_key": "laptop-fixture-identity",
+        "concurrency_policy": "queue",
+    }
+    captured_requests = []
+    original_start_digest = RunStore._start_digest
+
+    def capture_start_digest(request):
+        captured_requests.append(request)
+        return original_start_digest(request)
+
+    monkeypatch.setattr(RunStore, "_start_digest", staticmethod(capture_start_digest))
+    caplog.set_level(logging.DEBUG)
+    created = client.post("/api/plugins/workflow/runs", json=body)
+    assert created.status_code == 202
+    run_id = created.json()["result"]["run_id"]
+    fixture = copied / "packages/laptop-diagnostic/fixtures/laptop-snapshot.json"
+    fixture.write_text(json.dumps({"fixture": fixture_canary}) + "\n")
+    _restamp_showcase_copy(copied, "laptop-diagnostic")
+    showcase_module._clear_verified_showcase_cache_for_tests()
+
+    conflict = client.post("/api/plugins/workflow/runs", json=body)
+
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "idempotency_conflict"
+    assert len(captured_requests) >= 2
+    assert captured_requests[0].input_manifest_digest != (
+        captured_requests[-1].input_manifest_digest
+    )
+    start_identity = json.dumps(
+        {
+            "inputs": captured_requests[-1].input_manifest_digest,
+            "run_metadata": captured_requests[-1].run_metadata,
+        },
+        sort_keys=True,
+    )
+    status = store.get_run_status(run_id)
+    durable_events = json.dumps(store.tail_events(run_id), sort_keys=True)
+    responses = [
+        created.content,
+        conflict.content,
+        client.get("/api/plugins/workflow/runs").content,
+        client.get(f"/api/plugins/workflow/runs/{run_id}").content,
+        client.get(f"/api/plugins/workflow/runs/{run_id}/events").content,
+        client.get(
+            f"/api/plugins/workflow/runs/{run_id}/evidence",
+            params={"kind": "timeline"},
+        ).content,
+        start_identity.encode(),
+        json.dumps(status["run_metadata"], sort_keys=True).encode(),
+        durable_events.encode(),
+        "\n".join(record.getMessage() for record in caplog.records).encode(),
+    ]
+    for canary in (symptom_canary.encode(), fixture_canary.encode()):
+        assert all(canary not in response for response in responses)
+    manifest = json.loads(
+        (store.run_directory(run_id) / "inputs.json").read_text(encoding="utf-8")
+    )
+    assert set(manifest) == {"arguments", "evidence"}
+    assert all(
+        set(record) == {
+            "relative_path",
+            "size_bytes",
+            "media_type",
+            "sha256",
+        }
+        for record in manifest.values()
+    )
+    assert status["input_manifest_digest"] == captured_requests[0].input_manifest_digest
 
 
 def test_post_runs_rejects_environment_incompatible_showcase_before_persistence(
@@ -536,6 +818,56 @@ def test_post_runs_showcase_force_reverification_rejects_cached_bundle_mutation(
             "catalog_source": "showcase",
             "values": {},
             "idempotency_key": "mutated-showcase",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "workflow_showcase_verification_failed",
+            "retryable": False,
+        }
+    }
+    _assert_no_admission_residue(store)
+
+
+@pytest.mark.parametrize("tampered_resource", ["catalog", "fixture"])
+def test_post_runs_tampered_authenticated_input_bundle_fails_without_residue(
+    tmp_path, monkeypatch, tampered_resource
+) -> None:
+    home = tmp_path / "home"
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(copied),
+    )
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    if tampered_resource == "catalog":
+        resource = copied / "catalog.yaml"
+        resource.write_text(
+            resource.read_text(encoding="utf-8") + "tampered: true\n",
+            encoding="utf-8",
+        )
+    else:
+        resource = (
+            copied
+            / "packages/laptop-diagnostic/fixtures/laptop-snapshot.json"
+        )
+        resource.write_text('{"tampered":true}\n', encoding="utf-8")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+
+    response = TestClient(_app(_router())).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "laptop-diagnostic",
+            "catalog_source": "showcase",
+            "values": {"symptom": "fictional symptom"},
+            "idempotency_key": f"tampered-{tampered_resource}",
             "concurrency_policy": "queue",
         },
     )

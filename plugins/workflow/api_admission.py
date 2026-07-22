@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 import shutil
 import sqlite3
@@ -254,6 +255,30 @@ def start_api_run(
             else None
         ),
     )
+    verified_inputs: dict[str, tuple[bytes, str]] = {}
+    if scenario is not None:
+        translated_values = dict(values)
+        assert isinstance(value_bindings, Mapping)
+        assert isinstance(fixture_mapping, Mapping)
+        for public_name, internal_name in value_bindings.items():
+            if public_name in translated_values:
+                translated_values[str(internal_name)] = translated_values.pop(
+                    public_name
+                )
+        try:
+            for internal_name, relative_path in fixture_mapping.items():
+                fixture_bytes = resource_budget.read_cached(
+                    package.root / str(relative_path)
+                )
+                verified_inputs[str(internal_name)] = (
+                    fixture_bytes,
+                    hashlib.sha256(fixture_bytes).hexdigest(),
+                )
+        except WorkflowResourceCacheMissError as exc:
+            raise ApiAdmissionError(
+                "workflow_showcase_verification_failed", status_code=409
+            ) from exc
+        values = translated_values
 
     compatibility = assess_compatibility(package)
     try:
@@ -335,6 +360,7 @@ def start_api_run(
         prepared = store.prepare_run_snapshot(
             package,
             values=values or None,
+            verified_inputs=verified_inputs or None,
             resource_read_budget=resource_budget,
             trusted_package_digest=package_digest,
         )

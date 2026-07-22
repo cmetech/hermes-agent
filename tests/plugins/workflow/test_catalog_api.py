@@ -138,16 +138,32 @@ def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compa
         "supported": True,
         "reason": "supported",
     }
-    assert showcase_rows["resilience"]["run_support"]["supported"] is True
-    assert showcase_rows["laptop-diagnostic"]["run_support"] == {
-        "supported": False,
-        "reason": "unsupported_inputs",
+    laptop = showcase_rows["laptop-diagnostic"]
+    assert laptop["inputs"] == [
+        {"name": "evidence", "type": "file", "required": True},
+        {"name": "symptom", "type": "text", "required": True, "max_bytes": 4096},
+    ]
+    assert laptop["supported_inputs"] == {
+        "supported": True,
+        "reason": "flat_inputs",
     }
-    for name in ("ai-extensions", "scheduling"):
-        assert showcase_rows[name]["run_support"] == {
+    support_table = {
+        name: row["run_support"] for name, row in showcase_rows.items()
+    }
+    assert support_table == {
+        "approval-gate": {"supported": True, "reason": "supported"},
+        "laptop-diagnostic": {"supported": True, "reason": "supported"},
+        "resilience": {"supported": True, "reason": "supported"},
+        "ai-extensions": {
             "supported": False,
             "reason": "showcase_cli_required",
-        }
+        },
+        "scheduling": {
+            "supported": False,
+            "reason": "showcase_cli_required",
+        },
+    }
+    assert sum(row["supported"] for row in support_table.values()) == 3
     assert showcase_rows["ai-extensions"]["compatibility"]["runnable"] is False
     assert payload["truncated"] is False
 

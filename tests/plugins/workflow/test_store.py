@@ -10,6 +10,7 @@ import pytest
 
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import InputSnapshotError, RunStore, StorageQuotaError
+from plugins.workflow.trust import WorkflowResourceReadBudget
 
 
 def test_store_connection_context_closes_the_database_handle(tmp_path) -> None:
@@ -38,6 +39,30 @@ def test_prepare_snapshot_copies_inputs_immutably(tmp_path, workflow_writer):
     captured = prepared.staging_directory / manifest["evidence"]["relative_path"]
     assert captured.read_text(encoding="utf-8") == "original"
     assert manifest["evidence"]["sha256"] == prepared.input_digests["evidence"]
+
+
+def test_local_input_channel_reopens_caller_path_after_an_unrelated_cached_read(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = load_workflow(workflow_writer(tmp_path / "package", name="local-input"))
+    source = tmp_path / "evidence.txt"
+    source.write_bytes(b"authenticated-earlier")
+    budget = WorkflowResourceReadBudget(
+        max_file_bytes=1024,
+        max_total_bytes=1024,
+        max_files=4,
+    )
+    assert budget.read(source) == b"authenticated-earlier"
+    source.write_bytes(b"caller-mutated")
+
+    prepared = RunStore(tmp_path / "home").prepare_run_snapshot(
+        workflow,
+        inputs={"evidence": source},
+    )
+
+    manifest = json.loads((prepared.staging_directory / "inputs.json").read_text())
+    captured = prepared.staging_directory / manifest["evidence"]["relative_path"]
+    assert captured.read_bytes() == b"caller-mutated"
 
 
 def test_prepare_snapshot_captures_text_arguments_without_projecting_values(

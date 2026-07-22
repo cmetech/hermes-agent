@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -112,13 +113,21 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
             sys.executable,
             "-c",
             (
+                "import hashlib, json; "
                 "from plugins.workflow.showcase import "
                 "load_verified_showcase_package; "
                 "from plugins.workflow.trust import WorkflowResourceReadBudget; "
+                "budget=WorkflowResourceReadBudget("
+                "max_file_bytes=1048576, max_total_bytes=8388608, max_files=512); "
                 "record=load_verified_showcase_package("
-                "'approval-gate', read_budget=WorkflowResourceReadBudget("
-                "max_file_bytes=1048576, max_total_bytes=8388608, max_files=512)); "
-                "print(record.scenario.id, record.scenario.verified_bundled_provenance)"
+                "'laptop-diagnostic', read_budget=budget); "
+                "fixture=budget.read_cached(record.package.root / "
+                "record.scenario.input_fixtures['evidence']); "
+                "print(json.dumps({'id': record.scenario.id, "
+                "'verified': record.scenario.verified_bundled_provenance, "
+                "'fixtures': dict(record.scenario.input_fixtures), "
+                "'bindings': dict(record.scenario.input_value_bindings), "
+                "'fixture_sha256': hashlib.sha256(fixture).hexdigest()}))"
             ),
         ],
         cwd=tmp_path,
@@ -128,7 +137,24 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
         timeout=120,
     )
     assert showcase_probe.returncode == 0, showcase_probe.stderr
-    assert showcase_probe.stdout.strip() == "approval-gate True"
+    installed_showcase = json.loads(showcase_probe.stdout)
+    bundled_fixture = (
+        REPO_ROOT
+        / "plugins"
+        / "workflow"
+        / "showcases"
+        / "packages"
+        / "laptop-diagnostic"
+        / "fixtures"
+        / "laptop-snapshot.json"
+    )
+    assert installed_showcase == {
+        "id": "laptop-diagnostic",
+        "verified": True,
+        "fixtures": {"evidence": "fixtures/laptop-snapshot.json"},
+        "bindings": {"symptom": "arguments"},
+        "fixture_sha256": hashlib.sha256(bundled_fixture.read_bytes()).hexdigest(),
+    }
 
     fixture = (
         REPO_ROOT
