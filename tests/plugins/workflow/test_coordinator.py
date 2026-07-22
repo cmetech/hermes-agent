@@ -1404,9 +1404,14 @@ def test_sweep_cursor_never_skips_page_prefix_when_wake_consumes_budget(
         scheduler,
     )
 
-    assert cursor is None
-    scheduler.submit.assert_called_once_with(
-        admitted[-1], ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    submitted = [call.args[0] for call in scheduler.submit.call_args_list]
+    assert submitted
+    assert submitted == admitted[: len(submitted)]
+    last_submitted = store.load_run(submitted[-1])
+    assert cursor == (last_submitted["created_at"], submitted[-1])
+    assert all(
+        call.args[1] == ExecutionFence(identity.owner_id, leadership.lease.epoch)
+        for call in scheduler.submit.call_args_list
     )
 
 

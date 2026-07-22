@@ -4095,18 +4095,15 @@ class RunStore:
 
         second = observed.isoformat(timespec="seconds").removesuffix("+00:00")
         fractional_bound = f"{second}.{observed.microsecond:06d}"
-        clauses = [
+        common_clauses = [
             "admission_state='published'",
             "status='queued'",
             "execution_mode IN ('background','foreground')",
             "scheduled_at IS NOT NULL",
-            "(scheduled_at<? OR scheduled_at=? OR scheduled_at=?)",
         ]
-        values: list[object] = [
-            fractional_bound,
-            f"{second}Z",
-            f"{fractional_bound}Z",
-        ]
+        common = " AND ".join(common_clauses)
+        outer_clauses: list[str] = []
+        outer_values: list[object] = []
         if lower_observed is not None:
             lower_second = lower_observed.isoformat(timespec="seconds").removesuffix(
                 "+00:00"
@@ -4114,10 +4111,10 @@ class RunStore:
             lower_fractional_bound = (
                 f"{lower_second}.{lower_observed.microsecond:06d}"
             )
-            clauses.append(
+            outer_clauses.append(
                 "NOT (scheduled_at<? OR scheduled_at=? OR scheduled_at=?)"
             )
-            values.extend(
+            outer_values.extend(
                 (
                     lower_fractional_bound,
                     f"{lower_second}Z",
@@ -4125,17 +4122,35 @@ class RunStore:
                 )
             )
         if after is not None:
-            clauses.append(
+            outer_clauses.append(
                 "(created_at>? OR (created_at=? AND run_id>?))"
             )
-            values.extend((after[0], after[0], after[1]))
+            outer_values.extend((after[0], after[0], after[1]))
+        columns = "run_id, created_at, status, execution_mode, scheduled_at"
+        due_query = (
+            f"SELECT {columns} FROM runs INDEXED BY runs_scheduled_queue "
+            f"WHERE {common} AND scheduled_at<? "
+            "UNION ALL "
+            f"SELECT {columns} FROM runs INDEXED BY runs_scheduled_queue "
+            f"WHERE {common} AND scheduled_at=? "
+            "UNION ALL "
+            f"SELECT {columns} FROM runs INDEXED BY runs_scheduled_queue "
+            f"WHERE {common} AND scheduled_at=?"
+        )
+        outer_where = (
+            " WHERE " + " AND ".join(outer_clauses) if outer_clauses else ""
+        )
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT run_id, created_at, status, execution_mode, scheduled_at "
-                "FROM runs WHERE "
-                + " AND ".join(clauses)
-                + " ORDER BY created_at, run_id LIMIT ?",
-                (*values, limit + 1),
+                f"SELECT {columns} FROM ({due_query})"
+                f"{outer_where} ORDER BY created_at, run_id LIMIT ?",
+                (
+                    fractional_bound,
+                    f"{second}Z",
+                    f"{fractional_bound}Z",
+                    *outer_values,
+                    limit + 1,
+                ),
             ).fetchall()
         for row in rows:
             projection = self.load_run(str(row["run_id"]))

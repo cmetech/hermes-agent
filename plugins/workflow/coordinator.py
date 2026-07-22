@@ -93,12 +93,6 @@ class WorkflowCoordinatorService:
         self._runner_binding = runner_binding
         self._boot_id = current_boot_id()
         self._notification_repair_due_at = 0.0
-        self._scheduled_sweep_cursor: tuple[str, str] | None = None
-        self._scheduled_sweep_cutoff: datetime | None = None
-        self._scheduled_observed_at: datetime | None = None
-        self._scheduled_rescue_lower: datetime | None = None
-        self._scheduled_rescue_upper: datetime | None = None
-        self._scheduled_rescue_cursor: tuple[str, str] | None = None
         self._health_lock = threading.Lock()
         self._health = BackgroundServiceHealth(
             state="starting",
@@ -311,75 +305,70 @@ class WorkflowCoordinatorService:
                 owner_id=f"coordinator:{identity.owner_id}:{epoch}",
             )
         now = self._utcnow().astimezone(timezone.utc)
-        if self._scheduled_sweep_cutoff is None or self._scheduled_sweep_cutoff > now:
-            self._scheduled_sweep_cutoff = now
-            self._scheduled_sweep_cursor = None
-        if self._scheduled_observed_at is None or self._scheduled_observed_at > now:
-            self._scheduled_observed_at = now
-            self._scheduled_rescue_lower = None
-            self._scheduled_rescue_upper = None
-            self._scheduled_rescue_cursor = None
-        elif self._scheduled_rescue_upper is None and now > self._scheduled_observed_at:
-            self._scheduled_rescue_lower = self._scheduled_observed_at
-            self._scheduled_rescue_upper = now
-            self._scheduled_rescue_cursor = None
         wakes = coordinator_store.pending_wakes(
             identity,
             epoch=epoch,
             now=now,
             limit=100,
         )
-        rescue_active = self._scheduled_rescue_upper is not None
-        scheduled, scheduled_page_cursor, scheduled_page_exhausted = (
+        scheduled, _scheduled_cursor, _scheduled_exhausted = (
             run_store.scheduled_coordinator_candidates(
-                after=self._scheduled_sweep_cursor,
-                now=self._scheduled_sweep_cutoff,
-                limit=25 if rescue_active else 50,
+                after=None,
+                now=now,
+                limit=100,
             )
         )
-        if rescue_active:
-            rescued, rescue_page_cursor, rescue_page_exhausted = (
-                run_store.scheduled_coordinator_candidates(
-                    after=self._scheduled_rescue_cursor,
-                    now=self._scheduled_rescue_upper,
-                    not_before=self._scheduled_rescue_lower,
-                    limit=25,
-                )
-            )
-        else:
-            rescued = ()
-            rescue_page_cursor = self._scheduled_rescue_cursor
-            rescue_page_exhausted = True
-        scheduled_by_run = {
-            str(row["run_id"]): row for row in (*scheduled, *rescued)
-        }
+        scheduled_by_run = {str(row["run_id"]): row for row in scheduled}
         periodic, _page_cursor, page_exhausted = run_store.coordinator_candidates(
             after=cursor,
             now=now,
-            limit=max(1, 100 - len(scheduled_by_run)),
+            limit=100,
         )
         wake_by_run: dict[str, list[object]] = {}
         for wake in wakes:
             wake_by_run.setdefault(wake.run_id, []).append(wake)
-        wake_run_ids = list(wake_by_run)
         periodic_by_run = {str(row["run_id"]): row for row in periodic}
         indexed_by_run = {**scheduled_by_run, **periodic_by_run}
-        indexed_run_ids = [
+        uncorroborated_wake_ids: list[str] = []
+        for run_id in wake_by_run:
+            if run_id in indexed_by_run:
+                continue
+            try:
+                projection = run_store.load_run(run_id)
+                scheduled_at = run_store._scheduled_at_from_projection(projection)
+                created_at = str(projection["created_at"])
+            except Exception:
+                uncorroborated_wake_ids.append(run_id)
+            else:
+                if (
+                    projection.get("status") == "queued"
+                    and scheduled_at is not None
+                    and rfc3339_instant_is_after(scheduled_at, now)
+                ):
+                    for wake in wake_by_run[run_id]:
+                        coordinator_store.complete_wake(
+                            wake.generation,
+                            identity,
+                            epoch=epoch,
+                            now=self._utcnow().astimezone(timezone.utc),
+                            outcome="scheduled_not_due",
+                        )
+                    continue
+                indexed_by_run[run_id] = {
+                    "run_id": run_id,
+                    "created_at": created_at,
+                }
+        ordered_run_ids = uncorroborated_wake_ids + [
             str(row["run_id"])
             for row in sorted(
                 indexed_by_run.values(),
                 key=lambda row: (str(row["created_at"]), str(row["run_id"])),
-            )
-        ]
-        ordered_run_ids = wake_run_ids + [
-            run_id for run_id in indexed_run_ids if run_id not in wake_by_run
+            )[: max(0, 100 - len(uncorroborated_wake_ids))]
         ]
         actionable_work = False
         progress_at: datetime | None = None
         processed_runs: set[str] = set()
         processed_periodic_cursor = cursor
-        processed_scheduled_cursor = self._scheduled_sweep_cursor
-        processed_rescue_cursor = self._scheduled_rescue_cursor
         for run_id in ordered_run_ids:
             if self._monotonic() >= deadline:
                 break
@@ -447,40 +436,6 @@ class WorkflowCoordinatorService:
                     outcome=outcome,
                 )
         processed_page = True
-        processed_scheduled_page = True
-        for row in scheduled:
-            if str(row["run_id"]) not in processed_runs:
-                processed_scheduled_page = False
-                break
-            processed_scheduled_cursor = (
-                str(row["created_at"]),
-                str(row["run_id"]),
-            )
-        self._scheduled_sweep_cursor = (
-            None
-            if scheduled_page_exhausted and processed_scheduled_page
-            else processed_scheduled_cursor
-        )
-        if scheduled_page_exhausted and processed_scheduled_page:
-            self._scheduled_sweep_cutoff = None
-        processed_rescue_page = True
-        for row in rescued:
-            if str(row["run_id"]) not in processed_runs:
-                processed_rescue_page = False
-                break
-            processed_rescue_cursor = (
-                str(row["created_at"]),
-                str(row["run_id"]),
-            )
-        self._scheduled_rescue_cursor = (
-            None
-            if rescue_page_exhausted and processed_rescue_page
-            else processed_rescue_cursor
-        )
-        if rescue_active and rescue_page_exhausted and processed_rescue_page:
-            self._scheduled_observed_at = self._scheduled_rescue_upper
-            self._scheduled_rescue_lower = None
-            self._scheduled_rescue_upper = None
         for row in periodic:
             if str(row["run_id"]) not in processed_runs:
                 processed_page = False
@@ -509,12 +464,6 @@ class WorkflowCoordinatorService:
             run_store,
             fence=ExecutionFence(identity.owner_id, epoch),
         )
-        self._scheduled_sweep_cursor = None
-        self._scheduled_sweep_cutoff = None
-        self._scheduled_observed_at = None
-        self._scheduled_rescue_lower = None
-        self._scheduled_rescue_upper = None
-        self._scheduled_rescue_cursor = None
         pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="workflow-sweep")
         future: Future | None = None
         backoff_index = 0

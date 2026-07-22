@@ -117,6 +117,27 @@ def _leader(
     return coordinator, identity, acquired.lease.epoch
 
 
+def _complete_pending_wakes(
+    coordinator: CoordinatorStore,
+    identity: CoordinatorIdentity,
+    epoch: int,
+    *,
+    now: datetime,
+) -> None:
+    while True:
+        wakes = coordinator.pending_wakes(identity, epoch=epoch, now=now, limit=100)
+        if not wakes:
+            return
+        for wake in wakes:
+            assert coordinator.complete_wake(
+                wake.generation,
+                identity,
+                epoch=epoch,
+                now=now,
+                outcome="test_setup",
+            )
+
+
 def test_real_pending_wake_completes_not_due_then_indexed_sweep_submits_once(
     tmp_path: Path,
     workflow_writer,
@@ -387,7 +408,6 @@ def test_real_sweep_rescues_newly_due_work_behind_both_active_cursors(
     )
 
     assert normal_cursor is not None
-    assert service._scheduled_sweep_cursor is not None
     assert not any(
         call.args[0] == newly_due.run_id for call in scheduler.submit.call_args_list
     )
@@ -399,6 +419,222 @@ def test_real_sweep_rescues_newly_due_work_behind_both_active_cursors(
     assert any(
         call.args[0] == newly_due.run_id for call in scheduler.submit.call_args_list
     )
+
+
+def test_consecutive_forward_jump_discovers_new_due_work_during_backlogs(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    t0 = datetime(2026, 4, 3, 12, 0, tzinfo=UTC)
+    t1 = t0 + timedelta(hours=1)
+    t2 = t1 + timedelta(hours=1)
+    clocks = _Clocks(t0)
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        max_queued_runs=200,
+        max_nonterminal_runs=200,
+        max_start_requests_per_minute=200,
+        lease_clock=clocks.lease_sample,
+    )
+    coordinator, identity, epoch = _leader(
+        store, clocks, name="consecutive-forward-jump"
+    )
+    package = _package(
+        workflow_writer, tmp_path / "package", name="consecutive-forward-jump"
+    )
+    newly_due_at_t2 = _admit(
+        store,
+        package,
+        key="newly-due-at-t2",
+        schedule_at=t2.isoformat().replace("+00:00", "Z"),
+    )
+    clocks.wall = t0 + timedelta(microseconds=1)
+    for index in range(51):
+        _admit(
+            store,
+            package,
+            key=f"newly-due-at-t1-{index:03d}",
+            schedule_at=t1.isoformat().replace("+00:00", "Z"),
+        )
+    clocks.wall = t0 + timedelta(microseconds=2)
+    for index in range(101):
+        _admit(
+            store,
+            package,
+            key=f"base-due-{index:03d}",
+            schedule_at=(t0 - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        )
+    clocks.wall = t0
+    _complete_pending_wakes(coordinator, identity, epoch, now=clocks.wall)
+
+    service = _service(tmp_path / "home", clocks)
+    scheduler = MagicMock()
+    scheduler.submit.return_value = True
+    _actionable, ordinary_cursor, _progress = service._sweep_once(
+        store, coordinator, identity, epoch, scheduler
+    )
+
+    clocks.wall = t1
+    _actionable, ordinary_cursor, _progress = service._sweep_once(
+        store, coordinator, identity, epoch, scheduler, ordinary_cursor
+    )
+    assert not any(
+        call.args[0] == newly_due_at_t2.run_id
+        for call in scheduler.submit.call_args_list
+    )
+
+    scheduler.reset_mock()
+    clocks.wall = t2
+    service._sweep_once(store, coordinator, identity, epoch, scheduler, ordinary_cursor)
+
+    assert any(
+        call.args[0] == newly_due_at_t2.run_id
+        for call in scheduler.submit.call_args_list
+    )
+
+
+def test_due_and_ordinary_candidates_share_one_global_admission_order(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 4, 12, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        max_queued_runs=100,
+        max_nonterminal_runs=100,
+        max_start_requests_per_minute=100,
+        lease_clock=clocks.lease_sample,
+    )
+    coordinator, identity, epoch = _leader(store, clocks, name="global-admission-order")
+    package = _package(
+        workflow_writer, tmp_path / "package", name="global-admission-order"
+    )
+    scheduled = [
+        _admit(
+            store,
+            package,
+            key=f"older-scheduled-{index:03d}",
+            schedule_at=(clocks.wall - timedelta(hours=1))
+            .isoformat()
+            .replace("+00:00", "Z"),
+        )
+        for index in range(51)
+    ]
+    clocks.wall += timedelta(microseconds=1)
+    ordinary = _admit(store, package, key="newer-ordinary", schedule_at=None)
+    _complete_pending_wakes(coordinator, identity, epoch, now=clocks.wall)
+    service = _service(tmp_path / "home", clocks)
+    scheduler = MagicMock()
+    scheduler.submit.return_value = True
+
+    service._sweep_once(store, coordinator, identity, epoch, scheduler)
+
+    submitted = [call.args[0] for call in scheduler.submit.call_args_list]
+    assert set(submitted[:51]) == {run.run_id for run in scheduled}
+    assert submitted[51] == ordinary.run_id
+
+
+def test_newer_pending_wake_does_not_bypass_older_due_admissions(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    admitted_at = datetime(2026, 4, 4, 13, 0, tzinfo=UTC)
+    due_at = admitted_at + timedelta(hours=1)
+    clocks = _Clocks(admitted_at)
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        max_queued_runs=100,
+        max_nonterminal_runs=100,
+        max_start_requests_per_minute=100,
+        lease_clock=clocks.lease_sample,
+    )
+    coordinator, identity, epoch = _leader(
+        store, clocks, name="wake-global-admission-order"
+    )
+    package = _package(
+        workflow_writer, tmp_path / "package", name="wake-global-admission-order"
+    )
+    scheduled = [
+        _admit(
+            store,
+            package,
+            key=f"older-future-{index:03d}",
+            schedule_at=due_at.isoformat().replace("+00:00", "Z"),
+        )
+        for index in range(51)
+    ]
+    _complete_pending_wakes(coordinator, identity, epoch, now=clocks.wall)
+    clocks.wall += timedelta(microseconds=1)
+    ordinary = _admit(store, package, key="newer-wake", schedule_at=None)
+    clocks.wall = due_at
+    service = _service(tmp_path / "home", clocks)
+    scheduler = MagicMock()
+    scheduler.submit.return_value = True
+
+    service._sweep_once(store, coordinator, identity, epoch, scheduler)
+
+    submitted = [call.args[0] for call in scheduler.submit.call_args_list]
+    assert set(submitted[:51]) == {run.run_id for run in scheduled}
+    assert submitted[51] == ordinary.run_id
+
+
+def test_future_wake_is_completed_outside_a_full_execution_order_page(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 4, 15, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        max_queued_runs=150,
+        max_nonterminal_runs=150,
+        max_start_requests_per_minute=150,
+        lease_clock=clocks.lease_sample,
+    )
+    coordinator, identity, epoch = _leader(
+        store, clocks, name="administrative-future-wake"
+    )
+    package = _package(
+        workflow_writer, tmp_path / "package", name="administrative-future-wake"
+    )
+    for index in range(100):
+        _admit(
+            store,
+            package,
+            key=f"older-due-{index:03d}",
+            schedule_at=(clocks.wall - timedelta(hours=1))
+            .isoformat()
+            .replace("+00:00", "Z"),
+        )
+    _complete_pending_wakes(coordinator, identity, epoch, now=clocks.wall)
+    clocks.wall += timedelta(microseconds=1)
+    future = _admit(
+        store,
+        package,
+        key="future-outside-execution-page",
+        schedule_at=(clocks.wall + timedelta(days=365))
+        .isoformat()
+        .replace("+00:00", "Z"),
+    )
+    service = _service(tmp_path / "home", clocks)
+    scheduler = MagicMock()
+    scheduler.submit.return_value = True
+
+    service._sweep_once(store, coordinator, identity, epoch, scheduler)
+
+    assert not any(
+        call.args[0] == future.run_id for call in scheduler.submit.call_args_list
+    )
+    with store._connect() as connection:
+        wake = connection.execute(
+            "SELECT completed_at, outcome FROM coordinator_wakes WHERE run_id=?",
+            (future.run_id,),
+        ).fetchone()
+    assert wake["completed_at"] is not None
+    assert wake["outcome"] == "scheduled_not_due"
 
 
 def test_exact_future_schedule_filtering_is_bounded_and_eventually_eligible(
@@ -510,6 +746,75 @@ def test_exact_future_schedule_filtering_is_bounded_and_eventually_eligible(
             break
 
     assert future_ids <= discovered
+
+
+def test_scheduled_due_query_vm_work_is_bounded_before_future_rows(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 5, 12, 0, 0, 123456, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        max_queued_runs=350,
+        max_nonterminal_runs=350,
+        max_start_requests_per_minute=350,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(store, clocks, name="bounded-sql-work")
+    package = _package(workflow_writer, tmp_path / "package", name="bounded-sql-work")
+    future = "2026-04-05T12:00:00.1234561Z"
+
+    for index in range(10):
+        _admit(
+            store,
+            package,
+            key=f"initial-future-{index:03d}",
+            schedule_at=future,
+        )
+
+    original_connect = store._connect
+    opcode_count = 0
+
+    def counted_connect():
+        nonlocal opcode_count
+        connection = original_connect()
+
+        def count_opcode() -> int:
+            nonlocal opcode_count
+            opcode_count += 1
+            return 0
+
+        connection.set_progress_handler(count_opcode, 1)
+        return connection
+
+    monkeypatch.setattr(store, "_connect", counted_connect)
+    rows, _cursor, exhausted = store.scheduled_coordinator_candidates(
+        after=None, limit=1, now=clocks.wall
+    )
+    assert rows == ()
+    assert exhausted is True
+    initial_opcodes = opcode_count
+
+    monkeypatch.setattr(store, "_connect", original_connect)
+    for index in range(300):
+        _admit(
+            store,
+            package,
+            key=f"additional-future-{index:03d}",
+            schedule_at=future,
+        )
+
+    opcode_count = 0
+    monkeypatch.setattr(store, "_connect", counted_connect)
+    rows, _cursor, exhausted = store.scheduled_coordinator_candidates(
+        after=None, limit=1, now=clocks.wall
+    )
+
+    assert rows == ()
+    assert exhausted is True
+    assert opcode_count <= initial_opcodes + 100
 
 
 def test_promotion_rechecks_due_atomically_after_wall_clock_moves_backward(
