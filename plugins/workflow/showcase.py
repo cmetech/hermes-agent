@@ -106,6 +106,8 @@ class _VerifiedShowcaseCacheEntry:
 
 _VERIFIED_SHOWCASE_CACHE: dict[str, _VerifiedShowcaseCacheEntry] = {}
 _VERIFIED_SHOWCASE_CACHE_LOCK = threading.Lock()
+_VERIFIED_SHOWCASE_VERIFY_LOCK = threading.Lock()
+_VERIFIED_SHOWCASE_CACHE_GENERATION = 0
 
 
 @dataclass(frozen=True)
@@ -543,8 +545,106 @@ def showcase_background_api_eligible(scenario: ShowcaseScenario) -> bool:
 
 
 def _clear_verified_showcase_cache_for_tests() -> None:
+    global _VERIFIED_SHOWCASE_CACHE_GENERATION
     with _VERIFIED_SHOWCASE_CACHE_LOCK:
+        _VERIFIED_SHOWCASE_CACHE_GENERATION += 1
         _VERIFIED_SHOWCASE_CACHE.clear()
+
+
+def _load_verified_showcase_cache_hit(
+    *,
+    resolved_root: Path,
+    bundle_digest: str,
+    read_budget: WorkflowResourceReadBudget,
+) -> dict[str, VerifiedShowcasePackage] | None:
+    global _VERIFIED_SHOWCASE_CACHE_GENERATION
+    with _VERIFIED_SHOWCASE_CACHE_LOCK:
+        cached = _VERIFIED_SHOWCASE_CACHE.get(bundle_digest)
+        generation = _VERIFIED_SHOWCASE_CACHE_GENERATION
+    if cached is None:
+        return None
+
+    tree_signature = _bundle_tree_signature(resolved_root, read_budget)
+    with _VERIFIED_SHOWCASE_CACHE_LOCK:
+        if (
+            generation != _VERIFIED_SHOWCASE_CACHE_GENERATION
+            or _VERIFIED_SHOWCASE_CACHE.get(bundle_digest) is not cached
+        ):
+            return None
+        if (
+            tree_signature
+            and cached.root == resolved_root
+            and cached.tree_signature == tree_signature
+        ):
+            return dict(cached.packages)
+        _VERIFIED_SHOWCASE_CACHE_GENERATION += 1
+        _VERIFIED_SHOWCASE_CACHE.clear()
+    return None
+
+
+def _verify_and_cache_showcase_packages(
+    *,
+    resolved_root: Path,
+    bundle_digest: str,
+    read_budget: WorkflowResourceReadBudget,
+) -> dict[str, VerifiedShowcasePackage]:
+    global _VERIFIED_SHOWCASE_CACHE_GENERATION
+    before_signature = _bundle_tree_signature(resolved_root, read_budget)
+    catalog = load_showcase_catalog(
+        read_budget=read_budget,
+        allow_repair=False,
+    )
+    verified: dict[str, VerifiedShowcasePackage] = {}
+    for scenario_id, scenario in catalog.items():
+        if not scenario.verified_bundled_provenance:
+            raise ShowcaseCatalogError(
+                "showcase lacks verified bundled distribution provenance"
+            )
+        package = _scenario_package(
+            scenario,
+            source="showcase",
+            precedence=3,
+            bundle_root=resolved_root,
+            read_budget=read_budget,
+        )
+        risk, compatibility = _verified_distribution_assessment(
+            scenario,
+            package,
+            read_budget,
+            enforce_runnable=False,
+        )
+        verified[scenario_id] = VerifiedShowcasePackage(
+            scenario=scenario,
+            package=package,
+            risk=risk,
+            compatibility=compatibility,
+            bundle_digest=bundle_digest,
+        )
+
+    after_signature = _bundle_tree_signature(resolved_root, read_budget)
+    postcheck_budget = _fresh_read_budget(read_budget)
+    assert postcheck_budget is not None
+    current_bundle_digest = _bundle_digest(resolved_root, postcheck_budget)
+    _charge_read_budget(read_budget, postcheck_budget)
+    if (
+        before_signature != after_signature
+        or bundle_digest != current_bundle_digest
+    ):
+        raise ShowcaseCatalogError(
+            "showcase bundle changed during verified loading"
+        )
+    if after_signature:
+        with _VERIFIED_SHOWCASE_CACHE_LOCK:
+            _VERIFIED_SHOWCASE_CACHE_GENERATION += 1
+            _VERIFIED_SHOWCASE_CACHE.clear()
+            _VERIFIED_SHOWCASE_CACHE[bundle_digest] = (
+                _VerifiedShowcaseCacheEntry(
+                    root=resolved_root,
+                    tree_signature=after_signature,
+                    packages=dict(verified),
+                )
+            )
+    return verified
 
 
 def load_verified_showcase_packages(
@@ -553,76 +653,39 @@ def load_verified_showcase_packages(
     force_reverify: bool = False,
 ) -> dict[str, VerifiedShowcasePackage]:
     """Load only the authenticated bundled distribution, with bounded caching."""
+    global _VERIFIED_SHOWCASE_CACHE_GENERATION
     if not isinstance(read_budget, WorkflowResourceReadBudget):
         raise TypeError("read_budget must be a WorkflowResourceReadBudget")
-    with _VERIFIED_SHOWCASE_CACHE_LOCK:
-        with _bundle_path() as root:
-            resolved_root = root.resolve(strict=True)
-            bundle_digest = _bundle_digest(resolved_root, read_budget)
-            before_signature = _bundle_tree_signature(resolved_root, read_budget)
-            cached = _VERIFIED_SHOWCASE_CACHE.get(bundle_digest)
-            if (
-                not force_reverify
-                and before_signature
-                and cached is not None
-                and cached.root == resolved_root
-                and cached.tree_signature == before_signature
-            ):
-                return dict(cached.packages)
-
-            catalog = load_showcase_catalog(
+    with _bundle_path() as root:
+        resolved_root = root.resolve(strict=True)
+        bundle_digest = _bundle_digest(resolved_root, read_budget)
+        if force_reverify:
+            with _VERIFIED_SHOWCASE_CACHE_LOCK:
+                _VERIFIED_SHOWCASE_CACHE_GENERATION += 1
+                _VERIFIED_SHOWCASE_CACHE.clear()
+        else:
+            cached = _load_verified_showcase_cache_hit(
+                resolved_root=resolved_root,
+                bundle_digest=bundle_digest,
                 read_budget=read_budget,
-                allow_repair=False,
             )
-            verified: dict[str, VerifiedShowcasePackage] = {}
-            for scenario_id, scenario in catalog.items():
-                if not scenario.verified_bundled_provenance:
-                    raise ShowcaseCatalogError(
-                        "showcase lacks verified bundled distribution provenance"
-                    )
-                package = _scenario_package(
-                    scenario,
-                    source="showcase",
-                    precedence=3,
-                    bundle_root=resolved_root,
+            if cached is not None:
+                return cached
+
+        with _VERIFIED_SHOWCASE_VERIFY_LOCK:
+            if not force_reverify:
+                cached = _load_verified_showcase_cache_hit(
+                    resolved_root=resolved_root,
+                    bundle_digest=bundle_digest,
                     read_budget=read_budget,
                 )
-                risk, compatibility = _verified_distribution_assessment(
-                    scenario,
-                    package,
-                    read_budget,
-                    enforce_runnable=False,
-                )
-                verified[scenario_id] = VerifiedShowcasePackage(
-                    scenario=scenario,
-                    package=package,
-                    risk=risk,
-                    compatibility=compatibility,
-                    bundle_digest=bundle_digest,
-                )
-
-            after_signature = _bundle_tree_signature(resolved_root, read_budget)
-            postcheck_budget = _fresh_read_budget(read_budget)
-            assert postcheck_budget is not None
-            current_bundle_digest = _bundle_digest(resolved_root, postcheck_budget)
-            _charge_read_budget(read_budget, postcheck_budget)
-            if (
-                before_signature != after_signature
-                or bundle_digest != current_bundle_digest
-            ):
-                raise ShowcaseCatalogError(
-                    "showcase bundle changed during verified loading"
-                )
-            if after_signature:
-                _VERIFIED_SHOWCASE_CACHE.clear()
-                _VERIFIED_SHOWCASE_CACHE[bundle_digest] = (
-                    _VerifiedShowcaseCacheEntry(
-                        root=resolved_root,
-                        tree_signature=after_signature,
-                        packages=dict(verified),
-                    )
-                )
-            return verified
+                if cached is not None:
+                    return cached
+            return _verify_and_cache_showcase_packages(
+                resolved_root=resolved_root,
+                bundle_digest=bundle_digest,
+                read_budget=read_budget,
+            )
 
 
 def load_verified_showcase_package(

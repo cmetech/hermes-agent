@@ -1272,7 +1272,7 @@ upstream_changes:
   - load_verified_showcase_package
   - load_verified_showcase_packages
   - showcase_background_api_eligible
-  - bounded verified showcase cache and tree signature
+  - bounded generation-checked verified showcase cache and tree signature
   - visibility-permissive execution-strict compatibility deviation
   tests:
   - tests/plugins/workflow/test_installed_distribution_e2e.py
@@ -1282,7 +1282,9 @@ upstream_changes:
   upstream_candidate: true
   merge_guidance: Preserve rootless bundled loading, no-repair HTTP semantics,
     strict atomic bundle integrity, bounded digest reads, signature-invalidated
-    process caching, coalesced misses, and fresh admission re-verification.
+    process caching, narrow cache-lock scope with outside-lock hit verification,
+    generation-checked returns, coalesced misses, and fresh admission
+    re-verification.
     Environment incompatibility must remain a per-scenario projection concern,
     while CLI execution and API admission remain compatibility-strict.
   removal_condition: Remove when upstream has an equivalent bounded cached

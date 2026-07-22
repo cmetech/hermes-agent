@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 import shutil
 import subprocess
+import threading
 import time
 
 import pytest
@@ -183,6 +184,175 @@ def test_verified_loader_coalesces_concurrent_cache_misses(
 
     assert all("approval-gate" in result for result in results)
     assert concurrent_calls == digest_calls
+
+
+def test_verified_loader_warm_hits_verify_outside_cache_lock_and_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield copied
+
+    def budget() -> WorkflowResourceReadBudget:
+        return WorkflowResourceReadBudget(
+            max_file_bytes=1024 * 1024,
+            max_total_bytes=8 * 1024 * 1024,
+            max_files=512,
+        )
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+    original_cache_lock = showcase_module._VERIFIED_SHOWCASE_CACHE_LOCK
+
+    class CacheLockProbe:
+        def __init__(self) -> None:
+            self._lock = original_cache_lock
+            self._owner = threading.local()
+
+        def __enter__(self):
+            self._lock.acquire()
+            self._owner.held = True
+            return self
+
+        def __exit__(self, *_exc_info) -> None:
+            self._owner.held = False
+            self._lock.release()
+
+        def locked(self) -> bool:
+            return self._lock.locked()
+
+        def held_by_current_thread(self) -> bool:
+            return getattr(self._owner, "held", False)
+
+    cache_lock_probe = CacheLockProbe()
+    monkeypatch.setattr(
+        showcase_module,
+        "_VERIFIED_SHOWCASE_CACHE_LOCK",
+        cache_lock_probe,
+    )
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    showcase_module.load_verified_showcase_packages(read_budget=budget())
+
+    original_bundle_digest = showcase_module._bundle_digest
+    original_tree_signature = showcase_module._bundle_tree_signature
+    observations: list[tuple[str, bool]] = []
+    active_signatures = 0
+    active_lock = threading.Lock()
+    signatures_overlap = threading.Event()
+    release_signatures = threading.Event()
+
+    def probed_bundle_digest(*args, **kwargs):
+        observations.append(
+            ("bundle_digest", cache_lock_probe.held_by_current_thread())
+        )
+        return original_bundle_digest(*args, **kwargs)
+
+    def probed_tree_signature(*args, **kwargs):
+        nonlocal active_signatures
+        observations.append(
+            ("tree_signature", cache_lock_probe.held_by_current_thread())
+        )
+        with active_lock:
+            active_signatures += 1
+            if active_signatures == 2:
+                signatures_overlap.set()
+        try:
+            release_signatures.wait(timeout=2)
+            return original_tree_signature(*args, **kwargs)
+        finally:
+            with active_lock:
+                active_signatures -= 1
+
+    monkeypatch.setattr(showcase_module, "_bundle_digest", probed_bundle_digest)
+    monkeypatch.setattr(showcase_module, "_bundle_tree_signature", probed_tree_signature)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                showcase_module.load_verified_showcase_packages,
+                read_budget=budget(),
+            )
+            for _index in range(2)
+        ]
+        overlapped = signatures_overlap.wait(timeout=2)
+        release_signatures.set()
+        results = [future.result(timeout=5) for future in futures]
+
+    assert all("approval-gate" in result for result in results)
+    assert overlapped, "warm-hit tree verification serialized behind the cache lock"
+    assert observations
+    assert not [name for name, lock_held in observations if lock_held]
+
+
+def test_verified_loader_generation_change_prevents_stale_warm_hit_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield copied
+
+    def budget() -> WorkflowResourceReadBudget:
+        return WorkflowResourceReadBudget(
+            max_file_bytes=1024 * 1024,
+            max_total_bytes=8 * 1024 * 1024,
+            max_files=512,
+        )
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    initial = showcase_module.load_verified_showcase_packages(read_budget=budget())
+    initial_package = initial["approval-gate"]
+
+    original_tree_signature = showcase_module._bundle_tree_signature
+    pause_hit = threading.local()
+    hit_signature_ready = threading.Event()
+    release_hit = threading.Event()
+
+    def pausing_tree_signature(*args, **kwargs):
+        signature = original_tree_signature(*args, **kwargs)
+        if getattr(pause_hit, "enabled", False):
+            hit_signature_ready.set()
+            release_hit.wait(timeout=5)
+        return signature
+
+    def paused_warm_hit():
+        pause_hit.enabled = True
+        return showcase_module.load_verified_showcase_packages(read_budget=budget())
+
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_tree_signature",
+        pausing_tree_signature,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        stale_candidate = executor.submit(paused_warm_hit)
+        assert hit_signature_ready.wait(timeout=2)
+        forced_future = executor.submit(
+            showcase_module.load_verified_showcase_packages,
+            read_budget=budget(),
+            force_reverify=True,
+        )
+        force_interleaved = False
+        try:
+            forced = forced_future.result(timeout=2)
+            force_interleaved = True
+        except TimeoutError:
+            forced = None
+        finally:
+            release_hit.set()
+        stale_checked = stale_candidate.result(timeout=5)
+        if forced is None:
+            forced = forced_future.result(timeout=5)
+
+    assert force_interleaved, "force reverify could not advance the cache generation"
+    assert forced["approval-gate"] is not initial_package
+    assert stale_checked["approval-gate"] is forced["approval-gate"]
 
 
 def test_verified_loader_parses_only_digest_authenticated_package_bytes(
