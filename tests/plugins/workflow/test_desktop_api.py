@@ -5,6 +5,7 @@ import asyncio
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
+import sqlite3
 import sys
 from pathlib import Path
 import shutil
@@ -32,7 +33,11 @@ from plugins.workflow.compat import (
     CompatibilityReport,
     assess_compatibility,
 )
-from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.coordinator_store import (
+    CoordinatorHealthSnapshotError,
+    CoordinatorIdentity,
+    CoordinatorStore,
+)
 from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
@@ -657,6 +662,51 @@ def test_post_runs_api_admission_requires_healthy_coordinator_without_run(
     assert response.json()["detail"]["code"] == "coordinator_unavailable"
     assert list(store.runs_root.rglob("run.json")) == []
     assert list(store.staging_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "health_error",
+    [
+        CoordinatorHealthSnapshotError("snapshot unavailable"),
+        sqlite3.OperationalError("database unavailable"),
+    ],
+)
+def test_post_runs_api_admission_wraps_coordinator_health_errors_without_residue(
+    tmp_path, monkeypatch, workflow_writer, health_error
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, workflow_writer, name="api-health-error")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    writer = TokenPrincipal(
+        principal="writer", provider="test", scopes=("workflow:write",)
+    )
+
+    def unavailable_health(_self, *, now):
+        del now
+        raise health_error
+
+    monkeypatch.setattr(CoordinatorStore, "health", unavailable_health)
+
+    response = TestClient(
+        _app(_router(), token=writer), raise_server_exceptions=False
+    ).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "api-health-error",
+            "values": {},
+            "idempotency_key": "health-error",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "coordinator_unavailable",
+        "retryable": True,
+    }
+    _assert_no_admission_residue(store)
 
 
 def test_direct_api_admission_rejects_incompatible_workflow_before_persistence(

@@ -1330,6 +1330,7 @@ upstream_changes:
   owned_symbols:
   - StartRunRequest.catalog_source
   - start_api_run showcase branch
+  - start_api_run coordinator-health exception boundary
   - verified bundled showcase run metadata
   tests:
   - tests/plugins/workflow/test_desktop_api.py
@@ -1338,7 +1339,8 @@ upstream_changes:
   upstream_candidate: true
   merge_guidance: Preserve fresh rootless bundle verification on every
     showcase admission, shared run-support derivation, strict compatibility and
-    execution preflight, digest/risk/snapshot equality, coordinator gating,
+    execution preflight, digest/risk/snapshot equality, coordinator gating with
+    retryable unavailability for bounded health-read exceptions,
     server-derived API/Desktop provenance, stable idempotency, showcase-only
     metadata, and background-only execution. A caller-provided path, trust
     boolean, scenario record, or provenance claim must never establish bundled

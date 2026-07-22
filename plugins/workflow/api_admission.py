@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import shutil
+import sqlite3
 from typing import Literal, Mapping
 
 from plugins.workflow.admission import RunAdmissionRequest
@@ -220,9 +221,23 @@ def start_api_run(
     except WorkflowTrustError as exc:
         raise ApiAdmissionError("workflow_preflight_failed", status_code=409) from exc
 
-    coordinator = CoordinatorStore(store.database).health(
-        now=datetime.now(timezone.utc)
-    )
+    try:
+        coordinator = CoordinatorStore(store.database).health(
+            now=datetime.now(timezone.utc)
+        )
+    except (
+        OSError,
+        sqlite3.Error,
+        TypeError,
+        ValueError,
+        IndexError,
+        KeyError,
+        AssertionError,
+        OverflowError,
+    ) as exc:
+        raise ApiAdmissionError(
+            "coordinator_unavailable", status_code=503, retryable=True
+        ) from exc
     if coordinator.status != "healthy":
         raise ApiAdmissionError(
             "coordinator_unavailable",
