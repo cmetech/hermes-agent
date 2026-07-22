@@ -320,6 +320,59 @@ def test_workflow_catalog_projects_showcase_from_authenticated_snapshot(
     assert ai_row["trust_state"] == "verified_bundled"
 
 
+def test_workflow_catalog_omits_showcases_when_resource_disappears_after_authentication(
+    tmp_path, monkeypatch, workflow_writer, caplog
+) -> None:
+    import plugins.workflow.catalog_api as catalog_api
+
+    home = tmp_path / "home"
+    workflow_writer(home / "workflows", name="ordinary-user-workflow")
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(copied),
+    )
+    target = copied / "packages/ai-extensions/commands/inspect-evidence.md"
+    original_loader = showcase_module.load_verified_showcase_packages
+
+    def delete_after_authentication(*args, **kwargs):
+        verified = original_loader(*args, **kwargs)
+        target.unlink()
+        return verified
+
+    monkeypatch.setattr(
+        showcase_module,
+        "load_verified_showcase_packages",
+        delete_after_authentication,
+    )
+    caplog.set_level(logging.WARNING, logger="plugins.workflow.catalog_api")
+
+    items, truncated = catalog_api.build_workflow_catalog(
+        hermes_home=home,
+        workdir=tmp_path,
+    )
+
+    assert truncated is False
+    assert not any(item.get("source") == "showcase" for item in items)
+    assert any(
+        item.get("source") == "profile"
+        and item.get("name") == "ordinary-user-workflow"
+        for item in items
+    )
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "plugins.workflow.catalog_api"
+        and record.levelno == logging.WARNING
+    ] == [
+        "workflow showcase catalog projection verification failed: "
+        "WorkflowValidationError"
+    ]
+
+
 def test_workflow_catalog_rejects_verified_provenance_on_digest_mismatch(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:

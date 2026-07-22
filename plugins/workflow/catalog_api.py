@@ -697,7 +697,13 @@ def build_workflow_catalog(
                     ),
                 )
             )
-    except WorkflowCatalogInvalidDefinitionError as exc:
+    except (
+        WorkflowCatalogCapacityError,
+        WorkflowCatalogInvalidDefinitionError,
+        WorkflowResourceCapacityError,
+        WorkflowValidationError,
+        OSError,
+    ) as exc:
         logger.warning(
             "workflow showcase catalog projection verification failed: %s",
             type(exc).__name__,

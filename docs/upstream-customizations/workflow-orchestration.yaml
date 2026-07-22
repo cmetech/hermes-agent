@@ -142,6 +142,26 @@ upstream_changes:
     authenticated showcase snapshot through verification, compatibility, risk,
     and verified provenance with an equivalent digest equality gate.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-projection-failure-isolation
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/catalog_api.py
+  owned_symbols:
+  - bounded showcase projection failure isolation
+  - class-only projection failure warning
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  expected_commit_subject: 'fix(workflow): preserve catalog on showcase projection failure'
+  upstream_candidate: true
+  merge_guidance: Preserve unrelated user catalog rows when authenticated
+    showcase projection encounters expected definition, capacity, resource, or
+    filesystem failures after verification. Omit the complete showcase set,
+    log only the exception class, and do not broaden the catch to programming or
+    security failures.
+  removal_condition: Remove when upstream isolates equivalent bounded showcase
+    projection failures without suppressing independently discovered user rows.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-per-run-ai-entitlement
   change_class: workflow-security
   owner: workflow-orchestration
