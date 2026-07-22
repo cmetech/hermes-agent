@@ -4008,13 +4008,13 @@ class RunStore:
         now: datetime,
         limit: int = 100,
     ) -> tuple[tuple[dict[str, object], ...], tuple[str, str] | None, bool]:
-        """Return one stable keyset page of coordinator-eligible rows."""
+        """Return one stable keyset page of ordinary coordinator work."""
         if not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("now must be timezone-aware")
         try:
-            observed = now.astimezone(timezone.utc)
+            now.astimezone(timezone.utc)
         except (OverflowError, ValueError) as exc:
             raise ValueError("now is out of range") from exc
         if after is not None and (
@@ -4024,63 +4024,134 @@ class RunStore:
         ):
             raise ValueError("after must be a created_at/run_id tuple")
 
-        # The broad SQL bound keeps far-future rows out before LIMIT while
-        # admitting the complete observed second. The shared exact comparator
-        # below owns fractional precision and projection parity remains the
-        # authority over the derived query column.
-        scheduled_upper_bound = observed.isoformat(timespec="seconds").removesuffix(
-            "+00:00"
-        ) + "~"
-        eligible: list[sqlite3.Row] = []
-        scan_after = after
-        exhausted = False
-        batch_size = limit + 1
-        while len(eligible) <= limit and not exhausted:
-            clauses = [
-                "admission_state='published'",
-                "status IN ('queued','running','waiting_retry')",
-                "execution_mode IN ('background','foreground')",
-                "(status<>'queued' OR scheduled_at IS NULL OR scheduled_at<?)",
-            ]
-            values: list[object] = [scheduled_upper_bound]
-            if scan_after is not None:
-                clauses.append("(created_at>? OR (created_at=? AND run_id>?))")
-                values.extend((scan_after[0], scan_after[0], scan_after[1]))
-            with self._connect() as connection:
-                rows = connection.execute(
-                    "SELECT run_id, created_at, status, execution_mode, scheduled_at "
-                    "FROM runs WHERE "
-                    + " AND ".join(clauses)
-                    + " ORDER BY created_at, run_id LIMIT ?",
-                    (*values, batch_size),
-                ).fetchall()
-            if not rows:
-                exhausted = True
-                break
-            exhausted = len(rows) < batch_size
-            for row in rows:
-                scan_after = (str(row["created_at"]), str(row["run_id"]))
-                if row["status"] == "queued":
-                    projection = self.load_run(str(row["run_id"]))
-                    canonical = self._scheduled_at_from_projection(
-                        projection,
-                        indexed=row["scheduled_at"],
-                    )
-                    if canonical is not None and rfc3339_instant_is_after(
-                        canonical, observed
-                    ):
-                        continue
-                eligible.append(row)
-                if len(eligible) > limit:
-                    break
-        page = eligible[:limit]
-        exhausted = exhausted and len(eligible) <= limit
+        clauses = [
+            "admission_state='published'",
+            "status IN ('queued','running','waiting_retry')",
+            "execution_mode IN ('background','foreground')",
+            "(status<>'queued' OR scheduled_at IS NULL)",
+        ]
+        values: list[object] = []
+        if after is not None:
+            clauses.append("(created_at>? OR (created_at=? AND run_id>?))")
+            values.extend((after[0], after[0], after[1]))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id, created_at, status, execution_mode, scheduled_at "
+                "FROM runs WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY created_at, run_id LIMIT ?",
+                (*values, limit + 1),
+            ).fetchall()
+        for row in rows:
+            if row["status"] == "queued":
+                projection = self.load_run(str(row["run_id"]))
+                self._scheduled_at_from_projection(
+                    projection,
+                    indexed=row["scheduled_at"],
+                )
+        page = rows[:limit]
+        exhausted = len(rows) <= limit
         cursor = (
             (str(page[-1]["created_at"]), str(page[-1]["run_id"]))
             if page
             else after
         )
         return tuple(dict(row) for row in page), cursor, exhausted
+
+    def scheduled_coordinator_candidates(
+        self,
+        *,
+        after: tuple[str, str] | None,
+        now: datetime,
+        not_before: datetime | None = None,
+        limit: int = 100,
+    ) -> tuple[tuple[dict[str, object], ...], tuple[str, str] | None, bool]:
+        """Return one bounded exact-due page from the scheduled-run index."""
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        try:
+            observed = now.astimezone(timezone.utc)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("now is out of range") from exc
+        if not_before is not None:
+            if not_before.tzinfo is None or not_before.utcoffset() is None:
+                raise ValueError("not_before must be timezone-aware")
+            try:
+                lower_observed = not_before.astimezone(timezone.utc)
+            except (OverflowError, ValueError) as exc:
+                raise ValueError("not_before is out of range") from exc
+            if lower_observed >= observed:
+                return (), after, True
+        else:
+            lower_observed = None
+        if after is not None and (
+            not isinstance(after, tuple)
+            or len(after) != 2
+            or not all(isinstance(value, str) and value for value in after)
+        ):
+            raise ValueError("after must be a created_at/run_id tuple")
+
+        second = observed.isoformat(timespec="seconds").removesuffix("+00:00")
+        fractional_bound = f"{second}.{observed.microsecond:06d}"
+        clauses = [
+            "admission_state='published'",
+            "status='queued'",
+            "execution_mode IN ('background','foreground')",
+            "scheduled_at IS NOT NULL",
+            "(scheduled_at<? OR scheduled_at=? OR scheduled_at=?)",
+        ]
+        values: list[object] = [
+            fractional_bound,
+            f"{second}Z",
+            f"{fractional_bound}Z",
+        ]
+        if lower_observed is not None:
+            lower_second = lower_observed.isoformat(timespec="seconds").removesuffix(
+                "+00:00"
+            )
+            lower_fractional_bound = (
+                f"{lower_second}.{lower_observed.microsecond:06d}"
+            )
+            clauses.append(
+                "NOT (scheduled_at<? OR scheduled_at=? OR scheduled_at=?)"
+            )
+            values.extend(
+                (
+                    lower_fractional_bound,
+                    f"{lower_second}Z",
+                    f"{lower_fractional_bound}Z",
+                )
+            )
+        if after is not None:
+            clauses.append(
+                "(created_at>? OR (created_at=? AND run_id>?))"
+            )
+            values.extend((after[0], after[0], after[1]))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id, created_at, status, execution_mode, scheduled_at "
+                "FROM runs WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY created_at, run_id LIMIT ?",
+                (*values, limit + 1),
+            ).fetchall()
+        for row in rows:
+            projection = self.load_run(str(row["run_id"]))
+            canonical = self._scheduled_at_from_projection(
+                projection,
+                indexed=row["scheduled_at"],
+            )
+            if canonical is None or rfc3339_instant_is_after(canonical, observed):
+                raise JournalRecoveryError("scheduled due index selection mismatch")
+        page = rows[:limit]
+        cursor = (
+            (str(page[-1]["created_at"]), str(page[-1]["run_id"]))
+            if page
+            else after
+        )
+        return tuple(dict(row) for row in page), cursor, len(rows) <= limit
 
     def tail_events(
         self,

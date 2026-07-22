@@ -242,28 +242,31 @@ def test_candidates_filter_future_rows_before_paging_and_compare_exact_instants(
         schedule_at="2026-03-08T07:00:00.123456Z",
     )
 
-    first, cursor, exhausted = store.coordinator_candidates(
+    ordinary_rows, cursor, exhausted = store.coordinator_candidates(
         after=None, limit=2, now=clocks.wall
     )
-    second, second_cursor, second_exhausted = store.coordinator_candidates(
-        after=cursor, limit=2, now=clocks.wall
+    scheduled_rows, scheduled_cursor, scheduled_exhausted = (
+        store.scheduled_coordinator_candidates(after=None, limit=2, now=clocks.wall)
     )
 
-    assert [row["run_id"] for row in first] == [immediate.run_id, before.run_id]
-    assert exhausted is False
-    assert [row["run_id"] for row in second] == [equal.run_id]
-    assert second_exhausted is True
-    assert second_cursor == (second[0]["created_at"], equal.run_id)
-    selected = {row["run_id"] for row in (*first, *second)}
+    assert [row["run_id"] for row in ordinary_rows] == [immediate.run_id]
+    assert cursor == (ordinary_rows[0]["created_at"], immediate.run_id)
+    assert exhausted is True
+    assert [row["run_id"] for row in scheduled_rows] == [
+        before.run_id,
+        equal.run_id,
+    ]
+    assert scheduled_exhausted is True
+    assert scheduled_cursor == (scheduled_rows[-1]["created_at"], equal.run_id)
+    selected = {row["run_id"] for row in (*ordinary_rows, *scheduled_rows)}
     assert after.run_id not in selected
     assert selected.isdisjoint(future_ids)
 
     local_offset = clocks.wall.astimezone(timezone(timedelta(hours=-4)))
-    offset_rows, _offset_cursor, offset_exhausted = store.coordinator_candidates(
-        after=None, limit=100, now=local_offset
+    offset_scheduled, _offset_cursor, offset_exhausted = (
+        store.scheduled_coordinator_candidates(after=None, limit=100, now=local_offset)
     )
-    assert [row["run_id"] for row in offset_rows] == [
-        immediate.run_id,
+    assert [row["run_id"] for row in offset_scheduled] == [
         before.run_id,
         equal.run_id,
     ]
@@ -275,6 +278,238 @@ def test_candidates_filter_future_rows_before_paging_and_compare_exact_instants(
         )
     with pytest.raises(JournalRecoveryError, match="schedule index parity mismatch"):
         store.coordinator_candidates(after=None, limit=100, now=clocks.wall)
+
+
+def test_newly_due_scheduled_work_is_not_hidden_behind_the_normal_cursor(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 1, 12, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(store, clocks, name="forward-jump-leader")
+    package = _package(
+        workflow_writer, tmp_path / "package", name="forward-jump-candidates"
+    )
+    due = clocks.wall + timedelta(hours=1)
+    scheduled = _admit(
+        store,
+        package,
+        key="scheduled-before-normal-pages",
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+    )
+    ordinary = [
+        _admit(store, package, key=f"ordinary-{index}", schedule_at=None)
+        for index in range(3)
+    ]
+
+    first, cursor, exhausted = store.coordinator_candidates(
+        after=None, limit=2, now=clocks.wall
+    )
+
+    assert [row["run_id"] for row in first] == [
+        ordinary[0].run_id,
+        ordinary[1].run_id,
+    ]
+    assert cursor is not None
+    assert exhausted is False
+
+    clocks.wall = due
+    next_sweep, _scheduled_cursor, _next_exhausted = (
+        store.scheduled_coordinator_candidates(
+            after=None,
+            limit=2,
+            now=clocks.wall,
+        )
+    )
+
+    assert scheduled.run_id in {row["run_id"] for row in next_sweep}
+
+
+def test_real_sweep_rescues_newly_due_work_behind_both_active_cursors(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 1, 12, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        max_queued_runs=250,
+        max_nonterminal_runs=250,
+        max_start_requests_per_minute=250,
+        lease_clock=clocks.lease_sample,
+    )
+    coordinator, identity, epoch = _leader(
+        store, clocks, name="active-cursor-forward-jump"
+    )
+    package = _package(
+        workflow_writer, tmp_path / "package", name="active-cursor-forward-jump"
+    )
+    due = clocks.wall + timedelta(hours=1)
+    newly_due = _admit(
+        store,
+        package,
+        key="newly-due-before-backlogs",
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+    )
+    for index in range(51):
+        _admit(
+            store,
+            package,
+            key=f"already-due-{index:03d}",
+            schedule_at="2026-04-01T11:00:00Z",
+        )
+    for index in range(51):
+        _admit(store, package, key=f"ordinary-{index:03d}", schedule_at=None)
+    while True:
+        wakes = coordinator.pending_wakes(
+            identity, epoch=epoch, now=clocks.wall, limit=100
+        )
+        if not wakes:
+            break
+        for wake in wakes:
+            assert coordinator.complete_wake(
+                wake.generation,
+                identity,
+                epoch=epoch,
+                now=clocks.wall,
+                outcome="test_setup",
+            )
+
+    service = _service(tmp_path / "home", clocks)
+    scheduler = MagicMock()
+    scheduler.submit.return_value = True
+    _actionable, normal_cursor, _progress = service._sweep_once(
+        store, coordinator, identity, epoch, scheduler
+    )
+
+    assert normal_cursor is not None
+    assert service._scheduled_sweep_cursor is not None
+    assert not any(
+        call.args[0] == newly_due.run_id for call in scheduler.submit.call_args_list
+    )
+
+    scheduler.reset_mock()
+    clocks.wall = due
+    service._sweep_once(store, coordinator, identity, epoch, scheduler, normal_cursor)
+
+    assert any(
+        call.args[0] == newly_due.run_id for call in scheduler.submit.call_args_list
+    )
+
+
+def test_exact_future_schedule_filtering_is_bounded_and_eventually_eligible(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 2, 12, 0, 0, 123456, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        max_queued_runs=200,
+        max_nonterminal_runs=250,
+        max_start_requests_per_minute=250,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(store, clocks, name="bounded-exact-filter-leader")
+    package = _package(
+        workflow_writer, tmp_path / "package", name="bounded-exact-filter"
+    )
+    future_ids = {
+        _admit(
+            store,
+            package,
+            key=f"submicrosecond-future-{index:03d}",
+            schedule_at="2026-04-02T12:00:00.1234561Z",
+        ).run_id
+        for index in range(101)
+    }
+    earlier_due = [
+        _admit(
+            store,
+            package,
+            key=f"earlier-due-{index}",
+            schedule_at=f"2026-04-02T11:59:5{index}Z",
+        )
+        for index in range(2)
+    ]
+    equal = _admit(
+        store,
+        package,
+        key="microsecond-equal",
+        schedule_at="2026-04-02T12:00:00.123456Z",
+    )
+    loaded: list[str] = []
+    original_load_run = store.load_run
+    original_connect = store._connect
+    statements: list[str] = []
+
+    def traced_connect():
+        connection = original_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    def counted_load_run(run_id: str, *args, **kwargs):
+        loaded.append(run_id)
+        return original_load_run(run_id, *args, **kwargs)
+
+    monkeypatch.setattr(store, "_connect", traced_connect)
+    monkeypatch.setattr(store, "load_run", counted_load_run)
+
+    first, scheduled_cursor, exhausted = store.scheduled_coordinator_candidates(
+        after=None,
+        limit=2,
+        now=clocks.wall,
+    )
+
+    assert [row["run_id"] for row in first] == [run.run_id for run in earlier_due]
+    assert exhausted is False
+    assert len(loaded) <= 3
+    scheduled_select = next(
+        statement
+        for statement in statements
+        if "scheduled_at IS NOT NULL" in statement
+        and "ORDER BY created_at, run_id" in statement
+    )
+    with original_connect() as connection:
+        plan = tuple(
+            str(row["detail"])
+            for row in connection.execute(
+                f"EXPLAIN QUERY PLAN {scheduled_select}"
+            ).fetchall()
+        )
+    assert any("runs_scheduled_queue" in detail for detail in plan)
+
+    before_loads = len(loaded)
+    remainder, scheduled_cursor, exhausted = store.scheduled_coordinator_candidates(
+        after=scheduled_cursor,
+        limit=2,
+        now=clocks.wall,
+    )
+    assert [row["run_id"] for row in remainder] == [equal.run_id]
+    assert exhausted is True
+    assert len(loaded) - before_loads <= 3
+
+    clocks.wall = datetime(2026, 4, 2, 12, 0, 0, 123457, tzinfo=UTC)
+    scheduled_cursor = None if exhausted else scheduled_cursor
+    discovered: set[str] = set()
+    while True:
+        before_loads = len(loaded)
+        page, scheduled_cursor, exhausted = store.scheduled_coordinator_candidates(
+            after=scheduled_cursor,
+            limit=25,
+            now=clocks.wall,
+        )
+        assert len(loaded) - before_loads <= 26
+        discovered.update(str(row["run_id"]) for row in page)
+        if exhausted:
+            break
+
+    assert future_ids <= discovered
 
 
 def test_promotion_rechecks_due_atomically_after_wall_clock_moves_backward(
@@ -297,7 +532,7 @@ def test_promotion_rechecks_due_atomically_after_wall_clock_moves_backward(
         key="scheduled-promotion-race",
         schedule_at="2026-05-01T10:00:00.1234561Z",
     )
-    candidates, _cursor, _exhausted = store.coordinator_candidates(
+    candidates, _cursor, _exhausted = store.scheduled_coordinator_candidates(
         after=None, limit=100, now=clocks.wall
     )
     assert [row["run_id"] for row in candidates] == [admitted.run_id]

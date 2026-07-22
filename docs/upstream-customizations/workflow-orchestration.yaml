@@ -2457,7 +2457,7 @@ upstream_changes:
   - tests/plugins/workflow/test_scheduled_runs.py
   - tests/scripts/test_workflow_merge_gate.py
   owned_symbols:
-  - RunStore.coordinator_candidates due-aware stable pagination
+  - RunStore ordinary and scheduled coordinator candidate streams
   - RunStore.try_promote_run atomic due recheck
   - WorkflowCoordinatorService scheduled_not_due wake completion
   - WorkflowCoordinatorService five-second monotonic sweep bound
@@ -2474,9 +2474,13 @@ upstream_changes:
     due selection and scheduler promotion, with a separate injected monotonic
     clock for sweep cadence. Complete a genuine early run_admitted wake once as
     scheduled_not_due without stall, submit, promotion, claim, or retained wake
-    polling; let the bounded indexed scan rediscover it when due. Exclude
-    obvious future rows before page capacity while using corroborated projection
-    metadata and the shared exact RFC 3339 comparator for submicrosecond parity.
+    polling; let the bounded indexed scan rediscover it when due. Keep ordinary
+    work on its stable created-at cursor and discover due scheduled work through
+    an independent cursor plus a bounded newly-due interval rescue, merging the
+    resulting pages in original admission order. Exact SQL bounds derived from
+    the six-digit observed clock must exclude arbitrary-precision same-second
+    future rows before bounded projection corroboration, including the canonical
+    prefix case where a longer fraction sorts before the exact microsecond string.
     Recheck due under the admission lock, run lock, and promotion transaction so
     a backward wall jump refuses the compare-and-set and a later due sample
     promotes exactly once. Keep every backoff and local-wake timeout at or below
