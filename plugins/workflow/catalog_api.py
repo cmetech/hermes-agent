@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import stat
@@ -31,6 +32,9 @@ from plugins.workflow.trust import (
     WorkflowTrustStore,
     build_risk_summary,
 )
+
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from plugins.workflow.showcase import ShowcaseScenario, VerifiedShowcasePackage
@@ -404,9 +408,11 @@ def workflow_catalog_run_support(
     package: WorkflowPackage,
     *,
     showcase_scenario: "ShowcaseScenario | None" = None,
+    input_support: SupportedInputs | None = None,
 ) -> CatalogRunSupport:
     """Derive Desktop background-run support from authenticated server data."""
-    _inputs, input_support = _input_projection(package)
+    if input_support is None:
+        _inputs, input_support = _input_projection(package)
     if not input_support["supported"]:
         return {"supported": False, "reason": "unsupported_inputs"}
     if showcase_scenario is not None:
@@ -536,6 +542,7 @@ def _catalog_entry(
         "run_support": workflow_catalog_run_support(
             package,
             showcase_scenario=showcase_scenario,
+            input_support=supported_inputs,
         ),
     }
     if verified_showcase is not None:
@@ -565,7 +572,19 @@ def build_workflow_catalog(
         )
     except WorkflowResourceCapacityError:
         truncated = True
-    except (OSError, UnicodeError, ValueError):
+    except FileNotFoundError as exc:
+        logger.info(
+            "workflow showcase catalog verification unavailable: %s",
+            type(exc).__name__,
+        )
+        # A stripped distribution is trusted for nothing, but it must not
+        # suppress independently discovered user workflows.
+        verified_showcases = {}
+    except (OSError, UnicodeError, ValueError) as exc:
+        logger.warning(
+            "workflow showcase catalog verification failed: %s",
+            type(exc).__name__,
+        )
         # A stripped or integrity-failed distribution is trusted for nothing,
         # but it must not suppress independently discovered user workflows.
         verified_showcases = {}
@@ -822,6 +841,7 @@ def build_workflow_detail(
         "run_support": workflow_catalog_run_support(
             package,
             showcase_scenario=showcase_scenario,
+            input_support=supported_inputs,
         ),
         "risk_summary": risk.to_dict(),
         "compatibility": _compatibility_projection(compatibility),

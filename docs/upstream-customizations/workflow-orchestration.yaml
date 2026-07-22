@@ -1674,3 +1674,25 @@ upstream_changes:
     adversarial evidence, Medium-finding remediations, and explicit lower-
     severity follow-up disposition.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-catalog-verification-signal-and-projection-deduplication
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/catalog_api.py
+  - tests/plugins/workflow/test_catalog_api.py
+  owned_symbols:
+  - catalog showcase verification log signal
+  - workflow_catalog_run_support input_support reuse
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  expected_commit_subject: 'fix(workflow): signal catalog verification failures'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve fail-closed showcase omission while logging only the verification
+    exception class: absent bundle directories are informational and all other
+    verification failures are warnings. Never log bundle paths or exception text.
+    Reuse the already computed input-support classification in catalog and detail
+    projections so each row performs one input projection.
+  removal_condition: Remove when upstream provides equivalent sanitized showcase
+    verification observability and avoids duplicate input projection work.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

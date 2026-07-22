@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 from contextlib import contextmanager
 import shutil
 import sys
@@ -243,7 +244,7 @@ def test_workflow_catalog_cached_showcase_verification_preserves_user_budget(
 
 
 def test_workflow_catalog_missing_bundle_degrades_to_user_rows(
-    tmp_path, monkeypatch, workflow_writer
+    tmp_path, monkeypatch, workflow_writer, caplog
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -255,6 +256,7 @@ def test_workflow_catalog_missing_bundle_degrades_to_user_rows(
         "_bundle_path",
         lambda explicit=None: _test_bundle_path(missing),
     )
+    caplog.set_level(logging.INFO, logger="plugins.workflow.catalog_api")
 
     response = _catalog_get(_module().router, token=_reader())
 
@@ -267,10 +269,16 @@ def test_workflow_catalog_missing_bundle_degrades_to_user_rows(
     assert not any(
         item.get("source") == "showcase" for item in response.json()["items"]
     )
+    assert any(
+        record.name == "plugins.workflow.catalog_api"
+        and record.levelno == logging.INFO
+        and "FileNotFoundError" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_workflow_catalog_tamper_invalidates_cache_and_omits_entire_bundle(
-    tmp_path, monkeypatch, workflow_writer
+    tmp_path, monkeypatch, workflow_writer, caplog
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -304,6 +312,8 @@ def test_workflow_catalog_tamper_invalidates_cache_and_omits_entire_bundle(
         / "approval-gate.yaml"
     )
     workflow.write_text(workflow.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    caplog.set_level(logging.WARNING, logger="plugins.workflow.catalog_api")
+    caplog.clear()
 
     second = _catalog_get(_module().router, token=_reader())
 
@@ -316,6 +326,65 @@ def test_workflow_catalog_tamper_invalidates_cache_and_omits_entire_bundle(
         and item.get("name") == "ordinary-user-workflow"
         for item in second.json()["items"]
     )
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "plugins.workflow.catalog_api"
+        and record.levelno == logging.WARNING
+    ]
+    assert any("ShowcaseCatalogError" in message for message in warnings)
+    assert all(str(copied) not in message for message in warnings)
+
+
+def test_workflow_catalog_and_detail_project_inputs_once_per_row(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    workflow_writer(home / "workflows", name="alpha", filename="alpha.yaml")
+    workflow_writer(home / "workflows", name="bravo", filename="bravo.yaml")
+    missing = tmp_path / "missing-showcases"
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(missing),
+    )
+    import plugins.workflow.catalog_api as catalog_api
+
+    calls = 0
+    original_input_projection = catalog_api._input_projection
+
+    def count_input_projection(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_input_projection(*args, **kwargs)
+
+    monkeypatch.setattr(catalog_api, "_input_projection", count_input_projection)
+    monkeypatch.setattr(
+        catalog_api,
+        "_coordinator_projection",
+        lambda _home: {"healthy": False, "status": "unavailable", "reason": "test"},
+    )
+
+    items, truncated = catalog_api.build_workflow_catalog(
+        hermes_home=home,
+        workdir=workdir,
+    )
+
+    assert truncated is False
+    assert [item["name"] for item in items] == ["alpha", "bravo"]
+    assert calls == 2
+
+    catalog_api.build_workflow_detail(
+        "alpha",
+        hermes_home=home,
+        workdir=workdir,
+        catalog_source="profile",
+    )
+
+    assert calls == 3
 
 
 @pytest.mark.parametrize(
