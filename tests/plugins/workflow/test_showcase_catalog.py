@@ -4,6 +4,7 @@ import json
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from hashlib import sha256
 from pathlib import Path
 import shutil
 import subprocess
@@ -11,6 +12,7 @@ import threading
 import time
 
 import pytest
+import yaml
 
 from hermes_cli import capability_staging
 from plugins.workflow.showcase import (
@@ -32,12 +34,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 def test_catalog_has_safe_digest_verified_scenarios() -> None:
     catalog = load_showcase_catalog()
 
-    assert {
+    assert set(catalog) == {
         "ai-extensions",
+        "approval-gate",
         "laptop-diagnostic",
         "resilience",
         "scheduling",
-    } <= set(catalog)
+    }
     assert catalog["laptop-diagnostic"].offline is True
     assert catalog["laptop-diagnostic"].requires_ai is False
     assert catalog["ai-extensions"].requires_ai is True
@@ -45,6 +48,101 @@ def test_catalog_has_safe_digest_verified_scenarios() -> None:
     assert all(item.package_digest for item in catalog.values())
     assert all(item.verified_bundled_provenance for item in catalog.values())
     assert all("destructive" not in item.safety_class for item in catalog.values())
+
+
+def test_exact_membership_rejects_a_fully_restamped_sixth_scenario(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authenticated_catalog = load_showcase_catalog()
+    assert all(
+        scenario.verified_bundled_provenance
+        for scenario in authenticated_catalog.values()
+    )
+    expected_ids = set(authenticated_catalog)
+    assert expected_ids == {
+        "ai-extensions",
+        "approval-gate",
+        "laptop-diagnostic",
+        "resilience",
+        "scheduling",
+    }
+
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+    shutil.copytree(
+        copied / "packages/approval-gate",
+        copied / "packages/injected-sixth",
+    )
+    catalog_path = copied / "catalog.yaml"
+    raw_catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    injected = dict(
+        next(
+            scenario
+            for scenario in raw_catalog["scenarios"]
+            if scenario["id"] == "approval-gate"
+        )
+    )
+    injected.update(
+        {
+            "id": "injected-sixth",
+            "display_name": "Injected Sixth Tour",
+            "workflow_path": (
+                "packages/injected-sixth/workflows/approval-gate.yaml"
+            ),
+        }
+    )
+    raw_catalog["scenarios"].append(injected)
+    catalog_path.write_text(
+        yaml.safe_dump(raw_catalog, sort_keys=False), encoding="utf-8"
+    )
+    package_digests = {
+        package.name: showcase_module._tree_digest(package)
+        for package in sorted((copied / "packages").iterdir())
+    }
+    (copied / "digests.json").write_text(
+        json.dumps(
+            {
+                "catalog_sha256": sha256(catalog_path.read_bytes()).hexdigest(),
+                "packages": package_digests,
+                "schema_version": 1,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield copied
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+    restamped_catalog = load_showcase_catalog()
+    assert all(
+        scenario.verified_bundled_provenance
+        for scenario in restamped_catalog.values()
+    )
+
+    # These are the three legacy subset/membership checks. All accept the
+    # fully authenticated sixth scenario.
+    assert {
+        "ai-extensions",
+        "laptop-diagnostic",
+        "resilience",
+        "scheduling",
+    } <= set(restamped_catalog)
+    assert {
+        "approval-gate",
+        "laptop-diagnostic",
+        "resilience",
+        "scheduling",
+    } <= set(restamped_catalog)
+    assert "approval-gate" in restamped_catalog
+    assert all(item.package_digest for item in restamped_catalog.values())
+
+    with pytest.raises(AssertionError):
+        assert set(restamped_catalog) == expected_ids
 
 
 def test_bundled_approval_gate_is_verified_parameterless_and_portable() -> None:

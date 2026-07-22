@@ -46,13 +46,19 @@ WORKFLOW_GATE_OPTOUTS = {
         "tests/plugins/workflow/test_scheduler.py",
         "tests/plugins/workflow/test_schema.py",
         "tests/plugins/workflow/test_script_executor.py",
-        "tests/plugins/workflow/test_showcase_ai_e2e.py",
-        "tests/plugins/workflow/test_showcase_evidence.py",
         "tests/plugins/workflow/test_showcase_offline_e2e.py",
         "tests/plugins/workflow/test_showcase_schedule_e2e.py",
         "tests/plugins/workflow/test_store.py",
         "tests/plugins/workflow/test_topology.py",
     )
+}
+
+EXPECTED_SHOWCASE_IDS = {
+    "ai-extensions",
+    "approval-gate",
+    "laptop-diagnostic",
+    "resilience",
+    "scheduling",
 }
 
 
@@ -100,6 +106,38 @@ def test_showcase_desktop_e2e_is_in_merge_gate_and_native_matrix() -> None:
 
     assert path in GATE.read_text()
     assert path in CI.read_text()
+
+
+def test_showcase_ai_and_evidence_suites_are_promoted_into_the_merge_gate() -> None:
+    source = GATE.read_text()
+    for path in (
+        "tests/plugins/workflow/test_showcase_ai_e2e.py",
+        "tests/plugins/workflow/test_showcase_evidence.py",
+    ):
+        assert path in source
+        assert path not in WORKFLOW_GATE_OPTOUTS
+
+
+def test_exact_showcase_membership_is_pinned_at_all_three_gate_sites() -> None:
+    sites = (
+        (ROOT / "tests/plugins/workflow/test_showcase_catalog.py", "catalog"),
+        (
+            ROOT / "tests/plugins/workflow/test_portable_compatibility_e2e.py",
+            "showcase_catalog",
+        ),
+        (GATE, "catalog"),
+    )
+    for path, variable in sites:
+        source = path.read_text()
+        match = re.search(
+            rf"assert\s+set\({variable}\)\s*==\s*\{{(?P<members>[^}}]+)\}}",
+            source,
+            flags=re.DOTALL,
+        )
+        assert match is not None, path
+        assert set(re.findall(r'[\"\']([^\"\']+)[\"\']', match["members"])) == (
+            EXPECTED_SHOWCASE_IDS
+        )
 
 
 def test_merge_gate_pins_desktop_review_run_contract() -> None:

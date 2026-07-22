@@ -1239,21 +1239,25 @@ upstream_changes:
   - plugins/workflow/showcases/packages/approval-gate/workflows/approval-gate.hermes.yaml
   - plugins/workflow/showcases/packages/approval-gate/workflows/approval-gate.yaml
   - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
   - tests/plugins/workflow/test_showcase_catalog.py
   - tests/plugins/workflow/test_showcase_evidence.py
+  - tests/scripts/test_workflow_merge_gate.py
   owned_symbols:
   - approval-gate bundled showcase package
   - operator-approval capability claim
   - invariant-based showcase bundle gate
   tests:
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
   - tests/plugins/workflow/test_showcase_catalog.py
   - tests/plugins/workflow/test_showcase_evidence.py
+  - tests/scripts/test_workflow_merge_gate.py
   expected_commit_subject: 'feat(workflow): add bundled approval gate showcase'
   upstream_candidate: true
   merge_guidance: Preserve the no-input, offline, non-AI single approval node,
     its digest registration, durable interaction_approved evidence, and
-    relation-based catalog/brand assertions. Do not weaken laptop-diagnostic or
-    repurpose its richer approval/rework tour.
+    exact catalog, portable, and brand membership assertions. Do not weaken
+    laptop-diagnostic or repurpose its richer approval/rework tour.
   removal_condition: Remove when upstream ships an equivalent digest-verified
     parameterless approval showcase with durable evidence reporting.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

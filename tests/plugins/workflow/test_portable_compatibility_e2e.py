@@ -28,9 +28,13 @@ def test_archon_shape_and_installed_offline_showcases_need_no_yaml_rewrite(
     assert report.runnable
     assert [node.node_type for node in package.definition.nodes] == ["bash", "script", "approval", "cancel"]
     showcase_catalog = load_showcase_catalog()
-    assert {"approval-gate", "laptop-diagnostic", "resilience", "scheduling"} <= set(
-        showcase_catalog
-    )
+    assert set(showcase_catalog) == {
+        "ai-extensions",
+        "approval-gate",
+        "laptop-diagnostic",
+        "resilience",
+        "scheduling",
+    }
     assert all(
         showcase_catalog[name].verified_bundled_provenance
         for name in ("approval-gate", "laptop-diagnostic", "resilience")

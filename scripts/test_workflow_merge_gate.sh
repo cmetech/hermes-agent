@@ -69,6 +69,8 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py \
       tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py \
       tests/plugins/workflow/test_showcase_catalog.py \
+      tests/plugins/workflow/test_showcase_ai_e2e.py \
+      tests/plugins/workflow/test_showcase_evidence.py \
       tests/plugins/workflow/test_showcase_distribution_e2e.py \
       tests/plugins/workflow/test_portable_compatibility_e2e.py \
       tests/hermes_cli/test_capability_staging.py \
@@ -130,7 +132,13 @@ if [[ "${WORKFLOW_MERGE_GATE_FAST:-0}" != "1" ]]; then
   "$PYTHON_BIN" - <<'PY'
 from plugins.workflow.showcase import load_showcase_catalog
 catalog = load_showcase_catalog()
-assert "approval-gate" in catalog
+assert set(catalog) == {
+    "ai-extensions",
+    "approval-gate",
+    "laptop-diagnostic",
+    "resilience",
+    "scheduling",
+}
 assert all(item.package_digest for item in catalog.values())
 assert all(item.verified_bundled_provenance for item in catalog.values())
 PY
