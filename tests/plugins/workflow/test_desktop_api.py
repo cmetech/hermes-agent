@@ -1182,6 +1182,27 @@ def test_post_runs_relocates_only_byte_caps_to_typed_endpoint_validation(
     assert at_aggregate_cap.json()["detail"]["code"] == "workflow_not_found"
 
 
+def test_post_runs_rejects_unpaired_surrogate_as_ordinary_schema_error(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    response = TestClient(
+        _app(_router()), raise_server_exceptions=False
+    ).post(
+        "/api/plugins/workflow/runs",
+        content=(
+            b'{"workflow":"bounded","values":{"input":"\\ud800"},'
+            b'"idempotency_key":"bounded","concurrency_policy":"queue"}'
+        ),
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert isinstance(detail, list)
+    assert "workflow_input_too_large" not in response.text
+
+
 def test_post_runs_applies_catalog_resource_bounds_before_admission(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:

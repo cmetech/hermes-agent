@@ -853,6 +853,36 @@ class StartRunRequest(BaseModel):
     idempotency_key: str = Field(..., min_length=1, max_length=512)
     concurrency_policy: Literal["queue", "allow", "forbid"] = "queue"
 
+    @model_validator(mode="before")
+    @classmethod
+    def validate_value_utf8(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        values = data.get("values")
+        if not isinstance(values, dict):
+            return data
+
+        unencodable_names: list[object] = []
+        for name, value in values.items():
+            if not isinstance(value, str):
+                continue
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                unencodable_names.append(name)
+        if not unencodable_names:
+            return data
+
+        # FastAPI includes invalid input in ordinary validation details. Feed
+        # Pydantic a safe non-string sentinel so it rejects the same field
+        # without trying to serialize or disclose the unencodable value.
+        safe_values = dict(values)
+        for name in unencodable_names:
+            safe_values[name] = None
+        safe_data = dict(data)
+        safe_data["values"] = safe_values
+        return safe_data
+
     @model_validator(mode="after")
     def validate_bounds(self):
         if not self.workflow.strip():
