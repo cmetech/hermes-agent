@@ -2359,6 +2359,7 @@ upstream_changes:
   - scheduled projection/index parity recovery
   - scheduled namespace and journal reconstruction
   - reserved scheduled migration composition
+  - incomplete reserved namespace carry-through
   - namespace migration run-before-SQL lock order
   tests:
   - tests/plugins/workflow/test_installed_distribution_e2e.py
@@ -2375,6 +2376,12 @@ upstream_changes:
     recovery. Namespace rebuilds must never copy a source SQL scheduled_at value.
     Backfill corroborated final evidence for both published and reserved rows,
     while leaving incomplete reserved rows for normal reservation reconciliation.
+    When legacy namespace migration encounters an uncorroborated reserved row
+    whose final run directory is absent, retain its conflict-safe start digest,
+    derive its namespace, force the scheduled query value to null, and carry
+    the row only until ordinary reconciliation releases or quarantines it.
+    Never weaken corroboration for published rows or any reserved row whose
+    final directory exists, including malformed or partial durable evidence.
     Namespace migration must acquire and pin all run evidence before opening its
     SQLite write transaction, then revalidate the exact source rows, store
     generation, and evidence digests before rebuilding. Retry bounded source

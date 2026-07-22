@@ -917,6 +917,21 @@ class RunStore:
         def source_signature(rows: Iterable[sqlite3.Row]) -> tuple[tuple[object, ...], ...]:
             return tuple(tuple(row[name] for name in columns) for row in rows)
 
+        def evidence_signature(
+            directory: Path,
+        ) -> tuple[bool, str | None, str | None]:
+            try:
+                directory.stat()
+            except FileNotFoundError:
+                return False, None, None
+            digests = []
+            for name in ("run.json", "events.jsonl"):
+                try:
+                    digests.append(_sha256((directory / name).read_bytes()))
+                except FileNotFoundError:
+                    digests.append(None)
+            return True, digests[0], digests[1]
+
         for _attempt in range(3):
             locks = ExitStack()
             transaction_started = False
@@ -936,12 +951,19 @@ class RunStore:
                 pinned_source = source_signature(source_rows)
                 pinned_generation = source_generation()
                 pinned_evidence: dict[
-                    str, tuple[dict[str, object], Path, str, str]
+                    str,
+                    tuple[
+                        dict[str, object] | None,
+                        Path,
+                        bool,
+                        str | None,
+                        str | None,
+                    ],
                 ] = {}
-                try:
-                    for row in source_rows:
-                        run_id = str(row["run_id"])
-                        directory = Path(row["run_directory"])
+                for row in source_rows:
+                    run_id = str(row["run_id"])
+                    directory = Path(row["run_directory"])
+                    try:
                         projection, projection_sha256, journal_sha256 = (
                             self._corroborate_run_evidence_locked(
                                 directory, run_id=run_id
@@ -953,22 +975,51 @@ class RunStore:
                             )
                         RunStore._start_digest_from_projection(projection)
                         self._scheduled_at_from_projection(projection)
-                        pinned_evidence[run_id] = (
-                            projection,
-                            directory,
+                    except (
+                        OSError,
+                        TypeError,
+                        ValueError,
+                        json.JSONDecodeError,
+                        JournalRecoveryError,
+                    ) as exc:
+                        if row["admission_state"] != "reserved":
+                            raise sqlite3.DatabaseError(
+                                "runs namespace migration evidence is uncorroborated"
+                            ) from exc
+                        try:
+                            directory.stat()
+                        except FileNotFoundError:
+                            pass
+                        except OSError as directory_error:
+                            raise sqlite3.DatabaseError(
+                                "runs namespace migration evidence is unreadable"
+                            ) from directory_error
+                        else:
+                            raise sqlite3.DatabaseError(
+                                "runs namespace migration evidence is uncorroborated"
+                            ) from exc
+                        # Initialization holds the admission lock, so no publisher
+                        # can promote staging evidence while this genuinely
+                        # incomplete reserved row is classified under its run lock.
+                        projection = None
+                        (
+                            directory_present,
                             projection_sha256,
                             journal_sha256,
-                        )
-                except (
-                    OSError,
-                    TypeError,
-                    ValueError,
-                    json.JSONDecodeError,
-                    JournalRecoveryError,
-                ) as exc:
-                    raise sqlite3.DatabaseError(
-                        "runs namespace migration evidence is uncorroborated"
-                    ) from exc
+                        ) = evidence_signature(directory)
+                        if directory_present:
+                            raise sqlite3.DatabaseError(
+                                "runs namespace migration evidence is uncorroborated"
+                            ) from exc
+                    else:
+                        directory_present = True
+                    pinned_evidence[run_id] = (
+                        projection,
+                        directory,
+                        directory_present,
+                        projection_sha256,
+                        journal_sha256,
+                    )
 
                 connection.execute("BEGIN IMMEDIATE")
                 transaction_started = True
@@ -976,13 +1027,16 @@ class RunStore:
                     "SELECT * FROM runs ORDER BY run_id"
                 ).fetchall()
                 evidence_still_pinned = all(
-                    _sha256((directory / "run.json").read_bytes())
-                    == projection_sha256
-                    and _sha256((directory / "events.jsonl").read_bytes())
-                    == journal_sha256
+                    evidence_signature(directory)
+                    == (
+                        directory_present,
+                        projection_sha256,
+                        journal_sha256,
+                    )
                     for (
                         _projection,
                         directory,
+                        directory_present,
                         projection_sha256,
                         journal_sha256,
                     ) in pinned_evidence.values()
@@ -1057,8 +1111,14 @@ class RunStore:
                         )
                     )
                     projection = pinned_evidence[str(row["run_id"])][0]
-                    start_digest = RunStore._start_digest_from_projection(projection)
-                    scheduled_at = self._scheduled_at_from_projection(projection)
+                    if projection is None:
+                        start_digest = row["start_digest"]
+                        scheduled_at = None
+                    else:
+                        start_digest = RunStore._start_digest_from_projection(
+                            projection
+                        )
+                        scheduled_at = self._scheduled_at_from_projection(projection)
                     values = [
                         namespace_digest
                         if name == "idempotency_namespace_digest"

@@ -227,6 +227,138 @@ def test_genuine_v13_migration_leaves_incomplete_reservation_for_cleanup(
     assert restarted.storage_health()["status"] == "healthy"
 
 
+def test_v13_namespace_migration_carries_incomplete_reservation_to_cleanup(
+    tmp_path: Path, workflow_writer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home, max_executing_runs=0)
+    snapshot = _scheduled_snapshot(
+        store, workflow_writer, tmp_path, name="scheduled-v13-namespace-incomplete"
+    )
+    request = _scheduled_request(snapshot, name="scheduled-v13-namespace-incomplete")
+
+    def crash_before_durable_publication(*_args, **_kwargs):
+        raise RuntimeError("injected pre-publication crash")
+
+    monkeypatch.setattr(
+        store, "_publish_reserved_run", crash_before_durable_publication
+    )
+    with pytest.raises(RuntimeError, match="injected pre-publication crash"):
+        store.start_run(request, immutable_snapshot=snapshot)
+    with store._connect() as connection:
+        reserved = connection.execute(
+            "SELECT run_id, run_directory, staging_directory, admission_state, "
+            "start_digest FROM runs"
+        ).fetchone()
+    assert reserved["admission_state"] == "reserved"
+    assert not Path(reserved["run_directory"]).exists()
+    assert Path(reserved["staging_directory"]).is_dir()
+
+    _downgrade_to_v13_legacy_namespace(store)
+
+    migrated_reservation: dict[str, object] = {}
+    original_reconcile = RunStore._reconcile_admission
+
+    def inspect_namespace_row_then_reconcile(restarted: RunStore) -> None:
+        with restarted._connect() as connection:
+            row = connection.execute(
+                "SELECT idempotency_namespace_digest, start_digest, scheduled_at "
+                "FROM runs WHERE run_id=?",
+                (reserved["run_id"],),
+            ).fetchone()
+        if row is not None:
+            migrated_reservation.update(dict(row))
+        original_reconcile(restarted)
+
+    monkeypatch.setattr(
+        RunStore, "_reconcile_admission", inspect_namespace_row_then_reconcile
+    )
+
+    restarted = RunStore(home, max_executing_runs=0)
+
+    assert migrated_reservation["idempotency_namespace_digest"]
+    assert migrated_reservation["start_digest"] == reserved["start_digest"]
+    assert migrated_reservation["scheduled_at"] is None
+    assert restarted.storage_health() == {"status": "healthy", "reasons": []}
+    with restarted._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+        event = connection.execute(
+            "SELECT event_type, reason_code FROM admission_events "
+            "WHERE run_id=? ORDER BY sequence DESC LIMIT 1",
+            (reserved["run_id"],),
+        ).fetchone()
+    assert tuple(event) == ("admission_reservation_released", "incomplete_publication")
+    assert restarted.storage_health()["status"] == "healthy"
+
+
+def test_v13_namespace_migration_keeps_durable_reserved_schedule_for_publication(
+    tmp_path: Path, workflow_writer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home, max_executing_runs=0)
+    snapshot = _scheduled_snapshot(
+        store, workflow_writer, tmp_path, name="scheduled-v13-namespace-reserved"
+    )
+    request = _scheduled_request(snapshot, name="scheduled-v13-namespace-reserved")
+
+    def crash_before_publication(*_args, **_kwargs):
+        raise RuntimeError("injected publication crash")
+
+    monkeypatch.setattr(store, "_mark_reservation_published", crash_before_publication)
+    with pytest.raises(RuntimeError, match="injected publication crash"):
+        store.start_run(request, immutable_snapshot=snapshot)
+    with store._connect() as connection:
+        reserved = connection.execute(
+            "SELECT run_id, admission_state, scheduled_at FROM runs"
+        ).fetchone()
+    assert reserved["admission_state"] == "reserved"
+    assert reserved["scheduled_at"] == SCHEDULE_AT
+
+    _downgrade_to_v13_legacy_namespace(store)
+
+    restarted = RunStore(home, max_executing_runs=0)
+
+    indexed = _indexed_run(restarted, str(reserved["run_id"]))
+    assert indexed["admission_state"] == "published"
+    assert indexed["status"] == "queued"
+    assert indexed["scheduled_at"] == SCHEDULE_AT
+    assert restarted.storage_health() == {"status": "healthy", "reasons": []}
+
+
+def test_v13_namespace_migration_fails_closed_for_corrupt_durable_reservation(
+    tmp_path: Path, workflow_writer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home, max_executing_runs=0)
+    snapshot = _scheduled_snapshot(
+        store, workflow_writer, tmp_path, name="scheduled-v13-namespace-corrupt"
+    )
+    request = _scheduled_request(snapshot, name="scheduled-v13-namespace-corrupt")
+
+    def crash_before_publication(*_args, **_kwargs):
+        raise RuntimeError("injected publication crash")
+
+    monkeypatch.setattr(store, "_mark_reservation_published", crash_before_publication)
+    with pytest.raises(RuntimeError, match="injected publication crash"):
+        store.start_run(request, immutable_snapshot=snapshot)
+    with store._connect() as connection:
+        reserved = connection.execute(
+            "SELECT run_id, run_directory, admission_state FROM runs"
+        ).fetchone()
+    directory = Path(reserved["run_directory"])
+    assert reserved["admission_state"] == "reserved"
+    assert directory.is_dir()
+    (directory / "run.json").write_text("{broken", encoding="utf-8")
+
+    _downgrade_to_v13_legacy_namespace(store)
+
+    restarted = RunStore(home, max_executing_runs=0)
+
+    health = restarted.storage_health()
+    assert health["status"] == "repair_required"
+    assert any(reason["reason_code"] == "index_corrupt" for reason in health["reasons"])
+
+
 def test_projection_schedule_derivation_rejects_noncanonical_metadata() -> None:
     with pytest.raises(JournalRecoveryError, match="not canonical"):
         RunStore._scheduled_at_from_projection({
