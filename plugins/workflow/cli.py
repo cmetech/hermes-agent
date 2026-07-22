@@ -17,7 +17,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MethodType
-from typing import AbstractSet, Iterable, Mapping
+from typing import AbstractSet, Callable, Iterable, Mapping
 
 import yaml
 
@@ -1648,6 +1648,8 @@ def _scheduler(
     owner_id: str | None = None,
     execution_owner_id: str | None = None,
     execution_owner_epoch: int | None = None,
+    utcnow: Callable[[], datetime] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> RunScheduler:
     return RunScheduler(
         store,
@@ -1668,6 +1670,8 @@ def _scheduler(
         cooperative_shutdown_seconds=config.cooperative_shutdown_seconds,
         term_grace_seconds=config.term_grace_seconds,
         kill_reap_grace_seconds=config.kill_reap_grace_seconds,
+        utcnow=utcnow,
+        monotonic=monotonic,
         resource_limits=ProcessResourceLimits(
             max_rss_bytes=config.process_tree_rss_bytes,
             max_cpu_seconds=config.process_tree_cpu_seconds,

@@ -66,6 +66,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/scripts/test_workflow_merge_gate.py \
       tests/plugins/workflow/test_admission.py \
       tests/plugins/workflow/test_schedule_store_identity.py \
+      tests/plugins/workflow/test_scheduled_runs.py \
       tests/plugins/workflow/test_ai_entitlement.py \
       tests/plugins/workflow/test_node_mcp.py \
       tests/plugins/workflow/test_trust_policy.py \

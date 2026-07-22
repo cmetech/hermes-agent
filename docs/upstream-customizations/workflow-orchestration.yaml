@@ -2445,3 +2445,43 @@ upstream_changes:
     Desktop admission boundary, schedule-only durable identity, queued publication,
     digest parity, and metadata-redacted list/detail projection.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-scheduled-due-clocks
+  change_class: workflow-runtime
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/cli.py
+  - plugins/workflow/coordinator.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/store.py
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_scheduled_runs.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - RunStore.coordinator_candidates due-aware stable pagination
+  - RunStore.try_promote_run atomic due recheck
+  - WorkflowCoordinatorService scheduled_not_due wake completion
+  - WorkflowCoordinatorService five-second monotonic sweep bound
+  - coordinator-to-scheduler wall and monotonic clock threading
+  - RunScheduler promotion wall-clock sampling
+  - scheduled wake and clock base-gate membership
+  tests:
+  - tests/plugins/workflow/test_scheduled_runs.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(workflow): enforce scheduled due clocks'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve one server-injected timezone-aware wall clock across coordinator
+    due selection and scheduler promotion, with a separate injected monotonic
+    clock for sweep cadence. Complete a genuine early run_admitted wake once as
+    scheduled_not_due without stall, submit, promotion, claim, or retained wake
+    polling; let the bounded indexed scan rediscover it when due. Exclude
+    obvious future rows before page capacity while using corroborated projection
+    metadata and the shared exact RFC 3339 comparator for submicrosecond parity.
+    Recheck due under the admission lock, run lock, and promotion transaction so
+    a backward wall jump refuses the compare-and-set and a later due sample
+    promotes exactly once. Keep every backoff and local-wake timeout at or below
+    five monotonic seconds, independent of far-future wall time and local offset.
+  removal_condition: Remove when upstream provides equivalent exact due-aware
+    coordinator paging, one-shot early-wake deferral, atomic promotion recheck,
+    injected scheduler clocks, and five-second monotonic sweep bounds.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

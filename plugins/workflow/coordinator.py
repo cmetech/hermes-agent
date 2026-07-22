@@ -28,10 +28,12 @@ from plugins.workflow.lease_clock import (
     lease_is_fresh,
 )
 from plugins.workflow.models import ExecutionFence
+from plugins.workflow.schedule_time import rfc3339_instant_is_after
 from tools.managed_process import ProcessIdentity
 
 
 logger = logging.getLogger(__name__)
+_MAX_SWEEP_DELAY_SECONDS = 5.0
 
 
 class WorkflowCoordinatorService:
@@ -192,6 +194,8 @@ class WorkflowCoordinatorService:
             runner_binding=binding,
             profile_name=get_active_profile_name(),
             owner_id=f"coordinator:{fence.owner_id}:{fence.owner_epoch}",
+            utcnow=self._utcnow,
+            monotonic=self._monotonic,
         )
         scheduler.execution_fence = fence
         return scheduler
@@ -309,6 +313,7 @@ class WorkflowCoordinatorService:
         )
         periodic, _page_cursor, page_exhausted = run_store.coordinator_candidates(
             after=cursor,
+            now=now,
             limit=100,
         )
         wake_by_run: dict[str, list[object]] = {}
@@ -330,7 +335,15 @@ class WorkflowCoordinatorService:
             run_actionable = False
             try:
                 before = run_store.load_run(run_id)
-                if before.get("execution_mode") == "foreground":
+                scheduled_at = run_store._scheduled_at_from_projection(before)
+                scheduled_not_due = (
+                    before.get("status") == "queued"
+                    and scheduled_at is not None
+                    and rfc3339_instant_is_after(scheduled_at, now)
+                )
+                if scheduled_not_due:
+                    outcome = "scheduled_not_due"
+                elif before.get("execution_mode") == "foreground":
                     try:
                         run_store.adopt_expired_foreground(run_id, fence, now)
                     except ForegroundExecutionConflict:
@@ -339,9 +352,11 @@ class WorkflowCoordinatorService:
                         before = run_store.load_run(run_id)
                         outcome = "foreground_adopted"
                         run_actionable = True
-                if before.get("execution_mode") == "background" and before.get(
-                    "status"
-                ) in {"queued", "running", "waiting_retry"}:
+                if (
+                    not scheduled_not_due
+                    and before.get("execution_mode") == "background"
+                    and before.get("status") in {"queued", "running", "waiting_retry"}
+                ):
                     stalled = run_store.record_stall_if_due(
                         run_id,
                         fence=fence,
@@ -440,9 +455,9 @@ class WorkflowCoordinatorService:
                             backoff_index + 1,
                             len(self.sweep_backoff_seconds) - 1,
                         )
-                    next_sweep = (
-                        self._monotonic()
-                        + self.sweep_backoff_seconds[backoff_index]
+                    next_sweep = self._monotonic() + min(
+                        self.sweep_backoff_seconds[backoff_index],
+                        _MAX_SWEEP_DELAY_SECONDS,
                     )
 
                 now_monotonic = self._monotonic()
@@ -483,6 +498,7 @@ class WorkflowCoordinatorService:
                     )
 
                 wait_for = min(
+                    _MAX_SWEEP_DELAY_SECONDS,
                     max(0.001, heartbeat_due - self._monotonic()),
                     max(0.001, next_sweep - self._monotonic())
                     if future is None

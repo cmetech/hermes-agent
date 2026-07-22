@@ -191,6 +191,13 @@ def test_showcase_schedule_confirmation_suite_is_promoted_into_base_gate() -> No
     assert path not in WORKFLOW_GATE_OPTOUTS
 
 
+def test_scheduled_run_wake_and_clock_contract_is_promoted_into_base_gate() -> None:
+    path = "tests/plugins/workflow/test_scheduled_runs.py"
+
+    assert GATE.read_text().count(path) == 1
+    assert path not in WORKFLOW_GATE_OPTOUTS
+
+
 def test_exact_showcase_membership_is_pinned_at_all_three_gate_sites() -> None:
     sites = (
         (ROOT / "tests/plugins/workflow/test_showcase_catalog.py", "catalog"),

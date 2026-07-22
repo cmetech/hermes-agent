@@ -934,7 +934,7 @@ class RunScheduler:
                 )
                 projection = self.store.load_run(run_id)
                 if projection["status"] == "queued":
-                    if not self.store.try_promote_run(run_id):
+                    if not self.store.try_promote_run(run_id, now=self._utcnow()):
                         break
                 self.store.wake_due_retries(run_id, now=self._utcnow())
                 self._resolve_graph(run_id, package.definition.nodes)
@@ -1102,7 +1102,7 @@ class RunScheduler:
                     )
                     projection = self.store.load_run(run_id)
                     if projection["status"] == "queued":
-                        self.store.try_promote_run(run_id)
+                        self.store.try_promote_run(run_id, now=self._utcnow())
                     self.store.wake_due_retries(run_id, now=self._utcnow())
                     self._resolve_graph(run_id, packages[run_id].definition.nodes)
                     projection = self.store.load_run(run_id)
