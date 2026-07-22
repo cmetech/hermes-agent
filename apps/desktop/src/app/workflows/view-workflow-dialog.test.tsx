@@ -320,6 +320,7 @@ describe('workflow View dialog', () => {
       'unsupported inputs',
       {
         run_support: { reason: 'unsupported_inputs' as const, supported: false },
+        source: 'showcase' as const,
         supported_inputs: { reason: 'unsupported_input_shape' as const, supported: false }
       },
       'Run is unavailable because this workflow uses unsupported input fields.'

@@ -307,6 +307,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
   const [submitting, setSubmitting] = useState(false)
 
   const active = useRef(true)
+
   const focusTarget = useRef(
     returnFocusTo ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null)
   )
@@ -445,23 +446,33 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
     queueMicrotask(() => target?.focus())
   }
 
-  const blocked =
-    !detail ||
-    !detail.coordinator.healthy ||
-    detail.compatibility.runnable !== true ||
-    detail.run_support?.supported !== true ||
-    !workflowTrustAllowsRun(detail.trust_state) ||
-    detail.inputs.some(input => input.type === 'enum' && enumValues(detail, input.name).length === 0)
-
   const runSupport = detail?.run_support
-  const runSupportMessage =
+
+  const runSupportCopy = {
+    showcase_cli_required: copy.workflowRunShowcaseFromCli,
+    supported: null,
+    unsupported_inputs: copy.workflowRunUnsupportedInputs
+  }
+
+  const runDisabledReason =
     detail && !runSupport
       ? copy.workflowRunSupportUnavailable
       : detail && runSupport?.supported === false
-        ? detail.source === 'showcase'
-          ? copy.workflowRunShowcaseFromCli
-          : copy.workflowRunUnsupportedCommand(workflow.name)
-        : null
+        ? runSupportCopy[runSupport.reason]
+        : detail && detail.compatibility.runnable !== true
+          ? copy.workflowRunIncompatible
+          : detail && !workflowTrustAllowsRun(detail.trust_state)
+            ? copy.workflowRunUntrusted
+            : detail && !detail.coordinator.healthy
+              ? copy.workflowRunCoordinatorUnavailable
+              : null
+
+  const runSupportMessage = runSupport?.supported === false || !runSupport ? runDisabledReason : null
+
+  const blocked =
+    !detail ||
+    Boolean(runDisabledReason) ||
+    detail.inputs.some(input => input.type === 'enum' && enumValues(detail, input.name).length === 0)
 
   const admissionErrorMessages: Partial<Record<AdmissionError['kind'], string>> = {
     catalog_source: copy.workflowRunCatalogSourceInvalid,
@@ -473,6 +484,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
     showcase_cli: copy.workflowRunShowcaseFromCli,
     showcase_verification: copy.workflowRunShowcaseVerificationFailed
   }
+
   const errorMessage =
     error && !(error.kind === 'validation' && error.field)
       ? admissionErrorMessages[error.kind] || error.message || copy.workflowRunValidationError

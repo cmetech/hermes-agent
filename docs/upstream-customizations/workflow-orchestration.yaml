@@ -1691,7 +1691,7 @@ upstream_changes:
   - workflow_catalog_run_support input_support reuse
   tests:
   - tests/plugins/workflow/test_catalog_api.py
-  expected_commit_subject: 'fix(workflow): signal catalog verification failures'
+  expected_commit_subject: 'fix(workflow): surface catalog verification failures'
   upstream_candidate: true
   merge_guidance: >-
     Preserve fail-closed showcase omission while logging only the verification
@@ -1722,4 +1722,34 @@ upstream_changes:
     reread; the bounded read-budget accounting and cache locking remain intact.
   removal_condition: Remove when upstream retains authenticated definition and
     sidecar byte snapshots for unbudgeted showcase catalog parsing.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-reason-derived-run-gate
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/i18n/en.ts
+  owned_symbols:
+  - reason-derived workflow Run-disabled copy
+  - compatibility Run gate precedence
+  - lowercase verified bundle catalog label
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  expected_commit_subject: 'fix(desktop): derive workflow run availability'
+  upstream_candidate: true
+  merge_guidance: Preserve backend-authoritative run support and compatibility
+    decisions at every Desktop Run entry point. Select user copy from
+    run_support.reason rather than catalog source, fail closed for compatibility,
+    and order disabled reasons as support-unavailable, unsupported, incompatible,
+    then untrusted.
+  removal_condition: Remove when upstream Desktop derives every workflow Run
+    affordance from the same authoritative reason and compatibility contract.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

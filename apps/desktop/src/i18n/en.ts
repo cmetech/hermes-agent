@@ -1695,7 +1695,7 @@ export const en: Translations = {
     workflowColumnActions: 'Actions',
     workflowTrusted: 'trusted',
     workflowUntrusted: 'untrusted',
-    workflowVerifiedBundle: 'Verified bundle',
+    workflowVerifiedBundle: 'verified bundle',
     workflowIncompatible: 'Incompatible',
     workflowNoInputs: 'No inputs',
     workflowInputCount: count => `${count} input${count === 1 ? '' : 's'}`,

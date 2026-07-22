@@ -632,6 +632,7 @@ describe('Review & Run workflow dialog', () => {
         definition: { inputs: { mode: { required: false, type: 'enum' } } },
         inputs: [{ name: 'mode', required: false, type: 'enum' }],
         run_support: { reason: 'unsupported_inputs', supported: false },
+        source: 'showcase',
         supported_inputs: { reason: 'unsupported_input_shape', supported: false }
       })
     })
@@ -640,7 +641,7 @@ describe('Review & Run workflow dialog', () => {
     const dialog = await openReviewDialog()
     expect(
       within(dialog).getByText(
-        "This workflow's inputs aren't supported in the app yet — run it with hermes workflow run Portable contract."
+        'Run is unavailable because this workflow uses unsupported input fields.'
       )
     ).toBeTruthy()
     expect(within(dialog).getByText("The background coordinator isn't running — try again shortly.")).toBeTruthy()
@@ -661,7 +662,7 @@ describe('Review & Run workflow dialog', () => {
     renderView()
 
     const dialog = await openReviewDialog()
-    expect(within(dialog).getByText('Verified bundle')).toBeTruthy()
+    expect(within(dialog).getByText('verified bundle')).toBeTruthy()
     expect(within(dialog).getByText('Run this bundled showcase from the CLI.')).toBeTruthy()
     expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
     expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
