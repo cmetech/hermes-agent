@@ -922,6 +922,40 @@ def test_post_runs_declared_inputs_return_typed_errors_without_residue(
     _assert_no_admission_residue(store)
 
 
+def test_post_runs_accepts_declared_text_input(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_declared_catalog_workflow(
+        home,
+        workflow_writer,
+        name="api-declared-text",
+        inputs={
+            "subject": "{kind: text, required: true, max_bytes: 32}",
+        },
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    writer = TokenPrincipal(
+        principal="writer", provider="test", scopes=("workflow:write",)
+    )
+
+    response = TestClient(_app(_router(), token=writer)).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "api-declared-text",
+            "values": {"subject": "safe text"},
+            "idempotency_key": "declared-text-request",
+            "concurrency_policy": "allow",
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["result"]["admission_disposition"] == "created"
+    assert "safe text" not in response.text
+
+
 def test_declared_input_reservations_are_scoped_to_verified_showcases(
     tmp_path, workflow_writer
 ) -> None:

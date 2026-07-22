@@ -17,6 +17,11 @@ from plugins.workflow.cli import (
     show_package,
 )
 from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.input_contract import (
+    API_INPUT_VALUE_MAX_BYTES,
+    WorkflowInputContractError,
+    workflow_input_declarations,
+)
 from plugins.workflow.models import WorkflowPackage, WorkflowValidationError
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.sanitize import (
@@ -50,7 +55,7 @@ CATALOG_MAX_RESOURCE_FILES = 512
 CATALOG_MAX_RESOURCE_REQUEST_BYTES = 2 * CATALOG_MAX_RESOURCE_TOTAL_BYTES
 CATALOG_MAX_TRUST_STORE_BYTES = 4 * 1024 * 1024
 _PROFILE_STATE_DIRECTORIES = frozenset({"runs", ".staging", ".quarantine", ".locks"})
-_SUPPORTED_INPUT_TYPES = frozenset({"string", "number", "boolean", "enum"})
+_SUPPORTED_INPUT_TYPES = frozenset({"text", "string", "number", "boolean", "enum"})
 _RICH_INPUT_FIELDS = frozenset({"items", "properties", "schema"})
 _ENUM_INPUT_FIELDS = ("values", "enum", "options", "choices")
 _ENUM_MAX_CHOICES = 128
@@ -69,6 +74,7 @@ class CatalogInput(TypedDict):
     name: str
     type: str
     required: bool
+    max_bytes: NotRequired[int]
 
 
 class SupportedInputs(TypedDict):
@@ -352,9 +358,16 @@ def _input_projection(
     if not isinstance(raw_inputs, Mapping) or len(raw_inputs) > 64:
         return [], {"supported": False, "reason": "unsupported_input_shape"}
 
+    try:
+        declarations = workflow_input_declarations(package)
+    except WorkflowInputContractError:
+        declarations = None
+
     inputs: list[CatalogInput] = []
     unsupported_type = False
-    unsupported_shape = not workflow_input_names_are_portable(raw_inputs)
+    unsupported_shape = declarations is None or not workflow_input_names_are_portable(
+        raw_inputs
+    )
     for raw_name, raw in sorted(raw_inputs.items(), key=lambda item: str(item[0])):
         if (
             not isinstance(raw_name, str)
@@ -363,6 +376,7 @@ def _input_projection(
         ):
             unsupported_shape = True
             continue
+        declaration = declarations.get(raw_name) if declarations is not None else None
         declared_type = raw.get("type", raw.get("kind"))
         if "type" in raw and "kind" in raw and raw.get("type") != raw.get("kind"):
             unsupported_shape = True
@@ -383,11 +397,17 @@ def _input_projection(
             unsupported_type = True
         if declared_type == "enum" and not _enum_choices_supported(raw):
             unsupported_shape = True
-        inputs.append({
+        projected: CatalogInput = {
             "name": raw_name,
             "type": declared_type,
             "required": required,
-        })
+        }
+        if declaration is not None and declared_type == "text":
+            projected["max_bytes"] = declaration.byte_bound(
+                channel="text",
+                store_limit=API_INPUT_VALUE_MAX_BYTES,
+            )
+        inputs.append(projected)
 
     if unsupported_type:
         classification: SupportedInputs = {

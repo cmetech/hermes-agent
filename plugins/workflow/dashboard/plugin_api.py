@@ -199,6 +199,7 @@ class WorkflowCatalogInput(BaseModel):
     name: str = Field(..., min_length=1, max_length=128)
     type: str = Field(..., min_length=1, max_length=64)
     required: bool
+    max_bytes: int | None = Field(None, gt=0, exclude_if=lambda value: value is None)
 
 
 class WorkflowCatalogInputSupport(BaseModel):

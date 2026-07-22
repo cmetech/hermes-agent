@@ -507,6 +507,109 @@ def test_workflow_catalog_returns_stable_redacted_server_classification(
     assert beta.is_file()
 
 
+def test_workflow_catalog_projects_declared_text_bounds_and_support_modes(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    text_path = workflow_writer(
+        home / "workflows", name="declared-text", filename="declared-text.yaml"
+    )
+    text_path.with_name("declared-text.hermes.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "delivery_defaults": {
+                    "inputs": {
+                        "notes": {
+                            "kind": "text",
+                            "required": False,
+                            "max_bytes": 70 * 1024,
+                            "default": "SECRET_NOTES_DEFAULT",
+                        },
+                        "summary": {
+                            "kind": "text",
+                            "required": True,
+                            "max_bytes": 4096,
+                            "default": "SECRET_SUMMARY_DEFAULT",
+                        },
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    workflow_writer(home / "workflows", name="legacy-flat", filename="legacy-flat.yaml")
+    file_path = workflow_writer(
+        home / "workflows", name="declared-file", filename="declared-file.yaml"
+    )
+    file_path.with_name("declared-file.hermes.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "delivery_defaults": {
+                    "inputs": {
+                        "evidence": {
+                            "kind": "file",
+                            "required": True,
+                            "max_bytes": 4096,
+                        }
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    rows = {item["name"]: item for item in _user_items(response)}
+    assert rows["declared-text"]["inputs"] == [
+        {
+            "name": "notes",
+            "type": "text",
+            "required": False,
+            "max_bytes": 64 * 1024,
+        },
+        {
+            "name": "summary",
+            "type": "text",
+            "required": True,
+            "max_bytes": 4096,
+        },
+    ]
+    assert rows["declared-text"]["supported_inputs"] == {
+        "supported": True,
+        "reason": "flat_inputs",
+    }
+    assert rows["declared-text"]["run_support"] == {
+        "supported": True,
+        "reason": "supported",
+    }
+    assert rows["legacy-flat"]["supported_inputs"] == {
+        "supported": True,
+        "reason": "parameterless",
+    }
+    assert rows["legacy-flat"]["run_support"] == {
+        "supported": True,
+        "reason": "supported",
+    }
+    assert rows["declared-file"]["inputs"] == [
+        {"name": "evidence", "type": "file", "required": True}
+    ]
+    assert rows["declared-file"]["supported_inputs"] == {
+        "supported": False,
+        "reason": "unsupported_input_type",
+    }
+    assert rows["declared-file"]["run_support"] == {
+        "supported": False,
+        "reason": "unsupported_inputs",
+    }
+    assert b"SECRET_NOTES_DEFAULT" not in response.content
+    assert b"SECRET_SUMMARY_DEFAULT" not in response.content
+
+
 def test_workflow_catalog_marks_legacy_and_rich_input_kinds_unsupported(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
@@ -588,6 +691,46 @@ def test_workflow_catalog_marks_enum_without_usable_choices_unsupported(
         "supported": False,
         "reason": "unsupported_inputs",
     }
+
+
+def test_workflow_catalog_keeps_missing_input_kind_unsupported(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    path = workflow_writer(home / "workflows", name="missing-input-kind")
+    path.with_name("example.hermes.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "delivery_defaults": {
+                    "inputs": {
+                        "subject": {
+                            "required": True,
+                            "max_bytes": 32,
+                            "default": "SECRET_MISSING_KIND_DEFAULT",
+                        }
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    item = _user_items(response)[0]
+    assert item["inputs"] == [{"name": "subject", "type": "unknown", "required": True}]
+    assert item["supported_inputs"] == {
+        "supported": False,
+        "reason": "unsupported_input_type",
+    }
+    assert item["run_support"] == {
+        "supported": False,
+        "reason": "unsupported_inputs",
+    }
+    assert b"SECRET_MISSING_KIND_DEFAULT" not in response.content
 
 
 @pytest.mark.parametrize(

@@ -1248,6 +1248,39 @@ upstream_changes:
   removal_condition: Remove when upstream provides an equivalent typed,
     authenticated two-mode input contract and immutable per-input byte bounds.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-declared-text-catalog-projection
+  change_class: workflow-rest-adapter
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  owned_symbols:
+  - CatalogInput.max_bytes
+  - WorkflowCatalogInput.max_bytes
+  - declared text Desktop support classification
+  - declared text effective byte-bound projection
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  expected_commit_subject: 'feat(workflow): project declared text inputs'
+  upstream_candidate: true
+  merge_guidance: Preserve explicit raw type-or-kind and required-field shape
+    classification, including malformed missing-kind declarations, while using
+    the shared authenticated input declaration only to derive a valid text
+    field's effective max_bytes as min(declared max_bytes, 64 KiB). Project the
+    optional bound identically in list and detail, omit it from every existing
+    scalar and file projection, and never expose defaults or raw values. Keep
+    ordinary declared text and legacy-flat packages run-supported while user
+    file inputs remain unsupported until an authenticated fixture channel owns
+    them.
+  removal_condition: Remove when upstream provides equivalent safe declared-text
+    catalog/detail projection and authenticated background admission without
+    changing legacy projection shapes.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-catalog-desktop-trigger-verification
   change_class: workflow-verification
   owner: workflow-orchestration
