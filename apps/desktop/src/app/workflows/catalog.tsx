@@ -85,6 +85,11 @@ function CatalogRow({
         <span className="block truncate text-(--ui-text-secondary)" title={item.description}>
           {item.description}
         </span>
+        {item.requires_ai ? (
+          <span className="mt-0.5 block text-[0.625rem] text-(--ui-text-tertiary)">
+            {t.operations.workflowRequiresAi}
+          </span>
+        ) : null}
       </td>
       <td className="px-2.5 py-2 align-middle">
         <Badge variant={workflowTrustAllowsRun(item.trust_state) ? 'default' : 'destructive'}>

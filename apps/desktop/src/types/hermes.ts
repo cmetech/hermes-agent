@@ -150,6 +150,7 @@ export interface WorkflowDefinition {
   inputs: WorkflowDefinitionInput[]
   name: string
   precedence: 1 | 2 | 3
+  requires_ai?: boolean
   run_support?: WorkflowRunSupport
   source: WorkflowCatalogSource
   supported_inputs: WorkflowDefinitionInputSupport

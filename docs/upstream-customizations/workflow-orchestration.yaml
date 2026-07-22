@@ -167,6 +167,46 @@ upstream_changes:
   removal_condition: Remove when upstream's base release gate selects an
     equivalent exact schedule confirmation contract without an opt-out.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-desktop-ai-catalog-information
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/runtime.test.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/types/hermes.ts
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - tests/plugins/workflow/test_catalog_api.py
+  owned_symbols:
+  - CatalogEntry.requires_ai
+  - WorkflowCatalogEntry.requires_ai
+  - WorkflowDetailResponse.requires_ai
+  - optional WorkflowDefinition.requires_ai compatibility field
+  - CatalogRow AI inference informational line
+  - operations.workflowRequiresAi translations
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/i18n/runtime.test.ts
+  - tests/plugins/workflow/test_catalog_api.py
+  expected_commit_subject: 'feat(workflow): label AI catalog rows'
+  upstream_candidate: true
+  merge_guidance: Project requires_ai generically from authenticated showcase
+    scenario metadata in both catalog and detail responses, with false for
+    ordinary user workflows and no showcase-ID or source-name inference.
+    Desktop treats missing legacy payload fields as non-AI and renders the
+    localized line only when the field is true. Keep the line informational
+    so it never affects support, compatibility, trust, admission, or Run
+    enablement and disabled-reason precedence must remain unchanged.
+  removal_condition: Remove when upstream provides equivalent authenticated
+    generic AI metadata projection and four-locale informational Desktop
+    presentation without changing workflow eligibility or Run policy.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-authenticated-showcase-catalog-projection
   change_class: workflow-security
   owner: workflow-orchestration

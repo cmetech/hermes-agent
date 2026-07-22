@@ -103,6 +103,7 @@ class CatalogEntry(TypedDict):
     name: str
     version: str
     description: str
+    requires_ai: bool
     source: CatalogSource
     precedence: int
     trust_state: CatalogTrustState
@@ -614,6 +615,9 @@ def _catalog_entry(
         ),
         "version": version,
         "description": str(shown["definition"]["description"]),
+        "requires_ai": bool(
+            showcase_scenario is not None and showcase_scenario.requires_ai
+        ),
         "source": str(shown["source"]),
         "precedence": int(shown["precedence"]),
         "trust_state": trust_state,
@@ -944,6 +948,9 @@ def build_workflow_detail(
         ),
         "version": version,
         "description": str(shown["definition"]["description"]),
+        "requires_ai": bool(
+            showcase_scenario is not None and showcase_scenario.requires_ai
+        ),
         "source": str(shown["source"]),
         "precedence": int(shown["precedence"]),
         "trust_state": trust_state,

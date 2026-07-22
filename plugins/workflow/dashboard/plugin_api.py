@@ -231,6 +231,7 @@ class WorkflowCatalogEntry(BaseModel):
     name: str = Field(..., min_length=1, max_length=128)
     version: str = Field(..., min_length=1, max_length=32)
     description: str = Field(..., max_length=16_400)
+    requires_ai: bool
     source: Literal["project", "profile", "showcase"]
     precedence: Literal[1, 2, 3]
     trust_state: Literal["trusted", "untrusted", "verified_bundled"]
@@ -279,6 +280,7 @@ class WorkflowDetailResponse(BaseModel):
     name: str = Field(..., min_length=1, max_length=128)
     version: str = Field(..., min_length=1, max_length=32)
     description: str = Field(..., max_length=16_384)
+    requires_ai: bool
     source: str = Field(..., min_length=1, max_length=64)
     precedence: int
     trust_state: Literal["trusted", "untrusted", "verified_bundled"]

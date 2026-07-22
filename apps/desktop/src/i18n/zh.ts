@@ -1872,6 +1872,7 @@ export const zh: Translations = {
     workflowUntrusted: '不可信',
     workflowVerifiedBundle: '已验证捆绑包',
     workflowIncompatible: '不兼容',
+    workflowRequiresAi: '通过已配置的模型提供商运行 AI 推理',
     workflowNoInputs: '无输入',
     workflowInputCount: count => `${count} 个输入`,
     workflowSourceProfile: '配置文件',

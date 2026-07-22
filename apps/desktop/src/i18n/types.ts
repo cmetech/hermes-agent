@@ -1401,6 +1401,7 @@ export interface Translations {
     workflowUntrusted: string
     workflowVerifiedBundle: string
     workflowIncompatible: string
+    workflowRequiresAi: string
     workflowNoInputs: string
     workflowInputCount: (count: number) => string
     workflowSourceProfile: string

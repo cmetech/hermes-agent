@@ -1697,6 +1697,7 @@ export const en: Translations = {
     workflowUntrusted: 'untrusted',
     workflowVerifiedBundle: 'verified bundle',
     workflowIncompatible: 'Incompatible',
+    workflowRequiresAi: 'Runs AI inference through your configured model provider',
     workflowNoInputs: 'No inputs',
     workflowInputCount: count => `${count} input${count === 1 ? '' : 's'}`,
     workflowSourceProfile: 'Profile',

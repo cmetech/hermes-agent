@@ -1638,6 +1638,7 @@ export const ja = defineLocale({
     workflowUntrusted: '未信頼',
     workflowVerifiedBundle: '検証済みバンドル',
     workflowIncompatible: '非互換',
+    workflowRequiresAi: '設定済みのモデルプロバイダーを通じて AI 推論を実行します',
     workflowNoInputs: '入力なし',
     workflowInputCount: count => `${count} 件の入力`,
     workflowSourceProfile: 'プロファイル',

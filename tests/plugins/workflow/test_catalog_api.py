@@ -12,6 +12,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from hermes_cli.dashboard_auth.base import TokenPrincipal
+from pydantic import ValidationError
 import pytest
 import yaml
 
@@ -58,6 +59,13 @@ def _reader() -> TokenPrincipal:
 
 def _catalog_get(router, *, token=None):
     return TestClient(_app(router, token=token)).get("/api/plugins/workflow/workflows")
+
+
+def _detail_get(router, name: str, *, source: str, token=None):
+    return TestClient(_app(router, token=token)).get(
+        f"/api/plugins/workflow/workflows/{name}",
+        params={"catalog_source": source},
+    )
 
 
 def _user_items(response) -> list[dict[str, object]]:
@@ -163,6 +171,78 @@ def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compa
     assert sum(row["supported"] for row in support_table.values()) == 4
     assert showcase_rows["ai-extensions"]["compatibility"]["runnable"] is False
     assert payload["truncated"] is False
+
+
+def test_workflow_catalog_projects_authenticated_requires_ai_for_every_row(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="ordinary-user-workflow")
+    showcase_module._clear_verified_showcase_cache_for_tests()
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    rows = {
+        (item.get("source"), item.get("name")): item
+        for item in response.json()["items"]
+    }
+    assert rows[("profile", "ordinary-user-workflow")]["requires_ai"] is False
+    assert {
+        name: row["requires_ai"]
+        for (source, name), row in rows.items()
+        if source == "showcase"
+    } == {
+        "ai-extensions": True,
+        "approval-gate": False,
+        "laptop-diagnostic": False,
+        "resilience": False,
+        "scheduling": False,
+    }
+
+
+def test_workflow_detail_and_response_model_require_generic_requires_ai(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="ordinary-user-workflow")
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    module = _module()
+
+    ai = _detail_get(
+        module.router,
+        "ai-extensions",
+        source="showcase",
+        token=_reader(),
+    )
+    ordinary = _detail_get(
+        module.router,
+        "ordinary-user-workflow",
+        source="profile",
+        token=_reader(),
+    )
+
+    assert ai.status_code == ordinary.status_code == 200
+    assert ai.json()["requires_ai"] is True
+    assert ordinary.json()["requires_ai"] is False
+    validated = module.WorkflowCatalogEntry.model_validate(
+        next(
+            item
+            for item in _catalog_get(module.router, token=_reader()).json()["items"]
+            if item.get("source") == "showcase"
+        )
+    )
+    assert isinstance(validated.requires_ai, bool)
+    with pytest.raises(ValidationError):
+        module.WorkflowCatalogEntry.model_validate(
+            {
+                key: value
+                for key, value in validated.model_dump().items()
+                if key != "requires_ai"
+            }
+        )
 
 
 def test_workflow_catalog_keeps_isolation_incompatibility_scenario_local(
@@ -650,6 +730,7 @@ def test_workflow_catalog_returns_stable_redacted_server_classification(
         "name": "alpha",
         "version": "1",
         "description": "Typed workflow",
+        "requires_ai": False,
         "source": "profile",
         "precedence": 2,
         "trust_state": "trusted",
@@ -1070,6 +1151,7 @@ def test_workflow_catalog_degrades_unrepresentable_workflow_name_per_entry(
             "name": "normal",
             "version": "1",
             "description": "Portable workflow fixture",
+            "requires_ai": False,
             "source": "profile",
             "precedence": 2,
             "trust_state": "untrusted",
@@ -1113,6 +1195,7 @@ def test_workflow_catalog_isolates_invalid_definition(
             "name": "valid",
             "version": "1",
             "description": "Portable workflow fixture",
+            "requires_ai": False,
             "source": "profile",
             "precedence": 2,
             "trust_state": "untrusted",
@@ -1527,6 +1610,7 @@ def test_workflow_catalog_project_definition_overrides_profile(
             "name": "shared",
             "version": "1",
             "description": "project definition",
+            "requires_ai": False,
             "source": "project",
             "precedence": 1,
             "trust_state": "untrusted",

@@ -65,6 +65,21 @@ describe('desktop i18n runtime translator', () => {
     )
   })
 
+  it('keeps the workflow AI information localized in all four locales', () => {
+    for (const locale of ['en', 'ja', 'zh', 'zh-hant'] as const) {
+      expect(TRANSLATIONS[locale].operations.workflowRequiresAi).toBeTypeOf('string')
+    }
+
+    expect(TRANSLATIONS.en.operations.workflowRequiresAi).toBe(
+      'Runs AI inference through your configured model provider'
+    )
+    expect(TRANSLATIONS.ja.operations.workflowRequiresAi).toBe(
+      '設定済みのモデルプロバイダーを通じて AI 推論を実行します'
+    )
+    expect(TRANSLATIONS.zh.operations.workflowRequiresAi).toBe('通过已配置的模型提供商运行 AI 推理')
+    expect(TRANSLATIONS['zh-hant'].operations.workflowRequiresAi).toBe('透過已設定的模型供應商執行 AI 推論')
+  })
+
   it('translates settings copy for newly supported locales', () => {
     setRuntimeI18nLocale('ja')
     expect(translateNow('settings.appearance.title')).toBe('外観')

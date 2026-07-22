@@ -1587,6 +1587,7 @@ export const zhHant = defineLocale({
     workflowUntrusted: '不可信',
     workflowVerifiedBundle: '已驗證套件',
     workflowIncompatible: '不相容',
+    workflowRequiresAi: '透過已設定的模型供應商執行 AI 推論',
     workflowNoInputs: '無輸入',
     workflowInputCount: count => `${count} 個輸入`,
     workflowSourceProfile: '設定檔',

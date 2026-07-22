@@ -239,6 +239,62 @@ describe('WorkflowsView', () => {
     expect(onRunWorkflow).toHaveBeenCalledWith(item)
   })
 
+  it('shows authenticated AI metadata as information without changing Run policy', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowDefinitions.mockResolvedValue({
+      items: [
+        definition({ name: 'AI supported', requires_ai: true }),
+        definition({ name: 'Non-AI supported', requires_ai: false }),
+        definition({
+          compatibility: { level: 'unsupported', runnable: false },
+          name: 'AI unsupported inputs',
+          requires_ai: true,
+          run_support: { reason: 'unsupported_inputs', supported: false },
+          supported_inputs: { reason: 'unsupported_input_shape', supported: false },
+          trust_state: 'untrusted'
+        }),
+        definition({
+          compatibility: { level: 'unsupported', runnable: false },
+          name: 'AI incompatible runtime',
+          requires_ai: true,
+          trust_state: 'untrusted'
+        }),
+        definition({ name: 'AI untrusted', requires_ai: true, trust_state: 'untrusted' }),
+        definition({ name: 'Legacy payload' })
+      ],
+      truncated: false
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    const rows = within(await screen.findByRole('table', { name: 'Workflow catalog' }))
+      .getAllByRole('row')
+      .slice(1)
+
+    const aiCopy = 'Runs AI inference through your configured model provider'
+
+    expect(within(rows[0]!).getByText(aiCopy)).toBeTruthy()
+    expect(within(rows[1]!).queryByText(aiCopy)).toBeNull()
+    expect(within(rows[5]!).queryByText(aiCopy)).toBeNull()
+    expect((within(rows[0]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
+    expect((within(rows[1]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
+
+    const expectedDisabledReasons = [
+      'Run is unavailable because this workflow uses unsupported input fields.',
+      'This workflow is not compatible with the current Hermes runtime and cannot start.',
+      'Run is unavailable because this workflow failed trust verification.'
+    ]
+
+    for (const [index, expectedReason] of expectedDisabledReasons.entries()) {
+      const row = rows[index + 2]!
+      expect(within(row).getByText(aiCopy)).toBeTruthy()
+      const button = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
+      expect(button.disabled).toBe(true)
+      expect(document.getElementById(button.getAttribute('aria-describedby')!)?.textContent).toBe(expectedReason)
+    }
+  })
+
   it('keeps colliding bundled showcases distinct and presents their authoritative Run support honestly', async () => {
     $workflowSelectedRunId.set(null)
     listWorkflowDefinitions.mockResolvedValue({
