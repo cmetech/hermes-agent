@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Iterator, Literal, Mapping
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hermes_constants import get_hermes_home
 from plugins.workflow.actions import MUTATION_ACTIONS, mutation_is_valid
@@ -855,70 +855,58 @@ class StartRunRequest(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def normalize_invalid_value_shapes(cls, data: object) -> object:
+    def redact_invalid_values_for_validation(cls, data: object) -> object:
         if not isinstance(data, dict):
             return data
         if "values" not in data:
             return data
         values = data.get("values")
-        if not isinstance(values, dict):
-            safe_data = dict(data)
-            safe_data["values"] = None
-            return safe_data
-
-        safe_values: dict[object, object] = {}
-        replaced_value = False
-        for name, value in values.items():
-            if not isinstance(name, str):
-                safe_data = dict(data)
-                safe_data["values"] = None
-                return safe_data
-            try:
-                name.encode("utf-8")
-            except UnicodeEncodeError:
-                safe_data = dict(data)
-                safe_data["values"] = None
-                return safe_data
-
-            if isinstance(value, str):
+        values_are_valid = isinstance(values, dict)
+        if values_are_valid:
+            for name, value in values.items():
+                if not isinstance(name, str) or not isinstance(value, str):
+                    values_are_valid = False
+                    break
                 try:
+                    name.encode("utf-8")
                     value.encode("utf-8")
                 except UnicodeEncodeError:
-                    value = None
-            else:
-                value = None
-            safe_values[name] = value
-            replaced_value |= value is None
-        if not replaced_value:
+                    values_are_valid = False
+                    break
+
+        if values_are_valid:
+            from plugins.workflow.catalog_api import (
+                desktop_input_name_is_representable,
+            )
+            from plugins.workflow.sanitize import workflow_input_names_are_portable
+
+            values_are_valid = (
+                len(values) <= 64
+                and workflow_input_names_are_portable(values)
+                and all(desktop_input_name_is_representable(name) for name in values)
+            )
+        if values_are_valid:
             return data
 
-        # FastAPI includes invalid input in ordinary validation details. Feed
-        # Pydantic safe non-string sentinels so it rejects the same field
-        # without serializing or disclosing malformed nested content.
+        # A model-level error includes the whole request. Let Pydantic reject
+        # one safe field sentinel instead of retaining any raw input values.
         safe_data = dict(data)
-        safe_data["values"] = safe_values
+        safe_data["values"] = None
         return safe_data
 
-    @model_validator(mode="after")
-    def validate_bounds(self):
-        if not self.workflow.strip():
+    @field_validator("workflow")
+    @classmethod
+    def validate_workflow_nonblank(cls, value: str) -> str:
+        if not value.strip():
             raise ValueError("workflow must not be blank")
-        if not self.idempotency_key.strip():
+        return value
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_idempotency_key_nonblank(cls, value: str) -> str:
+        if not value.strip():
             raise ValueError("idempotency_key must not be blank")
-        if len(self.values) > 64:
-            raise ValueError("values contains too many entries")
-        from plugins.workflow.catalog_api import (
-            desktop_input_name_is_representable,
-        )
-        from plugins.workflow.sanitize import workflow_input_names_are_portable
-
-        if not workflow_input_names_are_portable(self.values):
-            raise ValueError("value names must be portable and distinct")
-
-        for key in self.values:
-            if not desktop_input_name_is_representable(key):
-                raise ValueError("value names must be bounded non-empty text")
-        return self
+        return value
 
 
 @router.post("/runs", status_code=202)

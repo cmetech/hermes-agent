@@ -1216,6 +1216,53 @@ def test_post_runs_rejects_unpaired_surrogate_shapes_as_ordinary_schema_error(
     assert r"\ud800" not in response.text
 
 
+@pytest.mark.parametrize(
+    "failure_path",
+    (
+        "blank-workflow",
+        "blank-idempotency",
+        "too-many-values",
+        "non-portable-name",
+        "colliding-names",
+        "unrepresentable-name",
+    ),
+)
+def test_post_runs_redacts_values_from_structural_validation_errors(
+    tmp_path, monkeypatch, failure_path
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    canary = "REV7-CANARY-6f0d8a2c9b41"
+    payload = {
+        "workflow": "bounded",
+        "values": {"input": canary},
+        "idempotency_key": "bounded",
+        "concurrency_policy": "queue",
+    }
+    if failure_path == "blank-workflow":
+        payload["workflow"] = "   "
+    elif failure_path == "blank-idempotency":
+        payload["idempotency_key"] = "   "
+    elif failure_path == "too-many-values":
+        payload["values"] = {
+            f"input-{index}": f"{canary}-{index}" for index in range(65)
+        }
+    elif failure_path == "non-portable-name":
+        payload["values"] = {"foo/bar": canary}
+    elif failure_path == "colliding-names":
+        payload["values"] = {"Mode": f"{canary}-1", "mode": f"{canary}-2"}
+    elif failure_path == "unrepresentable-name":
+        payload["values"] = {"api_token": canary}
+
+    response = TestClient(
+        _app(_router()), raise_server_exceptions=False
+    ).post("/api/plugins/workflow/runs", json=payload)
+
+    assert response.status_code == 422
+    assert isinstance(response.json()["detail"], list)
+    assert canary not in response.text
+    assert "workflow_input_too_large" not in response.text
+
+
 def test_post_runs_preserves_omitted_values_default(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
 
