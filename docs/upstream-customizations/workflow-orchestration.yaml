@@ -2343,3 +2343,38 @@ upstream_changes:
     AI showcase admission/coordinator coverage and exact release-gate selection
     while retaining independent real-worker request-MCP proof.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-scheduled-store-identity
+  change_class: workflow-runtime
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/store.py
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
+  - tests/plugins/workflow/test_schema_migrations.py
+  owned_symbols:
+  - RunStore schema 14 scheduled_at migration
+  - RunStore._scheduled_at_from_projection
+  - runs_scheduled_queue partial index
+  - scheduled projection/index parity recovery
+  - scheduled namespace and journal reconstruction
+  tests:
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
+  - tests/plugins/workflow/test_schema_migrations.py
+  expected_commit_subject: 'feat(workflow): preserve scheduled run identity'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve run_metadata.schedule_at in corroborated durable projection evidence
+    as the only schedule authority. Keep runs.scheduled_at nullable and derived
+    through one canonical UTC-Z projection helper across fresh reservation,
+    publication, schema backfill, namespace migration, admission-row rebuild,
+    integrity synchronization, damaged-index reconstruction, and journal-only
+    recovery. Namespace rebuilds must never copy a source SQL scheduled_at value.
+    Detect projection/index disagreement, repair only from corroborated evidence,
+    and leave the run queued and the store fail-closed for operator repair.
+    Unscheduled run projections and start digests must remain byte-identical.
+  removal_condition: Remove when upstream provides equivalent schema migration,
+    projection-authoritative parity checks, scheduled partial indexing, and
+    recovery-complete derived schedule identity across every reconstruction path.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

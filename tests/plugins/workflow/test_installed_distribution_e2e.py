@@ -207,7 +207,8 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     )
     assert migration_probe.returncode == 0, migration_probe.stderr
     migrated = json.loads(migration_probe.stdout)
-    assert migrated["version"] == 13
+    assert migrated["version"] == 14
+    assert "scheduled_at" in migrated["columns"]
     assert {
         "foreground_boot_id",
         "foreground_heartbeat_monotonic",
