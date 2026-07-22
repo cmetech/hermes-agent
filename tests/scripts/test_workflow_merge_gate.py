@@ -150,6 +150,30 @@ def test_laptop_diagnostic_middleware_e2e_is_exactly_pinned_in_release_gates() -
     ) == 1
 
 
+def test_ai_extensions_middleware_e2e_is_exactly_pinned_in_release_gates() -> None:
+    path = "tests/plugins/workflow/test_ai_extensions_middleware_e2e.py"
+
+    workflow = yaml.safe_load(CI.read_text())
+    portability = workflow["jobs"]["workflow-portability"]
+    portability_run = next(
+        step["run"]
+        for step in portability["steps"]
+        if step.get("name") == "Run portable workflow and installed-showcase gates"
+    )
+
+    assert GATE.read_text().count(path) == 1
+    assert CI.read_text().count(path) == 1
+    assert portability["strategy"]["matrix"]["os"] == [
+        "ubuntu-latest",
+        "macos-latest",
+        "windows-latest",
+    ]
+    assert portability_run.count(path) == 1
+    assert path not in WORKFLOW_GATE_OPTOUTS
+    assert GATE.read_text().count("tests/plugins/workflow/test_node_mcp.py") == 1
+    assert CI.read_text().count("tests/plugins/workflow/test_node_mcp.py") == 1
+
+
 def test_showcase_ai_and_evidence_suites_are_promoted_into_the_merge_gate() -> None:
     source = GATE.read_text()
     for path in (

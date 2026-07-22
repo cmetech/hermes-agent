@@ -2310,3 +2310,36 @@ upstream_changes:
     agent request-MCP lifecycle, pure runtime capability classifier, and exact
     fail-closed workflow error propagation across the native release matrix.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-ai-extensions-real-middleware-e2e
+  change_class: workflow-verification
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_ai_extensions_middleware_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - ai-extensions production-mounted middleware E2E
+  - ai-extensions exact base-gate and native-matrix selection
+  - Task 3.0 real request-MCP proof preservation
+  tests:
+  - tests/plugins/workflow/test_ai_extensions_middleware_e2e.py
+  - tests/plugins/workflow/test_node_mcp.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'test(workflow): cover AI showcase middleware run'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve the production-mounted offline catalog, detail, public admission,
+    and real coordinator path for the authenticated AI showcase. Keep capability
+    injection limited to the coordinator binding seam, require server-derived
+    real entitlement and Desktop background provenance, and assert the recording
+    runner receives sealed package MCP without treating it as MCP startup proof.
+    Keep incapable admission residue-free, explicit-real integrity failures
+    runner-free, and an actual app-server runtime change mapped to the existing
+    package_mcp_unavailable node error before provider traffic. Select this E2E
+    exactly once in both the base gate and native three-OS matrix without removing
+    the separate real-worker MCP lifecycle suite.
+  removal_condition: Remove when upstream carries equivalent production-mounted
+    AI showcase admission/coordinator coverage and exact release-gate selection
+    while retaining independent real-worker request-MCP proof.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
