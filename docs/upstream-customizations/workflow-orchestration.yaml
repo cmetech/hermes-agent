@@ -146,6 +146,27 @@ upstream_changes:
     honestly incompatible CLI AI showcase behavior while preserving schedule
     confirmation.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-schedule-confirmation-gate
+  change_class: workflow-testing
+  owner: workflow-orchestration
+  files:
+  - scripts/test_workflow_merge_gate.sh
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - showcase schedule confirmation base-gate membership
+  - test_showcase_schedule_confirmation_suite_is_promoted_into_base_gate
+  tests:
+  - tests/plugins/workflow/test_showcase_schedule_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'test(workflow): gate showcase schedule confirmation'
+  upstream_candidate: true
+  merge_guidance: Preserve exactly one base-gate selection for the showcase
+    schedule confirmation suite and keep it out of WORKFLOW_GATE_OPTOUTS so the
+    byte-pinned token derivation and exact refusal response cannot regress
+    outside the release gate.
+  removal_condition: Remove when upstream's base release gate selects an
+    equivalent exact schedule confirmation contract without an opt-out.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-authenticated-showcase-catalog-projection
   change_class: workflow-security
   owner: workflow-orchestration

@@ -48,7 +48,6 @@ WORKFLOW_GATE_OPTOUTS = {
         "tests/plugins/workflow/test_schema.py",
         "tests/plugins/workflow/test_script_executor.py",
         "tests/plugins/workflow/test_showcase_offline_e2e.py",
-        "tests/plugins/workflow/test_showcase_schedule_e2e.py",
         "tests/plugins/workflow/test_store.py",
         "tests/plugins/workflow/test_topology.py",
     )
@@ -159,6 +158,13 @@ def test_showcase_ai_and_evidence_suites_are_promoted_into_the_merge_gate() -> N
     ):
         assert path in source
         assert path not in WORKFLOW_GATE_OPTOUTS
+
+
+def test_showcase_schedule_confirmation_suite_is_promoted_into_base_gate() -> None:
+    path = "tests/plugins/workflow/test_showcase_schedule_e2e.py"
+
+    assert GATE.read_text().count(path) == 1
+    assert path not in WORKFLOW_GATE_OPTOUTS
 
 
 def test_exact_showcase_membership_is_pinned_at_all_three_gate_sites() -> None:

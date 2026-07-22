@@ -76,6 +76,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py \
       tests/plugins/workflow/test_showcase_catalog.py \
       tests/plugins/workflow/test_showcase_ai_e2e.py \
+      tests/plugins/workflow/test_showcase_schedule_e2e.py \
       tests/plugins/workflow/test_showcase_evidence.py \
       tests/plugins/workflow/test_showcase_distribution_e2e.py \
       tests/plugins/workflow/test_portable_compatibility_e2e.py \
