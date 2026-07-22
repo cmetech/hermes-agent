@@ -7,6 +7,7 @@ from pathlib import Path
 import time
 from typing import Any, BinaryIO, Callable, Mapping, Protocol
 
+from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.models import DeadlineBudget, RunExecutionLimits, WorkflowNode
 from plugins.workflow.store import ArtifactRef
 from tools.managed_process import (
@@ -34,6 +35,9 @@ class NodeExecutionContext:
     )
     node_state: Mapping[str, object] = field(default_factory=dict)
     operator_scope: str = "local"
+    ai_entitlement: AIEntitlementResolution = field(
+        default_factory=lambda: AIEntitlementResolution("real")
+    )
     execution_limits: RunExecutionLimits | None = None
     resource_limits: ProcessResourceLimits = field(
         default_factory=ProcessResourceLimits

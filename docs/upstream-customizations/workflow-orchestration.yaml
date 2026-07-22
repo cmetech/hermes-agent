@@ -67,6 +67,52 @@ upstream_changes:
   removal_condition: Remove when upstream exposes an equivalent generated
     product identity consumed by every version-output path.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-per-run-ai-entitlement
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/entitlement.py
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/executors/ai.py
+  - plugins/workflow/executors/approval.py
+  - plugins/workflow/executors/base.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/showcase.py
+  - plugins/workflow/showcases/digests.json
+  - plugins/workflow/showcases/packages/laptop-diagnostic/workflows/laptop-diagnostic.yaml
+  - scripts/test_workflow_merge_gate.sh
+  owned_symbols:
+  - AIEntitlementResolution
+  - agent_backed_features
+  - derive_ai_entitlement
+  - verified_showcase_run_metadata
+  - DeterministicAgentRunner
+  - entitled_agent_runner
+  - NodeExecutionContext.ai_entitlement
+  - showcase agent-backed feature validation
+  tests:
+  - tests/plugins/workflow/fixtures/entitlement/v3.0.2.json
+  - tests/plugins/workflow/test_ai_entitlement.py
+  - tests/plugins/workflow/test_ai_e2e.py
+  - tests/plugins/workflow/test_coordinator.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(workflow): enforce per-run AI entitlement'
+  upstream_candidate: true
+  merge_guidance: Preserve absence as a defined entitlement value. Current
+    verified-bundle markers and complete v3.0.2 showcase identity tuples must
+    derive deterministic without metadata upgrades or start-digest changes;
+    ordinary trusted workflows with no showcase shape remain real. Accept an
+    explicit real grant only when exact immutable identity corroborates the
+    digest-verified requires_ai scenario, and record execution_integrity before
+    runner selection on any mismatch. Classify command, prompt, loop, inline
+    agents, and approval rejection rework centrally; route every consumer
+    through the shared model-free runner under deterministic authority.
+  removal_condition: Remove when upstream provides equivalent immutable
+    per-run AI authority with v3.0.2 recovery/adoption compatibility and
+    fail-closed exact verified-scenario corroboration at every runner consumer.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: gateway-live-completion-eligibility
   change_class: model-selection-generic
   owner: workflow-orchestration

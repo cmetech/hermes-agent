@@ -19,7 +19,7 @@ import httpx
 from hermes_cli.dashboard_auth.base import TokenPrincipal
 import pytest
 
-from agent.plugin_agent import PluginAgentRunResult
+from agent.plugin_agent import PluginAgentRunner, PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
 import plugins.workflow.api_admission as api_admission_module
 from plugins.workflow.api_admission import (
@@ -1585,6 +1585,48 @@ def test_attention_includes_real_workflow_approval_interactions(tmp_path, monkey
         "reject",
         "cancel",
     ]
+
+
+def test_desktop_rejects_laptop_showcase_without_real_ai_under_offline_mode(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_OFFLINE", "1")
+    real_runner_calls = 0
+
+    def forbidden_real_run(*_args, **_kwargs):
+        nonlocal real_runner_calls
+        real_runner_calls += 1
+        raise AssertionError("Desktop showcase rejection selected real AI")
+
+    monkeypatch.setattr(PluginAgentRunner, "run", forbidden_real_run)
+    started = run_showcase(
+        "laptop-diagnostic",
+        hermes_home=home,
+        symptom="fictional Desktop rejection",
+    )
+    pending = started["pending_interaction"]
+    client = TestClient(_app(_router()))
+
+    rejected = client.post(
+        f"/api/plugins/workflow/runs/{started['run_id']}/reject",
+        json={
+            "expected_version": started["state_version"],
+            "interaction_id": pending["interaction_id"],
+            "reason": "keep the fictional plan manual",
+        },
+    )
+
+    assert rejected.status_code == 200
+    store = RunStore(home)
+    reworked = RunScheduler(
+        store,
+        agent_runner=PluginAgentRunner(plugin_id="workflow"),
+    ).advance(started["run_id"])
+    assert reworked["status"] == "paused"
+    assert reworked["nodes"]["review-plan"]["approval_rework_attempts"] == 1
+    assert real_runner_calls == 0
 
 
 def test_attention_returns_action_metadata_for_every_operator_attention_kind(

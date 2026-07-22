@@ -63,7 +63,9 @@ if [[ "$PHASE" == "base" ]]; then
       tests/gateway/test_plugin_delivery.py \
       tests/hermes_cli/test_plugin_provider_hot_reload.py \
       tests/scripts/test_workflow_merge_gate.py \
-      tests/plugins/workflow/test_admission.py tests/plugins/workflow/test_trust_policy.py \
+      tests/plugins/workflow/test_admission.py \
+      tests/plugins/workflow/test_ai_entitlement.py \
+      tests/plugins/workflow/test_trust_policy.py \
       tests/plugins/workflow/test_catalog_api.py \
       tests/plugins/workflow/test_workflow_detail_api.py \
       tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py \

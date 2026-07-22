@@ -19,7 +19,6 @@ from typing import Iterator, Literal, Mapping
 
 import yaml
 
-from agent.plugin_agent import PluginAgentRunResult
 from cron.jobs import create_job, list_jobs, use_cron_store
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import _input_requirements, _runtime_config, _scheduler
@@ -28,6 +27,10 @@ from plugins.workflow.compat import (
     CompatibilityLevel,
     CompatibilityReport,
     assess_compatibility,
+)
+from plugins.workflow.entitlement import (
+    validate_showcase_ai_contract,
+    verified_showcase_run_metadata,
 )
 from plugins.workflow.machine_contract import operator_command_contract
 from plugins.workflow.provenance import TriggerProvenance
@@ -407,10 +410,15 @@ def load_showcase_catalog(
                 or any(token in text for token in _FORBIDDEN_TEXT)
             ):
                 raise ShowcaseCatalogError(f"showcase safety contract rejected: {scenario_id}")
-            _load_workflow_from_verified_bytes(
+            package = _load_workflow_from_verified_bytes(
                 workflow,
                 read_budget=read_budget,
                 verified_bytes=verified_bytes,
+            )
+            validate_showcase_ai_contract(
+                scenario_id,
+                requires_ai=bool(item["requires_ai"]),
+                definition=package.definition,
             )
             result[scenario_id] = ShowcaseScenario(
                 **{key: str(item[key]) for key in ("id", "display_name", "purpose", "bundle_version", "package_version", "workflow_path", "interaction_mode", "safety_class", "cleanup_ownership")},
@@ -792,16 +800,6 @@ def preflight_showcase(showcase_id: str, *, hermes_home: str | Path) -> dict[str
     }
 
 
-class _DeterministicReworkRunner:
-    def run(self, request, *, is_cancelled=None):
-        return PluginAgentRunResult(
-            final_response="Deterministic revision recorded: keep every proposed action manual and reversible.",
-            session_id="showcase-rework", provider="deterministic", model="none",
-            status="completed", pending_interaction=None, usage={},
-            audit={"isolated_worker": False, "deterministic": True},
-        )
-
-
 def _store(home: str | Path, package=None) -> tuple[RunStore, object]:
     config = _runtime_config(home, sidecar=package.sidecar if package is not None else None)
     store = RunStore(
@@ -815,7 +813,13 @@ def _store(home: str | Path, package=None) -> tuple[RunStore, object]:
 
 
 def _advance_until_wait(store: RunStore, config, run_id: str) -> dict[str, object]:
-    scheduler = _scheduler(store, config, agent_runner=_DeterministicReworkRunner())
+    from agent.plugin_agent import PluginAgentRunner
+
+    scheduler = _scheduler(
+        store,
+        config,
+        agent_runner=PluginAgentRunner(plugin_id="workflow"),
+    )
     deadline = time.monotonic() + 305
     while True:
         projection = scheduler.advance(run_id)
@@ -907,7 +911,14 @@ def run_showcase(
         idempotency_namespace=f"profile-local:{trigger_source}",
         concurrency_key=f"showcase:{scenario.id}",
         concurrency_policy=str(package.sidecar.get("overlap_policy") or "queue"),
-        run_metadata={"showcase_id": scenario.id, "showcase_version": scenario.package_version, "bundle_digest": str(preflight["bundle_digest"]), "risk_digest": risk.risk_digest},
+        run_metadata=verified_showcase_run_metadata(
+            showcase_id=scenario.id,
+            showcase_version=scenario.package_version,
+            bundle_digest=str(preflight["bundle_digest"]),
+            risk_digest=risk.risk_digest,
+            requires_ai=scenario.requires_ai,
+            include_verified_marker=False,
+        ),
         provenance=TriggerProvenance.local_admin_claim(
             source=trigger_source,
             intent_key=intent_key,

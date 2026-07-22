@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Mapping
 
 from agent.plugin_agent import PluginAgentRunRequest
+from plugins.workflow.entitlement import (
+    AIExecutionIntegrityError,
+    entitled_agent_runner,
+)
 from plugins.workflow.executors.base import (
     NodeExecutionContext,
     NodeExecutionResult,
@@ -76,7 +80,17 @@ class ApprovalExecutor:
         rework = context.node_state.get("approval_rework")
         if not isinstance(rework, Mapping):
             return self._gate_result(context)
-        if self.agent_runner is None:
+        try:
+            agent_runner = entitled_agent_runner(
+                context.ai_entitlement, self.agent_runner
+            )
+        except AIExecutionIntegrityError as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="execution_integrity",
+                error_message=str(exc),
+            )
+        if agent_runner is None:
             return NodeExecutionResult(
                 "failed",
                 error_code="approval_rework_unavailable",
@@ -179,7 +193,7 @@ class ApprovalExecutor:
             ),
         )
         try:
-            result = self.agent_runner.run(request, is_cancelled=context.is_cancelled)
+            result = agent_runner.run(request, is_cancelled=context.is_cancelled)
         except PermissionError as exc:
             return NodeExecutionResult(
                 "failed",

@@ -9,6 +9,10 @@ from typing import Mapping
 
 from agent.plugin_agent import PluginAgentRunRequest
 from plugins.workflow.compat import resolve_tool_name
+from plugins.workflow.entitlement import (
+    AIExecutionIntegrityError,
+    entitled_agent_runner,
+)
 from plugins.workflow.executors.base import (
     NodeExecutionContext,
     NodeExecutionResult,
@@ -144,6 +148,16 @@ class AgentNodeExecutor:
         node = context.node
         if node.node_type not in {"command", "prompt"}:
             return self._failure("unsupported_ai_node", node.node_type)
+        try:
+            agent_runner = entitled_agent_runner(
+                context.ai_entitlement, self.agent_runner
+            )
+        except AIExecutionIntegrityError as exc:
+            return self._failure("execution_integrity", str(exc))
+        if agent_runner is None:
+            return self._failure(
+                "agent_runner_unavailable", "real agent execution is unavailable"
+            )
         fingerprint = self._fingerprint(context)
         explicit_context = node.options.get("context")
         context_mode = "fresh"
@@ -361,7 +375,7 @@ class AgentNodeExecutor:
                     else context.termination_policy.kill_grace_seconds
                 ),
             )
-            result = self.agent_runner.run(
+            result = agent_runner.run(
                 request,
                 is_cancelled=context.is_cancelled,
             )

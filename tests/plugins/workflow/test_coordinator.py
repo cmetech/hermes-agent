@@ -25,6 +25,7 @@ from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
+from plugins.workflow.showcase import run_showcase
 from plugins.workflow.store import ForegroundExecutionConflict, RunStore
 from tools.managed_process import ProcessIdentity
 
@@ -251,6 +252,82 @@ def test_legacy_foreground_lease_fails_closed_until_utc_deadline(
     assert acquired.epoch == 2
 
 
+def test_coordinator_adopts_legacy_cli_showcase_and_reworks_without_real_ai(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERMES_OFFLINE", "1")
+    runner_calls = 0
+
+    def forbidden_real_run(*_args, **_kwargs):
+        nonlocal runner_calls
+        runner_calls += 1
+        raise AssertionError("adopted legacy showcase selected real model execution")
+
+    monkeypatch.setattr(
+        "agent.plugin_agent.PluginAgentRunner.run", forbidden_real_run
+    )
+    started = run_showcase(
+        "laptop-diagnostic",
+        hermes_home=tmp_path,
+        symptom="fictional adopted startup issue",
+        no_wait=True,
+        idempotency_key="v302-adopted-laptop",
+    )
+    run_id = started["run_id"]
+    store = RunStore(tmp_path)
+    before = store.get_run_status(run_id)
+    assert before["status"] in {"running", "queued"}
+    assert set(before["run_metadata"]) == {
+        "showcase_id",
+        "showcase_version",
+        "bundle_digest",
+        "risk_digest",
+    }
+    assert store.release_foreground_execution(
+        run_id,
+        owner_id=before["foreground_owner_id"],
+        epoch=before["foreground_epoch"],
+        now=datetime.now(timezone.utc),
+    )
+
+    service = _service(
+        tmp_path,
+        host_kind="gateway",
+        host_instance_id="legacy-showcase-adopter",
+    )
+    stop = threading.Event()
+    thread = threading.Thread(target=service.run, args=(stop,))
+    thread.start()
+    try:
+        _wait_until(
+            lambda: store.get_run_status(run_id)["status"] == "paused",
+            timeout=10,
+        )
+        paused = store.get_run_status(run_id)
+        assert paused["execution_mode"] == "background"
+        pending = paused["pending_interaction"]
+        store.reject_run(
+            run_id,
+            reason="make the adopted plan more cautious",
+            expected_state_version=paused["state_version"],
+            interaction_id=pending["interaction_id"],
+            channel="desktop",
+        )
+        _wait_until(
+            lambda: store.get_run_status(run_id)["nodes"]["review-plan"].get(
+                "approval_rework_attempts"
+            )
+            == 1,
+            timeout=10,
+        )
+        reworked = store.get_run_status(run_id)
+        assert reworked["status"] == "paused"
+        assert runner_calls == 0
+    finally:
+        stop.set()
+        CoordinatorStore(store.database).notify_local()
+        thread.join(timeout=10)
+        assert not thread.is_alive()
 def test_stale_execution_fence_cannot_mutate_or_interrupt_successor_claim(
     tmp_path, workflow_writer
 ) -> None:

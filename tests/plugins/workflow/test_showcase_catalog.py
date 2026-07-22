@@ -50,6 +50,56 @@ def test_catalog_has_safe_digest_verified_scenarios() -> None:
     assert all("destructive" not in item.safety_class for item in catalog.values())
 
 
+@pytest.mark.parametrize(
+    "node_yaml",
+    [
+        "  - {id: consumer, command: inspect-evidence}\n",
+        "  - {id: consumer, prompt: summarize}\n",
+        (
+            "  - id: consumer\n"
+            "    loop: {prompt: iterate, until: DONE, max_iterations: 1}\n"
+        ),
+        (
+            "  - id: consumer\n"
+            "    command: inspect-evidence\n"
+            "    agents:\n"
+            "      reviewer:\n"
+            "        description: Review the fictional result\n"
+            "        prompt: Review without network access.\n"
+        ),
+    ],
+    ids=("command", "prompt", "loop", "inline-agent"),
+)
+def test_copied_non_ai_bundle_rejects_agent_backed_features(
+    tmp_path: Path, node_yaml: str
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+    workflow = (
+        copied
+        / "packages/laptop-diagnostic/workflows/laptop-diagnostic.yaml"
+    )
+    workflow.write_text(
+        "name: laptop-diagnostic\n"
+        "description: Restamped non-AI classifier fixture\n"
+        "nodes:\n"
+        + node_yaml,
+        encoding="utf-8",
+    )
+    manifest_path = copied / "digests.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["packages"]["laptop-diagnostic"] = showcase_module._tree_digest(
+        copied / "packages/laptop-diagnostic"
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ShowcaseCatalogError, match="requires_ai"):
+        load_showcase_catalog(copied)
+
+
 def test_exact_membership_rejects_a_fully_restamped_sixth_scenario(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

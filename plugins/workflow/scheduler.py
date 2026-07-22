@@ -18,6 +18,7 @@ import time
 import uuid
 from typing import Callable, Iterable, Mapping
 
+from plugins.workflow.entitlement import derive_ai_entitlement
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.approval import ApprovalExecutor
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
@@ -708,6 +709,12 @@ class RunScheduler:
                             node_state=node_state,
                             operator_scope=str(
                                 projection.get("operator_scope_digest") or "local"
+                            ),
+                            ai_entitlement=derive_ai_entitlement(
+                                projection.get("run_metadata", {}),
+                                definition_digest=str(
+                                    projection.get("definition_digest") or ""
+                                ),
                             ),
                             execution_limits=execution_limits,
                             resource_limits=ProcessResourceLimits(

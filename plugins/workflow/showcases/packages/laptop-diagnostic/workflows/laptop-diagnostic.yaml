@@ -20,17 +20,6 @@ nodes:
     runtime: uv
     depends_on: [render-report]
     when: "$render-report.output.severity != 'high'"
-  - id: interpret
-    command: interpret-report
-    context: fresh
-    depends_on: [render-report]
-    when: "$render-report.output.ai_requested == 'true'"
-    output_format:
-      type: object
-      required: [summary, simulated]
-      properties:
-        summary: {type: string}
-        simulated: {type: boolean}
   - id: review-plan
     approval:
       message: Review the fictional diagnostic report before finalizing a proposed plan. No remediation will run.

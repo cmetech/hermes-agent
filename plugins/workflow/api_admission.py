@@ -12,6 +12,7 @@ from typing import Literal, Mapping
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.coordinator_store import CoordinatorStore
+from plugins.workflow.entitlement import verified_showcase_run_metadata
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.store import RunStore
 from plugins.workflow.models import WorkflowValidationError
@@ -269,13 +270,14 @@ def start_api_run(
             package.sidecar.get("concurrency_key") or package.definition.name
         )
     else:
-        run_metadata = {
-            "showcase_id": verified_showcase.scenario.id,
-            "showcase_version": verified_showcase.scenario.package_version,
-            "bundle_digest": verified_showcase.bundle_digest,
-            "risk_digest": risk.risk_digest,
-            "showcase_provenance": "verified_bundled",
-        }
+        run_metadata = verified_showcase_run_metadata(
+            showcase_id=verified_showcase.scenario.id,
+            showcase_version=verified_showcase.scenario.package_version,
+            bundle_digest=verified_showcase.bundle_digest,
+            risk_digest=risk.risk_digest,
+            requires_ai=verified_showcase.scenario.requires_ai,
+            include_verified_marker=True,
+        )
         concurrency_key = f"showcase:{verified_showcase.scenario.id}"
 
     admitted = store.start_run(
