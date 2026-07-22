@@ -363,8 +363,8 @@ class ExecutionRuntimeCapabilities:
     hermes_managed_tool_loop: bool
 
 
-def classify_execution_runtime(api_mode: object) -> ExecutionRuntimeCapabilities:
-    """Classify one API mode without resolving credentials or starting I/O."""
+def _classify_execution_api_mode(api_mode: object) -> ExecutionRuntimeCapabilities:
+    """Classify one already-derived API mode."""
     normalized = api_mode.strip().lower() if isinstance(api_mode, str) else ""
     return ExecutionRuntimeCapabilities(
         api_mode=normalized,
@@ -374,12 +374,35 @@ def classify_execution_runtime(api_mode: object) -> ExecutionRuntimeCapabilities
     )
 
 
+def classify_execution_runtime(
+    *,
+    provider: object,
+    model_config: Mapping[str, Any] | object,
+    provider_config: Mapping[str, Any] | object | None = None,
+    target_model: object = None,
+) -> ExecutionRuntimeCapabilities:
+    """Prospectively classify a configured runtime without performing I/O.
+
+    The inputs are the metadata already available to provider catalogs and
+    admission checks. Credential resolution is deliberately outside this
+    contract; the worker classifies its actual resolved mapping with
+    :func:`classify_resolved_execution_runtime`.
+    """
+    api_mode = _effective_execution_api_mode(
+        provider=provider,
+        model_config=model_config,
+        provider_config=provider_config,
+        target_model=target_model,
+    )
+    return _classify_execution_api_mode(api_mode)
+
+
 def classify_resolved_execution_runtime(
     runtime: Mapping[str, Any] | object,
 ) -> ExecutionRuntimeCapabilities:
     """Classify the API mode on an already-resolved runtime mapping."""
     api_mode = runtime.get("api_mode") if isinstance(runtime, Mapping) else None
-    return classify_execution_runtime(api_mode)
+    return _classify_execution_api_mode(api_mode)
 
 
 def _parse_api_mode(raw: Any) -> Optional[str]:
@@ -426,6 +449,161 @@ def _maybe_apply_codex_app_server_runtime(
     if runtime == "codex_app_server":
         return "codex_app_server"
     return api_mode
+
+
+def _configured_api_mode(
+    config: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Return whether runtime metadata explicitly supplied an API mode.
+
+    Unknown string modes are retained for diagnostics but classify as
+    unsupported. A malformed explicit value returns an empty mode instead of
+    silently falling back to a potentially unsafe managed tool loop.
+    """
+    for key in ("api_mode", "transport"):
+        if key not in config:
+            continue
+        raw = config.get(key)
+        if not isinstance(raw, str):
+            return True, ""
+        return True, raw.strip().lower()
+    return False, ""
+
+
+def _effective_execution_api_mode(
+    *,
+    provider: object,
+    model_config: Mapping[str, Any] | object,
+    provider_config: Mapping[str, Any] | object | None = None,
+    target_model: object = None,
+) -> str:
+    """Pure effective-mode derivation shared by admission and resolution.
+
+    An ``api_mode`` on ``provider_config`` is authoritative because an actual
+    resolved runtime is passed through this same function. Prospective callers
+    may omit it and derive the mode from configured provider/model/URL
+    metadata. Unknown or malformed metadata fails closed.
+    """
+    if not isinstance(provider, str) or not provider.strip():
+        return ""
+    if not isinstance(model_config, Mapping):
+        return ""
+    if provider_config is not None and not isinstance(provider_config, Mapping):
+        return ""
+    if target_model is not None and not isinstance(target_model, str):
+        return ""
+
+    normalized_provider = provider.strip().lower()
+    model_cfg = dict(model_config)
+    provider_cfg = dict(provider_config or {})
+
+    has_resolved_mode, api_mode = _configured_api_mode(provider_cfg)
+    if has_resolved_mode:
+        return _maybe_apply_codex_app_server_runtime(
+            provider=normalized_provider,
+            api_mode=api_mode,
+            model_cfg=model_cfg,
+        )
+
+    effective_model = str(
+        target_model
+        or model_cfg.get("default")
+        or model_cfg.get("model")
+        or provider_cfg.get("model")
+        or provider_cfg.get("default_model")
+        or ""
+    ).strip()
+    base_url = str(
+        provider_cfg.get("base_url")
+        or provider_cfg.get("api")
+        or provider_cfg.get("url")
+        or model_cfg.get("base_url")
+        or ""
+    ).strip()
+    configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+
+    # These providers deliberately re-derive the transport on every model
+    # switch because one provider serves models on multiple API surfaces.
+    if normalized_provider in {"opencode-zen", "opencode-go"}:
+        from hermes_cli.models import opencode_model_api_mode
+
+        api_mode = opencode_model_api_mode(normalized_provider, effective_model)
+    elif normalized_provider == "azure-foundry":
+        has_model_mode, configured_mode = _configured_api_mode(model_cfg)
+        if has_model_mode and not configured_mode:
+            return ""
+        api_mode = configured_mode or "chat_completions"
+        if effective_model and api_mode != "anthropic_messages":
+            from hermes_cli.models import azure_foundry_model_api_mode
+
+            api_mode = azure_foundry_model_api_mode(effective_model) or api_mode
+    elif normalized_provider == "copilot":
+        has_model_mode, configured_mode = _configured_api_mode(model_cfg)
+        if (
+            has_model_mode
+            and _provider_supports_explicit_api_mode(
+                normalized_provider, configured_provider
+            )
+        ):
+            if not configured_mode:
+                return ""
+            api_mode = configured_mode
+        else:
+            from hermes_cli.models import copilot_model_api_mode
+
+            # Supplying an empty catalog keeps this metadata-only path pure.
+            api_mode = copilot_model_api_mode(effective_model, catalog=[])
+    elif normalized_provider == "bedrock":
+        from agent.bedrock_adapter import is_anthropic_bedrock_model
+
+        api_mode = (
+            "anthropic_messages"
+            if is_anthropic_bedrock_model(effective_model)
+            else "bedrock_converse"
+        )
+    else:
+        has_model_mode, configured_mode = _configured_api_mode(model_cfg)
+        if (
+            has_model_mode
+            and _provider_supports_explicit_api_mode(
+                normalized_provider, configured_provider
+            )
+        ):
+            if not configured_mode:
+                return ""
+            if normalized_provider == "custom":
+                api_mode = _resolve_plain_custom_api_mode(model_cfg, base_url)
+            else:
+                api_mode = configured_mode
+        else:
+            detected_mode = _detect_api_mode_for_url(base_url)
+            if detected_mode:
+                api_mode = detected_mode
+            elif normalized_provider in {"openai-codex", "xai", "xai-oauth"}:
+                api_mode = "codex_responses"
+            elif normalized_provider in {"anthropic", "minimax-oauth"}:
+                api_mode = "anthropic_messages"
+            elif normalized_provider in {
+                *PROVIDER_REGISTRY,
+                "custom",
+                "moa",
+                "openai",
+                "openrouter",
+                "vertex",
+                "google-vertex",
+                "vertex-ai",
+                "gcp-vertex",
+                "vertexai",
+            }:
+                api_mode = "chat_completions"
+            else:
+                return ""
+
+    return _maybe_apply_codex_app_server_runtime(
+        provider=normalized_provider,
+        api_mode=api_mode,
+        model_cfg=model_cfg,
+    )
 
 
 def _resolve_runtime_from_pool_entry(
@@ -1545,12 +1723,13 @@ def _resolve_explicit_runtime(
     return None
 
 
-def resolve_runtime_provider(
+def _resolve_runtime_provider_unclassified(
     *,
     requested: Optional[str] = None,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    model_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -1562,6 +1741,7 @@ def resolve_runtime_provider(
     persisted default. Other callers can leave it None to preserve existing
     behavior (api_mode derived from config).
     """
+    model_cfg = dict(model_cfg) if model_cfg is not None else _get_model_config()
     requested_provider = resolve_requested_provider(requested)
 
     if requested_provider == "moa":
@@ -1602,7 +1782,7 @@ def resolve_runtime_provider(
     if requested_provider == "azure-foundry":
         azure_runtime = _resolve_azure_foundry_runtime(
             requested_provider=requested_provider,
-            model_cfg=_get_model_config(),
+            model_cfg=model_cfg,
             explicit_api_key=explicit_api_key,
             explicit_base_url=explicit_base_url,
             target_model=target_model,
@@ -1657,7 +1837,6 @@ def resolve_runtime_provider(
     # resolve_provider() pick up an ANTHROPIC_API_KEY or OPENAI_API_KEY from
     # the environment and send the request to a cloud API. Fixes #3846.
     if not explicit_base_url and not explicit_api_key:
-        model_cfg = _get_model_config()
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         cfg_base_url = str(model_cfg.get("base_url") or "").strip()
         if cfg_base_url and cfg_provider in ("auto", ""):
@@ -1693,7 +1872,6 @@ def resolve_runtime_provider(
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
     )
-    model_cfg = _get_model_config()
     explicit_runtime = _resolve_explicit_runtime(
         provider=provider,
         requested_provider=requested_provider,
@@ -2114,6 +2292,38 @@ def resolve_runtime_provider(
         explicit_base_url=explicit_base_url,
     )
     runtime["requested_provider"] = requested_provider
+    return runtime
+
+
+def resolve_runtime_provider(
+    *,
+    requested: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve credentials and normalize the actual effective API mode.
+
+    All non-capability runtime fields come directly from the existing resolver.
+    The shared pure mode helper only changes ``api_mode`` when the explicit
+    OpenAI/Codex app-server opt-in requires it.
+    """
+    model_cfg = _get_model_config()
+    runtime = _resolve_runtime_provider_unclassified(
+        requested=requested,
+        explicit_api_key=explicit_api_key,
+        explicit_base_url=explicit_base_url,
+        target_model=target_model,
+        model_cfg=model_cfg,
+    )
+    effective_mode = _effective_execution_api_mode(
+        provider=runtime.get("provider"),
+        model_config=model_cfg,
+        provider_config=runtime,
+        target_model=target_model,
+    )
+    if runtime.get("api_mode") != effective_mode:
+        runtime["api_mode"] = effective_mode
     return runtime
 
 

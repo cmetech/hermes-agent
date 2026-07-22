@@ -2088,6 +2088,7 @@ upstream_changes:
   - ExecutionRuntimeCapabilities
   - classify_execution_runtime
   - classify_resolved_execution_runtime
+  - _effective_execution_api_mode
   - PluginAgentRunner.starts_request_mcp
   - PackageMCPUnavailable
   - _run request MCP lifecycle
@@ -2101,8 +2102,10 @@ upstream_changes:
   - tests/scripts/test_workflow_merge_gate.py
   expected_commit_subject: 'feat(workflow): start request MCP in plugin workers'
   upstream_candidate: true
-  merge_guidance: Preserve the pure fail-closed execution-runtime classifier and
-    resolve the actual worker runtime before starting any required request MCP.
+  merge_guidance: Preserve the pure fail-closed prospective execution-runtime
+    classifier over configured provider/model/runtime metadata and its shared
+    effective-mode derivation with the actual runtime resolver. Resolve and
+    independently classify the actual worker runtime before starting any required request MCP.
     The isolated worker must own discovery, registration, tool-policy ordering,
     and process reaping from one outer cleanup boundary while restoring loader,
     timeout, callbacks, hooks, inline tools, session state, and registry generation.
