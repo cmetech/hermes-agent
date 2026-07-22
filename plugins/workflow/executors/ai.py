@@ -199,6 +199,7 @@ class AgentNodeExecutor:
             )
             if (
                 persist
+                and context.ai_entitlement.value == "real"
                 and explicit_context != "fresh"
                 and self.session_registry is not None
             ):
