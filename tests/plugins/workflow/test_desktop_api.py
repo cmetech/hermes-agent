@@ -406,6 +406,59 @@ def test_schedule_at_parser_translates_unrepresentable_observed_offset() -> None
     assert error.value.status_code == 422
 
 
+def test_schedule_at_parser_accepts_durable_metadata_value_boundary() -> None:
+    schedule_at = f"2099-01-02T03:04:05.{'1' * 491}Z"
+
+    assert len(schedule_at) == 512
+    assert (
+        api_admission_module.normalize_api_schedule_at(
+            schedule_at, now_utc=SCHEDULE_NOW
+        )
+        == schedule_at
+    )
+
+
+def test_post_runs_rejects_schedule_over_durable_metadata_value_boundary(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    schedule_at = f"2099-01-02T03:04:05.{'1' * 492}Z"
+    assert len(schedule_at) == 513
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    module = _module()
+    monkeypatch.setattr(module, "_schedule_now_utc", lambda: SCHEDULE_NOW)
+
+    @contextmanager
+    def forbidden_store_lease():
+        pytest.fail("oversized schedule reached store construction")
+        yield
+
+    monkeypatch.setattr(module, "_store_lease", forbidden_store_lease)
+    monkeypatch.setattr(
+        api_admission_module,
+        "_catalog_package",
+        lambda *_args, **_kwargs: pytest.fail("oversized schedule loaded a package"),
+    )
+
+    response = TestClient(_app(module.router)).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "must-not-load",
+            "values": {},
+            "idempotency_key": "oversized-schedule",
+            "concurrency_policy": "queue",
+            "schedule_at": schedule_at,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {"code": "workflow_schedule_invalid", "retryable": False}
+    }
+    assert not home.exists()
+    assert not (home / "workflow-staging").exists()
+
+
 @pytest.mark.parametrize(
     "schedule_at",
     [

@@ -2410,6 +2410,7 @@ upstream_changes:
   owned_symbols:
   - StartRunRequest.schedule_at
   - normalize_api_schedule_at
+  - SCHEDULE_INSTANT_MAX_CHARS
   - normalize_rfc3339_instant
   - rfc3339_instant_is_after
   - scheduled API identity metadata
@@ -2426,8 +2427,10 @@ upstream_changes:
     Preserve endpoint-owned typed schedule validation before store or package
     access, including malformed JSON types, strict timezone awareness, explicit
     rejection of the RFC 3339 unknown offset, overflow-safe canonical UTC-Z
-    normalization, exact preservation of arbitrary accepted fractional precision,
-    trailing-zero equivalence, and a test-injected current instant. Keep
+    normalization, exact preservation of arbitrary accepted fractional precision
+    through the 512-character durable metadata boundary, rejection of the first
+    oversized canonical value, trailing-zero equivalence, and a test-injected
+    current instant. Keep
     schedule-only metadata limited to
     canonical schedule_at plus server-derived catalog_source and risk_digest;
     existing top-level definition, policy, and input digests remain authoritative.

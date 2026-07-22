@@ -12,6 +12,7 @@ _RFC3339_INSTANT = re.compile(
     r"(?:\.(?P<fraction>\d+))?"
     r"(?P<zone>[Zz]|[+-]\d{2}:\d{2})$"
 )
+SCHEDULE_INSTANT_MAX_CHARS = 512
 
 
 class ScheduleInstantError(ValueError):
@@ -38,7 +39,10 @@ def normalize_rfc3339_instant(value: object) -> str:
     fraction = (matched.group("fraction") or "").rstrip("0")
     if fraction and len(fraction) <= 6:
         fraction = fraction.ljust(6, "0")
-    return f"{canonical}{f'.{fraction}' if fraction else ''}Z"
+    normalized = f"{canonical}{f'.{fraction}' if fraction else ''}Z"
+    if len(normalized) > SCHEDULE_INSTANT_MAX_CHARS:
+        raise ScheduleInstantError("schedule instant exceeds durable metadata bound")
+    return normalized
 
 
 def rfc3339_instant_is_after(value: str, observed: datetime) -> bool:
@@ -63,6 +67,7 @@ def rfc3339_instant_is_after(value: str, observed: datetime) -> bool:
 
 
 __all__ = [
+    "SCHEDULE_INSTANT_MAX_CHARS",
     "ScheduleInstantError",
     "normalize_rfc3339_instant",
     "rfc3339_instant_is_after",
