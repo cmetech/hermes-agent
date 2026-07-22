@@ -63,7 +63,7 @@ from plugins.workflow.trust import (
 _ALLOWED_CLAIMS = frozenset({
     "immutable-inputs", "parallel-fan-in", "approval-rework",
     "artifact-verification", "no-live-inventory", "persisted-retry",
-    "typed-timeout", "process-cleanup", "explicit-ai-consent",
+    "typed-timeout", "process-cleanup",
     "scoped-extensions", "persistent-session", "local-mcp-cleanup",
     "explicit-schedule-consent", "one-shot-ownership", "cron-recovery",
     "operator-approval",
@@ -937,7 +937,9 @@ def preflight_showcase(showcase_id: str, *, hermes_home: str | Path) -> dict[str
     package = _scenario_package(scenario)
     with _bundle_path() as root:
         bundle_digest = _bundle_digest(root)
-    confirmation_kind = "ai" if scenario.requires_ai else "schedule" if scenario.interaction_mode == "schedule" else None
+    confirmation_kind = (
+        "schedule" if scenario.interaction_mode == "schedule" else None
+    )
     token = _sha256(f"{confirmation_kind or 'none'}\0{scenario.package_digest}\0{bundle_digest}".encode()) if confirmation_kind else None
     requested_skills = sorted({str(skill) for node in package.definition.nodes for skill in node.options.get("skills", ())})
     local_mcp = sorted({str(value) for node in package.definition.nodes for value in ((node.options.get("mcp"),) if isinstance(node.options.get("mcp"), str) else node.options.get("mcp", ())) if isinstance(value, str)})
@@ -1051,8 +1053,6 @@ def run_showcase(
         )
     home = Path(hermes_home).expanduser().resolve()
     preflight = preflight_showcase(showcase_id, hermes_home=home)
-    if scenario.requires_ai and confirmation_token != preflight["confirmation_token"]:
-        return {"status": "skipped", "reason_code": "ai_confirmation_required", "run_id": None, "confirmation_token": preflight["confirmation_token"]}
     if scenario.interaction_mode == "schedule":
         if not schedule_at:
             return {"status": "skipped", "reason_code": "schedule_time_required", "run_id": None}

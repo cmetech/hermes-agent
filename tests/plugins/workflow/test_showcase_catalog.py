@@ -128,6 +128,22 @@ def test_catalog_restamps_ai_extension_metadata_without_consent_vocabulary() -> 
     ).lower()
 
 
+def test_catalog_rejects_obsolete_ai_confirmation_claim(tmp_path: Path) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+    catalog_path = copied / "catalog.yaml"
+    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    ai = next(
+        item for item in raw["scenarios"] if item["id"] == "ai-extensions"
+    )
+    ai["capability_claims"].append("explicit-ai-consent")
+    catalog_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _restamp_showcase_copy(copied, "ai-extensions")
+
+    with pytest.raises(ShowcaseCatalogError, match="safety contract rejected"):
+        load_showcase_catalog(copied)
+
+
 @pytest.mark.parametrize(
     ("case", "fixture_path"),
     [
@@ -1328,9 +1344,9 @@ def test_preflight_is_side_effect_free_and_reports_explicit_opt_ins(
         {"name": "evidence", "kind": "file", "required": True, "max_bytes": 65536},
         {"name": "symptom", "kind": "text", "required": True, "max_bytes": 4096},
     ]
-    assert ai["requires_confirmation"] is True
-    assert ai["confirmation_kind"] == "ai"
-    assert ai["confirmation_token"]
+    assert ai["requires_confirmation"] is False
+    assert ai["confirmation_kind"] is None
+    assert ai["confirmation_token"] is None
 
 
 def test_showcase_cli_list_and_missing_input_have_stable_exit_categories(

@@ -118,6 +118,34 @@ upstream_changes:
     runner binding, context-derived compatibility projection, raw-only showcase
     cache, and fail-closed capability admission across every execution surface.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-honest-cli-ai-scope
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/showcase.py
+  - tests/plugins/workflow/test_showcase_ai_e2e.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_showcase_schedule_e2e.py
+  owned_symbols:
+  - preflight_showcase AI confirmation removal
+  - run_showcase ordinary CLI compatibility refusal
+  - obsolete explicit-ai-consent claim rejection
+  - schedule-kind confirmation preservation
+  tests:
+  - tests/plugins/workflow/test_showcase_ai_e2e.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_showcase_schedule_e2e.py
+  expected_commit_subject: 'fix(workflow): remove showcase AI confirmation gate'
+  upstream_candidate: true
+  merge_guidance: Preserve the absence of any AI-specific CLI confirmation
+    token or refusal. Both omitted and legacy optional token arguments must
+    reach ordinary deterministic-runner compatibility and reject package MCP
+    before store, staging, scheduler, runner, MCP, provider, or cron effects.
+    Keep the schedule-kind token derivation and refusal projection unchanged.
+  removal_condition: Remove when upstream provides equivalent no-token but
+    honestly incompatible CLI AI showcase behavior while preserving schedule
+    confirmation.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-authenticated-showcase-catalog-projection
   change_class: workflow-security
   owner: workflow-orchestration
@@ -1420,7 +1448,7 @@ upstream_changes:
     unchanged, and include only sealed input-manifest identity in durable run
     state and idempotency material. Keep laptop-diagnostic as the third supported
     bundled Desktop workflow and retain the guided ai-extensions metadata while
-    leaving its explicit CLI AI confirmation contract intact.
+    leaving CLI capability to the runner/runtime compatibility contract.
   removal_condition: Remove when upstream provides equivalent authenticated
     showcase binding, read-once fixture staging, run-support, isolation, and
     installed-distribution guarantees.
