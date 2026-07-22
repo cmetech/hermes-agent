@@ -781,6 +781,13 @@ class RunScheduler:
             node.options.get("retry"),
             default_max_attempts=execution_limits.combined_retries,
         )
+        policy = replace(
+            policy,
+            max_attempts=min(
+                policy.max_attempts,
+                execution_limits.combined_retries,
+            ),
+        )
         projection = self.store.load_run(claim.run_id)
         node_state = projection["nodes"][claim.node_id]
         consumed_before = int(node_state.get("retry_consumed", 0))

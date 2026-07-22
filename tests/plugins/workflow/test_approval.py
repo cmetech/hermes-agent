@@ -312,6 +312,64 @@ def test_scheduler_uses_ai_deadline_for_approval_rework(
     assert request.provider_request_timeout_seconds == 7
 
 
+def test_failed_approval_rework_consumes_unknown_provider_attempts(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "failed-rework",
+        name="failed-rework",
+        nodes=[{
+            "id": "review",
+            "approval": {
+                "message": "Approve?",
+                "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+            },
+            "retry": {"max_attempts": 5, "delay_ms": 1000, "on_error": "all"},
+        }],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "limits: {combined_retries: 2}\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "failed-rework-home")
+    admitted = _start(store, package, key="failed-rework")
+
+    class FailedReworkRunner:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="failed-rework",
+                provider="fake",
+                model="fake",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit={"failure_kind": "provider_timeout"},
+            )
+
+    runner = FailedReworkRunner()
+    scheduler = RunScheduler(store, agent_runner=runner)
+    first_pause = scheduler.advance(admitted.run_id)
+    pending = first_pause["nodes"]["review"]["pending_interaction"]
+    store.reject_run(
+        admitted.run_id,
+        reason="missing evidence",
+        expected_state_version=first_pause["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+
+    result = scheduler.advance(admitted.run_id)
+
+    assert result["status"] == "failed"
+    assert len(runner.requests) == 1
+    assert runner.requests[0].max_api_attempts == 2
+    assert result["nodes"]["review"]["retry_consumed"] == 2
+
+
 class ToolApprovalRunner:
     def __init__(self):
         self.requests = []

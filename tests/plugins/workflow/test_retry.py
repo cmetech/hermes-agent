@@ -385,3 +385,44 @@ def test_provider_attempts_are_cumulative_and_unknown_outcome_still_reconciles(
     result = scheduler.advance(admitted.run_id)
     assert result["status"] == "paused"
     assert result["nodes"]["work"]["retry_consumed"] == 5
+
+
+def test_run_combined_retries_cap_explicit_node_retry_attempts(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "run-cap",
+        name="run-cap",
+        nodes=[{
+            "id": "work",
+            "bash": "true",
+            "retry": {"max_attempts": 5, "delay_ms": 1000},
+        }],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "limits: {combined_retries: 2}\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "run-cap-home")
+    admitted = _start(store, package)
+    now = datetime(2026, 7, 17, tzinfo=timezone.utc)
+    calls = 0
+
+    class AlwaysTransient:
+        def execute(self, context):
+            nonlocal calls
+            calls += 1
+            assert context.execution_limits is not None
+            assert context.execution_limits.combined_retries == 2
+            return NodeExecutionResult("failed", error_code="provider_timeout")
+
+    scheduler = RunScheduler(store, utcnow=lambda: now, jitter=lambda: 0.5)
+    scheduler.executors["bash"] = AlwaysTransient()
+    assert scheduler.advance(admitted.run_id)["status"] == "waiting_retry"
+    now += timedelta(seconds=1)
+
+    result = scheduler.advance(admitted.run_id)
+
+    assert result["status"] == "failed"
+    assert calls == 2
+    assert result["nodes"]["work"]["retry_consumed"] == 2

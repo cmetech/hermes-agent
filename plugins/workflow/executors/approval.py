@@ -120,17 +120,18 @@ class ApprovalExecutor:
                 )
             ),
         )
+        granted_provider_attempts = (
+            execution_limits.combined_retries
+            if execution_limits is not None
+            else context.max_provider_attempts
+        )
         request = PluginAgentRunRequest(
             prompt=prompt,
             provider=context.workflow_options.get("provider"),
             model=context.workflow_options.get("model"),
             workdir=context.run_directory,
             max_iterations=90,
-            max_api_attempts=(
-                execution_limits.combined_retries
-                if execution_limits is not None
-                else context.max_provider_attempts
-            ),
+            max_api_attempts=granted_provider_attempts,
             idle_timeout_seconds=idle_timeout,
             wall_timeout_seconds=wall_timeout,
             provider_request_timeout_seconds=provider_timeout,
@@ -181,10 +182,23 @@ class ApprovalExecutor:
         if result.status == "cancelled":
             return NodeExecutionResult("cancelled", error_code="cancelled")
         if result.status != "completed":
+            metadata: dict[str, object] = {"audit": dict(result.audit)}
+            provider_attempts = result.audit.get("provider_attempts")
+            if isinstance(provider_attempts, int) and not isinstance(
+                provider_attempts, bool
+            ):
+                metadata["provider_attempts"] = max(0, provider_attempts)
+            else:
+                # The worker did not report its exact provider retry count.
+                # Charge the full grant so workflow retries cannot multiply it.
+                metadata["provider_attempts"] = max(
+                    0, granted_provider_attempts - 1
+                )
             return NodeExecutionResult(
                 "failed",
                 error_code="approval_rework_failed",
                 error_message="isolated approval rework failed",
+                metadata=metadata,
             )
         attempt = context.run_directory / "nodes" / context.node.id / context.attempt_id
         attempt.mkdir(parents=True, exist_ok=False)
