@@ -2074,3 +2074,42 @@ upstream_changes:
     concurrency, worker, deadline, retry, resource-tree, and termination-grace
     ceilings without resizing or retiming shared coordinator infrastructure.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: plugin-agent-request-mcp-lifecycle
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - hermes_cli/runtime_provider.py
+  - plugins/workflow/executors/ai.py
+  - scripts/test_workflow_merge_gate.sh
+  owned_symbols:
+  - ExecutionRuntimeCapabilities
+  - classify_execution_runtime
+  - classify_resolved_execution_runtime
+  - PluginAgentRunner.starts_request_mcp
+  - PackageMCPUnavailable
+  - _run request MCP lifecycle
+  - AgentNodeExecutor package_mcp_unavailable mapping
+  - workflow request-MCP release-gate selection
+  tests:
+  - tests/agent/test_plugin_agent.py
+  - tests/hermes_cli/test_execution_runtime_capabilities.py
+  - tests/plugins/workflow/test_ai_executor.py
+  - tests/plugins/workflow/test_node_mcp.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(workflow): start request MCP in plugin workers'
+  upstream_candidate: true
+  merge_guidance: Preserve the pure fail-closed execution-runtime classifier and
+    resolve the actual worker runtime before starting any required request MCP.
+    The isolated worker must own discovery, registration, tool-policy ordering,
+    and process reaping from one outer cleanup boundary while restoring loader,
+    timeout, callbacks, hooks, inline tools, session state, and registry generation.
+    Keep incapable runtimes and failed required MCP startup provider-call-free,
+    and retain the exact package_mcp_unavailable node failure code. Do not change
+    cron's optional profile-global MCP behavior.
+  removal_condition: Remove when upstream provides an equivalent isolated plugin
+    agent request-MCP lifecycle, pure runtime capability classifier, and exact
+    fail-closed workflow error propagation across the native release matrix.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

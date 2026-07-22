@@ -440,7 +440,9 @@ class AgentNodeExecutor:
             )
         if result.status != "completed":
             failure_kind = str(result.audit.get("failure_kind", "")).lower()
-            if (
+            if failure_kind == "package_mcp_unavailable":
+                error_code = "package_mcp_unavailable"
+            elif (
                 "unknown_side_effect" in failure_kind
                 or "outcome_unknown" in failure_kind
             ):

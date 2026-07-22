@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 import logging
 import os
 import re
@@ -347,6 +349,37 @@ _VALID_API_MODES = {
     # {"openai", "openai-codex"}. Default is unchanged.
     "codex_app_server",
 }
+
+_HERMES_MANAGED_TOOL_LOOP_API_MODES = frozenset({
+    "chat_completions",
+    "codex_responses",
+    "anthropic_messages",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionRuntimeCapabilities:
+    api_mode: str
+    hermes_managed_tool_loop: bool
+
+
+def classify_execution_runtime(api_mode: object) -> ExecutionRuntimeCapabilities:
+    """Classify one API mode without resolving credentials or starting I/O."""
+    normalized = api_mode.strip().lower() if isinstance(api_mode, str) else ""
+    return ExecutionRuntimeCapabilities(
+        api_mode=normalized,
+        hermes_managed_tool_loop=(
+            normalized in _HERMES_MANAGED_TOOL_LOOP_API_MODES
+        ),
+    )
+
+
+def classify_resolved_execution_runtime(
+    runtime: Mapping[str, Any] | object,
+) -> ExecutionRuntimeCapabilities:
+    """Classify the API mode on an already-resolved runtime mapping."""
+    api_mode = runtime.get("api_mode") if isinstance(runtime, Mapping) else None
+    return classify_execution_runtime(api_mode)
 
 
 def _parse_api_mode(raw: Any) -> Optional[str]:

@@ -31,7 +31,6 @@ WORKFLOW_GATE_OPTOUTS = {
         "tests/plugins/workflow/test_loop_executor.py",
         "tests/plugins/workflow/test_node_agents.py",
         "tests/plugins/workflow/test_node_hooks.py",
-        "tests/plugins/workflow/test_node_mcp.py",
         "tests/plugins/workflow/test_node_skills.py",
         "tests/plugins/workflow/test_node_tool_policy.py",
         "tests/plugins/workflow/test_operator_e2e.py",
@@ -108,6 +107,16 @@ def test_showcase_desktop_e2e_is_in_merge_gate_and_native_matrix() -> None:
 
     assert path in GATE.read_text()
     assert path in CI.read_text()
+
+
+def test_request_mcp_runtime_contract_is_in_merge_gate_and_native_matrix() -> None:
+    for path in (
+        "tests/plugins/workflow/test_node_mcp.py",
+        "tests/hermes_cli/test_execution_runtime_capabilities.py",
+    ):
+        assert GATE.read_text().count(path) == 1
+        assert CI.read_text().count(path) == 1
+        assert path not in WORKFLOW_GATE_OPTOUTS
 
 
 def test_laptop_diagnostic_middleware_e2e_is_exactly_pinned_in_release_gates() -> None:

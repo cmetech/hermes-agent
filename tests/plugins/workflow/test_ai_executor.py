@@ -206,6 +206,28 @@ def test_resource_failure_is_typed_and_never_hidden_as_agent_failure(tmp_path):
     assert result.error_code == "resource_limit"
 
 
+def test_required_package_mcp_failure_keeps_exact_node_error(tmp_path):
+    class PackageMCPRunner:
+        def run(self, request, **_kwargs):
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="",
+                provider=request.provider or "fake",
+                model=request.model or "fake",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit={"failure_kind": "package_mcp_unavailable"},
+            )
+
+    result = AgentNodeExecutor(PackageMCPRunner()).execute(
+        _context(tmp_path, _node("required-mcp", "work"))
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "package_mcp_unavailable"
+
+
 def test_ai_request_receives_remaining_absolute_deadline_and_retry_budget(tmp_path):
     runner = FakeAgentRunner("done")
     budget = DeadlineBudget.create(

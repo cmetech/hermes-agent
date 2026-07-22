@@ -54,6 +54,7 @@ if [[ "$PHASE" == "base" ]]; then
     "$PYTHON_BIN" -m pytest -q \
       tests/tools/test_managed_process.py tests/tools/test_process_registry.py \
       tests/agent/test_plugin_agent.py tests/tools/test_registry.py \
+      tests/hermes_cli/test_execution_runtime_capabilities.py \
       tests/hermes_cli/test_kanban_mutation_preconditions.py \
       tests/hermes_cli/test_kanban_db.py \
       tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py \
@@ -65,6 +66,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/scripts/test_workflow_merge_gate.py \
       tests/plugins/workflow/test_admission.py \
       tests/plugins/workflow/test_ai_entitlement.py \
+      tests/plugins/workflow/test_node_mcp.py \
       tests/plugins/workflow/test_trust_policy.py \
       tests/plugins/workflow/test_catalog_api.py \
       tests/plugins/workflow/test_workflow_detail_api.py \

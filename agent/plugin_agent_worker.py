@@ -20,6 +20,12 @@ _emit_lock = threading.Lock()
 _cancel_event = threading.Event()
 _active_agent: Any = None
 
+
+class PackageMCPUnavailable(RuntimeError):
+    """A request-carried MCP cannot be supplied to Hermes' tool loop."""
+
+    failure_kind = "package_mcp_unavailable"
+
 _ARCHON_HOOK_EVENT_MAP = {
     "PreToolUse": "pre_tool_call",
     "PostToolUse": "post_tool_call",
@@ -378,130 +384,163 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
     if not plugin_id:
         raise ValueError("plugin_id is missing")
 
-    # A node worker sees only the MCP definitions carried by its immutable
-    # request. Environment placeholders resolve here, after IPC, and resolved
-    # values are never returned to the plugin or parent process.
-    from tools import mcp_tool as worker_mcp
+    worker_mcp = None
+    original_mcp_loader = None
+    timeout_mod = None
+    configured_timeout = None
+    registry = None
+    session_db = None
+    inline_registered = False
+    callbacks_installed = False
+    original_approval_callback = None
+    original_sudo_callback = None
+    original_secret_callback = None
+    node_hook_manager = None
+    original_node_hooks = None
+    original_node_middleware = None
+    original_registry_generation = None
 
     try:
-        from hermes_cli.env_loader import load_hermes_dotenv
+        # A node worker sees only the MCP definitions carried by its immutable
+        # request. Environment placeholders resolve here, after IPC, and
+        # resolved values are never returned to the plugin or parent process.
+        from tools import mcp_tool as worker_mcp
+        from tools.registry import registry
 
-        load_hermes_dotenv()
-    except Exception:
-        pass
-    raw_mcp = dict(request.mcp_servers or {})
-    resolved_mcp = {
-        str(name): worker_mcp._interpolate_env_vars(dict(config))
-        for name, config in raw_mcp.items()
-    }
-    original_mcp_loader = worker_mcp._load_mcp_config
-    worker_mcp._load_mcp_config = lambda: resolved_mcp
+        original_registry_generation = registry._generation
 
-    # Bound provider calls inside this isolated process without introducing a
-    # parent-visible config/env mutation or a new AIAgent constructor surface.
-    import hermes_cli.timeouts as timeout_mod
+        try:
+            from hermes_cli.env_loader import load_hermes_dotenv
 
-    configured_timeout = timeout_mod.get_provider_request_timeout
-    timeout_mod.get_provider_request_timeout = lambda provider, model: min(
-        float(request.provider_request_timeout_seconds),
-        float(configured_timeout(provider, model)),
-    )
+            load_hermes_dotenv()
+        except Exception:
+            pass
+        raw_mcp = dict(request.mcp_servers or {})
+        resolved_mcp = {
+            str(name): worker_mcp._interpolate_env_vars(dict(config))
+            for name, config in raw_mcp.items()
+        }
+        enabled_mcp_names = {
+            name
+            for name, config in resolved_mcp.items()
+            if worker_mcp._parse_boolish(config.get("enabled", True), default=True)
+        }
+        original_mcp_loader = worker_mcp._load_mcp_config
+        worker_mcp._load_mcp_config = lambda: resolved_mcp
 
-    # Importing the agent after replacing the loader ensures model-tool
-    # discovery cannot connect to profile-global MCP servers.
-    from run_agent import AIAgent
-    from tools.registry import registry
+        # Bound provider calls inside this isolated process without introducing
+        # a parent-visible config/env mutation or a new AIAgent constructor
+        # surface.
+        import hermes_cli.timeouts as timeout_mod
 
-    allowed = None if request.allowed_tools is None else set(request.allowed_tools)
-    denied = set(request.denied_tools) | {"delegate_task"}
-    if not request.inline_agents:
-        denied.add("workflow_agent")
-    pending: list[dict[str, str]] = []
-    approved_action_consumed = False
+        configured_timeout = timeout_mod.get_provider_request_timeout
 
-    def pause(descriptor: dict[str, str]) -> None:
-        pending.append(descriptor)
-        active = _active_agent
-        if active is not None:
-            active._interrupt_requested = True
+        def bounded_provider_timeout(provider: str, model_name: str) -> float:
+            profile_timeout = configured_timeout(provider, model_name)
+            request_timeout = float(request.provider_request_timeout_seconds)
+            if profile_timeout is None:
+                return request_timeout
+            return min(request_timeout, float(profile_timeout))
 
-    inline_registered = False
-    if request.inline_agents:
-        from agent.plugin_agent import PluginAgentRunner
+        timeout_mod.get_provider_request_timeout = bounded_provider_timeout
 
-        inline_handler = _build_inline_agent_handler(
-            plugin_id=plugin_id,
-            definitions={
-                str(name): dict(definition)
-                for name, definition in request.inline_agents.items()
-            },
-            workdir=Path(request.workdir or Path.cwd()),
-            parent_request=request,
-            runner_factory=PluginAgentRunner,
-            emit_progress=lambda **progress: _emit("progress", **progress),
-            pause=pause,
+        from hermes_cli.runtime_provider import (
+            classify_resolved_execution_runtime,
+            resolve_runtime_provider,
         )
-        registry.register(
-            name="workflow_agent",
-            toolset="workflow-node",
-            schema={
-                "name": "workflow_agent",
-                "description": "Run one declared workflow-local inline agent synchronously.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "agent_id": {
-                            "type": "string",
-                            "enum": sorted(request.inline_agents),
-                        },
-                        "task": {"type": "string", "maxLength": 100000},
-                    },
-                    "required": ["agent_id", "task"],
-                    "additionalProperties": False,
-                },
-            },
-            handler=lambda args, **_kwargs: json.dumps(
-                inline_handler(args), ensure_ascii=False
-            ),
-        )
-        inline_registered = True
-    with registry.scoped_names(allowed_names=allowed, denied_names=denied):
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        from hermes_state import SessionDB
-
-        known = set(registry._tools)
-        unknown = sorted(
-            (set(request.allowed_tools or ()) | set(request.denied_tools)) - known
-        )
-        if unknown:
-            worker_mcp.shutdown_mcp_servers()
-            worker_mcp._load_mcp_config = original_mcp_loader
-            raise ValueError(f"unknown tool name(s): {', '.join(unknown)}")
 
         model = _configured_model(request.model)
-        runtime = resolve_runtime_provider(
-            requested=request.provider, target_model=model or None
-        )
-        session_db = SessionDB()
-        history = None
-        if request.context_mode == "shared":
-            if session_db.get_session(request.session_id) is None:
-                raise ValueError("session_id does not identify an existing session")
-            history = session_db.get_messages_as_conversation(request.session_id)
-
-        prompt = request.prompt
-        if request.skills:
-            from agent.skill_commands import build_preloaded_skills_prompt
-
-            skill_text, _loaded, missing = build_preloaded_skills_prompt(
-                list(request.skills), task_id=request.session_id
+        runtime = None
+        if enabled_mcp_names:
+            runtime = resolve_runtime_provider(
+                requested=request.provider, target_model=model or None
             )
-            if missing:
-                raise ValueError(f"unknown skill(s): {', '.join(missing)}")
-            if skill_text:
-                # Skill content is part of the new user turn, never a system
-                # prompt mutation, preserving cache and role alternation.
-                prompt = f"{skill_text}\n\n{request.prompt}"
+            runtime_capabilities = classify_resolved_execution_runtime(runtime)
+            if not runtime_capabilities.hermes_managed_tool_loop:
+                raise PackageMCPUnavailable(
+                    "package_mcp_unavailable: resolved runtime does not use "
+                    "Hermes' tool loop"
+                )
+
+        if enabled_mcp_names:
+            try:
+                worker_mcp.discover_mcp_tools()
+            except Exception as exc:
+                raise PackageMCPUnavailable(
+                    "package_mcp_unavailable: request MCP discovery failed"
+                ) from exc
+            statuses = {
+                str(status.get("name")): status
+                for status in worker_mcp.get_mcp_status()
+            }
+            unavailable = sorted(
+                name
+                for name in enabled_mcp_names
+                if statuses.get(name, {}).get("status") != "connected"
+            )
+            if unavailable:
+                raise PackageMCPUnavailable(
+                    "package_mcp_unavailable: required request MCP server(s) "
+                    f"did not connect: {', '.join(unavailable)}"
+                )
+
+        # Import the agent only after the request loader is installed and
+        # required MCP servers have registered their tools. Construction stays
+        # below runtime classification and tool-policy validation.
+        from run_agent import AIAgent
+
+        allowed = None if request.allowed_tools is None else set(request.allowed_tools)
+        denied = set(request.denied_tools) | {"delegate_task"}
+        if not request.inline_agents:
+            denied.add("workflow_agent")
+        pending: list[dict[str, str]] = []
+        approved_action_consumed = False
+
+        def pause(descriptor: dict[str, str]) -> None:
+            pending.append(descriptor)
+            active = _active_agent
+            if active is not None:
+                active._interrupt_requested = True
+
+        if request.inline_agents:
+            from agent.plugin_agent import PluginAgentRunner
+
+            inline_handler = _build_inline_agent_handler(
+                plugin_id=plugin_id,
+                definitions={
+                    str(name): dict(definition)
+                    for name, definition in request.inline_agents.items()
+                },
+                workdir=Path(request.workdir or Path.cwd()),
+                parent_request=request,
+                runner_factory=PluginAgentRunner,
+                emit_progress=lambda **progress: _emit("progress", **progress),
+                pause=pause,
+            )
+            registry.register(
+                name="workflow_agent",
+                toolset="workflow-node",
+                schema={
+                    "name": "workflow_agent",
+                    "description": "Run one declared workflow-local inline agent synchronously.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "agent_id": {
+                                "type": "string",
+                                "enum": sorted(request.inline_agents),
+                            },
+                            "task": {"type": "string", "maxLength": 100000},
+                        },
+                        "required": ["agent_id", "task"],
+                        "additionalProperties": False,
+                    },
+                },
+                handler=lambda args, **_kwargs: json.dumps(
+                    inline_handler(args), ensure_ascii=False
+                ),
+            )
+            inline_registered = True
 
         def approval(command, description, **_kwargs):
             nonlocal approved_action_consumed
@@ -545,16 +584,54 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             )
             return {"success": False, "stored_as": name, "validated": False}
 
-        from tools.terminal_tool import (
-            set_approval_callback,
-            set_sudo_password_callback,
-        )
-        from tools.skills_tool import set_secret_capture_callback
+        with registry.scoped_names(allowed_names=allowed, denied_names=denied):
+            from hermes_state import SessionDB
 
-        set_approval_callback(approval)
-        set_sudo_password_callback(sudo)
-        set_secret_capture_callback(secret)
-        try:
+            known = set(registry._tools)
+            unknown = sorted(
+                (set(request.allowed_tools or ()) | set(request.denied_tools)) - known
+            )
+            if unknown:
+                raise ValueError(f"unknown tool name(s): {', '.join(unknown)}")
+
+            if runtime is None:
+                runtime = resolve_runtime_provider(
+                    requested=request.provider, target_model=model or None
+                )
+
+            session_db = SessionDB()
+            history = None
+            if request.context_mode == "shared":
+                if session_db.get_session(request.session_id) is None:
+                    raise ValueError(
+                        "session_id does not identify an existing session"
+                    )
+                history = session_db.get_messages_as_conversation(request.session_id)
+
+            prompt = request.prompt
+            if request.skills:
+                from agent.skill_commands import build_preloaded_skills_prompt
+
+                skill_text, _loaded, missing = build_preloaded_skills_prompt(
+                    list(request.skills), task_id=request.session_id
+                )
+                if missing:
+                    raise ValueError(f"unknown skill(s): {', '.join(missing)}")
+                if skill_text:
+                    # Skill content is part of the new user turn, never a
+                    # system prompt mutation, preserving cache and role
+                    # alternation.
+                    prompt = f"{skill_text}\n\n{request.prompt}"
+
+            from tools import skills_tool, terminal_tool
+
+            original_approval_callback = terminal_tool._get_approval_callback()
+            original_sudo_callback = terminal_tool._get_sudo_password_callback()
+            original_secret_callback = skills_tool._secret_capture_callback
+            callbacks_installed = True
+            terminal_tool.set_approval_callback(approval)
+            terminal_tool.set_sudo_password_callback(sudo)
+            skills_tool.set_secret_capture_callback(secret)
             agent = AIAgent(
                 model=model,
                 max_iterations=request.max_iterations,
@@ -589,6 +666,17 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             )
             agent._api_max_retries = request.max_api_attempts
             _active_agent = agent
+            from hermes_cli.plugins import get_plugin_manager
+
+            node_hook_manager = get_plugin_manager()
+            original_node_hooks = {
+                name: list(callbacks)
+                for name, callbacks in node_hook_manager._hooks.items()
+            }
+            original_node_middleware = {
+                name: list(callbacks)
+                for name, callbacks in node_hook_manager._middleware.items()
+            }
             hook_events = _install_node_hooks(request.hooks)
             if _cancel_event.is_set():
                 agent._interrupt_requested = True
@@ -638,18 +726,55 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     "sandbox_policy_declared": request.sandbox_policy is not None,
                 },
             }
+    finally:
+        _active_agent = None
+        try:
+            if node_hook_manager is not None and original_node_hooks is not None:
+                node_hook_manager._hooks.clear()
+                node_hook_manager._hooks.update(original_node_hooks)
+            if (
+                node_hook_manager is not None
+                and original_node_middleware is not None
+            ):
+                node_hook_manager._middleware.clear()
+                node_hook_manager._middleware.update(original_node_middleware)
         finally:
-            _active_agent = None
-            set_approval_callback(None)
-            set_sudo_password_callback(None)
-            set_secret_capture_callback(None)
-            worker_mcp.shutdown_mcp_servers()
-            worker_mcp._load_mcp_config = original_mcp_loader
-            if inline_registered:
-                registry.deregister("workflow_agent")
-            close_db = getattr(session_db, "close", None)
-            if callable(close_db):
-                close_db()
+            try:
+                if callbacks_installed:
+                    terminal_tool.set_approval_callback(original_approval_callback)
+                    terminal_tool.set_sudo_password_callback(original_sudo_callback)
+                    skills_tool.set_secret_capture_callback(original_secret_callback)
+            finally:
+                try:
+                    close_db = getattr(session_db, "close", None)
+                    if callable(close_db):
+                        close_db()
+                finally:
+                    try:
+                        if inline_registered and registry is not None:
+                            registry.deregister("workflow_agent")
+                    finally:
+                        try:
+                            if worker_mcp is not None:
+                                worker_mcp.shutdown_mcp_servers()
+                        finally:
+                            if (
+                                worker_mcp is not None
+                                and original_mcp_loader is not None
+                            ):
+                                worker_mcp._load_mcp_config = original_mcp_loader
+                            if (
+                                timeout_mod is not None
+                                and configured_timeout is not None
+                            ):
+                                timeout_mod.get_provider_request_timeout = (
+                                    configured_timeout
+                                )
+                            if (
+                                registry is not None
+                                and original_registry_generation is not None
+                            ):
+                                registry._generation = original_registry_generation
 
 
 def main() -> int:
@@ -684,6 +809,9 @@ def main() -> int:
             plugin_id = str(payload.get("plugin_id") or "")
         except Exception:
             pass
+        failure_kind = getattr(exc, "failure_kind", type(exc).__name__)
+        if not isinstance(failure_kind, str) or not failure_kind:
+            failure_kind = type(exc).__name__
         result = {
             "final_response": "",
             "session_id": "",
@@ -694,7 +822,7 @@ def main() -> int:
             "usage": {},
             "audit": {
                 "plugin_id": plugin_id,
-                "failure_kind": type(exc).__name__,
+                "failure_kind": failure_kind,
                 "error": _sanitize(exc),
             },
         }
