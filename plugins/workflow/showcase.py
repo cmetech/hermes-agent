@@ -141,13 +141,22 @@ def _sha256(data: bytes) -> str:
 def _read_verified_bytes(
     path: Path,
     read_budget: WorkflowResourceReadBudget | None = None,
+    verified_bytes: dict[Path, bytes] | None = None,
 ) -> bytes:
     if path.is_symlink():
         raise ShowcaseCatalogError(f"showcase bundle symlink is forbidden: {path}")
     resolved = path.resolve(strict=True)
+    if verified_bytes is not None:
+        cached = verified_bytes.get(resolved)
+        if cached is not None:
+            return cached
     if read_budget is None:
-        return resolved.read_bytes()
-    return read_budget.read(resolved)
+        data = resolved.read_bytes()
+    else:
+        data = read_budget.read(resolved)
+    if verified_bytes is not None:
+        verified_bytes[resolved] = data
+    return data
 
 
 def _tree_entries(
@@ -179,6 +188,7 @@ def _tree_entries(
 def _tree_digest(
     root: Path,
     read_budget: WorkflowResourceReadBudget | None = None,
+    verified_bytes: dict[Path, bytes] | None = None,
 ) -> str:
     digest = hashlib.sha256()
     for path in _tree_entries(root, read_budget):
@@ -187,7 +197,7 @@ def _tree_digest(
                 raise ShowcaseCatalogError(f"showcase bundle symlink is forbidden: {path}")
             continue
         relative = path.relative_to(root).as_posix()
-        data = _read_verified_bytes(path, read_budget)
+        data = _read_verified_bytes(path, read_budget, verified_bytes)
         digest.update(relative.encode())
         digest.update(b"\0")
         digest.update(str(len(data)).encode())
@@ -201,6 +211,7 @@ def _validate_package_safety(
     root: Path,
     scenario_id: str,
     read_budget: WorkflowResourceReadBudget | None = None,
+    verified_bytes: dict[Path, bytes] | None = None,
 ) -> None:
     for path in _tree_entries(root, read_budget):
         if path.is_symlink():
@@ -210,7 +221,9 @@ def _validate_package_safety(
         if not path.is_file():
             continue
         try:
-            text = _read_verified_bytes(path, read_budget).decode("utf-8").lower()
+            text = _read_verified_bytes(
+                path, read_budget, verified_bytes
+            ).decode("utf-8").lower()
         except UnicodeError as exc:
             raise ShowcaseCatalogError(
                 f"showcase safety contract rejects binary resource: {scenario_id}"
@@ -320,6 +333,7 @@ def load_showcase_catalog(
     allow_repair: bool = True,
 ) -> dict[str, ShowcaseScenario]:
     with _bundle_path(bundle_root) as root:
+        verified_bytes = {} if read_budget is None else None
         try:
             catalog_bytes = _read_verified_bytes(root / "catalog.yaml", read_budget)
             digest_bytes = _read_verified_bytes(root / "digests.json", read_budget)
@@ -372,8 +386,12 @@ def load_showcase_catalog(
             workflow_path = str(item["workflow_path"])
             workflow = _contained(root, workflow_path)
             package_root = workflow.parent.parent
-            _validate_package_safety(package_root, scenario_id, read_budget)
-            actual_digest = _tree_digest(package_root, read_budget)
+            _validate_package_safety(
+                package_root, scenario_id, read_budget, verified_bytes
+            )
+            actual_digest = _tree_digest(
+                package_root, read_budget, verified_bytes
+            )
             if package_digests.get(scenario_id) != actual_digest:
                 raise ShowcaseCatalogError(f"showcase package digest mismatch: {scenario_id}")
             claims = tuple(str(value) for value in item["capability_claims"])
@@ -392,6 +410,7 @@ def load_showcase_catalog(
             _load_workflow_from_verified_bytes(
                 workflow,
                 read_budget=read_budget,
+                verified_bytes=verified_bytes,
             )
             result[scenario_id] = ShowcaseScenario(
                 **{key: str(item[key]) for key in ("id", "display_name", "purpose", "bundle_version", "package_version", "workflow_path", "interaction_mode", "safety_class", "cleanup_ownership")},
@@ -413,12 +432,39 @@ def _load_workflow_from_verified_bytes(
     workflow: Path,
     *,
     read_budget: WorkflowResourceReadBudget | None,
+    verified_bytes: dict[Path, bytes] | None = None,
     source: str = "explicit",
     precedence: int = 0,
 ) -> WorkflowPackage:
     if read_budget is None:
-        return load_workflow(
+        authenticated_snapshot = verified_bytes is not None
+        if not authenticated_snapshot:
+            verified_bytes = {}
+        try:
+            workflow_bytes = verified_bytes[workflow.resolve(strict=True)]
+        except KeyError:
+            try:
+                workflow_bytes = _read_verified_bytes(
+                    workflow, verified_bytes=verified_bytes
+                )
+            except OSError as exc:
+                raise ShowcaseCatalogError(
+                    f"verified workflow bytes are unavailable: {workflow.name}"
+                ) from exc
+        sidecar = workflow.with_name(f"{workflow.stem}.hermes.yaml")
+        if authenticated_snapshot:
+            sidecar_bytes = verified_bytes.get(sidecar.resolve())
+        else:
+            try:
+                sidecar_bytes = _read_verified_bytes(
+                    sidecar, verified_bytes=verified_bytes
+                )
+            except FileNotFoundError:
+                sidecar_bytes = None
+        return load_workflow_snapshot(
             workflow,
+            workflow_bytes=workflow_bytes,
+            sidecar_bytes=sidecar_bytes,
             source=source,
             precedence=precedence,
         )

@@ -418,6 +418,55 @@ def test_verified_loader_parses_only_digest_authenticated_package_bytes(
     assert verified["approval-gate"].package.sidecar["outward_action_nodes"] == ()
 
 
+def test_no_budget_catalog_parses_digest_authenticated_package_bytes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+    workflow = copied / "packages/approval-gate/workflows/approval-gate.yaml"
+    original_tree_digest = showcase_module._tree_digest
+    parsed_descriptions: list[str] = []
+
+    def mutate_after_authenticated_digest(root, *args, **kwargs):
+        digest = original_tree_digest(root, *args, **kwargs)
+        if Path(root).name == "approval-gate":
+            workflow.write_text(
+                "name: approval-gate\n"
+                "description: TRANSIENT UNVERIFIED\n"
+                "nodes:\n"
+                "  - id: operator-approval\n"
+                "    approval:\n"
+                "      message: changed\n",
+                encoding="utf-8",
+            )
+        return digest
+
+    original_load_workflow = showcase_module.load_workflow
+    original_load_snapshot = showcase_module.load_workflow_snapshot
+
+    def record_disk_parse(path, **kwargs):
+        package = original_load_workflow(path, **kwargs)
+        if Path(path).name == "approval-gate.yaml":
+            parsed_descriptions.append(package.definition.description)
+        return package
+
+    def record_snapshot_parse(path, **kwargs):
+        package = original_load_snapshot(path, **kwargs)
+        if Path(path).name == "approval-gate.yaml":
+            parsed_descriptions.append(package.definition.description)
+        return package
+
+    monkeypatch.setattr(showcase_module, "_tree_digest", mutate_after_authenticated_digest)
+    monkeypatch.setattr(showcase_module, "load_workflow", record_disk_parse)
+    monkeypatch.setattr(showcase_module, "load_workflow_snapshot", record_snapshot_parse)
+
+    load_showcase_catalog(copied)
+
+    assert parsed_descriptions == [
+        "Pause for explicit operator approval before completing the bundled tour"
+    ]
+
+
 def test_tree_entry_budget_stops_before_unbounded_rglob_materialization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

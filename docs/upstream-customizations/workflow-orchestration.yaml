@@ -1698,3 +1698,24 @@ upstream_changes:
   removal_condition: Remove when upstream provides equivalent sanitized showcase
     verification observability and avoids duplicate input projection work.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-no-budget-read-once
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/showcase.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  owned_symbols:
+  - _read_verified_bytes
+  - _load_workflow_from_verified_bytes
+  - no-budget authenticated showcase parsing
+  tests:
+  - tests/plugins/workflow/test_showcase_catalog.py
+  expected_commit_subject: 'fix(workflow): preserve unbudgeted verified showcase bytes'
+  upstream_candidate: true
+  merge_guidance: Preserve the definition and sidecar bytes first consumed by
+    no-budget catalog authentication and parse only that snapshot. A mutation
+    after the package digest must neither reach the parser nor cause a disk
+    reread; the bounded read-budget accounting and cache locking remain intact.
+  removal_condition: Remove when upstream retains authenticated definition and
+    sidecar byte snapshots for unbudgeted showcase catalog parsing.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
