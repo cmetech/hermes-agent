@@ -23,11 +23,7 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.dashboard.plugin_api import StartRunRequest
-from plugins.workflow.entitlement import (
-    AIEntitlementResolution,
-    DeterministicAgentRunner,
-    derive_ai_entitlement,
-)
+from plugins.workflow.entitlement import DeterministicAgentRunner
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.runner_binding import (
@@ -519,7 +515,12 @@ def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
-    _write_runtime_config(home, api_mode="codex_app_server")
+    provider, base_url = _start_provider_trap()
+    _write_runtime_config(
+        home,
+        api_mode="codex_app_server",
+        base_url=base_url,
+    )
     showcase_module._clear_verified_showcase_cache_for_tests()
     store = RunStore(home)
     trust_store = WorkflowTrustStore(home)
@@ -569,13 +570,16 @@ def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
         assert trust_store.path.read_bytes() == trust_before
         assert list(store.runs_root.rglob("run.json")) == []
         assert list(store.staging_root.iterdir()) == []
+        assert _ProviderCallTrap.requests == 0
     finally:
         client.close()
         mounted_plugin._close_runtime()
+        provider.shutdown()
+        provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
-def test_explicit_real_non_ai_scenario_derives_typed_integrity_without_runner(
+def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -588,34 +592,84 @@ def test_explicit_real_non_ai_scenario_derives_typed_integrity_without_runner(
     identity, lease = _healthy_admission_lease(store, "task-3-4-integrity-non-ai")
     runner = CapabilityDeclaringRecordingRunner()
     binding = _capable_test_binding(runner)
-    metadata = _scenario_metadata("approval-gate", binding)
-    run_id = _admit_sealed_showcase_run(
-        store,
-        showcase_name="approval-gate",
-        run_metadata=metadata,
-        idempotency_key="task-3-4-integrity-non-ai",
+    _verified_laptop, laptop_budget = _verified_showcase("laptop-diagnostic")
+    laptop_fixture = laptop_budget.read_cached(
+        Path(showcase_module.__file__).with_name("showcases")
+        / "packages/laptop-diagnostic/fixtures/laptop-snapshot.json"
     )
-    projection = store.get_run_status(run_id)
-    resolution = derive_ai_entitlement(
-        projection["run_metadata"],
-        definition_digest=projection["definition_digest"],
-        execution_context=binding.execution_context(
-            surface="background",
-            entitlement=AIEntitlementResolution("real"),
-        ),
-    )
+    original_metadata = api_admission_module.verified_showcase_run_metadata
 
-    assert projection["workflow"] == "approval-gate"
-    assert projection["run_metadata"]["showcase_id"] == "approval-gate"
-    assert resolution.value == "deterministic"
-    assert resolution.error_code == "execution_integrity"
-    assert runner.requests == []
-    assert CoordinatorStore(store.database).release(
-        identity,
-        epoch=lease.epoch,
-        now=datetime.now(timezone.utc),
+    def explicit_real_non_ai_metadata(**kwargs):
+        metadata = original_metadata(**kwargs)
+        if kwargs["showcase_id"] == "laptop-diagnostic":
+            metadata["ai_entitlement"] = "real"
+        return metadata
+
+    monkeypatch.setattr(
+        api_admission_module,
+        "verified_showcase_run_metadata",
+        explicit_real_non_ai_metadata,
     )
-    showcase_module._clear_verified_showcase_cache_for_tests()
+    client, mounted_plugin = _production_client(monkeypatch)
+    stop = None
+    thread = None
+
+    try:
+        admitted_response = client.post(
+            "/api/plugins/workflow/runs",
+            json={
+                "workflow": "laptop-diagnostic",
+                "catalog_source": "showcase",
+                "values": {"symptom": "fictional task 3.4 integrity exercise"},
+                "idempotency_key": "task-3-4-integrity-non-ai",
+                "concurrency_policy": "queue",
+            },
+        )
+        assert admitted_response.status_code == 202, admitted_response.text
+        run_id = admitted_response.json()["result"]["run_id"]
+        projection = store.get_run_status(run_id)
+        assert projection["workflow"] == "laptop-diagnostic"
+        assert projection["run_metadata"]["showcase_id"] == "laptop-diagnostic"
+        assert projection["run_metadata"]["showcase_provenance"] == "verified_bundled"
+        assert projection["run_metadata"]["ai_entitlement"] == "real"
+        assert (
+            store.run_directory(run_id) / "inputs/evidence"
+        ).read_bytes() == laptop_fixture
+        assert CoordinatorStore(store.database).release(
+            identity,
+            epoch=lease.epoch,
+            now=datetime.now(timezone.utc),
+        )
+        _service, stop, thread = _start_service(home, binding)
+        paused = _wait_for_status(client, run_id, "paused")
+        pending = paused["pending_interaction"]
+        assert pending["node_id"] == "review-plan"
+        assert pending["type"] == "workflow_approval"
+        rejected = client.post(
+            f"/api/plugins/workflow/runs/{run_id}/reject",
+            json={
+                "expected_version": paused["state_version"],
+                "interaction_id": pending["interaction_id"],
+                "reason": "exercise authenticated non-AI rework integrity",
+            },
+        )
+        assert rejected.status_code == 200, rejected.text
+        failed = _wait_for_status(client, run_id, "failed")
+
+        _stop_service(store, stop, thread)
+        stop = None
+        thread = None
+        assert runner.requests == []
+        assert failed["nodes"]["review-plan"]["state"] == "failed"
+        assert (
+            failed["nodes"]["review-plan"]["attempts"][-1]["error_code"]
+            == "execution_integrity"
+        )
+    finally:
+        _stop_service(store, stop, thread)
+        client.close()
+        mounted_plugin._close_runtime()
+        showcase_module._clear_verified_showcase_cache_for_tests()
 
 
 def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
