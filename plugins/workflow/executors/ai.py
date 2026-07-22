@@ -207,6 +207,12 @@ class AgentNodeExecutor:
                         )
 
         try:
+            execution_limits = context.execution_limits
+            granted_provider_attempts = (
+                execution_limits.combined_retries
+                if execution_limits is not None
+                else context.max_provider_attempts
+            )
             wall_timeout = (
                 context.deadline_budget.remaining_wall(context.monotonic())
                 if context.deadline_budget is not None
@@ -312,18 +318,40 @@ class AgentNodeExecutor:
                 ),
                 workdir=context.run_directory,
                 max_iterations=90,
-                max_api_attempts=context.max_provider_attempts,
+                max_api_attempts=granted_provider_attempts,
                 idle_timeout_seconds=idle_timeout,
                 wall_timeout_seconds=wall_timeout,
                 provider_request_timeout_seconds=provider_timeout,
-                max_process_tree_rss_bytes=context.resource_limits.max_rss_bytes,
-                max_process_tree_cpu_seconds=context.resource_limits.max_cpu_seconds,
-                max_descendants=context.resource_limits.max_descendants,
-                cooperative_shutdown_seconds=(
-                    context.termination_policy.cooperative_grace_seconds
+                max_process_tree_rss_bytes=(
+                    execution_limits.process_tree_rss_bytes
+                    if execution_limits is not None
+                    else context.resource_limits.max_rss_bytes
                 ),
-                term_grace_seconds=context.termination_policy.term_grace_seconds,
-                kill_reap_grace_seconds=context.termination_policy.kill_grace_seconds,
+                max_process_tree_cpu_seconds=(
+                    execution_limits.process_tree_cpu_seconds
+                    if execution_limits is not None
+                    else context.resource_limits.max_cpu_seconds
+                ),
+                max_descendants=(
+                    execution_limits.max_descendants
+                    if execution_limits is not None
+                    else context.resource_limits.max_descendants
+                ),
+                cooperative_shutdown_seconds=(
+                    execution_limits.cooperative_shutdown_seconds
+                    if execution_limits is not None
+                    else context.termination_policy.cooperative_grace_seconds
+                ),
+                term_grace_seconds=(
+                    execution_limits.term_grace_seconds
+                    if execution_limits is not None
+                    else context.termination_policy.term_grace_seconds
+                ),
+                kill_reap_grace_seconds=(
+                    execution_limits.kill_reap_grace_seconds
+                    if execution_limits is not None
+                    else context.termination_policy.kill_grace_seconds
+                ),
             )
             result = self.agent_runner.run(
                 request,
@@ -404,7 +432,7 @@ class AgentNodeExecutor:
                 # counter. Charge the full granted retry allowance so the
                 # workflow and provider layers can never multiply attempts.
                 metadata["provider_attempts"] = max(
-                    0, context.max_provider_attempts - 1
+                    0, granted_provider_attempts - 1
                 )
             return NodeExecutionResult(
                 "failed",

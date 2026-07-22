@@ -16,6 +16,7 @@ from plugins.workflow.models import (
     WorkflowDefinition,
     WorkflowNode,
     WorkflowPackage,
+    WorkflowRuntimeConfig,
     WorkflowValidationError,
     freeze_value,
 )
@@ -800,6 +801,21 @@ def _parse_sidecar(
             "unknown_sidecar_field",
             f"workflow sidecar has unknown execution field: {unknown[0]}",
         )
+    limits = sidecar.get("limits", {})
+    resources = sidecar.get("resource_limits", {})
+    if not isinstance(limits, Mapping) or not isinstance(resources, Mapping):
+        _fail(
+            "sidecar.limits",
+            "invalid_sidecar",
+            "workflow sidecar limits and resource_limits must be mappings",
+        )
+    try:
+        WorkflowRuntimeConfig.from_mapping(
+            sidecar_limits=limits,
+            sidecar_resources=resources,
+        )
+    except (TypeError, ValueError) as exc:
+        _fail("sidecar.limits", "invalid_sidecar", str(exc))
     outward = sidecar.get("outward_action_nodes", [])
     if not isinstance(outward, list) or any(
         not isinstance(item, str) for item in outward

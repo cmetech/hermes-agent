@@ -5,6 +5,7 @@ import threading
 
 import pytest
 
+from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.executors.base import NodeExecutionResult
 from plugins.workflow.scheduler import FailureClass, RunScheduler, classify_failure
@@ -38,6 +39,59 @@ def test_internal_provider_attempts_consume_combined_attempt_budget():
         )
         is FailureClass.EXHAUSTED
     )
+
+
+def test_run_combined_retries_bound_provider_and_workflow_attempts(
+    tmp_path, workflow_writer
+):
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name="run-budget",
+        nodes=[{"id": "work", "prompt": "work"}],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "limits: {combined_retries: 2}\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="combined-run-budget",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+
+    class ProviderTimeoutRunner:
+        def __init__(self):
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="",
+                provider="fake",
+                model="fake",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit={"failure_kind": "provider_timeout"},
+            )
+
+    runner = ProviderTimeoutRunner()
+    result = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+
+    assert result["status"] == "failed"
+    assert len(runner.requests) == 1
+    assert runner.requests[0].max_api_attempts == 2
+    assert result["nodes"]["work"]["retry_consumed"] == 2
 
 
 def test_host_pressure_refuses_before_worker_allocation(

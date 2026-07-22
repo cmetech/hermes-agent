@@ -122,6 +122,39 @@ def test_bundled_showcase_catalog_detail_and_admission_cross_real_middleware(
         assert len(run["run_metadata"]["bundle_digest"]) == 64
         assert len(run["run_metadata"]["risk_digest"]) == 64
         assert run["nodes"]["operator-approval"]["state"] == "ready"
+
+        resilience_response = client.post(
+            "/api/plugins/workflow/runs",
+            json={
+                "workflow": "resilience",
+                "catalog_source": "showcase",
+                "values": {},
+                "idempotency_key": str(uuid4()),
+                "concurrency_policy": "queue",
+            },
+        )
+        assert resilience_response.status_code == 202
+        resilience = resilience_response.json()["result"]
+        resilience_run = store.get_run_status(resilience["run_id"])
+        assert resilience_run["execution_mode"] == "background"
+        scheduler = RunScheduler(store)
+        try:
+            approval_limits = scheduler._run_execution_limits(
+                scheduler._load_run_package(admitted["run_id"])
+            )
+            resilience_limits = scheduler._run_execution_limits(
+                scheduler._load_run_package(resilience["run_id"])
+            )
+        finally:
+            scheduler.shutdown()
+        assert approval_limits.max_parallel_nodes == 1
+        assert approval_limits.max_total_workers == 1
+        assert approval_limits.subprocess_timeout_seconds == 30
+        assert approval_limits.max_descendants == 1
+        assert resilience_limits.max_parallel_nodes == 2
+        assert resilience_limits.max_total_workers == 2
+        assert resilience_limits.subprocess_timeout_seconds == 120
+        assert resilience_limits.max_descendants == 8
         assert _tree_snapshot(home / "workflows") != store_before_reads
         assert trust_store.path.read_bytes() == trust_before_reads
 

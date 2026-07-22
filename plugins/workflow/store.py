@@ -4935,6 +4935,7 @@ class RunStore:
         foreground_owner_id: str | None = None,
         foreground_owner_epoch: int | None = None,
         require_execution_authority: bool = False,
+        max_run_workers: int | None = None,
     ) -> NodeClaim | None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -4952,6 +4953,12 @@ class RunStore:
             or foreground_owner_epoch <= 0
         ):
             raise ValueError("foreground owner epoch must be a positive integer")
+        if max_run_workers is not None and (
+            isinstance(max_run_workers, bool)
+            or not isinstance(max_run_workers, int)
+            or max_run_workers <= 0
+        ):
+            raise ValueError("max_run_workers must be a positive integer")
         self._ensure_free_disk()
         directory = self.run_directory(run_id)
         with workflow_lock(self.admission_lock):
@@ -5034,6 +5041,14 @@ class RunStore:
                     if active_workers >= self.limits["workers"]:
                         connection.rollback()
                         return None
+                    if max_run_workers is not None:
+                        active_run_workers = connection.execute(
+                            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
+                            (run_id,),
+                        ).fetchone()[0]
+                        if active_run_workers >= max_run_workers:
+                            connection.rollback()
+                            return None
                     attempt_id = uuid.uuid4().hex
                     monotonic_instant = (
                         float(monotonic_now)

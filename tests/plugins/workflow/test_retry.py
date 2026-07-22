@@ -367,7 +367,12 @@ def test_provider_attempts_are_cumulative_and_unknown_outcome_still_reconciles(
         def execute(self, context):
             nonlocal calls
             calls += 1
-            assert context.max_provider_attempts == 1
+            assert context.execution_limits is not None
+            assert (
+                context.max_provider_attempts
+                == context.execution_limits.combined_retries
+                == 5
+            )
             code = "provider_timeout" if calls == 1 else "unknown_side_effect"
             return NodeExecutionResult(
                 "failed", error_code=code, metadata={"provider_attempts": 2}

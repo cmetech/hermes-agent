@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.scheduler import RunScheduler
@@ -64,3 +66,63 @@ def test_command_node_runs_from_immutable_snapshot_through_scheduler(
         store.run_directory(admitted.run_id) / result["artifacts"][0]["relative_path"]
     )
     assert output.read_text() == "investigated"
+
+
+def test_scheduler_sidecar_caps_normal_ai_request_fields_exactly(
+    tmp_path, workflow_writer
+):
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name="bounded-ai",
+        nodes=[{"id": "work", "prompt": "work", "idle_timeout": 99}],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "limits:\n"
+        "  ai_idle_timeout_seconds: 10\n"
+        "  ai_wall_timeout_seconds: 20\n"
+        "  provider_request_timeout_seconds: 8\n"
+        "  combined_retries: 3\n"
+        "  cooperative_shutdown_seconds: 1\n"
+        "  term_grace_seconds: 2\n"
+        "  kill_reap_grace_seconds: 1\n"
+        "resource_limits:\n"
+        f"  process_tree_rss_bytes: {64 * 1024 * 1024}\n"
+        "  process_tree_cpu_seconds: 9\n"
+        "  max_descendants: 2\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="bounded-ai-request",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    runner = RecordingRunner()
+    now = time.monotonic()
+
+    result = RunScheduler(store, agent_runner=runner, monotonic=lambda: now).advance(
+        admitted.run_id
+    )
+
+    assert result["status"] == "succeeded"
+    request = runner.requests[0]
+    assert request.idle_timeout_seconds == 10
+    assert request.wall_timeout_seconds == 20
+    assert request.provider_request_timeout_seconds == 8
+    assert request.max_api_attempts == 3
+    assert request.max_process_tree_rss_bytes == 64 * 1024 * 1024
+    assert request.max_process_tree_cpu_seconds == 9
+    assert request.max_descendants == 2
+    assert request.cooperative_shutdown_seconds == 1
+    assert request.term_grace_seconds == 2
+    assert request.kill_reap_grace_seconds == 1
+    assert request.max_iterations == 90

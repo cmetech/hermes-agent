@@ -5,7 +5,12 @@ from pathlib import Path
 from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext
-from plugins.workflow.models import DeadlineBudget, WorkflowNode, freeze_value
+from plugins.workflow.models import (
+    DeadlineBudget,
+    RunExecutionLimits,
+    WorkflowNode,
+    freeze_value,
+)
 from plugins.workflow.resources import VariableContext
 
 
@@ -228,6 +233,61 @@ def test_ai_request_receives_remaining_absolute_deadline_and_retry_budget(tmp_pa
     assert runner.requests[0].kill_reap_grace_seconds == 2
 
 
+def test_ai_request_maps_every_run_execution_limit_exactly(tmp_path):
+    runner = FakeAgentRunner("done")
+    limits = RunExecutionLimits(
+        max_parallel_nodes=2,
+        max_total_workers=3,
+        ai_idle_timeout_seconds=11,
+        ai_wall_timeout_seconds=37,
+        provider_request_timeout_seconds=7,
+        combined_retries=4,
+        subprocess_timeout_seconds=19,
+        process_tree_rss_bytes=128 * 1024 * 1024,
+        process_tree_cpu_seconds=13,
+        max_descendants=3,
+        cooperative_shutdown_seconds=1.5,
+        term_grace_seconds=2.5,
+        kill_reap_grace_seconds=3.5,
+    )
+    budget = DeadlineBudget.create(
+        now=10,
+        wall_seconds=limits.ai_wall_timeout_seconds,
+        idle_seconds=limits.ai_idle_timeout_seconds,
+        provider_seconds=limits.provider_request_timeout_seconds,
+    )
+
+    result = AgentNodeExecutor(runner).execute(
+        _context(
+            tmp_path,
+            _node("bounded-exactly", "work"),
+            execution_limits=limits,
+            deadline_budget=budget,
+            monotonic=lambda: 10,
+        )
+    )
+
+    assert result.status == "succeeded"
+    request = runner.requests[0]
+    assert request.idle_timeout_seconds == limits.ai_idle_timeout_seconds
+    assert request.wall_timeout_seconds == limits.ai_wall_timeout_seconds
+    assert (
+        request.provider_request_timeout_seconds
+        == limits.provider_request_timeout_seconds
+    )
+    assert request.max_api_attempts == limits.combined_retries
+    assert request.max_process_tree_rss_bytes == limits.process_tree_rss_bytes
+    assert request.max_process_tree_cpu_seconds == limits.process_tree_cpu_seconds
+    assert request.max_descendants == limits.max_descendants
+    assert (
+        request.cooperative_shutdown_seconds
+        == limits.cooperative_shutdown_seconds
+    )
+    assert request.term_grace_seconds == limits.term_grace_seconds
+    assert request.kill_reap_grace_seconds == limits.kill_reap_grace_seconds
+    assert request.max_iterations == 90
+
+
 def test_provider_failure_charges_granted_internal_retry_allowance(tmp_path):
     class TimeoutRunner:
         def run(self, request, **_kwargs):
@@ -252,3 +312,30 @@ def test_provider_failure_charges_granted_internal_retry_allowance(tmp_path):
 
     assert result.error_code == "provider_timeout"
     assert result.metadata["provider_attempts"] == 0
+
+
+def test_provider_failure_charges_run_scoped_retry_allowance(tmp_path):
+    class TimeoutRunner:
+        def run(self, request, **_kwargs):
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="",
+                provider=request.provider or "fake",
+                model=request.model or "fake",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit={"failure_kind": "provider_timeout"},
+            )
+
+    limits = RunExecutionLimits(combined_retries=2)
+    result = AgentNodeExecutor(TimeoutRunner()).execute(
+        _context(
+            tmp_path,
+            _node("timeout-run-limit", "work"),
+            execution_limits=limits,
+        )
+    )
+
+    assert result.error_code == "provider_timeout"
+    assert result.metadata["provider_attempts"] == 1

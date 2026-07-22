@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 
 from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import register_cli
-from plugins.workflow.models import ApprovalDecision
+from plugins.workflow.executors.approval import ApprovalExecutor
+from plugins.workflow.executors.base import NodeExecutionContext
+from plugins.workflow.models import (
+    ApprovalDecision,
+    DeadlineBudget,
+    RunExecutionLimits,
+    WorkflowNode,
+    freeze_value,
+)
+from plugins.workflow.resources import VariableContext
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
@@ -129,6 +139,81 @@ class ReworkRunner:
         )
 
 
+def test_approval_rework_request_maps_every_run_execution_limit_exactly(tmp_path):
+    runner = ReworkRunner()
+    limits = RunExecutionLimits(
+        max_parallel_nodes=2,
+        max_total_workers=3,
+        ai_idle_timeout_seconds=11,
+        ai_wall_timeout_seconds=37,
+        provider_request_timeout_seconds=7,
+        combined_retries=4,
+        subprocess_timeout_seconds=19,
+        process_tree_rss_bytes=128 * 1024 * 1024,
+        process_tree_cpu_seconds=13,
+        max_descendants=3,
+        cooperative_shutdown_seconds=1.5,
+        term_grace_seconds=2.5,
+        kill_reap_grace_seconds=3.5,
+    )
+    node = WorkflowNode(
+        id="review",
+        node_type="approval",
+        value=freeze_value({
+            "message": "Approve?",
+            "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+        }),
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    budget = DeadlineBudget.create(
+        now=10,
+        wall_seconds=limits.ai_wall_timeout_seconds,
+        idle_seconds=limits.ai_idle_timeout_seconds,
+        provider_seconds=limits.provider_request_timeout_seconds,
+    )
+    context = NodeExecutionContext(
+        run_id="run-1",
+        run_directory=run_directory,
+        node=node,
+        attempt_id="attempt-1",
+        workflow_options=freeze_value({"provider": "fake", "model": "fake"}),
+        variable_context=VariableContext(workflow_id="run-1"),
+        node_state=freeze_value({
+            "approval_rework": {"reason": "missing evidence"},
+        }),
+        execution_limits=limits,
+        deadline_budget=budget,
+        monotonic=lambda: 10,
+    )
+
+    result = ApprovalExecutor(runner).execute(context)
+
+    assert result.status == "paused"
+    request = runner.requests[0]
+    assert request.idle_timeout_seconds == limits.ai_idle_timeout_seconds
+    assert request.wall_timeout_seconds == limits.ai_wall_timeout_seconds
+    assert (
+        request.provider_request_timeout_seconds
+        == limits.provider_request_timeout_seconds
+    )
+    assert request.max_api_attempts == limits.combined_retries
+    assert request.max_process_tree_rss_bytes == limits.process_tree_rss_bytes
+    assert request.max_process_tree_cpu_seconds == limits.process_tree_cpu_seconds
+    assert request.max_descendants == limits.max_descendants
+    assert (
+        request.cooperative_shutdown_seconds
+        == limits.cooperative_shutdown_seconds
+    )
+    assert request.term_grace_seconds == limits.term_grace_seconds
+    assert request.kill_reap_grace_seconds == limits.kill_reap_grace_seconds
+    assert request.max_iterations == 90
+
+
 def test_rejection_runs_bounded_rework_with_reason_then_cancels(
     tmp_path, workflow_writer
 ):
@@ -180,6 +265,51 @@ def test_rejection_runs_bounded_rework_with_reason_then_cancels(
     )
     assert exhausted.outcome == "applied"
     assert store.load_run(admitted.run_id)["status"] == "cancelled"
+
+
+def test_scheduler_uses_ai_deadline_for_approval_rework(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "bounded-rework",
+        name="bounded-rework",
+        nodes=[{
+            "id": "review",
+            "approval": {
+                "message": "Approve?",
+                "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+            },
+        }],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "limits:\n"
+        "  ai_idle_timeout_seconds: 11\n"
+        "  ai_wall_timeout_seconds: 37\n"
+        "  provider_request_timeout_seconds: 7\n"
+        "  subprocess_timeout_seconds: 19\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "bounded-rework-home")
+    admitted = _start(store, package, key="bounded-rework")
+    runner = ReworkRunner()
+    now = time.monotonic()
+    scheduler = RunScheduler(store, agent_runner=runner, monotonic=lambda: now)
+    first_pause = scheduler.advance(admitted.run_id)
+    pending = first_pause["nodes"]["review"]["pending_interaction"]
+    store.reject_run(
+        admitted.run_id,
+        reason="missing evidence",
+        expected_state_version=first_pause["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+
+    scheduler.advance(admitted.run_id)
+
+    request = runner.requests[0]
+    assert request.idle_timeout_seconds == 11
+    assert request.wall_timeout_seconds == 37
+    assert request.provider_request_timeout_seconds == 7
 
 
 class ToolApprovalRunner:

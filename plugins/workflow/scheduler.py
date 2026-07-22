@@ -30,10 +30,13 @@ from plugins.workflow.models import (
     DeadlineBudget,
     ExecutionFence,
     RetryPolicy,
+    RunExecutionLimits,
     WorkflowNode,
+    WorkflowPackage,
+    WorkflowRuntimeConfig,
 )
 from plugins.workflow.resources import VariableContext
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow_snapshot
 from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.store import NodeClaim, RunStore, StorageQuotaError
 from tools.managed_process import ProcessResourceLimits, TerminationPolicy
@@ -279,6 +282,23 @@ class RunScheduler:
             cooperative_shutdown_seconds + term_grace_seconds + kill_reap_grace_seconds
         )
         self.resource_limits = resource_limits or ProcessResourceLimits()
+        self.profile_execution_limits = RunExecutionLimits.resolve(
+            WorkflowRuntimeConfig(
+                max_parallel_nodes=self.max_parallel_nodes,
+                max_total_workers=store.limits["workers"],
+                ai_idle_timeout_seconds=self.ai_idle_timeout_seconds,
+                ai_wall_timeout_seconds=self.ai_wall_timeout_seconds,
+                provider_request_timeout_seconds=self.provider_request_timeout_seconds,
+                subprocess_timeout_seconds=self.subprocess_timeout_seconds,
+                combined_retries=self.default_max_attempts,
+                process_tree_rss_bytes=self.resource_limits.max_rss_bytes,
+                process_tree_cpu_seconds=self.resource_limits.max_cpu_seconds,
+                max_descendants=self.resource_limits.max_descendants,
+                cooperative_shutdown_seconds=cooperative_shutdown_seconds,
+                term_grace_seconds=term_grace_seconds,
+                kill_reap_grace_seconds=kill_reap_grace_seconds,
+            )
+        )
         self._utcnow = utcnow or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic
         self._jitter = jitter
@@ -478,18 +498,53 @@ class RunScheduler:
                 return
             self.store.transition_pending_nodes(run_id, transitions)
 
-    def _node_timeout(self, node: WorkflowNode) -> float:
-        return float(
-            node.options.get(
-                "timeout",
-                self.ai_wall_timeout_seconds
-                if node.node_type in {"command", "prompt", "loop"}
-                else self.subprocess_timeout_seconds,
-            )
+    def _load_run_package(self, run_id: str) -> WorkflowPackage:
+        run_directory = self.store.run_directory(run_id)
+        definition = run_directory / "definition.yaml"
+        policy = run_directory / "policy.yaml"
+        return load_workflow_snapshot(
+            definition,
+            workflow_bytes=definition.read_bytes(),
+            sidecar_bytes=policy.read_bytes() if policy.is_file() else None,
         )
 
-    def _heartbeat_journal_reserve(self, node: WorkflowNode) -> int:
-        heartbeat_count = math.ceil(self._node_timeout(node) / self.heartbeat_seconds)
+    def _run_execution_limits(self, package: WorkflowPackage) -> RunExecutionLimits:
+        limits = package.sidecar.get("limits", {})
+        resources = package.sidecar.get("resource_limits", {})
+        if not isinstance(limits, Mapping) or not isinstance(resources, Mapping):
+            raise ValueError("workflow sidecar limits must contain mappings")
+        return RunExecutionLimits.resolve(
+            WorkflowRuntimeConfig(
+                **{
+                    name: getattr(self.profile_execution_limits, name)
+                    for name in self.profile_execution_limits.__dataclass_fields__
+                }
+            ),
+            sidecar_limits=limits,
+            sidecar_resources=resources,
+        )
+
+    def _node_timeout(
+        self,
+        node: WorkflowNode,
+        execution_limits: RunExecutionLimits | None = None,
+    ) -> float:
+        limits = execution_limits or self.profile_execution_limits
+        if node.node_type in {"command", "prompt", "loop", "approval"}:
+            return float(limits.ai_wall_timeout_seconds)
+        return min(
+            float(node.options.get("timeout", limits.subprocess_timeout_seconds)),
+            float(limits.subprocess_timeout_seconds),
+        )
+
+    def _heartbeat_journal_reserve(
+        self,
+        node: WorkflowNode,
+        execution_limits: RunExecutionLimits | None = None,
+    ) -> int:
+        heartbeat_count = math.ceil(
+            self._node_timeout(node, execution_limits) / self.heartbeat_seconds
+        )
         return heartbeat_count * 4096
 
     def _execute_claim(
@@ -499,6 +554,7 @@ class RunScheduler:
         node: WorkflowNode,
         package,
         projection: dict[str, object],
+        execution_limits: RunExecutionLimits,
     ) -> None:
         with self._activity:
             self._active_executions += 1
@@ -523,6 +579,7 @@ class RunScheduler:
                             "cancelled",
                             error_code=self._cancellation_reason(run_id) or "cancelled",
                         ),
+                        execution_limits,
                     )
                     return
                 node_state = dict(projection["nodes"][node.id])
@@ -530,7 +587,7 @@ class RunScheduler:
                 node_state.pop("action_grant", None)
                 if approved_action_digest is not None:
                     node_state["approved_action_digest"] = approved_action_digest
-                timeout = self._node_timeout(node)
+                timeout = self._node_timeout(node, execution_limits)
                 heartbeat_stop = threading.Event()
                 ownership_lost = threading.Event()
 
@@ -563,9 +620,11 @@ class RunScheduler:
                     idle_timeout = min(
                         float(
                             node.options.get(
-                                "idle_timeout", self.ai_idle_timeout_seconds
+                                "idle_timeout",
+                                execution_limits.ai_idle_timeout_seconds,
                             )
                         ),
+                        execution_limits.ai_idle_timeout_seconds,
                         timeout,
                     )
                     deadline_budget = DeadlineBudget.create(
@@ -573,7 +632,8 @@ class RunScheduler:
                         wall_seconds=timeout,
                         idle_seconds=idle_timeout,
                         provider_seconds=min(
-                            self.provider_request_timeout_seconds, timeout
+                            execution_limits.provider_request_timeout_seconds,
+                            timeout,
                         ),
                     )
                     variables = self._variables(
@@ -615,11 +675,16 @@ class RunScheduler:
                             operator_scope=str(
                                 projection.get("operator_scope_digest") or "local"
                             ),
-                            resource_limits=self.resource_limits,
+                            execution_limits=execution_limits,
+                            resource_limits=ProcessResourceLimits(
+                                max_rss_bytes=execution_limits.process_tree_rss_bytes,
+                                max_cpu_seconds=execution_limits.process_tree_cpu_seconds,
+                                max_descendants=execution_limits.max_descendants,
+                            ),
                             deadline_budget=deadline_budget,
-                            # Workflow scheduling is the sole retry authority;
-                            # the isolated host disables per-call API retries.
-                            max_provider_attempts=1,
+                            # Provider and workflow attempts draw from the same
+                            # frozen per-run allowance, so the retry layers do not multiply.
+                            max_provider_attempts=execution_limits.combined_retries,
                             cancellation_reason=lambda: self._cancellation_reason(
                                 run_id
                             ),
@@ -651,7 +716,18 @@ class RunScheduler:
                                 )
                             ),
                             monotonic=self._monotonic,
-                            termination_policy=self.termination_policy,
+                            termination_policy=TerminationPolicy(
+                                cooperative_grace_seconds=(
+                                    execution_limits.cooperative_shutdown_seconds
+                                ),
+                                term_grace_seconds=execution_limits.term_grace_seconds,
+                                kill_grace_seconds=(
+                                    execution_limits.kill_reap_grace_seconds
+                                ),
+                                wait_timeout_seconds=(
+                                    execution_limits.kill_reap_grace_seconds
+                                ),
+                            ),
                         )
                     )
                 except Exception as exc:
@@ -665,7 +741,7 @@ class RunScheduler:
                     heartbeat_thread.join(timeout=self.heartbeat_seconds)
                 if ownership_lost.is_set():
                     return
-            self._persist_result(claim, node, result)
+            self._persist_result(claim, node, result, execution_limits)
         except RuntimeError as exc:
             if "execution fence" in str(exc):
                 self.store.release_claim_before_execution(claim)
@@ -678,7 +754,11 @@ class RunScheduler:
                 self._activity.notify_all()
 
     def _persist_result(
-        self, claim: NodeClaim, node: WorkflowNode, result: NodeExecutionResult
+        self,
+        claim: NodeClaim,
+        node: WorkflowNode,
+        result: NodeExecutionResult,
+        execution_limits: RunExecutionLimits,
     ) -> None:
         if result.status == "failed" and result.error_code == "cleanup_failed":
             self.store.block_cleanup_failed(
@@ -699,7 +779,7 @@ class RunScheduler:
             return
         policy = RetryPolicy.from_mapping(
             node.options.get("retry"),
-            default_max_attempts=self.default_max_attempts,
+            default_max_attempts=execution_limits.combined_retries,
         )
         projection = self.store.load_run(claim.run_id)
         node_state = projection["nodes"][claim.node_id]
@@ -768,7 +848,8 @@ class RunScheduler:
         if max_nodes is None:
             return self.advance_all([run_id])[run_id]
         executed = 0
-        package = load_workflow(self.store.run_directory(run_id) / "definition.yaml")
+        package = self._load_run_package(run_id)
+        execution_limits = self._run_execution_limits(package)
         by_id = {node.id: node for node in package.definition.nodes}
         foreground_owner_id, foreground_owner_epoch = self._foreground_claim_token(
             self.store.load_run(run_id)
@@ -810,7 +891,10 @@ class RunScheduler:
                     if state["state"] == "ready"
                 )
                 remaining = None if max_nodes is None else max_nodes - executed
-                capacity = self.max_parallel_nodes
+                capacity = min(
+                    self.max_parallel_nodes,
+                    execution_limits.max_parallel_nodes,
+                )
                 if remaining is not None:
                     capacity = min(capacity, remaining)
                 claims = []
@@ -825,7 +909,7 @@ class RunScheduler:
                             now=self._utcnow(),
                             monotonic_now=self._monotonic(),
                             journal_reserve_bytes=self._heartbeat_journal_reserve(
-                                by_id[node_id]
+                                by_id[node_id], execution_limits
                             ),
                             executor_id=by_id[node_id].node_type,
                             owner_epoch=self.owner_id,
@@ -838,6 +922,7 @@ class RunScheduler:
                             foreground_owner_id=foreground_owner_id,
                             foreground_owner_epoch=foreground_owner_epoch,
                             require_execution_authority=True,
+                            max_run_workers=execution_limits.max_total_workers,
                         )
                     except StorageQuotaError as exc:
                         self.store.interrupt_for_host_pressure(run_id, message=str(exc))
@@ -867,6 +952,7 @@ class RunScheduler:
                             node,
                             package,
                             snapshot,
+                            execution_limits,
                         )
                         for claim, node, snapshot in claims
                     ]
@@ -911,8 +997,12 @@ class RunScheduler:
         """Replenish ready work fairly across runs under one bounded pool."""
         run_ids = list(dict.fromkeys(run_ids))
         packages = {
-            run_id: load_workflow(self.store.run_directory(run_id) / "definition.yaml")
+            run_id: self._load_run_package(run_id)
             for run_id in run_ids
+        }
+        execution_limits = {
+            run_id: self._run_execution_limits(package)
+            for run_id, package in packages.items()
         }
         foreground_tokens = {
             run_id: self._foreground_claim_token(self.store.load_run(run_id))
@@ -924,7 +1014,7 @@ class RunScheduler:
             max_workers=self.max_parallel_nodes,
             thread_name_prefix="workflow-node",
         )
-        futures = set()
+        futures = {}
         fair_cursor = 0
         try:
             while not self._shutdown.is_set():
@@ -932,7 +1022,7 @@ class RunScheduler:
                 if len(futures) >= self.max_parallel_nodes:
                     done, _pending = wait(futures, return_when=FIRST_COMPLETED)
                     for future in done:
-                        futures.remove(future)
+                        futures.pop(future)
                         future.result()
                 candidates: dict[str, list[str]] = {}
                 snapshots = {}
@@ -978,6 +1068,19 @@ class RunScheduler:
                             break
                         if not candidates[run_id]:
                             continue
+                        claimed_for_run = sum(
+                            claim_run_id == run_id
+                            for claim_run_id, *_rest in claims
+                        )
+                        executing_for_run = sum(
+                            future_run_id == run_id
+                            for future_run_id in futures.values()
+                        )
+                        if (
+                            claimed_for_run + executing_for_run
+                            >= execution_limits[run_id].max_parallel_nodes
+                        ):
+                            continue
                         node_id = candidates[run_id].pop(0)
                         try:
                             claim = self.store.claim_node(
@@ -992,7 +1095,8 @@ class RunScheduler:
                                         node
                                         for node in packages[run_id].definition.nodes
                                         if node.id == node_id
-                                    )
+                                    ),
+                                    execution_limits[run_id],
                                 ),
                                 executor_id=next(
                                     node.node_type
@@ -1009,6 +1113,9 @@ class RunScheduler:
                                 foreground_owner_id=foreground_tokens[run_id][0],
                                 foreground_owner_epoch=foreground_tokens[run_id][1],
                                 require_execution_authority=True,
+                                max_run_workers=(
+                                    execution_limits[run_id].max_total_workers
+                                ),
                             )
                         except StorageQuotaError as exc:
                             self.store.interrupt_for_host_pressure(
@@ -1034,6 +1141,7 @@ class RunScheduler:
                             node,
                             packages[run_id],
                             snapshots[run_id],
+                            execution_limits[run_id],
                         ))
                         fair_cursor = (active.index(run_id) + 1) % len(active)
                         claimed_this_round = True
@@ -1042,17 +1150,25 @@ class RunScheduler:
                     if not claimed_this_round:
                         break
                 if fence_lost:
-                    for _run_id, claim, _node, _package, _snapshot in claims:
+                    for (
+                        _run_id,
+                        claim,
+                        _node,
+                        _package,
+                        _snapshot,
+                        _limits,
+                    ) in claims:
                         self.store.release_claim_before_execution(claim)
                     break
                 for claim in claims:
-                    futures.add(pool.submit(self._execute_claim, *claim))
+                    future = pool.submit(self._execute_claim, *claim)
+                    futures[future] = claim[0]
                 if not claims:
                     if not futures:
                         break
                     done, _pending = wait(futures, return_when=FIRST_COMPLETED)
                     for future in done:
-                        futures.remove(future)
+                        futures.pop(future)
                         future.result()
             if futures:
                 done, _pending = wait(futures)

@@ -1758,3 +1758,43 @@ upstream_changes:
   removal_condition: Remove when upstream Desktop derives every workflow Run
     affordance from the same authoritative reason and compatibility contract.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-run-execution-limits
+  change_class: workflow-runtime
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/executors/ai.py
+  - plugins/workflow/executors/approval.py
+  - plugins/workflow/executors/base.py
+  - plugins/workflow/models.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/schema.py
+  - plugins/workflow/store.py
+  owned_symbols:
+  - RunExecutionLimits
+  - RunExecutionLimits.resolve
+  - NodeExecutionContext.execution_limits
+  - RunScheduler._load_run_package
+  - RunScheduler._run_execution_limits
+  - RunStore.claim_node max_run_workers composition
+  - exact PluginAgentRunRequest execution-limit mapping
+  tests:
+  - tests/plugins/workflow/test_ai_e2e.py
+  - tests/plugins/workflow/test_ai_executor.py
+  - tests/plugins/workflow/test_approval.py
+  - tests/plugins/workflow/test_deadlines.py
+  - tests/plugins/workflow/test_parallel_scheduler.py
+  - tests/plugins/workflow/test_provider_failures.py
+  - tests/plugins/workflow/test_retry.py
+  - tests/plugins/workflow/test_schema.py
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
+  expected_commit_subject: 'feat(workflow): enforce per-run execution limits'
+  upstream_candidate: true
+  merge_guidance: Preserve one frozen execution-limit record resolved from the
+    immutable run snapshot, with element-wise profile tightening at each claim
+    and executor boundary. Keep scheduler pools, lifecycle clocks, coordinator
+    thresholds, and admission quotas profile-global; retain the agent iteration
+    hard cap of 90 rather than adding a run-level max_iterations field.
+  removal_condition: Remove when upstream enforces equivalent immutable per-run
+    concurrency, worker, deadline, retry, resource-tree, and termination-grace
+    ceilings without resizing or retiming shared coordinator infrastructure.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
