@@ -67,6 +67,57 @@ upstream_changes:
   removal_condition: Remove when upstream exposes an equivalent generated
     product identity consumed by every version-output path.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-execution-capability-binding
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/cli.py
+  - plugins/workflow/coordinator.py
+  - plugins/workflow/entitlement.py
+  - plugins/workflow/executors/ai.py
+  - plugins/workflow/executors/approval.py
+  - plugins/workflow/executors/loop.py
+  - plugins/workflow/runner_binding.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/showcase.py
+  - scripts/test_workflow_merge_gate.sh
+  owned_symbols:
+  - RunnerCapabilities
+  - ExecutionCapabilityContext
+  - WorkflowRunnerBinding
+  - execution_capability_context
+  - background_execution_context
+  - assess_package_execution
+  - production_workflow_runner_binding
+  - raw authenticated showcase cache
+  - context-specific compatibility and risk projection
+  - coordinator runner-binding injection
+  - fire-time AI entitlement corroboration
+  tests:
+  - tests/plugins/workflow/test_runner_binding.py
+  - tests/plugins/workflow/test_ai_entitlement.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(workflow): bind execution capabilities'
+  upstream_candidate: true
+  merge_guidance: Preserve one immutable production runner binding shared by
+    catalog, detail, admission, scheduler, and coordinator paths. Cache only
+    authenticated raw showcase material, then recompute compatibility and risk
+    from the current execution surface, entitlement, runner, and runtime
+    capabilities. Capable AI showcase and trusted user MCP runs must admit;
+    incapable contexts must return the typed compatibility refusal before any
+    durable residue or provider traffic. Keep capability selection internal and
+    reject caller-supplied runner or capability authority.
+  removal_condition: Remove when upstream provides an equivalent immutable
+    runner binding, context-derived compatibility projection, raw-only showcase
+    cache, and fail-closed capability admission across every execution surface.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-per-run-ai-entitlement
   change_class: workflow-security
   owner: workflow-orchestration

@@ -32,8 +32,9 @@ def _artifact(path: Path, run_directory: Path) -> ArtifactRef:
 
 
 class ApprovalExecutor:
-    def __init__(self, agent_runner=None) -> None:
+    def __init__(self, agent_runner=None, *, deterministic_runner=None) -> None:
         self.agent_runner = agent_runner
+        self.deterministic_runner = deterministic_runner
 
     @staticmethod
     def _gate_result(
@@ -82,7 +83,9 @@ class ApprovalExecutor:
             return self._gate_result(context)
         try:
             agent_runner = entitled_agent_runner(
-                context.ai_entitlement, self.agent_runner
+                context.ai_entitlement,
+                self.agent_runner,
+                self.deterministic_runner,
             )
         except AIExecutionIntegrityError as exc:
             return NodeExecutionResult(

@@ -19,12 +19,17 @@ from agent.plugin_agent import PluginAgentRunner
 from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.entitlement import derive_ai_entitlement
 from plugins.workflow.evidence import EVIDENCE_KINDS
 from plugins.workflow.scheduler import RunScheduler
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.store import RunStore
-from plugins.workflow.trust import WorkflowResourceReadBudget, WorkflowTrustStore
+from plugins.workflow.trust import (
+    WorkflowResourceReadBudget,
+    WorkflowTrustStore,
+    build_risk_summary,
+)
 from tools.managed_process import ProcessIdentity
 
 
@@ -160,9 +165,13 @@ def _assert_exact_identity_and_limits(
     verified,
 ) -> tuple[dict[str, object], dict[str, object]]:
     status = store.get_run_status(run_id)
+    risk = build_risk_summary(
+        verified.package,
+        assess_compatibility(verified.package),
+    )
     expected_metadata = {
         "bundle_digest": verified.bundle_digest,
-        "risk_digest": verified.risk.risk_digest,
+        "risk_digest": risk.risk_digest,
         "showcase_id": "laptop-diagnostic",
         "showcase_provenance": "verified_bundled",
         "showcase_version": "1",

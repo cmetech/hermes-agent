@@ -11,7 +11,6 @@ import sqlite3
 from typing import Literal, Mapping
 
 from plugins.workflow.admission import RunAdmissionRequest
-from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.coordinator_store import CoordinatorStore
 from plugins.workflow.entitlement import verified_showcase_run_metadata
 from plugins.workflow.input_contract import (
@@ -22,6 +21,12 @@ from plugins.workflow.input_contract import (
 )
 from plugins.workflow.models import WorkflowPackage, WorkflowValidationError
 from plugins.workflow.provenance import TriggerProvenance
+from plugins.workflow.runner_binding import (
+    WorkflowRunnerBinding,
+    assess_package_execution,
+    background_execution_context,
+    production_workflow_runner_binding,
+)
 from plugins.workflow.store import InputSnapshotError, RunStore
 from plugins.workflow.trust import (
     WorkflowResourceCapacityError,
@@ -166,9 +171,11 @@ def start_api_run(
     concurrency_policy: Literal["queue", "allow", "forbid"],
     authority: ApiAdmissionAuthority,
     catalog_source: Literal["project", "profile", "showcase"] | None = None,
+    runner_binding: WorkflowRunnerBinding | None = None,
 ) -> dict[str, object]:
     """Admit one trusted catalog workflow without executing any workflow node."""
     home = Path(hermes_home).resolve()
+    binding = runner_binding or production_workflow_runner_binding()
     provenance = TriggerProvenance.authenticated_api(
         source=authority.trigger_source,
         assurance=authority.assurance,
@@ -280,13 +287,18 @@ def start_api_run(
             ) from exc
         values = translated_values
 
-    compatibility = assess_compatibility(package)
+    execution_context = background_execution_context(
+        binding,
+        requires_ai=(scenario.requires_ai if scenario is not None else None),
+    )
     try:
         package_digest = compute_package_digest(
             package, read_budget=resource_budget
         )
-        risk = build_risk_summary(
-            package, compatibility, read_budget=resource_budget
+        compatibility, risk = assess_package_execution(
+            package,
+            execution_context,
+            read_budget=resource_budget,
         )
     except WorkflowResourceCapacityError as exc:
         raise ApiAdmissionError(
@@ -296,9 +308,9 @@ def start_api_run(
         raise ApiAdmissionError("workflow_invalid_definition", status_code=422) from exc
     if package_digest.sha256 != risk.package_digest:
         raise ApiAdmissionError("workflow_package_changed", status_code=409)
-    if verified_showcase is not None and (
-        package_digest.sha256 != verified_showcase.risk.package_digest
-        or risk.risk_digest != verified_showcase.risk.risk_digest
+    if (
+        verified_showcase is not None
+        and package_digest.sha256 != verified_showcase.package_digest
     ):
         raise ApiAdmissionError(
             "workflow_showcase_verification_failed", status_code=409

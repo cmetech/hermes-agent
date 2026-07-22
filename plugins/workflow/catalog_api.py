@@ -23,6 +23,13 @@ from plugins.workflow.input_contract import (
     workflow_input_declarations,
 )
 from plugins.workflow.models import WorkflowPackage, WorkflowValidationError
+from plugins.workflow.runner_binding import (
+    ExecutionCapabilityContext,
+    WorkflowRunnerBinding,
+    assess_package_execution,
+    background_execution_context,
+    production_workflow_runner_binding,
+)
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.sanitize import (
     sanitize_projection,
@@ -561,12 +568,13 @@ def _catalog_entry(
     resource_budget: WorkflowResourceReadBudget,
     *,
     verified_showcase: "VerifiedShowcasePackage | None" = None,
+    execution_context: ExecutionCapabilityContext,
 ) -> CatalogEntry:
     # The CLI show projection is the established body-free catalog contract.
-    compatibility = (
-        verified_showcase.compatibility
-        if verified_showcase is not None
-        else assess_compatibility(package)
+    compatibility, risk = assess_package_execution(
+        package,
+        execution_context,
+        read_budget=resource_budget,
     )
     shown = qualify_workflow_catalog_package(
         package,
@@ -574,7 +582,6 @@ def _catalog_entry(
     )
     if verified_showcase is None:
         assert trust_store is not None and trust_snapshot is not None
-        risk = build_risk_summary(package, compatibility, read_budget=resource_budget)
         trust_state: CatalogTrustState = trust_store.check_snapshot(
             trust_snapshot,
             risk.package_digest,
@@ -617,10 +624,14 @@ def _catalog_entry(
 
 
 def build_workflow_catalog(
-    *, hermes_home: str | Path, workdir: str | Path
+    *,
+    hermes_home: str | Path,
+    workdir: str | Path,
+    runner_binding: WorkflowRunnerBinding | None = None,
 ) -> tuple[list[CatalogItem], bool]:
     """Return at most 500 stable entries without executing workflow code."""
     home = Path(hermes_home).expanduser().resolve()
+    binding = runner_binding or production_workflow_runner_binding()
     discovered, truncated = _discover_catalog(
         Path(workdir).expanduser().resolve(), home
     )
@@ -677,6 +688,10 @@ def build_workflow_catalog(
                 None,
                 projection_budget,
                 verified_showcase=verified,
+                execution_context=background_execution_context(
+                    binding,
+                    requires_ai=verified.scenario.requires_ai,
+                ),
             )
         )
 
@@ -708,6 +723,10 @@ def build_workflow_catalog(
                     trust_store,
                     trust_snapshot,
                     resource_budget,
+                    execution_context=background_execution_context(
+                        binding,
+                        requires_ai=None,
+                    ),
                 )
             )
         except (WorkflowCatalogCapacityError, WorkflowResourceCapacityError):
@@ -777,6 +796,7 @@ def build_workflow_detail(
     hermes_home: str | Path,
     workdir: str | Path,
     catalog_source: CatalogSource | None = None,
+    runner_binding: WorkflowRunnerBinding | None = None,
 ) -> dict[str, object]:
     """Return one bounded, redacted, read-only workflow preflight projection."""
     if not isinstance(name, str) or not name.strip() or len(name) > 128:
@@ -784,6 +804,7 @@ def build_workflow_detail(
     if catalog_source not in {None, "project", "profile", "showcase"}:
         raise WorkflowDetailNotFoundError(name)
     home = Path(hermes_home).expanduser().resolve()
+    binding = runner_binding or production_workflow_runner_binding()
     resource_budget = WorkflowResourceReadBudget(
         max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
         max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
@@ -835,28 +856,33 @@ def build_workflow_detail(
                 )
             raise WorkflowDetailNotFoundError(name)
 
-    compatibility = (
-        verified_showcase.compatibility
-        if verified_showcase is not None
-        else assess_compatibility(package)
+    execution_context = background_execution_context(
+        binding,
+        requires_ai=(
+            verified_showcase.scenario.requires_ai
+            if verified_showcase is not None
+            else None
+        ),
     )
+    try:
+        compatibility, risk = assess_package_execution(
+            package,
+            execution_context,
+            read_budget=resource_budget,
+        )
+    except WorkflowResourceCapacityError as exc:
+        raise WorkflowCatalogCapacityError(
+            "workflow detail resource limit exceeded"
+        ) from exc
+    except WorkflowValidationError as exc:
+        raise WorkflowCatalogInvalidDefinitionError(
+            "workflow detail contains an invalid package resource"
+        ) from exc
     shown = qualify_workflow_catalog_package(
         package,
         compatibility=compatibility,
     )
     if verified_showcase is None:
-        try:
-            risk = build_risk_summary(
-                package, compatibility, read_budget=resource_budget
-            )
-        except WorkflowResourceCapacityError as exc:
-            raise WorkflowCatalogCapacityError(
-                "workflow detail resource limit exceeded"
-            ) from exc
-        except WorkflowValidationError as exc:
-            raise WorkflowCatalogInvalidDefinitionError(
-                "workflow detail contains an invalid package resource"
-            ) from exc
         try:
             trust_store = WorkflowTrustStore(home)
             trust_snapshot = trust_store.snapshot_read_only(
@@ -874,7 +900,6 @@ def build_workflow_detail(
         version = "1"
         showcase_scenario = None
     else:
-        risk = verified_showcase.risk
         trust_state = "verified_bundled"
         version = str(verified_showcase.scenario.package_version)
         showcase_scenario = verified_showcase.scenario

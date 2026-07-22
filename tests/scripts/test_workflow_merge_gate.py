@@ -119,6 +119,14 @@ def test_request_mcp_runtime_contract_is_in_merge_gate_and_native_matrix() -> No
         assert path not in WORKFLOW_GATE_OPTOUTS
 
 
+def test_runner_binding_contract_is_in_merge_gate_and_native_matrix() -> None:
+    path = "tests/plugins/workflow/test_runner_binding.py"
+
+    assert GATE.read_text().count(path) == 1
+    assert CI.read_text().count(path) == 1
+    assert path not in WORKFLOW_GATE_OPTOUTS
+
+
 def test_laptop_diagnostic_middleware_e2e_is_exactly_pinned_in_release_gates() -> None:
     path = "tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py"
 

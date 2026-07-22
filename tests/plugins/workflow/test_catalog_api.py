@@ -154,16 +154,13 @@ def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compa
         "approval-gate": {"supported": True, "reason": "supported"},
         "laptop-diagnostic": {"supported": True, "reason": "supported"},
         "resilience": {"supported": True, "reason": "supported"},
-        "ai-extensions": {
-            "supported": False,
-            "reason": "showcase_cli_required",
-        },
+        "ai-extensions": {"supported": True, "reason": "supported"},
         "scheduling": {
             "supported": False,
             "reason": "showcase_cli_required",
         },
     }
-    assert sum(row["supported"] for row in support_table.values()) == 3
+    assert sum(row["supported"] for row in support_table.values()) == 4
     assert showcase_rows["ai-extensions"]["compatibility"]["runnable"] is False
     assert payload["truncated"] is False
 

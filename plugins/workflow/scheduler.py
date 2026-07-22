@@ -18,7 +18,7 @@ import time
 import uuid
 from typing import Callable, Iterable, Mapping
 
-from plugins.workflow.entitlement import derive_ai_entitlement
+from plugins.workflow.entitlement import AIEntitlementResolution, derive_ai_entitlement
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.approval import ApprovalExecutor
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
@@ -208,6 +208,7 @@ class RunScheduler:
         execution_owner_epoch: int | None = None,
         execution_fence: ExecutionFence | None = None,
         agent_runner=None,
+        runner_binding=None,
         session_registry: NodeSessionRegistry | None = None,
         profile_name: str = "default",
         max_parallel_nodes: int = 4,
@@ -256,6 +257,16 @@ class RunScheduler:
             or not 1 <= default_max_attempts <= 5
         ):
             raise ValueError("default retry attempts must be between 1 and 5")
+        if runner_binding is not None:
+            if agent_runner is not None and agent_runner is not runner_binding.real_runner:
+                raise ValueError("runner_binding and agent_runner disagree")
+            agent_runner = runner_binding.real_runner
+        self.runner_binding = runner_binding
+        deterministic_runner = (
+            runner_binding.deterministic_runner
+            if runner_binding is not None
+            else None
+        )
         self.store = store
         self.owner_id = owner_id or f"scheduler-{os.getpid()}-{uuid.uuid4().hex}"
         if (execution_owner_id is None) != (execution_owner_epoch is None):
@@ -316,7 +327,10 @@ class RunScheduler:
             "bash": BashExecutor(),
             "script": ScriptExecutor(),
             "cancel": CancelExecutor(),
-            "approval": ApprovalExecutor(agent_runner),
+            "approval": ApprovalExecutor(
+                agent_runner,
+                deterministic_runner=deterministic_runner,
+            ),
         }
         if agent_runner is not None:
             registry = session_registry or NodeSessionRegistry(store.hermes_home)
@@ -324,11 +338,15 @@ class RunScheduler:
                 agent_runner,
                 session_registry=registry,
                 profile_name=profile_name,
+                deterministic_runner=deterministic_runner,
             )
             self.executors.update({
                 "command": ai_executor,
                 "prompt": ai_executor,
-                "loop": LoopExecutor(agent_runner),
+                "loop": LoopExecutor(
+                    agent_runner,
+                    deterministic_runner=deterministic_runner,
+                ),
             })
 
     def _renew_execution_owner(self, run_id: str) -> bool:
@@ -714,6 +732,14 @@ class RunScheduler:
                                 projection.get("run_metadata", {}),
                                 definition_digest=str(
                                     projection.get("definition_digest") or ""
+                                ),
+                                execution_context=(
+                                    self.runner_binding.execution_context(
+                                        surface="background",
+                                        entitlement=AIEntitlementResolution("real"),
+                                    )
+                                    if self.runner_binding is not None
+                                    else None
                                 ),
                             ),
                             execution_limits=execution_limits,

@@ -17,6 +17,7 @@ import stat
 import tempfile
 import threading
 import time
+from types import MappingProxyType
 from typing import Iterator, Literal, Mapping
 
 import yaml
@@ -54,6 +55,7 @@ from plugins.workflow.trust import (
     WorkflowResourceReadBudget,
     WorkflowTrustError,
     build_risk_summary,
+    compute_package_digest,
     preflight_execution,
 )
 
@@ -107,8 +109,7 @@ class ShowcaseScenario:
 class VerifiedShowcasePackage:
     scenario: ShowcaseScenario
     package: WorkflowPackage
-    risk: WorkflowRiskSummary
-    compatibility: CompatibilityReport
+    package_digest: str
     bundle_digest: str
 
 
@@ -117,6 +118,8 @@ class _VerifiedShowcaseCacheEntry:
     root: Path
     tree_signature: tuple[tuple[object, ...], ...]
     packages: Mapping[str, VerifiedShowcasePackage]
+    resource_bytes: Mapping[Path, bytes]
+    resource_aliases: Mapping[Path, Path]
 
 
 _VERIFIED_SHOWCASE_CACHE: dict[str, _VerifiedShowcaseCacheEntry] = {}
@@ -732,8 +735,6 @@ def showcase_background_api_eligible(scenario: ShowcaseScenario) -> bool:
     """Return whether ordinary background admission preserves scenario intent."""
     return (
         scenario.interaction_mode == "guided"
-        and scenario.offline
-        and not scenario.requires_ai
         and not scenario.requires_network
     )
 
@@ -770,10 +771,38 @@ def _load_verified_showcase_cache_hit(
             and cached.root == resolved_root
             and cached.tree_signature == tree_signature
         ):
+            _restore_cached_resources(read_budget, cached)
             return dict(cached.packages)
         _VERIFIED_SHOWCASE_CACHE_GENERATION += 1
         _VERIFIED_SHOWCASE_CACHE.clear()
     return None
+
+
+def _restore_cached_resources(
+    read_budget: WorkflowResourceReadBudget,
+    cached: _VerifiedShowcaseCacheEntry,
+) -> None:
+    """Copy authenticated immutable bytes into one request-owned read budget."""
+    for path, data in cached.resource_bytes.items():
+        existing = read_budget._contents.get(path)
+        if existing is not None:
+            if existing != data:
+                raise ShowcaseCatalogError(
+                    "showcase resource cache conflicts with authenticated bytes"
+                )
+            continue
+        if (
+            read_budget.files_read >= read_budget.max_files
+            or len(data) > read_budget.max_file_bytes
+            or read_budget.bytes_read + len(data) > read_budget.max_total_bytes
+        ):
+            raise WorkflowResourceCapacityError(
+                "showcase verification aggregate limit exceeded"
+            )
+        read_budget._contents[path] = data
+        read_budget.files_read += 1
+        read_budget.bytes_read += len(data)
+    read_budget._aliases.update(cached.resource_aliases)
 
 
 def _verify_and_cache_showcase_packages(
@@ -801,17 +830,13 @@ def _verify_and_cache_showcase_packages(
             bundle_root=resolved_root,
             read_budget=read_budget,
         )
-        risk, compatibility = _verified_distribution_assessment(
-            scenario,
-            package,
-            read_budget,
-            enforce_runnable=False,
-        )
         verified[scenario_id] = VerifiedShowcasePackage(
             scenario=scenario,
             package=package,
-            risk=risk,
-            compatibility=compatibility,
+            package_digest=compute_package_digest(
+                package,
+                read_budget=read_budget,
+            ).sha256,
             bundle_digest=bundle_digest,
         )
 
@@ -835,7 +860,9 @@ def _verify_and_cache_showcase_packages(
                 _VerifiedShowcaseCacheEntry(
                     root=resolved_root,
                     tree_signature=after_signature,
-                    packages=dict(verified),
+                    packages=MappingProxyType(dict(verified)),
+                    resource_bytes=MappingProxyType(dict(read_budget._contents)),
+                    resource_aliases=MappingProxyType(dict(read_budget._aliases)),
                 )
             )
     return verified

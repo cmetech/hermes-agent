@@ -77,6 +77,7 @@ _DETERMINISTIC_AGENT_RUNNER = DeterministicAgentRunner()
 def entitled_agent_runner(
     resolution: AIEntitlementResolution,
     real_runner,
+    deterministic_runner=None,
 ):
     """Select the sole runner allowed by the already-derived run decision."""
     if resolution.error_code:
@@ -84,10 +85,18 @@ def entitled_agent_runner(
             resolution.error_message or "AI entitlement integrity failure"
         )
     if resolution.value == "deterministic":
-        return _DETERMINISTIC_AGENT_RUNNER
+        return (
+            deterministic_runner
+            if deterministic_runner is not None
+            else _DETERMINISTIC_AGENT_RUNNER
+        )
     if resolution.value == "real":
         return real_runner
-    return _DETERMINISTIC_AGENT_RUNNER
+    return (
+        deterministic_runner
+        if deterministic_runner is not None
+        else _DETERMINISTIC_AGENT_RUNNER
+    )
 
 
 def _integrity_failure(message: str) -> AIEntitlementResolution:
@@ -102,6 +111,7 @@ def derive_ai_entitlement(
     metadata: Mapping[str, object],
     *,
     definition_digest: str | None = None,
+    execution_context=None,
 ) -> AIEntitlementResolution:
     """Derive immutable per-run model authority without mutating metadata."""
     if not isinstance(metadata, Mapping):
@@ -135,17 +145,40 @@ def derive_ai_entitlement(
             "explicit real entitlement has incomplete showcase identity"
         )
 
+    verification_budget = None
     try:
         from plugins.workflow.showcase import load_verified_showcase_package
         from plugins.workflow.trust import WorkflowResourceReadBudget
 
+        verification_budget = WorkflowResourceReadBudget(
+            max_file_bytes=1024 * 1024,
+            max_total_bytes=8 * 1024 * 1024,
+            max_files=512,
+        )
         verified = load_verified_showcase_package(
             str(metadata["showcase_id"]),
-            read_budget=WorkflowResourceReadBudget(
-                max_file_bytes=1024 * 1024,
-                max_total_bytes=8 * 1024 * 1024,
-                max_files=512,
-            ),
+            read_budget=verification_budget,
+        )
+    except Exception:
+        return _integrity_failure(
+            "explicit real entitlement cannot be corroborated"
+        )
+
+    try:
+        from plugins.workflow.runner_binding import (
+            assess_package_execution,
+            background_execution_context,
+            production_workflow_runner_binding,
+        )
+
+        context = execution_context or background_execution_context(
+            production_workflow_runner_binding(),
+            requires_ai=verified.scenario.requires_ai,
+        )
+        _compatibility, risk = assess_package_execution(
+            verified.package,
+            context,
+            read_budget=verification_budget,
         )
     except Exception:
         return _integrity_failure(
@@ -158,8 +191,8 @@ def derive_ai_entitlement(
         and metadata.get("showcase_version")
         == verified.scenario.package_version
         and metadata.get("bundle_digest") == verified.bundle_digest
-        and metadata.get("risk_digest") == verified.risk.risk_digest
-        and definition_digest == verified.risk.package_digest
+        and metadata.get("risk_digest") == risk.risk_digest
+        and definition_digest == risk.package_digest
     ):
         return _integrity_failure(
             "explicit real entitlement does not match the verified AI scenario"

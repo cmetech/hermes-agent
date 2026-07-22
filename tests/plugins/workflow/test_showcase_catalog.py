@@ -1143,7 +1143,7 @@ def test_cli_run_still_rejects_isolated_backend_showcase_without_backend(
         ("approval-gate", True),
         ("resilience", True),
         ("laptop-diagnostic", True),
-        ("ai-extensions", False),
+        ("ai-extensions", True),
         ("scheduling", False),
     ],
 )

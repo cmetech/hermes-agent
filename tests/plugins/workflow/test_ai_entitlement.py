@@ -27,6 +27,12 @@ from plugins.workflow.showcase import load_verified_showcase_package
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import WorkflowResourceReadBudget
+from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
+from plugins.workflow.runner_binding import (
+    RunnerCapabilities,
+    assess_package_execution,
+    execution_capability_context,
+)
 
 
 FIXTURE_PATH = Path(__file__).with_name("fixtures") / "entitlement" / "v3.0.2.json"
@@ -239,26 +245,42 @@ def test_only_verified_ai_admission_writes_explicit_real_entitlement() -> None:
 
 
 def test_exact_verified_requires_ai_scenario_corroborates_real_entitlement() -> None:
+    read_budget = WorkflowResourceReadBudget(
+        max_file_bytes=1024 * 1024,
+        max_total_bytes=8 * 1024 * 1024,
+        max_files=512,
+    )
     verified = load_verified_showcase_package(
         "ai-extensions",
-        read_budget=WorkflowResourceReadBudget(
-            max_file_bytes=1024 * 1024,
-            max_total_bytes=8 * 1024 * 1024,
-            max_files=512,
+        read_budget=read_budget,
+    )
+    execution_context = execution_capability_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+        runner_capabilities=RunnerCapabilities(starts_request_mcp=True),
+        runtime_capabilities=ExecutionRuntimeCapabilities(
+            api_mode="chat_completions",
+            hermes_managed_tool_loop=True,
         ),
+    )
+    _compatibility, risk = assess_package_execution(
+        verified.package,
+        execution_context,
+        read_budget=read_budget,
     )
     metadata = entitlement_module.verified_showcase_run_metadata(
         showcase_id=verified.scenario.id,
         showcase_version=verified.scenario.package_version,
         bundle_digest=verified.bundle_digest,
-        risk_digest=verified.risk.risk_digest,
+        risk_digest=risk.risk_digest,
         requires_ai=True,
         include_verified_marker=False,
     )
 
     resolution = derive_ai_entitlement(
         metadata,
-        definition_digest=verified.risk.package_digest,
+        definition_digest=risk.package_digest,
+        execution_context=execution_context,
     )
 
     assert resolution == AIEntitlementResolution("real")

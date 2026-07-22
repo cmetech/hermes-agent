@@ -51,6 +51,7 @@ class WorkflowCoordinatorService:
         sweep_backoff_seconds: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0, 60.0),
         utcnow: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        runner_binding=None,
     ) -> None:
         for name, value in (
             ("heartbeat_seconds", heartbeat_seconds),
@@ -87,6 +88,7 @@ class WorkflowCoordinatorService:
         self.sweep_backoff_seconds = tuple(float(value) for value in sweep_backoff_seconds)
         self._utcnow = utcnow or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic
+        self._runner_binding = runner_binding
         self._boot_id = current_boot_id()
         self._notification_repair_due_at = 0.0
         self._health_lock = threading.Lock()
@@ -173,17 +175,21 @@ class WorkflowCoordinatorService:
             eligible_at = self._monotonic() + self.web_election_grace_seconds
         return self._monotonic() >= eligible_at, eligible_at
 
-    @staticmethod
-    def _scheduler(run_store, *, fence: ExecutionFence):
-        from agent.plugin_agent import PluginAgentRunner
+    def _scheduler(self, run_store, *, fence: ExecutionFence):
         from hermes_cli.profiles import get_active_profile_name
         from plugins.workflow.cli import _runtime_config, _scheduler
+        from plugins.workflow import runner_binding as runner_binding_module
 
         runtime = _runtime_config(run_store.hermes_home)
+        binding = (
+            self._runner_binding
+            if self._runner_binding is not None
+            else runner_binding_module.production_workflow_runner_binding()
+        )
         scheduler = _scheduler(
             run_store,
             runtime,
-            agent_runner=PluginAgentRunner(plugin_id="workflow"),
+            runner_binding=binding,
             profile_name=get_active_profile_name(),
             owner_id=f"coordinator:{fence.owner_id}:{fence.owner_epoch}",
         )

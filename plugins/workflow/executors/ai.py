@@ -49,8 +49,10 @@ class AgentNodeExecutor:
         *,
         session_registry: NodeSessionRegistry | None = None,
         profile_name: str = "default",
+        deterministic_runner=None,
     ) -> None:
         self.agent_runner = agent_runner
+        self.deterministic_runner = deterministic_runner
         self.session_registry = session_registry
         self.profile_name = profile_name
 
@@ -150,7 +152,9 @@ class AgentNodeExecutor:
             return self._failure("unsupported_ai_node", node.node_type)
         try:
             agent_runner = entitled_agent_runner(
-                context.ai_entitlement, self.agent_runner
+                context.ai_entitlement,
+                self.agent_runner,
+                self.deterministic_runner,
             )
         except AIExecutionIntegrityError as exc:
             return self._failure("execution_integrity", str(exc))

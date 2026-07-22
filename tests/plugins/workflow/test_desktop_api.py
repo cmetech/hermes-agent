@@ -404,7 +404,7 @@ def test_post_runs_admits_verified_showcase_in_background_and_joins_stably(
 @pytest.mark.parametrize(
     ("showcase_id", "status_code", "reason"),
     [
-        ("ai-extensions", 409, "workflow_showcase_cli_required"),
+        ("ai-extensions", 409, "workflow_compatibility_blocked"),
         ("scheduling", 409, "workflow_showcase_cli_required"),
     ],
 )
@@ -709,8 +709,8 @@ def test_post_runs_rejects_environment_incompatible_showcase_before_persistence(
     store = RunStore(home)
     _healthy_coordinator(store)
 
-    def incompatible(_package):
-        return CompatibilityReport(
+    def incompatible(package, _context, *, read_budget=None):
+        compatibility = CompatibilityReport(
             level=CompatibilityLevel.UNSUPPORTED,
             findings=(
                 CompatibilityFinding(
@@ -722,9 +722,17 @@ def test_post_runs_rejects_environment_incompatible_showcase_before_persistence(
             ),
             runnable=False,
         )
+        return compatibility, build_risk_summary(
+            package,
+            compatibility,
+            read_budget=read_budget,
+        )
 
-    monkeypatch.setattr(api_admission_module, "assess_compatibility", incompatible)
-    monkeypatch.setattr(showcase_module, "assess_compatibility", incompatible)
+    monkeypatch.setattr(
+        api_admission_module,
+        "assess_package_execution",
+        incompatible,
+    )
 
     response = TestClient(_app(_router())).post(
         "/api/plugins/workflow/runs",
@@ -1091,15 +1099,19 @@ def test_direct_api_admission_rejects_incompatible_workflow_before_persistence(
     )
     store = RunStore(home)
     _healthy_coordinator(store)
-    original_assess = api_admission_module.assess_compatibility
+    original_assess = api_admission_module.assess_package_execution
     assessments = 0
 
-    def counted_assess(package):
+    def counted_assess(package, context, *, read_budget=None):
         nonlocal assessments
         assessments += 1
-        return original_assess(package)
+        return original_assess(package, context, read_budget=read_budget)
 
-    monkeypatch.setattr(api_admission_module, "assess_compatibility", counted_assess)
+    monkeypatch.setattr(
+        api_admission_module,
+        "assess_package_execution",
+        counted_assess,
+    )
 
     with pytest.raises(ApiAdmissionError) as caught:
         start_api_run(
