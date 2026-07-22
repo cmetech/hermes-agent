@@ -3161,7 +3161,16 @@ class RunStore:
                 connection.rollback()
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
                 return RunAdmissionResult(None, "rejected", "overlap_forbidden")
-            if (
+            if scheduled_at is not None:
+                if counts.get("queued", 0) >= self.limits["queued"]:
+                    connection.rollback()
+                    shutil.rmtree(
+                        immutable_snapshot.staging_directory, ignore_errors=True
+                    )
+                    return RunAdmissionResult(None, "rejected", "queued_capacity")
+                status = "queued"
+                disposition = "queued"
+            elif (
                 (active and request.concurrency_policy == "queue")
                 or (older_queued is not None and request.concurrency_policy != "allow")
                 or (execution_at_capacity and request.concurrency_policy == "queue")

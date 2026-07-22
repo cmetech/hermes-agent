@@ -10,6 +10,7 @@ import threading
 import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import JournalRecoveryError, RunStore
 import plugins.workflow.store as store_module
@@ -415,6 +416,32 @@ def test_unscheduled_projection_keeps_null_derived_column_and_exact_start_digest
     projection = json.loads(projection_path.read_bytes())
     assert projection["run_metadata"] == {}
     assert RunStore._start_digest_from_projection(projection) == expected_digest
+
+
+def test_unscheduled_api_golden_digest_and_metadata_remain_byte_identical() -> None:
+    request = RunAdmissionRequest(
+        workflow_name="digest-fixture",
+        definition_digest="1" * 64,
+        policy_digest="2" * 64,
+        input_manifest_digest="3" * 64,
+        trigger_source="api",
+        idempotency_key="intent-api",
+        idempotency_namespace="api:service:test:writer",
+        concurrency_key="digest-fixture",
+        operator_scope="service:test:writer",
+        run_metadata={"zeta": "last", "alpha": "one"},
+        provenance=TriggerProvenance.authenticated_api(
+            assurance="verified_adapter",
+            intent_key="intent-api",
+            source_instance="api:token:test",
+            principal="service:test:writer",
+        ),
+    )
+
+    assert RunStore._start_digest(request) == (
+        "2432809a726b15ac48c7a0ccc7c2c7ed122fe79c8d68f0c85ecc862f8d91e475"
+    )
+    assert "schedule_at" not in request.run_metadata
 
 
 def test_genuine_v13_migration_backfills_schedule_and_is_idempotent(

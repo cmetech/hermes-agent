@@ -20,6 +20,9 @@ _PORTABLE_COMPONENT_MAX_UNITS = 255
 _TEXT_INPUT_SUFFIX = ".txt"
 _PROJECTION_MAX_CHARS = 16_384
 _TRUNCATION_SUFFIX = "…[TRUNCATED]"
+_CANONICAL_SCHEDULE_AT = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{6})?Z$"
+)
 
 
 def workflow_input_name_is_portable(name: object, *, max_length: int = 128) -> bool:
@@ -129,8 +132,30 @@ def sanitize_projection(value: object, *, key: str = "", depth: int = 0) -> obje
     return sanitize_projection(str(value), key=key, depth=depth + 1)
 
 
+def public_run_projection(value: Mapping[str, object]) -> dict[str, object]:
+    """Project a run while keeping durable admission metadata server-private."""
+    projected = sanitize_projection(value)
+    if not isinstance(projected, dict):
+        raise TypeError("run projection must be a mapping")
+    metadata = value.get("run_metadata")
+    projected.pop("run_metadata", None)
+    if not isinstance(metadata, Mapping):
+        return projected
+    schedule_at = metadata.get("schedule_at")
+    if (
+        not isinstance(schedule_at, str)
+        or _CANONICAL_SCHEDULE_AT.fullmatch(schedule_at) is None
+    ):
+        return projected
+    projected["schedule_at"] = schedule_at
+    if value.get("status") == "queued":
+        projected["presentation_state"] = "scheduled_wait"
+    return projected
+
+
 __all__ = [
     "projection_key_is_secret",
+    "public_run_projection",
     "sanitize_evidence_bytes",
     "sanitize_projection",
     "sanitize_text",

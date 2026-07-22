@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 from typing import Literal, Mapping
@@ -63,6 +64,45 @@ class ApiAdmissionError(RuntimeError):
         self.code = code
         self.status_code = status_code
         self.retryable = retryable
+
+
+_RFC3339_INSTANT = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
+)
+
+
+def normalize_api_schedule_at(
+    value: object | None,
+    *,
+    now_utc: datetime | None = None,
+) -> str | None:
+    """Validate one future RFC 3339 instant and return canonical UTC-Z text."""
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.endswith("-00:00")
+        or _RFC3339_INSTANT.fullmatch(value) is None
+    ):
+        raise ApiAdmissionError("workflow_schedule_invalid", status_code=422)
+    try:
+        parsed = datetime.fromisoformat(
+            value[:-1] + "+00:00" if value[-1] in {"Z", "z"} else value
+        )
+    except (OverflowError, ValueError) as exc:
+        raise ApiAdmissionError("workflow_schedule_invalid", status_code=422) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ApiAdmissionError("workflow_schedule_invalid", status_code=422)
+    observed = now_utc or datetime.now(timezone.utc)
+    if observed.tzinfo is None or observed.utcoffset() is None:
+        raise ValueError("now_utc must be timezone-aware")
+    canonical_instant = parsed.astimezone(timezone.utc)
+    if canonical_instant <= observed.astimezone(timezone.utc):
+        raise ApiAdmissionError("workflow_schedule_invalid", status_code=422)
+    timespec = "microseconds" if canonical_instant.microsecond else "seconds"
+    return canonical_instant.isoformat(timespec=timespec).removesuffix("+00:00") + "Z"
 
 
 def validate_api_value_bounds(values: Mapping[str, str]) -> dict[str, str]:
@@ -172,8 +212,14 @@ def start_api_run(
     authority: ApiAdmissionAuthority,
     catalog_source: Literal["project", "profile", "showcase"] | None = None,
     runner_binding: WorkflowRunnerBinding | None = None,
+    schedule_at: str | None = None,
+    schedule_now_utc: datetime | None = None,
 ) -> dict[str, object]:
     """Admit one trusted catalog workflow without executing any workflow node."""
+    schedule_at = normalize_api_schedule_at(
+        schedule_at,
+        now_utc=schedule_now_utc,
+    )
     home = Path(hermes_home).resolve()
     binding = runner_binding or production_workflow_runner_binding()
     provenance = TriggerProvenance.authenticated_api(
@@ -238,12 +284,18 @@ def start_api_run(
             verified_showcase.scenario if verified_showcase is not None else None
         ),
     )
+    scenario = verified_showcase.scenario if verified_showcase is not None else None
+    schedule_required = bool(
+        scenario is not None and scenario.interaction_mode == "schedule"
+    )
+    if schedule_required and schedule_at is None:
+        raise ApiAdmissionError("workflow_schedule_required", status_code=409)
     if not run_support["supported"]:
         if run_support["reason"] == "unsupported_inputs":
             raise ApiAdmissionError("workflow_inputs_unsupported", status_code=422)
-        raise ApiAdmissionError("workflow_showcase_cli_required", status_code=409)
+        if not (schedule_required and schedule_at is not None):
+            raise ApiAdmissionError("workflow_showcase_cli_required", status_code=409)
 
-    scenario = verified_showcase.scenario if verified_showcase is not None else None
     value_bindings = (
         getattr(scenario, "input_value_bindings", None) if scenario is not None else None
     )
@@ -406,6 +458,15 @@ def start_api_run(
             include_verified_marker=True,
         )
         concurrency_key = f"showcase:{verified_showcase.scenario.id}"
+    if schedule_at is not None:
+        run_metadata = {
+            **dict(run_metadata or {}),
+            "catalog_source": (
+                "showcase" if verified_showcase is not None else str(package.source)
+            ),
+            "risk_digest": risk.risk_digest,
+            "schedule_at": schedule_at,
+        }
 
     admitted = store.start_run(
         RunAdmissionRequest(
@@ -454,6 +515,7 @@ def start_api_run(
 __all__ = [
     "ApiAdmissionAuthority",
     "ApiAdmissionError",
+    "normalize_api_schedule_at",
     "start_api_run",
     "validate_api_value_bounds",
     "validate_declared_api_values",

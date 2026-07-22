@@ -2396,3 +2396,42 @@ upstream_changes:
     projection-authoritative parity checks, scheduled partial indexing, and
     recovery-complete derived schedule identity across every reconstruction path.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-scheduled-api-admission
+  change_class: workflow-runtime
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/sanitize.py
+  - plugins/workflow/store.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
+  owned_symbols:
+  - StartRunRequest.schedule_at
+  - normalize_api_schedule_at
+  - scheduled API identity metadata
+  - scheduled queued admission
+  - public_run_projection schedule redaction
+  - scheduled request/projection digest parity
+  tests:
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
+  expected_commit_subject: 'feat(workflow): admit scheduled desktop runs'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve endpoint-owned typed schedule validation before store or package
+    access, including malformed JSON types, strict timezone awareness, explicit
+    rejection of the RFC 3339 unknown offset, canonical UTC-Z normalization,
+    and a test-injected current instant. Keep schedule-only metadata limited to
+    canonical schedule_at plus server-derived catalog_source and risk_digest;
+    existing top-level definition, policy, and input digests remain authoritative.
+    Future runs must publish queued in background without node execution. Equivalent
+    offset forms must join one idempotent identity, distinct instants must conflict,
+    and journal recovery must reproduce the request digest. Keep unscheduled
+    metadata and golden digests byte-identical. Public run list/detail projections
+    must hide all durable run metadata and expose only canonical schedule_at plus
+    presentation_state=scheduled_wait while the run remains queued.
+  removal_condition: Remove when upstream carries an equivalent typed scheduled
+    Desktop admission boundary, schedule-only durable identity, queued publication,
+    digest parity, and metadata-redacted list/detail projection.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

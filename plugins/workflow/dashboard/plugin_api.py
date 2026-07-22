@@ -30,7 +30,7 @@ from plugins.workflow.runtime import (
     WorkflowApiRuntime,
     WorkflowRetentionPolicy,
 )
-from plugins.workflow.sanitize import sanitize_projection
+from plugins.workflow.sanitize import public_run_projection, sanitize_projection
 from plugins.workflow.store import JournalRecoveryError, RunStore
 
 
@@ -66,6 +66,10 @@ async def _router_lifespan(_app):
 
 
 router = APIRouter(lifespan=_router_lifespan)
+
+
+def _schedule_now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 _ALL_WORKFLOW_CAPABILITIES = frozenset({"read", "write", "delivery", "admin"})
@@ -842,7 +846,7 @@ def list_runs(
         })
     return {
         "schema_version": 1,
-        "runs": sanitize_projection(page),
+        "runs": [public_run_projection(item) for item in page],
         "next_cursor": next_cursor,
     }
 
@@ -855,6 +859,15 @@ class StartRunRequest(BaseModel):
     values: dict[str, str] = Field(default_factory=dict)
     idempotency_key: str = Field(..., min_length=1, max_length=512)
     concurrency_policy: Literal["queue", "allow", "forbid"] = "queue"
+    schedule_at: object | None = Field(
+        None,
+        json_schema_extra={
+            "anyOf": [
+                {"type": "string", "format": "date-time"},
+                {"type": "null"},
+            ]
+        },
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -923,6 +936,7 @@ def post_runs(
     from plugins.workflow.api_admission import (
         ApiAdmissionAuthority,
         ApiAdmissionError,
+        normalize_api_schedule_at,
         start_api_run,
         validate_api_value_bounds,
     )
@@ -937,6 +951,11 @@ def post_runs(
         return_route=operator.return_route,
     )
     try:
+        schedule_now_utc = _schedule_now_utc()
+        schedule_at = normalize_api_schedule_at(
+            request.schedule_at,
+            now_utc=schedule_now_utc,
+        )
         values = validate_api_value_bounds(request.values)
         with _store_lease() as store:
             result = start_api_run(
@@ -950,6 +969,8 @@ def post_runs(
                 idempotency_key=request.idempotency_key,
                 concurrency_policy=request.concurrency_policy,
                 authority=authority,
+                schedule_at=schedule_at,
+                schedule_now_utc=schedule_now_utc,
             )
     except ApiAdmissionError as exc:
         raise HTTPException(
@@ -973,7 +994,7 @@ def get_run(
     operator = _verified_operator(request, operator_scope)
     operator.require("read")
     with _store_lease() as store:
-        return sanitize_projection(_load_authorized(store, run_id, operator))
+        return public_run_projection(_load_authorized(store, run_id, operator))
 
 
 def _attention_origin(run: Mapping[str, object]) -> str:

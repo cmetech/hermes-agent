@@ -189,6 +189,10 @@ def _assert_no_admission_residue(store: RunStore) -> None:
     assert list(store.staging_root.iterdir()) == []
 
 
+SCHEDULE_NOW = datetime(2098, 12, 31, 0, 0, tzinfo=timezone.utc)
+SCHEDULE_AT = "2099-01-02T03:04:05Z"
+
+
 def _restamp_showcase_copy(root: Path, showcase_id: str) -> None:
     catalog_path = root / "catalog.yaml"
     manifest_path = root / "digests.json"
@@ -308,6 +312,14 @@ def test_post_runs_authenticated_session_middleware_records_desktop_source(
     scope = "dashboard:test:org:desktop-user"
     module = _module()
     client = TestClient(_app(module.router, session=session))
+    captured_requests: list[RunAdmissionRequest] = []
+    original_start_digest = RunStore._start_digest
+
+    def capture_start_digest(request):
+        captured_requests.append(request)
+        return original_start_digest(request)
+
+    monkeypatch.setattr(RunStore, "_start_digest", staticmethod(capture_start_digest))
 
     admitted = client.post(
         "/api/plugins/workflow/runs",
@@ -322,12 +334,92 @@ def test_post_runs_authenticated_session_middleware_records_desktop_source(
     assert admitted.status_code == 202
     run_id = admitted.json()["result"]["run_id"]
     run = store.get_run_status(run_id, operator_scope=scope)
+    assert run["status"] == "running"
     assert run["trigger"] == "desktop"
     assert run["execution_mode"] == "background"
+    assert run["run_metadata"] == {}
+    assert captured_requests[-1].run_metadata is None
+    assert RunStore._start_digest_from_projection(run) == original_start_digest(
+        captured_requests[-1]
+    )
     assert run["provenance"]["source"] == "desktop"
     assert run["provenance"]["assurance"] == "verified_adapter"
     assert run["provenance"]["actor_id"] == scope
     assert run["provenance"]["source_instance"] == "api:session:test"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2099-01-02T03:04:05Z", "2099-01-02T03:04:05Z"),
+        ("2099-01-02T04:04:05+01:00", "2099-01-02T03:04:05Z"),
+        ("2099-01-01T22:34:05-04:30", "2099-01-02T03:04:05Z"),
+        ("2099-01-02T04:04:05.125000+01:00", "2099-01-02T03:04:05.125000Z"),
+        ("2099-01-02T04:04:05.123456789+01:00", "2099-01-02T03:04:05.123456Z"),
+    ],
+)
+def test_schedule_at_parser_normalizes_aware_rfc3339_to_canonical_utc_z(
+    value: str, expected: str
+) -> None:
+    assert (
+        api_admission_module.normalize_api_schedule_at(
+            value, now_utc=SCHEDULE_NOW
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "schedule_at",
+    [
+        "",
+        "not-an-instant",
+        "2099-01-02T03:04:05",
+        "2099-01-02T03:04:05-00:00",
+        "2098-12-30T23:59:59Z",
+        "2098-12-31T00:00:00Z",
+        17,
+        {"instant": "2099-01-02T03:04:05Z"},
+        ["2099-01-02T03:04:05Z"],
+        True,
+    ],
+)
+def test_post_runs_rejects_invalid_schedule_at_before_store_or_package_work(
+    tmp_path, monkeypatch, schedule_at
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    module = _module()
+    monkeypatch.setattr(module, "_schedule_now_utc", lambda: SCHEDULE_NOW, raising=False)
+
+    @contextmanager
+    def forbidden_store_lease():
+        pytest.fail("invalid schedule reached store construction")
+        yield
+
+    monkeypatch.setattr(module, "_store_lease", forbidden_store_lease)
+    monkeypatch.setattr(
+        api_admission_module,
+        "_catalog_package",
+        lambda *_args, **_kwargs: pytest.fail("invalid schedule loaded a package"),
+    )
+
+    response = TestClient(_app(module.router)).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "must-not-load",
+            "values": {},
+            "idempotency_key": f"invalid-schedule-{schedule_at}",
+            "concurrency_policy": "queue",
+            "schedule_at": schedule_at,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {"code": "workflow_schedule_invalid", "retryable": False}
+    }
+    assert not home.exists()
 
 
 def test_post_runs_admits_verified_showcase_in_background_and_joins_stably(
@@ -405,7 +497,7 @@ def test_post_runs_admits_verified_showcase_in_background_and_joins_stably(
     ("showcase_id", "status_code", "reason"),
     [
         ("ai-extensions", 409, "workflow_compatibility_blocked"),
-        ("scheduling", 409, "workflow_showcase_cli_required"),
+        ("scheduling", 409, "workflow_schedule_required"),
     ],
 )
 def test_post_runs_rederives_showcase_run_support_without_persistence(
@@ -433,6 +525,228 @@ def test_post_runs_rederives_showcase_run_support_without_persistence(
         "detail": {"code": reason, "retryable": False}
     }
     _assert_no_admission_residue(store)
+    with store._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM admission_events").fetchone()[0]
+            == 0
+        )
+
+
+def test_future_schedule_is_queued_with_server_owned_identity_and_no_execution(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = _trusted_catalog_workflow(home, workflow_writer, name="scheduled-api")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    module = _module()
+    monkeypatch.setattr(module, "_schedule_now_utc", lambda: SCHEDULE_NOW)
+    monkeypatch.setattr(
+        RunScheduler,
+        "advance",
+        lambda *_args, **_kwargs: pytest.fail("scheduled admission executed a node"),
+    )
+
+    response = TestClient(_app(module.router)).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "scheduled-api",
+            "values": {},
+            "idempotency_key": "scheduled-api-created",
+            "concurrency_policy": "allow",
+            "schedule_at": "2099-01-02T04:04:05+01:00",
+        },
+    )
+
+    assert response.status_code == 202
+    result = response.json()["result"]
+    assert result["status"] == "queued"
+    run = store.get_run_status(result["run_id"])
+    risk = build_risk_summary(package, assess_compatibility(package))
+    assert run["status"] == "queued"
+    assert run["execution_mode"] == "background"
+    assert run["started_at"] is None
+    assert run["run_metadata"] == {
+        "catalog_source": "profile",
+        "risk_digest": risk.risk_digest,
+        "schedule_at": SCHEDULE_AT,
+    }
+    assert all(node["state"] == "ready" for node in run["nodes"].values())
+    with store._connect() as connection:
+        row = connection.execute(
+            "SELECT status, scheduled_at FROM runs WHERE run_id=?",
+            (result["run_id"],),
+        ).fetchone()
+    assert tuple(row) == ("queued", SCHEDULE_AT)
+
+
+def test_authenticated_scheduling_showcase_accepts_a_future_schedule(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    module = _module()
+    monkeypatch.setattr(module, "_schedule_now_utc", lambda: SCHEDULE_NOW)
+    monkeypatch.setattr(
+        RunScheduler,
+        "advance",
+        lambda *_args, **_kwargs: pytest.fail("showcase admission executed a node"),
+    )
+
+    response = TestClient(_app(module.router)).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "scheduling",
+            "catalog_source": "showcase",
+            "values": {},
+            "idempotency_key": "scheduled-showcase",
+            "concurrency_policy": "allow",
+            "schedule_at": SCHEDULE_AT,
+        },
+    )
+
+    assert response.status_code == 202
+    run = store.get_run_status(response.json()["result"]["run_id"])
+    assert run["status"] == "queued"
+    assert run["run_metadata"]["showcase_id"] == "scheduling"
+    assert run["run_metadata"]["catalog_source"] == "showcase"
+    assert run["run_metadata"]["schedule_at"] == SCHEDULE_AT
+
+
+def test_schedule_identity_joins_equivalent_offsets_conflicts_on_change_and_recovers(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, workflow_writer, name="scheduled-identity")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    module = _module()
+    monkeypatch.setattr(module, "_schedule_now_utc", lambda: SCHEDULE_NOW)
+    captured_requests: list[RunAdmissionRequest] = []
+    original_start_digest = RunStore._start_digest
+
+    def capture_start_digest(request):
+        captured_requests.append(request)
+        return original_start_digest(request)
+
+    monkeypatch.setattr(RunStore, "_start_digest", staticmethod(capture_start_digest))
+    client = TestClient(_app(module.router))
+    base = {
+        "workflow": "scheduled-identity",
+        "values": {},
+        "idempotency_key": "same-schedule-key",
+        "concurrency_policy": "allow",
+    }
+
+    created = client.post(
+        "/api/plugins/workflow/runs", json={**base, "schedule_at": SCHEDULE_AT}
+    )
+    existing = client.post(
+        "/api/plugins/workflow/runs",
+        json={**base, "schedule_at": "2099-01-02T04:04:05+01:00"},
+    )
+    conflict = client.post(
+        "/api/plugins/workflow/runs",
+        json={**base, "schedule_at": "2099-01-02T03:04:06Z"},
+    )
+
+    assert created.status_code == existing.status_code == 202
+    assert created.json()["result"]["admission_disposition"] == "queued"
+    assert existing.json()["result"]["admission_disposition"] == "existing"
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "idempotency_conflict"
+    run_id = created.json()["result"]["run_id"]
+    directory = store.run_directory(run_id)
+    (directory / "run.json").unlink()
+    recovered = store.load_run(run_id)
+    with store._connect() as connection:
+        stored_digest = connection.execute(
+            "SELECT start_digest FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()[0]
+    assert captured_requests[0].run_metadata == captured_requests[1].run_metadata
+    assert captured_requests[0].run_metadata != captured_requests[-1].run_metadata
+    assert original_start_digest(captured_requests[0]) == stored_digest
+    assert RunStore._start_digest_from_projection(recovered) == stored_digest
+
+
+def test_run_list_and_detail_expose_only_public_schedule_projection(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = _trusted_catalog_workflow(
+        home, workflow_writer, name="scheduled-redaction"
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    module = _module()
+    monkeypatch.setattr(module, "_schedule_now_utc", lambda: SCHEDULE_NOW)
+    client = TestClient(_app(module.router))
+
+    created = client.post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "scheduled-redaction",
+            "values": {},
+            "idempotency_key": "scheduled-redaction",
+            "concurrency_policy": "allow",
+            "schedule_at": SCHEDULE_AT,
+        },
+    )
+    assert created.status_code == 202
+    run_id = created.json()["result"]["run_id"]
+    internal = store.get_run_status(run_id)
+    assert internal["run_metadata"]["risk_digest"]
+    assert internal["run_metadata"]["catalog_source"] == "profile"
+
+    detail = client.get(f"/api/plugins/workflow/runs/{run_id}").json()
+    listed = next(
+        item
+        for item in client.get("/api/plugins/workflow/runs?view=all").json()["runs"]
+        if item["run_id"] == run_id
+    )
+    for projection in (detail, listed):
+        assert projection["schedule_at"] == SCHEDULE_AT
+        assert projection["presentation_state"] == "scheduled_wait"
+        assert "run_metadata" not in projection
+        encoded = json.dumps(projection, sort_keys=True)
+        assert internal["run_metadata"]["risk_digest"] not in encoded
+        assert "catalog_source" not in encoded
+
+    snapshot = store.prepare_run_snapshot(package)
+    canaries = {
+        "api_token": "SECRET-CANARY",
+        "caller_metadata": "CALLER-CANARY",
+        "local_path": "/private/operator/CANARY.txt",
+        "trust_internal": "TRUST-CANARY",
+    }
+    direct = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=snapshot.definition_digest,
+            policy_digest=snapshot.policy_digest,
+            input_manifest_digest=snapshot.input_manifest_digest,
+            trigger_source="desktop",
+            idempotency_key="scheduled-redaction-canaries",
+            concurrency_key=package.definition.name,
+            concurrency_policy="allow",
+            execution_mode="background",
+            run_metadata={"schedule_at": SCHEDULE_AT, **canaries},
+        ),
+        immutable_snapshot=snapshot,
+    )
+    assert direct.run_id is not None
+    canary_detail = client.get(
+        f"/api/plugins/workflow/runs/{direct.run_id}"
+    ).content
+    assert all(value.encode() not in canary_detail for value in canaries.values())
+    assert b"run_metadata" not in canary_detail
 
 
 def test_post_runs_translates_authenticated_laptop_inputs_and_stages_fixture(
