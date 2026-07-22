@@ -220,6 +220,76 @@ def test_lower_node_retry_cap_controls_first_provider_grant(
     assert runner.requests[0].max_api_attempts == 2
 
 
+@pytest.mark.parametrize(
+    "audit",
+    [
+        {"failure_kind": "agent_failed"},
+        {"failure_kind": "agent_failed", "provider_attempts": -1},
+    ],
+    ids=("missing-count", "invalid-count"),
+)
+def test_generic_ai_failure_charges_unknown_provider_attempts_under_retry_all(
+    tmp_path, workflow_writer, audit
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "generic-ai-failure",
+        name="generic-ai-failure",
+        nodes=[{
+            "id": "work",
+            "prompt": "work",
+            "retry": {
+                "max_attempts": 2,
+                "delay_ms": 1000,
+                "on_error": "all",
+            },
+        }],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "limits: {combined_retries: 2}\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "generic-ai-failure-home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="generic-ai-failure",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+
+    class GenericFailureRunner:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="",
+                provider="fake",
+                model="fake",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit=audit,
+            )
+
+    runner = GenericFailureRunner()
+    result = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+
+    assert result["status"] == "failed"
+    assert len(runner.requests) == 1
+    assert runner.requests[0].max_api_attempts == 2
+    assert result["last_error"]["code"] == "agent_failed"
+    assert result["nodes"]["work"]["retry_consumed"] == 2
+
+
 def test_host_pressure_refuses_before_worker_allocation(
     tmp_path, workflow_writer, monkeypatch
 ):

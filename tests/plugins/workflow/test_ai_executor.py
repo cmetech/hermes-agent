@@ -373,3 +373,33 @@ def test_malformed_provider_attempt_count_is_charged_conservatively(
 
     assert result.error_code == "provider_timeout"
     assert result.metadata["provider_attempts"] == 2
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (OSError("provider connection failed"), "network_error"),
+        (RuntimeError("agent host failed"), "agent_execution_failed"),
+    ],
+)
+def test_retryable_runner_exception_charges_unknown_provider_attempts(
+    tmp_path, failure, expected_code
+) -> None:
+    class FailingRunner:
+        def run(self, _request, **_kwargs):
+            raise failure
+
+    result = AgentNodeExecutor(FailingRunner()).execute(
+        _context(
+            tmp_path,
+            _node(
+                "runner-exception",
+                "work",
+                retry={"max_attempts": 3, "on_error": "all"},
+            ),
+            execution_limits=RunExecutionLimits(combined_retries=3),
+        )
+    )
+
+    assert result.error_code == expected_code
+    assert result.metadata["provider_attempts"] == 2

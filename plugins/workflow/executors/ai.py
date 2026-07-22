@@ -12,6 +12,7 @@ from plugins.workflow.compat import resolve_tool_name
 from plugins.workflow.executors.base import (
     NodeExecutionContext,
     NodeExecutionResult,
+    conservative_provider_retry_count,
     validated_provider_retry_count,
 )
 from plugins.workflow.resources import ResourceResolver, VariableContext
@@ -367,11 +368,31 @@ class AgentNodeExecutor:
         except PermissionError as exc:
             return self._failure("authorization", str(exc))
         except OSError as exc:
-            return self._failure("network_error", str(exc))
+            return NodeExecutionResult(
+                "failed",
+                error_code="network_error",
+                error_message=str(exc),
+                metadata={
+                    "provider_attempts": conservative_provider_retry_count(
+                        None,
+                        granted_attempts=granted_provider_attempts,
+                    )
+                },
+            )
         except ValueError as exc:
             return self._failure("validation", str(exc))
         except RuntimeError as exc:
-            return self._failure("agent_execution_failed", str(exc))
+            return NodeExecutionResult(
+                "failed",
+                error_code="agent_execution_failed",
+                error_message=str(exc),
+                metadata={
+                    "provider_attempts": conservative_provider_retry_count(
+                        None,
+                        granted_attempts=granted_provider_attempts,
+                    )
+                },
+            )
 
         metadata: dict[str, object] = {
             "session_id": result.session_id,
@@ -427,20 +448,13 @@ class AgentNodeExecutor:
                 error_code = "network_disconnect"
             else:
                 error_code = "agent_failed"
-            if (
-                error_code
-                in {
-                    "provider_timeout",
-                    "rate_limit",
-                    "network_disconnect",
-                }
-                and "provider_attempts" not in metadata
-            ):
+            if provider_attempts is None:
                 # The host loop does not currently expose its exact retry
                 # counter. Charge the full granted retry allowance so the
                 # workflow and provider layers can never multiply attempts.
-                metadata["provider_attempts"] = max(
-                    0, granted_provider_attempts - 1
+                metadata["provider_attempts"] = conservative_provider_retry_count(
+                    result.audit.get("provider_attempts"),
+                    granted_attempts=granted_provider_attempts,
                 )
             return NodeExecutionResult(
                 "failed",

@@ -89,6 +89,16 @@ def validated_provider_retry_count(
     return None
 
 
+def conservative_provider_retry_count(
+    value: object,
+    *,
+    granted_attempts: int,
+) -> int:
+    """Return an exact internal retry count or conservatively charge the grant."""
+    exact = validated_provider_retry_count(value, granted_attempts=granted_attempts)
+    return exact if exact is not None else granted_attempts - 1
+
+
 class BoundedProcessOutput:
     """File-backed subprocess output without inherited-pipe reader threads."""
 
@@ -147,6 +157,7 @@ __all__ = [
     "NodeExecutionContext",
     "NodeExecutionResult",
     "NodeExecutor",
+    "conservative_provider_retry_count",
     "process_tree_active",
     "validated_provider_retry_count",
 ]

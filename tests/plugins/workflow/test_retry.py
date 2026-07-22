@@ -427,3 +427,58 @@ def test_run_combined_retries_cap_explicit_node_retry_attempts(
     assert result["status"] == "failed"
     assert calls == 2
     assert result["nodes"]["work"]["retry_consumed"] == 2
+
+
+def test_exhausted_replay_fails_without_invoking_executor(
+    tmp_path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "exhausted-replay",
+            name="exhausted-replay",
+            nodes=[{
+                "id": "work",
+                "bash": "true",
+                "retry": {"max_attempts": 2, "delay_ms": 1000},
+            }],
+        )
+    )
+    store = RunStore(tmp_path / "exhausted-replay-home")
+    admitted = _start(store, package, key="exhausted-replay")
+
+    class ExhaustsBudget:
+        def execute(self, _context):
+            return NodeExecutionResult(
+                "failed",
+                error_code="provider_timeout",
+                metadata={"provider_attempts": 1},
+            )
+
+    scheduler = RunScheduler(store)
+    scheduler.executors["bash"] = ExhaustsBudget()
+    exhausted = scheduler.advance(admitted.run_id)
+    assert exhausted["status"] == "failed"
+    assert exhausted["nodes"]["work"]["retry_consumed"] == 2
+
+    replayed = store.retry_run(admitted.run_id, node_id="work")
+    assert replayed["nodes"]["work"]["state"] == "ready"
+
+    calls = 0
+    grants = []
+
+    class MustNotRun:
+        def execute(self, context):
+            nonlocal calls
+            calls += 1
+            grants.append(context.max_provider_attempts)
+            return NodeExecutionResult("succeeded")
+
+    scheduler.executors["bash"] = MustNotRun()
+    result = scheduler.advance(admitted.run_id)
+
+    assert result["status"] == "failed"
+    assert result["nodes"]["work"]["state"] == "failed"
+    assert result["last_error"]["code"] == "retry_budget_exhausted"
+    assert result["nodes"]["work"]["retry_consumed"] == 2
+    assert calls == 0
+    assert grants == []
