@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import json
 import time
 
@@ -378,6 +379,75 @@ def test_failed_approval_rework_conservatively_accounts_provider_attempts(
     assert len(runner.requests) == 1
     assert runner.requests[0].max_api_attempts == 2
     assert result["nodes"]["review"]["retry_consumed"] == 2
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (OSError("provider connection failed"), "network_error"),
+        (RuntimeError("approval agent failed"), "agent_execution_failed"),
+    ],
+)
+def test_approval_runner_exception_consumes_grant_without_refresh(
+    tmp_path, workflow_writer, failure, expected_code
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "crashed-rework",
+        name="crashed-rework",
+        nodes=[{
+            "id": "review",
+            "approval": {
+                "message": "Approve?",
+                "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+            },
+            "retry": {"max_attempts": 5, "delay_ms": 1000, "on_error": "all"},
+        }],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "limits: {combined_retries: 2}\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "crashed-rework-home")
+    admitted = _start(store, package, key="crashed-rework")
+
+    class CrashedReworkRunner:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            raise failure
+
+    now = datetime(2026, 7, 21, tzinfo=timezone.utc)
+    runner = CrashedReworkRunner()
+    scheduler = RunScheduler(
+        store,
+        agent_runner=runner,
+        utcnow=lambda: now,
+        jitter=lambda: 0.5,
+    )
+    first_pause = scheduler.advance(admitted.run_id)
+    pending = first_pause["nodes"]["review"]["pending_interaction"]
+    store.reject_run(
+        admitted.run_id,
+        reason="missing evidence",
+        expected_state_version=first_pause["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+
+    failed = scheduler.advance(admitted.run_id)
+    now += timedelta(seconds=1)
+    replay = scheduler.advance(admitted.run_id)
+
+    assert failed["status"] == "failed"
+    assert replay["status"] == "failed"
+    assert [request.max_api_attempts for request in runner.requests] == [2]
+    assert failed["last_error"]["code"] == expected_code
+    assert failed["nodes"]["review"]["retry_consumed"] == 2
+    attempt = failed["nodes"]["review"]["attempts"][-1]
+    assert attempt["error_code"] == expected_code
+    assert attempt["metadata"]["provider_attempts"] == 1
+    assert attempt["metadata"]["retry_consumed"] == 2
 
 
 class ToolApprovalRunner:

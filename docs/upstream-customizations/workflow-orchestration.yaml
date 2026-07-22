@@ -1781,7 +1781,7 @@ upstream_changes:
   - RunStore.claim_node max_run_workers composition
   - exact PluginAgentRunRequest execution-limit mapping
   - AgentNodeExecutor failed provider-attempt accounting
-  - ApprovalExecutor failed provider-attempt accounting
+  - ApprovalExecutor failed and runner-exception provider-attempt accounting
   - conservative_provider_retry_count
   - validated_provider_retry_count
   tests:
@@ -1794,7 +1794,7 @@ upstream_changes:
   - tests/plugins/workflow/test_retry.py
   - tests/plugins/workflow/test_schema.py
   - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
-  expected_commit_subject: 'fix(workflow): close retry accounting gaps'
+  expected_commit_subject: 'fix(workflow): account approval runner crashes'
   upstream_candidate: true
   merge_guidance: Preserve one frozen execution-limit record resolved from the
     immutable run snapshot, with element-wise profile tightening at each claim
@@ -1804,12 +1804,12 @@ upstream_changes:
     node retry policies must remain min-capped by the run allowance. Failed AI
     and approval rework execution must preserve an exact valid provider-attempt
     count or conservatively consume the unknown granted remainder before workflow
-    retry, including retryable agent-runner exceptions; never synthesize that
-    charge for successful, paused, or cancelled results. Each later workflow
-    attempt receives only the effective node/run allowance left after durable
-    prior consumption, and an exhausted replay must fail before executor
-    invocation. Accept reported provider retries only as non-boolean integers in
-    the inclusive zero to grant-minus-one range.
+    retry, including retryable agent-runner exceptions in both normal AI and
+    approval rework; never synthesize that charge for successful, paused, or
+    cancelled results. Each later workflow attempt receives only the effective
+    node/run allowance left after durable prior consumption, and an exhausted
+    replay must fail before executor invocation. Accept reported provider retries
+    only as non-boolean integers in the inclusive zero to grant-minus-one range.
   removal_condition: Remove when upstream enforces equivalent immutable per-run
     concurrency, worker, deadline, retry, resource-tree, and termination-grace
     ceilings without resizing or retiming shared coordinator infrastructure.

@@ -178,7 +178,32 @@ class ApprovalExecutor:
                 else context.termination_policy.kill_grace_seconds
             ),
         )
-        result = self.agent_runner.run(request, is_cancelled=context.is_cancelled)
+        try:
+            result = self.agent_runner.run(request, is_cancelled=context.is_cancelled)
+        except OSError as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="network_error",
+                error_message=str(exc),
+                metadata={
+                    "provider_attempts": conservative_provider_retry_count(
+                        None,
+                        granted_attempts=granted_provider_attempts,
+                    )
+                },
+            )
+        except RuntimeError as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="agent_execution_failed",
+                error_message=str(exc),
+                metadata={
+                    "provider_attempts": conservative_provider_retry_count(
+                        None,
+                        granted_attempts=granted_provider_attempts,
+                    )
+                },
+            )
         if result.status == "paused":
             return NodeExecutionResult(
                 "paused",
