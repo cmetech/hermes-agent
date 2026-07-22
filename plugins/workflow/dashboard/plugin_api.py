@@ -855,30 +855,46 @@ class StartRunRequest(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def validate_value_utf8(cls, data: object) -> object:
+    def normalize_invalid_value_shapes(cls, data: object) -> object:
         if not isinstance(data, dict):
+            return data
+        if "values" not in data:
             return data
         values = data.get("values")
         if not isinstance(values, dict):
-            return data
+            safe_data = dict(data)
+            safe_data["values"] = None
+            return safe_data
 
-        unencodable_names: list[object] = []
+        safe_values: dict[object, object] = {}
+        replaced_value = False
         for name, value in values.items():
-            if not isinstance(value, str):
-                continue
+            if not isinstance(name, str):
+                safe_data = dict(data)
+                safe_data["values"] = None
+                return safe_data
             try:
-                value.encode("utf-8")
+                name.encode("utf-8")
             except UnicodeEncodeError:
-                unencodable_names.append(name)
-        if not unencodable_names:
+                safe_data = dict(data)
+                safe_data["values"] = None
+                return safe_data
+
+            if isinstance(value, str):
+                try:
+                    value.encode("utf-8")
+                except UnicodeEncodeError:
+                    value = None
+            else:
+                value = None
+            safe_values[name] = value
+            replaced_value |= value is None
+        if not replaced_value:
             return data
 
         # FastAPI includes invalid input in ordinary validation details. Feed
-        # Pydantic a safe non-string sentinel so it rejects the same field
-        # without trying to serialize or disclose the unencodable value.
-        safe_values = dict(values)
-        for name in unencodable_names:
-            safe_values[name] = None
+        # Pydantic safe non-string sentinels so it rejects the same field
+        # without serializing or disclosing malformed nested content.
         safe_data = dict(data)
         safe_data["values"] = safe_values
         return safe_data

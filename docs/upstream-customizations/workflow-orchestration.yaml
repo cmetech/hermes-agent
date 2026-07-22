@@ -1217,7 +1217,7 @@ upstream_changes:
   - API_INPUT_AGGREGATE_MAX_BYTES
   - WorkflowInputDeclaration
   - workflow_input_declarations
-  - StartRunRequest.validate_value_utf8
+  - StartRunRequest.normalize_invalid_value_shapes
   - validate_api_value_bounds
   - validate_declared_api_values
   - RunStore.prepare_run_snapshot verified_inputs channel
@@ -1225,16 +1225,17 @@ upstream_changes:
   tests:
   - tests/plugins/workflow/test_desktop_api.py
   - tests/plugins/workflow/test_store.py
-  expected_commit_subject: 'fix(workflow): validate input UTF-8 shape'
+  expected_commit_subject: 'fix(workflow): sanitize invalid input shapes'
   upstream_candidate: true
   merge_guidance: Preserve server-derived declared-input versus legacy-flat
     mode from the authenticated package. Legacy flat values, including subject
     and arguments, retain their portable bounded idempotency contract. Keep
     structural shape, entry-count, type, portable-name, and UTF-8 representability
-    checks in Pydantic without echoing unencodable input, but apply the 64 KiB
-    per-value and 256 KiB aggregate key-plus-value byte caps in the endpoint path
-    before package work so only byte breaches receive workflow_input_too_large.
-    Declared required, undeclared, and authenticated
+    checks in Pydantic without retaining unencodable keys, values, non-mapping
+    containers, or malformed nested values in serialized validation errors, but
+    apply the 64 KiB per-value and 256 KiB aggregate key-plus-value byte caps in
+    the endpoint path before package work so only byte breaches receive
+    workflow_input_too_large. Declared required, undeclared, and authenticated
     showcase-reserved binding or fixture names must fail typed with no staging
     or run residue; reservations never apply to ordinary packages. Enforce each
     declaration's max_bytes for text, local-file, and digest-verified byte

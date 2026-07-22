@@ -1182,8 +1182,19 @@ def test_post_runs_relocates_only_byte_caps_to_typed_endpoint_validation(
     assert at_aggregate_cap.json()["detail"]["code"] == "workflow_not_found"
 
 
-def test_post_runs_rejects_unpaired_surrogate_as_ordinary_schema_error(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "values_json",
+    [
+        b'{"input":"\\ud800"}',
+        b'{"\\ud800":"value"}',
+        b'"\\ud800"',
+        b'["\\ud800"]',
+        b'{"input":{"nested":"\\ud800"}}',
+    ],
+    ids=("scalar", "key", "values-string", "values-list", "nested-value"),
+)
+def test_post_runs_rejects_unpaired_surrogate_shapes_as_ordinary_schema_error(
+    tmp_path, monkeypatch, values_json
 ) -> None:
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     response = TestClient(
@@ -1191,8 +1202,9 @@ def test_post_runs_rejects_unpaired_surrogate_as_ordinary_schema_error(
     ).post(
         "/api/plugins/workflow/runs",
         content=(
-            b'{"workflow":"bounded","values":{"input":"\\ud800"},'
-            b'"idempotency_key":"bounded","concurrency_policy":"queue"}'
+            b'{"workflow":"bounded","values":'
+            + values_json
+            + b',"idempotency_key":"bounded","concurrency_policy":"queue"}'
         ),
         headers={"content-type": "application/json"},
     )
@@ -1201,6 +1213,23 @@ def test_post_runs_rejects_unpaired_surrogate_as_ordinary_schema_error(
     detail = response.json()["detail"]
     assert isinstance(detail, list)
     assert "workflow_input_too_large" not in response.text
+    assert r"\ud800" not in response.text
+
+
+def test_post_runs_preserves_omitted_values_default(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    response = TestClient(_app(_router())).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "default-values",
+            "idempotency_key": "default-values",
+            "concurrency_policy": "queue",
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "workflow_not_found"
 
 
 def test_post_runs_applies_catalog_resource_bounds_before_admission(
