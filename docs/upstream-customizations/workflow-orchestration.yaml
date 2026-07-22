@@ -34,9 +34,10 @@ coverage:
   - commit: 3d6bd7f2cbd320ba14024d799159cbf452815acf
     reason: Separate user-requested v3.0.2 release preparation.
   - commit: bb6201e7872fdef7444495aa2649e06b0b0b277f
-    reason: Task 1.7 SDD scratch artifact hygiene.
+    reason: Mixed Task 1.7 commit force-added ignored SDD scratch; its guide change
+      was re-emitted by 5691622a0a910d830f5cdc5ddb9fea3e0ea19bd7.
   - commit: d3e40b9c7187b57df83886dbcb1fc586a9254ada
-    reason: Task 1.7 SDD scratch artifact cleanup hygiene.
+    reason: Scratch-only Task 1.7 SDD report untracking cleanup.
 upstream_changes:
 - id: brand-aware-version-label
   change_class: branding-generic
