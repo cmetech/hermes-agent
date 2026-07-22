@@ -118,6 +118,30 @@ upstream_changes:
     runner binding, context-derived compatibility projection, raw-only showcase
     cache, and fail-closed capability admission across every execution surface.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-authenticated-showcase-catalog-projection
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/showcase.py
+  owned_symbols:
+  - authenticated showcase projection budget reuse
+  - verified showcase package-digest projection gate
+  - _load_verified_showcase_cache_hit lock scope
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  expected_commit_subject: 'fix(workflow): project authenticated showcase cache'
+  upstream_candidate: true
+  merge_guidance: Preserve authenticated showcase bytes through catalog
+    compatibility and risk projection rather than reopening mutable bundle
+    resources. Require the recomputed risk package digest to match the cached
+    authenticated package digest before emitting verified-bundled provenance,
+    and copy large cached resource maps only after releasing the showcase cache
+    metadata lock.
+  removal_condition: Remove when upstream catalog projection uses one bounded
+    authenticated showcase snapshot through verification, compatibility, risk,
+    and verified provenance with an equivalent digest equality gate.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-per-run-ai-entitlement
   change_class: workflow-security
   owner: workflow-orchestration

@@ -576,6 +576,13 @@ def _catalog_entry(
         execution_context,
         read_budget=resource_budget,
     )
+    if (
+        verified_showcase is not None
+        and risk.package_digest != verified_showcase.package_digest
+    ):
+        raise WorkflowCatalogInvalidDefinitionError(
+            "verified showcase projection does not match authenticated package"
+        )
     shown = qualify_workflow_catalog_package(
         package,
         compatibility=compatibility,
@@ -675,25 +682,27 @@ def build_workflow_catalog(
             "workflow catalog trust classification is unavailable"
         ) from exc
     showcase_items: list[CatalogEntry] = []
-    for verified in verified_showcases.values():
-        projection_budget = WorkflowResourceReadBudget(
-            max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
-            max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
-            max_files=CATALOG_MAX_RESOURCE_FILES,
-        )
-        showcase_items.append(
-            _catalog_entry(
-                verified.package,
-                None,
-                None,
-                projection_budget,
-                verified_showcase=verified,
-                execution_context=background_execution_context(
-                    binding,
-                    requires_ai=verified.scenario.requires_ai,
-                ),
+    try:
+        for verified in verified_showcases.values():
+            showcase_items.append(
+                _catalog_entry(
+                    verified.package,
+                    None,
+                    None,
+                    showcase_budget,
+                    verified_showcase=verified,
+                    execution_context=background_execution_context(
+                        binding,
+                        requires_ai=verified.scenario.requires_ai,
+                    ),
+                )
             )
+    except WorkflowCatalogInvalidDefinitionError as exc:
+        logger.warning(
+            "workflow showcase catalog projection verification failed: %s",
+            type(exc).__name__,
         )
+        showcase_items = []
 
     user_limit = max(0, CATALOG_LIMIT - len(showcase_items))
     if len(discovered) > user_limit:

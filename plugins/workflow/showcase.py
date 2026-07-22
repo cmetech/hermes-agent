@@ -760,6 +760,7 @@ def _load_verified_showcase_cache_hit(
         return None
 
     tree_signature = _bundle_tree_signature(resolved_root, read_budget)
+    cache_hit = False
     with _VERIFIED_SHOWCASE_CACHE_LOCK:
         if (
             generation != _VERIFIED_SHOWCASE_CACHE_GENERATION
@@ -771,10 +772,13 @@ def _load_verified_showcase_cache_hit(
             and cached.root == resolved_root
             and cached.tree_signature == tree_signature
         ):
-            _restore_cached_resources(read_budget, cached)
-            return dict(cached.packages)
-        _VERIFIED_SHOWCASE_CACHE_GENERATION += 1
-        _VERIFIED_SHOWCASE_CACHE.clear()
+            cache_hit = True
+        else:
+            _VERIFIED_SHOWCASE_CACHE_GENERATION += 1
+            _VERIFIED_SHOWCASE_CACHE.clear()
+    if cache_hit:
+        _restore_cached_resources(read_budget, cached)
+        return dict(cached.packages)
     return None
 
 

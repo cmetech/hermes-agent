@@ -256,6 +256,110 @@ def test_workflow_catalog_cached_showcase_verification_preserves_user_budget(
         )
 
 
+def test_workflow_catalog_projects_showcase_from_authenticated_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    import plugins.workflow.catalog_api as catalog_api
+
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(copied),
+    )
+    target = copied / "packages/ai-extensions/commands/inspect-evidence.md"
+    original_loader = showcase_module.load_verified_showcase_packages
+    original_open = Path.open
+    projection_started = False
+    authenticated_digest = ""
+    projected_digests: list[str] = []
+
+    def mutate_after_authentication(*args, **kwargs):
+        nonlocal projection_started, authenticated_digest
+        verified = original_loader(*args, **kwargs)
+        authenticated_digest = verified["ai-extensions"].package_digest
+        target.write_text("mutated after authentication\n", encoding="utf-8")
+        projection_started = True
+        return verified
+
+    def forbid_reopen(self, *args, **kwargs):
+        if projection_started and self == target:
+            pytest.fail("catalog projection reopened authenticated showcase source")
+        return original_open(self, *args, **kwargs)
+
+    original_assess = catalog_api.assess_package_execution
+
+    def capture_assessment(package, context, *, read_budget=None):
+        compatibility, risk = original_assess(
+            package,
+            context,
+            read_budget=read_budget,
+        )
+        if package.source == "showcase" and package.definition.name == "ai-extensions":
+            projected_digests.append(risk.package_digest)
+        return compatibility, risk
+
+    monkeypatch.setattr(
+        showcase_module,
+        "load_verified_showcase_packages",
+        mutate_after_authentication,
+    )
+    monkeypatch.setattr(Path, "open", forbid_reopen)
+    monkeypatch.setattr(catalog_api, "assess_package_execution", capture_assessment)
+
+    items, truncated = catalog_api.build_workflow_catalog(
+        hermes_home=tmp_path / "home",
+        workdir=tmp_path,
+    )
+
+    assert truncated is False
+    assert projected_digests == [authenticated_digest]
+    ai_row = next(item for item in items if item["name"] == "ai-extensions")
+    assert ai_row["trust_state"] == "verified_bundled"
+
+
+def test_workflow_catalog_rejects_verified_provenance_on_digest_mismatch(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    import plugins.workflow.catalog_api as catalog_api
+
+    home = tmp_path / "home"
+    workflow_writer(home / "workflows", name="ordinary-user-workflow")
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    original_assess = catalog_api.assess_package_execution
+
+    def corrupt_showcase_digest(package, context, *, read_budget=None):
+        compatibility, risk = original_assess(
+            package,
+            context,
+            read_budget=read_budget,
+        )
+        if package.source == "showcase":
+            risk = replace(risk, package_digest="0" * 64)
+        return compatibility, risk
+
+    monkeypatch.setattr(
+        catalog_api,
+        "assess_package_execution",
+        corrupt_showcase_digest,
+    )
+
+    items, truncated = catalog_api.build_workflow_catalog(
+        hermes_home=home,
+        workdir=tmp_path,
+    )
+
+    assert truncated is False
+    assert not any(item.get("source") == "showcase" for item in items)
+    assert any(
+        item.get("source") == "profile"
+        and item.get("name") == "ordinary-user-workflow"
+        for item in items
+    )
+
+
 def test_workflow_catalog_missing_bundle_degrades_to_user_rows(
     tmp_path, monkeypatch, workflow_writer, caplog
 ) -> None:
