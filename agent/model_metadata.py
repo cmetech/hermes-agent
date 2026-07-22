@@ -24,6 +24,21 @@ from hermes_constants import OPENROUTER_MODELS_URL
 logger = logging.getLogger(__name__)
 
 
+def is_anthropic_bedrock_model(model_id: str) -> bool:
+    """Return whether a Bedrock model ID selects the Anthropic Claude path.
+
+    This predicate intentionally lives in the side-effect-free metadata module
+    so prospective runtime classification never imports the Bedrock adapter,
+    whose import performs optional dependency installation.
+    """
+    model_lower = model_id.lower()
+    for prefix in ("us.", "global.", "eu.", "ap.", "jp."):
+        if model_lower.startswith(prefix):
+            model_lower = model_lower[len(prefix):]
+            break
+    return model_lower.startswith("anthropic.claude")
+
+
 def _resolve_requests_verify() -> bool | str:
     """Resolve SSL verify setting for `requests` calls from env vars.
 

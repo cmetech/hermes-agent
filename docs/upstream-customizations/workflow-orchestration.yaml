@@ -2079,6 +2079,8 @@ upstream_changes:
   owner: workflow-orchestration
   files:
   - .github/workflows/ci.yml
+  - agent/bedrock_adapter.py
+  - agent/model_metadata.py
   - agent/plugin_agent.py
   - agent/plugin_agent_worker.py
   - hermes_cli/runtime_provider.py
@@ -2089,14 +2091,18 @@ upstream_changes:
   - classify_execution_runtime
   - classify_resolved_execution_runtime
   - _effective_execution_api_mode
+  - is_anthropic_bedrock_model
   - PluginAgentRunner.starts_request_mcp
   - PackageMCPUnavailable
   - _run request MCP lifecycle
   - AgentNodeExecutor package_mcp_unavailable mapping
   - workflow request-MCP release-gate selection
   tests:
+  - tests/agent/test_bedrock_adapter.py
+  - tests/agent/test_model_metadata.py
   - tests/agent/test_plugin_agent.py
   - tests/hermes_cli/test_execution_runtime_capabilities.py
+  - tests/hermes_cli/test_runtime_provider_resolution.py
   - tests/plugins/workflow/test_ai_executor.py
   - tests/plugins/workflow/test_node_mcp.py
   - tests/scripts/test_workflow_merge_gate.py
@@ -2106,6 +2112,10 @@ upstream_changes:
     classifier over configured provider/model/runtime metadata and its shared
     effective-mode derivation with the actual runtime resolver. Resolve and
     independently classify the actual worker runtime before starting any required request MCP.
+    Keep prospective Bedrock model routing in side-effect-free metadata rather
+    than importing the lazy-installing adapter, and treat both Claude Messages
+    and non-Claude Converse paths as Hermes-managed tool loops. Preserve legacy
+    no-config-read resolver short-circuits before loading optional model metadata.
     The isolated worker must own discovery, registration, tool-policy ordering,
     and process reaping from one outer cleanup boundary while restoring loader,
     timeout, callbacks, hooks, inline tools, session state, and registry generation.
