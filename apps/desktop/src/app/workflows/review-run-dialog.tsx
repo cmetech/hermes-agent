@@ -17,6 +17,7 @@ import { ErrorState } from '@/components/ui/error-state'
 import { Input } from '@/components/ui/input'
 import { Loader } from '@/components/ui/loader'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Textarea } from '@/components/ui/textarea'
 import { useI18n } from '@/i18n'
 import { startWorkflowRun, WorkflowApiError } from '@/lib/hermes-api'
 import { Play } from '@/lib/icons'
@@ -147,9 +148,30 @@ function InputField({
   value: FlatInputValue
 }) {
   const { t } = useI18n()
+  const copy = t.operations
   const inputId = useId()
+  const counterId = useId()
   const errorId = useId()
-  const describedBy = error ? errorId : undefined
+  const byteCount = input.type === 'text' ? new TextEncoder().encode(String(value ?? '')).byteLength : 0
+  const byteLimit = input.type === 'text' && typeof input.max_bytes === 'number' ? input.max_bytes : null
+  const overByteLimit = byteLimit !== null && byteCount > byteLimit
+  const fieldError = error ?? (overByteLimit ? copy.workflowRunInputTooLarge(input.name, byteLimit) : undefined)
+
+  const describedBy =
+    [byteLimit !== null ? counterId : null, fieldError ? errorId : null].filter(Boolean).join(' ') || undefined
+
+  if (input.type === 'file') {
+    return (
+      <div aria-labelledby={inputId} className="grid gap-1" role="group">
+        <span className="text-xs font-medium text-(--ui-text-primary)" id={inputId}>
+          {input.name}
+        </span>
+        <p className="rounded-[2.5px] border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) px-2 py-1 text-xs text-(--ui-text-secondary)">
+          {copy.workflowRunBundledFixture}
+        </p>
+      </div>
+    )
+  }
 
   if (input.type === 'boolean' && input.required) {
     return (
@@ -157,16 +179,16 @@ function InputField({
         <label className="flex items-center gap-2 text-xs font-medium text-(--ui-text-primary)" htmlFor={inputId}>
           <Checkbox
             aria-describedby={describedBy}
-            aria-invalid={Boolean(error)}
+            aria-invalid={Boolean(fieldError)}
             checked={Boolean(value)}
             id={inputId}
             onCheckedChange={checked => onChange(checked === true)}
           />
           {input.name}
         </label>
-        {error ? (
+        {fieldError ? (
           <p className="text-xs text-destructive" id={errorId} role="alert">
-            {error}
+            {fieldError}
           </p>
         ) : null}
       </div>
@@ -186,7 +208,7 @@ function InputField({
           >
             <SelectTrigger
               aria-describedby={describedBy}
-              aria-invalid={Boolean(error)}
+              aria-invalid={Boolean(fieldError)}
               aria-label={input.name}
               id={inputId}
               size="sm"
@@ -210,9 +232,9 @@ function InputField({
             </Button>
           ) : null}
         </div>
-        {error ? (
+        {fieldError ? (
           <p className="text-xs text-destructive" id={errorId} role="alert">
-            {error}
+            {fieldError}
           </p>
         ) : null}
       </div>
@@ -234,7 +256,7 @@ function InputField({
           >
             <SelectTrigger
               aria-describedby={describedBy}
-              aria-invalid={Boolean(error)}
+              aria-invalid={Boolean(fieldError)}
               aria-label={input.name}
               id={inputId}
               size="sm"
@@ -261,9 +283,41 @@ function InputField({
             </Button>
           ) : null}
         </div>
-        {error ? (
+        {fieldError ? (
           <p className="text-xs text-destructive" id={errorId} role="alert">
-            {error}
+            {fieldError}
+          </p>
+        ) : null}
+      </div>
+    )
+  }
+
+  if (input.type === 'text') {
+    return (
+      <div className="grid gap-1">
+        <label className="text-xs font-medium text-(--ui-text-primary)" htmlFor={inputId}>
+          {input.name}
+        </label>
+        <Textarea
+          aria-describedby={describedBy}
+          aria-invalid={Boolean(fieldError)}
+          id={inputId}
+          onChange={event => onChange(event.target.value)}
+          size="sm"
+          value={String(value ?? '')}
+        />
+        {byteLimit !== null ? (
+          <p
+            aria-live="polite"
+            className={overByteLimit ? 'text-xs text-destructive' : 'text-xs text-(--ui-text-tertiary)'}
+            id={counterId}
+          >
+            {copy.workflowRunInputBytes(byteCount, byteLimit)}
+          </p>
+        ) : null}
+        {fieldError ? (
+          <p className="text-xs text-destructive" id={errorId} role="alert">
+            {fieldError}
           </p>
         ) : null}
       </div>
@@ -277,16 +331,16 @@ function InputField({
       </label>
       <Input
         aria-describedby={describedBy}
-        aria-invalid={Boolean(error)}
+        aria-invalid={Boolean(fieldError)}
         id={inputId}
         onChange={event => onChange(event.target.value)}
         size="sm"
         type={input.type === 'number' ? 'number' : 'text'}
         value={String(value ?? '')}
       />
-      {error ? (
+      {fieldError ? (
         <p className="text-xs text-destructive" id={errorId} role="alert">
-          {error}
+          {fieldError}
         </p>
       ) : null}
     </div>
@@ -353,7 +407,21 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
 
     if (!admittedRun) {
       for (const input of detail.inputs) {
+        if (input.type === 'file') {
+          continue
+        }
+
         const value = values[input.name]
+
+        if (
+          input.type === 'text' &&
+          typeof input.max_bytes === 'number' &&
+          new TextEncoder().encode(String(value ?? '')).byteLength > input.max_bytes
+        ) {
+          nextFieldErrors[input.name] = copy.workflowRunInputTooLarge(input.name, input.max_bytes)
+
+          continue
+        }
 
         if (!input.required && value === undefined) {
           continue
@@ -472,6 +540,12 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
   const blocked =
     !detail ||
     Boolean(runDisabledReason) ||
+    detail.inputs.some(
+      input =>
+        input.type === 'text' &&
+        typeof input.max_bytes === 'number' &&
+        new TextEncoder().encode(String(values[input.name] ?? '')).byteLength > input.max_bytes
+    ) ||
     detail.inputs.some(input => input.type === 'enum' && enumValues(detail, input.name).length === 0)
 
   const admissionErrorMessages: Partial<Record<AdmissionError['kind'], string>> = {

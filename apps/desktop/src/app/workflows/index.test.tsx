@@ -251,11 +251,15 @@ describe('WorkflowsView', () => {
           trust_state: 'verified_bundled'
         }),
         definition({
+          inputs: [
+            { max_bytes: 4096, name: 'symptom', required: true, type: 'text' },
+            { name: 'evidence', required: true, type: 'file' }
+          ],
           name: 'laptop-diagnostic',
           precedence: 3,
-          run_support: { reason: 'unsupported_inputs', supported: false },
+          run_support: { reason: 'supported', supported: true },
           source: 'showcase',
-          supported_inputs: { reason: 'unsupported_input_shape', supported: false },
+          supported_inputs: { reason: 'flat_inputs', supported: true },
           trust_state: 'verified_bundled'
         }),
         definition({
@@ -280,23 +284,26 @@ describe('WorkflowsView', () => {
 
     await renderView(client, 'workflows')
 
-    const rows = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row').slice(1)
+    const rows = within(await screen.findByRole('table', { name: 'Workflow catalog' }))
+      .getAllByRole('row')
+      .slice(1)
+
     expect(rows).toHaveLength(5)
     expect(rows[0]?.textContent).toContain('Project')
     expect(rows[1]?.textContent).toContain('Bundled showcase')
     expect(rows[1]?.textContent).toContain('verified bundle')
     expect((within(rows[1]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
+    expect(rows[2]?.textContent).toContain('2 inputs')
+    expect((within(rows[2]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
     expect(rows[3]?.textContent).toContain('Incompatible')
 
-    for (const [index, row] of rows.slice(2).entries()) {
+    for (const row of rows.slice(3)) {
       expect(row.textContent).toContain('Bundled showcase')
       expect(row.textContent).toContain('verified bundle')
       const runButton = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
       expect(runButton.disabled).toBe(true)
       expect(document.getElementById(runButton.getAttribute('aria-describedby')!)?.textContent).toBe(
-        index === 0
-          ? 'Run is unavailable because this workflow uses unsupported input fields.'
-          : 'Run this bundled showcase from the CLI.'
+        'Run this bundled showcase from the CLI.'
       )
       expect((within(row).getByRole('button', { name: 'View' }) as HTMLButtonElement).disabled).toBe(false)
     }
@@ -387,7 +394,10 @@ describe('WorkflowsView', () => {
 
     await renderView(client, 'workflows')
 
-    const rows = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row').slice(1)
+    const rows = within(await screen.findByRole('table', { name: 'Workflow catalog' }))
+      .getAllByRole('row')
+      .slice(1)
+
     const unsupportedRun = within(rows[0]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement
     const incompatibleRun = within(rows[1]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement
 

@@ -1330,6 +1330,49 @@ upstream_changes:
     showcase binding, read-once fixture staging, run-support, isolation, and
     installed-distribution guarantees.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-declared-text-and-fixture-inputs
+  change_class: desktop-workflow-ui
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/runtime.test.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/types/hermes.ts
+  owned_symbols:
+  - WorkflowDefinitionInput.max_bytes
+  - ReviewRunDialog declared text UTF-8 byte-bound validation
+  - ReviewRunDialog authenticated bundled fixture row
+  - public-only workflow admission value serialization
+  - operations.workflowRunInputBytes translations
+  - operations.workflowRunInputTooLarge translations
+  - operations.workflowRunBundledFixture translations
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/i18n/runtime.test.ts
+  expected_commit_subject: 'feat(desktop): render declared workflow inputs'
+  upstream_candidate: true
+  merge_guidance: Preserve UTF-8 byte counting against the server-projected
+    effective max_bytes in both visible Run disablement and submit-time
+    validation; exact-bound text remains admissible and over-bound text never
+    reaches the API. Keep authenticated file fixtures read-only and identified
+    only by their projected public field plus localized bundled-fixture copy;
+    never add an upload/path control or include file fields, authenticated
+    internal bindings, or fixture targets in caller values. Retain all existing
+    scalar controls and the authoritative support, compatibility, trust, and
+    coordinator Run-disable precedence across catalog and View handoff paths.
+  removal_condition: Remove when upstream Desktop provides equivalent declared
+    text and authenticated bundled-fixture rendering with UTF-8 limits,
+    public-only admission values, and the same four-locale coverage.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-catalog-desktop-trigger-verification
   change_class: workflow-verification
   owner: workflow-orchestration

@@ -1437,6 +1437,9 @@ export interface Translations {
     workflowRunTrust: string
     workflowRunRisk: string
     workflowRunInputs: string
+    workflowRunInputBytes: (used: number, limit: number) => string
+    workflowRunInputTooLarge: (input: string, limit: number) => string
+    workflowRunBundledFixture: string
     workflowRunStart: string
     workflowRunRetry: string
     workflowRunStarted: string

@@ -305,6 +305,67 @@ describe('Review & Run workflow dialog', () => {
     })
   })
 
+  it('renders declared text and bundled fixture inputs and sends only the public text value', async () => {
+    catalogDefinition = definition({
+      inputs: [
+        { max_bytes: 5, name: 'symptom', required: true, type: 'text' },
+        { name: 'evidence', required: true, type: 'file' }
+      ],
+      source: 'showcase',
+      supported_inputs: { reason: 'flat_inputs', supported: true },
+      trust_state: 'verified_bundled'
+    })
+    preflightHandler = async () => ({ ok: true, value: detail({ ...catalogDefinition }) })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    const symptom = within(dialog).getByRole('textbox', { name: 'symptom' })
+    const fixture = within(dialog).getByRole('group', { name: 'evidence' })
+
+    expect(symptom.tagName).toBe('TEXTAREA')
+    expect(within(dialog).getByText('0 / 5 bytes')).toBeTruthy()
+    expect(within(fixture).getByText('Bundled fixture')).toBeTruthy()
+    expect(fixture.querySelector('input, textarea, button, [contenteditable="true"]')).toBeNull()
+
+    fireEvent.change(symptom, { target: { value: 'ééa' } })
+    expect(within(dialog).getByText('5 / 5 bytes')).toBeTruthy()
+    const submit = within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement
+    expect(submit.disabled).toBe(false)
+    fireEvent.click(submit)
+
+    await waitFor(() => expect($workflowSelectedRunId.get()).toBe('run-created'))
+    const request = apiStructured.mock.calls.find(([candidate]) => candidate.path === '/api/plugins/workflow/runs')?.[0]
+    expect(request?.body?.values).toEqual({ symptom: 'ééa' })
+    expect(request?.body?.values).not.toHaveProperty('arguments')
+    expect(request?.body?.values).not.toHaveProperty('evidence')
+  })
+
+  it('counts declared text as UTF-8 bytes and blocks a one-byte-over value without a POST', async () => {
+    catalogDefinition = definition({
+      inputs: [{ max_bytes: 5, name: 'symptom', required: true, type: 'text' }],
+      source: 'showcase',
+      supported_inputs: { reason: 'flat_inputs', supported: true },
+      trust_state: 'verified_bundled'
+    })
+    preflightHandler = async () => ({ ok: true, value: detail({ ...catalogDefinition }) })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    const symptom = within(dialog).getByRole('textbox', { name: 'symptom' })
+    fireEvent.change(symptom, { target: { value: 'ééab' } })
+
+    expect(within(dialog).getByText('6 / 5 bytes')).toBeTruthy()
+    expect(within(dialog).getByText('symptom exceeds the 5-byte limit.')).toBeTruthy()
+    const submit = within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement
+    expect(submit.disabled).toBe(true)
+    fireEvent.click(submit)
+    submit.removeAttribute('disabled')
+    fireEvent.click(submit)
+    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
+      0
+    )
+  })
+
   it('omits every untouched optional flat input from the admission body', async () => {
     catalogDefinition = definition({
       inputs: [
@@ -640,9 +701,7 @@ describe('Review & Run workflow dialog', () => {
 
     const dialog = await openReviewDialog()
     expect(
-      within(dialog).getByText(
-        'Run is unavailable because this workflow uses unsupported input fields.'
-      )
+      within(dialog).getByText('Run is unavailable because this workflow uses unsupported input fields.')
     ).toBeTruthy()
     expect(within(dialog).getByText("The background coordinator isn't running — try again shortly.")).toBeTruthy()
     expect(within(dialog).queryByRole('combobox', { name: 'mode' })).toBeNull()

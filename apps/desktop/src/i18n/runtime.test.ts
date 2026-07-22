@@ -36,6 +36,35 @@ describe('desktop i18n runtime translator', () => {
     expect(translateNow('cron.promptPlaceholder')).toBe('代理每次執行時應做什麼？')
   })
 
+  it('keeps workflow text bounds and bundled fixture copy localized in all four locales', () => {
+    for (const locale of ['en', 'ja', 'zh', 'zh-hant'] as const) {
+      const operations = TRANSLATIONS[locale].operations as Record<string, unknown>
+      expect(operations.workflowRunInputBytes).toBeTypeOf('function')
+      expect(operations.workflowRunBundledFixture).toBeTypeOf('string')
+      expect(operations.workflowRunInputTooLarge).toBeTypeOf('function')
+    }
+
+    expect(TRANSLATIONS.en.operations.workflowRunInputBytes(3, 5)).toBe('3 / 5 bytes')
+    expect(TRANSLATIONS.en.operations.workflowRunBundledFixture).toBe('Bundled fixture')
+    expect(TRANSLATIONS.en.operations.workflowRunInputTooLarge('symptom', 5)).toBe('symptom exceeds the 5-byte limit.')
+
+    expect(TRANSLATIONS.ja.operations.workflowRunInputBytes(3, 5)).toBe('3 / 5 バイト')
+    expect(TRANSLATIONS.ja.operations.workflowRunBundledFixture).toBe('同梱フィクスチャ')
+    expect(TRANSLATIONS.ja.operations.workflowRunInputTooLarge('symptom', 5)).toBe(
+      'symptom は 5 バイト以内にしてください。'
+    )
+
+    expect(TRANSLATIONS.zh.operations.workflowRunInputBytes(3, 5)).toBe('3 / 5 字节')
+    expect(TRANSLATIONS.zh.operations.workflowRunBundledFixture).toBe('内置测试文件')
+    expect(TRANSLATIONS.zh.operations.workflowRunInputTooLarge('symptom', 5)).toBe('symptom 不能超过 5 字节。')
+
+    expect(TRANSLATIONS['zh-hant'].operations.workflowRunInputBytes(3, 5)).toBe('3 / 5 位元組')
+    expect(TRANSLATIONS['zh-hant'].operations.workflowRunBundledFixture).toBe('內建測試檔案')
+    expect(TRANSLATIONS['zh-hant'].operations.workflowRunInputTooLarge('symptom', 5)).toBe(
+      'symptom 不能超過 5 位元組。'
+    )
+  })
+
   it('translates settings copy for newly supported locales', () => {
     setRuntimeI18nLocale('ja')
     expect(translateNow('settings.appearance.title')).toBe('外観')
