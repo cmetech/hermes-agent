@@ -2361,6 +2361,7 @@ upstream_changes:
   - reserved scheduled migration composition
   - incomplete reserved namespace carry-through
   - namespace migration run-before-SQL lock order
+  - deterministic namespace lock-order probe
   tests:
   - tests/plugins/workflow/test_installed_distribution_e2e.py
   - tests/plugins/workflow/test_schedule_store_identity.py
@@ -2386,7 +2387,8 @@ upstream_changes:
     SQLite write transaction, then revalidate the exact source rows, store
     generation, and evidence digests before rebuilding. Retry bounded source
     drift and never acquire or reacquire a run lock while holding SQLite write
-    authority.
+    authority. Keep the lock-order regression deterministic by completing its
+    independent SQLite probe before releasing the simulated live writer.
     Detect projection/index disagreement, repair only from corroborated evidence,
     and leave the run queued and the store fail-closed for operator repair.
     Unscheduled run projections and start digests must remain byte-identical.

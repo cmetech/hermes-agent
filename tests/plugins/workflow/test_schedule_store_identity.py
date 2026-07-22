@@ -528,17 +528,20 @@ def test_namespace_migration_obeys_run_then_sqlite_lock_order_and_uses_fresh_evi
             threading.get_ident() == migration_thread.get("ident")
             and Path(path).resolve() == target_lock
         ):
-            migration_waiting_for_run.set()
             probe = sqlite3.connect(store.database, timeout=0, isolation_level=None)
+            lock_order_error = None
             try:
                 probe.execute("BEGIN IMMEDIATE")
                 probe.rollback()
             except sqlite3.OperationalError as exc:
-                raise AssertionError(
-                    "namespace migration acquired SQLite before the run lock"
-                ) from exc
+                lock_order_error = exc
             finally:
                 probe.close()
+            migration_waiting_for_run.set()
+            if lock_order_error is not None:
+                raise AssertionError(
+                    "namespace migration acquired SQLite before the run lock"
+                ) from lock_order_error
             timeout_seconds = min(timeout_seconds, 0.25)
         with original_workflow_lock(path, timeout_seconds=timeout_seconds):
             yield
