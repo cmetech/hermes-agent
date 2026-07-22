@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
-import re
 import shutil
 import sqlite3
 from typing import Literal, Mapping
@@ -27,6 +26,11 @@ from plugins.workflow.runner_binding import (
     assess_package_execution,
     background_execution_context,
     production_workflow_runner_binding,
+)
+from plugins.workflow.schedule_time import (
+    ScheduleInstantError,
+    normalize_rfc3339_instant,
+    rfc3339_instant_is_after,
 )
 from plugins.workflow.store import InputSnapshotError, RunStore
 from plugins.workflow.trust import (
@@ -66,12 +70,6 @@ class ApiAdmissionError(RuntimeError):
         self.retryable = retryable
 
 
-_RFC3339_INSTANT = re.compile(
-    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}"
-    r"(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
-)
-
-
 def normalize_api_schedule_at(
     value: object | None,
     *,
@@ -80,29 +78,20 @@ def normalize_api_schedule_at(
     """Validate one future RFC 3339 instant and return canonical UTC-Z text."""
     if value is None:
         return None
-    if (
-        not isinstance(value, str)
-        or not value
-        or value.endswith("-00:00")
-        or _RFC3339_INSTANT.fullmatch(value) is None
-    ):
-        raise ApiAdmissionError("workflow_schedule_invalid", status_code=422)
     try:
-        parsed = datetime.fromisoformat(
-            value[:-1] + "+00:00" if value[-1] in {"Z", "z"} else value
-        )
-    except (OverflowError, ValueError) as exc:
+        canonical = normalize_rfc3339_instant(value)
+    except ScheduleInstantError as exc:
         raise ApiAdmissionError("workflow_schedule_invalid", status_code=422) from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ApiAdmissionError("workflow_schedule_invalid", status_code=422)
     observed = now_utc or datetime.now(timezone.utc)
     if observed.tzinfo is None or observed.utcoffset() is None:
         raise ValueError("now_utc must be timezone-aware")
-    canonical_instant = parsed.astimezone(timezone.utc)
-    if canonical_instant <= observed.astimezone(timezone.utc):
+    try:
+        is_future = rfc3339_instant_is_after(canonical, observed)
+    except ScheduleInstantError as exc:
+        raise ApiAdmissionError("workflow_schedule_invalid", status_code=422) from exc
+    if not is_future:
         raise ApiAdmissionError("workflow_schedule_invalid", status_code=422)
-    timespec = "microseconds" if canonical_instant.microsecond else "seconds"
-    return canonical_instant.isoformat(timespec=timespec).removesuffix("+00:00") + "Z"
+    return canonical
 
 
 def validate_api_value_bounds(values: Mapping[str, str]) -> dict[str, str]:

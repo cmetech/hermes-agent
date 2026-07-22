@@ -1417,13 +1417,13 @@ def mutate_run(
                 status_code=409,
                 detail={
                     "code": "invalid_transition",
-                    "current": sanitize_projection(current),
+                    "current": public_run_projection(current),
                 },
             )
         if int(current["state_version"]) != request.expected_version:
             raise HTTPException(
                 status_code=409,
-                detail={"code": "stale_state", "current": sanitize_projection(current)},
+                detail={"code": "stale_state", "current": public_run_projection(current)},
             )
         try:
             if action == "approve":
@@ -1518,7 +1518,7 @@ def mutate_run(
                 status_code=409,
                 detail={
                     "code": "stale_state",
-                    "current": sanitize_projection(
+                    "current": public_run_projection(
                         _load_authorized(store, run_id, operator)
                     ),
                 },
@@ -1527,4 +1527,4 @@ def mutate_run(
             raise HTTPException(
                 status_code=409, detail={"code": "invalid_transition"}
             ) from exc
-        return sanitize_projection(_load_authorized(store, run_id, operator))
+        return public_run_projection(_load_authorized(store, run_id, operator))

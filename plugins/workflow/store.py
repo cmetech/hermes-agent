@@ -50,6 +50,10 @@ from plugins.workflow.provenance import (
     TriggerProvenance,
     legacy_projection_provenance,
 )
+from plugins.workflow.schedule_time import (
+    ScheduleInstantError,
+    normalize_rfc3339_instant,
+)
 from plugins.workflow.sanitize import (
     sanitize_projection,
     workflow_filename_components_are_distinct,
@@ -1538,16 +1542,11 @@ class RunStore:
             raise JournalRecoveryError("run projection schedule is malformed")
         else:
             try:
-                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            except ValueError as exc:
+                canonical = normalize_rfc3339_instant(value)
+            except ScheduleInstantError as exc:
                 raise JournalRecoveryError(
                     "run projection schedule is malformed"
                 ) from exc
-            if parsed.tzinfo is None or parsed.utcoffset() is None:
-                raise JournalRecoveryError("run projection schedule is malformed")
-            canonical = parsed.astimezone(timezone.utc).isoformat().replace(
-                "+00:00", "Z"
-            )
             if value != canonical:
                 raise JournalRecoveryError("run projection schedule is not canonical")
             derived = canonical

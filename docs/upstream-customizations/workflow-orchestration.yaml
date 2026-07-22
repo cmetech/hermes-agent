@@ -2402,6 +2402,7 @@ upstream_changes:
   files:
   - plugins/workflow/api_admission.py
   - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/schedule_time.py
   - plugins/workflow/sanitize.py
   - plugins/workflow/store.py
   - tests/plugins/workflow/test_desktop_api.py
@@ -2409,9 +2410,12 @@ upstream_changes:
   owned_symbols:
   - StartRunRequest.schedule_at
   - normalize_api_schedule_at
+  - normalize_rfc3339_instant
+  - rfc3339_instant_is_after
   - scheduled API identity metadata
   - scheduled queued admission
   - public_run_projection schedule redaction
+  - scheduled mutation public projections
   - scheduled request/projection digest parity
   tests:
   - tests/plugins/workflow/test_desktop_api.py
@@ -2421,15 +2425,18 @@ upstream_changes:
   merge_guidance: >-
     Preserve endpoint-owned typed schedule validation before store or package
     access, including malformed JSON types, strict timezone awareness, explicit
-    rejection of the RFC 3339 unknown offset, canonical UTC-Z normalization,
-    and a test-injected current instant. Keep schedule-only metadata limited to
+    rejection of the RFC 3339 unknown offset, overflow-safe canonical UTC-Z
+    normalization, exact preservation of arbitrary accepted fractional precision,
+    trailing-zero equivalence, and a test-injected current instant. Keep
+    schedule-only metadata limited to
     canonical schedule_at plus server-derived catalog_source and risk_digest;
     existing top-level definition, policy, and input digests remain authoritative.
     Future runs must publish queued in background without node execution. Equivalent
     offset forms must join one idempotent identity, distinct instants must conflict,
     and journal recovery must reproduce the request digest. Keep unscheduled
-    metadata and golden digests byte-identical. Public run list/detail projections
-    must hide all durable run metadata and expose only canonical schedule_at plus
+    metadata and golden digests byte-identical. Public run list/detail and every
+    mutation success or current-state error projection must hide all durable run
+    metadata and expose only canonical schedule_at plus
     presentation_state=scheduled_wait while the run remains queued.
   removal_condition: Remove when upstream carries an equivalent typed scheduled
     Desktop admission boundary, schedule-only durable identity, queued publication,

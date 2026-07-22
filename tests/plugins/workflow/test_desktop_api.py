@@ -4,7 +4,7 @@ import importlib.util
 import asyncio
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
 import logging
@@ -355,7 +355,14 @@ def test_post_runs_authenticated_session_middleware_records_desktop_source(
         ("2099-01-02T04:04:05+01:00", "2099-01-02T03:04:05Z"),
         ("2099-01-01T22:34:05-04:30", "2099-01-02T03:04:05Z"),
         ("2099-01-02T04:04:05.125000+01:00", "2099-01-02T03:04:05.125000Z"),
-        ("2099-01-02T04:04:05.123456789+01:00", "2099-01-02T03:04:05.123456Z"),
+        (
+            "2099-01-02T04:04:05.123456789+01:00",
+            "2099-01-02T03:04:05.123456789Z",
+        ),
+        (
+            "2099-01-02T04:04:05.1234561000+01:00",
+            "2099-01-02T03:04:05.1234561Z",
+        ),
     ],
 )
 def test_schedule_at_parser_normalizes_aware_rfc3339_to_canonical_utc_z(
@@ -369,6 +376,36 @@ def test_schedule_at_parser_normalizes_aware_rfc3339_to_canonical_utc_z(
     )
 
 
+def test_schedule_at_parser_preserves_distinct_submicrosecond_instants() -> None:
+    first = api_admission_module.normalize_api_schedule_at(
+        "2099-01-02T03:04:05.1234561Z", now_utc=SCHEDULE_NOW
+    )
+    second = api_admission_module.normalize_api_schedule_at(
+        "2099-01-02T03:04:05.1234569Z", now_utc=SCHEDULE_NOW
+    )
+
+    assert first == "2099-01-02T03:04:05.1234561Z"
+    assert second == "2099-01-02T03:04:05.1234569Z"
+    assert first != second
+
+
+def test_schedule_at_parser_translates_unrepresentable_observed_offset() -> None:
+    unrepresentable_now = datetime(
+        1,
+        1,
+        1,
+        tzinfo=timezone(timedelta(hours=23, minutes=59)),
+    )
+
+    with pytest.raises(ApiAdmissionError) as error:
+        api_admission_module.normalize_api_schedule_at(
+            SCHEDULE_AT, now_utc=unrepresentable_now
+        )
+
+    assert error.value.code == "workflow_schedule_invalid"
+    assert error.value.status_code == 422
+
+
 @pytest.mark.parametrize(
     "schedule_at",
     [
@@ -378,6 +415,8 @@ def test_schedule_at_parser_normalizes_aware_rfc3339_to_canonical_utc_z(
         "2099-01-02T03:04:05-00:00",
         "2098-12-30T23:59:59Z",
         "2098-12-31T00:00:00Z",
+        "0001-01-01T00:00:00+23:59",
+        "9999-12-31T23:59:59-23:59",
         17,
         {"instant": "2099-01-02T03:04:05Z"},
         ["2099-01-02T03:04:05Z"],
@@ -644,16 +683,20 @@ def test_schedule_identity_joins_equivalent_offsets_conflicts_on_change_and_reco
         "concurrency_policy": "allow",
     }
 
+    exact_schedule = "2099-01-02T03:04:05.1234561Z"
     created = client.post(
-        "/api/plugins/workflow/runs", json={**base, "schedule_at": SCHEDULE_AT}
+        "/api/plugins/workflow/runs", json={**base, "schedule_at": exact_schedule}
     )
     existing = client.post(
         "/api/plugins/workflow/runs",
-        json={**base, "schedule_at": "2099-01-02T04:04:05+01:00"},
+        json={
+            **base,
+            "schedule_at": "2099-01-02T04:04:05.1234561000+01:00",
+        },
     )
     conflict = client.post(
         "/api/plugins/workflow/runs",
-        json={**base, "schedule_at": "2099-01-02T03:04:06Z"},
+        json={**base, "schedule_at": "2099-01-02T03:04:05.1234569Z"},
     )
 
     assert created.status_code == existing.status_code == 202
@@ -666,9 +709,12 @@ def test_schedule_identity_joins_equivalent_offsets_conflicts_on_change_and_reco
     (directory / "run.json").unlink()
     recovered = store.load_run(run_id)
     with store._connect() as connection:
-        stored_digest = connection.execute(
-            "SELECT start_digest FROM runs WHERE run_id=?", (run_id,)
-        ).fetchone()[0]
+        row = connection.execute(
+            "SELECT start_digest, scheduled_at FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+    stored_digest = row["start_digest"]
+    assert row["scheduled_at"] == exact_schedule
+    assert recovered["run_metadata"]["schedule_at"] == exact_schedule
     assert captured_requests[0].run_metadata == captured_requests[1].run_metadata
     assert captured_requests[0].run_metadata != captured_requests[-1].run_metadata
     assert original_start_digest(captured_requests[0]) == stored_digest
@@ -747,6 +793,108 @@ def test_run_list_and_detail_expose_only_public_schedule_projection(
     ).content
     assert all(value.encode() not in canary_detail for value in canaries.values())
     assert b"run_metadata" not in canary_detail
+
+
+def _scheduled_mutation_canaries() -> dict[str, str]:
+    return {
+        "catalog_source": "CATALOG-CANARY",
+        "risk_digest": "RISK-CANARY",
+        "bundle_digest": "BUNDLE-CANARY",
+        "entitlement_digest": "ENTITLEMENT-CANARY",
+        "local_path": "/private/operator/PATH-CANARY.txt",
+        "api_token": "TOKEN-CANARY",
+        "caller_metadata": "CALLER-CANARY",
+    }
+
+
+def _start_scheduled_mutation_run(store, package, *, key: str):
+    snapshot = store.prepare_run_snapshot(package)
+    result = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=snapshot.definition_digest,
+            policy_digest=snapshot.policy_digest,
+            input_manifest_digest=snapshot.input_manifest_digest,
+            trigger_source="desktop",
+            idempotency_key=key,
+            concurrency_key=package.definition.name,
+            concurrency_policy="allow",
+            execution_mode="background",
+            run_metadata={"schedule_at": SCHEDULE_AT, **_scheduled_mutation_canaries()},
+        ),
+        immutable_snapshot=snapshot,
+    )
+    assert result.run_id is not None
+    return result.run_id
+
+
+def _assert_public_scheduled_mutation_projection(
+    projection: dict[str, object], *, waiting: bool
+) -> None:
+    assert projection["schedule_at"] == SCHEDULE_AT
+    if waiting:
+        assert projection["presentation_state"] == "scheduled_wait"
+    else:
+        assert "presentation_state" not in projection
+    assert "run_metadata" not in projection
+    encoded = json.dumps(projection, sort_keys=True)
+    assert all(value not in encoded for value in _scheduled_mutation_canaries().values())
+
+
+def test_scheduled_mutation_success_uses_public_run_projection(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="scheduled-mutation-success")
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    run_id = _start_scheduled_mutation_run(store, package, key="success")
+    current = store.get_run_status(run_id)
+
+    response = TestClient(_app(_router())).post(
+        f"/api/plugins/workflow/runs/{run_id}/cancel",
+        json={"expected_version": current["state_version"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    _assert_public_scheduled_mutation_projection(response.json(), waiting=False)
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_version", "code"),
+    [
+        ("cancel", -1, "stale_state"),
+        ("archive", None, "invalid_transition"),
+    ],
+)
+def test_scheduled_mutation_errors_use_public_current_projection(
+    tmp_path, monkeypatch, workflow_writer, action, expected_version, code
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name=f"scheduled-{code}")
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    run_id = _start_scheduled_mutation_run(store, package, key=code)
+    current = store.get_run_status(run_id)
+    if expected_version is None:
+        expected_version = current["state_version"]
+
+    response = TestClient(_app(_router())).post(
+        f"/api/plugins/workflow/runs/{run_id}/{action}",
+        json={"expected_version": expected_version},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == code
+    projection = response.json()["detail"]["current"]
+    _assert_public_scheduled_mutation_projection(projection, waiting=True)
 
 
 def test_post_runs_translates_authenticated_laptop_inputs_and_stages_fixture(

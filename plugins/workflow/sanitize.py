@@ -6,6 +6,11 @@ import re
 from pathlib import PurePath
 from typing import Mapping
 
+from plugins.workflow.schedule_time import (
+    ScheduleInstantError,
+    normalize_rfc3339_instant,
+)
+
 
 _SECRET_KEY = re.compile(
     r"(?i)(secret|password|token|authorization|api[_-]?key|credential|reasoning|prompt|return[_-]?route)"
@@ -20,11 +25,6 @@ _PORTABLE_COMPONENT_MAX_UNITS = 255
 _TEXT_INPUT_SUFFIX = ".txt"
 _PROJECTION_MAX_CHARS = 16_384
 _TRUNCATION_SUFFIX = "…[TRUNCATED]"
-_CANONICAL_SCHEDULE_AT = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{6})?Z$"
-)
-
-
 def workflow_input_name_is_portable(name: object, *, max_length: int = 128) -> bool:
     """Return whether a name is one portable filename segment on every host OS."""
     if not isinstance(name, str):
@@ -142,12 +142,13 @@ def public_run_projection(value: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(metadata, Mapping):
         return projected
     schedule_at = metadata.get("schedule_at")
-    if (
-        not isinstance(schedule_at, str)
-        or _CANONICAL_SCHEDULE_AT.fullmatch(schedule_at) is None
-    ):
+    try:
+        canonical_schedule_at = normalize_rfc3339_instant(schedule_at)
+    except ScheduleInstantError:
         return projected
-    projected["schedule_at"] = schedule_at
+    if schedule_at != canonical_schedule_at:
+        return projected
+    projected["schedule_at"] = canonical_schedule_at
     if value.get("status") == "queued":
         projected["presentation_state"] = "scheduled_wait"
     return projected

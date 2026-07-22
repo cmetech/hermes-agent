@@ -26,7 +26,13 @@ def _scheduled_snapshot(store: RunStore, workflow_writer, tmp_path: Path, *, nam
     return store.prepare_run_snapshot(package)
 
 
-def _scheduled_request(snapshot, *, name: str, key: str = "scheduled"):
+def _scheduled_request(
+    snapshot,
+    *,
+    name: str,
+    key: str = "scheduled",
+    schedule_at: str = SCHEDULE_AT,
+):
     return RunAdmissionRequest(
         workflow_name=name,
         definition_digest=snapshot.definition_digest,
@@ -35,7 +41,7 @@ def _scheduled_request(snapshot, *, name: str, key: str = "scheduled"):
         trigger_source="cli",
         idempotency_key=key,
         concurrency_key=name,
-        run_metadata={"schedule_at": SCHEDULE_AT},
+        run_metadata={"schedule_at": schedule_at},
     )
 
 
@@ -121,6 +127,32 @@ def test_fresh_scheduled_publication_derives_query_column_and_uses_partial_index
             (SCHEDULE_AT,),
         ).fetchall()
     assert any("runs_scheduled_queue" in str(row["detail"]) for row in plan)
+
+
+def test_submicrosecond_schedule_survives_index_and_journal_recovery(
+    tmp_path: Path, workflow_writer
+) -> None:
+    exact_schedule = "2099-01-02T03:04:05.1234561Z"
+    store = RunStore(tmp_path / "home", max_executing_runs=0)
+    snapshot = _scheduled_snapshot(
+        store, workflow_writer, tmp_path, name="scheduled-submicrosecond"
+    )
+    admitted = store.start_run(
+        _scheduled_request(
+            snapshot,
+            name="scheduled-submicrosecond",
+            schedule_at=exact_schedule,
+        ),
+        immutable_snapshot=snapshot,
+    )
+    assert admitted.run_id is not None
+    directory = store.run_directory(admitted.run_id)
+    (directory / "run.json").unlink()
+
+    recovered = store.load_run(admitted.run_id)
+
+    assert recovered["run_metadata"]["schedule_at"] == exact_schedule
+    assert _indexed_run(store, admitted.run_id)["scheduled_at"] == exact_schedule
 
 
 def test_reserved_scheduled_publication_recovers_from_projection(
