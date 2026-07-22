@@ -861,7 +861,6 @@ class StartRunRequest(BaseModel):
             raise ValueError("idempotency_key must not be blank")
         if len(self.values) > 64:
             raise ValueError("values contains too many entries")
-        total = 0
         from plugins.workflow.catalog_api import (
             desktop_input_name_is_representable,
         )
@@ -870,15 +869,9 @@ class StartRunRequest(BaseModel):
         if not workflow_input_names_are_portable(self.values):
             raise ValueError("value names must be portable and distinct")
 
-        for key, value in self.values.items():
+        for key in self.values:
             if not desktop_input_name_is_representable(key):
                 raise ValueError("value names must be bounded non-empty text")
-            encoded = value.encode("utf-8")
-            if len(encoded) > 64 * 1024:
-                raise ValueError("value exceeds the API input limit")
-            total += len(key.encode("utf-8")) + len(encoded)
-        if total > 256 * 1024:
-            raise ValueError("values exceed the aggregate API input limit")
         return self
 
 
@@ -894,6 +887,7 @@ def post_runs(
         ApiAdmissionAuthority,
         ApiAdmissionError,
         start_api_run,
+        validate_api_value_bounds,
     )
 
     authority = ApiAdmissionAuthority(
@@ -906,6 +900,7 @@ def post_runs(
         return_route=operator.return_route,
     )
     try:
+        values = validate_api_value_bounds(request.values)
         with _store_lease() as store:
             result = start_api_run(
                 store,
@@ -914,7 +909,7 @@ def post_runs(
                 user_home=Path.home(),
                 workflow_name=request.workflow,
                 catalog_source=request.catalog_source,
-                values=request.values,
+                values=values,
                 idempotency_key=request.idempotency_key,
                 concurrency_policy=request.concurrency_policy,
                 authority=authority,

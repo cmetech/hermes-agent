@@ -1202,6 +1202,46 @@ upstream_changes:
   removal_condition: Remove when upstream provides equivalent real-middleware
     coverage for the complete Desktop workflow catalog-to-board contract.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-declared-input-contract
+  change_class: workflow-rest-adapter
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/input_contract.py
+  - plugins/workflow/store.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_store.py
+  owned_symbols:
+  - API_INPUT_VALUE_MAX_BYTES
+  - API_INPUT_AGGREGATE_MAX_BYTES
+  - WorkflowInputDeclaration
+  - workflow_input_declarations
+  - validate_api_value_bounds
+  - validate_declared_api_values
+  - RunStore.prepare_run_snapshot verified_inputs channel
+  - InputSnapshotError.code
+  tests:
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_store.py
+  expected_commit_subject: 'feat(workflow): enforce declared input bounds'
+  upstream_candidate: true
+  merge_guidance: Preserve server-derived declared-input versus legacy-flat
+    mode from the authenticated package. Legacy flat values, including subject
+    and arguments, retain their portable bounded idempotency contract. Keep
+    structural shape, entry-count, type, and portable-name checks in Pydantic,
+    but apply the 64 KiB per-value and 256 KiB aggregate key-plus-value byte
+    caps in the endpoint path before package work so only byte breaches receive
+    workflow_input_too_large. Declared required, undeclared, and authenticated
+    showcase-reserved binding or fixture names must fail typed with no staging
+    or run residue; reservations never apply to ordinary packages. Enforce each
+    declaration's max_bytes for text, local-file, and digest-verified byte
+    channels in the immutable store snapshot, cap declared text at 64 KiB, and
+    keep raw text and bytes out of errors, metadata, projections, audit, logs,
+    and start-digest material.
+  removal_condition: Remove when upstream provides an equivalent typed,
+    authenticated two-mode input contract and immutable per-input byte bounds.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-catalog-desktop-trigger-verification
   change_class: workflow-verification
   owner: workflow-orchestration

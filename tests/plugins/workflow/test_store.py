@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -152,6 +153,41 @@ def test_prepare_snapshot_rejects_symlink_and_oversized_input(
         store.prepare_run_snapshot(workflow, inputs={"evidence": link})
     with pytest.raises(InputSnapshotError, match="exceeds"):
         store.prepare_run_snapshot(workflow, inputs={"evidence": target})
+
+
+@pytest.mark.parametrize("channel", ["text", "local-file", "verified-fixture"])
+def test_prepare_snapshot_enforces_each_declared_input_byte_bound(
+    tmp_path, workflow_writer, channel
+) -> None:
+    workflow_path = workflow_writer(tmp_path / "package", name="declared-bounds")
+    workflow_path.with_name("example.hermes.yaml").write_text(
+        """delivery_defaults:
+  inputs:
+    symptom: {kind: text, required: true, max_bytes: 4}
+    evidence: {kind: file, required: true, max_bytes: 4}
+""",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow_path)
+    store = RunStore(tmp_path / "home")
+    source = tmp_path / "evidence.txt"
+    source.write_bytes(b"12345")
+
+    kwargs = {
+        "text": {"values": {"symptom": "12345"}},
+        "local-file": {"inputs": {"evidence": source}},
+        "verified-fixture": {
+            "verified_inputs": {
+                "evidence": (b"12345", hashlib.sha256(b"12345").hexdigest())
+            }
+        },
+    }[channel]
+
+    with pytest.raises(InputSnapshotError, match="exceeds.*4 bytes") as error:
+        store.prepare_run_snapshot(package, **kwargs)
+
+    assert error.value.code == "workflow_input_too_large"
+    assert list(store.staging_root.iterdir()) == []
 
 
 def test_prepare_snapshot_rejects_unreadable_or_changed_during_copy(

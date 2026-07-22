@@ -129,6 +129,37 @@ def _trusted_catalog_workflow(home, workflow_writer, *, name, nodes=None, **opti
     return package
 
 
+def _trusted_declared_catalog_workflow(
+    home,
+    workflow_writer,
+    *,
+    name,
+    inputs,
+):
+    workflow_path = workflow_writer(
+        home / "workflows",
+        name=name,
+        filename=f"{name}.yaml",
+    )
+    workflow_path.with_name(f"{name}.hermes.yaml").write_text(
+        "delivery_defaults:\n  inputs:\n"
+        + "".join(
+            f"    {input_name}: {definition}\n"
+            for input_name, definition in inputs.items()
+        ),
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow_path)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(home).trust(
+        digest.sha256,
+        actor="test-operator",
+        risk_digest=risk.risk_digest,
+    )
+    return package
+
+
 def _healthy_coordinator(store):
     acquired = CoordinatorStore(store.database).try_acquire(
         CoordinatorIdentity(
@@ -844,6 +875,82 @@ def test_post_runs_api_admission_joins_identical_and_conflicts_on_changed_input(
     assert conflict.json()["detail"]["code"] == "idempotency_conflict"
 
 
+@pytest.mark.parametrize(
+    ("values", "expected_code"),
+    [
+        ({}, "workflow_input_required"),
+        (
+            {"subject": "present", "undeclared": "rejected"},
+            "workflow_inputs_invalid",
+        ),
+        ({"subject": "x" * 33}, "workflow_input_too_large"),
+    ],
+)
+def test_post_runs_declared_inputs_return_typed_errors_without_residue(
+    tmp_path, monkeypatch, workflow_writer, values, expected_code
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_declared_catalog_workflow(
+        home,
+        workflow_writer,
+        name="api-declared",
+        inputs={
+            "subject": "{type: string, required: true, max_bytes: 32}",
+        },
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    writer = TokenPrincipal(
+        principal="writer", provider="test", scopes=("workflow:write",)
+    )
+
+    response = TestClient(_app(_router(), token=writer)).post(
+        "/api/plugins/workflow/runs",
+        json={
+            "workflow": "api-declared",
+            "values": values,
+            "idempotency_key": "declared-request",
+            "concurrency_policy": "allow",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {"code": expected_code, "retryable": False}
+    }
+    _assert_no_admission_residue(store)
+
+
+def test_declared_input_reservations_are_scoped_to_verified_showcases(
+    tmp_path, workflow_writer
+) -> None:
+    workflow_path = workflow_writer(tmp_path / "package", name="declared-scope")
+    workflow_path.with_name("example.hermes.yaml").write_text(
+        """delivery_defaults:
+  inputs:
+    arguments: {kind: text, required: true, max_bytes: 32}
+""",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow_path)
+
+    ordinary = api_admission_module.validate_declared_api_values(
+        package,
+        {"arguments": "safe"},
+    )
+    with pytest.raises(ApiAdmissionError) as reserved:
+        api_admission_module.validate_declared_api_values(
+            package,
+            {"arguments": "safe"},
+            verified_value_bindings={"subject": "arguments"},
+        )
+
+    assert ordinary == {"arguments": "safe"}
+    assert reserved.value.code == "workflow_inputs_invalid"
+    assert "safe" not in str(reserved.value)
+
+
 def test_api_admission_mutations_persist_authenticated_actor_and_channel(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
@@ -1015,6 +1122,64 @@ def test_post_runs_api_admission_rejects_unbounded_or_caller_auth_fields(
         unsafe_names
     )
     assert colliding_values.status_code == 422
+
+
+def test_post_runs_relocates_only_byte_caps_to_typed_endpoint_validation(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    client = TestClient(_app(_router()))
+    base = {
+        "workflow": "bounded",
+        "idempotency_key": "bounded",
+        "concurrency_policy": "queue",
+    }
+    at_cap_values = {
+        f"input-{index}": "x" * (4089 if index < 10 else 4088)
+        for index in range(64)
+    }
+    aggregate_values = dict(at_cap_values)
+    aggregate_values["input-0"] += "x"
+    assert sum(
+        len(name.encode("utf-8")) + len(value.encode("utf-8"))
+        for name, value in at_cap_values.items()
+    ) == 256 * 1024
+
+    per_value = client.post(
+        "/api/plugins/workflow/runs",
+        json={**base, "values": {"input": "x" * (70 * 1024)}},
+    )
+    aggregate = client.post(
+        "/api/plugins/workflow/runs",
+        json={
+            **base,
+            "values": aggregate_values,
+        },
+    )
+    at_aggregate_cap = client.post(
+        "/api/plugins/workflow/runs",
+        json={
+            **base,
+            "values": at_cap_values,
+        },
+    )
+    unrelated_schema = client.post(
+        "/api/plugins/workflow/runs",
+        json={**base, "workflow": ["not", "text"], "values": {}},
+    )
+
+    for response in (per_value, aggregate):
+        assert response.status_code == 422
+        assert response.json() == {
+            "detail": {
+                "code": "workflow_input_too_large",
+                "retryable": False,
+            }
+        }
+    assert unrelated_schema.status_code == 422
+    assert isinstance(unrelated_schema.json()["detail"], list)
+    assert at_aggregate_cap.status_code == 404
+    assert at_aggregate_cap.json()["detail"]["code"] == "workflow_not_found"
 
 
 def test_post_runs_applies_catalog_resource_bounds_before_admission(

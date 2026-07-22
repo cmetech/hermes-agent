@@ -13,9 +13,15 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.coordinator_store import CoordinatorStore
 from plugins.workflow.entitlement import verified_showcase_run_metadata
+from plugins.workflow.input_contract import (
+    API_INPUT_AGGREGATE_MAX_BYTES,
+    API_INPUT_VALUE_MAX_BYTES,
+    WorkflowInputContractError,
+    workflow_input_declarations,
+)
+from plugins.workflow.models import WorkflowPackage, WorkflowValidationError
 from plugins.workflow.provenance import TriggerProvenance
-from plugins.workflow.store import RunStore
-from plugins.workflow.models import WorkflowValidationError
+from plugins.workflow.store import InputSnapshotError, RunStore
 from plugins.workflow.trust import (
     WorkflowResourceCapacityError,
     WorkflowResourceCacheMissError,
@@ -51,6 +57,65 @@ class ApiAdmissionError(RuntimeError):
         self.code = code
         self.status_code = status_code
         self.retryable = retryable
+
+
+def validate_api_value_bounds(values: Mapping[str, str]) -> dict[str, str]:
+    """Apply endpoint-owned byte caps without reclassifying schema failures."""
+    total = 0
+    normalized = dict(values)
+    for name, value in normalized.items():
+        encoded = value.encode("utf-8")
+        if len(encoded) > API_INPUT_VALUE_MAX_BYTES:
+            raise ApiAdmissionError("workflow_input_too_large", status_code=422)
+        total += len(name.encode("utf-8")) + len(encoded)
+    if total > API_INPUT_AGGREGATE_MAX_BYTES:
+        raise ApiAdmissionError("workflow_input_too_large", status_code=422)
+    return normalized
+
+
+def validate_declared_api_values(
+    package: WorkflowPackage,
+    values: Mapping[str, str],
+    *,
+    verified_value_bindings: Mapping[str, str] | None = None,
+    verified_fixture_names: frozenset[str] | None = None,
+) -> dict[str, str]:
+    """Validate declared mode while leaving legacy-flat values unchanged."""
+    try:
+        declarations = workflow_input_declarations(package)
+    except WorkflowInputContractError as exc:
+        raise ApiAdmissionError("workflow_invalid_definition", status_code=422) from exc
+    normalized = dict(values)
+    if not declarations:
+        return normalized
+
+    bindings = dict(verified_value_bindings or {})
+    fixture_names = frozenset(verified_fixture_names or ())
+    binding_targets = frozenset(bindings.values())
+    reserved = binding_targets | fixture_names
+    allowed_direct = {
+        name
+        for name, declaration in declarations.items()
+        if declaration.accepts_api_value and name not in reserved
+    }
+    allowed = allowed_direct | frozenset(bindings)
+    if set(normalized) - allowed or set(normalized) & reserved:
+        raise ApiAdmissionError("workflow_inputs_invalid", status_code=422)
+
+    supplied_targets = set(normalized) & allowed_direct
+    supplied_targets.update(
+        target for public, target in bindings.items() if public in normalized
+    )
+    missing = {
+        name
+        for name, declaration in declarations.items()
+        if declaration.required
+        and declaration.accepts_api_value
+        and name not in supplied_targets
+    }
+    if missing:
+        raise ApiAdmissionError("workflow_input_required", status_code=422)
+    return normalized
 
 
 def _catalog_package(
@@ -170,6 +235,26 @@ def start_api_run(
             raise ApiAdmissionError("workflow_inputs_unsupported", status_code=422)
         raise ApiAdmissionError("workflow_showcase_cli_required", status_code=409)
 
+    scenario = verified_showcase.scenario if verified_showcase is not None else None
+    value_bindings = (
+        getattr(scenario, "input_value_bindings", None) if scenario is not None else None
+    )
+    fixture_mapping = (
+        getattr(scenario, "input_fixtures", None) if scenario is not None else None
+    )
+    values = validate_declared_api_values(
+        package,
+        values,
+        verified_value_bindings=(
+            value_bindings if isinstance(value_bindings, Mapping) else None
+        ),
+        verified_fixture_names=(
+            frozenset(fixture_mapping)
+            if isinstance(fixture_mapping, Mapping)
+            else None
+        ),
+    )
+
     compatibility = assess_compatibility(package)
     try:
         package_digest = compute_package_digest(
@@ -261,6 +346,10 @@ def start_api_run(
         raise ApiAdmissionError("workflow_invalid_definition", status_code=422) from exc
     except WorkflowResourceCacheMissError as exc:
         raise ApiAdmissionError("workflow_package_changed", status_code=409) from exc
+    except InputSnapshotError as exc:
+        if exc.code == "workflow_input_too_large":
+            raise ApiAdmissionError(exc.code, status_code=422) from exc
+        raise
     if prepared.definition_digest != risk.package_digest:
         shutil.rmtree(prepared.staging_directory, ignore_errors=True)
         raise ApiAdmissionError("workflow_package_changed", status_code=409)
@@ -328,4 +417,6 @@ __all__ = [
     "ApiAdmissionAuthority",
     "ApiAdmissionError",
     "start_api_run",
+    "validate_api_value_bounds",
+    "validate_declared_api_values",
 ]

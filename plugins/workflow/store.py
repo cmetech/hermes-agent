@@ -30,6 +30,10 @@ from plugins.workflow.admission import (
     RunAdmissionResult,
 )
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
+from plugins.workflow.input_contract import (
+    WorkflowInputContractError,
+    workflow_input_declarations,
+)
 from plugins.workflow.machine_contract import WorkflowConflict, projection_was_truncated
 from plugins.workflow.lease_clock import (
     LeaseClockSample,
@@ -61,7 +65,9 @@ from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
 class InputSnapshotError(ValueError):
-    pass
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class StorageQuotaError(RuntimeError):
@@ -2121,6 +2127,7 @@ class RunStore:
         *,
         inputs: Mapping[str, str | Path] | None = None,
         values: Mapping[str, str] | None = None,
+        verified_inputs: Mapping[str, tuple[bytes, str]] | None = None,
         resource_read_budget: WorkflowResourceReadBudget | None = None,
         trusted_package_digest: WorkflowPackageDigest | None = None,
     ) -> PreparedRunSnapshot:
@@ -2129,6 +2136,22 @@ class RunStore:
             staging = Path(tempfile.mkdtemp(prefix="run-", dir=self.staging_root))
             self._write_snapshot_owner(staging)
         try:
+            try:
+                input_declarations = workflow_input_declarations(package)
+            except WorkflowInputContractError as exc:
+                raise InputSnapshotError(
+                    "workflow input declaration is invalid"
+                ) from exc
+
+            def input_byte_bound(name: str, *, channel: str) -> int:
+                declaration = input_declarations.get(name)
+                if declaration is None:
+                    return self.max_input_bytes
+                return declaration.byte_bound(
+                    channel=channel,
+                    store_limit=self.max_input_bytes,
+                )
+
             package_digest = trusted_package_digest or compute_package_digest(
                 package, read_budget=resource_read_budget
             )
@@ -2210,12 +2233,17 @@ class RunStore:
             input_digests: dict[str, str] = {}
             input_root = staging / "inputs"
             if not workflow_input_names_are_portable(
-                [*(inputs or {}).keys(), *(values or {}).keys()]
+                [
+                    *(inputs or {}).keys(),
+                    *(verified_inputs or {}).keys(),
+                    *(values or {}).keys(),
+                ]
             ):
                 raise InputSnapshotError("invalid or colliding input name")
             if not workflow_filename_components_are_distinct(
                 [
                     *(inputs or {}).keys(),
+                    *(verified_inputs or {}).keys(),
                     *(f"{name}.txt" for name in (values or {})),
                 ]
             ):
@@ -2234,9 +2262,11 @@ class RunStore:
                     ) from exc
                 if not source.is_file():
                     raise InputSnapshotError(f"input is not a file: {source}")
-                if before.st_size > self.max_input_bytes:
+                byte_bound = input_byte_bound(name, channel="local-file")
+                if before.st_size > byte_bound:
                     raise InputSnapshotError(
-                        f"input exceeds {self.max_input_bytes} bytes: {source}"
+                        f"input {name} exceeds {byte_bound} bytes",
+                        code="workflow_input_too_large",
                     )
                 try:
                     data = source.read_bytes()
@@ -2263,13 +2293,45 @@ class RunStore:
                     or "application/octet-stream",
                     "sha256": digest,
                 }
+            for name, verified in sorted((verified_inputs or {}).items()):
+                if name in input_manifest or not workflow_input_name_is_portable(name):
+                    raise InputSnapshotError(f"invalid or duplicate input name: {name}")
+                if (
+                    not isinstance(verified, tuple)
+                    or len(verified) != 2
+                    or not isinstance(verified[0], bytes)
+                    or not isinstance(verified[1], str)
+                ):
+                    raise InputSnapshotError(f"invalid verified input: {name}")
+                data, expected_digest = verified
+                byte_bound = input_byte_bound(name, channel="verified-fixture")
+                if len(data) > byte_bound:
+                    raise InputSnapshotError(
+                        f"input {name} exceeds {byte_bound} bytes",
+                        code="workflow_input_too_large",
+                    )
+                digest = _sha256(data)
+                if not hmac.compare_digest(digest, expected_digest):
+                    raise InputSnapshotError(f"verified input digest mismatch: {name}")
+                input_root.mkdir(exist_ok=True)
+                target = input_root / name
+                target.write_bytes(data)
+                input_digests[name] = digest
+                input_manifest[name] = {
+                    "relative_path": target.relative_to(staging).as_posix(),
+                    "size_bytes": len(data),
+                    "media_type": "application/octet-stream",
+                    "sha256": digest,
+                }
             for name, value in sorted((values or {}).items()):
                 if name in input_manifest or not workflow_input_name_is_portable(name):
                     raise InputSnapshotError(f"invalid or duplicate input name: {name}")
                 data = value.encode("utf-8")
-                if len(data) > self.max_input_bytes:
+                byte_bound = input_byte_bound(name, channel="text")
+                if len(data) > byte_bound:
                     raise InputSnapshotError(
-                        f"input exceeds {self.max_input_bytes} bytes: {name}"
+                        f"input {name} exceeds {byte_bound} bytes",
+                        code="workflow_input_too_large",
                     )
                 input_root.mkdir(exist_ok=True)
                 target = input_root / f"{name}.txt"
