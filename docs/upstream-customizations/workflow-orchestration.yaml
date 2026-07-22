@@ -33,6 +33,10 @@ coverage:
     reason: Separate user-requested v3.0.1 release preparation.
   - commit: 3d6bd7f2cbd320ba14024d799159cbf452815acf
     reason: Separate user-requested v3.0.2 release preparation.
+  - commit: bb6201e7872fdef7444495aa2649e06b0b0b277f
+    reason: Task 1.7 SDD scratch artifact hygiene.
+  - commit: d3e40b9c7187b57df83886dbcb1fc586a9254ada
+    reason: Task 1.7 SDD scratch artifact cleanup hygiene.
 upstream_changes:
 - id: brand-aware-version-label
   change_class: branding-generic
