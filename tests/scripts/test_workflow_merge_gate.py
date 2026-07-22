@@ -5,6 +5,8 @@ import os
 import re
 import subprocess
 
+import yaml
+
 
 ROOT = Path(__file__).parents[2]
 GATE = ROOT / "scripts/test_workflow_merge_gate.sh"
@@ -106,6 +108,30 @@ def test_showcase_desktop_e2e_is_in_merge_gate_and_native_matrix() -> None:
 
     assert path in GATE.read_text()
     assert path in CI.read_text()
+
+
+def test_laptop_diagnostic_middleware_e2e_is_exactly_pinned_in_release_gates() -> None:
+    path = "tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py"
+
+    workflow = yaml.safe_load(CI.read_text())
+    portability = workflow["jobs"]["workflow-portability"]
+    portability_run = next(
+        step["run"]
+        for step in portability["steps"]
+        if step.get("name") == "Run portable workflow and installed-showcase gates"
+    )
+
+    assert GATE.read_text().count(path) == 1
+    assert CI.read_text().count(path) == 1
+    assert portability["strategy"]["matrix"]["os"] == [
+        "ubuntu-latest",
+        "macos-latest",
+        "windows-latest",
+    ]
+    assert portability_run.count(path) == 1
+    assert GATE.read_text().count(
+        "tests/plugins/workflow/test_installed_distribution_e2e.py"
+    ) == 1
 
 
 def test_showcase_ai_and_evidence_suites_are_promoted_into_the_merge_gate() -> None:

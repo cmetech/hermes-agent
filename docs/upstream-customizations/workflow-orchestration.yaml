@@ -1373,6 +1373,43 @@ upstream_changes:
     text and authenticated bundled-fixture rendering with UTF-8 limits,
     public-only admission values, and the same four-locale coverage.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-laptop-diagnostic-real-middleware-e2e
+  change_class: workflow-verification
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - laptop-diagnostic real-middleware approval E2E
+  - laptop-diagnostic bounded deterministic rejection E2E
+  - laptop-diagnostic operator-projection canary isolation proof
+  - laptop-diagnostic merge-gate and native-matrix membership
+  tests:
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'test(workflow): cover laptop middleware tour'
+  upstream_candidate: true
+  merge_guidance: Preserve the public typed-symptom POST through the production
+    session-token middleware, background-only 202 admission, real coordinator
+    ownership, review-plan approval API continuation to success, and the
+    separate HERMES_OFFLINE rejection path through one deterministic rework to
+    its bounded cancelled outcome. Keep PluginAgentRunner calls at zero on the
+    rejection branch. Continue proving digest-authenticated fixture SHA
+    equality, sealed-input execution after the source fixture becomes invalid,
+    byte-level store/trust/run-directory boundaries, exact provenance,
+    entitlement and effective limits, and absence of raw symptom/fixture
+    canaries from metadata, list/detail/status, evidence, audit, errors, logs,
+    and start-digest material. Pin this E2E exactly once in both the base merge
+    gate and three-OS native workflow matrix, and retain installed-wheel fixture
+    availability proof without network or billable inference.
+  removal_condition: Remove when upstream provides equivalent offline real-
+    middleware laptop-diagnostic coverage, exact release-gate membership, and
+    installed-distribution fixture proof.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-catalog-desktop-trigger-verification
   change_class: workflow-verification
   owner: workflow-orchestration
