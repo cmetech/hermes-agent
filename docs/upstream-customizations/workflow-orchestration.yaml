@@ -2910,6 +2910,7 @@ upstream_changes:
   files:
   - .superpowers/sdd/revision-7-adversarial-remediation-report.md
   - .superpowers/sdd/task-12-report.md
+  - .superpowers/sdd/task-14-report.md
   - docs/backlog/v3.0.3-release-review-deferrals.md
   - docs/reviews/2026-07-23-workflow-v3.0.3-verification.md
   owned_symbols:
@@ -2921,6 +2922,8 @@ upstream_changes:
   - first adversarial-remediation 51cd5c302 automated-gate evidence
   - final FV-RT-A 6e1dc254cba7 remediation evidence
   - final verified 70e4b1d8f branch-gate evidence
+  - final FV-RT-A-1 75e25d117 recovery-convergence evidence
+  - final 595/595 shared matrix and 556/556 Strategy A subtotal
   - Task 10 and Task 11 implementation-review dispositions
   - branch-merge versus release-readiness disposition
   - exact seven OUTSTANDING manual-only release gates
@@ -2934,20 +2937,24 @@ upstream_changes:
   - tests/plugins/workflow/test_scheduled_runs.py
   - tests/plugins/workflow/test_schedule_revalidation.py
   - tests/plugins/workflow/test_scheduling_middleware_e2e.py
-  expected_commit_subject: 'docs(workflow): record final runtime remediation'
+  expected_commit_subject: 'docs(workflow): record recoverable repair closure'
   upstream_candidate: true
   merge_guidance: >-
-    Preserve three distinct evidence eras: historical a6be8121e
-    plan-completion, first adversarial-remediation 51cd5c302, and final FV-RT-A
-    runtime-remediation 6e1dc254cba7 with verified branch HEAD 70e4b1d8f. Do
-    not imply the historical 1,045-test base gate reran at either remediation
-    SHA. Retain the final 23-file 591/591 matrix and its exact 552/552 original
-    Strategy A subtotal, the first 590/1 timing result, isolated 1/1 and
-    coordinator 39/39 diagnostics, installed-distribution 1/1, Desktop 144/144
-    across 16 files, both TypeScript projects, merge inventory 26/26,
-    customization tests 9/9 and live exit 0, lint/diff/commit/protected-surface
-    checks, Task 10 APPROVE with Critical 0 / Important 0 / Low 0, and Task 11
-    approved implementation with its report-wording-only Low. Keep
+    Preserve four distinct evidence eras: historical a6be8121e
+    plan-completion, first adversarial-remediation 51cd5c302, final FV-RT-A
+    runtime-remediation 6e1dc254cba7 with verified branch HEAD 70e4b1d8f, and
+    FV-RT-A-1 recovery convergence 75e25d117. Do not imply the historical
+    1,045-test base gate reran at either remediation SHA. Retain the final
+    23-file 591/591 matrix and its exact 552/552 original Strategy A subtotal,
+    the first 590/1 timing result, isolated 1/1 and coordinator 39/39
+    diagnostics, installed-distribution 1/1, Desktop 144/144 across 16 files,
+    both TypeScript projects, merge inventory 26/26, customization tests 9/9
+    and live exit 0, lint/diff/commit/protected-surface checks, Task 10 APPROVE
+    with Critical 0 / Important 0 / Low 0, and Task 11 approved implementation
+    with its report-wording-only Low. Retain FV-RT-A-1 strict RED, focused 4/4,
+    six-file recovery 152/152, Task 13 Pass/Approved review, and the clean
+    23-file 595/595 matrix with its exact 556/556 original Strategy A subtotal
+    plus coordinator 39. Keep
     named-coverage and failure-table mappings, earlier 536/536 adversarial
     remediation evidence, carried-finding and
     lower-confidence/pre-existing dispositions, exact paired-brand rehearsal
