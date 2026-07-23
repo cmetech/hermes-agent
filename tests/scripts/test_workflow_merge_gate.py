@@ -206,6 +206,18 @@ def test_scheduled_revalidation_contract_is_in_merge_gate_and_native_matrix() ->
     assert path not in WORKFLOW_GATE_OPTOUTS
 
 
+def test_complete_one_shot_scheduling_contract_is_selected_in_release_gates() -> None:
+    for path in (
+        "tests/plugins/workflow/test_schedule_store_identity.py",
+        "tests/plugins/workflow/test_scheduled_runs.py",
+        "tests/plugins/workflow/test_schedule_revalidation.py",
+        "tests/plugins/workflow/test_scheduling_middleware_e2e.py",
+    ):
+        assert GATE.read_text().count(path) == 1
+        assert CI.read_text().count(path) == 1
+        assert path not in WORKFLOW_GATE_OPTOUTS
+
+
 def test_exact_showcase_membership_is_pinned_at_all_three_gate_sites() -> None:
     sites = (
         (ROOT / "tests/plugins/workflow/test_showcase_catalog.py", "catalog"),

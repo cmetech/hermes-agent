@@ -171,12 +171,15 @@ jobs:
             tests/plugins/workflow/test_coordinator.py \
             tests/plugins/workflow/test_coordinator_multiprocess.py \
             tests/plugins/workflow/test_runner_binding.py \
+            tests/plugins/workflow/test_schedule_store_identity.py \
+            tests/plugins/workflow/test_scheduled_runs.py \
             tests/plugins/workflow/test_schedule_revalidation.py \
             tests/plugins/workflow/test_desktop_api.py \
             tests/plugins/workflow/test_node_mcp.py \
             tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py \
             tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py \
             tests/plugins/workflow/test_ai_extensions_middleware_e2e.py \
+            tests/plugins/workflow/test_scheduling_middleware_e2e.py \
             tests/plugins/workflow/test_schema_migrations.py \
             tests/plugins/workflow/test_notification_delivery.py \
             tests/plugins/workflow/test_notifications.py \

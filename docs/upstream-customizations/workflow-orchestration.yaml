@@ -2702,3 +2702,43 @@ upstream_changes:
     crash correlation, actual runner/runtime revalidation, and exact release-gate
     coverage without changing immediate-run identity or behavior.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-one-shot-scheduling-middleware-e2e
+  change_class: workflow-testing
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_scheduling_middleware_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - authenticated one-shot scheduling middleware E2E
+  - scheduled early-wake zero-execution proof
+  - scheduled checkpoint exactly-once proof
+  - cancel-before-fire retained-evidence proof
+  - coordinator restart and index-reconstruction scheduling parity
+  - scheduled AI fire-time capability matrix
+  - complete scheduling release-gate selection
+  tests:
+  - tests/plugins/workflow/test_scheduling_middleware_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'test(workflow): prove one-shot scheduling'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve a real session-token-authenticated Desktop middleware path from
+    verified showcase catalog selection through Run later admission, durable
+    queued scheduled_wait projection, genuine run_admitted wake completion as
+    scheduled_not_due, exact due-time revalidation, one coordinator/scheduler
+    execution, checkpoint evidence, and terminal success exactly once. Keep the
+    cancel-before-fire path on the authenticated mutation and retain its run
+    directory, journal, and audit evidence without later promotion or claims.
+    Reconstruct the canonical instant only from corroborated projection evidence
+    after coordinator restart and complete index loss. Exercise scheduled
+    ai-extensions with a local declared-capable runner/runtime and require
+    incapable-runner and codex_app_server substitutions to terminalize as
+    schedule_revalidation_failed before claim or provider traffic. Select this
+    E2E plus schedule identity, wake/clock, and revalidation suites exactly once
+    in both the base merge gate and native CI matrix, with no opt-out.
+  removal_condition: Remove when upstream carries equivalent authenticated,
+    deterministic one-shot scheduling E2E and exact cross-platform release-gate
+    coverage for recovery, clocks, cancellation, and fire-time authorization.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
