@@ -2832,7 +2832,10 @@ upstream_changes:
   - adversarial lower-confidence and pre-existing disposition register
   - Workflow v3.0.3 Revision 7 final verification mapping
   - failure-table-to-test mapping
-  - final gate and baseline-delta evidence
+  - historical plan-completion gate and baseline-delta evidence
+  - final remediated 51cd5c302 automated-gate evidence
+  - final review verdict and documentation-finding closure
+  - exact seven OUTSTANDING manual-only release gates
   - exact paired-brand SHA and manual-only handoff status
   - non-normative v3.0.3 deferred-work register
   tests:
@@ -2843,15 +2846,22 @@ upstream_changes:
   - tests/plugins/workflow/test_scheduled_runs.py
   - tests/plugins/workflow/test_schedule_revalidation.py
   - tests/plugins/workflow/test_scheduling_middleware_e2e.py
-  expected_commit_subject: 'docs(workflow): verify v3.0.3 revision 7'
+  expected_commit_subject: 'docs(workflow): refresh final verification evidence'
   upstream_candidate: true
   merge_guidance: >-
-    Preserve the exact release-gate counts and SHA evidence, named-coverage and
-    failure-table mappings, accepted adversarial remediation evidence,
+    Preserve the historical a6be8121e plan-completion gate separately from the
+    final remediated 51cd5c302 production evidence. Do not imply the historical
+    1,045-test base gate reran at the final SHA. Retain the exact final 536/536
+    Strategy A matrix, its unchanged scheduler timing failure followed by the
+    isolated 19/19 diagnostic and clean full rerun, installed-distribution
+    1/1, Desktop 144/144 across 16 files, both TypeScript projects, merge
+    inventory 26/26, lint/customization/diff/protected-surface checks, and the
+    final APPROVE verdict with Critical 0 and Important 0. Keep named-coverage
+    and failure-table mappings, accepted adversarial remediation evidence,
     carried-finding and lower-confidence/pre-existing dispositions, exact
-    paired-brand rehearsal SHA, and honest manual-only status together.
-    Deferred backlog files are non-normative and must not be interpreted as
-    widening Revision 7.
+    paired-brand rehearsal SHA, and all seven manual-only gates explicitly
+    OUTSTANDING until operator evidence exists. Deferred backlog files are
+    non-normative and must not be interpreted as widening Revision 7.
   removal_condition: Remove after equivalent v3.0.3 verification evidence and
     deferred-work dispositions are carried in the upstream release record.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
