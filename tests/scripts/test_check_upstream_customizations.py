@@ -212,3 +212,32 @@ def test_manifest_coverage_scope_excludes_pre_feature_and_named_release_commits(
     _git(repo, "commit", "-m", "feature scope leak")
     with pytest.raises(ValueError, match="unledgered_feature.py"):
         validate_diff_coverage(data, repo, f"{root}..HEAD")
+
+
+def test_manifest_coverage_ignores_only_local_sdd_progress_ledger(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["coverage"] = {"base_commit": baseline, "excluded_commits": []}
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+
+    progress = repo / ".superpowers/sdd/progress.md"
+    progress.parent.mkdir(parents=True)
+    progress.write_text("local progress\n")
+    _git(repo, "add", str(progress.relative_to(repo)))
+    _git(repo, "commit", "-m", "accidentally track local progress")
+    progress.unlink()
+    _git(repo, "commit", "-am", "untrack local progress")
+
+    data = load_and_validate_manifest(manifest, repo)
+    validate_diff_coverage(data, repo, f"{baseline}..HEAD")
+
+    adjacent = repo / ".superpowers/sdd/unregistered.md"
+    adjacent.write_text("must remain covered\n")
+    _git(repo, "add", str(adjacent.relative_to(repo)))
+    _git(repo, "commit", "-m", "add unregistered sdd artifact")
+    with pytest.raises(ValueError, match=r"\.superpowers/sdd/unregistered\.md"):
+        validate_diff_coverage(data, repo, f"{baseline}..HEAD")

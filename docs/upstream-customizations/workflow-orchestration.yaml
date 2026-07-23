@@ -706,18 +706,24 @@ upstream_changes:
   change_class: release-gate-generic
   owner: workflow-orchestration
   files:
+  - .superpowers/sdd/task-11-report.md
   - scripts/check_upstream_customizations.py
   owned_symbols:
+  - _EPHEMERAL_COVERAGE_PATHS
   - validate_diff_coverage
   - _range_base
   - _existed_at
   tests:
   - tests/scripts/test_check_upstream_customizations.py
-  expected_commit_subject: 'fix(release): enforce existing customization coverage'
+  expected_commit_subject: 'fix(release): ignore local sdd progress ledger'
   upstream_candidate: true
-  merge_guidance: Preserve baseline-aware classification so additive plugin and
-    script files remain low-friction while modifications, deletions, or renames
-    of upstream-existing plugin and script files require ledger ownership.
+  merge_guidance: Preserve baseline-aware classification so additive plugin
+    and script files remain low-friction while modifications, deletions, or
+    renames of upstream-existing plugin and script files require ledger
+    ownership. Ignore the exact ephemeral local path
+    .superpowers/sdd/progress.md even when historical coverage includes its add
+    or delete, without ignoring adjacent .superpowers/sdd artifacts or
+    excluding mixed production commits.
   removal_condition: Remove when upstream customization tracking distinguishes
     additive feature roots from existing upstream-owned files equivalently.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
