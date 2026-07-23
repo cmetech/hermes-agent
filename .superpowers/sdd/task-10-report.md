@@ -17,6 +17,9 @@ index parity from corroborated evidence, and appends `repair_verified`.
 Notification repair remains exclusively owned by the existing outbox cadence.
 If cleanup removes a selected repair between its event-log query and probe,
 directory resolution now fails closed without aborting the coordinator sweep.
+Quota accounting now captures bounded immutable evidence bytes; replay,
+projection/journal hashing, and legacy policy validation consume those exact
+snapshots, closing growth and replacement races between precheck and proof.
 
 ## Strict RED Evidence
 
@@ -85,6 +88,22 @@ exceeded the aggregate run quota. The exact-total boundary passed as the
 control. The always-run partial selector-index test separately failed 1/1
 before the index existed.
 
+The snapshot-TOCTOU closure began with:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_scheduled_runs.py -q \
+  -k 'revalidation_rejects_valid_evidence_growth_before_snapshot_read or
+      legacy_policy_validation_uses_quota_accounted_snapshot'
+
+2 failed, 41 deselected in 0.5s
+```
+
+A valid journal grown after the size stats was replayed and hashed at its
+larger size, clearing the repair beyond `max_run_bytes`. Legacy policy was
+reread after index sync instead of validating the quota-accounted bytes. A
+separate torn-tail preservation RED then failed 1/1 when snapshot replay no
+longer performed the prior recoverable final-frame truncation.
+
 ## Implementation
 
 - `repair_events_run_reason_sequence(run_id, reason_code, sequence DESC)` is
@@ -112,6 +131,15 @@ before the index existed.
 - Relevant `run.json`, journal, and legacy policy bytes are aggregated against
   `max_run_bytes`, while the journal separately remains bounded by
   `max_journal_bytes`. Equality at the aggregate boundary is allowed.
+- Revalidation reads each evidence file with a hard `limit + 1` bound, then
+  passes the paired projection/journal snapshots through full replay,
+  comparison, and hashing. Legacy policy digest/schema validation receives its
+  captured policy bytes rather than rereading the path.
+- Snapshot journal normalization preserves the prior live behavior for a valid
+  final frame missing its newline and for an invalid incomplete final frame.
+  It compares current bounded bytes before preserving/truncating, and the
+  normalized quota-bounded bytes are the exact bytes later replayed and hashed.
+  Default live recovery callers retain their existing behavior.
 
 The lane never deletes, quarantines, synthesizes, or rewrites damaged run
 evidence. Oversized corrupt files are bounded by the store's configured
@@ -148,25 +176,32 @@ Closure race plus adjacent repair-lane regressions:
 Complete focused closure set:
 
 ```text
-13 passed in 1.8s
+16 passed in 1.8s
 ```
 
-Affected runtime, migration, index, and coordinator coverage:
+Affected runtime, migration, index, coordinator, and recovery coverage:
 
 ```text
 scripts/run_tests.sh \
   tests/plugins/workflow/test_schedule_store_identity.py \
   tests/plugins/workflow/test_scheduled_runs.py \
   tests/plugins/workflow/test_coordinator.py \
-  tests/plugins/workflow/test_schema_migrations.py -q
+  tests/plugins/workflow/test_schema_migrations.py \
+  tests/plugins/workflow/test_fault_injection.py \
+  tests/plugins/workflow/test_notifications.py -q
 
-117 passed in 65.3s
+148 passed in 66.9s
 ```
 
 Additional checks:
 
-- Ruff on all five changed Python/test files: passed.
-- Customization-ledger checker: passed.
+- Ruff on the changed Python/test files: passed.
+- The customization-ledger checker reports the pre-existing committed scratch
+  path `.superpowers/sdd/progress.md` as uncovered. Commit `532c0274c` added
+  that ignored planning file and `8865c7bf3` removed it; the coverage checker
+  visits each commit's paths, so its historical deletion remains in scope.
+  This bounded-snapshot follow-up does not re-track scratch or broaden checker
+  policy.
 - `git diff --check`: passed.
 
 ## Self-Review
@@ -187,6 +222,11 @@ Additional checks:
   history continues growing.
 - Aggregate evidence at exactly `max_run_bytes` is accepted; one byte over is
   rejected before journal corroboration.
+- Valid post-precheck journal growth is rejected before replay, while policy
+  replacement after snapshot capture cannot change which policy bytes are
+  validated.
+- Snapshot revalidation preserves a torn incomplete tail separately, truncates
+  only to a fully replayable prefix, and verifies the normalized journal.
 
 ## Commit
 
@@ -199,3 +239,6 @@ Cleanup-race follow-up:
 
 Final selector/quota subject:
 `fix(workflow): bound repair revalidation selection`
+
+Snapshot-TOCTOU subject:
+`fix(workflow): validate bounded repair snapshots`

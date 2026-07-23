@@ -1512,8 +1512,14 @@ class RunStore:
     def _legacy_effect_policy_nodes(
         directory: Path,
         projection: Mapping[str, object],
+        *,
+        policy_data: bytes | None = None,
     ) -> list[str]:
-        policy_bytes = (directory / "policy.yaml").read_bytes()
+        policy_bytes = (
+            policy_data
+            if policy_data is not None
+            else (directory / "policy.yaml").read_bytes()
+        )
         expected_digest = projection.get("policy_digest")
         if not isinstance(expected_digest, str) or not expected_digest:
             raise JournalRecoveryError("legacy workflow policy digest is missing")
@@ -1528,6 +1534,65 @@ class RunStore:
         ):
             raise JournalRecoveryError("legacy outward-action policy is malformed")
         return outward
+
+    @staticmethod
+    def _read_bounded_repair_evidence(path: Path, *, max_bytes: int) -> bytes:
+        if max_bytes < 0:
+            raise StorageQuotaError("run repair evidence exceeds run quota")
+        with path.open("rb") as stream:
+            data = stream.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise StorageQuotaError("run repair evidence exceeds configured quota")
+        return data
+
+    def _normalize_repair_journal_snapshot(
+        self,
+        directory: Path,
+        *,
+        run_id: str,
+        journal_data: bytes,
+        max_bytes: int,
+    ) -> bytes:
+        """Preserve live torn-tail recovery while replaying immutable bytes."""
+        if not journal_data or journal_data.endswith(b"\n"):
+            return journal_data
+        torn_data = None
+        try:
+            self._rebuild_projection(
+                directory,
+                run_id=run_id,
+                journal_data=journal_data,
+            )
+        except JournalRecoveryError as original_error:
+            tail_offset = journal_data.rfind(b"\n") + 1
+            if tail_offset <= 0:
+                raise
+            normalized = journal_data[:tail_offset]
+            try:
+                self._rebuild_projection(
+                    directory,
+                    run_id=run_id,
+                    journal_data=normalized,
+                )
+            except JournalRecoveryError:
+                raise original_error
+            torn_data = journal_data[tail_offset:]
+        else:
+            normalized = journal_data + b"\n"
+        if len(normalized) > max_bytes:
+            raise StorageQuotaError("normalized journal exceeds configured quota")
+        journal_path = directory / "events.jsonl"
+        current = self._read_bounded_repair_evidence(
+            journal_path,
+            max_bytes=len(journal_data),
+        )
+        if current != journal_data:
+            raise JournalRecoveryError("run journal changed during revalidation")
+        if torn_data is not None:
+            preserved = directory / f"events.jsonl.torn-{uuid.uuid4().hex}"
+            _atomic_bytes(preserved, torn_data)
+        _atomic_bytes(journal_path, normalized)
+        return normalized
 
     def revalidate_run_repair(
         self,
@@ -1549,26 +1614,37 @@ class RunStore:
             ):
                 if reason_code not in self._active_run_repair_reasons(run_id):
                     return False
-                evidence_paths = [
-                    directory / "run.json",
-                    directory / "events.jsonl",
-                ]
+                projection_path = directory / "run.json"
+                journal_path = directory / "events.jsonl"
+                remaining_bytes = self.max_run_bytes
+                projection_data = self._read_bounded_repair_evidence(
+                    projection_path,
+                    max_bytes=remaining_bytes,
+                )
+                remaining_bytes -= len(projection_data)
+                journal_data = self._read_bounded_repair_evidence(
+                    journal_path,
+                    max_bytes=min(self.max_journal_bytes, remaining_bytes),
+                )
+                journal_data = self._normalize_repair_journal_snapshot(
+                    directory,
+                    run_id=run_id,
+                    journal_data=journal_data,
+                    max_bytes=min(self.max_journal_bytes, remaining_bytes),
+                )
+                remaining_bytes -= len(journal_data)
+                policy_data = None
                 if reason_code == "legacy_effect_policy_uncorroborated":
-                    evidence_paths.append(directory / "policy.yaml")
-                evidence_sizes = {
-                    path: path.stat().st_size for path in evidence_paths
-                }
-                if (
-                    evidence_sizes[directory / "events.jsonl"]
-                    > self.max_journal_bytes
-                ):
-                    return False
-                if sum(evidence_sizes.values()) > self.max_run_bytes:
-                    return False
+                    policy_data = self._read_bounded_repair_evidence(
+                        directory / "policy.yaml",
+                        max_bytes=remaining_bytes,
+                    )
                 projection, _, journal_sha256 = (
                     self._corroborate_run_evidence_locked(
                         directory,
                         run_id=run_id,
+                        projection_data=projection_data,
+                        journal_data=journal_data,
                     )
                 )
                 if journal_sha256 is None:
@@ -1592,7 +1668,11 @@ class RunStore:
                         journal_sha256=journal_sha256,
                     )
                 if reason_code == "legacy_effect_policy_uncorroborated":
-                    self._legacy_effect_policy_nodes(directory, projection)
+                    self._legacy_effect_policy_nodes(
+                        directory,
+                        projection,
+                        policy_data=policy_data,
+                    )
                 if "run_evidence_uncorroborated" in self._active_run_repair_reasons(
                     run_id
                 ):
@@ -1611,6 +1691,7 @@ class RunStore:
             JournalRecoveryError,
             KeyError,
             OSError,
+            StorageQuotaError,
             ValueError,
             WorkflowLockTimeout,
             json.JSONDecodeError,
@@ -1702,18 +1783,35 @@ class RunStore:
             )
 
     def _corroborate_run_evidence_locked(
-        self, directory: Path, *, run_id: str
+        self,
+        directory: Path,
+        *,
+        run_id: str,
+        projection_data: bytes | None = None,
+        journal_data: bytes | None = None,
     ) -> tuple[dict[str, object], str | None, str | None]:
+        if (projection_data is None) != (journal_data is None):
+            raise ValueError("projection and journal snapshots must be paired")
         projection_path = directory / "run.json"
         journal_path = directory / "events.jsonl"
-        projection_bytes = projection_path.read_bytes()
+        projection_bytes = (
+            projection_data
+            if projection_data is not None
+            else projection_path.read_bytes()
+        )
         projection = json.loads(projection_bytes)
         if not self._valid_projection(projection, run_id=run_id):
             raise JournalRecoveryError("run projection is not valid")
-        rebuilt = self._rebuild_projection(directory, run_id=run_id)
+        rebuilt = self._rebuild_projection(
+            directory,
+            run_id=run_id,
+            journal_data=journal_data,
+        )
         if _projection_digest(projection) != _projection_digest(rebuilt):
             raise JournalRecoveryError("run projection does not match journal head")
-        journal_bytes = journal_path.read_bytes()
+        journal_bytes = (
+            journal_data if journal_data is not None else journal_path.read_bytes()
+        )
         projection_sha256 = _sha256(projection_bytes)
         journal_sha256 = _sha256(journal_bytes)
         return projection, projection_sha256, journal_sha256
@@ -3896,10 +3994,19 @@ class RunStore:
                 return False
         return True
 
-    def _rebuild_projection(self, directory: Path, *, run_id: str) -> dict[str, object]:
+    def _rebuild_projection(
+        self,
+        directory: Path,
+        *,
+        run_id: str,
+        journal_data: bytes | None = None,
+    ) -> dict[str, object]:
         latest = None
         expected_sequence = 1
-        events = self._read_journal_events(directory)
+        events = self._read_journal_events(
+            directory,
+            journal_data=journal_data,
+        )
         for event in events:
             if event.get("sequence") != expected_sequence:
                 raise JournalRecoveryError(

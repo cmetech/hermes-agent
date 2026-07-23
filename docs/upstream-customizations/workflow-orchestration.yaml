@@ -2656,15 +2656,19 @@ upstream_changes:
   - indexed latest-active repair keyset selector
   - full-journal and legacy-policy unattended repair corroboration
   - aggregate repair evidence quota enforcement
+  - bounded immutable repair evidence snapshots
+  - snapshot-safe torn-tail normalization
   - cleanup-race fail-closed repair probing
   - leadership-term repair cursor reset
   - ordinary and scheduled candidate page repair isolation
   - v13 unrecoverable scheduled evidence sweep isolation
   tests:
+  - tests/plugins/workflow/test_fault_injection.py
+  - tests/plugins/workflow/test_notifications.py
   - tests/plugins/workflow/test_coordinator.py
   - tests/plugins/workflow/test_schedule_store_identity.py
   - tests/plugins/workflow/test_scheduled_runs.py
-  expected_commit_subject: 'fix(workflow): bound repair revalidation selection'
+  expected_commit_subject: 'fix(workflow): validate bounded repair snapshots'
   upstream_candidate: true
   merge_guidance: >-
     Exclude a run from both ordinary and exact-due scheduled coordinator
@@ -2682,11 +2686,16 @@ upstream_changes:
     Unrelated and notification history must never advance or starve this
     cursor. Keep a bounded lock wait and full journal-body corroboration;
     aggregate every relevant evidence file against max_run_bytes while
-    separately enforcing max_journal_bytes. Validate legacy policy digest and
-    schema before recording repair_verified; leave notification repairs to the
-    outbox cadence. Advance past locked or irreparable rows for fairness, reset
-    the cursor on a new leadership term, and eventually retry after wrapping
-    even while unrelated history grows. Concurrent cleanup between candidate
+    separately enforcing max_journal_bytes. Capture projection, journal, and
+    legacy policy through bounded reads, then replay, compare, hash, and
+    validate only those same immutable bytes so post-check growth or replacement
+    cannot enlarge the proof. Preserve valid missing-newline and invalid
+    incomplete-tail recovery with bounded compare-before-write normalization,
+    and hash the normalized snapshot. Validate legacy policy digest and schema
+    before recording repair_verified; leave notification repairs to the outbox
+    cadence. Advance past locked or irreparable rows for fairness, reset the
+    cursor on a new leadership term, and eventually retry after wrapping even
+    while unrelated history grows. Concurrent cleanup between candidate
     selection and directory resolution must fail the probe closed without
     aborting the healthy sweep. A later repair_verified transition must restore
     eligibility. Never delete, quarantine, rewrite, or infer damaged durable

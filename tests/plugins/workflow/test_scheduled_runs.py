@@ -177,7 +177,11 @@ def _legacy_repair_quota_case(
         return_value=(projection, store_module._projection_digest(projection), "a" * 64)
     )
     monkeypatch.setattr(store, "_corroborate_run_evidence_locked", corroborate)
-    monkeypatch.setattr(store, "_legacy_effect_policy_nodes", lambda *_args: [])
+    monkeypatch.setattr(
+        store,
+        "_legacy_effect_policy_nodes",
+        lambda *_args, **_kwargs: [],
+    )
     return store, admitted.run_id, evidence_bytes, corroborate
 
 
@@ -1673,6 +1677,177 @@ def test_revalidation_rejects_aggregate_evidence_over_run_quota(
         "legacy_effect_policy_uncorroborated",
     )
     corroborate.assert_not_called()
+
+
+def test_revalidation_rejects_valid_evidence_growth_before_snapshot_read(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 6, 11, 45, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(store, clocks, name="repair-snapshot-growth")
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="repair-snapshot-growth",
+    )
+    admitted = _admit(store, package, key="growth", schedule_at=None)
+    store.append_event(
+        admitted.run_id,
+        "semantic_progress",
+        {"step": "snapshot-growth"},
+    )
+    directory = store.run_directory(admitted.run_id)
+    projection_path = directory / "run.json"
+    journal_path = directory / "events.jsonl"
+    frames = journal_path.read_bytes().splitlines(keepends=True)
+    event = json.loads(frames[-1])
+    event["payload"] = {"padding": "x" * (32 * 1024)}
+    event.pop("frame_sha256")
+    _framed, encoded = store_module._encode_journal_frame(event)
+    grown_journal = b"".join((*frames[:-1], encoded))
+    store.max_run_bytes = (
+        projection_path.stat().st_size + journal_path.stat().st_size
+    )
+    assert len(grown_journal) + projection_path.stat().st_size > store.max_run_bytes
+    assert len(grown_journal) <= store.max_journal_bytes
+    assert store._transition_run_repair(
+        "run_evidence_uncorroborated",
+        run_id=admitted.run_id,
+        outcome="repair_required",
+    )
+    original_open = Path.open
+    mutated = False
+
+    def open_after_quota(path: Path, *args, **kwargs):
+        nonlocal mutated
+        mode = str(args[0] if args else kwargs.get("mode", "r"))
+        if path == projection_path and "r" in mode and "b" in mode and not mutated:
+            mutated = True
+            with original_open(journal_path, "wb") as stream:
+                stream.write(grown_journal)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_after_quota)
+
+    assert not store.revalidate_run_repair(
+        admitted.run_id,
+        "run_evidence_uncorroborated",
+    )
+    assert mutated
+    assert store._active_run_repair_reasons(admitted.run_id) == (
+        "run_evidence_uncorroborated",
+    )
+
+
+def test_legacy_policy_validation_uses_quota_accounted_snapshot(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 6, 11, 50, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(store, clocks, name="legacy-policy-snapshot")
+    workflow_path = workflow_writer(
+        tmp_path / "package",
+        name="legacy-policy-snapshot",
+    )
+    workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml").write_text(
+        "outward_action_nodes:\n- start\n",
+        encoding="utf-8",
+    )
+    admitted = _admit(
+        store,
+        load_workflow(workflow_path),
+        key="legacy-policy-snapshot",
+        schedule_at=None,
+    )
+    _rewrite_as_legacy_policy_projection(store, admitted.run_id)
+    assert store._transition_run_repair(
+        "legacy_effect_policy_uncorroborated",
+        run_id=admitted.run_id,
+        outcome="repair_required",
+    )
+    policy_path = store.run_directory(admitted.run_id) / "policy.yaml"
+    original_sync = store._sync_integrity_index
+    mutated = False
+
+    def sync_then_replace_policy(
+        connection,
+        *,
+        projection,
+        journal_sha256,
+    ) -> None:
+        nonlocal mutated
+        original_sync(
+            connection,
+            projection=projection,
+            journal_sha256=journal_sha256,
+        )
+        policy_path.write_text("outward_action_nodes: []\n", encoding="utf-8")
+        mutated = True
+
+    monkeypatch.setattr(store, "_sync_integrity_index", sync_then_replace_policy)
+
+    assert store.revalidate_run_repair(
+        admitted.run_id,
+        "legacy_effect_policy_uncorroborated",
+    )
+    assert mutated
+    assert store._active_run_repair_reasons(admitted.run_id) == ()
+
+
+def test_snapshot_revalidation_preserves_torn_tail_recovery(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 6, 11, 55, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(store, clocks, name="repair-snapshot-torn-tail")
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="repair-snapshot-torn-tail",
+    )
+    admitted = _admit(store, package, key="torn-tail", schedule_at=None)
+    store.append_event(
+        admitted.run_id,
+        "semantic_progress",
+        {"step": "complete"},
+    )
+    directory = store.run_directory(admitted.run_id)
+    journal_path = directory / "events.jsonl"
+    torn = b'{"frame_version":1,"schema_version":2,"sequence":999'
+    with journal_path.open("ab") as stream:
+        stream.write(torn)
+    assert store._transition_run_repair(
+        "run_evidence_uncorroborated",
+        run_id=admitted.run_id,
+        outcome="repair_required",
+    )
+
+    assert store.revalidate_run_repair(
+        admitted.run_id,
+        "run_evidence_uncorroborated",
+    )
+    assert journal_path.read_bytes().endswith(b"\n")
+    preserved = tuple(directory.glob("events.jsonl.torn-*"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == torn
+    assert store._active_run_repair_reasons(admitted.run_id) == ()
 
 
 def test_repair_revalidation_accepts_valid_journal_above_fixed_probe_sizes(
