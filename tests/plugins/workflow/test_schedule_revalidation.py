@@ -30,6 +30,7 @@ from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import WorkflowTrustStore, compute_package_digest
 import plugins.workflow.showcase as showcase_module
+import plugins.workflow.runner_binding as runner_binding_module
 import plugins.workflow.scheduled_revalidation as scheduled_revalidation_module
 
 
@@ -314,6 +315,146 @@ def test_execution_context_identity_changes_with_actual_runner_and_runtime() -> 
         })
         == 3
     )
+
+
+def test_same_binding_refreshes_runtime_before_scheduled_admission(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    config_source = {
+        "current": {
+            "model": {
+                "provider": "openrouter",
+                "default": "openai/gpt-5.3",
+            }
+        }
+    }
+    monkeypatch.setattr(
+        runner_binding_module,
+        "read_raw_config",
+        lambda: config_source["current"],
+    )
+    binding = runner_binding_module.production_workflow_runner_binding()
+
+    config_source["current"] = {
+        "model": {
+            "provider": "anthropic",
+            "default": "claude-sonnet-4-5",
+        }
+    }
+    store, _package, run_id, due, _coordinator, identity, epoch, context = (
+        _admit_scheduled_user(
+            home,
+            workflow_writer,
+            name="scheduled-config-changed-before-admission",
+            binding=binding,
+        )
+    )
+
+    assert context.runtime_capabilities == ExecutionRuntimeCapabilities(
+        api_mode="anthropic_messages",
+        hermes_managed_tool_loop=True,
+    )
+    admitted = store.load_run(run_id)
+    assert admitted["run_metadata"]["execution_identity"] == context.identity_digest
+
+    succeeded = _advance_with_binding(
+        store,
+        run_id,
+        due,
+        identity,
+        epoch,
+        binding,
+    )
+
+    assert succeeded["status"] == "succeeded"
+    assert succeeded["last_error"] is None
+    assert succeeded["schedule_revalidation"]["execution_identity"] == (
+        context.identity_digest
+    )
+
+
+def test_same_binding_rejects_runtime_change_after_scheduled_admission(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        "agent.skill_commands.build_preloaded_skills_prompt",
+        lambda *_args, **_kwargs: ("authenticated ascii skill", ["ascii-art"], []),
+    )
+    config_source = {
+        "current": {
+            "model": {
+                "provider": "openai-codex",
+                "default": "gpt-5.3-codex",
+            }
+        }
+    }
+    monkeypatch.setattr(
+        runner_binding_module,
+        "read_raw_config",
+        lambda: config_source["current"],
+    )
+    binding = runner_binding_module.production_workflow_runner_binding()
+    real_runner_requests: list[object] = []
+
+    def record_real_runner_request(
+        _runner,
+        request,
+        *,
+        is_cancelled=None,
+    ) -> PluginAgentRunResult:
+        assert is_cancelled is None or not is_cancelled()
+        real_runner_requests.append(request)
+        return PluginAgentRunResult(
+            final_response=json.dumps({"summary": "recorded", "simulated": True}),
+            session_id="scheduled-runtime-change-session",
+            provider="scheduled-runtime-change-trap",
+            model="offline-recording-model",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={"provider_attempts": 0},
+        )
+
+    monkeypatch.setattr(type(binding.real_runner), "run", record_real_runner_request)
+    store, run_id, due, identity, epoch = _admit_scheduled_showcase(
+        home,
+        showcase_id="ai-extensions",
+        binding=binding,
+    )
+
+    config_source["current"] = {
+        "model": {
+            "provider": "openai-codex",
+            "default": "gpt-5.3-codex",
+            "openai_runtime": "codex_app_server",
+        }
+    }
+    failed = _advance_with_binding(
+        store,
+        run_id,
+        due,
+        identity,
+        epoch,
+        binding,
+    )
+
+    assert failed["status"] == "failed"
+    assert failed["last_error"]["code"] == "schedule_revalidation_failed"
+    assert real_runner_requests == []
+    with store._connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_real_coordinator_revalidates_revoked_user_trust_before_any_claim(

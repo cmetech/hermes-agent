@@ -217,6 +217,76 @@ def test_production_binding_factory_declares_real_and_deterministic_runners(
     )
 
 
+def test_production_binding_refreshes_runtime_capabilities_per_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_source = {
+        "current": {
+            "model": {
+                "provider": "openrouter",
+                "default": "openai/gpt-5.3",
+            }
+        }
+    }
+    monkeypatch.setattr(
+        runner_binding_module,
+        "read_raw_config",
+        lambda: config_source["current"],
+    )
+
+    binding = runner_binding_module.production_workflow_runner_binding()
+    entitlement = AIEntitlementResolution("real")
+    initial_capabilities = ExecutionRuntimeCapabilities(
+        api_mode="chat_completions",
+        hermes_managed_tool_loop=True,
+    )
+    changed_capabilities = ExecutionRuntimeCapabilities(
+        api_mode="anthropic_messages",
+        hermes_managed_tool_loop=True,
+    )
+
+    assert binding.runtime_capabilities == initial_capabilities
+    assert (
+        binding.execution_context(
+            surface="background",
+            entitlement=entitlement,
+        ).runtime_capabilities
+        == initial_capabilities
+    )
+
+    config_source["current"] = {
+        "model": {
+            "provider": "anthropic",
+            "default": "claude-sonnet-4-5",
+        }
+    }
+
+    assert binding.runtime_capabilities == initial_capabilities
+    assert (
+        binding.execution_context(
+            surface="background",
+            entitlement=entitlement,
+        ).runtime_capabilities
+        == changed_capabilities
+    )
+
+    injected_binding = _binding(runtime_managed=True)
+    config_source["current"] = {
+        "model": {
+            "provider": "openai-codex",
+            "default": "gpt-5.3-codex",
+            "openai_runtime": "codex_app_server",
+        }
+    }
+    assert (
+        injected_binding.execution_context(
+            surface="background",
+            entitlement=entitlement,
+        ).runtime_capabilities
+        == initial_capabilities
+    )
+
+
 def _binding(*, runtime_managed: bool, runner_capable: bool = True):
     return WorkflowRunnerBinding(
         real_runner=object(),

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-from typing import TYPE_CHECKING, Literal, Mapping
+from typing import TYPE_CHECKING, Callable, Literal, Mapping
 
 from hermes_cli.config import get_compatible_custom_providers, read_raw_config
 from hermes_cli.runtime_provider import (
@@ -69,6 +69,9 @@ class WorkflowRunnerBinding:
     real_capabilities: RunnerCapabilities
     deterministic_capabilities: RunnerCapabilities
     runtime_capabilities: ExecutionRuntimeCapabilities
+    runtime_capabilities_provider: (
+        Callable[[], ExecutionRuntimeCapabilities] | None
+    ) = None
 
     def runner_for(self, entitlement: AIEntitlementResolution) -> object:
         return (
@@ -86,6 +89,11 @@ class WorkflowRunnerBinding:
             else self.deterministic_capabilities
         )
 
+    def _runtime_capabilities_for_context(self) -> ExecutionRuntimeCapabilities:
+        if self.runtime_capabilities_provider is not None:
+            return self.runtime_capabilities_provider()
+        return self.runtime_capabilities
+
     def execution_context(
         self,
         *,
@@ -96,7 +104,7 @@ class WorkflowRunnerBinding:
             surface=surface,
             entitlement=entitlement,
             runner_capabilities=self.capabilities_for(entitlement),
-            runtime_capabilities=self.runtime_capabilities,
+            runtime_capabilities=self._runtime_capabilities_for_context(),
         )
 
 
@@ -140,17 +148,26 @@ def _configured_provider_metadata(
     return provider, model_config, provider_config
 
 
+def _production_runtime_capabilities() -> ExecutionRuntimeCapabilities:
+    config = read_raw_config()
+    provider, model_config, provider_config = _configured_provider_metadata(config)
+    return classify_execution_runtime(
+        provider=provider,
+        model_config=model_config,
+        provider_config=provider_config,
+    )
+
+
 def production_workflow_runner_binding() -> WorkflowRunnerBinding:
     """Construct the immutable server-owned production runner declaration."""
     from agent.plugin_agent import PluginAgentRunner
 
-    config = read_raw_config()
-    provider, model_config, provider_config = _configured_provider_metadata(config)
     real_runner = PluginAgentRunner(plugin_id="workflow")
     deterministic_runner = entitled_agent_runner(
         AIEntitlementResolution("deterministic"),
         real_runner,
     )
+    runtime_capabilities = _production_runtime_capabilities()
     return WorkflowRunnerBinding(
         real_runner=real_runner,
         deterministic_runner=deterministic_runner,
@@ -160,11 +177,8 @@ def production_workflow_runner_binding() -> WorkflowRunnerBinding:
             )
         ),
         deterministic_capabilities=RunnerCapabilities(starts_request_mcp=False),
-        runtime_capabilities=classify_execution_runtime(
-            provider=provider,
-            model_config=model_config,
-            provider_config=provider_config,
-        ),
+        runtime_capabilities=runtime_capabilities,
+        runtime_capabilities_provider=_production_runtime_capabilities,
     )
 
 

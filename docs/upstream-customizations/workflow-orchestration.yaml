@@ -71,6 +71,7 @@ upstream_changes:
   change_class: workflow-security
   owner: workflow-orchestration
   files:
+  - .superpowers/sdd/task-2-report.md
   - .github/workflows/ci.yml
   - plugins/workflow/api_admission.py
   - plugins/workflow/catalog_api.py
@@ -88,6 +89,7 @@ upstream_changes:
   - RunnerCapabilities
   - ExecutionCapabilityContext
   - WorkflowRunnerBinding
+  - WorkflowRunnerBinding.runtime_capabilities_provider
   - execution_capability_context
   - background_execution_context
   - assess_package_execution
@@ -107,13 +109,16 @@ upstream_changes:
   expected_commit_subject: 'feat(workflow): bind execution capabilities'
   upstream_candidate: true
   merge_guidance: Preserve one immutable production runner binding shared by
-    catalog, detail, admission, scheduler, and coordinator paths. Cache only
-    authenticated raw showcase material, then recompute compatibility and risk
-    from the current execution surface, entitlement, runner, and runtime
-    capabilities. Capable AI showcase and trusted user MCP runs must admit;
-    incapable contexts must return the typed compatibility refusal before any
-    durable residue or provider traffic. Keep capability selection internal and
-    reject caller-supplied runner or capability authority.
+    catalog, detail, admission, scheduler, and coordinator paths. Keep its real
+    and deterministic runners plus runner capabilities fixed, but reclassify
+    production runtime capabilities from current raw config at every execution
+    context derivation; injected bindings without a provider remain immutable
+    snapshots. Cache only authenticated raw showcase material, then recompute
+    compatibility and risk from the current execution surface, entitlement,
+    runner, and runtime capabilities. Capable AI showcase and trusted user MCP
+    runs must admit; incapable contexts must return the typed compatibility
+    refusal before any durable residue or provider traffic. Keep capability
+    selection internal and reject caller-supplied runner or capability authority.
   removal_condition: Remove when upstream provides an equivalent immutable
     runner binding, context-derived compatibility projection, raw-only showcase
     cache, and fail-closed capability admission across every execution surface.
@@ -2582,6 +2587,7 @@ upstream_changes:
   change_class: workflow-runtime
   owner: workflow-orchestration
   files:
+  - .superpowers/sdd/task-1-report.md
   - plugins/workflow/coordinator.py
   - plugins/workflow/dashboard/plugin_api.py
   - plugins/workflow/sanitize.py
@@ -2652,6 +2658,7 @@ upstream_changes:
   - tests/scripts/test_workflow_merge_gate.py
   owned_symbols:
   - ExecutionCapabilityContext.identity_digest
+  - WorkflowRunnerBinding.runtime_capabilities_provider
   - ScheduledRunRevalidationError
   - showcase_scenario_digest
   - sealed_snapshot_digest
@@ -2684,8 +2691,12 @@ upstream_changes:
     the current locked projection, force-resolve the exact original catalog source,
     recompute compatibility before risk under the coordinator's actual server-owned
     runner and runtime, and require current exact user trust or force-reverified
-    showcase identity. Projected fields, cross-run handles, and replay cannot confer
-    authority. Missing, corrupt, revoked, replaced, restamped, or
+    showcase identity. The binding object, runners, and runner capabilities remain
+    immutable while production runtime classification refreshes from current raw
+    config at each admission, fire-time, and claim-time context derivation; injected
+    bindings without the provider remain snapshot-stable. Projected fields,
+    cross-run handles, and replay cannot confer authority. Missing, corrupt,
+    revoked, replaced, restamped, or
     capability-incompatible evidence must atomically terminalize as
     schedule_revalidation_failed with zero claims while retaining immutable run
     evidence. If a newly scheduled run's sealed package becomes invalid or
