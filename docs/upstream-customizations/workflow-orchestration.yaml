@@ -33,6 +33,8 @@ coverage:
     reason: Separate user-requested v3.0.1 release preparation.
   - commit: 3d6bd7f2cbd320ba14024d799159cbf452815acf
     reason: Separate user-requested v3.0.2 release preparation.
+  - commit: 966ad7f3e13a21193d356b0cbde4cc089e68d8be
+    reason: Separate user-requested v3.0.3 release preparation.
   - commit: bb6201e7872fdef7444495aa2649e06b0b0b277f
     reason: Mixed Task 1.7 commit force-added ignored SDD scratch; its guide change
       was re-emitted by 5691622a0a910d830f5cdc5ddb9fea3e0ea19bd7.
