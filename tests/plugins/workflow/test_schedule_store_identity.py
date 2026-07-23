@@ -136,6 +136,9 @@ def test_current_store_reinstalls_run_repair_lookup_index_on_every_open(
     store = RunStore(home)
     with store._connect() as connection:
         connection.execute("DROP INDEX IF EXISTS repair_events_run_reason_sequence")
+        connection.execute(
+            "DROP INDEX IF EXISTS repair_events_revalidation_sequence"
+        )
 
     reopened = RunStore(home)
 
@@ -146,7 +149,14 @@ def test_current_store_reinstalls_run_repair_lookup_index_on_every_open(
                 "PRAGMA index_info(repair_events_run_reason_sequence)"
             ).fetchall()
         )
+        revalidation_columns = tuple(
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA index_info(repair_events_revalidation_sequence)"
+            ).fetchall()
+        )
     assert columns == ("run_id", "reason_code", "sequence")
+    assert revalidation_columns == ("sequence", "run_id", "reason_code")
 
 
 def test_submicrosecond_schedule_survives_index_and_journal_recovery(

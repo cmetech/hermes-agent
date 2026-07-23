@@ -158,6 +158,12 @@ _UNATTENDED_REVALIDATION_REASONS = frozenset(
         "run_evidence_uncorroborated",
     }
 )
+_UNATTENDED_REVALIDATION_REASON_ORDER = tuple(
+    sorted(_UNATTENDED_REVALIDATION_REASONS)
+)
+_UNATTENDED_REVALIDATION_REASON_SQL = ",".join(
+    f"'{reason}'" for reason in _UNATTENDED_REVALIDATION_REASON_ORDER
+)
 _RUN_SCOPED_REPAIR_REASON_ORDER = tuple(sorted(_RUN_SCOPED_REPAIR_REASONS))
 _RUN_SCOPED_REPAIR_REASON_SQL = ",".join(
     f"'{reason}'" for reason in _RUN_SCOPED_REPAIR_REASON_ORDER
@@ -578,6 +584,13 @@ class RunStore:
                     );
                     CREATE INDEX IF NOT EXISTS repair_events_run_reason_sequence
                     ON repair_events(run_id, reason_code, sequence DESC);
+                    CREATE INDEX IF NOT EXISTS repair_events_revalidation_sequence
+                    ON repair_events(sequence, run_id, reason_code)
+                    WHERE outcome='repair_required'
+                    AND reason_code IN (
+                        'legacy_effect_policy_uncorroborated',
+                        'run_evidence_uncorroborated'
+                    );
                     CREATE TABLE IF NOT EXISTS cleanup_previews (
                         token_digest TEXT PRIMARY KEY,
                         created_at TEXT NOT NULL,
@@ -1461,55 +1474,39 @@ class RunStore:
         self,
         *,
         after: int | None,
-        limit: int = 64,
     ) -> tuple[dict[str, object] | None, int | None, bool]:
-        """Return one active evidence repair from a bounded event-log page."""
-        if limit <= 0:
-            raise ValueError("limit must be positive")
+        """Return one latest-active evidence repair after the keyset cursor."""
         with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT sequence, run_id, reason_code, outcome "
-                "FROM repair_events WHERE sequence>? "
-                "ORDER BY sequence LIMIT ?",
-                (after or 0, limit),
-            ).fetchall()
-            for row in rows:
-                reason_code = str(row["reason_code"])
-                run_id = row["run_id"]
-                if (
-                    run_id is None
-                    or reason_code not in _UNATTENDED_REVALIDATION_REASONS
-                    or str(row["outcome"]) != "repair_required"
-                ):
-                    continue
-                latest = connection.execute(
-                    "SELECT sequence, outcome FROM repair_events "
-                    "WHERE run_id=? AND reason_code=? "
-                    "ORDER BY sequence DESC LIMIT 1",
-                    (run_id, reason_code),
-                ).fetchone()
-                published = connection.execute(
-                    "SELECT 1 FROM runs WHERE run_id=? "
-                    "AND admission_state='published'",
-                    (run_id,),
-                ).fetchone()
-                if (
-                    latest is not None
-                    and int(latest["sequence"]) == int(row["sequence"])
-                    and str(latest["outcome"]) == "repair_required"
-                    and published is not None
-                ):
-                    return (
-                        {
-                            "sequence": int(row["sequence"]),
-                            "run_id": str(run_id),
-                            "reason_code": reason_code,
-                        },
-                        int(row["sequence"]),
-                        False,
-                    )
-        next_cursor = int(rows[-1]["sequence"]) if rows else after
-        return None, next_cursor, len(rows) < limit
+            row = connection.execute(
+                "SELECT repair.sequence, repair.run_id, repair.reason_code "
+                "FROM repair_events AS repair "
+                "INDEXED BY repair_events_revalidation_sequence "
+                "JOIN runs ON runs.run_id=repair.run_id "
+                "WHERE repair.sequence>? "
+                f"AND repair.reason_code IN ({_UNATTENDED_REVALIDATION_REASON_SQL}) "
+                "AND repair.outcome='repair_required' "
+                "AND repair.sequence=(SELECT MAX(latest.sequence) "
+                "FROM repair_events AS latest "
+                "WHERE latest.run_id=repair.run_id "
+                "AND latest.reason_code=repair.reason_code) "
+                "AND runs.admission_state='published' "
+                "AND runs.status IN ('queued','running','waiting_retry') "
+                "AND runs.execution_mode IN ('background','foreground') "
+                "ORDER BY repair.sequence LIMIT 1",
+                (after or 0,),
+            ).fetchone()
+        if row is None:
+            return None, after, True
+        sequence = int(row["sequence"])
+        return (
+            {
+                "sequence": sequence,
+                "run_id": str(row["run_id"]),
+                "reason_code": str(row["reason_code"]),
+            },
+            sequence,
+            False,
+        )
 
     @staticmethod
     def _legacy_effect_policy_nodes(
@@ -1558,13 +1555,15 @@ class RunStore:
                 ]
                 if reason_code == "legacy_effect_policy_uncorroborated":
                     evidence_paths.append(directory / "policy.yaml")
-                if (directory / "events.jsonl").stat().st_size > self.max_journal_bytes:
-                    return False
-                if any(
-                    path.stat().st_size > self.max_run_bytes
-                    for path in evidence_paths
-                    if path.name != "events.jsonl"
+                evidence_sizes = {
+                    path: path.stat().st_size for path in evidence_paths
+                }
+                if (
+                    evidence_sizes[directory / "events.jsonl"]
+                    > self.max_journal_bytes
                 ):
+                    return False
+                if sum(evidence_sizes.values()) > self.max_run_bytes:
                     return False
                 projection, _, journal_sha256 = (
                     self._corroborate_run_evidence_locked(

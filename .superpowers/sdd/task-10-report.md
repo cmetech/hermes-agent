@@ -66,16 +66,37 @@ Healthy submission completed before `run_directory()` raised `KeyError` from
 the selected repair probe, proving the exception escaped only because directory
 resolution preceded the method's intended fail-closed boundary.
 
+The final selector/quota closure began with:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_scheduled_runs.py -q \
+  -k 'revalidation_selector_skips_large_unrelated_history_in_one_call or
+      failed_revalidation_wraps_while_unrelated_history_keeps_growing or
+      revalidation_allows_exact_aggregate_evidence_quota or
+      revalidation_rejects_aggregate_evidence_over_run_quota'
+
+3 failed, 1 passed, 37 deselected in 1.0s
+```
+
+The selector failed to reach one active repair behind 10,000 unrelated events
+and failed to wrap while unrelated history kept growing. The over-cap case
+also entered corroboration because three individually small evidence files
+exceeded the aggregate run quota. The exact-total boundary passed as the
+control. The always-run partial selector-index test separately failed 1/1
+before the index existed.
+
 ## Implementation
 
 - `repair_events_run_reason_sequence(run_id, reason_code, sequence DESC)` is
   created in the always-run schema block, including current-schema reopen.
+  A partial `repair_events_revalidation_sequence` index contains only
+  unattended `repair_required` evidence/policy transitions.
 - Ordinary and scheduled exclusion predicates retain their existing range,
   keyset, queue-fence, and parity semantics while using indexed latest-event
   lookups.
-- The revalidation selector pages by `repair_events.sequence`, inspects a
-  bounded 64-row page, skips stale transitions and notification repairs, and
-  advances past failed or lock-contended candidates.
+- One indexed SQL keyset lookup selects only latest-active unattended repairs
+  joined to published, nonterminal coordinator-eligible runs. Unrelated and
+  notification history never advances the cursor.
 - The coordinator processes healthy candidate work before one repair attempt.
   A repaired run becomes eligible on the following sweep.
 - Evidence repair reads and rebuilds the full journal, compares it with
@@ -88,6 +109,9 @@ resolution preceded the method's intended fail-closed boundary.
 - Mutable run-directory resolution occurs inside the same guarded boundary as
   lock acquisition and evidence reads, so concurrent cleanup is treated as an
   unsuccessful probe and the event cursor still advances.
+- Relevant `run.json`, journal, and legacy policy bytes are aggregated against
+  `max_run_bytes`, while the journal separately remains bounded by
+  `max_journal_bytes`. Equality at the aggregate boundary is allowed.
 
 The lane never deletes, quarantines, synthesizes, or rewrites damaged run
 evidence. Oversized corrupt files are bounded by the store's configured
@@ -121,6 +145,12 @@ Closure race plus adjacent repair-lane regressions:
 6 passed, 31 deselected in 1.2s
 ```
 
+Complete focused closure set:
+
+```text
+13 passed in 1.8s
+```
+
 Affected runtime, migration, index, and coordinator coverage:
 
 ```text
@@ -130,7 +160,7 @@ scripts/run_tests.sh \
   tests/plugins/workflow/test_coordinator.py \
   tests/plugins/workflow/test_schema_migrations.py -q
 
-113 passed in 64.2s
+117 passed in 65.3s
 ```
 
 Additional checks:
@@ -152,9 +182,20 @@ Additional checks:
   journal quota.
 - Notification repair is skipped by the lane and remains active for outbox
   reconciliation.
+- One selector call reaches an active repair behind 10,000 unrelated events in
+  fewer than 500 SQLite opcodes; failed repairs wrap and retry while unrelated
+  history continues growing.
+- Aggregate evidence at exactly `max_run_bytes` is accepted; one byte over is
+  rejected before journal corroboration.
 
 ## Commit
 
 Original commit: `532c0274c fix(workflow): isolate repair-marked coordinator rows`
 
 Atomic review-fix subject: `fix(workflow): revalidate isolated repair rows`
+
+Cleanup-race follow-up:
+`af8f4c4a1 fix(workflow): tolerate disappearing repair rows`
+
+Final selector/quota subject:
+`fix(workflow): bound repair revalidation selection`

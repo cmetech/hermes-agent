@@ -2652,8 +2652,10 @@ upstream_changes:
   owned_symbols:
   - RunStore active run-repair coordinator exclusion
   - repair_events run/reason/descending-sequence lookup index
-  - bounded repair-event keyset revalidation lane
+  - partial latest-active repair revalidation sequence index
+  - indexed latest-active repair keyset selector
   - full-journal and legacy-policy unattended repair corroboration
+  - aggregate repair evidence quota enforcement
   - cleanup-race fail-closed repair probing
   - leadership-term repair cursor reset
   - ordinary and scheduled candidate page repair isolation
@@ -2662,7 +2664,7 @@ upstream_changes:
   - tests/plugins/workflow/test_coordinator.py
   - tests/plugins/workflow/test_schedule_store_identity.py
   - tests/plugins/workflow/test_scheduled_runs.py
-  expected_commit_subject: 'fix(workflow): revalidate isolated repair rows'
+  expected_commit_subject: 'fix(workflow): bound repair revalidation selection'
   upstream_candidate: true
   merge_guidance: >-
     Exclude a run from both ordinary and exact-due scheduled coordinator
@@ -2674,17 +2676,21 @@ upstream_changes:
     fence, created-at/run-id cursor order, and parity validation for every
     selected healthy row. Back every latest-transition lookup with the
     always-installed run/reason/descending-sequence index. After healthy
-    submissions, advance an event-sequence cursor through at most one eligible
-    evidence or legacy-policy repair per sweep, with a bounded lock wait and
-    full journal-body corroboration within configured store quotas. Validate
-    legacy policy digest and schema before recording repair_verified; leave
-    notification repairs to the outbox cadence. Advance past locked or
-    irreparable rows for fairness, reset the cursor on a new leadership term,
-    and eventually retry after wrapping the event log. Concurrent cleanup
-    between candidate selection and directory resolution must fail the probe
-    closed without aborting the healthy sweep. A later repair_verified
-    transition must restore eligibility. Never delete, quarantine, rewrite, or
-    infer damaged durable evidence.
+    submissions, use one indexed SQL keyset lookup over only latest-active
+    unattended repairs joined to published nonterminal coordinator-eligible
+    runs, then attempt at most one evidence or legacy-policy repair per sweep.
+    Unrelated and notification history must never advance or starve this
+    cursor. Keep a bounded lock wait and full journal-body corroboration;
+    aggregate every relevant evidence file against max_run_bytes while
+    separately enforcing max_journal_bytes. Validate legacy policy digest and
+    schema before recording repair_verified; leave notification repairs to the
+    outbox cadence. Advance past locked or irreparable rows for fairness, reset
+    the cursor on a new leadership term, and eventually retry after wrapping
+    even while unrelated history grows. Concurrent cleanup between candidate
+    selection and directory resolution must fail the probe closed without
+    aborting the healthy sweep. A later repair_verified transition must restore
+    eligibility. Never delete, quarantine, rewrite, or infer damaged durable
+    evidence.
   removal_condition: Remove when upstream provides equivalent latest-transition
     run-repair isolation, indexed lookup cost, and fair unattended evidence
     revalidation.

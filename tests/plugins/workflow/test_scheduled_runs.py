@@ -140,6 +140,47 @@ def _rewrite_as_legacy_policy_projection(store: RunStore, run_id: str):
     return store.load_run(run_id)
 
 
+def _legacy_repair_quota_case(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    clocks = _Clocks(datetime(2026, 4, 6, 9, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(store, clocks, name="legacy-repair-quota")
+    workflow_path = workflow_writer(
+        tmp_path / "package",
+        name="legacy-repair-quota",
+    )
+    workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml").write_text(
+        "outward_action_nodes:\n- start\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow_path)
+    admitted = _admit(store, package, key="legacy-quota", schedule_at=None)
+    projection = _rewrite_as_legacy_policy_projection(store, admitted.run_id)
+    assert store._transition_run_repair(
+        "legacy_effect_policy_uncorroborated",
+        run_id=admitted.run_id,
+        outcome="repair_required",
+    )
+    directory = store.run_directory(admitted.run_id)
+    evidence_bytes = sum(
+        (directory / filename).stat().st_size
+        for filename in ("run.json", "events.jsonl", "policy.yaml")
+    )
+    corroborate = MagicMock(
+        return_value=(projection, store_module._projection_digest(projection), "a" * 64)
+    )
+    monkeypatch.setattr(store, "_corroborate_run_evidence_locked", corroborate)
+    monkeypatch.setattr(store, "_legacy_effect_policy_nodes", lambda *_args: [])
+    return store, admitted.run_id, evidence_bytes, corroborate
+
+
 def test_future_scheduled_run_isolated_from_immediate_queue_consumers(
     tmp_path: Path,
     workflow_writer,
@@ -1479,6 +1520,159 @@ def test_revalidation_lane_leaves_notification_repairs_to_outbox_cadence(
     assert store._active_run_repair_reasons(notification.run_id) == (
         "notification_reconciliation_unverified",
     )
+
+
+def test_revalidation_selector_skips_large_unrelated_history_in_one_call(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 6, 11, 15, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(store, clocks, name="repair-selector-scaling")
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="repair-selector-scaling",
+    )
+    admitted = _admit(store, package, key="eligible", schedule_at=None)
+    with store._connect() as connection:
+        connection.execute(
+            "WITH RECURSIVE history(value) AS ("
+            "SELECT 1 UNION ALL SELECT value+1 FROM history WHERE value<10000"
+            ") INSERT INTO repair_events ("
+            "detected_at, reason_code, outcome, run_id, payload_json"
+            ") SELECT ?, 'unrelated_history', 'evidence_preserved', "
+            "'unrelated-' || value, '{}' FROM history",
+            (clocks.wall.isoformat(),),
+        )
+    assert store._transition_run_repair(
+        "run_evidence_uncorroborated",
+        run_id=admitted.run_id,
+        outcome="repair_required",
+    )
+    opcode_count = 0
+    original_connect = store._connect
+
+    def counted_connect():
+        connection = original_connect()
+
+        def count_opcode() -> int:
+            nonlocal opcode_count
+            opcode_count += 1
+            return 0
+
+        connection.set_progress_handler(count_opcode, 1)
+        return connection
+
+    monkeypatch.setattr(store, "_connect", counted_connect)
+
+    candidate, cursor, exhausted = store.repair_revalidation_candidate(
+        after=None,
+    )
+
+    assert candidate == {
+        "sequence": cursor,
+        "run_id": admitted.run_id,
+        "reason_code": "run_evidence_uncorroborated",
+    }
+    assert exhausted is False
+    assert opcode_count < 500
+
+
+def test_failed_revalidation_wraps_while_unrelated_history_keeps_growing(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 6, 11, 30, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(store, clocks, name="repair-selector-wrap")
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="repair-selector-wrap",
+    )
+    admitted = _admit(store, package, key="retry", schedule_at=None)
+    assert store._transition_run_repair(
+        "run_evidence_uncorroborated",
+        run_id=admitted.run_id,
+        outcome="repair_required",
+    )
+    candidate, cursor, exhausted = store.repair_revalidation_candidate(
+        after=None,
+    )
+    assert candidate is not None
+    assert exhausted is False
+
+    retries = 1
+    for batch in range(2):
+        with store._connect() as connection:
+            connection.execute(
+                "WITH RECURSIVE history(value) AS ("
+                "SELECT 1 UNION ALL SELECT value+1 FROM history WHERE value<100"
+                ") INSERT INTO repair_events ("
+                "detected_at, reason_code, outcome, run_id, payload_json"
+                ") SELECT ?, 'unrelated_history', 'evidence_preserved', "
+                "? || value, '{}' FROM history",
+                (clocks.wall.isoformat(), f"growing-{batch}-"),
+            )
+        candidate, cursor, exhausted = store.repair_revalidation_candidate(
+            after=cursor,
+        )
+        if exhausted:
+            cursor = None
+        if candidate is not None:
+            retries += 1
+
+    assert retries == 2
+    assert candidate is not None
+    assert candidate["run_id"] == admitted.run_id
+
+
+def test_revalidation_allows_exact_aggregate_evidence_quota(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, run_id, evidence_bytes, corroborate = _legacy_repair_quota_case(
+        tmp_path,
+        workflow_writer,
+        monkeypatch,
+    )
+    store.max_run_bytes = evidence_bytes
+
+    assert store.revalidate_run_repair(
+        run_id,
+        "legacy_effect_policy_uncorroborated",
+    )
+    corroborate.assert_called_once()
+
+
+def test_revalidation_rejects_aggregate_evidence_over_run_quota(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, run_id, evidence_bytes, corroborate = _legacy_repair_quota_case(
+        tmp_path,
+        workflow_writer,
+        monkeypatch,
+    )
+    store.max_run_bytes = evidence_bytes - 1
+
+    assert not store.revalidate_run_repair(
+        run_id,
+        "legacy_effect_policy_uncorroborated",
+    )
+    corroborate.assert_not_called()
 
 
 def test_repair_revalidation_accepts_valid_journal_above_fixed_probe_sizes(
