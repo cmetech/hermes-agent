@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
+import inspect
 import os
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -21,6 +23,7 @@ import plugins.workflow.notifications as notifications_module
 from plugins.workflow.sanitize import public_run_projection
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
+import plugins.workflow.store as store_module
 from plugins.workflow.store import (
     ForegroundExecutionConflict,
     JournalRecoveryError,
@@ -1295,7 +1298,7 @@ def test_exact_future_schedule_filtering_is_bounded_and_eventually_eligible(
     assert future_ids <= discovered
 
 
-def test_scheduled_candidate_generation_fixes_due_time_and_high_water(
+def test_scheduled_candidate_generation_fixes_due_time_and_admission_fence(
     tmp_path: Path,
     workflow_writer,
 ) -> None:
@@ -1323,11 +1326,11 @@ def test_scheduled_candidate_generation_fixes_due_time_and_high_water(
         ).run_id
         for index in range(2)
     ]
-    generation_observed, high_water = store.scheduled_coordinator_generation(
+    generation_observed, queue_sequence_fence = store.scheduled_coordinator_generation(
         now=clocks.wall
     )
     assert generation_observed == clocks.wall
-    assert high_water is not None
+    assert queue_sequence_fence == 2
     later = _admit(
         store,
         package,
@@ -1338,7 +1341,7 @@ def test_scheduled_candidate_generation_fixes_due_time_and_high_water(
     fenced, _cursor, exhausted = store.scheduled_coordinator_candidates(
         after=None,
         now=generation_observed,
-        through=high_water,
+        through_queue_sequence=queue_sequence_fence,
         limit=100,
     )
     unfenced, _cursor, _exhausted = store.scheduled_coordinator_candidates(
@@ -1350,6 +1353,110 @@ def test_scheduled_candidate_generation_fixes_due_time_and_high_water(
     assert [row["run_id"] for row in fenced] == captured
     assert exhausted is True
     assert [row["run_id"] for row in unfenced] == [*captured, later]
+    for invalid_fence in (-1, True, "2"):
+        with pytest.raises(
+            ValueError,
+            match="through_queue_sequence must be a non-negative integer",
+        ):
+            store.scheduled_coordinator_candidates(
+                after=None,
+                now=clocks.wall,
+                through_queue_sequence=invalid_fence,
+                limit=100,
+            )
+
+
+@pytest.mark.parametrize(
+    "later_created_at",
+    (
+        "2026-04-04T10:00:00+00:00",
+        "2026-04-04T09:59:59+00:00",
+    ),
+    ids=("same-created-at", "backward-created-at"),
+)
+def test_scheduled_generation_sequence_fence_excludes_post_capture_admission(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+    later_created_at: str,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 4, 12, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        max_queued_runs=4,
+        max_nonterminal_runs=4,
+        max_start_requests_per_minute=10,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(store, clocks, name="scheduled-created-key-fence")
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="scheduled-created-key-fence",
+    )
+    run_ids = iter(("1" * 32, "f" * 32, "0" * 32))
+    original_utc_now = store_module._utc_now
+    original_uuid4 = store_module.uuid.uuid4
+
+    def deterministic_run_uuid():
+        caller = inspect.currentframe().f_back
+        if caller is not None and caller.f_code.co_name == "_start_run_locked":
+            return SimpleNamespace(hex=next(run_ids))
+        return original_uuid4()
+
+    def admit_at(key: str, *, created_at: str) -> str:
+        snapshot = store.prepare_run_snapshot(package)
+        monkeypatch.setattr(store_module, "_utc_now", lambda: created_at)
+        try:
+            result = store.start_run(
+                RunAdmissionRequest(
+                    workflow_name=package.definition.name,
+                    definition_digest=snapshot.definition_digest,
+                    policy_digest=snapshot.policy_digest,
+                    input_manifest_digest=snapshot.input_manifest_digest,
+                    trigger_source="api",
+                    idempotency_key=key,
+                    concurrency_key=key,
+                    concurrency_policy="queue",
+                    execution_mode="background",
+                    run_metadata={"schedule_at": "2026-04-04T11:59:00Z"},
+                ),
+                immutable_snapshot=snapshot,
+            )
+        finally:
+            monkeypatch.setattr(store_module, "_utc_now", original_utc_now)
+        assert result.run_id is not None
+        return result.run_id
+
+    monkeypatch.setattr(store_module.uuid, "uuid4", deterministic_run_uuid)
+    captured = [
+        admit_at(
+            f"captured-clock-{index}",
+            created_at="2026-04-04T10:00:00+00:00",
+        )
+        for index in range(2)
+    ]
+    generation_observed, queue_sequence_fence = store.scheduled_coordinator_generation(
+        now=clocks.wall
+    )
+    assert queue_sequence_fence == 2
+    later = admit_at("later-clock", created_at=later_created_at)
+
+    fenced, _cursor, _exhausted = store.scheduled_coordinator_candidates(
+        after=None,
+        now=generation_observed,
+        through_queue_sequence=queue_sequence_fence,
+        limit=100,
+    )
+    unfenced, _cursor, _exhausted = store.scheduled_coordinator_candidates(
+        after=None,
+        now=clocks.wall,
+        limit=100,
+    )
+
+    assert later not in {str(row["run_id"]) for row in fenced}
+    assert {str(row["run_id"]) for row in unfenced} == {*captured, later}
 
 
 def test_scheduled_due_query_vm_work_is_bounded_before_future_rows(

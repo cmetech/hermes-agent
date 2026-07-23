@@ -1687,7 +1687,7 @@ def test_new_leadership_term_restarts_scheduled_paging_at_page_one(
     )
     service._scheduled_sweep_cursor = (store.load_run(run_ids[-1])["created_at"], run_ids[-1])
     service._scheduled_sweep_observed_at = now - timedelta(minutes=1)
-    service._scheduled_sweep_high_water = service._scheduled_sweep_cursor
+    service._scheduled_sweep_queue_sequence_fence = 1
     leadership_scheduler = MagicMock()
     leadership_scheduler.shutdown_deadline_seconds = 1.0
     monkeypatch.setattr(service, "_scheduler", lambda *_args, **_kwargs: leadership_scheduler)
@@ -1703,7 +1703,7 @@ def test_new_leadership_term_restarts_scheduled_paging_at_page_one(
     ) is True
     assert service._scheduled_sweep_cursor is None
     assert service._scheduled_sweep_observed_at is None
-    assert service._scheduled_sweep_high_water is None
+    assert service._scheduled_sweep_queue_sequence_fence is None
 
     scheduler = MagicMock()
     scheduler.submit.return_value = False

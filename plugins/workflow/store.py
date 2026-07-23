@@ -4447,7 +4447,7 @@ class RunStore:
         after: tuple[str, str] | None,
         now: datetime,
         not_before: datetime | None = None,
-        through: tuple[str, str] | None = None,
+        through_queue_sequence: int | None = None,
         limit: int = 100,
     ) -> tuple[tuple[dict[str, object], ...], tuple[str, str] | None, bool]:
         """Return one bounded exact-due page from the scheduled-run index."""
@@ -4476,12 +4476,14 @@ class RunStore:
             or not all(isinstance(value, str) and value for value in after)
         ):
             raise ValueError("after must be a created_at/run_id tuple")
-        if through is not None and (
-            not isinstance(through, tuple)
-            or len(through) != 2
-            or not all(isinstance(value, str) and value for value in through)
+        if through_queue_sequence is not None and (
+            isinstance(through_queue_sequence, bool)
+            or not isinstance(through_queue_sequence, int)
+            or through_queue_sequence < 0
         ):
-            raise ValueError("through must be a created_at/run_id tuple")
+            raise ValueError(
+                "through_queue_sequence must be a non-negative integer"
+            )
 
         second = observed.isoformat(timespec="seconds").removesuffix("+00:00")
         fractional_bound = f"{second}.{observed.microsecond:06d}"
@@ -4516,20 +4518,19 @@ class RunStore:
                 "(created_at>? OR (created_at=? AND run_id>?))"
             )
             outer_values.extend((after[0], after[0], after[1]))
-        if through is not None:
-            outer_clauses.append(
-                "(created_at<? OR (created_at=? AND run_id<=?))"
-            )
-            outer_values.extend((through[0], through[0], through[1]))
+        if through_queue_sequence is not None:
+            outer_clauses.append("queue_sequence<=?")
+            outer_values.append(through_queue_sequence)
         columns = "run_id, created_at, status, execution_mode, scheduled_at"
+        indexed_columns = f"{columns}, queue_sequence"
         due_query = (
-            f"SELECT {columns} FROM runs INDEXED BY runs_scheduled_queue "
+            f"SELECT {indexed_columns} FROM runs INDEXED BY runs_scheduled_queue "
             f"WHERE {common} AND scheduled_at<? "
             "UNION ALL "
-            f"SELECT {columns} FROM runs INDEXED BY runs_scheduled_queue "
+            f"SELECT {indexed_columns} FROM runs INDEXED BY runs_scheduled_queue "
             f"WHERE {common} AND scheduled_at=? "
             "UNION ALL "
-            f"SELECT {columns} FROM runs INDEXED BY runs_scheduled_queue "
+            f"SELECT {indexed_columns} FROM runs INDEXED BY runs_scheduled_queue "
             f"WHERE {common} AND scheduled_at=?"
         )
         outer_where = (
@@ -4567,52 +4568,29 @@ class RunStore:
         self,
         *,
         now: datetime,
-    ) -> tuple[datetime, tuple[str, str] | None]:
-        """Capture one fixed due instant and its inclusive finite scan tail."""
+    ) -> tuple[datetime, int]:
+        """Capture one fixed due instant and durable admission sequence fence."""
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("now must be timezone-aware")
         try:
             observed = now.astimezone(timezone.utc)
         except (OverflowError, ValueError) as exc:
             raise ValueError("now is out of range") from exc
-        second = observed.isoformat(timespec="seconds").removesuffix("+00:00")
-        fractional_bound = f"{second}.{observed.microsecond:06d}"
-        columns = "run_id, created_at, status, execution_mode, scheduled_at"
-        common = (
-            "admission_state='published' AND status='queued' "
-            "AND execution_mode IN ('background','foreground') "
-            "AND scheduled_at IS NOT NULL"
-        )
-        due_query = (
-            f"SELECT {columns} FROM runs INDEXED BY runs_scheduled_queue "
-            f"WHERE {common} AND scheduled_at<? "
-            "UNION ALL "
-            f"SELECT {columns} FROM runs INDEXED BY runs_scheduled_queue "
-            f"WHERE {common} AND scheduled_at=? "
-            "UNION ALL "
-            f"SELECT {columns} FROM runs INDEXED BY runs_scheduled_queue "
-            f"WHERE {common} AND scheduled_at=?"
-        )
         with self._connect() as connection:
             row = connection.execute(
-                f"SELECT {columns} FROM ({due_query}) "
-                "ORDER BY created_at DESC, run_id DESC LIMIT 1",
-                (
-                    fractional_bound,
-                    f"{second}Z",
-                    f"{fractional_bound}Z",
-                ),
+                "SELECT value FROM store_metadata WHERE key='queue_sequence'"
             ).fetchone()
-        if row is None:
-            return observed, None
-        projection = self.load_run(str(row["run_id"]))
-        canonical = self._scheduled_at_from_projection(
-            projection,
-            indexed=row["scheduled_at"],
-        )
-        if canonical is None or rfc3339_instant_is_after(canonical, observed):
-            raise JournalRecoveryError("scheduled due index selection mismatch")
-        return observed, (str(row["created_at"]), str(row["run_id"]))
+        try:
+            fence = int(row["value"]) if row is not None else 0
+        except (TypeError, ValueError) as exc:
+            raise JournalRecoveryError(
+                "scheduled coordinator queue sequence is invalid"
+            ) from exc
+        if fence < 0:
+            raise JournalRecoveryError(
+                "scheduled coordinator queue sequence is invalid"
+            )
+        return observed, fence
 
     def tail_events(
         self,

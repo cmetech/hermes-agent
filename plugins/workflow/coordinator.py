@@ -111,7 +111,7 @@ class WorkflowCoordinatorService:
         self._notification_repair_due_at = 0.0
         self._scheduled_sweep_cursor: tuple[str, str] | None = None
         self._scheduled_sweep_observed_at: datetime | None = None
-        self._scheduled_sweep_high_water: tuple[str, str] | None = None
+        self._scheduled_sweep_queue_sequence_fence: int | None = None
         self._health_lock = threading.Lock()
         self._health = BackgroundServiceHealth(
             state="starting",
@@ -341,24 +341,22 @@ class WorkflowCoordinatorService:
             self._scheduled_sweep_cursor = None
             (
                 self._scheduled_sweep_observed_at,
-                self._scheduled_sweep_high_water,
+                self._scheduled_sweep_queue_sequence_fence,
             ) = run_store.scheduled_coordinator_generation(
                 now=now,
             )
         scheduled_observed_at = self._scheduled_sweep_observed_at
         assert scheduled_observed_at is not None
-        if self._scheduled_sweep_high_water is None:
-            scheduled_continuation = ()
-            scheduled_exhausted = True
-        else:
-            scheduled_continuation, _scheduled_cursor, scheduled_exhausted = (
-                run_store.scheduled_coordinator_candidates(
-                    after=self._scheduled_sweep_cursor,
-                    now=scheduled_observed_at,
-                    through=self._scheduled_sweep_high_water,
-                    limit=100,
-                )
+        scheduled_fence = self._scheduled_sweep_queue_sequence_fence
+        assert scheduled_fence is not None
+        scheduled_continuation, _scheduled_cursor, scheduled_exhausted = (
+            run_store.scheduled_coordinator_candidates(
+                after=self._scheduled_sweep_cursor,
+                now=scheduled_observed_at,
+                through_queue_sequence=scheduled_fence,
+                limit=100,
             )
+        )
         scheduled_by_run = {
             str(row["run_id"]): row
             for row in (*fresh_scheduled, *scheduled_continuation)
@@ -494,7 +492,7 @@ class WorkflowCoordinatorService:
         if scheduled_exhausted and scheduled_processed:
             self._scheduled_sweep_cursor = None
             self._scheduled_sweep_observed_at = None
-            self._scheduled_sweep_high_water = None
+            self._scheduled_sweep_queue_sequence_fence = None
         else:
             self._scheduled_sweep_cursor = scheduled_cursor
         next_cursor = (
@@ -515,7 +513,7 @@ class WorkflowCoordinatorService:
     ) -> bool:
         self._scheduled_sweep_cursor = None
         self._scheduled_sweep_observed_at = None
-        self._scheduled_sweep_high_water = None
+        self._scheduled_sweep_queue_sequence_fence = None
         scheduler = self._scheduler(
             run_store,
             fence=ExecutionFence(identity.owner_id, epoch),

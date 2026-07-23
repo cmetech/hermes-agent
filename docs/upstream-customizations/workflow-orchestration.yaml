@@ -2618,22 +2618,24 @@ upstream_changes:
   - tests/plugins/workflow/test_showcase_catalog.py
   owned_symbols:
   - WorkflowCoordinatorService bounded scheduled scan generation
-  - RunStore scheduled coordinator generation high-water
+  - RunStore scheduled coordinator generation queue-sequence fence
   - verified showcase cache post-restore generation check
   tests:
   - tests/plugins/workflow/test_coordinator.py
   - tests/plugins/workflow/test_scheduled_runs.py
   - tests/plugins/workflow/test_showcase_catalog.py
-  expected_commit_subject: 'fix(workflow): bound scheduled scan generations'
+  expected_commit_subject: 'fix(workflow): fence scheduled scan admissions'
   upstream_candidate: true
   merge_guidance: Preserve the periodic durable cursor independently from the
     leadership-term scheduled generation. Re-sample the current due prefix
-    every sweep, while each continuation retains its fixed due instant and
-    inclusive created-at/run-id high-water so later admissions cannot extend
-    it. Under saturation reserve both periodic and scheduled continuation
-    heads within the shared 100-run cap. Cache tree hashing remains outside the
-    narrow lock; a changed generation after byte restoration must revert only
-    cache-added request-budget state and retry.
+    every sweep, while each continuation retains its fixed due instant and an
+    inclusive durable queue-sequence fence captured from store metadata so
+    same-timestamp or backward-clock admissions cannot extend it. Keep
+    created-at/run-id only for deterministic candidate and cursor order. Under
+    saturation reserve both periodic and scheduled continuation heads within
+    the shared 100-run cap. Cache tree hashing remains outside the narrow lock;
+    a changed generation after byte restoration must revert only cache-added
+    request-budget state and retry.
   removal_condition: Remove when upstream provides equivalent bounded scheduled
     liveness and post-restore cache-generation protection.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
