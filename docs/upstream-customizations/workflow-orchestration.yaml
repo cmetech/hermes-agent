@@ -33,6 +33,13 @@ coverage:
     reason: Separate user-requested v3.0.1 release preparation.
   - commit: 3d6bd7f2cbd320ba14024d799159cbf452815acf
     reason: Separate user-requested v3.0.2 release preparation.
+  - commit: 966ad7f3e13a21193d356b0cbde4cc089e68d8be
+    reason: Separate user-requested v3.0.3 release preparation.
+  - commit: bb6201e7872fdef7444495aa2649e06b0b0b277f
+    reason: Mixed Task 1.7 commit force-added ignored SDD scratch; its guide change
+      was re-emitted by 5691622a0a910d830f5cdc5ddb9fea3e0ea19bd7.
+  - commit: d3e40b9c7187b57df83886dbcb1fc586a9254ada
+    reason: Scratch-only Task 1.7 SDD report untracking cleanup.
 upstream_changes:
 - id: brand-aware-version-label
   change_class: branding-generic
@@ -61,6 +68,253 @@ upstream_changes:
     dependency-light Termux fast path.
   removal_condition: Remove when upstream exposes an equivalent generated
     product identity consumed by every version-output path.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-execution-capability-binding
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - .superpowers/sdd/task-2-report.md
+  - .superpowers/sdd/task-6-report.md
+  - .github/workflows/ci.yml
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/cli.py
+  - plugins/workflow/coordinator.py
+  - plugins/workflow/entitlement.py
+  - plugins/workflow/executors/ai.py
+  - plugins/workflow/executors/approval.py
+  - plugins/workflow/executors/loop.py
+  - plugins/workflow/runner_binding.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/showcase.py
+  - scripts/test_workflow_merge_gate.sh
+  owned_symbols:
+  - RunnerCapabilities
+  - ExecutionCapabilityContext
+  - WorkflowRunnerBinding
+  - WorkflowRunnerBinding.runtime_capabilities_provider
+  - execution_capability_context
+  - background_execution_context
+  - assess_package_execution
+  - production_workflow_runner_binding
+  - raw authenticated showcase cache
+  - catalog, detail, and admission verified showcase cache reuse
+  - context-specific compatibility and risk projection
+  - coordinator runner-binding injection
+  - fire-time AI entitlement corroboration
+  - scheduled fire-time forced showcase verification
+  tests:
+  - tests/plugins/workflow/test_runner_binding.py
+  - tests/plugins/workflow/test_ai_entitlement.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(workflow): bind execution capabilities'
+  upstream_candidate: true
+  merge_guidance: Preserve one immutable production runner binding shared by
+    catalog, detail, admission, scheduler, and coordinator paths. Keep its real
+    and deterministic runners plus runner capabilities fixed, but reclassify
+    production runtime capabilities from current raw config at every execution
+    context derivation; injected bindings without a provider remain immutable
+    snapshots. Cache only authenticated raw showcase material, then recompute
+    compatibility and risk from the current execution surface, entitlement,
+    runner, and runtime capabilities. Capable AI showcase and trusted user MCP
+    runs must admit; incapable contexts must return the typed compatibility
+    refusal before any durable residue or provider traffic. Keep capability
+    selection internal and reject caller-supplied runner or capability authority.
+    Let catalog, detail, and admission share one context-free authenticated
+    showcase cache entry, while every warm hit recomputes the live bundle tree
+    signature under the generation guard before restoring cached bytes. Reserve
+    forced full verification for scheduled fire-time revalidation; admission
+    must still recompute compatibility and risk for its current execution context.
+  removal_condition: Remove when upstream provides an equivalent immutable
+    runner binding, context-derived compatibility projection, raw-only showcase
+    cache, and fail-closed capability admission across every execution surface.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-honest-cli-ai-scope
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/showcase.py
+  - tests/plugins/workflow/test_showcase_ai_e2e.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_showcase_schedule_e2e.py
+  owned_symbols:
+  - preflight_showcase AI confirmation removal
+  - run_showcase ordinary CLI compatibility refusal
+  - obsolete explicit-ai-consent claim rejection
+  - schedule-kind confirmation preservation
+  tests:
+  - tests/plugins/workflow/test_showcase_ai_e2e.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_showcase_schedule_e2e.py
+  expected_commit_subject: 'fix(workflow): remove showcase AI confirmation gate'
+  upstream_candidate: true
+  merge_guidance: Preserve the absence of any AI-specific CLI confirmation
+    token or refusal. Both omitted and legacy optional token arguments must
+    reach ordinary deterministic-runner compatibility and reject package MCP
+    before store, staging, scheduler, runner, MCP, provider, or cron effects.
+    Keep the schedule-kind token derivation and refusal projection unchanged.
+  removal_condition: Remove when upstream provides equivalent no-token but
+    honestly incompatible CLI AI showcase behavior while preserving schedule
+    confirmation.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-schedule-confirmation-gate
+  change_class: workflow-testing
+  owner: workflow-orchestration
+  files:
+  - scripts/test_workflow_merge_gate.sh
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - showcase schedule confirmation base-gate membership
+  - test_showcase_schedule_confirmation_suite_is_promoted_into_base_gate
+  tests:
+  - tests/plugins/workflow/test_showcase_schedule_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'test(workflow): gate showcase schedule confirmation'
+  upstream_candidate: true
+  merge_guidance: Preserve exactly one base-gate selection for the showcase
+    schedule confirmation suite and keep it out of WORKFLOW_GATE_OPTOUTS so the
+    byte-pinned token derivation and exact refusal response cannot regress
+    outside the release gate.
+  removal_condition: Remove when upstream's base release gate selects an
+    equivalent exact schedule confirmation contract without an opt-out.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-desktop-ai-catalog-information
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/runtime.test.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/types/hermes.ts
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - tests/plugins/workflow/test_catalog_api.py
+  owned_symbols:
+  - CatalogEntry.requires_ai
+  - WorkflowCatalogEntry.requires_ai
+  - WorkflowDetailResponse.requires_ai
+  - optional WorkflowDefinition.requires_ai compatibility field
+  - CatalogRow AI inference informational line
+  - operations.workflowRequiresAi translations
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/i18n/runtime.test.ts
+  - tests/plugins/workflow/test_catalog_api.py
+  expected_commit_subject: 'feat(workflow): label AI catalog rows'
+  upstream_candidate: true
+  merge_guidance: Project requires_ai generically from authenticated showcase
+    scenario metadata in both catalog and detail responses, with false for
+    ordinary user workflows and no showcase-ID or source-name inference.
+    Desktop treats missing legacy payload fields as non-AI and renders the
+    localized line only when the field is true. Keep the line informational
+    so it never affects support, compatibility, trust, admission, or Run
+    enablement and disabled-reason precedence must remain unchanged.
+  removal_condition: Remove when upstream provides equivalent authenticated
+    generic AI metadata projection and four-locale informational Desktop
+    presentation without changing workflow eligibility or Run policy.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-authenticated-showcase-catalog-projection
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/showcase.py
+  owned_symbols:
+  - authenticated showcase projection budget reuse
+  - verified showcase package-digest projection gate
+  - _load_verified_showcase_cache_hit lock scope
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  expected_commit_subject: 'fix(workflow): project authenticated showcase cache'
+  upstream_candidate: true
+  merge_guidance: Preserve authenticated showcase bytes through catalog
+    compatibility and risk projection rather than reopening mutable bundle
+    resources. Require the recomputed risk package digest to match the cached
+    authenticated package digest before emitting verified-bundled provenance,
+    and copy large cached resource maps only after releasing the showcase cache
+    metadata lock.
+  removal_condition: Remove when upstream catalog projection uses one bounded
+    authenticated showcase snapshot through verification, compatibility, risk,
+    and verified provenance with an equivalent digest equality gate.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-projection-failure-isolation
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/catalog_api.py
+  owned_symbols:
+  - bounded showcase projection failure isolation
+  - class-only projection failure warning
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  expected_commit_subject: 'fix(workflow): preserve catalog on showcase projection failure'
+  upstream_candidate: true
+  merge_guidance: Preserve unrelated user catalog rows when authenticated
+    showcase projection encounters expected definition, capacity, resource, or
+    filesystem failures after verification. Omit the complete showcase set,
+    log only the exception class, and do not broaden the catch to programming or
+    security failures.
+  removal_condition: Remove when upstream isolates equivalent bounded showcase
+    projection failures without suppressing independently discovered user rows.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-per-run-ai-entitlement
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/entitlement.py
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/executors/ai.py
+  - plugins/workflow/executors/approval.py
+  - plugins/workflow/executors/base.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/showcase.py
+  - plugins/workflow/showcases/digests.json
+  - plugins/workflow/showcases/packages/laptop-diagnostic/workflows/laptop-diagnostic.yaml
+  - scripts/test_workflow_merge_gate.sh
+  owned_symbols:
+  - AIEntitlementResolution
+  - agent_backed_features
+  - derive_ai_entitlement
+  - verified_showcase_run_metadata
+  - DeterministicAgentRunner
+  - entitled_agent_runner
+  - NodeExecutionContext.ai_entitlement
+  - showcase agent-backed feature validation
+  tests:
+  - tests/plugins/workflow/fixtures/entitlement/v3.0.2.json
+  - tests/plugins/workflow/test_ai_entitlement.py
+  - tests/plugins/workflow/test_ai_e2e.py
+  - tests/plugins/workflow/test_coordinator.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_persisted_sessions.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'fix(workflow): isolate deterministic sessions'
+  upstream_candidate: true
+  merge_guidance: Preserve absence as a defined entitlement value. Current
+    verified-bundle markers and complete v3.0.2 showcase identity tuples must
+    derive deterministic without metadata upgrades or start-digest changes;
+    ordinary trusted workflows with no showcase shape remain real. Accept an
+    explicit real grant only when exact immutable identity corroborates the
+    digest-verified requires_ai scenario, and record execution_integrity before
+    runner selection on any mismatch. Classify command, prompt, loop, inline
+    agents, and approval rejection rework centrally; route every consumer
+    through the shared model-free runner under deterministic authority. Never
+    read or write the real persistent-session registry under deterministic
+    authority, so synthetic session identities cannot replace resumable real
+    sessions.
+  removal_condition: Remove when upstream provides equivalent immutable
+    per-run AI authority with v3.0.2 recovery/adoption compatibility and
+    fail-closed exact verified-scenario corroboration at every runner consumer.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: gateway-live-completion-eligibility
   change_class: model-selection-generic
@@ -454,18 +708,24 @@ upstream_changes:
   change_class: release-gate-generic
   owner: workflow-orchestration
   files:
+  - .superpowers/sdd/task-11-report.md
   - scripts/check_upstream_customizations.py
   owned_symbols:
+  - _EPHEMERAL_COVERAGE_PATHS
   - validate_diff_coverage
   - _range_base
   - _existed_at
   tests:
   - tests/scripts/test_check_upstream_customizations.py
-  expected_commit_subject: 'fix(release): enforce existing customization coverage'
+  expected_commit_subject: 'fix(release): ignore local sdd progress ledger'
   upstream_candidate: true
-  merge_guidance: Preserve baseline-aware classification so additive plugin and
-    script files remain low-friction while modifications, deletions, or renames
-    of upstream-existing plugin and script files require ledger ownership.
+  merge_guidance: Preserve baseline-aware classification so additive plugin
+    and script files remain low-friction while modifications, deletions, or
+    renames of upstream-existing plugin and script files require ledger
+    ownership. Ignore the exact ephemeral local path
+    .superpowers/sdd/progress.md even when historical coverage includes its add
+    or delete, without ignoring adjacent .superpowers/sdd artifacts or
+    excluding mixed production commits.
   removal_condition: Remove when upstream customization tracking distinguishes
     additive feature roots from existing upstream-owned files equivalently.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
@@ -1147,6 +1407,214 @@ upstream_changes:
   removal_condition: Remove when upstream provides equivalent real-middleware
     coverage for the complete Desktop workflow catalog-to-board contract.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-declared-input-contract
+  change_class: workflow-rest-adapter
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/input_contract.py
+  - plugins/workflow/store.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_store.py
+  owned_symbols:
+  - API_INPUT_VALUE_MAX_BYTES
+  - API_INPUT_AGGREGATE_MAX_BYTES
+  - WorkflowInputDeclaration
+  - workflow_input_declarations
+  - StartRunRequest.redact_invalid_values_for_validation
+  - StartRunRequest field-level blank validation
+  - validate_api_value_bounds
+  - validate_declared_api_values
+  - RunStore.prepare_run_snapshot verified_inputs channel
+  - InputSnapshotError.code
+  tests:
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_store.py
+  expected_commit_subject: 'fix(workflow): redact invalid input errors'
+  upstream_candidate: true
+  merge_guidance: Preserve server-derived declared-input versus legacy-flat
+    mode from the authenticated package. Legacy flat values, including subject
+    and arguments, retain their portable bounded idempotency contract. Keep
+    structural shape, entry-count, type, portable-name, and UTF-8 representability
+    checks in Pydantic while preserving the invariant that raw values survive
+    model parsing only for a fully valid values map. Invalid maps must reduce to
+    a safe field-level error, and blank workflow/idempotency checks must remain
+    field-level so model errors never retain input values. Apply the 64 KiB
+    per-value and 256 KiB aggregate key-plus-value byte caps only in the endpoint
+    path before package work so only byte breaches receive
+    workflow_input_too_large. Declared required, undeclared, and authenticated
+    showcase-reserved binding or fixture names must fail typed with no staging
+    or run residue; reservations never apply to ordinary packages. Enforce each
+    declaration's max_bytes for text, local-file, and digest-verified byte
+    channels in the immutable store snapshot, cap declared text at 64 KiB, and
+    keep raw text and bytes out of errors, metadata, projections, audit, logs,
+    and start-digest material.
+  removal_condition: Remove when upstream provides an equivalent typed,
+    authenticated two-mode input contract and immutable per-input byte bounds.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-declared-text-catalog-projection
+  change_class: workflow-rest-adapter
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  owned_symbols:
+  - CatalogInput.max_bytes
+  - WorkflowCatalogInput.max_bytes
+  - declared text Desktop support classification
+  - declared text effective byte-bound projection
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  expected_commit_subject: 'feat(workflow): project declared text inputs'
+  upstream_candidate: true
+  merge_guidance: Preserve explicit raw type-or-kind and required-field shape
+    classification, including malformed missing-kind declarations, while using
+    the shared authenticated input declaration only to derive a valid text
+    field's effective max_bytes as min(declared max_bytes, 64 KiB). Project the
+    optional bound identically in list and detail, omit it from every existing
+    scalar and file projection, and never expose defaults or raw values. Keep
+    ordinary declared text and legacy-flat packages run-supported while user
+    file inputs remain unsupported until an authenticated fixture channel owns
+    them.
+  removal_condition: Remove when upstream provides equivalent safe declared-text
+    catalog/detail projection and authenticated background admission without
+    changing legacy projection shapes.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-authenticated-showcase-inputs
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/showcase.py
+  - plugins/workflow/showcases/catalog.schema.json
+  - plugins/workflow/showcases/catalog.yaml
+  - plugins/workflow/showcases/digests.json
+  - plugins/workflow/showcases/packages/laptop-diagnostic/workflows/laptop-diagnostic.hermes.yaml
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_store.py
+  owned_symbols:
+  - ShowcaseScenario.input_fixtures
+  - ShowcaseScenario.input_value_bindings
+  - _fixture_path
+  - _authenticated_input_mappings
+  - _showcase_input_projection
+  - authenticated showcase public-value translation
+  - authenticated fixture read-once staging
+  - laptop-diagnostic three-of-five Desktop run support
+  - ai-extensions Revision 7 authenticated metadata
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  - tests/plugins/workflow/test_store.py
+  expected_commit_subject: 'feat(workflow): authenticate showcase inputs'
+  upstream_candidate: true
+  merge_guidance: Preserve fixture and binding mappings only as authenticated
+    catalog data. Reject unsafe, escaping, symlinked, non-regular, colliding,
+    undeclared, and kind-mismatched targets before admission. Translate public
+    values only after forced verification and pass only digest-manifest-covered
+    cached fixture bytes plus their expected SHA-256 through the verified-input
+    snapshot channel; never reopen the fixture in REST admission. Reserve every
+    internal target from callers, keep ordinary legacy and local-file channels
+    unchanged, and include only sealed input-manifest identity in durable run
+    state and idempotency material. Keep laptop-diagnostic as the third supported
+    bundled Desktop workflow and retain the guided ai-extensions metadata while
+    leaving CLI capability to the runner/runtime compatibility contract.
+  removal_condition: Remove when upstream provides equivalent authenticated
+    showcase binding, read-once fixture staging, run-support, isolation, and
+    installed-distribution guarantees.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-declared-text-and-fixture-inputs
+  change_class: desktop-workflow-ui
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/runtime.test.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/types/hermes.ts
+  owned_symbols:
+  - WorkflowDefinitionInput.max_bytes
+  - ReviewRunDialog declared text UTF-8 byte-bound validation
+  - ReviewRunDialog authenticated bundled fixture row
+  - public-only workflow admission value serialization
+  - operations.workflowRunInputBytes translations
+  - operations.workflowRunInputTooLarge translations
+  - operations.workflowRunBundledFixture translations
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/i18n/runtime.test.ts
+  expected_commit_subject: 'feat(desktop): render declared workflow inputs'
+  upstream_candidate: true
+  merge_guidance: Preserve UTF-8 byte counting against the server-projected
+    effective max_bytes in both visible Run disablement and submit-time
+    validation; exact-bound text remains admissible and over-bound text never
+    reaches the API. Keep authenticated file fixtures read-only and identified
+    only by their projected public field plus localized bundled-fixture copy;
+    never add an upload/path control or include file fields, authenticated
+    internal bindings, or fixture targets in caller values. Retain all existing
+    scalar controls and the authoritative support, compatibility, trust, and
+    coordinator Run-disable precedence across catalog and View handoff paths.
+  removal_condition: Remove when upstream Desktop provides equivalent declared
+    text and authenticated bundled-fixture rendering with UTF-8 limits,
+    public-only admission values, and the same four-locale coverage.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-laptop-diagnostic-real-middleware-e2e
+  change_class: workflow-verification
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - laptop-diagnostic real-middleware approval E2E
+  - laptop-diagnostic bounded deterministic rejection E2E
+  - laptop-diagnostic operator-projection canary isolation proof
+  - laptop-diagnostic merge-gate and native-matrix membership
+  tests:
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'test(workflow): cover laptop middleware tour'
+  upstream_candidate: true
+  merge_guidance: Preserve the public typed-symptom POST through the production
+    session-token middleware, background-only 202 admission, real coordinator
+    ownership, review-plan approval API continuation to success, and the
+    separate HERMES_OFFLINE rejection path through one deterministic rework to
+    its bounded cancelled outcome. Keep PluginAgentRunner calls at zero on the
+    rejection branch. Continue proving digest-authenticated fixture SHA
+    equality, sealed-input execution after the source fixture becomes invalid,
+    byte-level store/trust/run-directory boundaries, exact provenance,
+    entitlement and effective limits, and absence of raw symptom/fixture
+    canaries from metadata, list/detail/status, evidence, audit, errors, logs,
+    and start-digest material. Pin this E2E exactly once in both the base merge
+    gate and three-OS native workflow matrix, and retain installed-wheel fixture
+    availability proof without network or billable inference.
+  removal_condition: Remove when upstream provides equivalent offline real-
+    middleware laptop-diagnostic coverage, exact release-gate membership, and
+    installed-distribution fixture proof.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-catalog-desktop-trigger-verification
   change_class: workflow-verification
   owner: workflow-orchestration
@@ -1239,21 +1707,25 @@ upstream_changes:
   - plugins/workflow/showcases/packages/approval-gate/workflows/approval-gate.hermes.yaml
   - plugins/workflow/showcases/packages/approval-gate/workflows/approval-gate.yaml
   - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
   - tests/plugins/workflow/test_showcase_catalog.py
   - tests/plugins/workflow/test_showcase_evidence.py
+  - tests/scripts/test_workflow_merge_gate.py
   owned_symbols:
   - approval-gate bundled showcase package
   - operator-approval capability claim
   - invariant-based showcase bundle gate
   tests:
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
   - tests/plugins/workflow/test_showcase_catalog.py
   - tests/plugins/workflow/test_showcase_evidence.py
+  - tests/scripts/test_workflow_merge_gate.py
   expected_commit_subject: 'feat(workflow): add bundled approval gate showcase'
   upstream_candidate: true
   merge_guidance: Preserve the no-input, offline, non-AI single approval node,
     its digest registration, durable interaction_approved evidence, and
-    relation-based catalog/brand assertions. Do not weaken laptop-diagnostic or
-    repurpose its richer approval/rework tour.
+    exact catalog, portable, and brand membership assertions. Do not weaken
+    laptop-diagnostic or repurpose its richer approval/rework tour.
   removal_condition: Remove when upstream ships an equivalent digest-verified
     parameterless approval showcase with durable evidence reporting.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
@@ -1272,7 +1744,7 @@ upstream_changes:
   - load_verified_showcase_package
   - load_verified_showcase_packages
   - showcase_background_api_eligible
-  - bounded verified showcase cache and tree signature
+  - bounded generation-checked verified showcase cache and tree signature
   - visibility-permissive execution-strict compatibility deviation
   tests:
   - tests/plugins/workflow/test_installed_distribution_e2e.py
@@ -1282,7 +1754,9 @@ upstream_changes:
   upstream_candidate: true
   merge_guidance: Preserve rootless bundled loading, no-repair HTTP semantics,
     strict atomic bundle integrity, bounded digest reads, signature-invalidated
-    process caching, coalesced misses, and fresh admission re-verification.
+    process caching, narrow cache-lock scope with outside-lock hit verification,
+    generation-checked returns, coalesced misses, and fresh admission
+    re-verification.
     Environment incompatibility must remain a per-scenario projection concern,
     while CLI execution and API admission remain compatibility-strict.
   removal_condition: Remove when upstream has an equivalent bounded cached
@@ -1330,6 +1804,7 @@ upstream_changes:
   owned_symbols:
   - StartRunRequest.catalog_source
   - start_api_run showcase branch
+  - start_api_run coordinator-health exception boundary
   - verified bundled showcase run metadata
   tests:
   - tests/plugins/workflow/test_desktop_api.py
@@ -1338,7 +1813,8 @@ upstream_changes:
   upstream_candidate: true
   merge_guidance: Preserve fresh rootless bundle verification on every
     showcase admission, shared run-support derivation, strict compatibility and
-    execution preflight, digest/risk/snapshot equality, coordinator gating,
+    execution preflight, digest/risk/snapshot equality, coordinator gating with
+    retryable unavailability for bounded health-read exceptions,
     server-derived API/Desktop provenance, stable idempotency, showcase-only
     metadata, and background-only execution. A caller-provided path, trust
     boolean, scenario record, or provenance claim must never establish bundled
@@ -1671,4 +2147,823 @@ upstream_changes:
   removal_condition: Remove when upstream carries equivalent independent
     adversarial evidence, Medium-finding remediations, and explicit lower-
     severity follow-up disposition.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-catalog-verification-signal-and-projection-deduplication
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/catalog_api.py
+  - tests/plugins/workflow/test_catalog_api.py
+  owned_symbols:
+  - catalog showcase verification log signal
+  - exact class-only catalog log assertions
+  - workflow_catalog_run_support input_support reuse
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  expected_commit_subject: 'fix(workflow): surface catalog verification failures'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve fail-closed showcase omission while logging only the verification
+    exception class: absent bundle directories are informational and all other
+    verification failures are warnings. Assert the exact class-only message in
+    tests; never log bundle paths or exception text.
+    Reuse the already computed input-support classification in catalog and detail
+    projections so each row performs one input projection.
+  removal_condition: Remove when upstream provides equivalent sanitized showcase
+    verification observability and avoids duplicate input projection work.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-showcase-no-budget-read-once
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/showcase.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  owned_symbols:
+  - _read_verified_bytes
+  - _load_workflow_from_verified_bytes
+  - no-budget authenticated showcase parsing
+  tests:
+  - tests/plugins/workflow/test_showcase_catalog.py
+  expected_commit_subject: 'fix(workflow): preserve unbudgeted verified showcase bytes'
+  upstream_candidate: true
+  merge_guidance: Preserve the definition and sidecar bytes first consumed by
+    no-budget catalog authentication and parse only that snapshot. A mutation
+    after the package digest must neither reach the parser nor cause a disk
+    reread; the bounded read-budget accounting and cache locking remain intact.
+  removal_condition: Remove when upstream retains authenticated definition and
+    sidecar byte snapshots for unbudgeted showcase catalog parsing.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: desktop-workflow-reason-derived-run-gate
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/i18n/en.ts
+  owned_symbols:
+  - reason-derived workflow Run-disabled copy
+  - compatibility Run gate precedence
+  - lowercase verified bundle catalog label
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  expected_commit_subject: 'fix(desktop): derive workflow run availability'
+  upstream_candidate: true
+  merge_guidance: Preserve backend-authoritative run support and compatibility
+    decisions at every Desktop Run entry point. Select user copy from
+    run_support.reason rather than catalog source, fail closed for compatibility,
+    and order disabled reasons as support-unavailable, unsupported, incompatible,
+    then untrusted.
+  removal_condition: Remove when upstream Desktop derives every workflow Run
+    affordance from the same authoritative reason and compatibility contract.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-desktop-one-shot-scheduling
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/adapter.test.ts
+  - apps/desktop/src/app/workflows/adapter.ts
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/catalog-run-policy.ts
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/run-inspector.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/languages.test.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - apps/desktop/src/lib/hermes-api.ts
+  - apps/desktop/src/types/hermes.ts
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_runner_binding.py
+  owned_symbols:
+  - CatalogRunSupportReason.schedule_required
+  - workflow_catalog_run_support schedule projection
+  - generic showcase eligibility before schedule-required projection
+  - StartWorkflowRunRequest.scheduleAt
+  - workflowSupportsImmediateRun
+  - workflowSupportsScheduledRun
+  - canonicalWorkflowScheduleAt
+  - ReviewRunDialog Run later action
+  - scheduled_wait Desktop presentation
+  - scheduled intent success notification
+  - active-locale scheduled time formatting
+  - localized scheduled card accessible description
+  - explicit nullable scheduling projection fields
+  - four-locale one-shot scheduling copy
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_runner_binding.py
+  - tests/plugins/workflow/test_showcase_schedule_e2e.py
+  - tests/plugins/workflow/test_showcase_ai_e2e.py
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - apps/desktop/src/app/workflows/adapter.test.ts
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
+  - apps/desktop/src/i18n/languages.test.ts
+  expected_commit_subject: 'feat(workflow): add Desktop one-shot scheduling'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve server-derived scheduling eligibility: a scheduling
+    interaction without a time is schedule_required only after the generic
+    no-network showcase policy is satisfied, while a canonical future
+    schedule_at remains subject to the same policy. Desktop must consume that
+    typed reason, keep
+    immediate request bodies unchanged, normalize a timezone-aware local picker
+    to canonical UTC, and use the existing one-shot workflow scheduler and
+    cancellation mutation. Use the scheduled intent for new-run success copy,
+    the active locale for local time, and the same localized state in visible
+    and accessible card presentation. Keep compatibility, trust, input, coordinator, and
+    execution-capability gates authoritative on the server. Do not introduce
+    recurrence, a Cron bridge, consent machinery, caller-supplied capabilities,
+    or showcase-ID policy in the renderer.
+  removal_condition: Remove when upstream exposes equivalent server-authoritative
+    one-shot workflow scheduling in Desktop with typed support projection,
+    canonical time handling, scheduled-wait presentation, and four-locale
+    coverage while retaining the separate legacy CLI Cron showcase.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-run-execution-limits
+  change_class: workflow-runtime
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/executors/ai.py
+  - plugins/workflow/executors/approval.py
+  - plugins/workflow/executors/base.py
+  - plugins/workflow/models.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/schema.py
+  - plugins/workflow/store.py
+  owned_symbols:
+  - RunExecutionLimits
+  - RunExecutionLimits.resolve
+  - NodeExecutionContext.execution_limits
+  - RunScheduler._load_run_package
+  - RunScheduler._run_execution_limits
+  - RunScheduler._effective_retry_policy
+  - RunScheduler._persist_result combined retry cap
+  - NodeExecutionContext.max_provider_attempts remaining-budget grant
+  - RunStore.claim_node max_run_workers composition
+  - exact PluginAgentRunRequest execution-limit mapping
+  - AgentNodeExecutor failed provider-attempt accounting
+  - ApprovalExecutor failure, runner-exception, and authorization accounting
+  - conservative_provider_retry_count
+  - validated_provider_retry_count
+  tests:
+  - tests/plugins/workflow/test_ai_e2e.py
+  - tests/plugins/workflow/test_ai_executor.py
+  - tests/plugins/workflow/test_approval.py
+  - tests/plugins/workflow/test_deadlines.py
+  - tests/plugins/workflow/test_parallel_scheduler.py
+  - tests/plugins/workflow/test_provider_failures.py
+  - tests/plugins/workflow/test_retry.py
+  - tests/plugins/workflow/test_schema.py
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
+  expected_commit_subject: 'fix(workflow): preserve approval authorization failures'
+  upstream_candidate: true
+  merge_guidance: Preserve one frozen execution-limit record resolved from the
+    immutable run snapshot, with element-wise profile tightening at each claim
+    and executor boundary. Keep scheduler pools, lifecycle clocks, coordinator
+    thresholds, and admission quotas profile-global; retain the agent iteration
+    hard cap of 90 rather than adding a run-level max_iterations field. Explicit
+    node retry policies must remain min-capped by the run allowance. Failed AI
+    and approval rework execution must preserve an exact valid provider-attempt
+    count or conservatively consume the unknown granted remainder before workflow
+    retry, including retryable agent-runner exceptions in both normal AI and
+    approval rework. Catch PermissionError before OSError so pre-provider
+    authorization refusals remain non-retryable and never receive a synthetic
+    provider charge; never synthesize that charge for successful, paused, or
+    cancelled results. Each later workflow attempt receives only the effective
+    node/run allowance left after durable prior consumption, and an exhausted
+    replay must fail before executor invocation. Accept reported provider retries
+    only as non-boolean integers in the inclusive zero to grant-minus-one range.
+  removal_condition: Remove when upstream enforces equivalent immutable per-run
+    concurrency, worker, deadline, retry, resource-tree, and termination-grace
+    ceilings without resizing or retiming shared coordinator infrastructure.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: plugin-agent-request-mcp-lifecycle
+  change_class: agent-core-generic
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  - agent/bedrock_adapter.py
+  - agent/model_metadata.py
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - hermes_cli/runtime_provider.py
+  - plugins/workflow/executors/ai.py
+  - scripts/test_workflow_merge_gate.sh
+  owned_symbols:
+  - ExecutionRuntimeCapabilities
+  - classify_execution_runtime
+  - classify_resolved_execution_runtime
+  - _effective_execution_api_mode
+  - is_anthropic_bedrock_model
+  - PluginAgentRunner.starts_request_mcp
+  - PackageMCPUnavailable
+  - _run request MCP lifecycle
+  - AgentNodeExecutor package_mcp_unavailable mapping
+  - workflow request-MCP release-gate selection
+  tests:
+  - tests/agent/test_bedrock_adapter.py
+  - tests/agent/test_model_metadata.py
+  - tests/agent/test_plugin_agent.py
+  - tests/hermes_cli/test_execution_runtime_capabilities.py
+  - tests/hermes_cli/test_runtime_provider_resolution.py
+  - tests/plugins/workflow/test_ai_executor.py
+  - tests/plugins/workflow/test_node_mcp.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(workflow): start request MCP in plugin workers'
+  upstream_candidate: true
+  merge_guidance: Preserve the pure fail-closed prospective execution-runtime
+    classifier over configured provider/model/runtime metadata and its shared
+    effective-mode derivation with the actual runtime resolver. Resolve and
+    independently classify the actual worker runtime before starting any required request MCP.
+    Keep prospective Bedrock model routing in side-effect-free metadata rather
+    than importing the lazy-installing adapter, and treat both Claude Messages
+    and non-Claude Converse paths as Hermes-managed tool loops. Preserve legacy
+    no-config-read resolver short-circuits before loading optional model metadata.
+    The isolated worker must own discovery, registration, tool-policy ordering,
+    and process reaping from one outer cleanup boundary while restoring loader,
+    timeout, callbacks, hooks, inline tools, session state, and registry generation.
+    Keep incapable runtimes and failed required MCP startup provider-call-free,
+    and retain the exact package_mcp_unavailable node failure code. Do not change
+    cron's optional profile-global MCP behavior.
+  removal_condition: Remove when upstream provides an equivalent isolated plugin
+    agent request-MCP lifecycle, pure runtime capability classifier, and exact
+    fail-closed workflow error propagation across the native release matrix.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-ai-extensions-real-middleware-e2e
+  change_class: workflow-verification
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_ai_extensions_middleware_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - ai-extensions production-mounted middleware E2E
+  - ai-extensions exact base-gate and native-matrix selection
+  - Task 3.0 real request-MCP proof preservation
+  tests:
+  - tests/plugins/workflow/test_ai_extensions_middleware_e2e.py
+  - tests/plugins/workflow/test_node_mcp.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'test(workflow): cover AI showcase middleware run'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve the production-mounted offline catalog, detail, public admission,
+    and real coordinator path for the authenticated AI showcase. Keep capability
+    injection limited to the coordinator binding seam, require server-derived
+    real entitlement and Desktop background provenance, and assert the recording
+    runner receives sealed package MCP without treating it as MCP startup proof.
+    Keep incapable admission residue-free, explicit-real integrity failures
+    runner-free, and an actual app-server runtime change mapped to the existing
+    package_mcp_unavailable node error before provider traffic. Select this E2E
+    exactly once in both the base gate and native three-OS matrix without removing
+    the separate real-worker MCP lifecycle suite.
+  removal_condition: Remove when upstream carries equivalent production-mounted
+    AI showcase admission/coordinator coverage and exact release-gate selection
+    while retaining independent real-worker request-MCP proof.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-scheduled-store-identity
+  change_class: workflow-runtime
+  owner: workflow-orchestration
+  files:
+  - .superpowers/sdd/task-5-remediation-report.md
+  - plugins/workflow/store.py
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
+  - tests/plugins/workflow/test_schema_migrations.py
+  owned_symbols:
+  - RunStore schema 14 scheduled_at migration
+  - RunStore._scheduled_at_from_projection
+  - runs_scheduled_queue partial index
+  - scheduled projection/index parity recovery
+  - scheduled namespace and journal reconstruction
+  - reserved scheduled migration composition
+  - incomplete reserved namespace carry-through
+  - published scheduled backfill fault isolation
+  - namespace migration run-before-SQL lock order
+  - deterministic namespace lock-order probe
+  tests:
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
+  - tests/plugins/workflow/test_schema_migrations.py
+  expected_commit_subject: 'feat(workflow): preserve scheduled run identity'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve run_metadata.schedule_at in corroborated durable projection evidence
+    as the only schedule authority. Keep runs.scheduled_at nullable and derived
+    through one canonical UTC-Z projection helper across fresh reservation,
+    publication, schema backfill, namespace migration, admission-row rebuild,
+    integrity synchronization, damaged-index reconstruction, and journal-only
+    recovery. Namespace rebuilds must never copy a source SQL scheduled_at value.
+    Backfill corroborated final evidence for both published and reserved rows,
+    while leaving incomplete reserved rows for normal reservation reconciliation.
+    During v13-to-v14 backfill, leave uncorroborated published rows indexed with
+    a null derived schedule for ordinary run-scoped reconciliation; preserve the
+    admission index and generation, avoid global repair, and keep unrelated
+    admission usable.
+    When legacy namespace migration encounters an uncorroborated reserved row
+    whose final run directory is absent, retain its conflict-safe start digest,
+    derive its namespace, force the scheduled query value to null, and carry
+    the row only until ordinary reconciliation releases or quarantines it.
+    Never weaken corroboration for published rows or any reserved row whose
+    final directory exists, including malformed or partial durable evidence.
+    Namespace migration must acquire and pin all run evidence before opening its
+    SQLite write transaction, then revalidate the exact source rows, store
+    generation, and evidence digests before rebuilding. Retry bounded source
+    drift and never acquire or reacquire a run lock while holding SQLite write
+    authority. Keep the lock-order regression deterministic by completing its
+    independent SQLite probe before releasing the simulated live writer.
+    Detect projection/index disagreement, repair only from corroborated evidence,
+    and leave the run queued and the store fail-closed for operator repair.
+    Unscheduled run projections and start digests must remain byte-identical.
+  removal_condition: Remove when upstream provides equivalent schema migration,
+    projection-authoritative parity checks, scheduled partial indexing, and
+    recovery-complete derived schedule identity across every reconstruction path.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-scheduled-api-admission
+  change_class: workflow-runtime
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/schedule_time.py
+  - plugins/workflow/sanitize.py
+  - plugins/workflow/store.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
+  owned_symbols:
+  - StartRunRequest.schedule_at
+  - normalize_api_schedule_at
+  - SCHEDULE_INSTANT_MAX_CHARS
+  - normalize_rfc3339_instant
+  - rfc3339_instant_is_after
+  - scheduled API identity metadata
+  - scheduled queued admission
+  - public_run_projection schedule redaction
+  - scheduled mutation public projections
+  - scheduled request/projection digest parity
+  tests:
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
+  expected_commit_subject: 'feat(workflow): admit scheduled desktop runs'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve endpoint-owned typed schedule validation before store or package
+    access, including malformed JSON types, strict timezone awareness, explicit
+    rejection of the RFC 3339 unknown offset, overflow-safe canonical UTC-Z
+    normalization, exact preservation of arbitrary accepted fractional precision
+    through the 512-character durable metadata boundary, rejection of the first
+    oversized canonical value, trailing-zero equivalence, and a test-injected
+    current instant. Keep
+    schedule-only metadata starts with canonical schedule_at plus server-derived
+    catalog_source and risk_digest and is extended only by the exact identities
+    required by workflow-scheduled-fire-time-revalidation; existing top-level
+    definition, policy, and input digests remain authoritative.
+    Future runs must publish queued in background without node execution. Equivalent
+    offset forms must join one idempotent identity, distinct instants must conflict,
+    and journal recovery must reproduce the request digest. Keep unscheduled
+    metadata and golden digests byte-identical. Public run list/detail and every
+    mutation success or current-state error projection must hide all durable run
+    metadata and expose only canonical schedule_at plus
+    presentation_state=scheduled_wait while the run remains queued.
+  removal_condition: Remove when upstream carries an equivalent typed scheduled
+    Desktop admission boundary, schedule-only durable identity, queued publication,
+    digest parity, and metadata-redacted list/detail projection.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-scheduled-due-clocks
+  change_class: workflow-runtime
+  owner: workflow-orchestration
+  files:
+  - .superpowers/sdd/task-3-report.md
+  - plugins/workflow/cli.py
+  - plugins/workflow/coordinator.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/store.py
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_coordinator.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - RunStore ordinary and exact index-ranged scheduled coordinator candidate streams
+  - RunStore.try_promote_run atomic due recheck
+  - WorkflowCoordinatorService scheduled_not_due wake completion
+  - WorkflowCoordinatorService deterministic merge with saturated periodic liveness
+  - WorkflowCoordinatorService five-second monotonic sweep bound
+  - coordinator-to-scheduler wall and monotonic clock threading
+  - RunScheduler promotion wall-clock sampling
+  - scheduled wake and clock base-gate membership
+  tests:
+  - tests/plugins/workflow/test_coordinator.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(workflow): enforce scheduled due clocks'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve one server-injected timezone-aware wall clock across coordinator
+    due selection and scheduler promotion, with a separate injected monotonic
+    clock for sweep cadence. Complete a genuine early run_admitted wake once as
+    scheduled_not_due without stall, submit, promotion, claim, or retained wake
+    polling; let the bounded indexed scan rediscover it when due. Complete
+    not-due scheduled wakes outside the execution-order budget, then merge the
+    oldest current-due scheduled rows, ordinary cursor page, and actionable
+    wakes in deterministic created-at/run-id order. Preserve that exact global
+    order whenever the merged set fits the hard 100-run budget. Under
+    saturation, reserve the oldest row from the current periodic ordinary-cursor
+    page, process it first for deadline-safe liveness, and fill the remaining
+    99 slots from the normal order excluding that row. Preserve source ordering,
+    never duplicate the reserved row, and advance the ordinary cursor only
+    through its actually processed prefix. Re-sample the current due prefix on
+    every sweep so consecutive forward jumps cannot be hidden behind a stale
+    cursor. Split exact SQL due bounds into index-native range/equality branches
+    derived from the six-digit observed clock, excluding arbitrary-precision
+    same-second future rows before the bounded created-order sort and projection
+    corroboration, including the canonical prefix case where a longer fraction
+    sorts before the exact microsecond string.
+    Recheck due under the admission lock, run lock, and promotion transaction so
+    a backward wall jump refuses the compare-and-set and a later due sample
+    promotes exactly once. Keep every backoff and local-wake timeout at or below
+    five monotonic seconds, independent of far-future wall time and local offset.
+  removal_condition: Remove when upstream provides equivalent exact due-aware
+    coordinator paging, one-shot early-wake deferral, atomic promotion recheck,
+    saturated periodic-page liveness, prefix-safe cursor advancement, injected
+    scheduler clocks, and five-second monotonic sweep bounds.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-bounded-scheduled-page-and-cache-races
+  change_class: workflow-runtime
+  owner: workflow-orchestration
+  files:
+  - .superpowers/sdd/task-8-report.md
+  - plugins/workflow/coordinator.py
+  - plugins/workflow/showcase.py
+  - plugins/workflow/store.py
+  - tests/plugins/workflow/test_coordinator.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  owned_symbols:
+  - WorkflowCoordinatorService bounded scheduled scan generation
+  - RunStore scheduled coordinator generation queue-sequence fence
+  - verified showcase cache post-restore generation check
+  tests:
+  - tests/plugins/workflow/test_coordinator.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  - tests/plugins/workflow/test_showcase_catalog.py
+  expected_commit_subject: 'fix(workflow): fence scheduled scan admissions'
+  upstream_candidate: true
+  merge_guidance: Preserve the periodic durable cursor independently from the
+    leadership-term scheduled generation. Re-sample the current due prefix
+    every sweep, while each continuation retains its fixed due instant and an
+    inclusive durable queue-sequence fence captured from store metadata so
+    same-timestamp or backward-clock admissions cannot extend it. Keep
+    created-at/run-id only for deterministic candidate and cursor order. Under
+    saturation reserve both periodic and scheduled continuation heads within
+    the shared 100-run cap. Cache tree hashing remains outside the narrow lock;
+    a changed generation after byte restoration must revert only cache-added
+    request-budget state and retry.
+  removal_condition: Remove when upstream provides equivalent bounded scheduled
+    liveness and post-restore cache-generation protection.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-coordinator-repair-isolation
+  change_class: workflow-runtime
+  owner: workflow-orchestration
+  files:
+  - .superpowers/sdd/task-10-report.md
+  - .superpowers/sdd/task-13-report.md
+  - plugins/workflow/coordinator.py
+  - plugins/workflow/store.py
+  - tests/plugins/workflow/test_coordinator.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  owned_symbols:
+  - RunStore active run-repair coordinator exclusion
+  - repair_events run/reason/descending-sequence lookup index
+  - partial latest-active repair revalidation sequence index
+  - indexed latest-active repair keyset selector
+  - full-journal and legacy-policy unattended repair corroboration
+  - aggregate repair evidence quota enforcement
+  - bounded immutable repair evidence snapshots
+  - snapshot-safe torn-tail normalization
+  - authoritative journal projection adoption
+  - reconstructed schedule index resynchronization
+  - cleanup-race fail-closed repair probing
+  - leadership-term repair cursor reset
+  - ordinary and scheduled candidate page repair isolation
+  - v13 unrecoverable scheduled evidence sweep isolation
+  - v13 recoverable scheduled projection convergence
+  tests:
+  - tests/plugins/workflow/test_fault_injection.py
+  - tests/plugins/workflow/test_notifications.py
+  - tests/plugins/workflow/test_coordinator.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  expected_commit_subject: 'fix(workflow): restore recoverable repair projections'
+  upstream_candidate: true
+  merge_guidance: >-
+    Exclude a run from both ordinary and exact-due scheduled coordinator
+    candidate streams while the latest transition for any run-scoped repair
+    reason remains repair_required. Apply the exclusion inside each bounded SQL
+    query so repair-marked rows cannot consume page slots, pin keyset progress,
+    or abort projection parity checks for healthy peers. Preserve the scheduled
+    index range branches, exact due-time comparison, queue-sequence generation
+    fence, created-at/run-id cursor order, and parity validation for every
+    selected healthy row. Back every latest-transition lookup with the
+    always-installed run/reason/descending-sequence index. After healthy
+    submissions, use one indexed SQL keyset lookup over only latest-active
+    unattended repairs joined to published nonterminal coordinator-eligible
+    runs, then attempt at most one evidence or legacy-policy repair per sweep.
+    Unrelated and notification history must never advance or starve this
+    cursor. Keep a bounded lock wait and full journal-body corroboration;
+    aggregate every relevant evidence file against max_run_bytes while
+    separately enforcing max_journal_bytes. Capture projection, journal, and
+    legacy policy through bounded reads, then replay, compare, hash, and
+    validate only those same immutable bytes so post-check growth or replacement
+    cannot enlarge the proof. Treat all captured run.json bytes as
+    non-authoritative after corroboration fails: replay the captured
+    authoritative journal and atomically adopt its projection only after
+    bounded rereads prove both live files still equal the captured snapshots.
+    Journal identity/schema/body corruption, quota overflow, or changed
+    evidence must stay repair_required. Preserve valid missing-newline and
+    invalid incomplete-tail recovery with bounded compare-before-write
+    normalization, and hash the normalized snapshot. Restore SQLite
+    scheduled_at from the canonical rebuilt projection before integrity parity
+    in both unattended revalidation and direct-load reconstruction, without
+    weakening ordinary corroborated-load parity. Validate legacy policy digest
+    and schema before recording repair_verified; leave notification repairs to
+    the outbox cadence. Advance past locked or irreparable rows for fairness,
+    reset the cursor on a new leadership term, and eventually retry after
+    wrapping even while unrelated history grows. Concurrent cleanup between
+    candidate selection and directory resolution must fail the probe closed
+    without aborting the healthy sweep. A later repair_verified transition must
+    restore eligibility. Never delete, quarantine, or infer damaged durable
+    evidence; rewrite only run.json from the unchanged authoritative journal
+    under the bounded adoption rules above.
+  removal_condition: Remove when upstream provides equivalent latest-transition
+    run-repair isolation, indexed lookup cost, and fair unattended evidence
+    revalidation.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-scheduled-queued-consumer-isolation
+  change_class: workflow-runtime
+  owner: workflow-orchestration
+  files:
+  - .superpowers/sdd/task-1-report.md
+  - plugins/workflow/coordinator.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/sanitize.py
+  - plugins/workflow/schedule_time.py
+  - plugins/workflow/store.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  owned_symbols:
+  - run_is_scheduled_wait canonical projection predicate
+  - future scheduled queue-position and predecessor isolation
+  - due scheduled allow queue forbid policy preservation
+  - schedule_overlap_forbidden terminal evidence
+  - due-aware public run presentation
+  - backward-clock scheduled-wait queue dematerialization
+  - request-scoped list status and projection clock
+  - request-scoped detail and mutation response clocks
+  - cancel-before-due immutable evidence retention
+  - cancelled scheduled wake completion and cleanup eligibility
+  - scheduled foreground and retry isolation
+  tests:
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  expected_commit_subject: 'fix(workflow): isolate scheduled queue consumers'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve one canonical projection-derived scheduled-wait predicate using an
+    injected aware UTC wall clock. Future scheduled rows remain durably queued
+    with their original fairness sequence but have no immediate queue position,
+    lane ownership, predecessor effect, foreground owner, coordinator
+    eligibility, running count, or worker claim. They continue to count against
+    queued and nonterminal admission quotas and remain cancellable through the
+    existing desired-status path without deleting their immutable directory or
+    journal. At due promotion, evaluate the declared overlap policy atomically:
+    allow may overlap subject to capacity, queue materializes its original
+    position while waiting for the active lane, and forbid records terminal
+    schedule_overlap_forbidden before any node claim, deferring outbox
+    projection until after the promotion transaction so terminal evidence
+    remains journal-repairable. Public list, detail, and mutation projections
+    must derive scheduled_wait only while the canonical
+    instant is still future. A backward wall jump after a due run materializes
+    in the immediate queue must atomically clear its position and blocker while
+    preserving the original sequence. Run list status, presentation, retention
+    cutoff, and cursor pages must share one server-owned request observation.
+    Run detail plus every mutation success, current-state, stale-state, and
+    invalid-transition projection must likewise derive status and presentation
+    from one server-owned observation for that response.
+    Cancelled scheduled wakes complete without submission, and the retained
+    evidence enters ordinary terminal cleanup eligibility rather than receiving
+    schedule-specific deletion. Keep ordinary unscheduled promotion, foreground
+    recovery, retry timing, and cleanup retention behavior unchanged.
+  removal_condition: Remove when upstream carries equivalent future-scheduled
+    isolation across every queued consumer, atomic due-time overlap behavior,
+    and cancel-before-fire evidence retention.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-scheduled-fire-time-revalidation
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - .superpowers/sdd/task-4-report.md
+  - .github/workflows/ci.yml
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/runner_binding.py
+  - plugins/workflow/scheduled_revalidation.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/store.py
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_schedule_revalidation.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - ExecutionCapabilityContext.identity_digest
+  - WorkflowRunnerBinding.runtime_capabilities_provider
+  - ScheduledRunRevalidationError
+  - showcase_scenario_digest
+  - sealed_snapshot_digest
+  - scheduled_catalog_source_identity
+  - scheduled_execution_context
+  - revalidate_scheduled_run
+  - RunScheduler._authorize_scheduled_promotion
+  - RunScheduler._prepare_run_package
+  - _ScheduledPromotionAuthorization
+  - RunStore._scheduled_promotion_authorization
+  - RunStore._consume_scheduled_promotion_authorization
+  - RunStore._invalidate_scheduled_promotion_authorization
+  - RunStore._fail_scheduled_package_preparation
+  - RunStore.fail_scheduled_revalidation
+  - scheduled promotion authorization correlation
+  - schedule_revalidation_failed terminal evidence
+  - scheduled revalidation release-gate membership
+  tests:
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_schedule_revalidation.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'fix(workflow): revalidate scheduled authorization'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve scheduled-only exact canonical catalog root plus relative source,
+    package, every immutable execution-readable sealed snapshot byte,
+    context-dependent risk, execution-context, and authenticated showcase scenario
+    and bundle identity at admission. Immediately before atomic due promotion and
+    before any claim, consume a store-instance-owned opaque one-use verifier against
+    the current locked projection, force-resolve the exact original catalog source,
+    recompute compatibility before risk under the coordinator's actual server-owned
+    runner and runtime, and require current exact user trust or force-reverified
+    showcase identity. The binding object, runners, and runner capabilities remain
+    immutable while production runtime classification refreshes from current raw
+    config at each admission, fire-time, and claim-time context derivation; injected
+    bindings without the provider remain snapshot-stable. Projected fields,
+    cross-run handles, and replay cannot confer authority. Missing, corrupt,
+    revoked, replaced, restamped, or
+    capability-incompatible evidence must atomically terminalize as
+    schedule_revalidation_failed with zero claims while retaining immutable run
+    evidence. If a newly scheduled run's sealed package becomes invalid or
+    unreadable after the eager check but before execution-path package preparation,
+    consume its opaque authorization and record the same typed failure atomically;
+    isolate that failure so an advance-all peer still runs. Preserve exception
+    propagation for ordinary and legacy scheduled runs without server admission
+    evidence. Valid-but-changed package bytes must still reach promotion-bound
+    full-tree verification. Keep admission/fire-time trust-store byte bounds in
+    parity through the canonical catalog ceiling, while preserving the one
+    bounded read-only, lock-file-free fire-time snapshot. Defer notification
+    writes while the promotion
+    transaction is open and rely on its durable wake/journal reconciliation. A
+    crash before promotion may revalidate after restart; a durably correlated
+    promotion continues without duplicate promotion or revalidation. Keep immediate
+    and unscheduled metadata, start digests, execution, and failure behavior
+    byte-identical, with no caller-supplied capability and no consent or token
+    contract.
+  removal_condition: Remove when upstream provides equivalent scheduled-only
+    read-only fire-time authorization, atomic zero-claim terminal failure, durable
+    crash correlation, actual runner/runtime revalidation, and exact release-gate
+    coverage without changing immediate-run identity or behavior.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-one-shot-scheduling-middleware-e2e
+  change_class: workflow-testing
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_scheduling_middleware_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - authenticated one-shot scheduling middleware E2E
+  - scheduled early-wake zero-execution proof
+  - singleton completed run_admitted wake proof
+  - scheduled checkpoint exactly-once proof
+  - successful schedule-revalidation projection and promotion proof
+  - singleton terminal run_succeeded reconstruction proof
+  - cancel-before-fire retained-evidence proof
+  - coordinator restart and index-reconstruction scheduling parity
+  - scheduled AI fire-time capability matrix
+  - complete scheduling release-gate selection
+  tests:
+  - tests/plugins/workflow/test_scheduling_middleware_e2e.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'test(workflow): prove one-shot scheduling'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve a real session-token-authenticated Desktop middleware path from
+    verified showcase catalog selection through Run later admission, durable
+    queued scheduled_wait projection, genuine run_admitted wake completion as
+    scheduled_not_due, exact due-time revalidation, one coordinator/scheduler
+    execution, checkpoint evidence, and terminal success exactly once. Keep the
+    cancel-before-fire path on the authenticated mutation and retain its run
+    directory, journal, and audit evidence without later promotion or claims.
+    Reconstruct the canonical instant only from corroborated projection evidence
+    after coordinator restart and complete index loss. Exercise scheduled
+    ai-extensions with a local declared-capable runner/runtime and require
+    incapable-runner and codex_app_server substitutions to terminalize as
+    schedule_revalidation_failed before claim or provider traffic. Select this
+    E2E plus schedule identity, wake/clock, and revalidation suites exactly once
+    in both the base merge gate and native CI matrix, with no opt-out.
+  removal_condition: Remove when upstream carries equivalent authenticated,
+    deterministic one-shot scheduling E2E and exact cross-platform release-gate
+    coverage for recovery, clocks, cancellation, and fire-time authorization.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-v3-0-3-final-verification
+  change_class: workflow-documentation
+  owner: workflow-orchestration
+  files:
+  - .superpowers/sdd/revision-7-adversarial-remediation-report.md
+  - .superpowers/sdd/task-12-report.md
+  - .superpowers/sdd/task-14-report.md
+  - docs/backlog/v3.0.3-release-review-deferrals.md
+  - docs/reviews/2026-07-23-workflow-v3.0.3-verification.md
+  owned_symbols:
+  - Workflow v3.0.3 Revision 7 adversarial remediation evidence
+  - adversarial lower-confidence and pre-existing disposition register
+  - Workflow v3.0.3 Revision 7 final verification mapping
+  - failure-table-to-test mapping
+  - historical plan-completion gate and baseline-delta evidence
+  - first adversarial-remediation 51cd5c302 automated-gate evidence
+  - final FV-RT-A 6e1dc254cba7 remediation evidence
+  - final verified 70e4b1d8f branch-gate evidence
+  - final FV-RT-A-1 75e25d117 recovery-convergence evidence
+  - final 595/595 shared matrix and 556/556 Strategy A subtotal
+  - Task 10 and Task 11 implementation-review dispositions
+  - branch-merge versus release-readiness disposition
+  - exact seven OUTSTANDING manual-only release gates
+  - exact paired-brand SHA and manual-only handoff status
+  - non-normative v3.0.3 deferred-work register
+  tests:
+  - tests/scripts/test_workflow_merge_gate.py
+  - tests/plugins/workflow/test_ai_entitlement.py
+  - tests/plugins/workflow/test_node_mcp.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  - tests/plugins/workflow/test_schedule_revalidation.py
+  - tests/plugins/workflow/test_scheduling_middleware_e2e.py
+  expected_commit_subject: 'docs(workflow): record recoverable repair closure'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve four distinct evidence eras: historical a6be8121e
+    plan-completion, first adversarial-remediation 51cd5c302, final FV-RT-A
+    runtime-remediation 6e1dc254cba7 with verified branch HEAD 70e4b1d8f, and
+    FV-RT-A-1 recovery convergence 75e25d117. Do not imply the historical
+    1,045-test base gate reran at either remediation SHA. Retain the final
+    23-file 591/591 matrix and its exact 552/552 original Strategy A subtotal,
+    the first 590/1 timing result, isolated 1/1 and coordinator 39/39
+    diagnostics, installed-distribution 1/1, Desktop 144/144 across 16 files,
+    both TypeScript projects, merge inventory 26/26, customization tests 9/9
+    and live exit 0, lint/diff/commit/protected-surface checks, Task 10 APPROVE
+    with Critical 0 / Important 0 / Low 0, and Task 11 approved implementation
+    with its report-wording-only Low. Retain FV-RT-A-1 strict RED, focused 4/4,
+    six-file recovery 152/152, Task 13 Pass/Approved review, and the clean
+    23-file 595/595 matrix with its exact 556/556 original Strategy A subtotal
+    plus coordinator 39. Keep
+    named-coverage and failure-table mappings, earlier 536/536 adversarial
+    remediation evidence, carried-finding and
+    lower-confidence/pre-existing dispositions, exact paired-brand rehearsal
+    SHA, and all seven manual-only gates explicitly OUTSTANDING until operator
+    evidence exists. Branch merge readiness must remain distinct from release
+    readiness, which is BLOCKED only on those manual gates. Deferred backlog
+    files are non-normative and must not be interpreted as widening Revision 7.
+  removal_condition: Remove after equivalent v3.0.3 verification evidence and
+    deferred-work dispositions are carried in the upstream release record.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

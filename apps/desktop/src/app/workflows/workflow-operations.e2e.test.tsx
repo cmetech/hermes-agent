@@ -107,4 +107,66 @@ describe('workflow operations mounted adapter flow', () => {
     expect((cancel as HTMLButtonElement).disabled).toBe(false)
     expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull()
   })
+
+  it('cancels a scheduled wait through the existing mutation and repaints terminal state', async () => {
+    const scheduleAt = '2099-01-02T03:04:05Z'
+    let current = snapshot({
+      blocking_reason: 'scheduled_wait',
+      next_actions: ['cancel'],
+      pending_interaction: null,
+      presentation_state: 'scheduled_wait',
+      schedule_at: scheduleAt,
+      status: 'queued'
+    })
+    api.mockImplementation(async (request: ApiRequest) => {
+      if (request.path.startsWith('/api/plugins/workflow/runs?')) {
+        return { next_cursor: null, runs: [current], schema_version: 1 }
+      }
+      if (request.path === '/api/plugins/workflow/attention') {
+        return { items: [], next_cursor: null, schema_version: 1 }
+      }
+      if (request.path.includes('/events?')) {
+        return { cursor_reset: false, events: [], next_cursor: 0, schema_version: 1 }
+      }
+      if (request.path === '/api/plugins/workflow/runs/run-1/cancel') {
+        current = snapshot({
+          blocking_reason: null,
+          next_actions: [],
+          pending_interaction: null,
+          presentation_state: undefined,
+          schedule_at: scheduleAt,
+          state_version: 2,
+          status: 'cancelled'
+        })
+        return current
+      }
+      if (request.path === '/api/plugins/workflow/runs/run-1') {
+        return current
+      }
+      throw new Error(`unexpected workflow request: ${request.path}`)
+    })
+
+    render(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { mutations: { retry: false }, queries: { retry: false } } })}
+      >
+        <WorkflowsView />
+      </QueryClientProvider>
+    )
+    fireEvent.click(await screen.findByRole('tab', { name: 'Active board' }))
+    $workflowSelectedRunId.set('run-1')
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
+
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: { expected_version: 1 },
+          method: 'POST',
+          path: '/api/plugins/workflow/runs/run-1/cancel'
+        })
+      )
+    )
+    expect(await screen.findAllByText('cancelled')).toHaveLength(2)
+    expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull()
+  })
 })

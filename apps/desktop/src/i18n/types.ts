@@ -1401,6 +1401,7 @@ export interface Translations {
     workflowUntrusted: string
     workflowVerifiedBundle: string
     workflowIncompatible: string
+    workflowRequiresAi: string
     workflowNoInputs: string
     workflowInputCount: (count: number) => string
     workflowSourceProfile: string
@@ -1437,7 +1438,18 @@ export interface Translations {
     workflowRunTrust: string
     workflowRunRisk: string
     workflowRunInputs: string
+    workflowRunInputBytes: (used: number, limit: number) => string
+    workflowRunInputTooLarge: (input: string, limit: number) => string
+    workflowRunBundledFixture: string
     workflowRunStart: string
+    workflowRunAt: string
+    workflowRunLater: string
+    workflowRunLaterDescription: string
+    workflowRunScheduleInvalid: string
+    workflowScheduled: string
+    workflowScheduledAt: string
+    workflowScheduledLocal: string
+    workflowScheduledCanonical: string
     workflowRunRetry: string
     workflowRunStarted: string
     workflowRunAlreadyRunning: string

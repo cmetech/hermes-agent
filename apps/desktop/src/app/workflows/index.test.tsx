@@ -3,9 +3,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { I18nProvider } from '@/i18n'
 import type { WorkflowDefinition, WorkflowDetail, WorkflowRunSnapshot } from '@/types/hermes'
 
 import { WorkflowCatalog } from './catalog'
+import { RunInspector } from './run-inspector'
 import { $workflowSelectedRunId } from './store'
 
 const getWorkflowRun = vi.fn()
@@ -239,6 +241,62 @@ describe('WorkflowsView', () => {
     expect(onRunWorkflow).toHaveBeenCalledWith(item)
   })
 
+  it('shows authenticated AI metadata as information without changing Run policy', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowDefinitions.mockResolvedValue({
+      items: [
+        definition({ name: 'AI supported', requires_ai: true }),
+        definition({ name: 'Non-AI supported', requires_ai: false }),
+        definition({
+          compatibility: { level: 'unsupported', runnable: false },
+          name: 'AI unsupported inputs',
+          requires_ai: true,
+          run_support: { reason: 'unsupported_inputs', supported: false },
+          supported_inputs: { reason: 'unsupported_input_shape', supported: false },
+          trust_state: 'untrusted'
+        }),
+        definition({
+          compatibility: { level: 'unsupported', runnable: false },
+          name: 'AI incompatible runtime',
+          requires_ai: true,
+          trust_state: 'untrusted'
+        }),
+        definition({ name: 'AI untrusted', requires_ai: true, trust_state: 'untrusted' }),
+        definition({ name: 'Legacy payload' })
+      ],
+      truncated: false
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    const rows = within(await screen.findByRole('table', { name: 'Workflow catalog' }))
+      .getAllByRole('row')
+      .slice(1)
+
+    const aiCopy = 'Runs AI inference through your configured model provider'
+
+    expect(within(rows[0]!).getByText(aiCopy)).toBeTruthy()
+    expect(within(rows[1]!).queryByText(aiCopy)).toBeNull()
+    expect(within(rows[5]!).queryByText(aiCopy)).toBeNull()
+    expect((within(rows[0]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
+    expect((within(rows[1]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
+
+    const expectedDisabledReasons = [
+      'Run is unavailable because this workflow uses unsupported input fields.',
+      'This workflow is not compatible with the current Hermes runtime and cannot start.',
+      'Run is unavailable because this workflow failed trust verification.'
+    ]
+
+    for (const [index, expectedReason] of expectedDisabledReasons.entries()) {
+      const row = rows[index + 2]!
+      expect(within(row).getByText(aiCopy)).toBeTruthy()
+      const button = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
+      expect(button.disabled).toBe(true)
+      expect(document.getElementById(button.getAttribute('aria-describedby')!)?.textContent).toBe(expectedReason)
+    }
+  })
+
   it('keeps colliding bundled showcases distinct and presents their authoritative Run support honestly', async () => {
     $workflowSelectedRunId.set(null)
     listWorkflowDefinitions.mockResolvedValue({
@@ -251,11 +309,15 @@ describe('WorkflowsView', () => {
           trust_state: 'verified_bundled'
         }),
         definition({
+          inputs: [
+            { max_bytes: 4096, name: 'symptom', required: true, type: 'text' },
+            { name: 'evidence', required: true, type: 'file' }
+          ],
           name: 'laptop-diagnostic',
           precedence: 3,
-          run_support: { reason: 'unsupported_inputs', supported: false },
+          run_support: { reason: 'supported', supported: true },
           source: 'showcase',
-          supported_inputs: { reason: 'unsupported_input_shape', supported: false },
+          supported_inputs: { reason: 'flat_inputs', supported: true },
           trust_state: 'verified_bundled'
         }),
         definition({
@@ -269,7 +331,7 @@ describe('WorkflowsView', () => {
         definition({
           name: 'scheduling',
           precedence: 3,
-          run_support: { reason: 'showcase_cli_required', supported: false },
+          run_support: { reason: 'schedule_required', supported: false },
           source: 'showcase',
           trust_state: 'verified_bundled'
         })
@@ -280,24 +342,33 @@ describe('WorkflowsView', () => {
 
     await renderView(client, 'workflows')
 
-    const rows = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row').slice(1)
+    const rows = within(await screen.findByRole('table', { name: 'Workflow catalog' }))
+      .getAllByRole('row')
+      .slice(1)
+
     expect(rows).toHaveLength(5)
     expect(rows[0]?.textContent).toContain('Project')
     expect(rows[1]?.textContent).toContain('Bundled showcase')
-    expect(rows[1]?.textContent).toContain('Verified bundle')
+    expect(rows[1]?.textContent).toContain('verified bundle')
     expect((within(rows[1]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
+    expect(rows[2]?.textContent).toContain('2 inputs')
+    expect((within(rows[2]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
     expect(rows[3]?.textContent).toContain('Incompatible')
 
-    for (const row of rows.slice(2)) {
+    for (const row of rows.slice(3)) {
       expect(row.textContent).toContain('Bundled showcase')
-      expect(row.textContent).toContain('Verified bundle')
+      expect(row.textContent).toContain('verified bundle')
+      expect((within(row).getByRole('button', { name: 'View' }) as HTMLButtonElement).disabled).toBe(false)
+    }
+
+    for (const row of rows.slice(3, 4)) {
       const runButton = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
       expect(runButton.disabled).toBe(true)
       expect(document.getElementById(runButton.getAttribute('aria-describedby')!)?.textContent).toBe(
         'Run this bundled showcase from the CLI.'
       )
-      expect((within(row).getByRole('button', { name: 'View' }) as HTMLButtonElement).disabled).toBe(false)
     }
+    expect((within(rows[4]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
   })
 
   it('opens the workflow View dialog from the catalog action', async () => {
@@ -362,6 +433,43 @@ describe('WorkflowsView', () => {
     const disabledRun = within(rows[2]!).getByRole('button', { name: 'Run' })
     expect(document.getElementById(disabledRun.getAttribute('aria-describedby')!)?.textContent).toBe(
       'Run is unavailable because this workflow uses unsupported input fields.'
+    )
+  })
+
+  it('derives unavailable Run copy from support reason and compatibility rather than catalog source', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowDefinitions.mockResolvedValue({
+      items: [
+        definition({
+          name: 'Profile unsupported inputs',
+          run_support: { reason: 'unsupported_inputs', supported: false },
+          supported_inputs: { reason: 'unsupported_input_shape', supported: false }
+        }),
+        definition({
+          compatibility: { level: 'unsupported', runnable: false },
+          name: 'Profile incompatible runtime'
+        })
+      ],
+      truncated: false
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    const rows = within(await screen.findByRole('table', { name: 'Workflow catalog' }))
+      .getAllByRole('row')
+      .slice(1)
+
+    const unsupportedRun = within(rows[0]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement
+    const incompatibleRun = within(rows[1]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement
+
+    expect(unsupportedRun.disabled).toBe(true)
+    expect(document.getElementById(unsupportedRun.getAttribute('aria-describedby')!)?.textContent).toBe(
+      'Run is unavailable because this workflow uses unsupported input fields.'
+    )
+    expect(incompatibleRun.disabled).toBe(true)
+    expect(document.getElementById(incompatibleRun.getAttribute('aria-describedby')!)?.textContent).toBe(
+      'This workflow is not compatible with the current Hermes runtime and cannot start.'
     )
   })
 
@@ -597,6 +705,50 @@ describe('WorkflowsView', () => {
     const cancel = await screen.findByRole('button', { name: 'Cancel' })
     expect((cancel as HTMLButtonElement).disabled).toBe(false)
     expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull()
+  })
+
+  it('renders the server-derived scheduled wait with localized and canonical instants', async () => {
+    const scheduleAt = '2099-01-02T03:04:05Z'
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    getWorkflowRun.mockResolvedValue(
+      run({
+        blocking_reason: 'scheduled_wait',
+        next_actions: ['cancel'],
+        presentation_state: 'scheduled_wait',
+        schedule_at: scheduleAt,
+        status: 'queued'
+      })
+    )
+
+    await renderView(client)
+
+    expect(await screen.findByText('Scheduled')).toBeTruthy()
+    expect(screen.getByText(scheduleAt)).toBeTruthy()
+    expect(screen.getByText(new Date(scheduleAt).toLocaleString())).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('formats a scheduled local instant with the active non-English locale', () => {
+    const scheduleAt = '2099-01-02T03:04:05Z'
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    render(
+      <QueryClientProvider client={client}>
+        <I18nProvider configClient={null} initialLocale="ja">
+          <RunInspector
+            run={run({
+              blocking_reason: 'scheduled_wait',
+              next_actions: ['cancel'],
+              presentation_state: 'scheduled_wait',
+              schedule_at: scheduleAt,
+              status: 'queued'
+            })}
+          />
+        </I18nProvider>
+      </QueryClientProvider>
+    )
+
+    expect(screen.getByText(new Date(scheduleAt).toLocaleString('ja'))).toBeTruthy()
   })
 
   it('replaces event history when the backend reports a cursor gap', async () => {

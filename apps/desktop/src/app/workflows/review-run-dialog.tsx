@@ -17,12 +17,17 @@ import { ErrorState } from '@/components/ui/error-state'
 import { Input } from '@/components/ui/input'
 import { Loader } from '@/components/ui/loader'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Textarea } from '@/components/ui/textarea'
 import { useI18n } from '@/i18n'
 import { startWorkflowRun, WorkflowApiError } from '@/lib/hermes-api'
 import { Play } from '@/lib/icons'
 import type { WorkflowDefinition, WorkflowDefinitionInput, WorkflowDetail } from '@/types/hermes'
 
-import { workflowTrustAllowsRun } from './catalog-run-policy'
+import {
+  workflowSupportsImmediateRun,
+  workflowSupportsScheduledRun,
+  workflowTrustAllowsRun
+} from './catalog-run-policy'
 import { workflowDetailQueryOptions } from './detail-query'
 
 type FlatInputValue = boolean | number | string | undefined
@@ -36,6 +41,7 @@ interface AdmissionError {
     | 'coordinator'
     | 'network'
     | 'profile'
+    | 'schedule'
     | 'showcase_cli'
     | 'showcase_verification'
     | 'validation'
@@ -45,11 +51,12 @@ interface AdmissionError {
 interface AdmittedRun {
   disposition: string
   runId: string
+  scheduled: boolean
 }
 
 export interface ReviewRunDialogProps {
   onClose: () => void
-  onRunLocated: (runId: string, disposition: string) => Promise<void> | void
+  onRunLocated: (runId: string, disposition: string, scheduled: boolean) => Promise<void> | void
   profile: null | string
   returnFocusTo?: HTMLElement | null
   workflow: WorkflowDefinition
@@ -100,6 +107,10 @@ function admissionError(error: unknown): AdmissionError {
     return { kind: 'compatibility' }
   }
 
+  if (error.code === 'workflow_schedule_invalid' || error.code === 'workflow_schedule_required') {
+    return { kind: 'schedule' }
+  }
+
   if (error.code === 'workflow_showcase_cli_required') {
     return { kind: 'showcase_cli' }
   }
@@ -125,6 +136,40 @@ function initialValues(inputs: readonly WorkflowDefinitionInput[]): Record<strin
   )
 }
 
+export function canonicalWorkflowScheduleAt(value: string, now = new Date()): string | null {
+  const matched =
+    /^(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})T(?<hour>\d{2}):(?<minute>\d{2})(?::(?<second>\d{2}))?$/.exec(
+      value
+    )
+
+  if (!matched?.groups) {
+    return null
+  }
+
+  const year = Number(matched.groups.year)
+  const month = Number(matched.groups.month) - 1
+  const day = Number(matched.groups.day)
+  const hour = Number(matched.groups.hour)
+  const minute = Number(matched.groups.minute)
+  const second = Number(matched.groups.second ?? '0')
+  const instant = new Date(year, month, day, hour, minute, second)
+
+  if (
+    !Number.isFinite(instant.getTime()) ||
+    instant.getFullYear() !== year ||
+    instant.getMonth() !== month ||
+    instant.getDate() !== day ||
+    instant.getHours() !== hour ||
+    instant.getMinutes() !== minute ||
+    instant.getSeconds() !== second ||
+    instant.getTime() <= now.getTime()
+  ) {
+    return null
+  }
+
+  return instant.toISOString().replace('.000Z', 'Z')
+}
+
 function PreflightLoader({ label }: { label: string }) {
   return (
     <div aria-label={label} className="grid min-h-40 place-items-center" role="status">
@@ -147,9 +192,30 @@ function InputField({
   value: FlatInputValue
 }) {
   const { t } = useI18n()
+  const copy = t.operations
   const inputId = useId()
+  const counterId = useId()
   const errorId = useId()
-  const describedBy = error ? errorId : undefined
+  const byteCount = input.type === 'text' ? new TextEncoder().encode(String(value ?? '')).byteLength : 0
+  const byteLimit = input.type === 'text' && typeof input.max_bytes === 'number' ? input.max_bytes : null
+  const overByteLimit = byteLimit !== null && byteCount > byteLimit
+  const fieldError = error ?? (overByteLimit ? copy.workflowRunInputTooLarge(input.name, byteLimit) : undefined)
+
+  const describedBy =
+    [byteLimit !== null ? counterId : null, fieldError ? errorId : null].filter(Boolean).join(' ') || undefined
+
+  if (input.type === 'file') {
+    return (
+      <div aria-labelledby={inputId} className="grid gap-1" role="group">
+        <span className="text-xs font-medium text-(--ui-text-primary)" id={inputId}>
+          {input.name}
+        </span>
+        <p className="rounded-[2.5px] border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) px-2 py-1 text-xs text-(--ui-text-secondary)">
+          {copy.workflowRunBundledFixture}
+        </p>
+      </div>
+    )
+  }
 
   if (input.type === 'boolean' && input.required) {
     return (
@@ -157,16 +223,16 @@ function InputField({
         <label className="flex items-center gap-2 text-xs font-medium text-(--ui-text-primary)" htmlFor={inputId}>
           <Checkbox
             aria-describedby={describedBy}
-            aria-invalid={Boolean(error)}
+            aria-invalid={Boolean(fieldError)}
             checked={Boolean(value)}
             id={inputId}
             onCheckedChange={checked => onChange(checked === true)}
           />
           {input.name}
         </label>
-        {error ? (
+        {fieldError ? (
           <p className="text-xs text-destructive" id={errorId} role="alert">
-            {error}
+            {fieldError}
           </p>
         ) : null}
       </div>
@@ -186,7 +252,7 @@ function InputField({
           >
             <SelectTrigger
               aria-describedby={describedBy}
-              aria-invalid={Boolean(error)}
+              aria-invalid={Boolean(fieldError)}
               aria-label={input.name}
               id={inputId}
               size="sm"
@@ -210,9 +276,9 @@ function InputField({
             </Button>
           ) : null}
         </div>
-        {error ? (
+        {fieldError ? (
           <p className="text-xs text-destructive" id={errorId} role="alert">
-            {error}
+            {fieldError}
           </p>
         ) : null}
       </div>
@@ -234,7 +300,7 @@ function InputField({
           >
             <SelectTrigger
               aria-describedby={describedBy}
-              aria-invalid={Boolean(error)}
+              aria-invalid={Boolean(fieldError)}
               aria-label={input.name}
               id={inputId}
               size="sm"
@@ -261,9 +327,41 @@ function InputField({
             </Button>
           ) : null}
         </div>
-        {error ? (
+        {fieldError ? (
           <p className="text-xs text-destructive" id={errorId} role="alert">
-            {error}
+            {fieldError}
+          </p>
+        ) : null}
+      </div>
+    )
+  }
+
+  if (input.type === 'text') {
+    return (
+      <div className="grid gap-1">
+        <label className="text-xs font-medium text-(--ui-text-primary)" htmlFor={inputId}>
+          {input.name}
+        </label>
+        <Textarea
+          aria-describedby={describedBy}
+          aria-invalid={Boolean(fieldError)}
+          id={inputId}
+          onChange={event => onChange(event.target.value)}
+          size="sm"
+          value={String(value ?? '')}
+        />
+        {byteLimit !== null ? (
+          <p
+            aria-live="polite"
+            className={overByteLimit ? 'text-xs text-destructive' : 'text-xs text-(--ui-text-tertiary)'}
+            id={counterId}
+          >
+            {copy.workflowRunInputBytes(byteCount, byteLimit)}
+          </p>
+        ) : null}
+        {fieldError ? (
+          <p className="text-xs text-destructive" id={errorId} role="alert">
+            {fieldError}
           </p>
         ) : null}
       </div>
@@ -277,16 +375,16 @@ function InputField({
       </label>
       <Input
         aria-describedby={describedBy}
-        aria-invalid={Boolean(error)}
+        aria-invalid={Boolean(fieldError)}
         id={inputId}
         onChange={event => onChange(event.target.value)}
         size="sm"
         type={input.type === 'number' ? 'number' : 'text'}
         value={String(value ?? '')}
       />
-      {error ? (
+      {fieldError ? (
         <p className="text-xs text-destructive" id={errorId} role="alert">
-          {error}
+          {fieldError}
         </p>
       ) : null}
     </div>
@@ -302,11 +400,15 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
   const [preflightAttempt, setPreflightAttempt] = useState(0)
   const [values, setValues] = useState<Record<string, FlatInputValue>>({})
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
+  const [scheduleAt, setScheduleAt] = useState('')
+  const [scheduleError, setScheduleError] = useState(false)
+  const [retryScheduleAt, setRetryScheduleAt] = useState<string | null>(null)
   const [error, setError] = useState<AdmissionError | null>(null)
   const [admittedRun, setAdmittedRun] = useState<AdmittedRun | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
   const active = useRef(true)
+
   const focusTarget = useRef(
     returnFocusTo ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null)
   )
@@ -342,8 +444,16 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
     }
   }, [preflightAttempt, profile, queryClient, workflow.name, workflow.source])
 
-  const submit = async () => {
+  const submit = async (scheduled = false, canonicalRetry?: string) => {
     if (!detail || submitInFlight.current) {
+      return
+    }
+
+    const canonicalScheduleAt = scheduled ? (canonicalRetry ?? canonicalWorkflowScheduleAt(scheduleAt)) : undefined
+
+    if (scheduled && !canonicalScheduleAt) {
+      setScheduleError(true)
+
       return
     }
 
@@ -352,7 +462,21 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
 
     if (!admittedRun) {
       for (const input of detail.inputs) {
+        if (input.type === 'file') {
+          continue
+        }
+
         const value = values[input.name]
+
+        if (
+          input.type === 'text' &&
+          typeof input.max_bytes === 'number' &&
+          new TextEncoder().encode(String(value ?? '')).byteLength > input.max_bytes
+        ) {
+          nextFieldErrors[input.name] = copy.workflowRunInputTooLarge(input.name, input.max_bytes)
+
+          continue
+        }
 
         if (!input.required && value === undefined) {
           continue
@@ -378,6 +502,8 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
     setSubmitting(true)
     setError(null)
     setFieldErrors({})
+    setScheduleError(false)
+    setRetryScheduleAt(canonicalScheduleAt ?? null)
 
     let run = admittedRun
 
@@ -388,6 +514,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
             catalogSource: workflow.source,
             concurrencyPolicy: 'queue',
             idempotencyKey,
+            ...(canonicalScheduleAt ? { scheduleAt: canonicalScheduleAt } : {}),
             values: wireValues,
             workflow: workflow.name
           },
@@ -396,7 +523,8 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
 
         run = {
           disposition: response.result.admission_disposition,
-          runId: response.result.run_id
+          runId: response.result.run_id,
+          scheduled: canonicalScheduleAt !== undefined
         }
 
         if (active.current) {
@@ -405,7 +533,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
       }
 
       if (active.current) {
-        await onRunLocated(run.runId, run.disposition)
+        await onRunLocated(run.runId, run.disposition, run.scheduled)
       }
     } catch (caught) {
       if (!active.current) {
@@ -445,23 +573,45 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
     queueMicrotask(() => target?.focus())
   }
 
-  const blocked =
-    !detail ||
-    !detail.coordinator.healthy ||
-    detail.compatibility.runnable !== true ||
-    detail.run_support?.supported !== true ||
-    !workflowTrustAllowsRun(detail.trust_state) ||
-    detail.inputs.some(input => input.type === 'enum' && enumValues(detail, input.name).length === 0)
-
   const runSupport = detail?.run_support
-  const runSupportMessage =
+
+  const runSupportCopy = {
+    schedule_required: null,
+    showcase_cli_required: copy.workflowRunShowcaseFromCli,
+    supported: null,
+    unsupported_inputs: copy.workflowRunUnsupportedInputs
+  }
+
+  const runDisabledReason =
     detail && !runSupport
       ? copy.workflowRunSupportUnavailable
-      : detail && runSupport?.supported === false
-        ? detail.source === 'showcase'
-          ? copy.workflowRunShowcaseFromCli
-          : copy.workflowRunUnsupportedCommand(workflow.name)
-        : null
+      : detail && runSupport && !workflowSupportsScheduledRun(runSupport)
+        ? runSupportCopy[runSupport.reason]
+        : detail && detail.compatibility.runnable !== true
+          ? copy.workflowRunIncompatible
+          : detail && !workflowTrustAllowsRun(detail.trust_state)
+            ? copy.workflowRunUntrusted
+            : detail && !detail.coordinator.healthy
+              ? copy.workflowRunCoordinatorUnavailable
+              : null
+
+  const runSupportMessage =
+    (runSupport?.supported === false && runSupport.reason !== 'schedule_required') || !runSupport
+      ? runDisabledReason
+      : null
+
+  const commonBlocked =
+    !detail ||
+    Boolean(runDisabledReason) ||
+    detail.inputs.some(
+      input =>
+        input.type === 'text' &&
+        typeof input.max_bytes === 'number' &&
+        new TextEncoder().encode(String(values[input.name] ?? '')).byteLength > input.max_bytes
+    ) ||
+    detail.inputs.some(input => input.type === 'enum' && enumValues(detail, input.name).length === 0)
+  const immediateBlocked = commonBlocked || !workflowSupportsImmediateRun(runSupport)
+  const scheduledBlocked = commonBlocked || !workflowSupportsScheduledRun(runSupport)
 
   const admissionErrorMessages: Partial<Record<AdmissionError['kind'], string>> = {
     catalog_source: copy.workflowRunCatalogSourceInvalid,
@@ -470,9 +620,11 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
     coordinator: copy.workflowRunCoordinatorUnavailable,
     network: copy.workflowRunNetworkError,
     profile: copy.workflowRunProfileUnavailable,
+    schedule: copy.workflowRunScheduleInvalid,
     showcase_cli: copy.workflowRunShowcaseFromCli,
     showcase_verification: copy.workflowRunShowcaseVerificationFailed
   }
+
   const errorMessage =
     error && !(error.kind === 'validation' && error.field)
       ? admissionErrorMessages[error.kind] || error.message || copy.workflowRunValidationError
@@ -543,6 +695,31 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
                 ))}
               </fieldset>
             ) : null}
+            {!admittedRun ? (
+              <section className="grid gap-1 border-t border-(--ui-stroke-tertiary) pt-3">
+                <label className="text-xs font-medium text-(--ui-text-primary)" htmlFor="workflow-run-at">
+                  {copy.workflowRunAt}
+                </label>
+                <Input
+                  aria-describedby={scheduleError ? 'workflow-run-at-error' : undefined}
+                  aria-invalid={scheduleError}
+                  id="workflow-run-at"
+                  onChange={event => {
+                    setScheduleAt(event.target.value)
+                    setScheduleError(false)
+                  }}
+                  size="sm"
+                  type="datetime-local"
+                  value={scheduleAt}
+                />
+                <p className="text-xs text-(--ui-text-tertiary)">{copy.workflowRunLaterDescription}</p>
+                {scheduleError ? (
+                  <p className="text-xs text-destructive" id="workflow-run-at-error" role="alert">
+                    {copy.workflowRunScheduleInvalid}
+                  </p>
+                ) : null}
+              </section>
+            ) : null}
             {runSupportMessage ? (
               <Alert variant="warning">
                 <AlertDescription>{runSupportMessage}</AlertDescription>
@@ -576,7 +753,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
                   {error?.kind === 'coordinator' || error?.kind === 'network' || error?.kind === 'profile' ? (
                     <Button
                       disabled={submitting}
-                      onClick={() => void submit()}
+                      onClick={() => void submit(retryScheduleAt !== null, retryScheduleAt ?? undefined)}
                       size="xs"
                       type="button"
                       variant="secondary"
@@ -591,7 +768,15 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
         ) : null}
         {!admittedRun ? (
           <DialogFooter>
-            <Button disabled={blocked || submitting} onClick={() => void submit()} type="button">
+            <Button
+              disabled={scheduledBlocked || submitting}
+              onClick={() => void submit(true)}
+              type="button"
+              variant="secondary"
+            >
+              {copy.workflowRunLater}
+            </Button>
+            <Button disabled={immediateBlocked || submitting} onClick={() => void submit()} type="button">
               {copy.workflowRunStart}
             </Button>
           </DialogFooter>

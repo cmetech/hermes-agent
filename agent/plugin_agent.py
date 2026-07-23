@@ -450,6 +450,8 @@ def _exchange_worker(
 class PluginAgentRunner:
     """Plugin-bound facade that never exposes a live agent or credentials."""
 
+    starts_request_mcp = True
+
     def __init__(self, plugin_id: str) -> None:
         if not isinstance(plugin_id, str) or not plugin_id.strip():
             raise ValueError("plugin_id must be non-empty")

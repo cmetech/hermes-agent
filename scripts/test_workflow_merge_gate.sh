@@ -54,6 +54,7 @@ if [[ "$PHASE" == "base" ]]; then
     "$PYTHON_BIN" -m pytest -q \
       tests/tools/test_managed_process.py tests/tools/test_process_registry.py \
       tests/agent/test_plugin_agent.py tests/tools/test_registry.py \
+      tests/hermes_cli/test_execution_runtime_capabilities.py \
       tests/hermes_cli/test_kanban_mutation_preconditions.py \
       tests/hermes_cli/test_kanban_db.py \
       tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py \
@@ -63,12 +64,25 @@ if [[ "$PHASE" == "base" ]]; then
       tests/gateway/test_plugin_delivery.py \
       tests/hermes_cli/test_plugin_provider_hot_reload.py \
       tests/scripts/test_workflow_merge_gate.py \
-      tests/plugins/workflow/test_admission.py tests/plugins/workflow/test_trust_policy.py \
+      tests/plugins/workflow/test_admission.py \
+      tests/plugins/workflow/test_schedule_store_identity.py \
+      tests/plugins/workflow/test_scheduled_runs.py \
+      tests/plugins/workflow/test_schedule_revalidation.py \
+      tests/plugins/workflow/test_ai_entitlement.py \
+      tests/plugins/workflow/test_node_mcp.py \
+      tests/plugins/workflow/test_trust_policy.py \
+      tests/plugins/workflow/test_runner_binding.py \
       tests/plugins/workflow/test_catalog_api.py \
       tests/plugins/workflow/test_workflow_detail_api.py \
       tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py \
       tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py \
+      tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py \
+      tests/plugins/workflow/test_ai_extensions_middleware_e2e.py \
+      tests/plugins/workflow/test_scheduling_middleware_e2e.py \
       tests/plugins/workflow/test_showcase_catalog.py \
+      tests/plugins/workflow/test_showcase_ai_e2e.py \
+      tests/plugins/workflow/test_showcase_schedule_e2e.py \
+      tests/plugins/workflow/test_showcase_evidence.py \
       tests/plugins/workflow/test_showcase_distribution_e2e.py \
       tests/plugins/workflow/test_portable_compatibility_e2e.py \
       tests/hermes_cli/test_capability_staging.py \
@@ -130,7 +144,13 @@ if [[ "${WORKFLOW_MERGE_GATE_FAST:-0}" != "1" ]]; then
   "$PYTHON_BIN" - <<'PY'
 from plugins.workflow.showcase import load_showcase_catalog
 catalog = load_showcase_catalog()
-assert "approval-gate" in catalog
+assert set(catalog) == {
+    "ai-extensions",
+    "approval-gate",
+    "laptop-diagnostic",
+    "resilience",
+    "scheduling",
+}
 assert all(item.package_digest for item in catalog.values())
 assert all(item.verified_bundled_provenance for item in catalog.values())
 PY

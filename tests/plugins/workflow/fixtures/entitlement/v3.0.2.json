@@ -1,0 +1,41 @@
+{
+  "cases": [
+    {
+      "name": "rest-approval-gate",
+      "workflow_name": "approval-gate",
+      "definition_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "policy_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "input_manifest_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "trigger_source": "desktop",
+      "idempotency_key": "v302-rest-approval-gate",
+      "idempotency_namespace": "api:profile-local-dashboard",
+      "concurrency_key": "showcase:approval-gate",
+      "run_metadata": {
+        "showcase_id": "approval-gate",
+        "showcase_version": "1.0.0",
+        "bundle_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "risk_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "showcase_provenance": "verified_bundled"
+      },
+      "expected_start_digest": "ea7f81ef6f8376b426541fdb18c33b2be5739809dc7172fc964ca82a4b4404a4"
+    },
+    {
+      "name": "cli-laptop-diagnostic",
+      "workflow_name": "laptop-diagnostic",
+      "definition_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+      "policy_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+      "input_manifest_digest": "6666666666666666666666666666666666666666666666666666666666666666",
+      "trigger_source": "cli",
+      "idempotency_key": "v302-cli-laptop-diagnostic",
+      "idempotency_namespace": "profile-local:cli",
+      "concurrency_key": "showcase:laptop-diagnostic",
+      "run_metadata": {
+        "showcase_id": "laptop-diagnostic",
+        "showcase_version": "1.0.0",
+        "bundle_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "risk_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "expected_start_digest": "f3c275f45556ba752653422a34e0929c253667b2056f52c0457b75b463c0ed53"
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, expectTypeOf, it } from 'vitest'
 
 import type { WorkflowRunSnapshot } from '@/types/hermes'
 
@@ -53,5 +53,28 @@ describe('workflowBoardModel', () => {
       ])
     )
     expect(card.ariaDescription).toContain('verified_adapter')
+  })
+
+  it('uses the localized scheduled state in both visible and accessible card copy', () => {
+    const model = workflowBoardModel(
+      [
+        {
+          ...run('queued'),
+          presentation_state: 'scheduled_wait',
+          schedule_at: '2099-01-02T03:04:05Z',
+          workflow: 'Deferred deployment'
+        }
+      ],
+      { scheduledLabel: 'スケジュール済み', scopeLabel: 'ワークフロー' }
+    )
+    const card = model.columns[0]!.cards[0]!
+
+    expect(card.exactState).toBe('スケジュール済み')
+    expect(card.ariaDescription).toBe('Deferred deployment, スケジュール済み, healthy')
+  })
+
+  it('types nullable server scheduling projection fields explicitly', () => {
+    expectTypeOf<WorkflowRunSnapshot['presentation_state']>().toEqualTypeOf<null | string | undefined>()
+    expectTypeOf<WorkflowRunSnapshot['schedule_at']>().toEqualTypeOf<null | string | undefined>()
   })
 })

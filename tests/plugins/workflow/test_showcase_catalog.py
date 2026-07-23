@@ -4,12 +4,15 @@ import json
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from hashlib import sha256
 from pathlib import Path
 import shutil
 import subprocess
+import threading
 import time
 
 import pytest
+import yaml
 
 from hermes_cli import capability_staging
 from plugins.workflow.showcase import (
@@ -28,15 +31,58 @@ import plugins.workflow.showcase as showcase_module
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
+def _restamp_showcase_copy(root: Path, showcase_id: str = "laptop-diagnostic") -> None:
+    catalog_path = root / "catalog.yaml"
+    manifest_path = root / "digests.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["catalog_sha256"] = sha256(catalog_path.read_bytes()).hexdigest()
+    manifest["packages"][showcase_id] = showcase_module._tree_digest(
+        root / "packages" / showcase_id
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _authenticated_input_catalog_copy(tmp_path: Path) -> tuple[Path, dict]:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+    sidecar = (
+        copied
+        / "packages/laptop-diagnostic/workflows/laptop-diagnostic.hermes.yaml"
+    )
+    sidecar.write_text(
+        sidecar.read_text(encoding="utf-8").replace(
+            "    symptom: {kind: text, required: true, max_bytes: 4096}",
+            "    arguments: {kind: text, required: true, max_bytes: 4096}",
+        ),
+        encoding="utf-8",
+    )
+    catalog_path = copied / "catalog.yaml"
+    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    laptop = next(
+        item for item in raw["scenarios"] if item["id"] == "laptop-diagnostic"
+    )
+    laptop["input_fixtures"] = {
+        "evidence": "fixtures/laptop-snapshot.json",
+    }
+    laptop["input_value_bindings"] = {"symptom": "arguments"}
+    catalog_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _restamp_showcase_copy(copied)
+    return copied, laptop
+
+
 def test_catalog_has_safe_digest_verified_scenarios() -> None:
     catalog = load_showcase_catalog()
 
-    assert {
+    assert set(catalog) == {
         "ai-extensions",
+        "approval-gate",
         "laptop-diagnostic",
         "resilience",
         "scheduling",
-    } <= set(catalog)
+    }
     assert catalog["laptop-diagnostic"].offline is True
     assert catalog["laptop-diagnostic"].requires_ai is False
     assert catalog["ai-extensions"].requires_ai is True
@@ -44,6 +90,442 @@ def test_catalog_has_safe_digest_verified_scenarios() -> None:
     assert all(item.package_digest for item in catalog.values())
     assert all(item.verified_bundled_provenance for item in catalog.values())
     assert all("destructive" not in item.safety_class for item in catalog.values())
+
+
+def test_catalog_authenticates_laptop_input_bindings_and_fixture_path() -> None:
+    scenario = load_showcase_catalog()["laptop-diagnostic"]
+
+    assert scenario.input_value_bindings == {"symptom": "arguments"}
+    assert scenario.input_fixtures == {
+        "evidence": "fixtures/laptop-snapshot.json"
+    }
+
+
+def test_catalog_restamps_ai_extension_metadata_without_consent_vocabulary() -> None:
+    scenario = load_showcase_catalog()["ai-extensions"]
+
+    assert scenario.interaction_mode == "guided"
+    assert scenario.requires_ai is True
+    assert scenario.expected_checkpoints == ("extension-resolution", "cleanup")
+    assert scenario.expected_terminal_outcomes == ("succeeded", "failed")
+    assert scenario.capability_claims == (
+        "scoped-extensions",
+        "persistent-session",
+        "local-mcp-cleanup",
+    )
+    assert scenario.purpose == (
+        "Demonstrate AI, skill, hook, inline-agent, and local MCP extension "
+        "integration."
+    )
+    assert "consent" not in json.dumps(
+        {
+            "purpose": scenario.purpose,
+            "checkpoints": scenario.expected_checkpoints,
+            "outcomes": scenario.expected_terminal_outcomes,
+            "claims": scenario.capability_claims,
+        },
+        sort_keys=True,
+    ).lower()
+
+
+def test_catalog_rejects_obsolete_ai_confirmation_claim(tmp_path: Path) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+    catalog_path = copied / "catalog.yaml"
+    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    ai = next(
+        item for item in raw["scenarios"] if item["id"] == "ai-extensions"
+    )
+    ai["capability_claims"].append("explicit-ai-consent")
+    catalog_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _restamp_showcase_copy(copied, "ai-extensions")
+
+    with pytest.raises(ShowcaseCatalogError, match="safety contract rejected"):
+        load_showcase_catalog(copied)
+
+
+@pytest.mark.parametrize(
+    ("case", "fixture_path"),
+    [
+        ("absolute", "/private/laptop-snapshot.json"),
+        ("parent", "fixtures/../laptop-snapshot.json"),
+        ("lexical-escape", "../../../outside.json"),
+        ("empty-component", "fixtures//laptop-snapshot.json"),
+        ("nonregular", "fixtures"),
+    ],
+)
+def test_authenticated_fixture_paths_reject_unsafe_or_nonregular_targets(
+    tmp_path: Path,
+    case: str,
+    fixture_path: str,
+) -> None:
+    copied, laptop = _authenticated_input_catalog_copy(tmp_path)
+    laptop["input_fixtures"]["evidence"] = fixture_path
+    catalog_path = copied / "catalog.yaml"
+    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    next(
+        item for item in raw["scenarios"] if item["id"] == "laptop-diagnostic"
+    )["input_fixtures"] = laptop["input_fixtures"]
+    catalog_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _restamp_showcase_copy(copied)
+
+    with pytest.raises(ShowcaseCatalogError, match="fixture|path|resource"):
+        load_showcase_catalog(copied)
+
+
+def test_authenticated_fixture_path_rejects_resolved_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    copied, laptop = _authenticated_input_catalog_copy(tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"private": true}\n', encoding="utf-8")
+    fixture_link = (
+        copied / "packages/laptop-diagnostic/fixtures/escaped-snapshot.json"
+    )
+    try:
+        fixture_link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    laptop["input_fixtures"]["evidence"] = "fixtures/escaped-snapshot.json"
+    catalog_path = copied / "catalog.yaml"
+    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    next(
+        item for item in raw["scenarios"] if item["id"] == "laptop-diagnostic"
+    )["input_fixtures"] = laptop["input_fixtures"]
+    catalog_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    manifest_path = copied / "digests.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["catalog_sha256"] = sha256(catalog_path.read_bytes()).hexdigest()
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ShowcaseCatalogError, match="symlink"):
+        load_showcase_catalog(copied)
+
+
+@pytest.mark.parametrize(
+    ("case", "fixtures", "bindings"),
+    [
+        (
+            "duplicate-public-casefold",
+            {"evidence": "fixtures/laptop-snapshot.json"},
+            {"symptom": "arguments", "Symptom": "arguments"},
+        ),
+        (
+            "duplicate-binding-target",
+            {"evidence": "fixtures/laptop-snapshot.json"},
+            {"symptom": "arguments", "issue": "arguments"},
+        ),
+        (
+            "binding-fixture-overlap",
+            {"evidence": "fixtures/laptop-snapshot.json"},
+            {"symptom": "evidence"},
+        ),
+        (
+            "public-aliases-fixture-target",
+            {"evidence": "fixtures/laptop-snapshot.json"},
+            {"evidence": "arguments"},
+        ),
+        (
+            "public-aliases-binding-target",
+            {"evidence": "fixtures/laptop-snapshot.json"},
+            {"arguments": "arguments"},
+        ),
+        (
+            "undeclared-binding-target",
+            {"evidence": "fixtures/laptop-snapshot.json"},
+            {"symptom": "missing"},
+        ),
+        (
+            "binding-kind-mismatch",
+            {"evidence": "fixtures/laptop-snapshot.json"},
+            {"symptom": "evidence"},
+        ),
+        (
+            "fixture-kind-mismatch",
+            {"arguments": "fixtures/laptop-snapshot.json"},
+            {"symptom": "arguments"},
+        ),
+    ],
+)
+def test_authenticated_input_mappings_reject_collisions_and_kind_mismatches(
+    tmp_path: Path,
+    case: str,
+    fixtures: dict[str, str],
+    bindings: dict[str, str],
+) -> None:
+    copied, _laptop = _authenticated_input_catalog_copy(tmp_path)
+    catalog_path = copied / "catalog.yaml"
+    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    laptop = next(
+        item for item in raw["scenarios"] if item["id"] == "laptop-diagnostic"
+    )
+    laptop["input_fixtures"] = fixtures
+    laptop["input_value_bindings"] = bindings
+    catalog_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _restamp_showcase_copy(copied)
+
+    with pytest.raises(ShowcaseCatalogError, match="input|fixture|binding"):
+        load_showcase_catalog(copied)
+
+
+def test_authenticated_input_mappings_reject_generated_filename_collision(
+    tmp_path: Path,
+) -> None:
+    copied, _laptop = _authenticated_input_catalog_copy(tmp_path)
+    sidecar = (
+        copied
+        / "packages/laptop-diagnostic/workflows/laptop-diagnostic.hermes.yaml"
+    )
+    sidecar.write_text(
+        sidecar.read_text(encoding="utf-8").replace(
+            "    evidence: {kind: file, required: true, max_bytes: 65536}",
+            "    arguments.txt: {kind: file, required: true, max_bytes: 65536}",
+        ),
+        encoding="utf-8",
+    )
+    catalog_path = copied / "catalog.yaml"
+    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    laptop = next(
+        item for item in raw["scenarios"] if item["id"] == "laptop-diagnostic"
+    )
+    laptop["input_fixtures"] = {
+        "arguments.txt": "fixtures/laptop-snapshot.json"
+    }
+    laptop["input_value_bindings"] = {"symptom": "arguments"}
+    catalog_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _restamp_showcase_copy(copied)
+
+    with pytest.raises(ShowcaseCatalogError, match="input|fixture|binding|collid"):
+        load_showcase_catalog(copied)
+
+
+def test_authenticated_binding_public_name_cannot_alias_direct_declaration(
+    tmp_path: Path,
+) -> None:
+    copied, _laptop = _authenticated_input_catalog_copy(tmp_path)
+    sidecar = (
+        copied
+        / "packages/laptop-diagnostic/workflows/laptop-diagnostic.hermes.yaml"
+    )
+    sidecar.write_text(
+        sidecar.read_text(encoding="utf-8").replace(
+            "    arguments: {kind: text, required: true, max_bytes: 4096}",
+            "    arguments: {kind: text, required: true, max_bytes: 4096}\n"
+            "    symptom: {kind: text, required: true, max_bytes: 4096}",
+        ),
+        encoding="utf-8",
+    )
+    _restamp_showcase_copy(copied)
+
+    with pytest.raises(ShowcaseCatalogError, match="public|alias|input"):
+        load_showcase_catalog(copied)
+
+
+def test_authenticated_fixture_cannot_collide_with_direct_text_filename(
+    tmp_path: Path,
+) -> None:
+    copied, _laptop = _authenticated_input_catalog_copy(tmp_path)
+    sidecar = (
+        copied
+        / "packages/laptop-diagnostic/workflows/laptop-diagnostic.hermes.yaml"
+    )
+    sidecar.write_text(
+        sidecar.read_text(encoding="utf-8")
+        .replace(
+            "    evidence: {kind: file, required: true, max_bytes: 65536}",
+            "    notes.txt: {kind: file, required: true, max_bytes: 65536}",
+        )
+        .replace(
+            "    arguments: {kind: text, required: true, max_bytes: 4096}",
+            "    arguments: {kind: text, required: true, max_bytes: 4096}\n"
+            "    notes: {kind: text, required: false, max_bytes: 4096}",
+        ),
+        encoding="utf-8",
+    )
+    catalog_path = copied / "catalog.yaml"
+    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    laptop = next(
+        item for item in raw["scenarios"] if item["id"] == "laptop-diagnostic"
+    )
+    laptop["input_fixtures"] = {"notes.txt": "fixtures/laptop-snapshot.json"}
+    catalog_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _restamp_showcase_copy(copied)
+
+    with pytest.raises(ShowcaseCatalogError, match="input|fixture|collid"):
+        load_showcase_catalog(copied)
+
+
+def test_authenticated_fixture_tamper_fails_verified_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied, _laptop = _authenticated_input_catalog_copy(tmp_path)
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield copied
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    fixture = copied / "packages/laptop-diagnostic/fixtures/laptop-snapshot.json"
+    fixture.write_text('{"tampered": true}\n', encoding="utf-8")
+
+    with pytest.raises(ShowcaseCatalogError, match="package digest mismatch"):
+        showcase_module.load_verified_showcase_packages(
+            read_budget=WorkflowResourceReadBudget(
+                max_file_bytes=1024 * 1024,
+                max_total_bytes=8 * 1024 * 1024,
+                max_files=512,
+            ),
+            force_reverify=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "node_yaml",
+    [
+        "  - {id: consumer, command: inspect-evidence}\n",
+        "  - {id: consumer, prompt: summarize}\n",
+        (
+            "  - id: consumer\n"
+            "    loop: {prompt: iterate, until: DONE, max_iterations: 1}\n"
+        ),
+        (
+            "  - id: consumer\n"
+            "    command: inspect-evidence\n"
+            "    agents:\n"
+            "      reviewer:\n"
+            "        description: Review the fictional result\n"
+            "        prompt: Review without network access.\n"
+        ),
+    ],
+    ids=("command", "prompt", "loop", "inline-agent"),
+)
+def test_copied_non_ai_bundle_rejects_agent_backed_features(
+    tmp_path: Path, node_yaml: str
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+    workflow = (
+        copied
+        / "packages/laptop-diagnostic/workflows/laptop-diagnostic.yaml"
+    )
+    workflow.write_text(
+        "name: laptop-diagnostic\n"
+        "description: Restamped non-AI classifier fixture\n"
+        "nodes:\n"
+        + node_yaml,
+        encoding="utf-8",
+    )
+    manifest_path = copied / "digests.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["packages"]["laptop-diagnostic"] = showcase_module._tree_digest(
+        copied / "packages/laptop-diagnostic"
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ShowcaseCatalogError, match="requires_ai"):
+        load_showcase_catalog(copied)
+
+
+def test_exact_membership_rejects_a_fully_restamped_sixth_scenario(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authenticated_catalog = load_showcase_catalog()
+    assert all(
+        scenario.verified_bundled_provenance
+        for scenario in authenticated_catalog.values()
+    )
+    expected_ids = set(authenticated_catalog)
+    assert expected_ids == {
+        "ai-extensions",
+        "approval-gate",
+        "laptop-diagnostic",
+        "resilience",
+        "scheduling",
+    }
+
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+    shutil.copytree(
+        copied / "packages/approval-gate",
+        copied / "packages/injected-sixth",
+    )
+    catalog_path = copied / "catalog.yaml"
+    raw_catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    injected = dict(
+        next(
+            scenario
+            for scenario in raw_catalog["scenarios"]
+            if scenario["id"] == "approval-gate"
+        )
+    )
+    injected.update(
+        {
+            "id": "injected-sixth",
+            "display_name": "Injected Sixth Tour",
+            "workflow_path": (
+                "packages/injected-sixth/workflows/approval-gate.yaml"
+            ),
+        }
+    )
+    raw_catalog["scenarios"].append(injected)
+    catalog_path.write_text(
+        yaml.safe_dump(raw_catalog, sort_keys=False), encoding="utf-8"
+    )
+    package_digests = {
+        package.name: showcase_module._tree_digest(package)
+        for package in sorted((copied / "packages").iterdir())
+    }
+    (copied / "digests.json").write_text(
+        json.dumps(
+            {
+                "catalog_sha256": sha256(catalog_path.read_bytes()).hexdigest(),
+                "packages": package_digests,
+                "schema_version": 1,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield copied
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+    restamped_catalog = load_showcase_catalog()
+    assert all(
+        scenario.verified_bundled_provenance
+        for scenario in restamped_catalog.values()
+    )
+
+    # These are the three legacy subset/membership checks. All accept the
+    # fully authenticated sixth scenario.
+    assert {
+        "ai-extensions",
+        "laptop-diagnostic",
+        "resilience",
+        "scheduling",
+    } <= set(restamped_catalog)
+    assert {
+        "approval-gate",
+        "laptop-diagnostic",
+        "resilience",
+        "scheduling",
+    } <= set(restamped_catalog)
+    assert "approval-gate" in restamped_catalog
+    assert all(item.package_digest for item in restamped_catalog.values())
+
+    with pytest.raises(AssertionError):
+        assert set(restamped_catalog) == expected_ids
 
 
 def test_bundled_approval_gate_is_verified_parameterless_and_portable() -> None:
@@ -185,6 +667,274 @@ def test_verified_loader_coalesces_concurrent_cache_misses(
     assert concurrent_calls == digest_calls
 
 
+def test_verified_loader_warm_hits_verify_outside_cache_lock_and_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield copied
+
+    def budget() -> WorkflowResourceReadBudget:
+        return WorkflowResourceReadBudget(
+            max_file_bytes=1024 * 1024,
+            max_total_bytes=8 * 1024 * 1024,
+            max_files=512,
+        )
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+    original_cache_lock = showcase_module._VERIFIED_SHOWCASE_CACHE_LOCK
+
+    class CacheLockProbe:
+        def __init__(self) -> None:
+            self._lock = original_cache_lock
+            self._owner = threading.local()
+
+        def __enter__(self):
+            self._lock.acquire()
+            self._owner.held = True
+            return self
+
+        def __exit__(self, *_exc_info) -> None:
+            self._owner.held = False
+            self._lock.release()
+
+        def locked(self) -> bool:
+            return self._lock.locked()
+
+        def held_by_current_thread(self) -> bool:
+            return getattr(self._owner, "held", False)
+
+    cache_lock_probe = CacheLockProbe()
+    monkeypatch.setattr(
+        showcase_module,
+        "_VERIFIED_SHOWCASE_CACHE_LOCK",
+        cache_lock_probe,
+    )
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    showcase_module.load_verified_showcase_packages(read_budget=budget())
+
+    original_bundle_digest = showcase_module._bundle_digest
+    original_tree_signature = showcase_module._bundle_tree_signature
+    observations: list[tuple[str, bool]] = []
+    active_signatures = 0
+    active_lock = threading.Lock()
+    signatures_overlap = threading.Event()
+    release_signatures = threading.Event()
+
+    def probed_bundle_digest(*args, **kwargs):
+        observations.append(
+            ("bundle_digest", cache_lock_probe.held_by_current_thread())
+        )
+        return original_bundle_digest(*args, **kwargs)
+
+    def probed_tree_signature(*args, **kwargs):
+        nonlocal active_signatures
+        observations.append(
+            ("tree_signature", cache_lock_probe.held_by_current_thread())
+        )
+        with active_lock:
+            active_signatures += 1
+            if active_signatures == 2:
+                signatures_overlap.set()
+        try:
+            release_signatures.wait(timeout=2)
+            return original_tree_signature(*args, **kwargs)
+        finally:
+            with active_lock:
+                active_signatures -= 1
+
+    monkeypatch.setattr(showcase_module, "_bundle_digest", probed_bundle_digest)
+    monkeypatch.setattr(showcase_module, "_bundle_tree_signature", probed_tree_signature)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                showcase_module.load_verified_showcase_packages,
+                read_budget=budget(),
+            )
+            for _index in range(2)
+        ]
+        overlapped = signatures_overlap.wait(timeout=2)
+        release_signatures.set()
+        results = [future.result(timeout=5) for future in futures]
+
+    assert all("approval-gate" in result for result in results)
+    assert overlapped, "warm-hit tree verification serialized behind the cache lock"
+    assert observations
+    assert not [name for name, lock_held in observations if lock_held]
+
+
+def test_verified_loader_generation_change_prevents_stale_warm_hit_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield copied
+
+    def budget() -> WorkflowResourceReadBudget:
+        return WorkflowResourceReadBudget(
+            max_file_bytes=1024 * 1024,
+            max_total_bytes=8 * 1024 * 1024,
+            max_files=512,
+        )
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    initial = showcase_module.load_verified_showcase_packages(read_budget=budget())
+    initial_package = initial["approval-gate"]
+
+    original_tree_signature = showcase_module._bundle_tree_signature
+    pause_hit = threading.local()
+    hit_signature_ready = threading.Event()
+    release_hit = threading.Event()
+
+    def pausing_tree_signature(*args, **kwargs):
+        signature = original_tree_signature(*args, **kwargs)
+        if getattr(pause_hit, "enabled", False):
+            hit_signature_ready.set()
+            release_hit.wait(timeout=5)
+        return signature
+
+    def paused_warm_hit():
+        pause_hit.enabled = True
+        return showcase_module.load_verified_showcase_packages(read_budget=budget())
+
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_tree_signature",
+        pausing_tree_signature,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        stale_candidate = executor.submit(paused_warm_hit)
+        assert hit_signature_ready.wait(timeout=2)
+        forced_future = executor.submit(
+            showcase_module.load_verified_showcase_packages,
+            read_budget=budget(),
+            force_reverify=True,
+        )
+        force_interleaved = False
+        try:
+            forced = forced_future.result(timeout=2)
+            force_interleaved = True
+        except TimeoutError:
+            forced = None
+        finally:
+            release_hit.set()
+        stale_checked = stale_candidate.result(timeout=5)
+        if forced is None:
+            forced = forced_future.result(timeout=5)
+
+    assert force_interleaved, "force reverify could not advance the cache generation"
+    assert forced["approval-gate"] is not initial_package
+    assert stale_checked["approval-gate"] is forced["approval-gate"]
+
+
+def test_verified_loader_rechecks_generation_after_restoring_warm_cache_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield copied
+
+    def budget() -> WorkflowResourceReadBudget:
+        return WorkflowResourceReadBudget(
+            max_file_bytes=1024 * 1024,
+            max_total_bytes=8 * 1024 * 1024,
+            max_files=512,
+        )
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    initial = showcase_module.load_verified_showcase_packages(read_budget=budget())
+    initial_package = initial["approval-gate"]
+    request_budget = budget()
+    request_owned_path = (tmp_path / "request-owned.bin").resolve()
+    request_owned_alias = tmp_path / "request-owned-alias.bin"
+    request_owned_bytes = b"request-owned"
+    request_budget._contents[request_owned_path] = request_owned_bytes
+    request_budget.remember_alias(request_owned_alias, request_owned_path)
+    request_budget.files_read = 1
+    request_budget.bytes_read = len(request_owned_bytes)
+    contents_container = request_budget._contents
+    aliases_container = request_budget._aliases
+    restore_started = threading.Event()
+    release_restore = threading.Event()
+    rollback_observed = threading.Event()
+    release_retry = threading.Event()
+    original_restore = showcase_module._restore_cached_resources
+    original_cache_hit = showcase_module._load_verified_showcase_cache_hit
+    before_restore: dict[str, object] = {}
+
+    def pausing_restore(read_budget, cached):
+        original_restore(read_budget, cached)
+        restore_started.set()
+        release_restore.wait(timeout=5)
+
+    def observing_cache_hit(**kwargs):
+        read_budget = kwargs["read_budget"]
+        if read_budget is request_budget and not before_restore:
+            before_restore.update(
+                contents=dict(read_budget._contents),
+                aliases=dict(read_budget._aliases),
+                files_read=read_budget.files_read,
+                bytes_read=read_budget.bytes_read,
+            )
+        result = original_cache_hit(**kwargs)
+        if read_budget is request_budget and result is None:
+            rollback_observed.set()
+            release_retry.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(showcase_module, "_restore_cached_resources", pausing_restore)
+    monkeypatch.setattr(
+        showcase_module,
+        "_load_verified_showcase_cache_hit",
+        observing_cache_hit,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        stale_candidate = executor.submit(
+            showcase_module.load_verified_showcase_packages,
+            read_budget=request_budget,
+        )
+        assert restore_started.wait(timeout=2)
+        forced = executor.submit(
+            showcase_module.load_verified_showcase_packages,
+            read_budget=budget(),
+            force_reverify=True,
+        ).result(timeout=5)
+        release_restore.set()
+        assert rollback_observed.wait(timeout=2)
+        assert request_budget._contents is contents_container
+        assert request_budget._aliases is aliases_container
+        assert request_budget._contents == before_restore["contents"]
+        assert request_budget._aliases == before_restore["aliases"]
+        assert request_budget.files_read == before_restore["files_read"]
+        assert request_budget.bytes_read == before_restore["bytes_read"]
+        assert request_budget._contents[request_owned_path] == request_owned_bytes
+        assert (
+            request_budget._aliases[
+                WorkflowResourceReadBudget._logical_key(request_owned_alias)
+            ]
+            == request_owned_path
+        )
+        release_retry.set()
+        current = stale_candidate.result(timeout=5)
+
+    assert forced["approval-gate"] is not initial_package
+    assert current["approval-gate"] is forced["approval-gate"]
+
+
 def test_verified_loader_parses_only_digest_authenticated_package_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -246,6 +996,73 @@ def test_verified_loader_parses_only_digest_authenticated_package_bytes(
         "Pause for explicit operator approval before completing the bundled tour"
     )
     assert verified["approval-gate"].package.sidecar["outward_action_nodes"] == ()
+
+
+def test_no_budget_catalog_parses_digest_authenticated_package_bytes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+    workflow = copied / "packages/approval-gate/workflows/approval-gate.yaml"
+    sidecar = workflow.with_name("approval-gate.hermes.yaml")
+    replacement_sidecar = tmp_path / "replacement.hermes.yaml"
+    replacement_sidecar.write_text(
+        "overlap_policy: queue\n"
+        "execution_environment: trusted_local\n"
+        "outward_action_nodes: [operator-approval]\n",
+        encoding="utf-8",
+    )
+    original_tree_digest = showcase_module._tree_digest
+    parsed_descriptions: list[str] = []
+    parsed_outward_action_nodes: list[tuple[str, ...] | None] = []
+
+    def mutate_after_authenticated_digest(root, *args, **kwargs):
+        digest = original_tree_digest(root, *args, **kwargs)
+        if Path(root).name == "approval-gate":
+            workflow.write_text(
+                "name: approval-gate\n"
+                "description: TRANSIENT UNVERIFIED\n"
+                "nodes:\n"
+                "  - id: operator-approval\n"
+                "    approval:\n"
+                "      message: changed\n",
+                encoding="utf-8",
+            )
+            sidecar.unlink()
+            sidecar.symlink_to(replacement_sidecar)
+        return digest
+
+    original_load_workflow = showcase_module.load_workflow
+    original_load_snapshot = showcase_module.load_workflow_snapshot
+
+    def record_disk_parse(path, **kwargs):
+        package = original_load_workflow(path, **kwargs)
+        if Path(path).name == "approval-gate.yaml":
+            parsed_descriptions.append(package.definition.description)
+            parsed_outward_action_nodes.append(
+                package.sidecar.get("outward_action_nodes")
+            )
+        return package
+
+    def record_snapshot_parse(path, **kwargs):
+        package = original_load_snapshot(path, **kwargs)
+        if Path(path).name == "approval-gate.yaml":
+            parsed_descriptions.append(package.definition.description)
+            parsed_outward_action_nodes.append(
+                package.sidecar.get("outward_action_nodes")
+            )
+        return package
+
+    monkeypatch.setattr(showcase_module, "_tree_digest", mutate_after_authenticated_digest)
+    monkeypatch.setattr(showcase_module, "load_workflow", record_disk_parse)
+    monkeypatch.setattr(showcase_module, "load_workflow_snapshot", record_snapshot_parse)
+
+    load_showcase_catalog(copied)
+
+    assert parsed_descriptions == [
+        "Pause for explicit operator approval before completing the bundled tour"
+    ]
+    assert parsed_outward_action_nodes == [()]
 
 
 def test_tree_entry_budget_stops_before_unbounded_rglob_materialization(
@@ -441,7 +1258,7 @@ def test_cli_run_still_rejects_isolated_backend_showcase_without_backend(
         ("approval-gate", True),
         ("resilience", True),
         ("laptop-diagnostic", True),
-        ("ai-extensions", False),
+        ("ai-extensions", True),
         ("scheduling", False),
     ],
 )
@@ -626,9 +1443,9 @@ def test_preflight_is_side_effect_free_and_reports_explicit_opt_ins(
         {"name": "evidence", "kind": "file", "required": True, "max_bytes": 65536},
         {"name": "symptom", "kind": "text", "required": True, "max_bytes": 4096},
     ]
-    assert ai["requires_confirmation"] is True
-    assert ai["confirmation_kind"] == "ai"
-    assert ai["confirmation_token"]
+    assert ai["requires_confirmation"] is False
+    assert ai["confirmation_kind"] is None
+    assert ai["confirmation_token"] is None
 
 
 def test_showcase_cli_list_and_missing_input_have_stable_exit_categories(

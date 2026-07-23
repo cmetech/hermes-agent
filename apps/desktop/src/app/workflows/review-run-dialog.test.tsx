@@ -220,6 +220,7 @@ describe('Review & Run workflow dialog', () => {
     const dialog = await openReviewDialog()
     expect(within(dialog).getByText('Checks a release before deployment.')).toBeTruthy()
     expect(within(dialog).queryByRole('group', { name: 'Inputs' })).toBeNull()
+    expect(within(dialog).getByRole('button', { name: 'Run later' })).toBeTruthy()
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start workflow' }))
 
     await waitFor(() => {
@@ -249,6 +250,61 @@ describe('Review & Run workflow dialog', () => {
     expect((await screen.findByRole('tab', { name: 'Active board' })).getAttribute('aria-selected')).toBe('true')
     expect($workflowSelectedRunId.get()).toBe('run-created')
     expect($notifications.get()[0]?.message).toBe('Started')
+  })
+
+  it('derives schedule eligibility from run support and normalizes the local picker instant', async () => {
+    catalogDefinition = definition({
+      run_support: { reason: 'schedule_required', supported: false },
+      source: 'showcase',
+      trust_state: 'verified_bundled'
+    })
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        ...catalogDefinition,
+        definition: { inputs: {}, name: WORKFLOW_NAME }
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    const immediate = within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement
+    expect(immediate.disabled).toBe(true)
+    const picker = within(dialog).getByLabelText('Run at') as HTMLInputElement
+    fireEvent.change(picker, { target: { value: '2099-01-02T04:04' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Run later' }))
+
+    const canonical = new Date(2099, 0, 2, 4, 4).toISOString().replace('.000Z', 'Z')
+    await waitFor(() =>
+      expect(apiStructured).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            schedule_at: canonical,
+            workflow: WORKFLOW_NAME
+          }),
+          method: 'POST',
+          path: '/api/plugins/workflow/runs'
+        })
+      )
+    )
+    expect($notifications.get()[0]?.message).toBe('Scheduled')
+  })
+
+  it.each([
+    ['', 'Choose a future date and time.'],
+    ['2020-01-02T04:04', 'Choose a future date and time.']
+  ])('blocks invalid Run later picker value %j with accessible localized feedback', async (value, message) => {
+    renderView()
+    const dialog = await openReviewDialog()
+    const picker = within(dialog).getByLabelText('Run at')
+
+    if (value) {
+      fireEvent.change(picker, { target: { value } })
+    }
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Run later' }))
+
+    expect((await within(dialog).findByRole('alert')).textContent).toContain(message)
+    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(0)
   })
 
   it('uses typed controls, serializes flat values as strings, and binds preflight plus start to the opening profile', async () => {
@@ -303,6 +359,67 @@ describe('Review & Run workflow dialog', () => {
       },
       profile: 'profile-a'
     })
+  })
+
+  it('renders declared text and bundled fixture inputs and sends only the public text value', async () => {
+    catalogDefinition = definition({
+      inputs: [
+        { max_bytes: 5, name: 'symptom', required: true, type: 'text' },
+        { name: 'evidence', required: true, type: 'file' }
+      ],
+      source: 'showcase',
+      supported_inputs: { reason: 'flat_inputs', supported: true },
+      trust_state: 'verified_bundled'
+    })
+    preflightHandler = async () => ({ ok: true, value: detail({ ...catalogDefinition }) })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    const symptom = within(dialog).getByRole('textbox', { name: 'symptom' })
+    const fixture = within(dialog).getByRole('group', { name: 'evidence' })
+
+    expect(symptom.tagName).toBe('TEXTAREA')
+    expect(within(dialog).getByText('0 / 5 bytes')).toBeTruthy()
+    expect(within(fixture).getByText('Bundled fixture')).toBeTruthy()
+    expect(fixture.querySelector('input, textarea, button, [contenteditable="true"]')).toBeNull()
+
+    fireEvent.change(symptom, { target: { value: 'ééa' } })
+    expect(within(dialog).getByText('5 / 5 bytes')).toBeTruthy()
+    const submit = within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement
+    expect(submit.disabled).toBe(false)
+    fireEvent.click(submit)
+
+    await waitFor(() => expect($workflowSelectedRunId.get()).toBe('run-created'))
+    const request = apiStructured.mock.calls.find(([candidate]) => candidate.path === '/api/plugins/workflow/runs')?.[0]
+    expect(request?.body?.values).toEqual({ symptom: 'ééa' })
+    expect(request?.body?.values).not.toHaveProperty('arguments')
+    expect(request?.body?.values).not.toHaveProperty('evidence')
+  })
+
+  it('counts declared text as UTF-8 bytes and blocks a one-byte-over value without a POST', async () => {
+    catalogDefinition = definition({
+      inputs: [{ max_bytes: 5, name: 'symptom', required: true, type: 'text' }],
+      source: 'showcase',
+      supported_inputs: { reason: 'flat_inputs', supported: true },
+      trust_state: 'verified_bundled'
+    })
+    preflightHandler = async () => ({ ok: true, value: detail({ ...catalogDefinition }) })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    const symptom = within(dialog).getByRole('textbox', { name: 'symptom' })
+    fireEvent.change(symptom, { target: { value: 'ééab' } })
+
+    expect(within(dialog).getByText('6 / 5 bytes')).toBeTruthy()
+    expect(within(dialog).getByText('symptom exceeds the 5-byte limit.')).toBeTruthy()
+    const submit = within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement
+    expect(submit.disabled).toBe(true)
+    fireEvent.click(submit)
+    submit.removeAttribute('disabled')
+    fireEvent.click(submit)
+    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
+      0
+    )
   })
 
   it('omits every untouched optional flat input from the admission body', async () => {
@@ -564,6 +681,22 @@ describe('Review & Run workflow dialog', () => {
     expect($workflowSelectedRunId.get()).toBeNull()
   })
 
+  it('renders the server-authoritative typed schedule rejection on a Run later race', async () => {
+    startHandler = async () => ({
+      body: { detail: { code: 'workflow_schedule_invalid', retryable: false } },
+      ok: false,
+      status: 422
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    fireEvent.change(within(dialog).getByLabelText('Run at'), { target: { value: '2099-01-02T04:04' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Run later' }))
+
+    expect(await within(dialog).findByText('Choose a future date and time.')).toBeTruthy()
+    expect(within(dialog).queryByText('The workflow inputs were not accepted.')).toBeNull()
+  })
+
   it('maps the FastAPI 422 loc/msg array to the rejected input field', async () => {
     catalogDefinition = definition({
       inputs: [{ name: 'count', required: true, type: 'number' }],
@@ -624,6 +757,42 @@ describe('Review & Run workflow dialog', () => {
     expect($notifications.get()[0]?.message).toBe('Already running — showing you that run')
   })
 
+  it('keeps an existing disposition authoritative for Run later copy', async () => {
+    catalogDefinition = definition({
+      run_support: { reason: 'schedule_required', supported: false },
+      source: 'showcase',
+      trust_state: 'verified_bundled'
+    })
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        ...catalogDefinition,
+        definition: { inputs: {}, name: WORKFLOW_NAME }
+      })
+    })
+    startHandler = async () => startResponse('existing', 'run-existing')
+    api.mockImplementation(async request => {
+      if (request.path.startsWith('/api/plugins/workflow/runs?')) {
+        return { next_cursor: null, runs: [runSnapshot('run-existing')], schema_version: 1 }
+      }
+      if (request.path === '/api/plugins/workflow/attention') {
+        return { items: [], next_cursor: null, schema_version: 1 }
+      }
+      if (request.path === '/api/plugins/workflow/runs/run-existing') {
+        return runSnapshot('run-existing')
+      }
+      throw new Error(`unexpected legacy request: ${request.path}`)
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    fireEvent.change(within(dialog).getByLabelText('Run at'), { target: { value: '2099-01-02T04:04' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Run later' }))
+
+    await waitFor(() => expect($workflowSelectedRunId.get()).toBe('run-existing'))
+    expect($notifications.get()[0]?.message).toBe('Already running — showing you that run')
+  })
+
   it('fails closed when preflight reports unsupported inputs or an unavailable coordinator', async () => {
     preflightHandler = async () => ({
       ok: true,
@@ -632,6 +801,7 @@ describe('Review & Run workflow dialog', () => {
         definition: { inputs: { mode: { required: false, type: 'enum' } } },
         inputs: [{ name: 'mode', required: false, type: 'enum' }],
         run_support: { reason: 'unsupported_inputs', supported: false },
+        source: 'showcase',
         supported_inputs: { reason: 'unsupported_input_shape', supported: false }
       })
     })
@@ -639,9 +809,7 @@ describe('Review & Run workflow dialog', () => {
 
     const dialog = await openReviewDialog()
     expect(
-      within(dialog).getByText(
-        "This workflow's inputs aren't supported in the app yet — run it with hermes workflow run Portable contract."
-      )
+      within(dialog).getByText('Run is unavailable because this workflow uses unsupported input fields.')
     ).toBeTruthy()
     expect(within(dialog).getByText("The background coordinator isn't running — try again shortly.")).toBeTruthy()
     expect(within(dialog).queryByRole('combobox', { name: 'mode' })).toBeNull()
@@ -661,7 +829,7 @@ describe('Review & Run workflow dialog', () => {
     renderView()
 
     const dialog = await openReviewDialog()
-    expect(within(dialog).getByText('Verified bundle')).toBeTruthy()
+    expect(within(dialog).getByText('verified bundle')).toBeTruthy()
     expect(within(dialog).getByText('Run this bundled showcase from the CLI.')).toBeTruthy()
     expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
     expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(

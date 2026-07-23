@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { TRANSLATIONS } from './catalog'
 import { DEFAULT_LOCALE, isLocale, isSupportedLocaleValue, localeConfigValue, normalizeLocale } from './languages'
 
 describe('desktop i18n languages', () => {
@@ -39,5 +40,19 @@ describe('desktop i18n languages', () => {
     expect(localeConfigValue('zh')).toBe('zh')
     expect(localeConfigValue('zh-hant')).toBe('zh-hant')
     expect(localeConfigValue('ja')).toBe('ja')
+  })
+
+  it('describes one-shot workflow scheduling in every locale without claiming Cron creation', () => {
+    for (const translation of Object.values(TRANSLATIONS)) {
+      const copy = [
+        translation.operations.workflowRunLater,
+        translation.operations.workflowRunLaterDescription,
+        translation.operations.workflowScheduled
+      ].join(' ')
+
+      expect(copy).not.toMatch(/cron/i)
+      expect(translation.operations.workflowRunLater).toBeTruthy()
+      expect(translation.operations.workflowScheduled).toBeTruthy()
+    }
   })
 })

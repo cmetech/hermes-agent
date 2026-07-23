@@ -250,8 +250,14 @@ export function WorkflowsView() {
   const nextCursor = pages.at(-1)?.next_cursor ?? null
 
   const model = useMemo(
-    () => workflowBoardModel(runItems, { nextCursor, scopeLabel: t.operations.workflows, stale: runs.isError }),
-    [nextCursor, runItems, runs.isError, t.operations.workflows]
+    () =>
+      workflowBoardModel(runItems, {
+        nextCursor,
+        scheduledLabel: t.operations.workflowScheduled,
+        scopeLabel: t.operations.workflows,
+        stale: runs.isError
+      }),
+    [nextCursor, runItems, runs.isError, t.operations.workflowScheduled, t.operations.workflows]
   )
 
   if (view !== 'workflows' && runs.isLoading) {
@@ -354,7 +360,7 @@ export function WorkflowsView() {
       {reviewIntent ? (
         <ReviewRunDialog
           onClose={closeReview}
-          onRunLocated={async (runId, disposition) => {
+          onRunLocated={async (runId, disposition, scheduled) => {
             await ensureGatewayProfile(reviewIntent.profile)
 
             if (!mounted.current || reviewGeneration.current !== reviewIntent.generation) {
@@ -364,7 +370,11 @@ export function WorkflowsView() {
             notify({
               kind: 'success',
               message:
-                disposition === 'existing' ? t.operations.workflowRunAlreadyRunning : t.operations.workflowRunStarted
+                disposition === 'existing'
+                  ? t.operations.workflowRunAlreadyRunning
+                  : scheduled
+                    ? t.operations.workflowScheduled
+                    : t.operations.workflowRunStarted
             })
             selectWorkflowRun(runId)
             setView('board')

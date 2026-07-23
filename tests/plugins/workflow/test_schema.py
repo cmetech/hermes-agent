@@ -309,6 +309,16 @@ def test_sidecar_cannot_declare_trust_or_invalid_node_references(
         load_workflow(path)
 
 
+def test_sidecar_rejects_run_level_max_iterations(workflow_writer, tmp_path):
+    path = workflow_writer(tmp_path, filename="bounded.yaml")
+    path.with_name("bounded.hermes.yaml").write_text(
+        "limits:\n  max_iterations: 12\n", encoding="utf-8"
+    )
+
+    with pytest.raises(WorkflowValidationError, match="max_iterations"):
+        load_workflow(path)
+
+
 @pytest.mark.parametrize(
     "nodes",
     [
