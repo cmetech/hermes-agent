@@ -15,6 +15,8 @@ uses a 50 ms lock wait, validates the complete journal body within configured
 store quotas, validates legacy policy digest and schema when required, repairs
 index parity from corroborated evidence, and appends `repair_verified`.
 Notification repair remains exclusively owned by the existing outbox cadence.
+If cleanup removes a selected repair between its event-log query and probe,
+directory resolution now fails closed without aborting the coordinator sweep.
 
 ## Strict RED Evidence
 
@@ -51,6 +53,19 @@ under locked/corrupt rows, and missing cursor reset on leadership change. A
 separate RED then proved that a fixed 4 MiB probe ceiling would strand a valid
 journal allowed by an 8 MiB configured quota.
 
+Closure review added one deterministic cleanup-race RED:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_scheduled_runs.py -q \
+  -k disappearing_repair_candidate_does_not_abort_healthy_sweep
+
+1 failed, 36 deselected in 0.5s
+```
+
+Healthy submission completed before `run_directory()` raised `KeyError` from
+the selected repair probe, proving the exception escaped only because directory
+resolution preceded the method's intended fail-closed boundary.
+
 ## Implementation
 
 - `repair_events_run_reason_sequence(run_id, reason_code, sequence DESC)` is
@@ -70,6 +85,9 @@ journal allowed by an 8 MiB configured quota.
   classification and unattended revalidation.
 - A new leadership term resets the repair cursor. Reaching the event-log tail
   wraps the cursor so still-active failures are eventually retried.
+- Mutable run-directory resolution occurs inside the same guarded boundary as
+  lock acquisition and evidence reads, so concurrent cleanup is treated as an
+  unsuccessful probe and the event cursor still advances.
 
 The lane never deletes, quarantines, synthesizes, or rewrites damaged run
 evidence. Oversized corrupt files are bounded by the store's configured
@@ -97,6 +115,12 @@ Focused review regressions:
 7 passed in 1.5s
 ```
 
+Closure race plus adjacent repair-lane regressions:
+
+```text
+6 passed, 31 deselected in 1.2s
+```
+
 Affected runtime, migration, index, and coordinator coverage:
 
 ```text
@@ -106,7 +130,7 @@ scripts/run_tests.sh \
   tests/plugins/workflow/test_coordinator.py \
   tests/plugins/workflow/test_schema_migrations.py -q
 
-112 passed in 63.6s
+113 passed in 64.2s
 ```
 
 Additional checks:

@@ -2654,6 +2654,7 @@ upstream_changes:
   - repair_events run/reason/descending-sequence lookup index
   - bounded repair-event keyset revalidation lane
   - full-journal and legacy-policy unattended repair corroboration
+  - cleanup-race fail-closed repair probing
   - leadership-term repair cursor reset
   - ordinary and scheduled candidate page repair isolation
   - v13 unrecoverable scheduled evidence sweep isolation
@@ -2679,7 +2680,9 @@ upstream_changes:
     legacy policy digest and schema before recording repair_verified; leave
     notification repairs to the outbox cadence. Advance past locked or
     irreparable rows for fairness, reset the cursor on a new leadership term,
-    and eventually retry after wrapping the event log. A later repair_verified
+    and eventually retry after wrapping the event log. Concurrent cleanup
+    between candidate selection and directory resolution must fail the probe
+    closed without aborting the healthy sweep. A later repair_verified
     transition must restore eligibility. Never delete, quarantine, rewrite, or
     infer damaged durable evidence.
   removal_condition: Remove when upstream provides equivalent latest-transition

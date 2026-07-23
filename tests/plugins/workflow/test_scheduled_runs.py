@@ -1365,6 +1365,78 @@ def test_repair_revalidation_cursor_bypasses_locked_and_corrupt_rows(
     )
 
 
+def test_disappearing_repair_candidate_does_not_abort_healthy_sweep(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 6, 10, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    coordinator, identity, epoch = _leader(
+        store,
+        clocks,
+        name="disappearing-repair",
+    )
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="disappearing-repair",
+    )
+    disappearing = _admit(store, package, key="disappearing", schedule_at=None)
+    healthy = _admit(store, package, key="healthy", schedule_at=None)
+    for wake in coordinator.pending_wakes(
+        identity,
+        epoch=epoch,
+        now=clocks.wall,
+    ):
+        assert coordinator.complete_wake(
+            wake.generation,
+            identity,
+            epoch=epoch,
+            now=clocks.wall,
+            outcome="test_setup",
+        )
+    assert store._transition_run_repair(
+        "run_evidence_uncorroborated",
+        run_id=disappearing.run_id,
+        outcome="repair_required",
+    )
+    original_run_directory = store.run_directory
+
+    def run_directory_after_cleanup(
+        run_id: str,
+        *,
+        operator_scope: str | None = None,
+    ) -> Path:
+        if run_id == disappearing.run_id:
+            raise KeyError(run_id)
+        return original_run_directory(run_id, operator_scope=operator_scope)
+
+    monkeypatch.setattr(store, "run_directory", run_directory_after_cleanup)
+    scheduler = MagicMock()
+    scheduler.submit.return_value = True
+    service = _service(tmp_path / "home", clocks)
+    service._notification_repair_due_at = clocks.monotonic_value + 100
+
+    actionable, _cursor, _progress = service._sweep_once(
+        store,
+        coordinator,
+        identity,
+        epoch,
+        scheduler,
+    )
+
+    assert actionable is True
+    assert [call.args[0] for call in scheduler.submit.call_args_list] == [
+        healthy.run_id
+    ]
+    assert service._repair_revalidation_cursor is not None
+
+
 def test_revalidation_lane_leaves_notification_repairs_to_outbox_cadence(
     tmp_path: Path,
     workflow_writer,

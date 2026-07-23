@@ -1544,8 +1544,8 @@ class RunStore:
             raise ValueError("repair reason is not eligible for unattended revalidation")
         if lock_timeout_seconds <= 0:
             raise ValueError("revalidation lock budget must be positive")
-        directory = self.run_directory(run_id)
         try:
+            directory = self.run_directory(run_id)
             with workflow_lock(
                 self._run_lock_path(run_id),
                 timeout_seconds=lock_timeout_seconds,
