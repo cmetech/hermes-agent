@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import re
+from typing import Mapping
 
 
 _RFC3339_INSTANT = re.compile(
@@ -66,9 +67,23 @@ def rfc3339_instant_is_after(value: str, observed: datetime) -> bool:
     return fraction.ljust(width, "0") > observed_fraction.ljust(width, "0")
 
 
+def run_is_scheduled_wait(run: Mapping[str, object], *, observed: datetime) -> bool:
+    """Return whether a durable queued run is still before its fire instant."""
+    if run.get("status") != "queued":
+        return False
+    metadata = run.get("run_metadata")
+    if not isinstance(metadata, Mapping):
+        return False
+    schedule_at = metadata.get("schedule_at")
+    if not isinstance(schedule_at, str):
+        return False
+    return rfc3339_instant_is_after(schedule_at, observed)
+
+
 __all__ = [
     "SCHEDULE_INSTANT_MAX_CHARS",
     "ScheduleInstantError",
     "normalize_rfc3339_instant",
     "rfc3339_instant_is_after",
+    "run_is_scheduled_wait",
 ]

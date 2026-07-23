@@ -54,6 +54,7 @@ from plugins.workflow.schedule_time import (
     ScheduleInstantError,
     normalize_rfc3339_instant,
     rfc3339_instant_is_after,
+    run_is_scheduled_wait,
 )
 from plugins.workflow.sanitize import (
     sanitize_projection,
@@ -1590,7 +1591,8 @@ class RunStore:
                 if isinstance(indexed_sequence, int)
                 else RunStore._next_queue_sequence(connection)
             )
-            queue_position = queue_sequence
+            if scheduled_at is None:
+                queue_position = queue_sequence
         connection.execute(
             "UPDATE runs SET status=?, desired_status=?, execution_mode=?, "
             "scheduled_at=?, "
@@ -1793,7 +1795,8 @@ class RunStore:
             or not isinstance(queue_sequence, int)
         ):
             queue_sequence = self._next_queue_sequence(connection)
-            queue_position = queue_sequence
+            if scheduled_at is None:
+                queue_position = queue_sequence
         connection.execute(
             "INSERT INTO runs ("
             "run_id, workflow_name, trigger_source, "
@@ -3150,6 +3153,7 @@ class RunStore:
             older_queued = self._eligible_queued_predecessor(
                 connection,
                 run_id=None,
+                now=admission_now,
             )
             status = "running"
             disposition = "created"
@@ -3157,7 +3161,11 @@ class RunStore:
             queue_position = None
             queue_sequence = None
             execution_at_capacity = counts.get("running", 0) >= self.limits["executing"]
-            if active and request.concurrency_policy == "forbid":
+            if (
+                scheduled_at is None
+                and active
+                and request.concurrency_policy == "forbid"
+            ):
                 connection.rollback()
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
                 return RunAdmissionResult(None, "rejected", "overlap_forbidden")
@@ -3170,6 +3178,7 @@ class RunStore:
                     return RunAdmissionResult(None, "rejected", "queued_capacity")
                 status = "queued"
                 disposition = "queued"
+                queue_sequence = self._next_queue_sequence(connection)
             elif (
                 (active and request.concurrency_policy == "queue")
                 or (older_queued is not None and request.concurrency_policy != "allow")
@@ -3773,20 +3782,32 @@ class RunStore:
         connection: sqlite3.Connection,
         *,
         run_id: str | None,
+        now: datetime,
         before_sequence: int | None = None,
     ):
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        observed = now.astimezone(timezone.utc)
+        second = observed.isoformat(timespec="seconds").removesuffix("+00:00")
+        fractional_bound = f"{second}.{observed.microsecond:06d}"
         clauses = [
             "candidate.status='queued'",
+            "(candidate.scheduled_at IS NULL OR candidate.scheduled_at<? "
+            "OR candidate.scheduled_at=? OR candidate.scheduled_at=?)",
             "(candidate.concurrency_policy='allow' OR NOT EXISTS ("
             "SELECT 1 FROM runs AS holder WHERE holder.run_id<>candidate.run_id "
             "AND holder.workflow_name=candidate.workflow_name "
             "AND holder.concurrency_key=candidate.concurrency_key "
             "AND holder.lane_state='held'))",
         ]
-        values: list[object] = []
+        values: list[object] = [
+            fractional_bound,
+            f"{second}Z",
+            f"{fractional_bound}Z",
+        ]
         if run_id is not None:
             clauses.insert(0, "candidate.run_id<>?")
-            values.append(run_id)
+            values.insert(0, run_id)
         if before_sequence is not None:
             clauses.append("candidate.queue_sequence<?")
             values.append(before_sequence)
@@ -3842,6 +3863,7 @@ class RunStore:
             older_queued = self._eligible_queued_predecessor(
                 connection,
                 run_id=str(projection["run_id"]),
+                now=self._lease_clock().utc_now,
             )
             if (
                 active is None
@@ -3928,20 +3950,86 @@ class RunStore:
                 older = self._eligible_queued_predecessor(
                     connection,
                     run_id=run_id,
+                    now=now or self._lease_clock().utc_now,
                     before_sequence=int(sequence),
                 )
                 active = None
                 if row["concurrency_policy"] != "allow":
                     active = connection.execute(
-                        "SELECT 1 FROM runs WHERE run_id<>? AND workflow_name=? "
+                        "SELECT run_id FROM runs WHERE run_id<>? AND workflow_name=? "
                         "AND concurrency_key=? AND lane_state='held' LIMIT 1",
                         (run_id, row["workflow_name"], row["concurrency_key"]),
                     ).fetchone()
                 running = connection.execute(
                     "SELECT COUNT(*) FROM runs WHERE status='running'"
                 ).fetchone()[0]
+                if (
+                    scheduled_at is not None
+                    and row["concurrency_policy"] == "forbid"
+                    and active is not None
+                ):
+                    projection["status"] = "failed"
+                    projection["queue_position"] = None
+                    projection["queue_sequence"] = None
+                    projection["blocked_by_run_id"] = None
+                    projection["last_error"] = {
+                        "code": "schedule_overlap_forbidden",
+                        "message": "scheduled run overlaps active same-key work",
+                    }
+                    for node in projection["nodes"].values():
+                        if node["state"] not in {"succeeded", "failed", "skipped"}:
+                            node.pop("claim", None)
+                            node["state"] = "cancelled"
+                    self._append_locked(
+                        directory,
+                        projection,
+                        "run_failed",
+                        {"reason_code": "schedule_overlap_forbidden"},
+                    )
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
+                    )
+                    self._record_coordinator_wake(
+                        connection,
+                        run_id=run_id,
+                        reason_code="run_failed",
+                    )
+                    connection.commit()
+                    self._notify_coordinator()
+                    return False
                 if older or active or running >= self.limits["executing"]:
-                    connection.rollback()
+                    blocked_by = (
+                        str(active["run_id"])
+                        if active is not None and "run_id" in active.keys()
+                        else None
+                    )
+                    if (
+                        projection.get("queue_position") != sequence
+                        or projection.get("blocked_by_run_id") != blocked_by
+                    ):
+                        projection["queue_position"] = sequence
+                        projection["queue_sequence"] = sequence
+                        projection["blocked_by_run_id"] = blocked_by
+                        self._append_locked(
+                            directory,
+                            projection,
+                            "run_queued",
+                            {"reason_code": "scheduled_lane_wait"},
+                        )
+                        self._sync_integrity_index(
+                            connection,
+                            projection=projection,
+                            journal_sha256=_sha256(
+                                (directory / "events.jsonl").read_bytes()
+                            ),
+                        )
+                        connection.commit()
+                    else:
+                        connection.rollback()
                     return False
                 event_now = _utc_now()
                 projection["status"] = "running"
@@ -5249,13 +5337,17 @@ class RunStore:
             health = "interrupted"
         elif status == "queued":
             health = "waiting"
-            blocking_reason = (
-                "concurrency_lane_busy"
-                if run.get("blocked_by_run_id")
-                else "execution_capacity"
-            )
+            if run_is_scheduled_wait(run, observed=observed_at):
+                blocking_reason = "scheduled_wait"
+            else:
+                blocking_reason = (
+                    "concurrency_lane_busy"
+                    if run.get("blocked_by_run_id")
+                    else "execution_capacity"
+                )
             if (
-                observed is not None
+                blocking_reason != "scheduled_wait"
+                and observed is not None
                 and observed.status != "healthy"
                 and not run.get("blocked_by_run_id")
             ):

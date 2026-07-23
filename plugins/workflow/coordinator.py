@@ -28,7 +28,7 @@ from plugins.workflow.lease_clock import (
     lease_is_fresh,
 )
 from plugins.workflow.models import ExecutionFence
-from plugins.workflow.schedule_time import rfc3339_instant_is_after
+from plugins.workflow.schedule_time import run_is_scheduled_wait
 from tools.managed_process import ProcessIdentity
 
 
@@ -335,16 +335,12 @@ class WorkflowCoordinatorService:
                 continue
             try:
                 projection = run_store.load_run(run_id)
-                scheduled_at = run_store._scheduled_at_from_projection(projection)
+                run_store._scheduled_at_from_projection(projection)
                 created_at = str(projection["created_at"])
             except Exception:
                 uncorroborated_wake_ids.append(run_id)
             else:
-                if (
-                    projection.get("status") == "queued"
-                    and scheduled_at is not None
-                    and rfc3339_instant_is_after(scheduled_at, now)
-                ):
+                if run_is_scheduled_wait(projection, observed=now):
                     for wake in wake_by_run[run_id]:
                         coordinator_store.complete_wake(
                             wake.generation,
@@ -376,12 +372,8 @@ class WorkflowCoordinatorService:
             run_actionable = False
             try:
                 before = run_store.load_run(run_id)
-                scheduled_at = run_store._scheduled_at_from_projection(before)
-                scheduled_not_due = (
-                    before.get("status") == "queued"
-                    and scheduled_at is not None
-                    and rfc3339_instant_is_after(scheduled_at, now)
-                )
+                run_store._scheduled_at_from_projection(before)
+                scheduled_not_due = run_is_scheduled_wait(before, observed=now)
                 if scheduled_not_due:
                     outcome = "scheduled_not_due"
                 elif before.get("execution_mode") == "foreground":

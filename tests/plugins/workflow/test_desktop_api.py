@@ -906,6 +906,8 @@ def test_scheduled_mutation_success_uses_public_run_projection(
     _healthy_coordinator(store)
     run_id = _start_scheduled_mutation_run(store, package, key="success")
     current = store.get_run_status(run_id)
+    run_directory = store.run_directory(run_id)
+    journal_before = (run_directory / "events.jsonl").read_bytes()
 
     response = TestClient(_app(_router())).post(
         f"/api/plugins/workflow/runs/{run_id}/cancel",
@@ -915,6 +917,31 @@ def test_scheduled_mutation_success_uses_public_run_projection(
     assert response.status_code == 200
     assert response.json()["status"] == "cancelled"
     _assert_public_scheduled_mutation_projection(response.json(), waiting=False)
+    assert run_directory.is_dir()
+    assert (run_directory / "run.json").is_file()
+    journal_after = (run_directory / "events.jsonl").read_bytes()
+    assert journal_after.startswith(journal_before)
+    assert b'"event_type":"run_cancelled"' in journal_after
+
+    restarted = RunStore(home)
+    after_due = datetime(2100, 1, 1, tzinfo=timezone.utc)
+    scheduled, _cursor, _exhausted = restarted.scheduled_coordinator_candidates(
+        after=None,
+        now=after_due,
+    )
+    assert run_id not in {str(item["run_id"]) for item in scheduled}
+    restarted_scheduler = RunScheduler(restarted, utcnow=lambda: after_due)
+    try:
+        assert restarted_scheduler.advance(run_id)["status"] == "cancelled"
+    finally:
+        restarted_scheduler.shutdown(deadline_seconds=1)
+    with restarted._connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            == 0
+        )
 
 
 @pytest.mark.parametrize(

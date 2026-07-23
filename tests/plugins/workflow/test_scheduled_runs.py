@@ -16,9 +16,15 @@ from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import ExecutionFence
+from plugins.workflow.sanitize import public_run_projection
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
-from plugins.workflow.store import JournalRecoveryError, RunStore
+from plugins.workflow.store import (
+    ForegroundExecutionConflict,
+    JournalRecoveryError,
+    RunStore,
+)
+from plugins.workflow.executors.base import NodeExecutionResult
 from tools.managed_process import ProcessIdentity
 
 
@@ -81,6 +87,8 @@ def _admit(
     *,
     key: str,
     schedule_at: str | None,
+    concurrency_key: str | None = None,
+    concurrency_policy: str = "queue",
 ):
     snapshot = store.prepare_run_snapshot(package)
     metadata = {"schedule_at": schedule_at} if schedule_at is not None else None
@@ -92,8 +100,8 @@ def _admit(
             input_manifest_digest=snapshot.input_manifest_digest,
             trigger_source="api",
             idempotency_key=key,
-            concurrency_key=key,
-            concurrency_policy="queue",
+            concurrency_key=concurrency_key or key,
+            concurrency_policy=concurrency_policy,
             execution_mode="background",
             run_metadata=metadata,
         ),
@@ -101,6 +109,303 @@ def _admit(
     )
     assert result.run_id is not None
     return result
+
+
+def test_future_scheduled_run_isolated_from_immediate_queue_consumers(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=4,
+        max_queued_runs=2,
+        max_nonterminal_runs=3,
+        lease_clock=clocks.lease_sample,
+    )
+    _coordinator, identity, epoch = _leader(
+        store, clocks, name="consumer-matrix-leader"
+    )
+    package = _package(workflow_writer, tmp_path / "package", name="consumer-matrix")
+    due = clocks.wall + timedelta(hours=1)
+    scheduled = _admit(
+        store,
+        package,
+        key="scheduled",
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        concurrency_key="shared",
+    )
+
+    projection = store.load_run(scheduled.run_id)
+    with store._connect() as connection:
+        row = connection.execute(
+            "SELECT status, queue_position, queue_sequence, lane_state, "
+            "foreground_owner_id, foreground_epoch FROM runs WHERE run_id=?",
+            (scheduled.run_id,),
+        ).fetchone()
+        counts = {
+            "queued": connection.execute(
+                "SELECT COUNT(*) FROM runs WHERE status='queued'"
+            ).fetchone()[0],
+            "nonterminal": connection.execute(
+                "SELECT COUNT(*) FROM runs WHERE status IN "
+                "('queued','running','waiting_retry','paused','interrupted')"
+            ).fetchone()[0],
+            "running": connection.execute(
+                "SELECT COUNT(*) FROM runs WHERE status='running'"
+            ).fetchone()[0],
+            "workers": connection.execute(
+                "SELECT COUNT(*) FROM worker_claims"
+            ).fetchone()[0],
+        }
+
+    assert tuple(row)[:2] == ("queued", None)
+    assert isinstance(row["queue_sequence"], int)
+    assert row["lane_state"] == "released"
+    assert row["foreground_owner_id"] is None
+    assert row["foreground_epoch"] is None
+    assert projection["execution_mode"] == "background"
+    assert counts == {"queued": 1, "nonterminal": 1, "running": 0, "workers": 0}
+    assert (
+        public_run_projection(projection, now=clocks.wall)["presentation_state"]
+        == "scheduled_wait"
+    )
+    due_projection = public_run_projection(projection, now=due)
+    assert "presentation_state" not in due_projection
+    ordinary, _cursor, _exhausted = store.coordinator_candidates(
+        after=None, now=clocks.wall
+    )
+    assert scheduled.run_id not in {str(item["run_id"]) for item in ordinary}
+    assert (
+        store.claim_foreground_execution(
+            scheduled.run_id,
+            owner_id="must-not-adopt",
+            now=clocks.wall,
+            lease_seconds=30,
+        )
+        is None
+    )
+    with pytest.raises(ForegroundExecutionConflict, match="not foreground-owned"):
+        store.adopt_expired_foreground(
+            scheduled.run_id,
+            ExecutionFence(identity.owner_id, epoch),
+            clocks.wall,
+        )
+
+    second = _admit(
+        store,
+        package,
+        key="scheduled-capacity",
+        schedule_at=(due + timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+    )
+    rejected_snapshot = store.prepare_run_snapshot(package)
+    rejected = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=rejected_snapshot.definition_digest,
+            policy_digest=rejected_snapshot.policy_digest,
+            input_manifest_digest=rejected_snapshot.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="scheduled-over-capacity",
+            concurrency_key="other",
+            concurrency_policy="queue",
+            execution_mode="background",
+            run_metadata={
+                "schedule_at": (due + timedelta(minutes=2))
+                .isoformat()
+                .replace("+00:00", "Z")
+            },
+        ),
+        immutable_snapshot=rejected_snapshot,
+    )
+    assert second.run_id is not None
+    assert rejected.reason_code == "queued_capacity"
+
+    quota_store = RunStore(
+        tmp_path / "quota-home",
+        max_queued_runs=3,
+        max_nonterminal_runs=1,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(quota_store, clocks, name="nonterminal-quota-leader")
+    quota_package = _package(
+        workflow_writer, tmp_path / "quota-package", name="nonterminal-quota"
+    )
+    _admit(
+        quota_store,
+        quota_package,
+        key="first",
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+    )
+    quota_snapshot = quota_store.prepare_run_snapshot(quota_package)
+    quota_rejected = quota_store.start_run(
+        RunAdmissionRequest(
+            workflow_name=quota_package.definition.name,
+            definition_digest=quota_snapshot.definition_digest,
+            policy_digest=quota_snapshot.policy_digest,
+            input_manifest_digest=quota_snapshot.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="second",
+            concurrency_key="second",
+            concurrency_policy="queue",
+            execution_mode="background",
+            run_metadata={"schedule_at": due.isoformat().replace("+00:00", "Z")},
+        ),
+        immutable_snapshot=quota_snapshot,
+    )
+    assert quota_rejected.reason_code == "nonterminal_capacity"
+
+
+@pytest.mark.parametrize("policy", ["allow", "queue", "forbid"])
+def test_future_scheduled_run_never_blocks_same_key_immediate_work(
+    tmp_path: Path,
+    workflow_writer,
+    policy: str,
+) -> None:
+    clocks = _Clocks(datetime(2026, 1, 2, 12, 0, tzinfo=UTC))
+    store = RunStore(tmp_path / policy, lease_clock=clocks.lease_sample)
+    _leader(store, clocks, name=f"same-key-{policy}")
+    package = _package(
+        workflow_writer, tmp_path / f"package-{policy}", name=f"same-key-{policy}"
+    )
+    scheduled = _admit(
+        store,
+        package,
+        key="scheduled",
+        schedule_at=(clocks.wall + timedelta(hours=1))
+        .isoformat()
+        .replace("+00:00", "Z"),
+        concurrency_key="shared",
+        concurrency_policy=policy,
+    )
+    immediate = _admit(
+        store,
+        package,
+        key="immediate",
+        schedule_at=None,
+        concurrency_key="shared",
+        concurrency_policy=policy,
+    )
+
+    assert store.load_run(scheduled.run_id)["status"] == "queued"
+    current = store.load_run(immediate.run_id)
+    assert current["status"] == "running"
+    assert current["queue_position"] is None
+    assert current["blocked_by_run_id"] is None
+
+
+@pytest.mark.parametrize("policy", ["allow", "queue", "forbid"])
+def test_due_scheduled_run_preserves_declared_overlap_policy_before_claim(
+    tmp_path: Path,
+    workflow_writer,
+    policy: str,
+) -> None:
+    clocks = _Clocks(datetime(2026, 1, 3, 12, 0, tzinfo=UTC))
+    store = RunStore(tmp_path / policy, lease_clock=clocks.lease_sample)
+    _leader(store, clocks, name=f"due-policy-{policy}")
+    package = _package(
+        workflow_writer, tmp_path / f"due-package-{policy}", name=f"due-policy-{policy}"
+    )
+    active = _admit(
+        store,
+        package,
+        key="active",
+        schedule_at=None,
+        concurrency_key="shared",
+        concurrency_policy="allow",
+    )
+    due = clocks.wall + timedelta(minutes=1)
+    scheduled = _admit(
+        store,
+        package,
+        key="scheduled",
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        concurrency_key="shared",
+        concurrency_policy=policy,
+    )
+    clocks.wall = due
+
+    promoted = store.try_promote_run(scheduled.run_id, now=clocks.wall)
+    projection = store.load_run(scheduled.run_id)
+    with store._connect() as connection:
+        claims = connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (scheduled.run_id,)
+        ).fetchone()[0]
+
+    if policy == "allow":
+        assert promoted is True
+        assert projection["status"] == "running"
+    elif policy == "queue":
+        assert promoted is False
+        assert projection["status"] == "queued"
+        assert projection["queue_position"] == projection["queue_sequence"]
+    else:
+        assert promoted is False
+        assert projection["status"] == "failed"
+        assert projection["last_error"]["code"] == "schedule_overlap_forbidden"
+        assert any(
+            event["event_type"] == "run_failed"
+            for event in store.tail_events(scheduled.run_id)
+        )
+    assert claims == 0
+    assert store.load_run(active.run_id)["status"] == "running"
+
+
+def test_scheduled_run_uses_existing_retry_clock_only_after_it_fires(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 1, 4, 12, 0, tzinfo=UTC))
+    package = _package(
+        workflow_writer,
+        tmp_path / "retry-package",
+        name="scheduled-retry",
+    )
+    store = RunStore(tmp_path / "retry-home", lease_clock=clocks.lease_sample)
+    _coordinator, identity, epoch = _leader(
+        store, clocks, name="scheduled-retry-leader"
+    )
+    due = clocks.wall + timedelta(minutes=1)
+    scheduled = _admit(
+        store,
+        package,
+        key="scheduled-retry",
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        concurrency_policy="allow",
+    )
+    calls = 0
+
+    class _FailsOnce:
+        def execute(self, _context):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return NodeExecutionResult("failed", error_code="provider_timeout")
+            return NodeExecutionResult("succeeded")
+
+    scheduler = RunScheduler(
+        store,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=clocks.utcnow,
+        jitter=lambda: 0.5,
+    )
+    scheduler.executors["bash"] = _FailsOnce()
+    try:
+        assert scheduler.advance(scheduled.run_id)["status"] == "queued"
+        assert calls == 0
+        clocks.wall = due
+        waiting = scheduler.advance(scheduled.run_id)
+        retry_at = due + timedelta(seconds=1)
+        assert waiting["status"] == "waiting_retry"
+        assert waiting["nodes"]["start"]["next_attempt_at"] == retry_at.isoformat()
+        assert calls == 1
+        assert scheduler.advance(scheduled.run_id)["status"] == "waiting_retry"
+        assert calls == 1
+        clocks.wall = retry_at
+        assert scheduler.advance(scheduled.run_id)["status"] == "succeeded"
+        assert calls == 2
+    finally:
+        scheduler.shutdown(deadline_seconds=1)
 
 
 def _leader(

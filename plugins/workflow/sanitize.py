@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from pathlib import PurePath
 from typing import Mapping
 
 from plugins.workflow.schedule_time import (
     ScheduleInstantError,
     normalize_rfc3339_instant,
+    run_is_scheduled_wait,
 )
 
 
@@ -132,7 +134,9 @@ def sanitize_projection(value: object, *, key: str = "", depth: int = 0) -> obje
     return sanitize_projection(str(value), key=key, depth=depth + 1)
 
 
-def public_run_projection(value: Mapping[str, object]) -> dict[str, object]:
+def public_run_projection(
+    value: Mapping[str, object], *, now: datetime | None = None
+) -> dict[str, object]:
     """Project a run while keeping durable admission metadata server-private."""
     projected = sanitize_projection(value)
     if not isinstance(projected, dict):
@@ -149,7 +153,10 @@ def public_run_projection(value: Mapping[str, object]) -> dict[str, object]:
     if schedule_at != canonical_schedule_at:
         return projected
     projected["schedule_at"] = canonical_schedule_at
-    if value.get("status") == "queued":
+    if run_is_scheduled_wait(
+        value,
+        observed=now or datetime.now(timezone.utc),
+    ):
         projected["presentation_state"] = "scheduled_wait"
     return projected
 

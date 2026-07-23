@@ -2495,3 +2495,47 @@ upstream_changes:
     coordinator paging, one-shot early-wake deferral, atomic promotion recheck,
     injected scheduler clocks, and five-second monotonic sweep bounds.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-scheduled-queued-consumer-isolation
+  change_class: workflow-runtime
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/coordinator.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/sanitize.py
+  - plugins/workflow/schedule_time.py
+  - plugins/workflow/store.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  owned_symbols:
+  - run_is_scheduled_wait canonical projection predicate
+  - future scheduled queue-position and predecessor isolation
+  - due scheduled allow queue forbid policy preservation
+  - schedule_overlap_forbidden terminal evidence
+  - due-aware public run presentation
+  - cancel-before-due immutable evidence retention
+  - scheduled foreground and retry isolation
+  tests:
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  expected_commit_subject: 'fix(workflow): isolate scheduled queue consumers'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve one canonical projection-derived scheduled-wait predicate using an
+    injected aware UTC wall clock. Future scheduled rows remain durably queued
+    with their original fairness sequence but have no immediate queue position,
+    lane ownership, predecessor effect, foreground owner, coordinator
+    eligibility, running count, or worker claim. They continue to count against
+    queued and nonterminal admission quotas and remain cancellable through the
+    existing desired-status path without deleting their immutable directory or
+    journal. At due promotion, evaluate the declared overlap policy atomically:
+    allow may overlap subject to capacity, queue materializes its original
+    position while waiting for the active lane, and forbid records terminal
+    schedule_overlap_forbidden before any node claim. Public list, detail, and
+    mutation projections must derive scheduled_wait only while the canonical
+    instant is still future, from the same request-scoped clock where available.
+    Keep ordinary unscheduled promotion, foreground recovery, retry timing, and
+    cleanup retention behavior unchanged.
+  removal_condition: Remove when upstream carries equivalent future-scheduled
+    isolation across every queued consumer, atomic due-time overlap behavior,
+    and cancel-before-fire evidence retention.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

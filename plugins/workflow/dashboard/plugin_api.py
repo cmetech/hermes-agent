@@ -846,7 +846,7 @@ def list_runs(
         })
     return {
         "schema_version": 1,
-        "runs": [public_run_projection(item) for item in page],
+        "runs": [public_run_projection(item, now=observed_at) for item in page],
         "next_cursor": next_cursor,
     }
 
@@ -994,7 +994,10 @@ def get_run(
     operator = _verified_operator(request, operator_scope)
     operator.require("read")
     with _store_lease() as store:
-        return public_run_projection(_load_authorized(store, run_id, operator))
+        return public_run_projection(
+            _load_authorized(store, run_id, operator),
+            now=_schedule_now_utc(),
+        )
 
 
 def _attention_origin(run: Mapping[str, object]) -> str:
@@ -1417,13 +1420,16 @@ def mutate_run(
                 status_code=409,
                 detail={
                     "code": "invalid_transition",
-                    "current": public_run_projection(current),
+                    "current": public_run_projection(current, now=_schedule_now_utc()),
                 },
             )
         if int(current["state_version"]) != request.expected_version:
             raise HTTPException(
                 status_code=409,
-                detail={"code": "stale_state", "current": public_run_projection(current)},
+                detail={
+                    "code": "stale_state",
+                    "current": public_run_projection(current, now=_schedule_now_utc()),
+                },
             )
         try:
             if action == "approve":
@@ -1519,7 +1525,8 @@ def mutate_run(
                 detail={
                     "code": "stale_state",
                     "current": public_run_projection(
-                        _load_authorized(store, run_id, operator)
+                        _load_authorized(store, run_id, operator),
+                        now=_schedule_now_utc(),
                     ),
                 },
             ) from exc
@@ -1527,4 +1534,7 @@ def mutate_run(
             raise HTTPException(
                 status_code=409, detail={"code": "invalid_transition"}
             ) from exc
-        return public_run_projection(_load_authorized(store, run_id, operator))
+        return public_run_projection(
+            _load_authorized(store, run_id, operator),
+            now=_schedule_now_utc(),
+        )
