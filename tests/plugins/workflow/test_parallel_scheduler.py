@@ -170,6 +170,106 @@ def test_ready_layers_are_replenished_fairly_across_active_runs(
     assert set(first_wave[:2]) == {"first-run", "second-run"}
 
 
+def test_mixed_run_limits_share_profile_pool_without_leaking(
+    tmp_path, workflow_writer
+):
+    store = RunStore(tmp_path / "home", max_total_workers=5)
+    runs = []
+    for name, parallel, workers in (("run-a", 1, 2), ("run-b", 4, 4)):
+        workflow = workflow_writer(
+            tmp_path / name,
+            name=name,
+            nodes=[{"id": f"n{i}", "bash": "true"} for i in range(8)],
+        )
+        workflow.with_name("example.hermes.yaml").write_text(
+            "limits:\n"
+            f"  max_parallel_nodes: {parallel}\n"
+            f"  max_total_workers: {workers}\n",
+            encoding="utf-8",
+        )
+        runs.append(_start(store, load_workflow(workflow), key=name).run_id)
+    lock = threading.Lock()
+    active = defaultdict(int)
+    maximum = defaultdict(int)
+    maximum_total = 0
+    observed_limits = defaultdict(set)
+
+    class MixedLimitExecutor:
+        def execute(self, context):
+            nonlocal maximum_total
+            with lock:
+                active[context.workflow_name] += 1
+                maximum[context.workflow_name] = max(
+                    maximum[context.workflow_name], active[context.workflow_name]
+                )
+                maximum_total = max(maximum_total, sum(active.values()))
+                observed_limits[context.workflow_name].add((
+                    context.execution_limits.max_parallel_nodes,
+                    context.execution_limits.max_total_workers,
+                ))
+            time.sleep(0.06)
+            with lock:
+                active[context.workflow_name] -= 1
+            return NodeExecutionResult("succeeded")
+
+    scheduler = RunScheduler(store, max_parallel_nodes=5)
+    scheduler.executors["bash"] = MixedLimitExecutor()
+
+    results = scheduler.advance_all(runs)
+
+    assert {result["status"] for result in results.values()} == {"succeeded"}
+    assert maximum["run-a"] == 1
+    assert maximum["run-b"] == 4
+    assert maximum_total <= 5
+    assert observed_limits == {
+        "run-a": {(1, 2)},
+        "run-b": {(4, 4)},
+    }
+
+
+def test_store_composes_per_run_worker_ceiling_with_profile_ceiling(
+    tmp_path, workflow_writer
+):
+    store = RunStore(tmp_path / "home", max_total_workers=3)
+    runs = []
+    for name in ("run-a", "run-b"):
+        package = load_workflow(
+            workflow_writer(
+                tmp_path / name,
+                name=name,
+                nodes=[{"id": f"n{i}", "bash": "true"} for i in range(3)],
+            )
+        )
+        run_id = _start(store, package, key=name).run_id
+        store.transition_pending_nodes(
+            run_id,
+            {f"n{i}": ("ready", None) for i in range(3)},
+        )
+        runs.append(run_id)
+
+    first_a = store.claim_node(
+        runs[0], "n0", "owner", max_run_workers=2
+    )
+    second_a = store.claim_node(
+        runs[0], "n1", "owner", max_run_workers=2
+    )
+    blocked_by_run = store.claim_node(
+        runs[0], "n2", "owner", max_run_workers=2
+    )
+    first_b = store.claim_node(
+        runs[1], "n0", "owner", max_run_workers=3
+    )
+    blocked_by_profile = store.claim_node(
+        runs[1], "n1", "owner", max_run_workers=3
+    )
+
+    assert first_a is not None
+    assert second_a is not None
+    assert blocked_by_run is None
+    assert first_b is not None
+    assert blocked_by_profile is None
+
+
 def test_profile_worker_cap_holds_across_scheduler_instances(tmp_path, workflow_writer):
     store = RunStore(tmp_path / "home", max_total_workers=2)
     runs = []

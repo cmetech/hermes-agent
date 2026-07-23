@@ -40,8 +40,11 @@ def _clean_completion(output: str, signal: str) -> tuple[bool, str]:
 
 
 class LoopExecutor:
-    def __init__(self, agent_runner) -> None:
-        self._agent = AgentNodeExecutor(agent_runner)
+    def __init__(self, agent_runner, *, deterministic_runner=None) -> None:
+        self._agent = AgentNodeExecutor(
+            agent_runner,
+            deterministic_runner=deterministic_runner,
+        )
         self._bash = BashExecutor()
 
     @staticmethod

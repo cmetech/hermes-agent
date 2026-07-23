@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -9,6 +10,7 @@ import pytest
 
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import InputSnapshotError, RunStore, StorageQuotaError
+from plugins.workflow.trust import WorkflowResourceReadBudget
 
 
 def test_store_connection_context_closes_the_database_handle(tmp_path) -> None:
@@ -37,6 +39,30 @@ def test_prepare_snapshot_copies_inputs_immutably(tmp_path, workflow_writer):
     captured = prepared.staging_directory / manifest["evidence"]["relative_path"]
     assert captured.read_text(encoding="utf-8") == "original"
     assert manifest["evidence"]["sha256"] == prepared.input_digests["evidence"]
+
+
+def test_local_input_channel_reopens_caller_path_after_an_unrelated_cached_read(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = load_workflow(workflow_writer(tmp_path / "package", name="local-input"))
+    source = tmp_path / "evidence.txt"
+    source.write_bytes(b"authenticated-earlier")
+    budget = WorkflowResourceReadBudget(
+        max_file_bytes=1024,
+        max_total_bytes=1024,
+        max_files=4,
+    )
+    assert budget.read(source) == b"authenticated-earlier"
+    source.write_bytes(b"caller-mutated")
+
+    prepared = RunStore(tmp_path / "home").prepare_run_snapshot(
+        workflow,
+        inputs={"evidence": source},
+    )
+
+    manifest = json.loads((prepared.staging_directory / "inputs.json").read_text())
+    captured = prepared.staging_directory / manifest["evidence"]["relative_path"]
+    assert captured.read_bytes() == b"caller-mutated"
 
 
 def test_prepare_snapshot_captures_text_arguments_without_projecting_values(
@@ -152,6 +178,41 @@ def test_prepare_snapshot_rejects_symlink_and_oversized_input(
         store.prepare_run_snapshot(workflow, inputs={"evidence": link})
     with pytest.raises(InputSnapshotError, match="exceeds"):
         store.prepare_run_snapshot(workflow, inputs={"evidence": target})
+
+
+@pytest.mark.parametrize("channel", ["text", "local-file", "verified-fixture"])
+def test_prepare_snapshot_enforces_each_declared_input_byte_bound(
+    tmp_path, workflow_writer, channel
+) -> None:
+    workflow_path = workflow_writer(tmp_path / "package", name="declared-bounds")
+    workflow_path.with_name("example.hermes.yaml").write_text(
+        """delivery_defaults:
+  inputs:
+    symptom: {kind: text, required: true, max_bytes: 4}
+    evidence: {kind: file, required: true, max_bytes: 4}
+""",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow_path)
+    store = RunStore(tmp_path / "home")
+    source = tmp_path / "evidence.txt"
+    source.write_bytes(b"12345")
+
+    kwargs = {
+        "text": {"values": {"symptom": "12345"}},
+        "local-file": {"inputs": {"evidence": source}},
+        "verified-fixture": {
+            "verified_inputs": {
+                "evidence": (b"12345", hashlib.sha256(b"12345").hexdigest())
+            }
+        },
+    }[channel]
+
+    with pytest.raises(InputSnapshotError, match="exceeds.*4 bytes") as error:
+        store.prepare_run_snapshot(package, **kwargs)
+
+    assert error.value.code == "workflow_input_too_large"
+    assert list(store.staging_root.iterdir()) == []
 
 
 def test_prepare_snapshot_rejects_unreadable_or_changed_during_copy(

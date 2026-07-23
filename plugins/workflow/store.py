@@ -30,6 +30,10 @@ from plugins.workflow.admission import (
     RunAdmissionResult,
 )
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
+from plugins.workflow.input_contract import (
+    WorkflowInputContractError,
+    workflow_input_declarations,
+)
 from plugins.workflow.machine_contract import WorkflowConflict, projection_was_truncated
 from plugins.workflow.lease_clock import (
     LeaseClockSample,
@@ -46,6 +50,12 @@ from plugins.workflow.provenance import (
     TriggerProvenance,
     legacy_projection_provenance,
 )
+from plugins.workflow.schedule_time import (
+    ScheduleInstantError,
+    normalize_rfc3339_instant,
+    rfc3339_instant_is_after,
+    run_is_scheduled_wait,
+)
 from plugins.workflow.sanitize import (
     sanitize_projection,
     workflow_filename_components_are_distinct,
@@ -61,7 +71,9 @@ from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
 class InputSnapshotError(ValueError):
-    pass
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class StorageQuotaError(RuntimeError):
@@ -74,6 +86,23 @@ class JournalRecoveryError(RuntimeError):
 
 class ForegroundExecutionConflict(RuntimeError):
     """A foreground owner transition lost its exact state/epoch comparison."""
+
+
+class _ScheduledPromotionAuthorization:
+    """Store-instance-owned, one-use fire-time verifier."""
+
+    __slots__ = ("_consumed", "_run_id", "_store_identity", "_verify")
+
+    def __init__(
+        self,
+        store_identity: object,
+        run_id: str,
+        verify: Callable[[Mapping[str, object]], None],
+    ) -> None:
+        self._store_identity = store_identity
+        self._run_id = run_id
+        self._verify = verify
+        self._consumed = False
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -123,11 +152,33 @@ _RUN_SCOPED_REPAIR_REASONS = frozenset(
         "run_evidence_uncorroborated",
     }
 )
+_UNATTENDED_REVALIDATION_REASONS = frozenset(
+    {
+        "legacy_effect_policy_uncorroborated",
+        "run_evidence_uncorroborated",
+    }
+)
+_UNATTENDED_REVALIDATION_REASON_ORDER = tuple(
+    sorted(_UNATTENDED_REVALIDATION_REASONS)
+)
+_UNATTENDED_REVALIDATION_REASON_SQL = ",".join(
+    f"'{reason}'" for reason in _UNATTENDED_REVALIDATION_REASON_ORDER
+)
 _RUN_SCOPED_REPAIR_REASON_ORDER = tuple(sorted(_RUN_SCOPED_REPAIR_REASONS))
 _RUN_SCOPED_REPAIR_REASON_SQL = ",".join(
     f"'{reason}'" for reason in _RUN_SCOPED_REPAIR_REASON_ORDER
 )
-_STORE_SCHEMA_VERSION = 13
+_RUN_SCOPED_REPAIR_EXCLUSION_SQL = (
+    "NOT EXISTS (SELECT 1 FROM repair_events AS repair "
+    "WHERE repair.run_id=runs.run_id "
+    f"AND repair.reason_code IN ({_RUN_SCOPED_REPAIR_REASON_SQL}) "
+    "AND repair.sequence=(SELECT MAX(latest.sequence) "
+    "FROM repair_events AS latest WHERE latest.run_id=repair.run_id "
+    "AND latest.reason_code=repair.reason_code) "
+    "AND repair.outcome='repair_required')"
+)
+_STORE_SCHEMA_VERSION = 14
+_SCHEDULE_PARITY_UNSET = object()
 # Direct RunStore/CLI access is already the profile-local filesystem admin
 # boundary. Network adapters must always pass their verified authority binding.
 _LOCAL_ADMIN_AUTHORITY_BINDING = "profile-local-runstore-admin"
@@ -369,6 +420,7 @@ class RunStore:
         self._notification_repair_timeout_lock = threading.Lock()
         self._notification_repair_timeout_run_id: str | None = None
         self._notification_repair_timeout_count = 0
+        self._scheduled_authorization_identity = object()
         self._admission_open = True
         self._initialized = False
         self._initialize()
@@ -440,6 +492,7 @@ class RunStore:
                         concurrency_policy TEXT NOT NULL,
                         disposition TEXT NOT NULL,
                         status TEXT NOT NULL,
+                        scheduled_at TEXT,
                         queue_position INTEGER,
                         queue_sequence INTEGER,
                         blocked_by_run_id TEXT,
@@ -529,6 +582,15 @@ class RunStore:
                         journal_sha256 TEXT,
                         payload_json TEXT NOT NULL DEFAULT '{}'
                     );
+                    CREATE INDEX IF NOT EXISTS repair_events_run_reason_sequence
+                    ON repair_events(run_id, reason_code, sequence DESC);
+                    CREATE INDEX IF NOT EXISTS repair_events_revalidation_sequence
+                    ON repair_events(sequence, run_id, reason_code)
+                    WHERE outcome='repair_required'
+                    AND reason_code IN (
+                        'legacy_effect_policy_uncorroborated',
+                        'run_evidence_uncorroborated'
+                    );
                     CREATE TABLE IF NOT EXISTS cleanup_previews (
                         token_digest TEXT PRIMARY KEY,
                         created_at TEXT NOT NULL,
@@ -561,6 +623,7 @@ class RunStore:
                     "NOT NULL DEFAULT 'published'"
                 ),
                 "desired_status": ("ALTER TABLE runs ADD COLUMN desired_status TEXT"),
+                "scheduled_at": ("ALTER TABLE runs ADD COLUMN scheduled_at TEXT"),
                 "staging_directory": (
                     "ALTER TABLE runs ADD COLUMN staging_directory TEXT"
                 ),
@@ -628,6 +691,8 @@ class RunStore:
                 if name not in columns:
                     connection.execute(statement)
             self._migrate_runs_idempotency_namespace(connection)
+            if schema_version < 14:
+                self._migrate_scheduled_at(connection)
             self._migrate_runnable_admission(connection)
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS runs_coordinator_scan "
@@ -646,6 +711,12 @@ class RunStore:
                 "ON runs(archived_at, restored_to_history, status, "
                 "updated_at DESC, run_id DESC) "
                 "WHERE admission_state='published'"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS runs_scheduled_queue "
+                "ON runs(scheduled_at, created_at, run_id) "
+                "WHERE admission_state='published' AND status='queued' "
+                "AND scheduled_at IS NOT NULL"
             )
             cleanup_preview_columns = {
                 row["name"]
@@ -675,6 +746,7 @@ class RunStore:
                 "concurrency_policy",
                 "disposition",
                 "status",
+                "scheduled_at",
                 "queue_position",
                 "queue_sequence",
                 "blocked_by_run_id",
@@ -827,8 +899,8 @@ class RunStore:
         finally:
             connection.close()
 
-    @staticmethod
     def _migrate_runs_idempotency_namespace(
+        self,
         connection: sqlite3.Connection,
     ) -> None:
         columns = [
@@ -856,6 +928,7 @@ class RunStore:
             "concurrency_policy",
             "disposition",
             "status",
+            "scheduled_at",
             "queue_position",
             "queue_sequence",
             "blocked_by_run_id",
@@ -886,127 +959,293 @@ class RunStore:
             "integrity_verified_at",
         )
         source_columns = set(columns)
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            source_rows = connection.execute(
-                "SELECT * FROM runs ORDER BY run_id"
-            ).fetchall()
-            connection.execute("DROP TABLE IF EXISTS runs_namespace_migration")
-            connection.execute(
-                """
-                CREATE TABLE runs_namespace_migration (
-                    run_id TEXT PRIMARY KEY,
-                    workflow_name TEXT NOT NULL,
-                    trigger_source TEXT NOT NULL,
-                    idempotency_namespace_digest TEXT NOT NULL,
-                    idempotency_digest TEXT NOT NULL,
-                    start_digest TEXT NOT NULL,
-                    concurrency_key TEXT NOT NULL,
-                    concurrency_policy TEXT NOT NULL,
-                    disposition TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    queue_position INTEGER,
-                    queue_sequence INTEGER,
-                    blocked_by_run_id TEXT,
-                    pause_lane_policy TEXT NOT NULL DEFAULT 'hold',
-                    lane_state TEXT NOT NULL DEFAULT 'released',
-                    run_directory TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    archived_at TEXT,
-                    restored_to_history INTEGER NOT NULL DEFAULT 0,
-                    admission_state TEXT NOT NULL DEFAULT 'published',
-                    desired_status TEXT,
-                    staging_directory TEXT,
-                    operator_scope_digest TEXT,
-                    provenance_json TEXT,
-                    execution_mode TEXT NOT NULL DEFAULT 'foreground',
-                    foreground_owner_id TEXT,
-                    foreground_lease_expires_at TEXT,
-                    foreground_epoch INTEGER,
-                    foreground_boot_id TEXT,
-                    foreground_heartbeat_monotonic REAL,
-                    foreground_lease_seconds REAL,
-                    projection_schema_version INTEGER NOT NULL DEFAULT 1,
-                    projection_state_version INTEGER,
-                    projection_sha256 TEXT,
-                    journal_sequence INTEGER,
-                    journal_sha256 TEXT,
-                    integrity_verified_at TEXT,
-                    UNIQUE(
-                        idempotency_namespace_digest,
-                        workflow_name,
-                        idempotency_digest
-                    )
-                )
-                """
-            )
-            placeholders = ", ".join("?" for _ in target_columns)
-            column_sql = ", ".join(target_columns)
-            for row in source_rows:
-                namespace_digest = (
-                    row["idempotency_namespace_digest"]
-                    if "idempotency_namespace_digest" in source_columns
-                    and row["idempotency_namespace_digest"]
-                    else _sha256(
-                        f"profile-local:{row['trigger_source']}".encode()
-                    )
-                )
-                start_digest = row["start_digest"]
+        placeholders = ", ".join("?" for _ in target_columns)
+        column_sql = ", ".join(target_columns)
+
+        def source_generation() -> str | None:
+            row = connection.execute(
+                "SELECT value FROM store_metadata WHERE key='generation'"
+            ).fetchone()
+            return str(row["value"]) if row is not None else None
+
+        def source_signature(rows: Iterable[sqlite3.Row]) -> tuple[tuple[object, ...], ...]:
+            return tuple(tuple(row[name] for name in columns) for row in rows)
+
+        def evidence_signature(
+            directory: Path,
+        ) -> tuple[bool, str | None, str | None]:
+            try:
+                directory.stat()
+            except FileNotFoundError:
+                return False, None, None
+            digests = []
+            for name in ("run.json", "events.jsonl"):
                 try:
-                    projection = json.loads(
-                        (Path(row["run_directory"]) / "run.json").read_text()
+                    digests.append(_sha256((directory / name).read_bytes()))
+                except FileNotFoundError:
+                    digests.append(None)
+            return True, digests[0], digests[1]
+
+        for _attempt in range(3):
+            locks = ExitStack()
+            transaction_started = False
+            try:
+                candidate_rows = connection.execute(
+                    "SELECT run_id FROM runs ORDER BY run_id"
+                ).fetchall()
+                candidate_ids = tuple(str(row["run_id"]) for row in candidate_rows)
+                for run_id in candidate_ids:
+                    locks.enter_context(workflow_lock(self._run_lock_path(run_id)))
+
+                source_rows = connection.execute(
+                    "SELECT * FROM runs ORDER BY run_id"
+                ).fetchall()
+                if tuple(str(row["run_id"]) for row in source_rows) != candidate_ids:
+                    continue
+                pinned_source = source_signature(source_rows)
+                pinned_generation = source_generation()
+                pinned_evidence: dict[
+                    str,
+                    tuple[
+                        dict[str, object] | None,
+                        Path,
+                        bool,
+                        str | None,
+                        str | None,
+                    ],
+                ] = {}
+                for row in source_rows:
+                    run_id = str(row["run_id"])
+                    directory = Path(row["run_directory"])
+                    try:
+                        projection, projection_sha256, journal_sha256 = (
+                            self._corroborate_run_evidence_locked(
+                                directory, run_id=run_id
+                            )
+                        )
+                        if projection_sha256 is None or journal_sha256 is None:
+                            raise JournalRecoveryError(
+                                "run evidence digests are unavailable"
+                            )
+                        RunStore._start_digest_from_projection(projection)
+                        self._scheduled_at_from_projection(projection)
+                    except (
+                        OSError,
+                        TypeError,
+                        ValueError,
+                        json.JSONDecodeError,
+                        JournalRecoveryError,
+                    ) as exc:
+                        if row["admission_state"] != "reserved":
+                            raise sqlite3.DatabaseError(
+                                "runs namespace migration evidence is uncorroborated"
+                            ) from exc
+                        try:
+                            directory.stat()
+                        except FileNotFoundError:
+                            pass
+                        except OSError as directory_error:
+                            raise sqlite3.DatabaseError(
+                                "runs namespace migration evidence is unreadable"
+                            ) from directory_error
+                        else:
+                            raise sqlite3.DatabaseError(
+                                "runs namespace migration evidence is uncorroborated"
+                            ) from exc
+                        # Initialization holds the admission lock, so no publisher
+                        # can promote staging evidence while this genuinely
+                        # incomplete reserved row is classified under its run lock.
+                        projection = None
+                        (
+                            directory_present,
+                            projection_sha256,
+                            journal_sha256,
+                        ) = evidence_signature(directory)
+                        if directory_present:
+                            raise sqlite3.DatabaseError(
+                                "runs namespace migration evidence is uncorroborated"
+                            ) from exc
+                    else:
+                        directory_present = True
+                    pinned_evidence[run_id] = (
+                        projection,
+                        directory,
+                        directory_present,
+                        projection_sha256,
+                        journal_sha256,
                     )
-                    start_digest = RunStore._start_digest_from_projection(
-                        projection
+
+                connection.execute("BEGIN IMMEDIATE")
+                transaction_started = True
+                current_rows = connection.execute(
+                    "SELECT * FROM runs ORDER BY run_id"
+                ).fetchall()
+                evidence_still_pinned = all(
+                    evidence_signature(directory)
+                    == (
+                        directory_present,
+                        projection_sha256,
+                        journal_sha256,
                     )
-                except (
-                    OSError,
-                    TypeError,
-                    ValueError,
-                    json.JSONDecodeError,
-                    JournalRecoveryError,
+                    for (
+                        _projection,
+                        directory,
+                        directory_present,
+                        projection_sha256,
+                        journal_sha256,
+                    ) in pinned_evidence.values()
+                )
+                if (
+                    source_signature(current_rows) != pinned_source
+                    or source_generation() != pinned_generation
+                    or not evidence_still_pinned
                 ):
-                    # Preserve the legacy digest when evidence cannot
-                    # corroborate the semantic replacement. That row remains
-                    # conflict-safe instead of turning ambiguity into replay.
-                    pass
-                values = [
-                    namespace_digest
-                    if name == "idempotency_namespace_digest"
-                    else start_digest
-                    if name == "start_digest"
-                    else row[name]
-                    for name in target_columns
-                ]
+                    connection.rollback()
+                    transaction_started = False
+                    continue
+
+                connection.execute("DROP TABLE IF EXISTS runs_namespace_migration")
                 connection.execute(
-                    f"INSERT INTO runs_namespace_migration ({column_sql}) "
-                    f"VALUES ({placeholders})",
-                    values,
+                    """
+                    CREATE TABLE runs_namespace_migration (
+                        run_id TEXT PRIMARY KEY,
+                        workflow_name TEXT NOT NULL,
+                        trigger_source TEXT NOT NULL,
+                        idempotency_namespace_digest TEXT NOT NULL,
+                        idempotency_digest TEXT NOT NULL,
+                        start_digest TEXT NOT NULL,
+                        concurrency_key TEXT NOT NULL,
+                        concurrency_policy TEXT NOT NULL,
+                        disposition TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        scheduled_at TEXT,
+                        queue_position INTEGER,
+                        queue_sequence INTEGER,
+                        blocked_by_run_id TEXT,
+                        pause_lane_policy TEXT NOT NULL DEFAULT 'hold',
+                        lane_state TEXT NOT NULL DEFAULT 'released',
+                        run_directory TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        archived_at TEXT,
+                        restored_to_history INTEGER NOT NULL DEFAULT 0,
+                        admission_state TEXT NOT NULL DEFAULT 'published',
+                        desired_status TEXT,
+                        staging_directory TEXT,
+                        operator_scope_digest TEXT,
+                        provenance_json TEXT,
+                        execution_mode TEXT NOT NULL DEFAULT 'foreground',
+                        foreground_owner_id TEXT,
+                        foreground_lease_expires_at TEXT,
+                        foreground_epoch INTEGER,
+                        foreground_boot_id TEXT,
+                        foreground_heartbeat_monotonic REAL,
+                        foreground_lease_seconds REAL,
+                        projection_schema_version INTEGER NOT NULL DEFAULT 1,
+                        projection_state_version INTEGER,
+                        projection_sha256 TEXT,
+                        journal_sequence INTEGER,
+                        journal_sha256 TEXT,
+                        integrity_verified_at TEXT,
+                        UNIQUE(
+                            idempotency_namespace_digest,
+                            workflow_name,
+                            idempotency_digest
+                        )
+                    )
+                    """
                 )
-            copied = connection.execute(
-                "SELECT COUNT(*) FROM runs_namespace_migration"
-            ).fetchone()[0]
-            if copied != len(source_rows):
-                raise sqlite3.DatabaseError("runs namespace migration lost rows")
-            connection.execute("DROP TABLE runs")
-            connection.execute("ALTER TABLE runs_namespace_migration RENAME TO runs")
+                for row in source_rows:
+                    namespace_digest = (
+                        row["idempotency_namespace_digest"]
+                        if "idempotency_namespace_digest" in source_columns
+                        and row["idempotency_namespace_digest"]
+                        else _sha256(
+                            f"profile-local:{row['trigger_source']}".encode()
+                        )
+                    )
+                    projection = pinned_evidence[str(row["run_id"])][0]
+                    if projection is None:
+                        start_digest = row["start_digest"]
+                        scheduled_at = None
+                    else:
+                        start_digest = RunStore._start_digest_from_projection(
+                            projection
+                        )
+                        scheduled_at = self._scheduled_at_from_projection(projection)
+                    values = [
+                        namespace_digest
+                        if name == "idempotency_namespace_digest"
+                        else start_digest
+                        if name == "start_digest"
+                        else scheduled_at
+                        if name == "scheduled_at"
+                        else row[name]
+                        for name in target_columns
+                    ]
+                    connection.execute(
+                        f"INSERT INTO runs_namespace_migration ({column_sql}) "
+                        f"VALUES ({placeholders})",
+                        values,
+                    )
+                copied = connection.execute(
+                    "SELECT COUNT(*) FROM runs_namespace_migration"
+                ).fetchone()[0]
+                if copied != len(source_rows):
+                    raise sqlite3.DatabaseError("runs namespace migration lost rows")
+                connection.execute("DROP TABLE runs")
+                connection.execute(
+                    "ALTER TABLE runs_namespace_migration RENAME TO runs"
+                )
+                connection.execute(
+                    "CREATE INDEX runs_concurrency "
+                    "ON runs(workflow_name, concurrency_key, status)"
+                )
+                if connection.execute("PRAGMA foreign_key_check").fetchall():
+                    raise sqlite3.DatabaseError(
+                        "runs namespace migration violated foreign keys"
+                    )
+                if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise sqlite3.DatabaseError(
+                        "runs namespace migration failed integrity check"
+                    )
+                connection.commit()
+                transaction_started = False
+                return
+            except BaseException:
+                if transaction_started:
+                    connection.rollback()
+                raise
+            finally:
+                locks.close()
+        raise sqlite3.DatabaseError(
+            "runs namespace migration source changed during migration"
+        )
+
+    def _migrate_scheduled_at(self, connection: sqlite3.Connection) -> None:
+        """Backfill the v14 query column from corroborated durable evidence."""
+        rows = connection.execute(
+            "SELECT run_id, run_directory, admission_state FROM runs "
+            "WHERE admission_state IN ('published','reserved') ORDER BY run_id"
+        ).fetchall()
+        for row in rows:
+            try:
+                projection, _, _ = self._corroborate_run_evidence(
+                    Path(row["run_directory"]), run_id=str(row["run_id"])
+                )
+                scheduled_at = self._scheduled_at_from_projection(projection)
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+                JournalRecoveryError,
+            ):
+                continue
             connection.execute(
-                "CREATE INDEX runs_concurrency "
-                "ON runs(workflow_name, concurrency_key, status)"
+                "UPDATE runs SET scheduled_at=? WHERE run_id=?",
+                (scheduled_at, row["run_id"]),
             )
-            if connection.execute("PRAGMA foreign_key_check").fetchall():
-                raise sqlite3.DatabaseError(
-                    "runs namespace migration violated foreign keys"
-                )
-            if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                raise sqlite3.DatabaseError(
-                    "runs namespace migration failed integrity check"
-                )
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
 
     @staticmethod
     def _migrate_runnable_admission(connection: sqlite3.Connection) -> None:
@@ -1231,6 +1470,298 @@ class RunStore:
             ).fetchall()
         return tuple(str(row["reason_code"]) for row in rows)
 
+    def repair_revalidation_candidate(
+        self,
+        *,
+        after: int | None,
+    ) -> tuple[dict[str, object] | None, int | None, bool]:
+        """Return one latest-active evidence repair after the keyset cursor."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT repair.sequence, repair.run_id, repair.reason_code "
+                "FROM repair_events AS repair "
+                "INDEXED BY repair_events_revalidation_sequence "
+                "JOIN runs ON runs.run_id=repair.run_id "
+                "WHERE repair.sequence>? "
+                f"AND repair.reason_code IN ({_UNATTENDED_REVALIDATION_REASON_SQL}) "
+                "AND repair.outcome='repair_required' "
+                "AND repair.sequence=(SELECT MAX(latest.sequence) "
+                "FROM repair_events AS latest "
+                "WHERE latest.run_id=repair.run_id "
+                "AND latest.reason_code=repair.reason_code) "
+                "AND runs.admission_state='published' "
+                "AND runs.status IN ('queued','running','waiting_retry') "
+                "AND runs.execution_mode IN ('background','foreground') "
+                "ORDER BY repair.sequence LIMIT 1",
+                (after or 0,),
+            ).fetchone()
+        if row is None:
+            return None, after, True
+        sequence = int(row["sequence"])
+        return (
+            {
+                "sequence": sequence,
+                "run_id": str(row["run_id"]),
+                "reason_code": str(row["reason_code"]),
+            },
+            sequence,
+            False,
+        )
+
+    @staticmethod
+    def _legacy_effect_policy_nodes(
+        directory: Path,
+        projection: Mapping[str, object],
+        *,
+        policy_data: bytes | None = None,
+    ) -> list[str]:
+        policy_bytes = (
+            policy_data
+            if policy_data is not None
+            else (directory / "policy.yaml").read_bytes()
+        )
+        expected_digest = projection.get("policy_digest")
+        if not isinstance(expected_digest, str) or not expected_digest:
+            raise JournalRecoveryError("legacy workflow policy digest is missing")
+        if not hmac.compare_digest(_sha256(policy_bytes), expected_digest):
+            raise JournalRecoveryError("legacy workflow policy digest mismatch")
+        document = yaml.safe_load(policy_bytes) or {}
+        if not isinstance(document, Mapping):
+            raise JournalRecoveryError("legacy workflow policy is malformed")
+        outward = document.get("outward_action_nodes", [])
+        if not isinstance(outward, list) or any(
+            not isinstance(candidate, str) for candidate in outward
+        ):
+            raise JournalRecoveryError("legacy outward-action policy is malformed")
+        return outward
+
+    @staticmethod
+    def _read_bounded_repair_evidence(path: Path, *, max_bytes: int) -> bytes:
+        if max_bytes < 0:
+            raise StorageQuotaError("run repair evidence exceeds run quota")
+        with path.open("rb") as stream:
+            data = stream.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise StorageQuotaError("run repair evidence exceeds configured quota")
+        return data
+
+    def _normalize_repair_journal_snapshot(
+        self,
+        directory: Path,
+        *,
+        run_id: str,
+        journal_data: bytes,
+        max_bytes: int,
+    ) -> bytes:
+        """Preserve live torn-tail recovery while replaying immutable bytes."""
+        if not journal_data or journal_data.endswith(b"\n"):
+            return journal_data
+        torn_data = None
+        try:
+            self._rebuild_projection(
+                directory,
+                run_id=run_id,
+                journal_data=journal_data,
+            )
+        except JournalRecoveryError as original_error:
+            tail_offset = journal_data.rfind(b"\n") + 1
+            if tail_offset <= 0:
+                raise
+            normalized = journal_data[:tail_offset]
+            try:
+                self._rebuild_projection(
+                    directory,
+                    run_id=run_id,
+                    journal_data=normalized,
+                )
+            except JournalRecoveryError:
+                raise original_error
+            torn_data = journal_data[tail_offset:]
+        else:
+            normalized = journal_data + b"\n"
+        if len(normalized) > max_bytes:
+            raise StorageQuotaError("normalized journal exceeds configured quota")
+        journal_path = directory / "events.jsonl"
+        current = self._read_bounded_repair_evidence(
+            journal_path,
+            max_bytes=len(journal_data),
+        )
+        if current != journal_data:
+            raise JournalRecoveryError("run journal changed during revalidation")
+        if torn_data is not None:
+            preserved = directory / f"events.jsonl.torn-{uuid.uuid4().hex}"
+            _atomic_bytes(preserved, torn_data)
+        _atomic_bytes(journal_path, normalized)
+        return normalized
+
+    def _adopt_rebuilt_repair_projection(
+        self,
+        directory: Path,
+        *,
+        run_id: str,
+        projection_data: bytes,
+        journal_data: bytes,
+        policy_data: bytes | None,
+    ) -> tuple[dict[str, object], str]:
+        rebuilt = self._rebuild_projection(
+            directory,
+            run_id=run_id,
+            journal_data=journal_data,
+        )
+        rebuilt_data = (
+            json.dumps(
+                rebuilt,
+                sort_keys=True,
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        if (
+            len(rebuilt_data) + len(journal_data) + len(policy_data or b"")
+            > self.max_run_bytes
+        ):
+            raise StorageQuotaError("rebuilt projection exceeds run quota")
+        projection_path = directory / "run.json"
+        journal_path = directory / "events.jsonl"
+        if (
+            self._read_bounded_repair_evidence(
+                projection_path,
+                max_bytes=len(projection_data),
+            )
+            != projection_data
+        ):
+            raise JournalRecoveryError("run projection changed during revalidation")
+        if (
+            self._read_bounded_repair_evidence(
+                journal_path,
+                max_bytes=len(journal_data),
+            )
+            != journal_data
+        ):
+            raise JournalRecoveryError("run journal changed during revalidation")
+        _atomic_bytes(projection_path, rebuilt_data)
+        return rebuilt, _sha256(journal_data)
+
+    def revalidate_run_repair(
+        self,
+        run_id: str,
+        reason_code: str,
+        *,
+        lock_timeout_seconds: float = 0.05,
+    ) -> bool:
+        """Revalidate one repair within the coordinator's unattended budget."""
+        if reason_code not in _UNATTENDED_REVALIDATION_REASONS:
+            raise ValueError("repair reason is not eligible for unattended revalidation")
+        if lock_timeout_seconds <= 0:
+            raise ValueError("revalidation lock budget must be positive")
+        try:
+            directory = self.run_directory(run_id)
+            with workflow_lock(
+                self._run_lock_path(run_id),
+                timeout_seconds=lock_timeout_seconds,
+            ):
+                if reason_code not in self._active_run_repair_reasons(run_id):
+                    return False
+                projection_path = directory / "run.json"
+                journal_path = directory / "events.jsonl"
+                remaining_bytes = self.max_run_bytes
+                projection_data = self._read_bounded_repair_evidence(
+                    projection_path,
+                    max_bytes=remaining_bytes,
+                )
+                remaining_bytes -= len(projection_data)
+                journal_data = self._read_bounded_repair_evidence(
+                    journal_path,
+                    max_bytes=min(self.max_journal_bytes, remaining_bytes),
+                )
+                journal_data = self._normalize_repair_journal_snapshot(
+                    directory,
+                    run_id=run_id,
+                    journal_data=journal_data,
+                    max_bytes=min(self.max_journal_bytes, remaining_bytes),
+                )
+                remaining_bytes -= len(journal_data)
+                policy_data = None
+                if reason_code == "legacy_effect_policy_uncorroborated":
+                    policy_data = self._read_bounded_repair_evidence(
+                        directory / "policy.yaml",
+                        max_bytes=remaining_bytes,
+                    )
+                try:
+                    projection, _, journal_sha256 = (
+                        self._corroborate_run_evidence_locked(
+                            directory,
+                            run_id=run_id,
+                            projection_data=projection_data,
+                            journal_data=journal_data,
+                        )
+                    )
+                except (
+                    JournalRecoveryError,
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                ):
+                    projection, journal_sha256 = self._adopt_rebuilt_repair_projection(
+                        directory,
+                        run_id=run_id,
+                        projection_data=projection_data,
+                        journal_data=journal_data,
+                        policy_data=policy_data,
+                    )
+                if journal_sha256 is None:
+                    raise JournalRecoveryError("run journal digest is missing")
+                scheduled_at = self._scheduled_at_from_projection(projection)
+                with self._connect() as connection:
+                    indexed = connection.execute(
+                        "SELECT scheduled_at FROM runs WHERE run_id=?",
+                        (run_id,),
+                    ).fetchone()
+                    if indexed is None:
+                        return False
+                    if indexed["scheduled_at"] != scheduled_at:
+                        connection.execute(
+                            "UPDATE runs SET scheduled_at=? WHERE run_id=?",
+                            (scheduled_at, run_id),
+                        )
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=journal_sha256,
+                    )
+                if reason_code == "legacy_effect_policy_uncorroborated":
+                    self._legacy_effect_policy_nodes(
+                        directory,
+                        projection,
+                        policy_data=policy_data,
+                    )
+                if "run_evidence_uncorroborated" in self._active_run_repair_reasons(
+                    run_id
+                ):
+                    self._transition_run_repair(
+                        "run_evidence_uncorroborated",
+                        run_id=run_id,
+                        outcome="repair_verified",
+                    )
+                self._transition_run_repair(
+                    reason_code,
+                    run_id=run_id,
+                    outcome="repair_verified",
+                )
+                return True
+        except (
+            JournalRecoveryError,
+            KeyError,
+            OSError,
+            StorageQuotaError,
+            ValueError,
+            WorkflowLockTimeout,
+            json.JSONDecodeError,
+            sqlite3.Error,
+            yaml.YAMLError,
+        ):
+            return False
+
     def _note_notification_repair_timeout(self, run_id: str) -> int:
         """Count consecutive repair-lock timeouts for one cursor-blocking run."""
         with self._notification_repair_timeout_lock:
@@ -1314,21 +1845,69 @@ class RunStore:
             )
 
     def _corroborate_run_evidence_locked(
-        self, directory: Path, *, run_id: str
+        self,
+        directory: Path,
+        *,
+        run_id: str,
+        projection_data: bytes | None = None,
+        journal_data: bytes | None = None,
     ) -> tuple[dict[str, object], str | None, str | None]:
+        if (projection_data is None) != (journal_data is None):
+            raise ValueError("projection and journal snapshots must be paired")
         projection_path = directory / "run.json"
         journal_path = directory / "events.jsonl"
-        projection_bytes = projection_path.read_bytes()
+        projection_bytes = (
+            projection_data
+            if projection_data is not None
+            else projection_path.read_bytes()
+        )
         projection = json.loads(projection_bytes)
         if not self._valid_projection(projection, run_id=run_id):
             raise JournalRecoveryError("run projection is not valid")
-        rebuilt = self._rebuild_projection(directory, run_id=run_id)
+        rebuilt = self._rebuild_projection(
+            directory,
+            run_id=run_id,
+            journal_data=journal_data,
+        )
         if _projection_digest(projection) != _projection_digest(rebuilt):
             raise JournalRecoveryError("run projection does not match journal head")
-        journal_bytes = journal_path.read_bytes()
+        journal_bytes = (
+            journal_data if journal_data is not None else journal_path.read_bytes()
+        )
         projection_sha256 = _sha256(projection_bytes)
         journal_sha256 = _sha256(journal_bytes)
         return projection, projection_sha256, journal_sha256
+
+    @staticmethod
+    def _scheduled_at_from_projection(
+        projection: Mapping[str, object],
+        *,
+        indexed: object = _SCHEDULE_PARITY_UNSET,
+    ) -> str | None:
+        """Derive and, when supplied, parity-check the schedule query column."""
+        metadata = projection.get("run_metadata")
+        if metadata is None:
+            metadata = {}
+        elif not isinstance(metadata, Mapping):
+            raise JournalRecoveryError("run projection metadata is malformed")
+        value = metadata.get("schedule_at")
+        if value is None:
+            derived = None
+        elif not isinstance(value, str) or not value:
+            raise JournalRecoveryError("run projection schedule is malformed")
+        else:
+            try:
+                canonical = normalize_rfc3339_instant(value)
+            except ScheduleInstantError as exc:
+                raise JournalRecoveryError(
+                    "run projection schedule is malformed"
+                ) from exc
+            if value != canonical:
+                raise JournalRecoveryError("run projection schedule is not canonical")
+            derived = canonical
+        if indexed is not _SCHEDULE_PARITY_UNSET and indexed != derived:
+            raise JournalRecoveryError("run schedule index parity mismatch")
+        return derived
 
     @staticmethod
     def _sync_integrity_index(
@@ -1337,6 +1916,18 @@ class RunStore:
         projection: Mapping[str, object],
         journal_sha256: str,
     ) -> None:
+        schedule_row = connection.execute(
+            "SELECT scheduled_at FROM runs WHERE run_id=?",
+            (projection["run_id"],),
+        ).fetchone()
+        scheduled_at = RunStore._scheduled_at_from_projection(
+            projection,
+            **(
+                {"indexed": schedule_row["scheduled_at"]}
+                if schedule_row is not None
+                else {}
+            ),
+        )
         queue_position = projection.get("queue_position")
         queue_sequence = projection.get("queue_sequence")
         if projection.get("status") == "queued" and (
@@ -1353,9 +1944,11 @@ class RunStore:
                 if isinstance(indexed_sequence, int)
                 else RunStore._next_queue_sequence(connection)
             )
-            queue_position = queue_sequence
+            if scheduled_at is None:
+                queue_position = queue_sequence
         connection.execute(
             "UPDATE runs SET status=?, desired_status=?, execution_mode=?, "
+            "scheduled_at=?, "
             "foreground_owner_id=?, foreground_lease_expires_at=?, "
             "foreground_epoch=?, foreground_boot_id=?, "
             "foreground_heartbeat_monotonic=?, foreground_lease_seconds=?, "
@@ -1369,6 +1962,7 @@ class RunStore:
                 projection["status"],
                 projection.get("desired_status"),
                 projection.get("execution_mode", "foreground"),
+                scheduled_at,
                 projection.get("foreground_owner_id"),
                 projection.get("foreground_lease_expires_at"),
                 projection.get("foreground_epoch"),
@@ -1396,10 +1990,12 @@ class RunStore:
         self, directory: Path, projection: Mapping[str, object]
     ) -> None:
         journal_sha256 = _sha256((directory / "events.jsonl").read_bytes())
+        scheduled_at = self._scheduled_at_from_projection(projection)
         expected = (
             projection["status"],
             projection.get("desired_status"),
             projection.get("execution_mode", "foreground"),
+            scheduled_at,
             projection.get("queue_position"),
             projection.get("queue_sequence"),
             projection.get("blocked_by_run_id"),
@@ -1415,7 +2011,8 @@ class RunStore:
         )
         with self._connect() as connection:
             current = connection.execute(
-                "SELECT status, desired_status, execution_mode, queue_position, "
+                "SELECT status, desired_status, execution_mode, scheduled_at, "
+                "queue_position, "
                 "queue_sequence, blocked_by_run_id, pause_lane_policy, lane_state, "
                 "archived_at, restored_to_history, "
                 "projection_schema_version, "
@@ -1431,8 +2028,8 @@ class RunStore:
             and isinstance(current["queue_sequence"], int)
         ):
             legacy_expected = list(expected)
-            legacy_expected[3] = current["queue_sequence"]
             legacy_expected[4] = current["queue_sequence"]
+            legacy_expected[5] = current["queue_sequence"]
             expected = tuple(legacy_expected)
         if current is not None and tuple(current) == expected:
             return
@@ -1445,7 +2042,35 @@ class RunStore:
                 "run_evidence_uncorroborated", run_id=str(projection["run_id"])
             )
             raise
+        corroborated_scheduled_at = self._scheduled_at_from_projection(corroborated)
         with self._connect() as connection:
+            try:
+                self._scheduled_at_from_projection(
+                    corroborated,
+                    **(
+                        {"indexed": current["scheduled_at"]}
+                        if current is not None
+                        else {}
+                    ),
+                )
+            except JournalRecoveryError:
+                self._mark_repair_required(
+                    "index_schedule_inconsistent",
+                    run_id=str(projection["run_id"]),
+                )
+                self._record_repair_event(
+                    connection,
+                    reason_code="index_schedule_inconsistent",
+                    outcome="index_rebuilt",
+                    run_id=str(projection["run_id"]),
+                    source_path=directory,
+                    projection_sha256=_projection_digest(corroborated),
+                    journal_sha256=journal_sha256,
+                )
+                connection.execute(
+                    "UPDATE runs SET scheduled_at=? WHERE run_id=?",
+                    (corroborated_scheduled_at, projection["run_id"]),
+                )
             self._sync_integrity_index(
                 connection,
                 projection=corroborated,
@@ -1512,6 +2137,7 @@ class RunStore:
         directory: Path,
         projection: Mapping[str, object],
     ) -> None:
+        scheduled_at = self._scheduled_at_from_projection(projection)
         concurrency_policy = projection.get("concurrency_policy", "queue")
         if concurrency_policy not in {"queue", "allow", "forbid"}:
             raise JournalRecoveryError("run concurrency policy is invalid")
@@ -1522,13 +2148,14 @@ class RunStore:
             or not isinstance(queue_sequence, int)
         ):
             queue_sequence = self._next_queue_sequence(connection)
-            queue_position = queue_sequence
+            if scheduled_at is None:
+                queue_position = queue_sequence
         connection.execute(
             "INSERT INTO runs ("
             "run_id, workflow_name, trigger_source, "
             "idempotency_namespace_digest, idempotency_digest, "
             "start_digest, concurrency_key, concurrency_policy, disposition, "
-            "status, queue_position, queue_sequence, blocked_by_run_id, "
+            "status, scheduled_at, queue_position, queue_sequence, blocked_by_run_id, "
             "pause_lane_policy, lane_state, run_directory, "
             "created_at, updated_at, archived_at, restored_to_history, "
             "admission_state, desired_status, "
@@ -1536,7 +2163,7 @@ class RunStore:
             "execution_mode, foreground_owner_id, foreground_lease_expires_at, "
             "foreground_epoch, foreground_boot_id, "
             "foreground_heartbeat_monotonic, foreground_lease_seconds) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
             "?, ?, ?, ?, 'published', NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 projection["run_id"],
@@ -1550,6 +2177,7 @@ class RunStore:
                 concurrency_policy,
                 projection.get("admission_disposition", "created"),
                 projection["status"],
+                scheduled_at,
                 queue_position,
                 queue_sequence,
                 projection.get("blocked_by_run_id"),
@@ -1681,6 +2309,24 @@ class RunStore:
                             source_path=run_directory,
                         )
                     continue
+                try:
+                    scheduled_at = self._scheduled_at_from_projection(projection)
+                except JournalRecoveryError:
+                    transitioned = self._transition_run_repair(
+                        "run_evidence_uncorroborated",
+                        run_id=run_id,
+                        outcome="repair_required",
+                    )
+                    active_run_repairs.add(run_id)
+                    if transitioned:
+                        self._record_repair_event(
+                            connection,
+                            reason_code="published_evidence_uncorroborated",
+                            outcome="evidence_preserved",
+                            run_id=run_id,
+                            source_path=run_directory,
+                        )
+                    continue
                 if row["status"] != projection["status"]:
                     connection.execute(
                         "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
@@ -1697,6 +2343,27 @@ class RunStore:
                         source_path=run_directory,
                         projection_sha256=projection_hash,
                         journal_sha256=journal_hash,
+                    )
+                try:
+                    self._scheduled_at_from_projection(
+                        projection, indexed=row["scheduled_at"]
+                    )
+                except JournalRecoveryError:
+                    self._mark_repair_required(
+                        "index_schedule_inconsistent", run_id=run_id
+                    )
+                    self._record_repair_event(
+                        connection,
+                        reason_code="index_schedule_inconsistent",
+                        outcome="index_rebuilt",
+                        run_id=run_id,
+                        source_path=run_directory,
+                        projection_sha256=projection_hash,
+                        journal_sha256=journal_hash,
+                    )
+                    connection.execute(
+                        "UPDATE runs SET scheduled_at=? WHERE run_id=?",
+                        (scheduled_at, run_id),
                     )
                 self._sync_integrity_index(
                     connection,
@@ -2121,6 +2788,7 @@ class RunStore:
         *,
         inputs: Mapping[str, str | Path] | None = None,
         values: Mapping[str, str] | None = None,
+        verified_inputs: Mapping[str, tuple[bytes, str]] | None = None,
         resource_read_budget: WorkflowResourceReadBudget | None = None,
         trusted_package_digest: WorkflowPackageDigest | None = None,
     ) -> PreparedRunSnapshot:
@@ -2129,6 +2797,22 @@ class RunStore:
             staging = Path(tempfile.mkdtemp(prefix="run-", dir=self.staging_root))
             self._write_snapshot_owner(staging)
         try:
+            try:
+                input_declarations = workflow_input_declarations(package)
+            except WorkflowInputContractError as exc:
+                raise InputSnapshotError(
+                    "workflow input declaration is invalid"
+                ) from exc
+
+            def input_byte_bound(name: str, *, channel: str) -> int:
+                declaration = input_declarations.get(name)
+                if declaration is None:
+                    return self.max_input_bytes
+                return declaration.byte_bound(
+                    channel=channel,
+                    store_limit=self.max_input_bytes,
+                )
+
             package_digest = trusted_package_digest or compute_package_digest(
                 package, read_budget=resource_read_budget
             )
@@ -2210,12 +2894,17 @@ class RunStore:
             input_digests: dict[str, str] = {}
             input_root = staging / "inputs"
             if not workflow_input_names_are_portable(
-                [*(inputs or {}).keys(), *(values or {}).keys()]
+                [
+                    *(inputs or {}).keys(),
+                    *(verified_inputs or {}).keys(),
+                    *(values or {}).keys(),
+                ]
             ):
                 raise InputSnapshotError("invalid or colliding input name")
             if not workflow_filename_components_are_distinct(
                 [
                     *(inputs or {}).keys(),
+                    *(verified_inputs or {}).keys(),
                     *(f"{name}.txt" for name in (values or {})),
                 ]
             ):
@@ -2234,9 +2923,11 @@ class RunStore:
                     ) from exc
                 if not source.is_file():
                     raise InputSnapshotError(f"input is not a file: {source}")
-                if before.st_size > self.max_input_bytes:
+                byte_bound = input_byte_bound(name, channel="local-file")
+                if before.st_size > byte_bound:
                     raise InputSnapshotError(
-                        f"input exceeds {self.max_input_bytes} bytes: {source}"
+                        f"input {name} exceeds {byte_bound} bytes",
+                        code="workflow_input_too_large",
                     )
                 try:
                     data = source.read_bytes()
@@ -2263,13 +2954,45 @@ class RunStore:
                     or "application/octet-stream",
                     "sha256": digest,
                 }
+            for name, verified in sorted((verified_inputs or {}).items()):
+                if name in input_manifest or not workflow_input_name_is_portable(name):
+                    raise InputSnapshotError(f"invalid or duplicate input name: {name}")
+                if (
+                    not isinstance(verified, tuple)
+                    or len(verified) != 2
+                    or not isinstance(verified[0], bytes)
+                    or not isinstance(verified[1], str)
+                ):
+                    raise InputSnapshotError(f"invalid verified input: {name}")
+                data, expected_digest = verified
+                byte_bound = input_byte_bound(name, channel="verified-fixture")
+                if len(data) > byte_bound:
+                    raise InputSnapshotError(
+                        f"input {name} exceeds {byte_bound} bytes",
+                        code="workflow_input_too_large",
+                    )
+                digest = _sha256(data)
+                if not hmac.compare_digest(digest, expected_digest):
+                    raise InputSnapshotError(f"verified input digest mismatch: {name}")
+                input_root.mkdir(exist_ok=True)
+                target = input_root / name
+                target.write_bytes(data)
+                input_digests[name] = digest
+                input_manifest[name] = {
+                    "relative_path": target.relative_to(staging).as_posix(),
+                    "size_bytes": len(data),
+                    "media_type": "application/octet-stream",
+                    "sha256": digest,
+                }
             for name, value in sorted((values or {}).items()):
                 if name in input_manifest or not workflow_input_name_is_portable(name):
                     raise InputSnapshotError(f"invalid or duplicate input name: {name}")
                 data = value.encode("utf-8")
-                if len(data) > self.max_input_bytes:
+                byte_bound = input_byte_bound(name, channel="text")
+                if len(data) > byte_bound:
                     raise InputSnapshotError(
-                        f"input exceeds {self.max_input_bytes} bytes: {name}"
+                        f"input {name} exceeds {byte_bound} bytes",
+                        code="workflow_input_too_large",
                     )
                 input_root.mkdir(exist_ok=True)
                 target = input_root / f"{name}.txt"
@@ -2651,6 +3374,9 @@ class RunStore:
             for key, value in metadata.items()
         ):
             raise ValueError("run_metadata must contain bounded string pairs")
+        scheduled_at = self._scheduled_at_from_projection(
+            {"run_metadata": metadata}
+        )
         provenance = request.provenance or TriggerProvenance.legacy(
             source=request.trigger_source,
             intent_key=request.idempotency_key,
@@ -2780,6 +3506,7 @@ class RunStore:
             older_queued = self._eligible_queued_predecessor(
                 connection,
                 run_id=None,
+                now=admission_now,
             )
             status = "running"
             disposition = "created"
@@ -2787,11 +3514,25 @@ class RunStore:
             queue_position = None
             queue_sequence = None
             execution_at_capacity = counts.get("running", 0) >= self.limits["executing"]
-            if active and request.concurrency_policy == "forbid":
+            if (
+                scheduled_at is None
+                and active
+                and request.concurrency_policy == "forbid"
+            ):
                 connection.rollback()
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
                 return RunAdmissionResult(None, "rejected", "overlap_forbidden")
-            if (
+            if scheduled_at is not None:
+                if counts.get("queued", 0) >= self.limits["queued"]:
+                    connection.rollback()
+                    shutil.rmtree(
+                        immutable_snapshot.staging_directory, ignore_errors=True
+                    )
+                    return RunAdmissionResult(None, "rejected", "queued_capacity")
+                status = "queued"
+                disposition = "queued"
+                queue_sequence = self._next_queue_sequence(connection)
+            elif (
                 (active and request.concurrency_policy == "queue")
                 or (older_queued is not None and request.concurrency_policy != "allow")
                 or (execution_at_capacity and request.concurrency_policy == "queue")
@@ -2822,14 +3563,15 @@ class RunStore:
                 "run_id, workflow_name, trigger_source, "
                 "idempotency_namespace_digest, idempotency_digest, "
                 "start_digest, concurrency_key, concurrency_policy, disposition, "
-                "status, queue_position, queue_sequence, blocked_by_run_id, "
+                "status, scheduled_at, queue_position, queue_sequence, "
+                "blocked_by_run_id, "
                 "pause_lane_policy, lane_state, run_directory, "
                 "created_at, updated_at, admission_state, desired_status, "
                 "staging_directory, operator_scope_digest, provenance_json, execution_mode, "
                 "foreground_owner_id, foreground_lease_expires_at, foreground_epoch, "
                 "foreground_boot_id, foreground_heartbeat_monotonic, "
                 "foreground_lease_seconds) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     run_id,
                     request.workflow_name,
@@ -2841,6 +3583,7 @@ class RunStore:
                     request.concurrency_policy,
                     disposition,
                     "admitting",
+                    scheduled_at,
                     queue_position,
                     queue_sequence,
                     blocked_by,
@@ -2995,6 +3738,23 @@ class RunStore:
 
     def _mark_reservation_published(self, run_id: str, *, status: str) -> None:
         with self._connect() as connection:
+            reserved = connection.execute(
+                "SELECT run_directory, scheduled_at FROM runs "
+                "WHERE run_id=? AND admission_state='reserved'",
+                (run_id,),
+            ).fetchone()
+            if reserved is None:
+                raise RuntimeError(f"admission reservation is not active: {run_id}")
+            projection, _, journal_sha256 = self._corroborate_run_evidence(
+                Path(reserved["run_directory"]), run_id=run_id
+            )
+            if projection["status"] != status:
+                raise JournalRecoveryError(
+                    "reservation projection status does not match publication"
+                )
+            self._scheduled_at_from_projection(
+                projection, indexed=reserved["scheduled_at"]
+            )
             updated = connection.execute(
                 "UPDATE runs SET admission_state='published', status=?, "
                 "desired_status=NULL, staging_directory=NULL, updated_at=? "
@@ -3002,6 +3762,11 @@ class RunStore:
                 (status, _utc_now(), run_id),
             ).rowcount
             if updated == 1:
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=journal_sha256,
+                )
                 self._record_coordinator_wake(
                     connection,
                     run_id=run_id,
@@ -3205,11 +3970,18 @@ class RunStore:
                     outcome="repair_required",
                 )
                 raise
+            scheduled_at = self._scheduled_at_from_projection(rebuilt)
             _atomic_json(path, rebuilt)
             with self._connect() as connection:
                 connection.execute(
-                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
-                    (rebuilt["status"], rebuilt["updated_at"], run_id),
+                    "UPDATE runs SET status=?, updated_at=?, scheduled_at=? "
+                    "WHERE run_id=?",
+                    (
+                        rebuilt["status"],
+                        rebuilt["updated_at"],
+                        scheduled_at,
+                        run_id,
+                    ),
                 )
                 self._sync_integrity_index(
                     connection,
@@ -3291,10 +4063,19 @@ class RunStore:
                 return False
         return True
 
-    def _rebuild_projection(self, directory: Path, *, run_id: str) -> dict[str, object]:
+    def _rebuild_projection(
+        self,
+        directory: Path,
+        *,
+        run_id: str,
+        journal_data: bytes | None = None,
+    ) -> dict[str, object]:
         latest = None
         expected_sequence = 1
-        events = self._read_journal_events(directory)
+        events = self._read_journal_events(
+            directory,
+            journal_data=journal_data,
+        )
         for event in events:
             if event.get("sequence") != expected_sequence:
                 raise JournalRecoveryError(
@@ -3370,20 +4151,32 @@ class RunStore:
         connection: sqlite3.Connection,
         *,
         run_id: str | None,
+        now: datetime,
         before_sequence: int | None = None,
     ):
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        observed = now.astimezone(timezone.utc)
+        second = observed.isoformat(timespec="seconds").removesuffix("+00:00")
+        fractional_bound = f"{second}.{observed.microsecond:06d}"
         clauses = [
             "candidate.status='queued'",
+            "(candidate.scheduled_at IS NULL OR candidate.scheduled_at<? "
+            "OR candidate.scheduled_at=? OR candidate.scheduled_at=?)",
             "(candidate.concurrency_policy='allow' OR NOT EXISTS ("
             "SELECT 1 FROM runs AS holder WHERE holder.run_id<>candidate.run_id "
             "AND holder.workflow_name=candidate.workflow_name "
             "AND holder.concurrency_key=candidate.concurrency_key "
             "AND holder.lane_state='held'))",
         ]
-        values: list[object] = []
+        values: list[object] = [
+            fractional_bound,
+            f"{second}Z",
+            f"{fractional_bound}Z",
+        ]
         if run_id is not None:
             clauses.insert(0, "candidate.run_id<>?")
-            values.append(run_id)
+            values.insert(0, run_id)
         if before_sequence is not None:
             clauses.append("candidate.queue_sequence<?")
             values.append(before_sequence)
@@ -3439,6 +4232,7 @@ class RunStore:
             older_queued = self._eligible_queued_predecessor(
                 connection,
                 run_id=str(projection["run_id"]),
+                now=self._lease_clock().utc_now,
             )
             if (
                 active is None
@@ -3487,7 +4281,207 @@ class RunStore:
         self._notify_coordinator()
         return projection
 
-    def try_promote_run(self, run_id: str) -> bool:
+    def _scheduled_promotion_authorization(
+        self,
+        run_id: str,
+        verify: Callable[[Mapping[str, object]], None],
+    ) -> _ScheduledPromotionAuthorization:
+        if not isinstance(run_id, str) or not run_id or not callable(verify):
+            raise ValueError("scheduled authorization requires a run and verifier")
+        return _ScheduledPromotionAuthorization(
+            self._scheduled_authorization_identity,
+            run_id,
+            verify,
+        )
+
+    def _validate_scheduled_promotion_authorization(
+        self,
+        authorization: object,
+        run_id: str,
+    ) -> _ScheduledPromotionAuthorization:
+        if (
+            type(authorization) is not _ScheduledPromotionAuthorization
+            or authorization._store_identity is not self._scheduled_authorization_identity
+        ):
+            raise RuntimeError("opaque scheduled authorization is required")
+        if authorization._run_id != run_id:
+            raise RuntimeError("scheduled authorization belongs to a different run")
+        if authorization._consumed:
+            raise RuntimeError("scheduled authorization was already consumed")
+        return authorization
+
+    def _consume_scheduled_promotion_authorization(
+        self,
+        authorization: object,
+        run_id: str,
+        projection: Mapping[str, object],
+    ) -> None:
+        verified = self._invalidate_scheduled_promotion_authorization(
+            authorization,
+            run_id,
+        )
+        verified._verify(projection)
+
+    def _invalidate_scheduled_promotion_authorization(
+        self,
+        authorization: object,
+        run_id: str,
+    ) -> _ScheduledPromotionAuthorization:
+        verified = self._validate_scheduled_promotion_authorization(
+            authorization,
+            run_id,
+        )
+        verified._consumed = True
+        return verified
+
+    def _fail_scheduled_revalidation_locked(
+        self,
+        connection: sqlite3.Connection,
+        directory: Path,
+        projection: dict[str, object],
+    ) -> None:
+        projection["status"] = "failed"
+        projection["queue_position"] = None
+        projection["queue_sequence"] = None
+        projection["blocked_by_run_id"] = None
+        projection["last_error"] = {
+            "code": "schedule_revalidation_failed",
+            "message": "scheduled run authorization changed before execution",
+        }
+        nodes = projection.get("nodes")
+        if not isinstance(nodes, Mapping):
+            raise RuntimeError("scheduled run nodes are missing")
+        for node in nodes.values():
+            if not isinstance(node, dict):
+                raise RuntimeError("scheduled run node is malformed")
+            if node["state"] not in {"succeeded", "failed", "skipped"}:
+                node.pop("claim", None)
+                node["state"] = "cancelled"
+        self._append_locked(
+            directory,
+            projection,
+            "run_failed",
+            {"reason_code": "schedule_revalidation_failed"},
+            defer_notification=True,
+        )
+        self._sync_integrity_index(
+            connection,
+            projection=projection,
+            journal_sha256=_sha256((directory / "events.jsonl").read_bytes()),
+        )
+        self._record_coordinator_wake(
+            connection,
+            run_id=str(projection["run_id"]),
+            reason_code="run_failed",
+        )
+
+    def fail_scheduled_revalidation(
+        self,
+        run_id: str,
+        *,
+        expected_state_version: int,
+    ) -> bool:
+        """Atomically terminalize a still-queued scheduled run before claim."""
+        directory = self.run_directory(run_id)
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT status, scheduled_at FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(run_id)
+                projection = json.loads((directory / "run.json").read_text())
+                self._scheduled_at_from_projection(
+                    projection,
+                    indexed=row["scheduled_at"],
+                )
+                if (
+                    row["status"] != "queued"
+                    or int(projection.get("state_version", -1))
+                    != expected_state_version
+                ):
+                    connection.rollback()
+                    return False
+                self._fail_scheduled_revalidation_locked(
+                    connection,
+                    directory,
+                    projection,
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+        self._notify_coordinator()
+        return True
+
+    def _fail_scheduled_package_preparation(
+        self,
+        run_id: str,
+        authorization: object,
+    ) -> bool:
+        """Consume server authority and fail a queued run whose package cannot load."""
+        directory = self.run_directory(run_id)
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self._invalidate_scheduled_promotion_authorization(
+                    authorization,
+                    run_id,
+                )
+                row = connection.execute(
+                    "SELECT status, scheduled_at FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(run_id)
+                projection = json.loads((directory / "run.json").read_text())
+                scheduled_at = self._scheduled_at_from_projection(
+                    projection,
+                    indexed=row["scheduled_at"],
+                )
+                metadata = projection.get("run_metadata")
+                if (
+                    scheduled_at is None
+                    or not isinstance(metadata, Mapping)
+                    or not isinstance(metadata.get("execution_identity"), str)
+                ):
+                    raise RuntimeError(
+                        "scheduled package failure requires server admission evidence"
+                    )
+                if row["status"] != "queued":
+                    connection.rollback()
+                    return False
+                self._fail_scheduled_revalidation_locked(
+                    connection,
+                    directory,
+                    projection,
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+        self._notify_coordinator()
+        return True
+
+    def try_promote_run(
+        self,
+        run_id: str,
+        *,
+        now: datetime | None = None,
+        schedule_revalidation=None,
+    ) -> bool:
         directory = self.run_directory(run_id)
         with workflow_lock(self.admission_lock), workflow_lock(
             self._run_lock_path(run_id)
@@ -3497,12 +4491,58 @@ class RunStore:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
                     "SELECT workflow_name, concurrency_key, concurrency_policy, "
-                    "status, queue_sequence FROM runs WHERE run_id=?",
+                    "status, queue_sequence, scheduled_at FROM runs WHERE run_id=?",
                     (run_id,),
                 ).fetchone()
                 if row is None or row["status"] != "queued":
                     connection.rollback()
                     return bool(row and row["status"] == "running")
+                projection = json.loads((directory / "run.json").read_text())
+                scheduled_at = self._scheduled_at_from_projection(
+                    projection,
+                    indexed=row["scheduled_at"],
+                )
+                if scheduled_at is not None:
+                    if now is None:
+                        raise ValueError("now is required for scheduled promotion")
+                    if rfc3339_instant_is_after(scheduled_at, now):
+                        if (
+                            projection.get("queue_position") is not None
+                            or projection.get("blocked_by_run_id") is not None
+                        ):
+                            projection["queue_position"] = None
+                            projection["blocked_by_run_id"] = None
+                            self._append_locked(
+                                directory,
+                                projection,
+                                "run_scheduled_wait",
+                                {"reason_code": "clock_before_schedule"},
+                            )
+                            self._sync_integrity_index(
+                                connection,
+                                projection=projection,
+                                journal_sha256=_sha256(
+                                    (directory / "events.jsonl").read_bytes()
+                                ),
+                            )
+                            connection.commit()
+                        else:
+                            connection.rollback()
+                        return False
+                    metadata = projection.get("run_metadata")
+                    if not isinstance(metadata, Mapping):
+                        raise RuntimeError("scheduled revalidation metadata missing")
+                    if (
+                        isinstance(metadata.get("execution_identity"), str)
+                        and schedule_revalidation is None
+                    ):
+                        connection.rollback()
+                        return False
+                    if schedule_revalidation is not None:
+                        self._validate_scheduled_promotion_authorization(
+                            schedule_revalidation,
+                            run_id,
+                        )
                 sequence = row["queue_sequence"]
                 if sequence is None:
                     sequence = self._next_queue_sequence(connection)
@@ -3514,29 +4554,140 @@ class RunStore:
                 older = self._eligible_queued_predecessor(
                     connection,
                     run_id=run_id,
+                    now=now or self._lease_clock().utc_now,
                     before_sequence=int(sequence),
                 )
                 active = None
                 if row["concurrency_policy"] != "allow":
                     active = connection.execute(
-                        "SELECT 1 FROM runs WHERE run_id<>? AND workflow_name=? "
+                        "SELECT run_id FROM runs WHERE run_id<>? AND workflow_name=? "
                         "AND concurrency_key=? AND lane_state='held' LIMIT 1",
                         (run_id, row["workflow_name"], row["concurrency_key"]),
                     ).fetchone()
                 running = connection.execute(
                     "SELECT COUNT(*) FROM runs WHERE status='running'"
                 ).fetchone()[0]
-                if older or active or running >= self.limits["executing"]:
-                    connection.rollback()
+                if (
+                    scheduled_at is not None
+                    and row["concurrency_policy"] == "forbid"
+                    and active is not None
+                ):
+                    projection["status"] = "failed"
+                    projection["queue_position"] = None
+                    projection["queue_sequence"] = None
+                    projection["blocked_by_run_id"] = None
+                    projection["last_error"] = {
+                        "code": "schedule_overlap_forbidden",
+                        "message": "scheduled run overlaps active same-key work",
+                    }
+                    for node in projection["nodes"].values():
+                        if node["state"] not in {"succeeded", "failed", "skipped"}:
+                            node.pop("claim", None)
+                            node["state"] = "cancelled"
+                    self._append_locked(
+                        directory,
+                        projection,
+                        "run_failed",
+                        {"reason_code": "schedule_overlap_forbidden"},
+                        defer_notification=True,
+                    )
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
+                    )
+                    self._record_coordinator_wake(
+                        connection,
+                        run_id=run_id,
+                        reason_code="run_failed",
+                    )
+                    connection.commit()
+                    self._notify_coordinator()
                     return False
-                projection = json.loads((directory / "run.json").read_text())
-                now = _utc_now()
+                if older or active or running >= self.limits["executing"]:
+                    blocked_by = (
+                        str(active["run_id"])
+                        if active is not None and "run_id" in active.keys()
+                        else None
+                    )
+                    if (
+                        projection.get("queue_position") != sequence
+                        or projection.get("blocked_by_run_id") != blocked_by
+                    ):
+                        projection["queue_position"] = sequence
+                        projection["queue_sequence"] = sequence
+                        projection["blocked_by_run_id"] = blocked_by
+                        self._append_locked(
+                            directory,
+                            projection,
+                            "run_queued",
+                            {"reason_code": "scheduled_lane_wait"},
+                        )
+                        self._sync_integrity_index(
+                            connection,
+                            projection=projection,
+                            journal_sha256=_sha256(
+                                (directory / "events.jsonl").read_bytes()
+                            ),
+                        )
+                        connection.commit()
+                    else:
+                        connection.rollback()
+                    return False
+                admission_state_version = int(projection.get("state_version", -1))
+                execution_identity = ""
+                if scheduled_at is not None and schedule_revalidation is not None:
+                    metadata = projection.get("run_metadata")
+                    if not isinstance(metadata, Mapping):
+                        raise RuntimeError("scheduled revalidation metadata missing")
+                    execution_identity = str(
+                        metadata.get("execution_identity") or ""
+                    )
+                    try:
+                        self._consume_scheduled_promotion_authorization(
+                            schedule_revalidation,
+                            run_id,
+                            projection,
+                        )
+                    except Exception as exc:
+                        from plugins.workflow.scheduled_revalidation import (
+                            ScheduledRunRevalidationError,
+                        )
+
+                        if not isinstance(exc, ScheduledRunRevalidationError):
+                            raise
+                        self._fail_scheduled_revalidation_locked(
+                            connection,
+                            directory,
+                            projection,
+                        )
+                        connection.commit()
+                        self._notify_coordinator()
+                        return False
+                event_now = _utc_now()
                 projection["status"] = "running"
-                projection["started_at"] = now
+                projection["started_at"] = event_now
                 projection["queue_position"] = None
                 projection["queue_sequence"] = None
                 projection["blocked_by_run_id"] = None
-                self._append_locked(directory, projection, "run_promoted")
+                if scheduled_at is not None and schedule_revalidation is not None:
+                    projection["schedule_revalidation"] = {
+                        "execution_identity": execution_identity,
+                        "admission_state_version": admission_state_version,
+                    }
+                self._append_locked(
+                    directory,
+                    projection,
+                    "run_promoted",
+                    (
+                        {"schedule_revalidated": True}
+                        if scheduled_at is not None
+                        and schedule_revalidation is not None
+                        else None
+                    ),
+                )
                 self._sync_integrity_index(
                     connection,
                     projection=projection,
@@ -3592,33 +4743,51 @@ class RunStore:
         self,
         *,
         after: tuple[str, str] | None,
+        now: datetime,
         limit: int = 100,
     ) -> tuple[tuple[dict[str, object], ...], tuple[str, str] | None, bool]:
-        """Return one stable keyset page of coordinator-eligible rows."""
+        """Return one stable keyset page of ordinary coordinator work."""
         if not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        try:
+            now.astimezone(timezone.utc)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("now is out of range") from exc
+        if after is not None and (
+            not isinstance(after, tuple)
+            or len(after) != 2
+            or not all(isinstance(value, str) and value for value in after)
+        ):
+            raise ValueError("after must be a created_at/run_id tuple")
+
         clauses = [
             "admission_state='published'",
             "status IN ('queued','running','waiting_retry')",
             "execution_mode IN ('background','foreground')",
+            "(status<>'queued' OR scheduled_at IS NULL)",
+            _RUN_SCOPED_REPAIR_EXCLUSION_SQL,
         ]
         values: list[object] = []
         if after is not None:
-            if (
-                not isinstance(after, tuple)
-                or len(after) != 2
-                or not all(isinstance(value, str) and value for value in after)
-            ):
-                raise ValueError("after must be a created_at/run_id tuple")
             clauses.append("(created_at>? OR (created_at=? AND run_id>?))")
             values.extend((after[0], after[0], after[1]))
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT run_id, created_at, status, execution_mode FROM runs WHERE "
+                "SELECT run_id, created_at, status, execution_mode, scheduled_at "
+                "FROM runs WHERE "
                 + " AND ".join(clauses)
                 + " ORDER BY created_at, run_id LIMIT ?",
                 (*values, limit + 1),
             ).fetchall()
+        for row in rows:
+            if row["status"] == "queued":
+                projection = self.load_run(str(row["run_id"]))
+                self._scheduled_at_from_projection(
+                    projection,
+                    indexed=row["scheduled_at"],
+                )
         page = rows[:limit]
         exhausted = len(rows) <= limit
         cursor = (
@@ -3627,6 +4796,158 @@ class RunStore:
             else after
         )
         return tuple(dict(row) for row in page), cursor, exhausted
+
+    def scheduled_coordinator_candidates(
+        self,
+        *,
+        after: tuple[str, str] | None,
+        now: datetime,
+        not_before: datetime | None = None,
+        through_queue_sequence: int | None = None,
+        limit: int = 100,
+    ) -> tuple[tuple[dict[str, object], ...], tuple[str, str] | None, bool]:
+        """Return one bounded exact-due page from the scheduled-run index."""
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        try:
+            observed = now.astimezone(timezone.utc)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("now is out of range") from exc
+        if not_before is not None:
+            if not_before.tzinfo is None or not_before.utcoffset() is None:
+                raise ValueError("not_before must be timezone-aware")
+            try:
+                lower_observed = not_before.astimezone(timezone.utc)
+            except (OverflowError, ValueError) as exc:
+                raise ValueError("not_before is out of range") from exc
+            if lower_observed >= observed:
+                return (), after, True
+        else:
+            lower_observed = None
+        if after is not None and (
+            not isinstance(after, tuple)
+            or len(after) != 2
+            or not all(isinstance(value, str) and value for value in after)
+        ):
+            raise ValueError("after must be a created_at/run_id tuple")
+        if through_queue_sequence is not None and (
+            isinstance(through_queue_sequence, bool)
+            or not isinstance(through_queue_sequence, int)
+            or through_queue_sequence < 0
+        ):
+            raise ValueError(
+                "through_queue_sequence must be a non-negative integer"
+            )
+
+        second = observed.isoformat(timespec="seconds").removesuffix("+00:00")
+        fractional_bound = f"{second}.{observed.microsecond:06d}"
+        common_clauses = [
+            "admission_state='published'",
+            "status='queued'",
+            "execution_mode IN ('background','foreground')",
+            "scheduled_at IS NOT NULL",
+            _RUN_SCOPED_REPAIR_EXCLUSION_SQL,
+        ]
+        common = " AND ".join(common_clauses)
+        outer_clauses: list[str] = []
+        outer_values: list[object] = []
+        if lower_observed is not None:
+            lower_second = lower_observed.isoformat(timespec="seconds").removesuffix(
+                "+00:00"
+            )
+            lower_fractional_bound = (
+                f"{lower_second}.{lower_observed.microsecond:06d}"
+            )
+            outer_clauses.append(
+                "NOT (scheduled_at<? OR scheduled_at=? OR scheduled_at=?)"
+            )
+            outer_values.extend(
+                (
+                    lower_fractional_bound,
+                    f"{lower_second}Z",
+                    f"{lower_fractional_bound}Z",
+                )
+            )
+        if after is not None:
+            outer_clauses.append(
+                "(created_at>? OR (created_at=? AND run_id>?))"
+            )
+            outer_values.extend((after[0], after[0], after[1]))
+        if through_queue_sequence is not None:
+            outer_clauses.append("queue_sequence<=?")
+            outer_values.append(through_queue_sequence)
+        columns = "run_id, created_at, status, execution_mode, scheduled_at"
+        indexed_columns = f"{columns}, queue_sequence"
+        due_query = (
+            f"SELECT {indexed_columns} FROM runs INDEXED BY runs_scheduled_queue "
+            f"WHERE {common} AND scheduled_at<? "
+            "UNION ALL "
+            f"SELECT {indexed_columns} FROM runs INDEXED BY runs_scheduled_queue "
+            f"WHERE {common} AND scheduled_at=? "
+            "UNION ALL "
+            f"SELECT {indexed_columns} FROM runs INDEXED BY runs_scheduled_queue "
+            f"WHERE {common} AND scheduled_at=?"
+        )
+        outer_where = (
+            " WHERE " + " AND ".join(outer_clauses) if outer_clauses else ""
+        )
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {columns} FROM ({due_query})"
+                f"{outer_where} ORDER BY created_at, run_id LIMIT ?",
+                (
+                    fractional_bound,
+                    f"{second}Z",
+                    f"{fractional_bound}Z",
+                    *outer_values,
+                    limit + 1,
+                ),
+            ).fetchall()
+        for row in rows:
+            projection = self.load_run(str(row["run_id"]))
+            canonical = self._scheduled_at_from_projection(
+                projection,
+                indexed=row["scheduled_at"],
+            )
+            if canonical is None or rfc3339_instant_is_after(canonical, observed):
+                raise JournalRecoveryError("scheduled due index selection mismatch")
+        page = rows[:limit]
+        cursor = (
+            (str(page[-1]["created_at"]), str(page[-1]["run_id"]))
+            if page
+            else after
+        )
+        return tuple(dict(row) for row in page), cursor, len(rows) <= limit
+
+    def scheduled_coordinator_generation(
+        self,
+        *,
+        now: datetime,
+    ) -> tuple[datetime, int]:
+        """Capture one fixed due instant and durable admission sequence fence."""
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        try:
+            observed = now.astimezone(timezone.utc)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("now is out of range") from exc
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM store_metadata WHERE key='queue_sequence'"
+            ).fetchone()
+        try:
+            fence = int(row["value"]) if row is not None else 0
+        except (TypeError, ValueError) as exc:
+            raise JournalRecoveryError(
+                "scheduled coordinator queue sequence is invalid"
+            ) from exc
+        if fence < 0:
+            raise JournalRecoveryError(
+                "scheduled coordinator queue sequence is invalid"
+            )
+        return observed, fence
 
     def tail_events(
         self,
@@ -3814,7 +5135,9 @@ class RunStore:
             run_id = str(row["run_id"])
             try:
                 result = self.get_run_status(
-                    run_id, operator_scope=operator_scope
+                    run_id,
+                    operator_scope=operator_scope,
+                    now=observed_at,
                 )
             except (
                 JournalRecoveryError,
@@ -4604,13 +5927,26 @@ class RunStore:
                 connection.close()
 
     def get_run_status(
-        self, run_id: str, *, operator_scope: str | None = None
+        self,
+        run_id: str,
+        *,
+        operator_scope: str | None = None,
+        now: datetime | None = None,
     ) -> dict[str, object]:
         run = self.load_run(run_id, operator_scope=operator_scope)
         if not isinstance(run.get("provenance"), Mapping):
             run["provenance"] = legacy_projection_provenance(run)
         observed_sample = self._lease_clock()
-        observed_at = observed_sample.utc_now
+        observed_at = now or observed_sample.utc_now
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        observed_at = observed_at.astimezone(timezone.utc)
+        if now is not None:
+            observed_sample = LeaseClockSample(
+                observed_at,
+                observed_sample.monotonic_now,
+                observed_sample.boot_id,
+            )
         nodes = run.get("nodes", {})
         node_values = list(nodes.values()) if isinstance(nodes, dict) else []
         completed = sum(
@@ -4709,13 +6045,17 @@ class RunStore:
             health = "interrupted"
         elif status == "queued":
             health = "waiting"
-            blocking_reason = (
-                "concurrency_lane_busy"
-                if run.get("blocked_by_run_id")
-                else "execution_capacity"
-            )
+            if run_is_scheduled_wait(run, observed=observed_at):
+                blocking_reason = "scheduled_wait"
+            else:
+                blocking_reason = (
+                    "concurrency_lane_busy"
+                    if run.get("blocked_by_run_id")
+                    else "execution_capacity"
+                )
             if (
-                observed is not None
+                blocking_reason != "scheduled_wait"
+                and observed is not None
                 and observed.status != "healthy"
                 and not run.get("blocked_by_run_id")
             ):
@@ -4887,22 +6227,8 @@ class RunStore:
         if isinstance(persisted, list):
             return "outward" if node_id in persisted else "replay_safe"
         directory = self.run_directory(run_id)
-        policy_path = directory / "policy.yaml"
         try:
-            policy_bytes = policy_path.read_bytes()
-            expected_digest = str(run["policy_digest"])
-            if not hmac.compare_digest(_sha256(policy_bytes), expected_digest):
-                raise JournalRecoveryError("legacy workflow policy digest mismatch")
-            document = yaml.safe_load(policy_bytes) or {}
-            if not isinstance(document, Mapping):
-                raise JournalRecoveryError("legacy workflow policy is malformed")
-            outward = document.get("outward_action_nodes", [])
-            if not isinstance(outward, list) or any(
-                not isinstance(candidate, str) for candidate in outward
-            ):
-                raise JournalRecoveryError(
-                    "legacy outward-action policy is malformed"
-                )
+            outward = self._legacy_effect_policy_nodes(directory, run)
         except (OSError, KeyError, yaml.YAMLError, JournalRecoveryError):
             self._transition_run_repair(
                 "legacy_effect_policy_uncorroborated",
@@ -4935,6 +6261,7 @@ class RunStore:
         foreground_owner_id: str | None = None,
         foreground_owner_epoch: int | None = None,
         require_execution_authority: bool = False,
+        max_run_workers: int | None = None,
     ) -> NodeClaim | None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -4952,6 +6279,12 @@ class RunStore:
             or foreground_owner_epoch <= 0
         ):
             raise ValueError("foreground owner epoch must be a positive integer")
+        if max_run_workers is not None and (
+            isinstance(max_run_workers, bool)
+            or not isinstance(max_run_workers, int)
+            or max_run_workers <= 0
+        ):
+            raise ValueError("max_run_workers must be a positive integer")
         self._ensure_free_disk()
         directory = self.run_directory(run_id)
         with workflow_lock(self.admission_lock):
@@ -5034,6 +6367,14 @@ class RunStore:
                     if active_workers >= self.limits["workers"]:
                         connection.rollback()
                         return None
+                    if max_run_workers is not None:
+                        active_run_workers = connection.execute(
+                            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
+                            (run_id,),
+                        ).fetchone()[0]
+                        if active_run_workers >= max_run_workers:
+                            connection.rollback()
+                            return None
                     attempt_id = uuid.uuid4().hex
                     monotonic_instant = (
                         float(monotonic_now)

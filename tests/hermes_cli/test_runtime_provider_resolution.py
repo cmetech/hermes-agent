@@ -8,6 +8,46 @@ import pytest
 from hermes_cli import runtime_provider as rp
 
 
+def test_moa_resolution_preserves_legacy_no_config_read_short_circuit(monkeypatch):
+    def forbidden_config_read():
+        raise AssertionError("MoA resolution must not read model config")
+
+    monkeypatch.setattr(rp, "_get_model_config", forbidden_config_read)
+
+    resolved = rp.resolve_runtime_provider(requested="moa")
+
+    assert resolved == {
+        "provider": "moa",
+        "api_mode": "chat_completions",
+        "base_url": "moa://local",
+        "api_key": "moa-virtual-provider",
+        "source": "moa-virtual-provider",
+        "requested_provider": "moa",
+    }
+
+
+def test_explicit_azure_anthropic_preserves_no_config_read_short_circuit(monkeypatch):
+    def forbidden_config_read():
+        raise AssertionError("explicit Azure-Anthropic resolution must not read config")
+
+    monkeypatch.setattr(rp, "_get_model_config", forbidden_config_read)
+
+    resolved = rp.resolve_runtime_provider(
+        requested="anthropic",
+        explicit_api_key="test-azure-anthropic-key",
+        explicit_base_url="https://example.services.ai.azure.com/anthropic/v1",
+    )
+
+    assert resolved == {
+        "provider": "anthropic",
+        "api_mode": "anthropic_messages",
+        "base_url": "https://example.services.ai.azure.com/anthropic/v1",
+        "api_key": "test-azure-anthropic-key",
+        "source": "azure-explicit",
+        "requested_provider": "anthropic",
+    }
+
+
 def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
     """A saved provider must not resolve as another authenticated provider."""
     monkeypatch.setattr(

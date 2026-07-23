@@ -1,6 +1,6 @@
 delivery_defaults:
   inputs:
-    symptom: {kind: text, required: true, max_bytes: 4096}
+    arguments: {kind: text, required: true, max_bytes: 4096}
     evidence: {kind: file, required: true, max_bytes: 65536}
 overlap_policy: queue
 execution_environment: trusted_local

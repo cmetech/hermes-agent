@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 from contextlib import contextmanager
 import shutil
 import sys
@@ -11,10 +12,12 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from hermes_cli.dashboard_auth.base import TokenPrincipal
+from pydantic import ValidationError
 import pytest
 import yaml
 
 from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.catalog_api import workflow_catalog_run_support
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.trust import (
@@ -57,6 +60,13 @@ def _reader() -> TokenPrincipal:
 
 def _catalog_get(router, *, token=None):
     return TestClient(_app(router, token=token)).get("/api/plugins/workflow/workflows")
+
+
+def _detail_get(router, name: str, *, source: str, token=None):
+    return TestClient(_app(router, token=token)).get(
+        f"/api/plugins/workflow/workflows/{name}",
+        params={"catalog_source": source},
+    )
 
 
 def _user_items(response) -> list[dict[str, object]]:
@@ -137,18 +147,140 @@ def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compa
         "supported": True,
         "reason": "supported",
     }
-    assert showcase_rows["resilience"]["run_support"]["supported"] is True
-    assert showcase_rows["laptop-diagnostic"]["run_support"] == {
-        "supported": False,
-        "reason": "unsupported_inputs",
+    laptop = showcase_rows["laptop-diagnostic"]
+    assert laptop["inputs"] == [
+        {"name": "evidence", "type": "file", "required": True},
+        {"name": "symptom", "type": "text", "required": True, "max_bytes": 4096},
+    ]
+    assert laptop["supported_inputs"] == {
+        "supported": True,
+        "reason": "flat_inputs",
     }
-    for name in ("ai-extensions", "scheduling"):
-        assert showcase_rows[name]["run_support"] == {
+    support_table = {
+        name: row["run_support"] for name, row in showcase_rows.items()
+    }
+    assert support_table == {
+        "approval-gate": {"supported": True, "reason": "supported"},
+        "laptop-diagnostic": {"supported": True, "reason": "supported"},
+        "resilience": {"supported": True, "reason": "supported"},
+        "ai-extensions": {"supported": True, "reason": "supported"},
+        "scheduling": {
             "supported": False,
-            "reason": "showcase_cli_required",
-        }
+            "reason": "schedule_required",
+        },
+    }
+    assert sum(row["supported"] for row in support_table.values()) == 4
     assert showcase_rows["ai-extensions"]["compatibility"]["runnable"] is False
     assert payload["truncated"] is False
+
+    scheduling_detail = _detail_get(
+        _module().router,
+        "scheduling",
+        source="showcase",
+        token=_reader(),
+    )
+    assert scheduling_detail.status_code == 200
+    assert scheduling_detail.json()["run_support"] == {
+        "supported": False,
+        "reason": "schedule_required",
+    }
+
+
+@pytest.mark.parametrize("schedule_at", [None, "2099-01-02T03:04:05Z"])
+def test_scheduled_run_support_retains_generic_showcase_network_policy(
+    tmp_path, workflow_writer, schedule_at
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "workflows",
+        name="networked-schedule-policy-fixture",
+    )
+    package = load_workflow(workflow)
+    scenario = replace(
+        showcase_module.load_showcase_catalog()["scheduling"],
+        id="non-catalog-networked-schedule",
+        requires_network=True,
+    )
+
+    assert workflow_catalog_run_support(
+        package,
+        showcase_scenario=scenario,
+        schedule_at=schedule_at,
+    ) == {
+        "supported": False,
+        "reason": "showcase_cli_required",
+    }
+
+
+def test_workflow_catalog_projects_authenticated_requires_ai_for_every_row(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="ordinary-user-workflow")
+    showcase_module._clear_verified_showcase_cache_for_tests()
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    rows = {
+        (item.get("source"), item.get("name")): item
+        for item in response.json()["items"]
+    }
+    assert rows[("profile", "ordinary-user-workflow")]["requires_ai"] is False
+    assert {
+        name: row["requires_ai"]
+        for (source, name), row in rows.items()
+        if source == "showcase"
+    } == {
+        "ai-extensions": True,
+        "approval-gate": False,
+        "laptop-diagnostic": False,
+        "resilience": False,
+        "scheduling": False,
+    }
+
+
+def test_workflow_detail_and_response_model_require_generic_requires_ai(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow_writer(home / "workflows", name="ordinary-user-workflow")
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    module = _module()
+
+    ai = _detail_get(
+        module.router,
+        "ai-extensions",
+        source="showcase",
+        token=_reader(),
+    )
+    ordinary = _detail_get(
+        module.router,
+        "ordinary-user-workflow",
+        source="profile",
+        token=_reader(),
+    )
+
+    assert ai.status_code == ordinary.status_code == 200
+    assert ai.json()["requires_ai"] is True
+    assert ordinary.json()["requires_ai"] is False
+    validated = module.WorkflowCatalogEntry.model_validate(
+        next(
+            item
+            for item in _catalog_get(module.router, token=_reader()).json()["items"]
+            if item.get("source") == "showcase"
+        )
+    )
+    assert isinstance(validated.requires_ai, bool)
+    with pytest.raises(ValidationError):
+        module.WorkflowCatalogEntry.model_validate(
+            {
+                key: value
+                for key, value in validated.model_dump().items()
+                if key != "requires_ai"
+            }
+        )
 
 
 def test_workflow_catalog_keeps_isolation_incompatibility_scenario_local(
@@ -242,8 +374,165 @@ def test_workflow_catalog_cached_showcase_verification_preserves_user_budget(
         )
 
 
-def test_workflow_catalog_missing_bundle_degrades_to_user_rows(
+def test_workflow_catalog_projects_showcase_from_authenticated_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    import plugins.workflow.catalog_api as catalog_api
+
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(copied),
+    )
+    target = copied / "packages/ai-extensions/commands/inspect-evidence.md"
+    original_loader = showcase_module.load_verified_showcase_packages
+    original_open = Path.open
+    projection_started = False
+    authenticated_digest = ""
+    projected_digests: list[str] = []
+
+    def mutate_after_authentication(*args, **kwargs):
+        nonlocal projection_started, authenticated_digest
+        verified = original_loader(*args, **kwargs)
+        authenticated_digest = verified["ai-extensions"].package_digest
+        target.write_text("mutated after authentication\n", encoding="utf-8")
+        projection_started = True
+        return verified
+
+    def forbid_reopen(self, *args, **kwargs):
+        if projection_started and self == target:
+            pytest.fail("catalog projection reopened authenticated showcase source")
+        return original_open(self, *args, **kwargs)
+
+    original_assess = catalog_api.assess_package_execution
+
+    def capture_assessment(package, context, *, read_budget=None):
+        compatibility, risk = original_assess(
+            package,
+            context,
+            read_budget=read_budget,
+        )
+        if package.source == "showcase" and package.definition.name == "ai-extensions":
+            projected_digests.append(risk.package_digest)
+        return compatibility, risk
+
+    monkeypatch.setattr(
+        showcase_module,
+        "load_verified_showcase_packages",
+        mutate_after_authentication,
+    )
+    monkeypatch.setattr(Path, "open", forbid_reopen)
+    monkeypatch.setattr(catalog_api, "assess_package_execution", capture_assessment)
+
+    items, truncated = catalog_api.build_workflow_catalog(
+        hermes_home=tmp_path / "home",
+        workdir=tmp_path,
+    )
+
+    assert truncated is False
+    assert projected_digests == [authenticated_digest]
+    ai_row = next(item for item in items if item["name"] == "ai-extensions")
+    assert ai_row["trust_state"] == "verified_bundled"
+
+
+def test_workflow_catalog_omits_showcases_when_resource_disappears_after_authentication(
+    tmp_path, monkeypatch, workflow_writer, caplog
+) -> None:
+    import plugins.workflow.catalog_api as catalog_api
+
+    home = tmp_path / "home"
+    workflow_writer(home / "workflows", name="ordinary-user-workflow")
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(copied),
+    )
+    target = copied / "packages/ai-extensions/commands/inspect-evidence.md"
+    original_loader = showcase_module.load_verified_showcase_packages
+
+    def delete_after_authentication(*args, **kwargs):
+        verified = original_loader(*args, **kwargs)
+        target.unlink()
+        return verified
+
+    monkeypatch.setattr(
+        showcase_module,
+        "load_verified_showcase_packages",
+        delete_after_authentication,
+    )
+    caplog.set_level(logging.WARNING, logger="plugins.workflow.catalog_api")
+
+    items, truncated = catalog_api.build_workflow_catalog(
+        hermes_home=home,
+        workdir=tmp_path,
+    )
+
+    assert truncated is False
+    assert not any(item.get("source") == "showcase" for item in items)
+    assert any(
+        item.get("source") == "profile"
+        and item.get("name") == "ordinary-user-workflow"
+        for item in items
+    )
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "plugins.workflow.catalog_api"
+        and record.levelno == logging.WARNING
+    ] == [
+        "workflow showcase catalog projection verification failed: "
+        "WorkflowValidationError"
+    ]
+
+
+def test_workflow_catalog_rejects_verified_provenance_on_digest_mismatch(
     tmp_path, monkeypatch, workflow_writer
+) -> None:
+    import plugins.workflow.catalog_api as catalog_api
+
+    home = tmp_path / "home"
+    workflow_writer(home / "workflows", name="ordinary-user-workflow")
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    original_assess = catalog_api.assess_package_execution
+
+    def corrupt_showcase_digest(package, context, *, read_budget=None):
+        compatibility, risk = original_assess(
+            package,
+            context,
+            read_budget=read_budget,
+        )
+        if package.source == "showcase":
+            risk = replace(risk, package_digest="0" * 64)
+        return compatibility, risk
+
+    monkeypatch.setattr(
+        catalog_api,
+        "assess_package_execution",
+        corrupt_showcase_digest,
+    )
+
+    items, truncated = catalog_api.build_workflow_catalog(
+        hermes_home=home,
+        workdir=tmp_path,
+    )
+
+    assert truncated is False
+    assert not any(item.get("source") == "showcase" for item in items)
+    assert any(
+        item.get("source") == "profile"
+        and item.get("name") == "ordinary-user-workflow"
+        for item in items
+    )
+
+
+def test_workflow_catalog_missing_bundle_degrades_to_user_rows(
+    tmp_path, monkeypatch, workflow_writer, caplog
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -255,6 +544,7 @@ def test_workflow_catalog_missing_bundle_degrades_to_user_rows(
         "_bundle_path",
         lambda explicit=None: _test_bundle_path(missing),
     )
+    caplog.set_level(logging.INFO, logger="plugins.workflow.catalog_api")
 
     response = _catalog_get(_module().router, token=_reader())
 
@@ -267,10 +557,19 @@ def test_workflow_catalog_missing_bundle_degrades_to_user_rows(
     assert not any(
         item.get("source") == "showcase" for item in response.json()["items"]
     )
+    signals = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "plugins.workflow.catalog_api"
+        and record.levelno == logging.INFO
+    ]
+    assert signals == [
+        "workflow showcase catalog verification unavailable: FileNotFoundError"
+    ]
 
 
 def test_workflow_catalog_tamper_invalidates_cache_and_omits_entire_bundle(
-    tmp_path, monkeypatch, workflow_writer
+    tmp_path, monkeypatch, workflow_writer, caplog
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -304,6 +603,8 @@ def test_workflow_catalog_tamper_invalidates_cache_and_omits_entire_bundle(
         / "approval-gate.yaml"
     )
     workflow.write_text(workflow.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    caplog.set_level(logging.WARNING, logger="plugins.workflow.catalog_api")
+    caplog.clear()
 
     second = _catalog_get(_module().router, token=_reader())
 
@@ -316,6 +617,66 @@ def test_workflow_catalog_tamper_invalidates_cache_and_omits_entire_bundle(
         and item.get("name") == "ordinary-user-workflow"
         for item in second.json()["items"]
     )
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "plugins.workflow.catalog_api"
+        and record.levelno == logging.WARNING
+    ]
+    assert warnings == [
+        "workflow showcase catalog verification failed: ShowcaseCatalogError"
+    ]
+
+
+def test_workflow_catalog_and_detail_project_inputs_once_per_row(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    workflow_writer(home / "workflows", name="alpha", filename="alpha.yaml")
+    workflow_writer(home / "workflows", name="bravo", filename="bravo.yaml")
+    missing = tmp_path / "missing-showcases"
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(missing),
+    )
+    import plugins.workflow.catalog_api as catalog_api
+
+    calls = 0
+    original_input_projection = catalog_api._input_projection
+
+    def count_input_projection(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_input_projection(*args, **kwargs)
+
+    monkeypatch.setattr(catalog_api, "_input_projection", count_input_projection)
+    monkeypatch.setattr(
+        catalog_api,
+        "_coordinator_projection",
+        lambda _home: {"healthy": False, "status": "unavailable", "reason": "test"},
+    )
+
+    items, truncated = catalog_api.build_workflow_catalog(
+        hermes_home=home,
+        workdir=workdir,
+    )
+
+    assert truncated is False
+    assert [item["name"] for item in items] == ["alpha", "bravo"]
+    assert calls == 2
+
+    catalog_api.build_workflow_detail(
+        "alpha",
+        hermes_home=home,
+        workdir=workdir,
+        catalog_source="profile",
+    )
+
+    assert calls == 3
 
 
 @pytest.mark.parametrize(
@@ -411,6 +772,7 @@ def test_workflow_catalog_returns_stable_redacted_server_classification(
         "name": "alpha",
         "version": "1",
         "description": "Typed workflow",
+        "requires_ai": False,
         "source": "profile",
         "precedence": 2,
         "trust_state": "trusted",
@@ -436,6 +798,109 @@ def test_workflow_catalog_returns_stable_redacted_server_classification(
     assert b"SECRET_NUMERIC_DEFAULT" not in response.content
     assert b"SECRET_TITLE_DEFAULT" not in response.content
     assert beta.is_file()
+
+
+def test_workflow_catalog_projects_declared_text_bounds_and_support_modes(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    text_path = workflow_writer(
+        home / "workflows", name="declared-text", filename="declared-text.yaml"
+    )
+    text_path.with_name("declared-text.hermes.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "delivery_defaults": {
+                    "inputs": {
+                        "notes": {
+                            "kind": "text",
+                            "required": False,
+                            "max_bytes": 70 * 1024,
+                            "default": "SECRET_NOTES_DEFAULT",
+                        },
+                        "summary": {
+                            "kind": "text",
+                            "required": True,
+                            "max_bytes": 4096,
+                            "default": "SECRET_SUMMARY_DEFAULT",
+                        },
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    workflow_writer(home / "workflows", name="legacy-flat", filename="legacy-flat.yaml")
+    file_path = workflow_writer(
+        home / "workflows", name="declared-file", filename="declared-file.yaml"
+    )
+    file_path.with_name("declared-file.hermes.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "delivery_defaults": {
+                    "inputs": {
+                        "evidence": {
+                            "kind": "file",
+                            "required": True,
+                            "max_bytes": 4096,
+                        }
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    rows = {item["name"]: item for item in _user_items(response)}
+    assert rows["declared-text"]["inputs"] == [
+        {
+            "name": "notes",
+            "type": "text",
+            "required": False,
+            "max_bytes": 64 * 1024,
+        },
+        {
+            "name": "summary",
+            "type": "text",
+            "required": True,
+            "max_bytes": 4096,
+        },
+    ]
+    assert rows["declared-text"]["supported_inputs"] == {
+        "supported": True,
+        "reason": "flat_inputs",
+    }
+    assert rows["declared-text"]["run_support"] == {
+        "supported": True,
+        "reason": "supported",
+    }
+    assert rows["legacy-flat"]["supported_inputs"] == {
+        "supported": True,
+        "reason": "parameterless",
+    }
+    assert rows["legacy-flat"]["run_support"] == {
+        "supported": True,
+        "reason": "supported",
+    }
+    assert rows["declared-file"]["inputs"] == [
+        {"name": "evidence", "type": "file", "required": True}
+    ]
+    assert rows["declared-file"]["supported_inputs"] == {
+        "supported": False,
+        "reason": "unsupported_input_type",
+    }
+    assert rows["declared-file"]["run_support"] == {
+        "supported": False,
+        "reason": "unsupported_inputs",
+    }
+    assert b"SECRET_NOTES_DEFAULT" not in response.content
+    assert b"SECRET_SUMMARY_DEFAULT" not in response.content
 
 
 def test_workflow_catalog_marks_legacy_and_rich_input_kinds_unsupported(
@@ -519,6 +984,46 @@ def test_workflow_catalog_marks_enum_without_usable_choices_unsupported(
         "supported": False,
         "reason": "unsupported_inputs",
     }
+
+
+def test_workflow_catalog_keeps_missing_input_kind_unsupported(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    path = workflow_writer(home / "workflows", name="missing-input-kind")
+    path.with_name("example.hermes.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "delivery_defaults": {
+                    "inputs": {
+                        "subject": {
+                            "required": True,
+                            "max_bytes": 32,
+                            "default": "SECRET_MISSING_KIND_DEFAULT",
+                        }
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    item = _user_items(response)[0]
+    assert item["inputs"] == [{"name": "subject", "type": "unknown", "required": True}]
+    assert item["supported_inputs"] == {
+        "supported": False,
+        "reason": "unsupported_input_type",
+    }
+    assert item["run_support"] == {
+        "supported": False,
+        "reason": "unsupported_inputs",
+    }
+    assert b"SECRET_MISSING_KIND_DEFAULT" not in response.content
 
 
 @pytest.mark.parametrize(
@@ -688,6 +1193,7 @@ def test_workflow_catalog_degrades_unrepresentable_workflow_name_per_entry(
             "name": "normal",
             "version": "1",
             "description": "Portable workflow fixture",
+            "requires_ai": False,
             "source": "profile",
             "precedence": 2,
             "trust_state": "untrusted",
@@ -731,6 +1237,7 @@ def test_workflow_catalog_isolates_invalid_definition(
             "name": "valid",
             "version": "1",
             "description": "Portable workflow fixture",
+            "requires_ai": False,
             "source": "profile",
             "precedence": 2,
             "trust_state": "untrusted",
@@ -1145,6 +1652,7 @@ def test_workflow_catalog_project_definition_overrides_profile(
             "name": "shared",
             "version": "1",
             "description": "project definition",
+            "requires_ai": False,
             "source": "project",
             "precedence": 1,
             "trust_state": "untrusted",

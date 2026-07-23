@@ -12,6 +12,7 @@ import pytest
 
 from hermes_cli.plugin_services import BackgroundServiceContext
 from hermes_cli.plugin_invocation import DeliveryReceipt
+import plugins.workflow.coordinator as coordinator_module
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import (
     CoordinatorIdentity,
@@ -25,6 +26,7 @@ from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
+from plugins.workflow.showcase import run_showcase
 from plugins.workflow.store import ForegroundExecutionConflict, RunStore
 from tools.managed_process import ProcessIdentity
 
@@ -251,6 +253,82 @@ def test_legacy_foreground_lease_fails_closed_until_utc_deadline(
     assert acquired.epoch == 2
 
 
+def test_coordinator_adopts_legacy_cli_showcase_and_reworks_without_real_ai(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERMES_OFFLINE", "1")
+    runner_calls = 0
+
+    def forbidden_real_run(*_args, **_kwargs):
+        nonlocal runner_calls
+        runner_calls += 1
+        raise AssertionError("adopted legacy showcase selected real model execution")
+
+    monkeypatch.setattr(
+        "agent.plugin_agent.PluginAgentRunner.run", forbidden_real_run
+    )
+    started = run_showcase(
+        "laptop-diagnostic",
+        hermes_home=tmp_path,
+        symptom="fictional adopted startup issue",
+        no_wait=True,
+        idempotency_key="v302-adopted-laptop",
+    )
+    run_id = started["run_id"]
+    store = RunStore(tmp_path)
+    before = store.get_run_status(run_id)
+    assert before["status"] in {"running", "queued"}
+    assert set(before["run_metadata"]) == {
+        "showcase_id",
+        "showcase_version",
+        "bundle_digest",
+        "risk_digest",
+    }
+    assert store.release_foreground_execution(
+        run_id,
+        owner_id=before["foreground_owner_id"],
+        epoch=before["foreground_epoch"],
+        now=datetime.now(timezone.utc),
+    )
+
+    service = _service(
+        tmp_path,
+        host_kind="gateway",
+        host_instance_id="legacy-showcase-adopter",
+    )
+    stop = threading.Event()
+    thread = threading.Thread(target=service.run, args=(stop,))
+    thread.start()
+    try:
+        _wait_until(
+            lambda: store.get_run_status(run_id)["status"] == "paused",
+            timeout=10,
+        )
+        paused = store.get_run_status(run_id)
+        assert paused["execution_mode"] == "background"
+        pending = paused["pending_interaction"]
+        store.reject_run(
+            run_id,
+            reason="make the adopted plan more cautious",
+            expected_state_version=paused["state_version"],
+            interaction_id=pending["interaction_id"],
+            channel="desktop",
+        )
+        _wait_until(
+            lambda: store.get_run_status(run_id)["nodes"]["review-plan"].get(
+                "approval_rework_attempts"
+            )
+            == 1,
+            timeout=10,
+        )
+        reworked = store.get_run_status(run_id)
+        assert reworked["status"] == "paused"
+        assert runner_calls == 0
+    finally:
+        stop.set()
+        CoordinatorStore(store.database).notify_local()
+        thread.join(timeout=10)
+        assert not thread.is_alive()
 def test_stale_execution_fence_cannot_mutate_or_interrupt_successor_claim(
     tmp_path, workflow_writer
 ) -> None:
@@ -1102,6 +1180,53 @@ def test_scheduler_submit_is_nonblocking_deduplicated_and_avoids_head_of_line(
     scheduler.shutdown(deadline_seconds=2)
 
 
+def test_sweep_selection_preserves_global_order_below_budget() -> None:
+    ordered = ["scheduled-0", "periodic-0", "scheduled-1"]
+
+    selected = coordinator_module._select_sweep_run_ids(
+        ordered,
+        ["periodic-0"],
+    )
+
+    assert selected == ordered
+
+
+def test_sweep_selection_reserves_periodic_head_before_saturated_prefix() -> None:
+    scheduled = [f"scheduled-{index:03d}" for index in range(100)]
+
+    selected = coordinator_module._select_sweep_run_ids(
+        [*scheduled, "periodic-0", "periodic-1"],
+        ["periodic-0", "periodic-1"],
+    )
+
+    assert selected == ["periodic-0", *scheduled[:99]]
+
+
+def test_sweep_selection_does_not_duplicate_reserved_head_in_prefix() -> None:
+    scheduled = [f"scheduled-{index:03d}" for index in range(100)]
+
+    selected = coordinator_module._select_sweep_run_ids(
+        ["periodic-0", *scheduled],
+        ["periodic-0"],
+    )
+
+    assert selected == ["periodic-0", *scheduled[:99]]
+    assert selected.count("periodic-0") == 1
+
+
+def test_sweep_selection_reserves_periodic_and_scheduled_continuation_heads() -> None:
+    fresh = [f"fresh-{index:03d}" for index in range(100)]
+
+    selected = coordinator_module._select_sweep_run_ids(
+        [*fresh, "continuation-0", "periodic-0"],
+        ["periodic-0"],
+        ["continuation-0"],
+    )
+
+    assert selected == ["periodic-0", "continuation-0", *fresh[:98]]
+    assert len(selected) == 100
+
+
 def test_idle_backoff_uses_actionable_work_not_rows_seen(
     tmp_path, workflow_writer
 ) -> None:
@@ -1327,10 +1452,265 @@ def test_sweep_cursor_never_skips_page_prefix_when_wake_consumes_budget(
         scheduler,
     )
 
-    assert cursor is None
-    scheduler.submit.assert_called_once_with(
-        admitted[-1], ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    submitted = [call.args[0] for call in scheduler.submit.call_args_list]
+    assert submitted
+    assert submitted == admitted[: len(submitted)]
+    last_submitted = store.load_run(submitted[-1])
+    assert cursor == (last_submitted["created_at"], submitted[-1])
+    assert all(
+        call.args[1] == ExecutionFence(identity.owner_id, leadership.lease.epoch)
+        for call in scheduler.submit.call_args_list
     )
+
+
+def test_scheduled_due_pages_advance_past_a_stably_lane_blocked_first_page(
+    tmp_path, workflow_writer
+) -> None:
+    now = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
+    store = RunStore(
+        tmp_path,
+        max_queued_runs=102,
+        max_nonterminal_runs=102,
+        max_start_requests_per_minute=200,
+    )
+    coordinator = CoordinatorStore(store.database)
+    identity = _identity("scheduled-page")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    package = load_workflow(workflow_writer(tmp_path / "package", name="scheduled-page"))
+
+    def admit(index: int, *, concurrency_key: str) -> str:
+        prepared = store.prepare_run_snapshot(package)
+        return store.start_run(
+            RunAdmissionRequest(
+                workflow_name=package.definition.name,
+                definition_digest=prepared.definition_digest,
+                policy_digest=prepared.policy_digest,
+                input_manifest_digest=prepared.input_manifest_digest,
+                trigger_source="api",
+                idempotency_key=f"scheduled-page-{index:03d}",
+                concurrency_key=concurrency_key,
+                concurrency_policy="queue",
+                execution_mode="background",
+                run_metadata={"schedule_at": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")},
+            ),
+            immutable_snapshot=prepared,
+        ).run_id
+
+    blocked = [admit(index, concurrency_key="blocked-lane") for index in range(100)]
+    independent = admit(100, concurrency_key="independent-lane")
+    for wake in coordinator.pending_wakes(identity, epoch=leadership.lease.epoch, now=now):
+        assert coordinator.complete_wake(
+            wake.generation, identity, epoch=leadership.lease.epoch, now=now, outcome="test_setup"
+        )
+
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(host_kind="gateway", host_instance_id="scheduled-page"),
+        hermes_home=tmp_path,
+        utcnow=lambda: now,
+        monotonic=lambda: 0.0,
+    )
+    scheduler = MagicMock()
+    scheduler.submit.side_effect = lambda run_id, _fence: run_id == independent
+
+    _first_actionable, cursor, _first_progress = service._sweep_once(
+        store, coordinator, identity, leadership.lease.epoch, scheduler
+    )
+    second_actionable, second_periodic_cursor, _second_progress = service._sweep_once(
+        store, coordinator, identity, leadership.lease.epoch, scheduler, cursor=cursor
+    )
+
+    submitted = [call.args[0] for call in scheduler.submit.call_args_list]
+    assert submitted.count(independent) == 1
+    assert second_actionable is True
+    assert len(submitted[:100]) == 100
+    assert len(submitted[100:]) == 100
+    assert submitted[100] == independent
+    assert cursor is None
+    assert second_periodic_cursor is None
+    assert set(submitted[:100]) == set(blocked)
+
+
+def test_scheduled_due_prefix_is_resampled_during_a_sustained_forward_stream(
+    tmp_path, workflow_writer
+) -> None:
+    now = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "scheduled-stream"))
+    store = RunStore(
+        tmp_path,
+        max_queued_runs=400,
+        max_nonterminal_runs=400,
+        max_start_requests_per_minute=1000,
+        lease_clock=clock,
+    )
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    identity = _identity("scheduled-stream")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="scheduled-stream")
+    )
+
+    def admit(index: str, *, schedule_at: datetime) -> str:
+        prepared = store.prepare_run_snapshot(package)
+        result = store.start_run(
+            RunAdmissionRequest(
+                workflow_name=package.definition.name,
+                definition_digest=prepared.definition_digest,
+                policy_digest=prepared.policy_digest,
+                input_manifest_digest=prepared.input_manifest_digest,
+                trigger_source="api",
+                idempotency_key=f"scheduled-stream-{index}",
+                concurrency_key=f"scheduled-stream-{index}",
+                concurrency_policy="queue",
+                execution_mode="background",
+                run_metadata={
+                    "schedule_at": schedule_at.isoformat().replace("+00:00", "Z")
+                },
+            ),
+            immutable_snapshot=prepared,
+        )
+        assert result.run_id is not None
+        return result.run_id
+
+    def drain_wakes() -> None:
+        while wakes := coordinator.pending_wakes(
+            identity,
+            epoch=leadership.lease.epoch,
+            now=clock.sample.utc_now,
+        ):
+            for wake in wakes:
+                assert coordinator.complete_wake(
+                    wake.generation,
+                    identity,
+                    epoch=leadership.lease.epoch,
+                    now=clock.sample.utc_now,
+                    outcome="test_setup",
+                )
+
+    target = admit("target", schedule_at=now + timedelta(seconds=1))
+    for index in range(101):
+        admit(f"initial-{index:03d}", schedule_at=now - timedelta(seconds=1))
+    drain_wakes()
+
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(
+            host_kind="gateway",
+            host_instance_id="scheduled-stream",
+        ),
+        hermes_home=tmp_path,
+        utcnow=lambda: clock.sample.utc_now,
+        monotonic=lambda: clock.sample.monotonic_now,
+    )
+    scheduler = MagicMock()
+    scheduler.submit.side_effect = lambda run_id, _fence: run_id == target
+
+    _actionable, periodic_cursor, _progress = service._sweep_once(
+        store,
+        coordinator,
+        identity,
+        leadership.lease.epoch,
+        scheduler,
+    )
+    target_projection = store.load_run(target)
+    target_key = (str(target_projection["created_at"]), target)
+    assert service._scheduled_sweep_cursor is not None
+    assert service._scheduled_sweep_cursor > target_key
+
+    clock.sample = LeaseClockSample(
+        now + timedelta(seconds=2),
+        102.0,
+        "scheduled-stream",
+    )
+    unfenced_cursor = service._scheduled_sweep_cursor
+    for wave in range(2):
+        for index in range(100):
+            admit(
+                f"wave-{wave}-{index:03d}",
+                schedule_at=clock.sample.utc_now - timedelta(seconds=1),
+            )
+        drain_wakes()
+        _page, unfenced_cursor, exhausted = store.scheduled_coordinator_candidates(
+            after=unfenced_cursor,
+            now=clock.sample.utc_now,
+            limit=100,
+        )
+        assert exhausted is False
+        _actionable, periodic_cursor, _progress = service._sweep_once(
+            store,
+            coordinator,
+            identity,
+            leadership.lease.epoch,
+            scheduler,
+            cursor=periodic_cursor,
+        )
+
+    submitted = [call.args[0] for call in scheduler.submit.call_args_list]
+    assert target in submitted
+
+
+def test_new_leadership_term_restarts_scheduled_paging_at_page_one(
+    tmp_path, workflow_writer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
+    store = RunStore(tmp_path, max_queued_runs=2, max_start_requests_per_minute=10)
+    coordinator = CoordinatorStore(store.database)
+    identity = _identity("scheduled-restart")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    package = load_workflow(workflow_writer(tmp_path / "package", name="scheduled-restart"))
+    run_ids = []
+    for index in range(2):
+        prepared = store.prepare_run_snapshot(package)
+        run_ids.append(
+            store.start_run(
+                RunAdmissionRequest(
+                    workflow_name=package.definition.name,
+                    definition_digest=prepared.definition_digest,
+                    policy_digest=prepared.policy_digest,
+                    input_manifest_digest=prepared.input_manifest_digest,
+                    trigger_source="api",
+                    idempotency_key=f"scheduled-restart-{index}",
+                    concurrency_key=f"scheduled-restart-{index}",
+                    execution_mode="background",
+                    run_metadata={"schedule_at": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")},
+                ),
+                immutable_snapshot=prepared,
+            ).run_id
+        )
+    for wake in coordinator.pending_wakes(identity, epoch=leadership.lease.epoch, now=now):
+        assert coordinator.complete_wake(
+            wake.generation, identity, epoch=leadership.lease.epoch, now=now, outcome="test_setup"
+        )
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(host_kind="gateway", host_instance_id="scheduled-restart"),
+        hermes_home=tmp_path,
+        utcnow=lambda: now,
+        monotonic=lambda: 0.0,
+    )
+    service._scheduled_sweep_cursor = (store.load_run(run_ids[-1])["created_at"], run_ids[-1])
+    service._scheduled_sweep_observed_at = now - timedelta(minutes=1)
+    service._scheduled_sweep_queue_sequence_fence = 1
+    service._repair_revalidation_cursor = 99
+    leadership_scheduler = MagicMock()
+    leadership_scheduler.shutdown_deadline_seconds = 1.0
+    monkeypatch.setattr(service, "_scheduler", lambda *_args, **_kwargs: leadership_scheduler)
+    stopped = threading.Event()
+    stopped.set()
+
+    assert service._lead(
+        stopped,
+        run_store=store,
+        coordinator_store=coordinator,
+        identity=identity,
+        epoch=leadership.lease.epoch,
+    ) is True
+    assert service._scheduled_sweep_cursor is None
+    assert service._scheduled_sweep_observed_at is None
+    assert service._scheduled_sweep_queue_sequence_fence is None
+    assert service._repair_revalidation_cursor is None
+
+    scheduler = MagicMock()
+    scheduler.submit.return_value = False
+    service._sweep_once(store, coordinator, identity, leadership.lease.epoch, scheduler)
+    assert scheduler.submit.call_args_list[0].args[0] == run_ids[0]
 
 
 def test_foreground_and_background_admission_are_fenced_by_live_leader(

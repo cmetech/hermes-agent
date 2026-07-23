@@ -159,6 +159,10 @@ def test_request_and_result_are_immutable() -> None:
         result.status = "failed"  # type: ignore[misc]
 
 
+def test_real_plugin_agent_runner_declares_request_mcp_ownership() -> None:
+    assert PluginAgentRunner.starts_request_mcp is True
+
+
 def test_plugin_runner_returns_usage_without_exposing_credentials(monkeypatch) -> None:
     captured: dict = {}
 

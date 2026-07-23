@@ -9,7 +9,16 @@ from typing import Mapping
 
 from agent.plugin_agent import PluginAgentRunRequest
 from plugins.workflow.compat import resolve_tool_name
-from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
+from plugins.workflow.entitlement import (
+    AIExecutionIntegrityError,
+    entitled_agent_runner,
+)
+from plugins.workflow.executors.base import (
+    NodeExecutionContext,
+    NodeExecutionResult,
+    conservative_provider_retry_count,
+    validated_provider_retry_count,
+)
 from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
 from plugins.workflow.store import ArtifactRef
@@ -40,8 +49,10 @@ class AgentNodeExecutor:
         *,
         session_registry: NodeSessionRegistry | None = None,
         profile_name: str = "default",
+        deterministic_runner=None,
     ) -> None:
         self.agent_runner = agent_runner
+        self.deterministic_runner = deterministic_runner
         self.session_registry = session_registry
         self.profile_name = profile_name
 
@@ -139,6 +150,18 @@ class AgentNodeExecutor:
         node = context.node
         if node.node_type not in {"command", "prompt"}:
             return self._failure("unsupported_ai_node", node.node_type)
+        try:
+            agent_runner = entitled_agent_runner(
+                context.ai_entitlement,
+                self.agent_runner,
+                self.deterministic_runner,
+            )
+        except AIExecutionIntegrityError as exc:
+            return self._failure("execution_integrity", str(exc))
+        if agent_runner is None:
+            return self._failure(
+                "agent_runner_unavailable", "real agent execution is unavailable"
+            )
         fingerprint = self._fingerprint(context)
         explicit_context = node.options.get("context")
         context_mode = "fresh"
@@ -180,6 +203,7 @@ class AgentNodeExecutor:
             )
             if (
                 persist
+                and context.ai_entitlement.value == "real"
                 and explicit_context != "fresh"
                 and self.session_registry is not None
             ):
@@ -207,6 +231,15 @@ class AgentNodeExecutor:
                         )
 
         try:
+            execution_limits = context.execution_limits
+            granted_provider_attempts = min(
+                context.max_provider_attempts,
+                (
+                    execution_limits.combined_retries
+                    if execution_limits is not None
+                    else context.max_provider_attempts
+                ),
+            )
             wall_timeout = (
                 context.deadline_budget.remaining_wall(context.monotonic())
                 if context.deadline_budget is not None
@@ -312,31 +345,73 @@ class AgentNodeExecutor:
                 ),
                 workdir=context.run_directory,
                 max_iterations=90,
-                max_api_attempts=context.max_provider_attempts,
+                max_api_attempts=granted_provider_attempts,
                 idle_timeout_seconds=idle_timeout,
                 wall_timeout_seconds=wall_timeout,
                 provider_request_timeout_seconds=provider_timeout,
-                max_process_tree_rss_bytes=context.resource_limits.max_rss_bytes,
-                max_process_tree_cpu_seconds=context.resource_limits.max_cpu_seconds,
-                max_descendants=context.resource_limits.max_descendants,
-                cooperative_shutdown_seconds=(
-                    context.termination_policy.cooperative_grace_seconds
+                max_process_tree_rss_bytes=(
+                    execution_limits.process_tree_rss_bytes
+                    if execution_limits is not None
+                    else context.resource_limits.max_rss_bytes
                 ),
-                term_grace_seconds=context.termination_policy.term_grace_seconds,
-                kill_reap_grace_seconds=context.termination_policy.kill_grace_seconds,
+                max_process_tree_cpu_seconds=(
+                    execution_limits.process_tree_cpu_seconds
+                    if execution_limits is not None
+                    else context.resource_limits.max_cpu_seconds
+                ),
+                max_descendants=(
+                    execution_limits.max_descendants
+                    if execution_limits is not None
+                    else context.resource_limits.max_descendants
+                ),
+                cooperative_shutdown_seconds=(
+                    execution_limits.cooperative_shutdown_seconds
+                    if execution_limits is not None
+                    else context.termination_policy.cooperative_grace_seconds
+                ),
+                term_grace_seconds=(
+                    execution_limits.term_grace_seconds
+                    if execution_limits is not None
+                    else context.termination_policy.term_grace_seconds
+                ),
+                kill_reap_grace_seconds=(
+                    execution_limits.kill_reap_grace_seconds
+                    if execution_limits is not None
+                    else context.termination_policy.kill_grace_seconds
+                ),
             )
-            result = self.agent_runner.run(
+            result = agent_runner.run(
                 request,
                 is_cancelled=context.is_cancelled,
             )
         except PermissionError as exc:
             return self._failure("authorization", str(exc))
         except OSError as exc:
-            return self._failure("network_error", str(exc))
+            return NodeExecutionResult(
+                "failed",
+                error_code="network_error",
+                error_message=str(exc),
+                metadata={
+                    "provider_attempts": conservative_provider_retry_count(
+                        None,
+                        granted_attempts=granted_provider_attempts,
+                    )
+                },
+            )
         except ValueError as exc:
             return self._failure("validation", str(exc))
         except RuntimeError as exc:
-            return self._failure("agent_execution_failed", str(exc))
+            return NodeExecutionResult(
+                "failed",
+                error_code="agent_execution_failed",
+                error_message=str(exc),
+                metadata={
+                    "provider_attempts": conservative_provider_retry_count(
+                        None,
+                        granted_attempts=granted_provider_attempts,
+                    )
+                },
+            )
 
         metadata: dict[str, object] = {
             "session_id": result.session_id,
@@ -347,11 +422,12 @@ class AgentNodeExecutor:
             "cache_fingerprint": fingerprint,
             "warnings": warnings,
         }
-        provider_attempts = result.audit.get("provider_attempts")
-        if isinstance(provider_attempts, int) and not isinstance(
-            provider_attempts, bool
-        ):
-            metadata["provider_attempts"] = max(0, provider_attempts)
+        provider_attempts = validated_provider_retry_count(
+            result.audit.get("provider_attempts"),
+            granted_attempts=granted_provider_attempts,
+        )
+        if provider_attempts is not None:
+            metadata["provider_attempts"] = provider_attempts
         if result.status == "paused":
             metadata["pending_interaction"] = dict(result.pending_interaction or {})
             return NodeExecutionResult("paused", metadata=metadata)
@@ -368,7 +444,9 @@ class AgentNodeExecutor:
             )
         if result.status != "completed":
             failure_kind = str(result.audit.get("failure_kind", "")).lower()
-            if (
+            if failure_kind == "package_mcp_unavailable":
+                error_code = "package_mcp_unavailable"
+            elif (
                 "unknown_side_effect" in failure_kind
                 or "outcome_unknown" in failure_kind
             ):
@@ -391,20 +469,13 @@ class AgentNodeExecutor:
                 error_code = "network_disconnect"
             else:
                 error_code = "agent_failed"
-            if (
-                error_code
-                in {
-                    "provider_timeout",
-                    "rate_limit",
-                    "network_disconnect",
-                }
-                and "provider_attempts" not in metadata
-            ):
+            if provider_attempts is None:
                 # The host loop does not currently expose its exact retry
                 # counter. Charge the full granted retry allowance so the
                 # workflow and provider layers can never multiply attempts.
-                metadata["provider_attempts"] = max(
-                    0, context.max_provider_attempts - 1
+                metadata["provider_attempts"] = conservative_provider_retry_count(
+                    result.audit.get("provider_attempts"),
+                    granted_attempts=granted_provider_attempts,
                 )
             return NodeExecutionResult(
                 "failed",

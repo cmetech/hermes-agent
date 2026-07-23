@@ -5,6 +5,8 @@ import os
 import re
 import subprocess
 
+import yaml
+
 
 ROOT = Path(__file__).parents[2]
 GATE = ROOT / "scripts/test_workflow_merge_gate.sh"
@@ -29,7 +31,6 @@ WORKFLOW_GATE_OPTOUTS = {
         "tests/plugins/workflow/test_loop_executor.py",
         "tests/plugins/workflow/test_node_agents.py",
         "tests/plugins/workflow/test_node_hooks.py",
-        "tests/plugins/workflow/test_node_mcp.py",
         "tests/plugins/workflow/test_node_skills.py",
         "tests/plugins/workflow/test_node_tool_policy.py",
         "tests/plugins/workflow/test_operator_e2e.py",
@@ -46,13 +47,18 @@ WORKFLOW_GATE_OPTOUTS = {
         "tests/plugins/workflow/test_scheduler.py",
         "tests/plugins/workflow/test_schema.py",
         "tests/plugins/workflow/test_script_executor.py",
-        "tests/plugins/workflow/test_showcase_ai_e2e.py",
-        "tests/plugins/workflow/test_showcase_evidence.py",
         "tests/plugins/workflow/test_showcase_offline_e2e.py",
-        "tests/plugins/workflow/test_showcase_schedule_e2e.py",
         "tests/plugins/workflow/test_store.py",
         "tests/plugins/workflow/test_topology.py",
     )
+}
+
+EXPECTED_SHOWCASE_IDS = {
+    "ai-extensions",
+    "approval-gate",
+    "laptop-diagnostic",
+    "resilience",
+    "scheduling",
 }
 
 
@@ -100,6 +106,138 @@ def test_showcase_desktop_e2e_is_in_merge_gate_and_native_matrix() -> None:
 
     assert path in GATE.read_text()
     assert path in CI.read_text()
+
+
+def test_request_mcp_runtime_contract_is_in_merge_gate_and_native_matrix() -> None:
+    for path in (
+        "tests/plugins/workflow/test_node_mcp.py",
+        "tests/hermes_cli/test_execution_runtime_capabilities.py",
+    ):
+        assert GATE.read_text().count(path) == 1
+        assert CI.read_text().count(path) == 1
+        assert path not in WORKFLOW_GATE_OPTOUTS
+
+
+def test_runner_binding_contract_is_in_merge_gate_and_native_matrix() -> None:
+    path = "tests/plugins/workflow/test_runner_binding.py"
+
+    assert GATE.read_text().count(path) == 1
+    assert CI.read_text().count(path) == 1
+    assert path not in WORKFLOW_GATE_OPTOUTS
+
+
+def test_laptop_diagnostic_middleware_e2e_is_exactly_pinned_in_release_gates() -> None:
+    path = "tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py"
+
+    workflow = yaml.safe_load(CI.read_text())
+    portability = workflow["jobs"]["workflow-portability"]
+    portability_run = next(
+        step["run"]
+        for step in portability["steps"]
+        if step.get("name") == "Run portable workflow and installed-showcase gates"
+    )
+
+    assert GATE.read_text().count(path) == 1
+    assert CI.read_text().count(path) == 1
+    assert portability["strategy"]["matrix"]["os"] == [
+        "ubuntu-latest",
+        "macos-latest",
+        "windows-latest",
+    ]
+    assert portability_run.count(path) == 1
+    assert GATE.read_text().count(
+        "tests/plugins/workflow/test_installed_distribution_e2e.py"
+    ) == 1
+
+
+def test_ai_extensions_middleware_e2e_is_exactly_pinned_in_release_gates() -> None:
+    path = "tests/plugins/workflow/test_ai_extensions_middleware_e2e.py"
+
+    workflow = yaml.safe_load(CI.read_text())
+    portability = workflow["jobs"]["workflow-portability"]
+    portability_run = next(
+        step["run"]
+        for step in portability["steps"]
+        if step.get("name") == "Run portable workflow and installed-showcase gates"
+    )
+
+    assert GATE.read_text().count(path) == 1
+    assert CI.read_text().count(path) == 1
+    assert portability["strategy"]["matrix"]["os"] == [
+        "ubuntu-latest",
+        "macos-latest",
+        "windows-latest",
+    ]
+    assert portability_run.count(path) == 1
+    assert path not in WORKFLOW_GATE_OPTOUTS
+    assert GATE.read_text().count("tests/plugins/workflow/test_node_mcp.py") == 1
+    assert CI.read_text().count("tests/plugins/workflow/test_node_mcp.py") == 1
+
+
+def test_showcase_ai_and_evidence_suites_are_promoted_into_the_merge_gate() -> None:
+    source = GATE.read_text()
+    for path in (
+        "tests/plugins/workflow/test_showcase_ai_e2e.py",
+        "tests/plugins/workflow/test_showcase_evidence.py",
+    ):
+        assert path in source
+        assert path not in WORKFLOW_GATE_OPTOUTS
+
+
+def test_showcase_schedule_confirmation_suite_is_promoted_into_base_gate() -> None:
+    path = "tests/plugins/workflow/test_showcase_schedule_e2e.py"
+
+    assert GATE.read_text().count(path) == 1
+    assert path not in WORKFLOW_GATE_OPTOUTS
+
+
+def test_scheduled_run_wake_and_clock_contract_is_promoted_into_base_gate() -> None:
+    path = "tests/plugins/workflow/test_scheduled_runs.py"
+
+    assert GATE.read_text().count(path) == 1
+    assert path not in WORKFLOW_GATE_OPTOUTS
+
+
+def test_scheduled_revalidation_contract_is_in_merge_gate_and_native_matrix() -> None:
+    path = "tests/plugins/workflow/test_schedule_revalidation.py"
+
+    assert GATE.read_text().count(path) == 1
+    assert CI.read_text().count(path) == 1
+    assert path not in WORKFLOW_GATE_OPTOUTS
+
+
+def test_complete_one_shot_scheduling_contract_is_selected_in_release_gates() -> None:
+    for path in (
+        "tests/plugins/workflow/test_schedule_store_identity.py",
+        "tests/plugins/workflow/test_scheduled_runs.py",
+        "tests/plugins/workflow/test_schedule_revalidation.py",
+        "tests/plugins/workflow/test_scheduling_middleware_e2e.py",
+    ):
+        assert GATE.read_text().count(path) == 1
+        assert CI.read_text().count(path) == 1
+        assert path not in WORKFLOW_GATE_OPTOUTS
+
+
+def test_exact_showcase_membership_is_pinned_at_all_three_gate_sites() -> None:
+    sites = (
+        (ROOT / "tests/plugins/workflow/test_showcase_catalog.py", "catalog"),
+        (
+            ROOT / "tests/plugins/workflow/test_portable_compatibility_e2e.py",
+            "showcase_catalog",
+        ),
+        (GATE, "catalog"),
+    )
+    for path, variable in sites:
+        source = path.read_text()
+        match = re.search(
+            rf"assert\s+set\({variable}\)\s*==\s*\{{(?P<members>[^}}]+)\}}",
+            source,
+            flags=re.DOTALL,
+        )
+        assert match is not None, path
+        assert set(re.findall(r'[\"\']([^\"\']+)[\"\']', match["members"])) == (
+            EXPECTED_SHOWCASE_IDS
+        )
 
 
 def test_merge_gate_pins_desktop_review_run_contract() -> None:

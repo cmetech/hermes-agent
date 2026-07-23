@@ -72,16 +72,28 @@ function health(run: WorkflowRunSnapshot) {
   return 'healthy' as const
 }
 
+function exactState(run: WorkflowRunSnapshot, scheduledLabel = 'Scheduled'): string {
+  return run.presentation_state === 'scheduled_wait' ? scheduledLabel : run.status
+}
+
 export function workflowBoardModel(
   runs: readonly WorkflowRunSnapshot[],
-  options: { nextCursor?: null | string; scopeLabel: string; stale?: boolean } = { scopeLabel: 'Workflows' }
+  options: { nextCursor?: null | string; scheduledLabel?: string; scopeLabel: string; stale?: boolean } = {
+    scopeLabel: 'Workflows'
+  }
 ): ActivityBoardModel {
   const columns: ActivityBoardColumn[] = COLUMNS.map(([id, label]) => {
     const selected = runs.filter(run => columnId(run) === id)
 
     return {
       cards: selected.map(run => ({
-        ariaDescription: [run.workflow, run.status, run.health, run.provenance?.source, run.provenance?.assurance]
+        ariaDescription: [
+          run.workflow,
+          exactState(run, options.scheduledLabel),
+          run.health,
+          run.provenance?.source,
+          run.provenance?.assurance
+        ]
           .filter(Boolean)
           .join(', '),
         badges: [
@@ -105,7 +117,7 @@ export function workflowBoardModel(
           ...(run.current_nodes?.[0] ? [{ label: run.current_nodes[0], tone: 'notice' as const }] : []),
           { label: `${run.progress.completed_nodes}/${run.progress.total_nodes}` }
         ],
-        exactState: run.status,
+        exactState: exactState(run, options.scheduledLabel),
         health: health(run),
         id: run.run_id,
         title: run.workflow,

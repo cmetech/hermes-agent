@@ -15,6 +15,7 @@ interface WorkflowApiModule {
       catalogSource: 'profile' | 'project' | 'showcase'
       concurrencyPolicy: 'allow' | 'forbid' | 'queue'
       idempotencyKey: string
+      scheduleAt?: string
       values: Record<string, string>
       workflow: string
     },
@@ -118,6 +119,32 @@ describe('workflow catalog authenticated API', () => {
       method: 'POST',
       path: '/api/plugins/workflow/runs',
       profile: 'writer'
+    })
+  })
+
+  it('adds only the canonical schedule field for a one-shot scheduled run', async () => {
+    const { startWorkflowRun } = await workflowApi()
+
+    await startWorkflowRun({
+      catalogSource: 'profile',
+      concurrencyPolicy: 'queue',
+      idempotencyKey: 'scheduled-desktop-request',
+      scheduleAt: '2099-01-02T03:04:05Z',
+      values: {},
+      workflow: 'deploy'
+    })
+
+    expect(apiStructured).toHaveBeenCalledWith({
+      body: {
+        catalog_source: 'profile',
+        concurrency_policy: 'queue',
+        idempotency_key: 'scheduled-desktop-request',
+        schedule_at: '2099-01-02T03:04:05Z',
+        values: {},
+        workflow: 'deploy'
+      },
+      method: 'POST',
+      path: '/api/plugins/workflow/runs'
     })
   })
 

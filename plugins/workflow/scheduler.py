@@ -18,6 +18,7 @@ import time
 import uuid
 from typing import Callable, Iterable, Mapping
 
+from plugins.workflow.entitlement import AIEntitlementResolution, derive_ai_entitlement
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.approval import ApprovalExecutor
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
@@ -30,10 +31,13 @@ from plugins.workflow.models import (
     DeadlineBudget,
     ExecutionFence,
     RetryPolicy,
+    RunExecutionLimits,
     WorkflowNode,
+    WorkflowPackage,
+    WorkflowRuntimeConfig,
 )
 from plugins.workflow.resources import VariableContext
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow_snapshot
 from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.store import NodeClaim, RunStore, StorageQuotaError
 from tools.managed_process import ProcessResourceLimits, TerminationPolicy
@@ -204,6 +208,7 @@ class RunScheduler:
         execution_owner_epoch: int | None = None,
         execution_fence: ExecutionFence | None = None,
         agent_runner=None,
+        runner_binding=None,
         session_registry: NodeSessionRegistry | None = None,
         profile_name: str = "default",
         max_parallel_nodes: int = 4,
@@ -252,6 +257,16 @@ class RunScheduler:
             or not 1 <= default_max_attempts <= 5
         ):
             raise ValueError("default retry attempts must be between 1 and 5")
+        if runner_binding is not None:
+            if agent_runner is not None and agent_runner is not runner_binding.real_runner:
+                raise ValueError("runner_binding and agent_runner disagree")
+            agent_runner = runner_binding.real_runner
+        self.runner_binding = runner_binding
+        deterministic_runner = (
+            runner_binding.deterministic_runner
+            if runner_binding is not None
+            else None
+        )
         self.store = store
         self.owner_id = owner_id or f"scheduler-{os.getpid()}-{uuid.uuid4().hex}"
         if (execution_owner_id is None) != (execution_owner_epoch is None):
@@ -279,6 +294,23 @@ class RunScheduler:
             cooperative_shutdown_seconds + term_grace_seconds + kill_reap_grace_seconds
         )
         self.resource_limits = resource_limits or ProcessResourceLimits()
+        self.profile_execution_limits = RunExecutionLimits.resolve(
+            WorkflowRuntimeConfig(
+                max_parallel_nodes=self.max_parallel_nodes,
+                max_total_workers=store.limits["workers"],
+                ai_idle_timeout_seconds=self.ai_idle_timeout_seconds,
+                ai_wall_timeout_seconds=self.ai_wall_timeout_seconds,
+                provider_request_timeout_seconds=self.provider_request_timeout_seconds,
+                subprocess_timeout_seconds=self.subprocess_timeout_seconds,
+                combined_retries=self.default_max_attempts,
+                process_tree_rss_bytes=self.resource_limits.max_rss_bytes,
+                process_tree_cpu_seconds=self.resource_limits.max_cpu_seconds,
+                max_descendants=self.resource_limits.max_descendants,
+                cooperative_shutdown_seconds=cooperative_shutdown_seconds,
+                term_grace_seconds=term_grace_seconds,
+                kill_reap_grace_seconds=kill_reap_grace_seconds,
+            )
+        )
         self._utcnow = utcnow or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic
         self._jitter = jitter
@@ -295,7 +327,10 @@ class RunScheduler:
             "bash": BashExecutor(),
             "script": ScriptExecutor(),
             "cancel": CancelExecutor(),
-            "approval": ApprovalExecutor(agent_runner),
+            "approval": ApprovalExecutor(
+                agent_runner,
+                deterministic_runner=deterministic_runner,
+            ),
         }
         if agent_runner is not None:
             registry = session_registry or NodeSessionRegistry(store.hermes_home)
@@ -303,11 +338,15 @@ class RunScheduler:
                 agent_runner,
                 session_registry=registry,
                 profile_name=profile_name,
+                deterministic_runner=deterministic_runner,
             )
             self.executors.update({
                 "command": ai_executor,
                 "prompt": ai_executor,
-                "loop": LoopExecutor(agent_runner),
+                "loop": LoopExecutor(
+                    agent_runner,
+                    deterministic_runner=deterministic_runner,
+                ),
             })
 
     def _renew_execution_owner(self, run_id: str) -> bool:
@@ -478,18 +517,155 @@ class RunScheduler:
                 return
             self.store.transition_pending_nodes(run_id, transitions)
 
-    def _node_timeout(self, node: WorkflowNode) -> float:
-        return float(
-            node.options.get(
-                "timeout",
-                self.ai_wall_timeout_seconds
-                if node.node_type in {"command", "prompt", "loop"}
-                else self.subprocess_timeout_seconds,
-            )
+    def _load_run_package(self, run_id: str) -> WorkflowPackage:
+        run_directory = self.store.run_directory(run_id)
+        definition = run_directory / "definition.yaml"
+        policy = run_directory / "policy.yaml"
+        return load_workflow_snapshot(
+            definition,
+            workflow_bytes=definition.read_bytes(),
+            sidecar_bytes=policy.read_bytes() if policy.is_file() else None,
         )
 
-    def _heartbeat_journal_reserve(self, node: WorkflowNode) -> int:
-        heartbeat_count = math.ceil(self._node_timeout(node) / self.heartbeat_seconds)
+    def _run_execution_limits(self, package: WorkflowPackage) -> RunExecutionLimits:
+        limits = package.sidecar.get("limits", {})
+        resources = package.sidecar.get("resource_limits", {})
+        if not isinstance(limits, Mapping) or not isinstance(resources, Mapping):
+            raise ValueError("workflow sidecar limits must contain mappings")
+        return RunExecutionLimits.resolve(
+            WorkflowRuntimeConfig(
+                **{
+                    name: getattr(self.profile_execution_limits, name)
+                    for name in self.profile_execution_limits.__dataclass_fields__
+                }
+            ),
+            sidecar_limits=limits,
+            sidecar_resources=resources,
+        )
+
+    def _prepare_run_package(self, run_id: str, schedule_revalidation):
+        try:
+            package = self._load_run_package(run_id)
+            return package, self._run_execution_limits(package)
+        except Exception:
+            if schedule_revalidation is None:
+                raise
+            self.store._fail_scheduled_package_preparation(
+                run_id,
+                schedule_revalidation,
+            )
+            return None
+
+    def _authorize_scheduled_promotion(
+        self,
+        run_id: str,
+        projection: Mapping[str, object],
+    ):
+        metadata = projection.get("run_metadata")
+        if not isinstance(metadata, Mapping) or not isinstance(
+            metadata.get("schedule_at"), str
+        ):
+            return True, None
+        if self.execution_fence is None or self.runner_binding is None:
+            # Legacy schedule-only projections predate fire-time evidence and
+            # retain their existing direct-scheduler behavior. New admissions
+            # cannot promote without the coordinator's actual execution context.
+            if not isinstance(metadata.get("execution_identity"), str):
+                return True, None
+            self.store.fail_scheduled_revalidation(
+                run_id,
+                expected_state_version=int(projection.get("state_version", -1)),
+            )
+            return False, None
+        try:
+            from plugins.workflow.scheduled_revalidation import (
+                revalidate_scheduled_run,
+                scheduled_execution_context,
+                verify_sealed_snapshot,
+            )
+            run_directory = self.store.run_directory(run_id)
+            verify_sealed_snapshot(
+                projection,
+                run_directory=run_directory,
+            )
+
+            def verify(current_projection: Mapping[str, object]) -> None:
+                context = scheduled_execution_context(
+                    current_projection,
+                    self.runner_binding,
+                )
+                revalidate_scheduled_run(
+                    current_projection,
+                    context,
+                    hermes_home=self.store.hermes_home,
+                    run_directory=run_directory,
+                )
+
+            authorization = self.store._scheduled_promotion_authorization(
+                run_id,
+                verify,
+            )
+        except Exception:
+            self.store.fail_scheduled_revalidation(
+                run_id,
+                expected_state_version=int(projection.get("state_version", -1)),
+            )
+            return False, None
+        return True, authorization
+
+    def _try_promote(
+        self,
+        run_id: str,
+        *,
+        now: datetime,
+        schedule_revalidation,
+    ) -> bool:
+        if schedule_revalidation is None:
+            return self.store.try_promote_run(run_id, now=now)
+        return self.store.try_promote_run(
+            run_id,
+            now=now,
+            schedule_revalidation=schedule_revalidation,
+        )
+
+    def _node_timeout(
+        self,
+        node: WorkflowNode,
+        execution_limits: RunExecutionLimits | None = None,
+    ) -> float:
+        limits = execution_limits or self.profile_execution_limits
+        if node.node_type in {"command", "prompt", "loop", "approval"}:
+            return float(limits.ai_wall_timeout_seconds)
+        return min(
+            float(node.options.get("timeout", limits.subprocess_timeout_seconds)),
+            float(limits.subprocess_timeout_seconds),
+        )
+
+    @staticmethod
+    def _effective_retry_policy(
+        node: WorkflowNode,
+        execution_limits: RunExecutionLimits,
+    ) -> RetryPolicy:
+        policy = RetryPolicy.from_mapping(
+            node.options.get("retry"),
+            default_max_attempts=execution_limits.combined_retries,
+        )
+        return replace(
+            policy,
+            max_attempts=min(
+                policy.max_attempts,
+                execution_limits.combined_retries,
+            ),
+        )
+
+    def _heartbeat_journal_reserve(
+        self,
+        node: WorkflowNode,
+        execution_limits: RunExecutionLimits | None = None,
+    ) -> int:
+        heartbeat_count = math.ceil(
+            self._node_timeout(node, execution_limits) / self.heartbeat_seconds
+        )
         return heartbeat_count * 4096
 
     def _execute_claim(
@@ -499,6 +675,7 @@ class RunScheduler:
         node: WorkflowNode,
         package,
         projection: dict[str, object],
+        execution_limits: RunExecutionLimits,
     ) -> None:
         with self._activity:
             self._active_executions += 1
@@ -523,14 +700,32 @@ class RunScheduler:
                             "cancelled",
                             error_code=self._cancellation_reason(run_id) or "cancelled",
                         ),
+                        execution_limits,
                     )
                     return
                 node_state = dict(projection["nodes"][node.id])
+                retry_policy = self._effective_retry_policy(node, execution_limits)
+                consumed_attempts = max(
+                    0, int(node_state.get("retry_consumed", 0))
+                )
+                remaining_attempts = retry_policy.max_attempts - consumed_attempts
+                if remaining_attempts <= 0:
+                    self._persist_result(
+                        claim,
+                        node,
+                        NodeExecutionResult(
+                            "failed",
+                            error_code="retry_budget_exhausted",
+                            error_message="combined retry budget is exhausted",
+                        ),
+                        execution_limits,
+                    )
+                    return
                 approved_action_digest = self.store.consume_action_grant(claim)
                 node_state.pop("action_grant", None)
                 if approved_action_digest is not None:
                     node_state["approved_action_digest"] = approved_action_digest
-                timeout = self._node_timeout(node)
+                timeout = self._node_timeout(node, execution_limits)
                 heartbeat_stop = threading.Event()
                 ownership_lost = threading.Event()
 
@@ -563,9 +758,11 @@ class RunScheduler:
                     idle_timeout = min(
                         float(
                             node.options.get(
-                                "idle_timeout", self.ai_idle_timeout_seconds
+                                "idle_timeout",
+                                execution_limits.ai_idle_timeout_seconds,
                             )
                         ),
+                        execution_limits.ai_idle_timeout_seconds,
                         timeout,
                     )
                     deadline_budget = DeadlineBudget.create(
@@ -573,7 +770,8 @@ class RunScheduler:
                         wall_seconds=timeout,
                         idle_seconds=idle_timeout,
                         provider_seconds=min(
-                            self.provider_request_timeout_seconds, timeout
+                            execution_limits.provider_request_timeout_seconds,
+                            timeout,
                         ),
                     )
                     variables = self._variables(
@@ -615,11 +813,30 @@ class RunScheduler:
                             operator_scope=str(
                                 projection.get("operator_scope_digest") or "local"
                             ),
-                            resource_limits=self.resource_limits,
+                            ai_entitlement=derive_ai_entitlement(
+                                projection.get("run_metadata", {}),
+                                definition_digest=str(
+                                    projection.get("definition_digest") or ""
+                                ),
+                                execution_context=(
+                                    self.runner_binding.execution_context(
+                                        surface="background",
+                                        entitlement=AIEntitlementResolution("real"),
+                                    )
+                                    if self.runner_binding is not None
+                                    else None
+                                ),
+                            ),
+                            execution_limits=execution_limits,
+                            resource_limits=ProcessResourceLimits(
+                                max_rss_bytes=execution_limits.process_tree_rss_bytes,
+                                max_cpu_seconds=execution_limits.process_tree_cpu_seconds,
+                                max_descendants=execution_limits.max_descendants,
+                            ),
                             deadline_budget=deadline_budget,
-                            # Workflow scheduling is the sole retry authority;
-                            # the isolated host disables per-call API retries.
-                            max_provider_attempts=1,
+                            # Provider and workflow attempts draw from the same
+                            # frozen per-run allowance, so the retry layers do not multiply.
+                            max_provider_attempts=remaining_attempts,
                             cancellation_reason=lambda: self._cancellation_reason(
                                 run_id
                             ),
@@ -651,7 +868,18 @@ class RunScheduler:
                                 )
                             ),
                             monotonic=self._monotonic,
-                            termination_policy=self.termination_policy,
+                            termination_policy=TerminationPolicy(
+                                cooperative_grace_seconds=(
+                                    execution_limits.cooperative_shutdown_seconds
+                                ),
+                                term_grace_seconds=execution_limits.term_grace_seconds,
+                                kill_grace_seconds=(
+                                    execution_limits.kill_reap_grace_seconds
+                                ),
+                                wait_timeout_seconds=(
+                                    execution_limits.kill_reap_grace_seconds
+                                ),
+                            ),
                         )
                     )
                 except Exception as exc:
@@ -665,7 +893,7 @@ class RunScheduler:
                     heartbeat_thread.join(timeout=self.heartbeat_seconds)
                 if ownership_lost.is_set():
                     return
-            self._persist_result(claim, node, result)
+            self._persist_result(claim, node, result, execution_limits)
         except RuntimeError as exc:
             if "execution fence" in str(exc):
                 self.store.release_claim_before_execution(claim)
@@ -678,7 +906,11 @@ class RunScheduler:
                 self._activity.notify_all()
 
     def _persist_result(
-        self, claim: NodeClaim, node: WorkflowNode, result: NodeExecutionResult
+        self,
+        claim: NodeClaim,
+        node: WorkflowNode,
+        result: NodeExecutionResult,
+        execution_limits: RunExecutionLimits,
     ) -> None:
         if result.status == "failed" and result.error_code == "cleanup_failed":
             self.store.block_cleanup_failed(
@@ -697,10 +929,7 @@ class RunScheduler:
                 metadata=result.metadata,
             )
             return
-        policy = RetryPolicy.from_mapping(
-            node.options.get("retry"),
-            default_max_attempts=self.default_max_attempts,
-        )
+        policy = self._effective_retry_policy(node, execution_limits)
         projection = self.store.load_run(claim.run_id)
         node_state = projection["nodes"][claim.node_id]
         consumed_before = int(node_state.get("retry_consumed", 0))
@@ -766,9 +995,21 @@ class RunScheduler:
         if self._shutdown.is_set():
             return self.store.load_run(run_id)
         if max_nodes is None:
-            return self.advance_all([run_id])[run_id]
+            advanced = self.advance_all([run_id])
+            return advanced.get(run_id, self.store.load_run(run_id))
         executed = 0
-        package = load_workflow(self.store.run_directory(run_id) / "definition.yaml")
+        initial = self.store.load_run(run_id)
+        authorization = None
+        if initial["status"] == "queued":
+            authorized, authorization = self._authorize_scheduled_promotion(
+                run_id, initial
+            )
+            if not authorized:
+                return self.store.load_run(run_id)
+        prepared_package = self._prepare_run_package(run_id, authorization)
+        if prepared_package is None:
+            return self.store.load_run(run_id)
+        package, execution_limits = prepared_package
         by_id = {node.id: node for node in package.definition.nodes}
         foreground_owner_id, foreground_owner_epoch = self._foreground_claim_token(
             self.store.load_run(run_id)
@@ -789,7 +1030,11 @@ class RunScheduler:
                 )
                 projection = self.store.load_run(run_id)
                 if projection["status"] == "queued":
-                    if not self.store.try_promote_run(run_id):
+                    if not self._try_promote(
+                        run_id,
+                        now=self._utcnow(),
+                        schedule_revalidation=authorization,
+                    ):
                         break
                 self.store.wake_due_retries(run_id, now=self._utcnow())
                 self._resolve_graph(run_id, package.definition.nodes)
@@ -810,7 +1055,10 @@ class RunScheduler:
                     if state["state"] == "ready"
                 )
                 remaining = None if max_nodes is None else max_nodes - executed
-                capacity = self.max_parallel_nodes
+                capacity = min(
+                    self.max_parallel_nodes,
+                    execution_limits.max_parallel_nodes,
+                )
                 if remaining is not None:
                     capacity = min(capacity, remaining)
                 claims = []
@@ -825,7 +1073,7 @@ class RunScheduler:
                             now=self._utcnow(),
                             monotonic_now=self._monotonic(),
                             journal_reserve_bytes=self._heartbeat_journal_reserve(
-                                by_id[node_id]
+                                by_id[node_id], execution_limits
                             ),
                             executor_id=by_id[node_id].node_type,
                             owner_epoch=self.owner_id,
@@ -838,6 +1086,7 @@ class RunScheduler:
                             foreground_owner_id=foreground_owner_id,
                             foreground_owner_epoch=foreground_owner_epoch,
                             require_execution_authority=True,
+                            max_run_workers=execution_limits.max_total_workers,
                         )
                     except StorageQuotaError as exc:
                         self.store.interrupt_for_host_pressure(run_id, message=str(exc))
@@ -867,6 +1116,7 @@ class RunScheduler:
                             node,
                             package,
                             snapshot,
+                            execution_limits,
                         )
                         for claim, node, snapshot in claims
                     ]
@@ -910,10 +1160,35 @@ class RunScheduler:
     def advance_all(self, run_ids: Iterable[str]):
         """Replenish ready work fairly across runs under one bounded pool."""
         run_ids = list(dict.fromkeys(run_ids))
-        packages = {
-            run_id: load_workflow(self.store.run_directory(run_id) / "definition.yaml")
-            for run_id in run_ids
-        }
+        authorizations = {}
+        authorized_run_ids = []
+        for run_id in run_ids:
+            projection = self.store.load_run(run_id)
+            authorization = None
+            if projection["status"] == "queued":
+                authorized, authorization = self._authorize_scheduled_promotion(
+                    run_id, projection
+                )
+                if not authorized:
+                    continue
+            authorizations[run_id] = authorization
+            authorized_run_ids.append(run_id)
+        run_ids = authorized_run_ids
+        packages = {}
+        execution_limits = {}
+        prepared_run_ids = []
+        for run_id in run_ids:
+            prepared_package = self._prepare_run_package(
+                run_id,
+                authorizations[run_id],
+            )
+            if prepared_package is None:
+                continue
+            package, limits = prepared_package
+            packages[run_id] = package
+            execution_limits[run_id] = limits
+            prepared_run_ids.append(run_id)
+        run_ids = prepared_run_ids
         foreground_tokens = {
             run_id: self._foreground_claim_token(self.store.load_run(run_id))
             for run_id in run_ids
@@ -924,7 +1199,7 @@ class RunScheduler:
             max_workers=self.max_parallel_nodes,
             thread_name_prefix="workflow-node",
         )
-        futures = set()
+        futures = {}
         fair_cursor = 0
         try:
             while not self._shutdown.is_set():
@@ -932,7 +1207,7 @@ class RunScheduler:
                 if len(futures) >= self.max_parallel_nodes:
                     done, _pending = wait(futures, return_when=FIRST_COMPLETED)
                     for future in done:
-                        futures.remove(future)
+                        futures.pop(future)
                         future.result()
                 candidates: dict[str, list[str]] = {}
                 snapshots = {}
@@ -948,7 +1223,11 @@ class RunScheduler:
                     )
                     projection = self.store.load_run(run_id)
                     if projection["status"] == "queued":
-                        self.store.try_promote_run(run_id)
+                        self._try_promote(
+                            run_id,
+                            now=self._utcnow(),
+                            schedule_revalidation=authorizations[run_id],
+                        )
                     self.store.wake_due_retries(run_id, now=self._utcnow())
                     self._resolve_graph(run_id, packages[run_id].definition.nodes)
                     projection = self.store.load_run(run_id)
@@ -978,6 +1257,19 @@ class RunScheduler:
                             break
                         if not candidates[run_id]:
                             continue
+                        claimed_for_run = sum(
+                            claim_run_id == run_id
+                            for claim_run_id, *_rest in claims
+                        )
+                        executing_for_run = sum(
+                            future_run_id == run_id
+                            for future_run_id in futures.values()
+                        )
+                        if (
+                            claimed_for_run + executing_for_run
+                            >= execution_limits[run_id].max_parallel_nodes
+                        ):
+                            continue
                         node_id = candidates[run_id].pop(0)
                         try:
                             claim = self.store.claim_node(
@@ -992,7 +1284,8 @@ class RunScheduler:
                                         node
                                         for node in packages[run_id].definition.nodes
                                         if node.id == node_id
-                                    )
+                                    ),
+                                    execution_limits[run_id],
                                 ),
                                 executor_id=next(
                                     node.node_type
@@ -1009,6 +1302,9 @@ class RunScheduler:
                                 foreground_owner_id=foreground_tokens[run_id][0],
                                 foreground_owner_epoch=foreground_tokens[run_id][1],
                                 require_execution_authority=True,
+                                max_run_workers=(
+                                    execution_limits[run_id].max_total_workers
+                                ),
                             )
                         except StorageQuotaError as exc:
                             self.store.interrupt_for_host_pressure(
@@ -1034,6 +1330,7 @@ class RunScheduler:
                             node,
                             packages[run_id],
                             snapshots[run_id],
+                            execution_limits[run_id],
                         ))
                         fair_cursor = (active.index(run_id) + 1) % len(active)
                         claimed_this_round = True
@@ -1042,17 +1339,25 @@ class RunScheduler:
                     if not claimed_this_round:
                         break
                 if fence_lost:
-                    for _run_id, claim, _node, _package, _snapshot in claims:
+                    for (
+                        _run_id,
+                        claim,
+                        _node,
+                        _package,
+                        _snapshot,
+                        _limits,
+                    ) in claims:
                         self.store.release_claim_before_execution(claim)
                     break
                 for claim in claims:
-                    futures.add(pool.submit(self._execute_claim, *claim))
+                    future = pool.submit(self._execute_claim, *claim)
+                    futures[future] = claim[0]
                 if not claims:
                     if not futures:
                         break
                     done, _pending = wait(futures, return_when=FIRST_COMPLETED)
                     for future in done:
-                        futures.remove(future)
+                        futures.pop(future)
                         future.result()
             if futures:
                 done, _pending = wait(futures)

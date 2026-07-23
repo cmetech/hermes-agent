@@ -10,16 +10,18 @@ from importlib import resources
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import secrets
 import shutil
+import stat
 import tempfile
 import threading
 import time
+from types import MappingProxyType
 from typing import Iterator, Literal, Mapping
 
 import yaml
 
-from agent.plugin_agent import PluginAgentRunResult
 from cron.jobs import create_job, list_jobs, use_cron_store
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import _input_requirements, _runtime_config, _scheduler
@@ -29,11 +31,23 @@ from plugins.workflow.compat import (
     CompatibilityReport,
     assess_compatibility,
 )
+from plugins.workflow.entitlement import (
+    validate_showcase_ai_contract,
+    verified_showcase_run_metadata,
+)
+from plugins.workflow.input_contract import (
+    WorkflowInputContractError,
+    workflow_input_declarations,
+)
 from plugins.workflow.machine_contract import operator_command_contract
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.models import WorkflowPackage
 from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import RunStore
+from plugins.workflow.sanitize import (
+    workflow_filename_components_are_distinct,
+    workflow_input_names_are_portable,
+)
 from plugins.workflow.trust import (
     WorkflowRiskSummary,
     WorkflowResourceCapacityError,
@@ -41,6 +55,7 @@ from plugins.workflow.trust import (
     WorkflowResourceReadBudget,
     WorkflowTrustError,
     build_risk_summary,
+    compute_package_digest,
     preflight_execution,
 )
 
@@ -48,7 +63,7 @@ from plugins.workflow.trust import (
 _ALLOWED_CLAIMS = frozenset({
     "immutable-inputs", "parallel-fan-in", "approval-rework",
     "artifact-verification", "no-live-inventory", "persisted-retry",
-    "typed-timeout", "process-cleanup", "explicit-ai-consent",
+    "typed-timeout", "process-cleanup",
     "scoped-extensions", "persistent-session", "local-mcp-cleanup",
     "explicit-schedule-consent", "one-shot-ownership", "cron-recovery",
     "operator-approval",
@@ -86,14 +101,15 @@ class ShowcaseScenario:
     cleanup_ownership: str
     package_digest: str
     verified_bundled_provenance: bool
+    input_fixtures: Mapping[str, str]
+    input_value_bindings: Mapping[str, str]
 
 
 @dataclass(frozen=True, slots=True)
 class VerifiedShowcasePackage:
     scenario: ShowcaseScenario
     package: WorkflowPackage
-    risk: WorkflowRiskSummary
-    compatibility: CompatibilityReport
+    package_digest: str
     bundle_digest: str
 
 
@@ -102,10 +118,14 @@ class _VerifiedShowcaseCacheEntry:
     root: Path
     tree_signature: tuple[tuple[object, ...], ...]
     packages: Mapping[str, VerifiedShowcasePackage]
+    resource_bytes: Mapping[Path, bytes]
+    resource_aliases: Mapping[Path, Path]
 
 
 _VERIFIED_SHOWCASE_CACHE: dict[str, _VerifiedShowcaseCacheEntry] = {}
 _VERIFIED_SHOWCASE_CACHE_LOCK = threading.Lock()
+_VERIFIED_SHOWCASE_VERIFY_LOCK = threading.Lock()
+_VERIFIED_SHOWCASE_CACHE_GENERATION = 0
 
 
 @dataclass(frozen=True)
@@ -139,13 +159,22 @@ def _sha256(data: bytes) -> str:
 def _read_verified_bytes(
     path: Path,
     read_budget: WorkflowResourceReadBudget | None = None,
+    verified_bytes: dict[Path, bytes] | None = None,
 ) -> bytes:
     if path.is_symlink():
         raise ShowcaseCatalogError(f"showcase bundle symlink is forbidden: {path}")
     resolved = path.resolve(strict=True)
+    if verified_bytes is not None:
+        cached = verified_bytes.get(resolved)
+        if cached is not None:
+            return cached
     if read_budget is None:
-        return resolved.read_bytes()
-    return read_budget.read(resolved)
+        data = resolved.read_bytes()
+    else:
+        data = read_budget.read(resolved)
+    if verified_bytes is not None:
+        verified_bytes[resolved] = data
+    return data
 
 
 def _tree_entries(
@@ -177,6 +206,7 @@ def _tree_entries(
 def _tree_digest(
     root: Path,
     read_budget: WorkflowResourceReadBudget | None = None,
+    verified_bytes: dict[Path, bytes] | None = None,
 ) -> str:
     digest = hashlib.sha256()
     for path in _tree_entries(root, read_budget):
@@ -185,7 +215,7 @@ def _tree_digest(
                 raise ShowcaseCatalogError(f"showcase bundle symlink is forbidden: {path}")
             continue
         relative = path.relative_to(root).as_posix()
-        data = _read_verified_bytes(path, read_budget)
+        data = _read_verified_bytes(path, read_budget, verified_bytes)
         digest.update(relative.encode())
         digest.update(b"\0")
         digest.update(str(len(data)).encode())
@@ -199,6 +229,7 @@ def _validate_package_safety(
     root: Path,
     scenario_id: str,
     read_budget: WorkflowResourceReadBudget | None = None,
+    verified_bytes: dict[Path, bytes] | None = None,
 ) -> None:
     for path in _tree_entries(root, read_budget):
         if path.is_symlink():
@@ -208,7 +239,9 @@ def _validate_package_safety(
         if not path.is_file():
             continue
         try:
-            text = _read_verified_bytes(path, read_budget).decode("utf-8").lower()
+            text = _read_verified_bytes(
+                path, read_budget, verified_bytes
+            ).decode("utf-8").lower()
         except UnicodeError as exc:
             raise ShowcaseCatalogError(
                 f"showcase safety contract rejects binary resource: {scenario_id}"
@@ -244,6 +277,118 @@ def _contained(root: Path, relative: str) -> Path:
     except (OSError, ValueError) as exc:
         raise ShowcaseCatalogError(f"showcase resource is missing or escapes: {relative}") from exc
     return candidate
+
+
+def _fixture_path(package_root: Path, relative: object) -> Path:
+    if not isinstance(relative, str) or not relative or len(relative) > 1024:
+        raise ShowcaseCatalogError("showcase fixture path must be bounded text")
+    parts = relative.split("/")
+    portable = PurePosixPath(relative)
+    if (
+        portable.is_absolute()
+        or "\\" in relative
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise ShowcaseCatalogError(f"showcase fixture path is unsafe: {relative}")
+    fixture = _contained(package_root, relative)
+    try:
+        metadata = fixture.lstat()
+    except OSError as exc:
+        raise ShowcaseCatalogError(
+            f"showcase fixture resource is unreadable: {relative}"
+        ) from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ShowcaseCatalogError(
+            f"showcase fixture resource is not a regular file: {relative}"
+        )
+    return fixture
+
+
+def _authenticated_input_mappings(
+    item: Mapping[object, object],
+    *,
+    package: WorkflowPackage,
+) -> tuple[dict[str, str], dict[str, str]]:
+    raw_fixtures = item.get("input_fixtures", {})
+    raw_bindings = item.get("input_value_bindings", {})
+    if (
+        not isinstance(raw_fixtures, Mapping)
+        or not isinstance(raw_bindings, Mapping)
+        or len(raw_fixtures) > 64
+        or len(raw_bindings) > 64
+    ):
+        raise ShowcaseCatalogError(
+            "showcase input fixtures and bindings must be bounded mappings"
+        )
+    if not workflow_input_names_are_portable(raw_fixtures) or not (
+        workflow_input_names_are_portable(raw_bindings)
+    ):
+        raise ShowcaseCatalogError("showcase input names must be portable")
+
+    fixtures: dict[str, str] = {}
+    bindings: dict[str, str] = {}
+    for raw_name, raw_path in raw_fixtures.items():
+        if not isinstance(raw_name, str) or not isinstance(raw_path, str):
+            raise ShowcaseCatalogError("showcase fixture mapping is invalid")
+        _fixture_path(package.root, raw_path)
+        fixtures[raw_name] = raw_path
+    for raw_public, raw_target in raw_bindings.items():
+        if not isinstance(raw_public, str) or not isinstance(raw_target, str):
+            raise ShowcaseCatalogError("showcase input binding is invalid")
+        bindings[raw_public] = raw_target
+
+    try:
+        declarations = workflow_input_declarations(package)
+    except WorkflowInputContractError as exc:
+        raise ShowcaseCatalogError("showcase input declarations are invalid") from exc
+
+    targets = list(bindings.values())
+    if not workflow_input_names_are_portable(targets):
+        raise ShowcaseCatalogError("showcase input binding targets must be one-to-one")
+    fixture_targets = {name.casefold() for name in fixtures}
+    binding_targets = {target.casefold() for target in targets}
+    public_sources = {name.casefold() for name in bindings}
+    if fixture_targets & binding_targets:
+        raise ShowcaseCatalogError("showcase binding and fixture targets overlap")
+    if public_sources & {name.casefold() for name in declarations}:
+        raise ShowcaseCatalogError(
+            "showcase public input names must not alias internal targets"
+        )
+    if not workflow_filename_components_are_distinct(
+        [
+            *fixtures,
+            *(
+                f"{name}.txt"
+                for name, declaration in declarations.items()
+                if declaration.accepts_api_value
+            ),
+        ]
+    ):
+        raise ShowcaseCatalogError("showcase input targets collide after staging")
+    if len({path.casefold() for path in fixtures.values()}) != len(fixtures):
+        raise ShowcaseCatalogError("showcase fixture paths must be one-to-one")
+
+    for target in targets:
+        declaration = declarations.get(target)
+        if declaration is None:
+            raise ShowcaseCatalogError(
+                f"showcase binding target is undeclared: {target}"
+            )
+        if declaration.kind != "text":
+            raise ShowcaseCatalogError(
+                f"showcase binding target must declare text kind: {target}"
+            )
+    for target in fixtures:
+        declaration = declarations.get(target)
+        if declaration is None:
+            raise ShowcaseCatalogError(
+                f"showcase fixture target is undeclared: {target}"
+            )
+        if declaration.kind != "file":
+            raise ShowcaseCatalogError(
+                f"showcase fixture target must declare file kind: {target}"
+            )
+    return dict(sorted(fixtures.items())), dict(sorted(bindings.items()))
 
 
 def _bundle_digest(
@@ -318,6 +463,7 @@ def load_showcase_catalog(
     allow_repair: bool = True,
 ) -> dict[str, ShowcaseScenario]:
     with _bundle_path(bundle_root) as root:
+        verified_bytes = {} if read_budget is None else None
         try:
             catalog_bytes = _read_verified_bytes(root / "catalog.yaml", read_budget)
             digest_bytes = _read_verified_bytes(root / "digests.json", read_budget)
@@ -370,8 +516,12 @@ def load_showcase_catalog(
             workflow_path = str(item["workflow_path"])
             workflow = _contained(root, workflow_path)
             package_root = workflow.parent.parent
-            _validate_package_safety(package_root, scenario_id, read_budget)
-            actual_digest = _tree_digest(package_root, read_budget)
+            _validate_package_safety(
+                package_root, scenario_id, read_budget, verified_bytes
+            )
+            actual_digest = _tree_digest(
+                package_root, read_budget, verified_bytes
+            )
             if package_digests.get(scenario_id) != actual_digest:
                 raise ShowcaseCatalogError(f"showcase package digest mismatch: {scenario_id}")
             claims = tuple(str(value) for value in item["capability_claims"])
@@ -387,9 +537,19 @@ def load_showcase_catalog(
                 or any(token in text for token in _FORBIDDEN_TEXT)
             ):
                 raise ShowcaseCatalogError(f"showcase safety contract rejected: {scenario_id}")
-            _load_workflow_from_verified_bytes(
+            package = _load_workflow_from_verified_bytes(
                 workflow,
                 read_budget=read_budget,
+                verified_bytes=verified_bytes,
+            )
+            validate_showcase_ai_contract(
+                scenario_id,
+                requires_ai=bool(item["requires_ai"]),
+                definition=package.definition,
+            )
+            input_fixtures, input_value_bindings = _authenticated_input_mappings(
+                item,
+                package=package,
             )
             result[scenario_id] = ShowcaseScenario(
                 **{key: str(item[key]) for key in ("id", "display_name", "purpose", "bundle_version", "package_version", "workflow_path", "interaction_mode", "safety_class", "cleanup_ownership")},
@@ -403,6 +563,8 @@ def load_showcase_catalog(
                 limits={str(key): int(value) for key, value in limits.items()},
                 package_digest=actual_digest,
                 verified_bundled_provenance=bundle_root is None,
+                input_fixtures=input_fixtures,
+                input_value_bindings=input_value_bindings,
             )
         return dict(sorted(result.items()))
 
@@ -411,12 +573,49 @@ def _load_workflow_from_verified_bytes(
     workflow: Path,
     *,
     read_budget: WorkflowResourceReadBudget | None,
+    verified_bytes: dict[Path, bytes] | None = None,
     source: str = "explicit",
     precedence: int = 0,
 ) -> WorkflowPackage:
     if read_budget is None:
-        return load_workflow(
+        authenticated_snapshot = verified_bytes is not None
+        workflow_key = workflow.absolute()
+        if authenticated_snapshot:
+            try:
+                workflow_bytes = verified_bytes[workflow_key]
+            except KeyError as exc:
+                raise ShowcaseCatalogError(
+                    f"verified workflow bytes are unavailable: {workflow.name}"
+                ) from exc
+        else:
+            verified_bytes = {}
+            try:
+                workflow_bytes = _read_verified_bytes(
+                    workflow, verified_bytes=verified_bytes
+                )
+            except OSError as exc:
+                raise ShowcaseCatalogError(
+                    f"verified workflow bytes are unavailable: {workflow.name}"
+                ) from exc
+        sidecar_key = workflow_key.with_name(f"{workflow.stem}.hermes.yaml")
+        if authenticated_snapshot:
+            try:
+                sidecar_bytes = verified_bytes[sidecar_key]
+            except KeyError as exc:
+                raise ShowcaseCatalogError(
+                    f"verified workflow sidecar bytes are unavailable: {workflow.name}"
+                ) from exc
+        else:
+            try:
+                sidecar_bytes = _read_verified_bytes(
+                    sidecar_key, verified_bytes=verified_bytes
+                )
+            except FileNotFoundError:
+                sidecar_bytes = None
+        return load_workflow_snapshot(
             workflow,
+            workflow_bytes=workflow_bytes,
+            sidecar_bytes=sidecar_bytes,
             source=source,
             precedence=precedence,
         )
@@ -536,15 +735,166 @@ def showcase_background_api_eligible(scenario: ShowcaseScenario) -> bool:
     """Return whether ordinary background admission preserves scenario intent."""
     return (
         scenario.interaction_mode == "guided"
-        and scenario.offline
-        and not scenario.requires_ai
         and not scenario.requires_network
     )
 
 
 def _clear_verified_showcase_cache_for_tests() -> None:
+    global _VERIFIED_SHOWCASE_CACHE_GENERATION
     with _VERIFIED_SHOWCASE_CACHE_LOCK:
+        _VERIFIED_SHOWCASE_CACHE_GENERATION += 1
         _VERIFIED_SHOWCASE_CACHE.clear()
+
+
+def _load_verified_showcase_cache_hit(
+    *,
+    resolved_root: Path,
+    bundle_digest: str,
+    read_budget: WorkflowResourceReadBudget,
+) -> dict[str, VerifiedShowcasePackage] | None:
+    global _VERIFIED_SHOWCASE_CACHE_GENERATION
+    with _VERIFIED_SHOWCASE_CACHE_LOCK:
+        cached = _VERIFIED_SHOWCASE_CACHE.get(bundle_digest)
+        generation = _VERIFIED_SHOWCASE_CACHE_GENERATION
+    if cached is None:
+        return None
+
+    tree_signature = _bundle_tree_signature(resolved_root, read_budget)
+    cache_hit = False
+    with _VERIFIED_SHOWCASE_CACHE_LOCK:
+        if (
+            generation != _VERIFIED_SHOWCASE_CACHE_GENERATION
+            or _VERIFIED_SHOWCASE_CACHE.get(bundle_digest) is not cached
+        ):
+            return None
+        if (
+            tree_signature
+            and cached.root == resolved_root
+            and cached.tree_signature == tree_signature
+        ):
+            cache_hit = True
+        else:
+            _VERIFIED_SHOWCASE_CACHE_GENERATION += 1
+            _VERIFIED_SHOWCASE_CACHE.clear()
+    if cache_hit:
+        previous_contents = dict(read_budget._contents)
+        previous_aliases = dict(read_budget._aliases)
+        previous_files_read = read_budget.files_read
+        previous_bytes_read = read_budget.bytes_read
+        try:
+            _restore_cached_resources(read_budget, cached)
+        except Exception:
+            read_budget._contents.clear()
+            read_budget._contents.update(previous_contents)
+            read_budget._aliases.clear()
+            read_budget._aliases.update(previous_aliases)
+            read_budget.files_read = previous_files_read
+            read_budget.bytes_read = previous_bytes_read
+            raise
+        with _VERIFIED_SHOWCASE_CACHE_LOCK:
+            current = (
+                generation == _VERIFIED_SHOWCASE_CACHE_GENERATION
+                and _VERIFIED_SHOWCASE_CACHE.get(bundle_digest) is cached
+            )
+        if current:
+            return dict(cached.packages)
+        read_budget._contents.clear()
+        read_budget._contents.update(previous_contents)
+        read_budget._aliases.clear()
+        read_budget._aliases.update(previous_aliases)
+        read_budget.files_read = previous_files_read
+        read_budget.bytes_read = previous_bytes_read
+    return None
+
+
+def _restore_cached_resources(
+    read_budget: WorkflowResourceReadBudget,
+    cached: _VerifiedShowcaseCacheEntry,
+) -> None:
+    """Copy authenticated immutable bytes into one request-owned read budget."""
+    for path, data in cached.resource_bytes.items():
+        existing = read_budget._contents.get(path)
+        if existing is not None:
+            if existing != data:
+                raise ShowcaseCatalogError(
+                    "showcase resource cache conflicts with authenticated bytes"
+                )
+            continue
+        if (
+            read_budget.files_read >= read_budget.max_files
+            or len(data) > read_budget.max_file_bytes
+            or read_budget.bytes_read + len(data) > read_budget.max_total_bytes
+        ):
+            raise WorkflowResourceCapacityError(
+                "showcase verification aggregate limit exceeded"
+            )
+        read_budget._contents[path] = data
+        read_budget.files_read += 1
+        read_budget.bytes_read += len(data)
+    read_budget._aliases.update(cached.resource_aliases)
+
+
+def _verify_and_cache_showcase_packages(
+    *,
+    resolved_root: Path,
+    bundle_digest: str,
+    read_budget: WorkflowResourceReadBudget,
+) -> dict[str, VerifiedShowcasePackage]:
+    global _VERIFIED_SHOWCASE_CACHE_GENERATION
+    before_signature = _bundle_tree_signature(resolved_root, read_budget)
+    catalog = load_showcase_catalog(
+        read_budget=read_budget,
+        allow_repair=False,
+    )
+    verified: dict[str, VerifiedShowcasePackage] = {}
+    for scenario_id, scenario in catalog.items():
+        if not scenario.verified_bundled_provenance:
+            raise ShowcaseCatalogError(
+                "showcase lacks verified bundled distribution provenance"
+            )
+        package = _scenario_package(
+            scenario,
+            source="showcase",
+            precedence=3,
+            bundle_root=resolved_root,
+            read_budget=read_budget,
+        )
+        verified[scenario_id] = VerifiedShowcasePackage(
+            scenario=scenario,
+            package=package,
+            package_digest=compute_package_digest(
+                package,
+                read_budget=read_budget,
+            ).sha256,
+            bundle_digest=bundle_digest,
+        )
+
+    after_signature = _bundle_tree_signature(resolved_root, read_budget)
+    postcheck_budget = _fresh_read_budget(read_budget)
+    assert postcheck_budget is not None
+    current_bundle_digest = _bundle_digest(resolved_root, postcheck_budget)
+    _charge_read_budget(read_budget, postcheck_budget)
+    if (
+        before_signature != after_signature
+        or bundle_digest != current_bundle_digest
+    ):
+        raise ShowcaseCatalogError(
+            "showcase bundle changed during verified loading"
+        )
+    if after_signature:
+        with _VERIFIED_SHOWCASE_CACHE_LOCK:
+            _VERIFIED_SHOWCASE_CACHE_GENERATION += 1
+            _VERIFIED_SHOWCASE_CACHE.clear()
+            _VERIFIED_SHOWCASE_CACHE[bundle_digest] = (
+                _VerifiedShowcaseCacheEntry(
+                    root=resolved_root,
+                    tree_signature=after_signature,
+                    packages=MappingProxyType(dict(verified)),
+                    resource_bytes=MappingProxyType(dict(read_budget._contents)),
+                    resource_aliases=MappingProxyType(dict(read_budget._aliases)),
+                )
+            )
+    return verified
 
 
 def load_verified_showcase_packages(
@@ -553,76 +903,39 @@ def load_verified_showcase_packages(
     force_reverify: bool = False,
 ) -> dict[str, VerifiedShowcasePackage]:
     """Load only the authenticated bundled distribution, with bounded caching."""
+    global _VERIFIED_SHOWCASE_CACHE_GENERATION
     if not isinstance(read_budget, WorkflowResourceReadBudget):
         raise TypeError("read_budget must be a WorkflowResourceReadBudget")
-    with _VERIFIED_SHOWCASE_CACHE_LOCK:
-        with _bundle_path() as root:
-            resolved_root = root.resolve(strict=True)
-            bundle_digest = _bundle_digest(resolved_root, read_budget)
-            before_signature = _bundle_tree_signature(resolved_root, read_budget)
-            cached = _VERIFIED_SHOWCASE_CACHE.get(bundle_digest)
-            if (
-                not force_reverify
-                and before_signature
-                and cached is not None
-                and cached.root == resolved_root
-                and cached.tree_signature == before_signature
-            ):
-                return dict(cached.packages)
-
-            catalog = load_showcase_catalog(
+    with _bundle_path() as root:
+        resolved_root = root.resolve(strict=True)
+        bundle_digest = _bundle_digest(resolved_root, read_budget)
+        if force_reverify:
+            with _VERIFIED_SHOWCASE_CACHE_LOCK:
+                _VERIFIED_SHOWCASE_CACHE_GENERATION += 1
+                _VERIFIED_SHOWCASE_CACHE.clear()
+        else:
+            cached = _load_verified_showcase_cache_hit(
+                resolved_root=resolved_root,
+                bundle_digest=bundle_digest,
                 read_budget=read_budget,
-                allow_repair=False,
             )
-            verified: dict[str, VerifiedShowcasePackage] = {}
-            for scenario_id, scenario in catalog.items():
-                if not scenario.verified_bundled_provenance:
-                    raise ShowcaseCatalogError(
-                        "showcase lacks verified bundled distribution provenance"
-                    )
-                package = _scenario_package(
-                    scenario,
-                    source="showcase",
-                    precedence=3,
-                    bundle_root=resolved_root,
+            if cached is not None:
+                return cached
+
+        with _VERIFIED_SHOWCASE_VERIFY_LOCK:
+            if not force_reverify:
+                cached = _load_verified_showcase_cache_hit(
+                    resolved_root=resolved_root,
+                    bundle_digest=bundle_digest,
                     read_budget=read_budget,
                 )
-                risk, compatibility = _verified_distribution_assessment(
-                    scenario,
-                    package,
-                    read_budget,
-                    enforce_runnable=False,
-                )
-                verified[scenario_id] = VerifiedShowcasePackage(
-                    scenario=scenario,
-                    package=package,
-                    risk=risk,
-                    compatibility=compatibility,
-                    bundle_digest=bundle_digest,
-                )
-
-            after_signature = _bundle_tree_signature(resolved_root, read_budget)
-            postcheck_budget = _fresh_read_budget(read_budget)
-            assert postcheck_budget is not None
-            current_bundle_digest = _bundle_digest(resolved_root, postcheck_budget)
-            _charge_read_budget(read_budget, postcheck_budget)
-            if (
-                before_signature != after_signature
-                or bundle_digest != current_bundle_digest
-            ):
-                raise ShowcaseCatalogError(
-                    "showcase bundle changed during verified loading"
-                )
-            if after_signature:
-                _VERIFIED_SHOWCASE_CACHE.clear()
-                _VERIFIED_SHOWCASE_CACHE[bundle_digest] = (
-                    _VerifiedShowcaseCacheEntry(
-                        root=resolved_root,
-                        tree_signature=after_signature,
-                        packages=dict(verified),
-                    )
-                )
-            return verified
+                if cached is not None:
+                    return cached
+            return _verify_and_cache_showcase_packages(
+                resolved_root=resolved_root,
+                bundle_digest=bundle_digest,
+                read_budget=read_budget,
+            )
 
 
 def load_verified_showcase_package(
@@ -649,7 +962,9 @@ def preflight_showcase(showcase_id: str, *, hermes_home: str | Path) -> dict[str
     package = _scenario_package(scenario)
     with _bundle_path() as root:
         bundle_digest = _bundle_digest(root)
-    confirmation_kind = "ai" if scenario.requires_ai else "schedule" if scenario.interaction_mode == "schedule" else None
+    confirmation_kind = (
+        "schedule" if scenario.interaction_mode == "schedule" else None
+    )
     token = _sha256(f"{confirmation_kind or 'none'}\0{scenario.package_digest}\0{bundle_digest}".encode()) if confirmation_kind else None
     requested_skills = sorted({str(skill) for node in package.definition.nodes for skill in node.options.get("skills", ())})
     local_mcp = sorted({str(value) for node in package.definition.nodes for value in ((node.options.get("mcp"),) if isinstance(node.options.get("mcp"), str) else node.options.get("mcp", ())) if isinstance(value, str)})
@@ -657,7 +972,13 @@ def preflight_showcase(showcase_id: str, *, hermes_home: str | Path) -> dict[str
         (len(node.options.get("agents", {})) for node in package.definition.nodes),
         default=0,
     )
-    input_requirements = _input_requirements(package, [])
+    input_requirements = {
+        item.name: asdict(item) for item in _input_requirements(package, [])
+    }
+    for public_name, internal_name in scenario.input_value_bindings.items():
+        requirement = input_requirements.pop(internal_name)
+        requirement["name"] = public_name
+        input_requirements[public_name] = requirement
     return {
         "schema_version": 1, "showcase_id": scenario.id, "display_name": scenario.display_name,
         "purpose": scenario.purpose, "runnable": True, "offline": scenario.offline,
@@ -667,20 +988,12 @@ def preflight_showcase(showcase_id: str, *, hermes_home: str | Path) -> dict[str
         "package_digest": scenario.package_digest, "bundle_digest": bundle_digest,
         "requested_skills": requested_skills, "local_mcp_servers": [f"mcp/{value}" for value in local_mcp],
         "inline_agent_limit": inline_agents, "wall_seconds": scenario.limits["wall_seconds"],
-        "input_requirements": [asdict(item) for item in input_requirements],
+        "input_requirements": [
+            input_requirements[name] for name in sorted(input_requirements)
+        ],
         "side_effects_initialized": False,
         "command_contract": operator_command_contract(),
     }
-
-
-class _DeterministicReworkRunner:
-    def run(self, request, *, is_cancelled=None):
-        return PluginAgentRunResult(
-            final_response="Deterministic revision recorded: keep every proposed action manual and reversible.",
-            session_id="showcase-rework", provider="deterministic", model="none",
-            status="completed", pending_interaction=None, usage={},
-            audit={"isolated_worker": False, "deterministic": True},
-        )
 
 
 def _store(home: str | Path, package=None) -> tuple[RunStore, object]:
@@ -696,7 +1009,13 @@ def _store(home: str | Path, package=None) -> tuple[RunStore, object]:
 
 
 def _advance_until_wait(store: RunStore, config, run_id: str) -> dict[str, object]:
-    scheduler = _scheduler(store, config, agent_runner=_DeterministicReworkRunner())
+    from agent.plugin_agent import PluginAgentRunner
+
+    scheduler = _scheduler(
+        store,
+        config,
+        agent_runner=PluginAgentRunner(plugin_id="workflow"),
+    )
     deadline = time.monotonic() + 305
     while True:
         projection = scheduler.advance(run_id)
@@ -759,8 +1078,6 @@ def run_showcase(
         )
     home = Path(hermes_home).expanduser().resolve()
     preflight = preflight_showcase(showcase_id, hermes_home=home)
-    if scenario.requires_ai and confirmation_token != preflight["confirmation_token"]:
-        return {"status": "skipped", "reason_code": "ai_confirmation_required", "run_id": None, "confirmation_token": preflight["confirmation_token"]}
     if scenario.interaction_mode == "schedule":
         if not schedule_at:
             return {"status": "skipped", "reason_code": "schedule_time_required", "run_id": None}
@@ -788,7 +1105,14 @@ def run_showcase(
         idempotency_namespace=f"profile-local:{trigger_source}",
         concurrency_key=f"showcase:{scenario.id}",
         concurrency_policy=str(package.sidecar.get("overlap_policy") or "queue"),
-        run_metadata={"showcase_id": scenario.id, "showcase_version": scenario.package_version, "bundle_digest": str(preflight["bundle_digest"]), "risk_digest": risk.risk_digest},
+        run_metadata=verified_showcase_run_metadata(
+            showcase_id=scenario.id,
+            showcase_version=scenario.package_version,
+            bundle_digest=str(preflight["bundle_digest"]),
+            risk_digest=risk.risk_digest,
+            requires_ai=scenario.requires_ai,
+            include_verified_marker=False,
+        ),
         provenance=TriggerProvenance.local_admin_claim(
             source=trigger_source,
             intent_key=intent_key,

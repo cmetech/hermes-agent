@@ -320,6 +320,7 @@ describe('workflow View dialog', () => {
       'unsupported inputs',
       {
         run_support: { reason: 'unsupported_inputs' as const, supported: false },
+        source: 'showcase' as const,
         supported_inputs: { reason: 'unsupported_input_shape' as const, supported: false }
       },
       'Run is unavailable because this workflow uses unsupported input fields.'
@@ -427,6 +428,16 @@ describe('workflow View dialog', () => {
   })
 
   it('replaces View with Review & Run for the same captured profile without stacking dialogs or refetching', async () => {
+    currentCatalogDefinition = definition({
+      inputs: [
+        { max_bytes: 12, name: 'symptom', required: true, type: 'text' },
+        { name: 'evidence', required: true, type: 'file' }
+      ],
+      source: 'showcase',
+      supported_inputs: { reason: 'flat_inputs', supported: true },
+      trust_state: 'verified_bundled'
+    })
+    currentDetail = detail({ ...currentCatalogDefinition })
     renderView()
     const viewDialog = await openView()
     await within(viewDialog).findByTestId('shared-mermaid-renderer')
@@ -442,11 +453,25 @@ describe('workflow View dialog', () => {
         request.path.startsWith(`/api/plugins/workflow/workflows/${encodeURIComponent(WORKFLOW_NAME)}`)
       )
     ).toHaveLength(1)
+    const symptom = within(review).getByRole('textbox', { name: 'symptom' })
+    expect(symptom.tagName).toBe('TEXTAREA')
+    const fixture = within(review).getByRole('group', { name: 'evidence' })
+    expect(within(fixture).getByText('Bundled fixture')).toBeTruthy()
+    expect(fixture.querySelector('input, textarea, button, [contenteditable="true"]')).toBeNull()
+    fireEvent.change(symptom, { target: { value: 'fan noise' } })
     fireEvent.click(within(review).getByRole('button', { name: 'Start workflow' }))
-    await waitFor(() =>
-      expect(apiStructured).toHaveBeenCalledWith(
-        expect.objectContaining({ path: '/api/plugins/workflow/runs', profile: 'profile-a' })
-      )
-    )
+    await waitFor(() => {
+      const request = apiStructured.mock.calls.find(
+        ([candidate]) => candidate.path === '/api/plugins/workflow/runs'
+      )?.[0]
+
+      expect(request).toMatchObject({
+        body: { values: { symptom: 'fan noise' } },
+        path: '/api/plugins/workflow/runs',
+        profile: 'profile-a'
+      })
+      expect(request?.body?.values).not.toHaveProperty('arguments')
+      expect(request?.body?.values).not.toHaveProperty('evidence')
+    })
   })
 })

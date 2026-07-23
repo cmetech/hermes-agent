@@ -35,6 +35,10 @@ scenarios:
     expected_terminal_outcomes: [paused, succeeded]
     expected_artifacts: [diagnostic-report.json, diagnostic-report.md, remediation-plan.md]
     capability_claims: [immutable-inputs, parallel-fan-in, approval-rework, artifact-verification, no-live-inventory]
+    input_fixtures:
+      evidence: fixtures/laptop-snapshot.json
+    input_value_bindings:
+      symptom: arguments
     limits: {wall_seconds: 300, max_parallel_nodes: 4, max_descendants: 8}
     cleanup_ownership: immutable-run-metadata
   - id: resilience
@@ -57,20 +61,20 @@ scenarios:
     cleanup_ownership: immutable-run-metadata
   - id: ai-extensions
     display_name: Optional AI and Extensions Tour
-    purpose: Demonstrate explicitly authorized AI, skill, hook, inline-agent, and local MCP scope.
+    purpose: Demonstrate AI, skill, hook, inline-agent, and local MCP extension integration.
     bundle_version: "2.1.0"
     package_version: "1"
     workflow_path: packages/ai-extensions/workflows/ai-extensions.yaml
-    interaction_mode: consent
+    interaction_mode: guided
     offline: false
     requires_ai: true
     requires_network: false
     safety_class: explicit-ai-local-extensions
     supported_platforms: [linux, macos, windows]
-    expected_checkpoints: [consent, extension-resolution, cleanup]
-    expected_terminal_outcomes: [skipped, succeeded, failed]
+    expected_checkpoints: [extension-resolution, cleanup]
+    expected_terminal_outcomes: [succeeded, failed]
     expected_artifacts: []
-    capability_claims: [explicit-ai-consent, scoped-extensions, persistent-session, local-mcp-cleanup]
+    capability_claims: [scoped-extensions, persistent-session, local-mcp-cleanup]
     limits: {wall_seconds: 600, max_parallel_nodes: 1, max_descendants: 8}
     cleanup_ownership: immutable-run-metadata
   - id: scheduling

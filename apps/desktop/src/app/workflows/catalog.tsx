@@ -15,7 +15,7 @@ import { listWorkflowDefinitions } from '@/lib/hermes-api'
 import { Eye, Play } from '@/lib/icons'
 import type { WorkflowDefinition, WorkflowDefinitionError } from '@/types/hermes'
 
-import { workflowTrustAllowsRun } from './catalog-run-policy'
+import { workflowSupportsScheduledRun, workflowTrustAllowsRun } from './catalog-run-policy'
 
 const WORKFLOW_DOCS_URL =
   'https://github.com/cmetech/hermes-agent/blob/base/website/docs/user-guide/features/workflows.md'
@@ -59,15 +59,22 @@ function CatalogRow({
   const { t } = useI18n()
   const runReasonId = useId()
 
+  const runSupportCopy = {
+    schedule_required: null,
+    showcase_cli_required: t.operations.workflowRunShowcaseFromCli,
+    supported: null,
+    unsupported_inputs: t.operations.workflowRunUnsupportedInputs
+  }
+
   const runDisabledReason = !item.run_support
     ? t.operations.workflowRunSupportUnavailable
-    : !item.run_support.supported
-      ? item.source === 'showcase'
-        ? t.operations.workflowRunShowcaseFromCli
-        : t.operations.workflowRunUnsupportedInputs
-      : !workflowTrustAllowsRun(item.trust_state)
-        ? t.operations.workflowRunUntrusted
-        : null
+    : !workflowSupportsScheduledRun(item.run_support)
+      ? runSupportCopy[item.run_support.reason]
+      : item.compatibility?.runnable === false
+        ? t.operations.workflowRunIncompatible
+        : !workflowTrustAllowsRun(item.trust_state)
+          ? t.operations.workflowRunUntrusted
+          : null
 
   const inputCount = item.inputs.length
 
@@ -79,6 +86,11 @@ function CatalogRow({
         <span className="block truncate text-(--ui-text-secondary)" title={item.description}>
           {item.description}
         </span>
+        {item.requires_ai ? (
+          <span className="mt-0.5 block text-[0.625rem] text-(--ui-text-tertiary)">
+            {t.operations.workflowRequiresAi}
+          </span>
+        ) : null}
       </td>
       <td className="px-2.5 py-2 align-middle">
         <Badge variant={workflowTrustAllowsRun(item.trust_state) ? 'default' : 'destructive'}>
