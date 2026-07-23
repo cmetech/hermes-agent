@@ -186,8 +186,9 @@ def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compa
     }
 
 
+@pytest.mark.parametrize("schedule_at", [None, "2099-01-02T03:04:05Z"])
 def test_scheduled_run_support_retains_generic_showcase_network_policy(
-    tmp_path, workflow_writer
+    tmp_path, workflow_writer, schedule_at
 ) -> None:
     workflow = workflow_writer(
         tmp_path / "workflows",
@@ -203,7 +204,7 @@ def test_scheduled_run_support_retains_generic_showcase_network_policy(
     assert workflow_catalog_run_support(
         package,
         showcase_scenario=scenario,
-        schedule_at="2099-01-02T03:04:05Z",
+        schedule_at=schedule_at,
     ) == {
         "supported": False,
         "reason": "showcase_cli_required",

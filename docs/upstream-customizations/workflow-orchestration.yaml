@@ -2234,6 +2234,7 @@ upstream_changes:
   owned_symbols:
   - CatalogRunSupportReason.schedule_required
   - workflow_catalog_run_support schedule projection
+  - generic showcase eligibility before schedule-required projection
   - StartWorkflowRunRequest.scheduleAt
   - workflowSupportsImmediateRun
   - workflowSupportsScheduledRun
@@ -2262,9 +2263,10 @@ upstream_changes:
   upstream_candidate: true
   merge_guidance: >-
     Preserve server-derived scheduling eligibility: a scheduling
-    interaction without a time is schedule_required, while a canonical future
-    schedule_at is supported only while the generic no-network showcase policy
-    remains satisfied. Desktop must consume that typed reason, keep
+    interaction without a time is schedule_required only after the generic
+    no-network showcase policy is satisfied, while a canonical future
+    schedule_at remains subject to the same policy. Desktop must consume that
+    typed reason, keep
     immediate request bodies unchanged, normalize a timezone-aware local picker
     to canonical UTC, and use the existing one-shot workflow scheduler and
     cancellation mutation. Use the scheduled intent for new-run success copy,
