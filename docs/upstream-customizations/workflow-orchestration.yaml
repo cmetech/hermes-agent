@@ -2204,6 +2204,7 @@ upstream_changes:
   change_class: desktop-workflows
   owner: workflow-orchestration
   files:
+  - apps/desktop/src/app/workflows/adapter.test.ts
   - apps/desktop/src/app/workflows/adapter.ts
   - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
   - apps/desktop/src/app/workflows/catalog-run-policy.ts
@@ -2239,6 +2240,10 @@ upstream_changes:
   - canonicalWorkflowScheduleAt
   - ReviewRunDialog Run later action
   - scheduled_wait Desktop presentation
+  - scheduled intent success notification
+  - active-locale scheduled time formatting
+  - localized scheduled card accessible description
+  - explicit nullable scheduling projection fields
   - four-locale one-shot scheduling copy
   tests:
   - tests/plugins/workflow/test_catalog_api.py
@@ -2247,6 +2252,7 @@ upstream_changes:
   - tests/plugins/workflow/test_showcase_schedule_e2e.py
   - tests/plugins/workflow/test_showcase_ai_e2e.py
   - apps/desktop/src/lib/hermes-api.test.ts
+  - apps/desktop/src/app/workflows/adapter.test.ts
   - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
   - apps/desktop/src/app/workflows/index.test.tsx
   - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
@@ -2257,10 +2263,13 @@ upstream_changes:
   merge_guidance: >-
     Preserve server-derived scheduling eligibility: a scheduling
     interaction without a time is schedule_required, while a canonical future
-    schedule_at is supported. Desktop must consume that typed reason, keep
+    schedule_at is supported only while the generic no-network showcase policy
+    remains satisfied. Desktop must consume that typed reason, keep
     immediate request bodies unchanged, normalize a timezone-aware local picker
     to canonical UTC, and use the existing one-shot workflow scheduler and
-    cancellation mutation. Keep compatibility, trust, input, coordinator, and
+    cancellation mutation. Use the scheduled intent for new-run success copy,
+    the active locale for local time, and the same localized state in visible
+    and accessible card presentation. Keep compatibility, trust, input, coordinator, and
     execution-capability gates authoritative on the server. Do not introduce
     recurrence, a Cron bridge, consent machinery, caller-supplied capabilities,
     or showcase-ID policy in the renderer.

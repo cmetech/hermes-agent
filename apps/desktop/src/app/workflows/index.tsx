@@ -360,7 +360,7 @@ export function WorkflowsView() {
       {reviewIntent ? (
         <ReviewRunDialog
           onClose={closeReview}
-          onRunLocated={async (runId, disposition) => {
+          onRunLocated={async (runId, disposition, scheduled) => {
             await ensureGatewayProfile(reviewIntent.profile)
 
             if (!mounted.current || reviewGeneration.current !== reviewIntent.generation) {
@@ -370,7 +370,11 @@ export function WorkflowsView() {
             notify({
               kind: 'success',
               message:
-                disposition === 'existing' ? t.operations.workflowRunAlreadyRunning : t.operations.workflowRunStarted
+                disposition === 'existing'
+                  ? t.operations.workflowRunAlreadyRunning
+                  : scheduled
+                    ? t.operations.workflowScheduled
+                    : t.operations.workflowRunStarted
             })
             selectWorkflowRun(runId)
             setView('board')

@@ -3,9 +3,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { I18nProvider } from '@/i18n'
 import type { WorkflowDefinition, WorkflowDetail, WorkflowRunSnapshot } from '@/types/hermes'
 
 import { WorkflowCatalog } from './catalog'
+import { RunInspector } from './run-inspector'
 import { $workflowSelectedRunId } from './store'
 
 const getWorkflowRun = vi.fn()
@@ -724,6 +726,29 @@ describe('WorkflowsView', () => {
     expect(screen.getByText(scheduleAt)).toBeTruthy()
     expect(screen.getByText(new Date(scheduleAt).toLocaleString())).toBeTruthy()
     expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('formats a scheduled local instant with the active non-English locale', () => {
+    const scheduleAt = '2099-01-02T03:04:05Z'
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    render(
+      <QueryClientProvider client={client}>
+        <I18nProvider configClient={null} initialLocale="ja">
+          <RunInspector
+            run={run({
+              blocking_reason: 'scheduled_wait',
+              next_actions: ['cancel'],
+              presentation_state: 'scheduled_wait',
+              schedule_at: scheduleAt,
+              status: 'queued'
+            })}
+          />
+        </I18nProvider>
+      </QueryClientProvider>
+    )
+
+    expect(screen.getByText(new Date(scheduleAt).toLocaleString('ja'))).toBeTruthy()
   })
 
   it('replaces event history when the backend reports a cursor gap', async () => {

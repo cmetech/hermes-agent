@@ -69,7 +69,7 @@ function EvidenceItems({
 }
 
 export function RunInspector({ actionsDisabled = false, events = [], onAction, run }: RunInspectorProps) {
-  const { t } = useI18n()
+  const { locale, t } = useI18n()
   const copy = t.operations
   const profile = getApiRequestProfile() ?? 'default'
   const [tab, setTab] = useState<InspectorTab>('overview')
@@ -128,7 +128,7 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
                 <dt>{copy.workflowScheduledAt}</dt>
                 <dd className="grid gap-0.5">
                   <span>
-                    {copy.workflowScheduledLocal}: <span>{new Date(scheduledAt).toLocaleString()}</span>
+                    {copy.workflowScheduledLocal}: <span>{new Date(scheduledAt).toLocaleString(locale)}</span>
                   </span>
                   <span className="font-mono text-xs">
                     {copy.workflowScheduledCanonical}: <span>{scheduledAt}</span>

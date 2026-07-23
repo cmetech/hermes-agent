@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.catalog_api import workflow_catalog_run_support
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.trust import (
@@ -182,6 +183,30 @@ def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compa
     assert scheduling_detail.json()["run_support"] == {
         "supported": False,
         "reason": "schedule_required",
+    }
+
+
+def test_scheduled_run_support_retains_generic_showcase_network_policy(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "workflows",
+        name="networked-schedule-policy-fixture",
+    )
+    package = load_workflow(workflow)
+    scenario = replace(
+        showcase_module.load_showcase_catalog()["scheduling"],
+        id="non-catalog-networked-schedule",
+        requires_network=True,
+    )
+
+    assert workflow_catalog_run_support(
+        package,
+        showcase_scenario=scenario,
+        schedule_at="2099-01-02T03:04:05Z",
+    ) == {
+        "supported": False,
+        "reason": "showcase_cli_required",
     }
 
 

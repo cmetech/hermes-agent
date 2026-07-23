@@ -51,11 +51,12 @@ interface AdmissionError {
 interface AdmittedRun {
   disposition: string
   runId: string
+  scheduled: boolean
 }
 
 export interface ReviewRunDialogProps {
   onClose: () => void
-  onRunLocated: (runId: string, disposition: string) => Promise<void> | void
+  onRunLocated: (runId: string, disposition: string, scheduled: boolean) => Promise<void> | void
   profile: null | string
   returnFocusTo?: HTMLElement | null
   workflow: WorkflowDefinition
@@ -522,7 +523,8 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
 
         run = {
           disposition: response.result.admission_disposition,
-          runId: response.result.run_id
+          runId: response.result.run_id,
+          scheduled: canonicalScheduleAt !== undefined
         }
 
         if (active.current) {
@@ -531,7 +533,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
       }
 
       if (active.current) {
-        await onRunLocated(run.runId, run.disposition)
+        await onRunLocated(run.runId, run.disposition, run.scheduled)
       }
     } catch (caught) {
       if (!active.current) {

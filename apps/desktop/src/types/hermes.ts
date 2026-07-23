@@ -209,11 +209,13 @@ export interface WorkflowRunSnapshot {
   health: string
   next_actions: string[]
   pending_interaction?: null | Record<string, unknown>
+  presentation_state?: null | string
   previous_node?: null | string
   provenance?: WorkflowProvenance
   progress: WorkflowProgress
   queue_position?: null | number
   run_id: string
+  schedule_at?: null | string
   state_version: number
   status: string
   restored_to_history?: boolean

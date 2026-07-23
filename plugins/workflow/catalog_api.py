@@ -456,8 +456,9 @@ def workflow_catalog_run_support(
         if showcase_scenario.interaction_mode == "schedule":
             if schedule_at is None:
                 return {"supported": False, "reason": "schedule_required"}
-            return {"supported": True, "reason": "supported"}
-        if not showcase_background_api_eligible(showcase_scenario):
+            if showcase_scenario.requires_network:
+                return {"supported": False, "reason": "showcase_cli_required"}
+        elif not showcase_background_api_eligible(showcase_scenario):
             return {"supported": False, "reason": "showcase_cli_required"}
     return {"supported": True, "reason": "supported"}
 

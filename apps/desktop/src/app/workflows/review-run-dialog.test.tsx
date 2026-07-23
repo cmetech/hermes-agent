@@ -287,6 +287,7 @@ describe('Review & Run workflow dialog', () => {
         })
       )
     )
+    expect($notifications.get()[0]?.message).toBe('Scheduled')
   })
 
   it.each([
@@ -751,6 +752,42 @@ describe('Review & Run workflow dialog', () => {
 
     const dialog = await openReviewDialog()
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start workflow' }))
+
+    await waitFor(() => expect($workflowSelectedRunId.get()).toBe('run-existing'))
+    expect($notifications.get()[0]?.message).toBe('Already running — showing you that run')
+  })
+
+  it('keeps an existing disposition authoritative for Run later copy', async () => {
+    catalogDefinition = definition({
+      run_support: { reason: 'schedule_required', supported: false },
+      source: 'showcase',
+      trust_state: 'verified_bundled'
+    })
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        ...catalogDefinition,
+        definition: { inputs: {}, name: WORKFLOW_NAME }
+      })
+    })
+    startHandler = async () => startResponse('existing', 'run-existing')
+    api.mockImplementation(async request => {
+      if (request.path.startsWith('/api/plugins/workflow/runs?')) {
+        return { next_cursor: null, runs: [runSnapshot('run-existing')], schema_version: 1 }
+      }
+      if (request.path === '/api/plugins/workflow/attention') {
+        return { items: [], next_cursor: null, schema_version: 1 }
+      }
+      if (request.path === '/api/plugins/workflow/runs/run-existing') {
+        return runSnapshot('run-existing')
+      }
+      throw new Error(`unexpected legacy request: ${request.path}`)
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    fireEvent.change(within(dialog).getByLabelText('Run at'), { target: { value: '2099-01-02T04:04' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Run later' }))
 
     await waitFor(() => expect($workflowSelectedRunId.get()).toBe('run-existing'))
     expect($notifications.get()[0]?.message).toBe('Already running — showing you that run')
