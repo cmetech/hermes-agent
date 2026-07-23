@@ -2639,6 +2639,35 @@ upstream_changes:
   removal_condition: Remove when upstream provides equivalent bounded scheduled
     liveness and post-restore cache-generation protection.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-coordinator-repair-isolation
+  change_class: workflow-runtime
+  owner: workflow-orchestration
+  files:
+  - .superpowers/sdd/task-10-report.md
+  - plugins/workflow/store.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  owned_symbols:
+  - RunStore active run-repair coordinator exclusion
+  - ordinary and scheduled candidate page repair isolation
+  - v13 unrecoverable scheduled evidence sweep isolation
+  tests:
+  - tests/plugins/workflow/test_scheduled_runs.py
+  expected_commit_subject: 'fix(workflow): isolate repair-marked coordinator rows'
+  upstream_candidate: true
+  merge_guidance: >-
+    Exclude a run from both ordinary and exact-due scheduled coordinator
+    candidate streams while the latest transition for any run-scoped repair
+    reason remains repair_required. Apply the exclusion inside each bounded SQL
+    query so repair-marked rows cannot consume page slots, pin keyset progress,
+    or abort projection parity checks for healthy peers. Preserve the scheduled
+    index range branches, exact due-time comparison, queue-sequence generation
+    fence, created-at/run-id cursor order, and parity validation for every
+    selected healthy row. A later repair_verified transition must restore
+    eligibility. Never delete, quarantine, rewrite, infer, or clear the damaged
+    run's durable evidence as part of coordinator selection.
+  removal_condition: Remove when upstream provides equivalent latest-transition
+    run-repair isolation inside both bounded coordinator candidate queries.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-scheduled-queued-consumer-isolation
   change_class: workflow-runtime
   owner: workflow-orchestration

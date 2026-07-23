@@ -156,6 +156,15 @@ _RUN_SCOPED_REPAIR_REASON_ORDER = tuple(sorted(_RUN_SCOPED_REPAIR_REASONS))
 _RUN_SCOPED_REPAIR_REASON_SQL = ",".join(
     f"'{reason}'" for reason in _RUN_SCOPED_REPAIR_REASON_ORDER
 )
+_RUN_SCOPED_REPAIR_EXCLUSION_SQL = (
+    "NOT EXISTS (SELECT 1 FROM repair_events AS repair "
+    "WHERE repair.run_id=runs.run_id "
+    f"AND repair.reason_code IN ({_RUN_SCOPED_REPAIR_REASON_SQL}) "
+    "AND repair.sequence=(SELECT MAX(latest.sequence) "
+    "FROM repair_events AS latest WHERE latest.run_id=repair.run_id "
+    "AND latest.reason_code=repair.reason_code) "
+    "AND repair.outcome='repair_required')"
+)
 _STORE_SCHEMA_VERSION = 14
 _SCHEDULE_PARITY_UNSET = object()
 # Direct RunStore/CLI access is already the profile-local filesystem admin
@@ -4412,6 +4421,7 @@ class RunStore:
             "status IN ('queued','running','waiting_retry')",
             "execution_mode IN ('background','foreground')",
             "(status<>'queued' OR scheduled_at IS NULL)",
+            _RUN_SCOPED_REPAIR_EXCLUSION_SQL,
         ]
         values: list[object] = []
         if after is not None:
@@ -4492,6 +4502,7 @@ class RunStore:
             "status='queued'",
             "execution_mode IN ('background','foreground')",
             "scheduled_at IS NOT NULL",
+            _RUN_SCOPED_REPAIR_EXCLUSION_SQL,
         ]
         common = " AND ".join(common_clauses)
         outer_clauses: list[str] = []

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import inspect
 import os
 from pathlib import Path
+import sqlite3
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -795,6 +796,208 @@ def test_newly_due_scheduled_work_is_not_hidden_behind_the_normal_cursor(
     )
 
     assert scheduled.run_id in {row["run_id"] for row in next_sweep}
+
+
+def test_active_run_repairs_do_not_consume_coordinator_candidate_pages(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 2, 12, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(store, clocks, name="repair-candidate-isolation")
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="repair-candidate-isolation",
+    )
+    due = (clocks.wall - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    repaired_ordinary = _admit(
+        store,
+        package,
+        key="repaired-ordinary",
+        schedule_at=None,
+    )
+    healthy_ordinary = _admit(
+        store,
+        package,
+        key="healthy-ordinary",
+        schedule_at=None,
+    )
+    repaired_scheduled = _admit(
+        store,
+        package,
+        key="repaired-scheduled",
+        schedule_at=due,
+    )
+    healthy_scheduled = _admit(
+        store,
+        package,
+        key="healthy-scheduled",
+        schedule_at=due,
+    )
+    for run_id in (repaired_ordinary.run_id, repaired_scheduled.run_id):
+        assert store._transition_run_repair(
+            "run_evidence_uncorroborated",
+            run_id=run_id,
+            outcome="repair_required",
+        )
+
+    ordinary, ordinary_cursor, ordinary_exhausted = store.coordinator_candidates(
+        after=None,
+        now=clocks.wall,
+        limit=1,
+    )
+    scheduled, scheduled_cursor, scheduled_exhausted = (
+        store.scheduled_coordinator_candidates(
+            after=None,
+            now=clocks.wall,
+            limit=1,
+        )
+    )
+
+    assert [row["run_id"] for row in ordinary] == [healthy_ordinary.run_id]
+    assert ordinary_cursor == (ordinary[0]["created_at"], healthy_ordinary.run_id)
+    assert ordinary_exhausted is True
+    assert [row["run_id"] for row in scheduled] == [healthy_scheduled.run_id]
+    assert scheduled_cursor == (
+        scheduled[0]["created_at"],
+        healthy_scheduled.run_id,
+    )
+    assert scheduled_exhausted is True
+
+    for run_id in (repaired_ordinary.run_id, repaired_scheduled.run_id):
+        assert store._transition_run_repair(
+            "run_evidence_uncorroborated",
+            run_id=run_id,
+            outcome="repair_verified",
+        )
+
+    ordinary, _ordinary_cursor, _ordinary_exhausted = store.coordinator_candidates(
+        after=None,
+        now=clocks.wall,
+        limit=10,
+    )
+    scheduled, _scheduled_cursor, _scheduled_exhausted = (
+        store.scheduled_coordinator_candidates(
+            after=None,
+            now=clocks.wall,
+            limit=10,
+        )
+    )
+    assert {row["run_id"] for row in ordinary} == {
+        repaired_ordinary.run_id,
+        healthy_ordinary.run_id,
+    }
+    assert {row["run_id"] for row in scheduled} == {
+        repaired_scheduled.run_id,
+        healthy_scheduled.run_id,
+    }
+
+
+def test_unrecoverable_migrated_run_does_not_block_healthy_scheduled_sweep(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 3, 12, 0, tzinfo=UTC))
+    home = tmp_path / "home"
+    store = RunStore(
+        home,
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    coordinator, identity, epoch = _leader(
+        store,
+        clocks,
+        name="migration-repair-isolation",
+    )
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="migration-repair-isolation",
+    )
+    due = (clocks.wall - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    damaged = _admit(
+        store,
+        package,
+        key="damaged",
+        schedule_at=due,
+    )
+    healthy = _admit(
+        store,
+        package,
+        key="healthy",
+        schedule_at=due,
+    )
+    store.append_event(
+        damaged.run_id,
+        "semantic_progress",
+        {"step": "before-corruption"},
+    )
+    for wake in coordinator.pending_wakes(
+        identity,
+        epoch=epoch,
+        now=clocks.wall,
+    ):
+        assert coordinator.complete_wake(
+            wake.generation,
+            identity,
+            epoch=epoch,
+            now=clocks.wall,
+            outcome="test_setup",
+        )
+    damaged_directory = store.run_directory(damaged.run_id)
+    damaged_journal = damaged_directory / "events.jsonl"
+    frames = damaged_journal.read_bytes().splitlines(keepends=True)
+    assert len(frames) == 2
+    corrupted_journal = frames[0] + b"{not-json}\n" + frames[1]
+    damaged_journal.write_bytes(corrupted_journal)
+
+    with sqlite3.connect(store.database) as connection:
+        connection.execute("DROP INDEX runs_scheduled_queue")
+        connection.execute("ALTER TABLE runs DROP COLUMN scheduled_at")
+        connection.execute("PRAGMA user_version=13")
+
+    restarted = RunStore(
+        home,
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    with restarted._connect() as connection:
+        damaged_row = connection.execute(
+            "SELECT admission_state, status, scheduled_at FROM runs WHERE run_id=?",
+            (damaged.run_id,),
+        ).fetchone()
+    assert tuple(damaged_row) == ("published", "queued", None)
+    assert restarted._active_run_repair_reasons(damaged.run_id) == (
+        "run_evidence_uncorroborated",
+    )
+    assert restarted._active_run_repair_reasons(healthy.run_id) == ()
+
+    scheduler = MagicMock()
+    scheduler.submit.return_value = True
+    service = _service(home, clocks)
+
+    actionable, _cursor, _progress = service._sweep_once(
+        restarted,
+        coordinator,
+        identity,
+        epoch,
+        scheduler,
+    )
+
+    assert actionable is True
+    assert [call.args[0] for call in scheduler.submit.call_args_list] == [
+        healthy.run_id
+    ]
+    assert damaged_journal.read_bytes() == corrupted_journal
+    assert "run_evidence_uncorroborated" in restarted._active_run_repair_reasons(
+        damaged.run_id
+    )
+    assert not tuple(restarted.quarantine_root.glob("admission-index-*"))
 
 
 def test_real_sweep_rescues_newly_due_work_behind_both_active_cursors(
