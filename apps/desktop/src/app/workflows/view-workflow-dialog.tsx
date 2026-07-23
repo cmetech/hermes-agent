@@ -20,7 +20,7 @@ import { WorkflowApiError } from '@/lib/hermes-api'
 import { Eye, Play } from '@/lib/icons'
 import type { WorkflowDefinition } from '@/types/hermes'
 
-import { workflowTrustAllowsRun } from './catalog-run-policy'
+import { workflowSupportsScheduledRun, workflowTrustAllowsRun } from './catalog-run-policy'
 import { useWorkflowDetailQuery } from './detail-query'
 
 const MermaidRenderer = lazy(() => import('@/components/assistant-ui/embeds/mermaid-embed'))
@@ -98,20 +98,25 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
     [copy.workflowViewDefinition, copy.workflowViewDiagram]
   )
 
+  const runSupportCopy = {
+    schedule_required: null,
+    showcase_cli_required: copy.workflowRunShowcaseFromCli,
+    supported: null,
+    unsupported_inputs: copy.workflowRunUnsupportedInputs
+  }
+
   const runDisabledReason = detail.isError
     ? copy.workflowViewRunError
     : !detail.data
       ? copy.workflowViewRunLoading
-      : !workflowTrustAllowsRun(detail.data.trust_state)
-        ? copy.workflowRunUntrusted
-        : !detail.data.run_support
-          ? copy.workflowRunSupportUnavailable
-          : !detail.data.run_support.supported
-            ? detail.data.source === 'showcase'
-              ? copy.workflowRunShowcaseFromCli
-              : copy.workflowRunUnsupportedInputs
-            : detail.data.compatibility.runnable !== true
-              ? copy.workflowRunIncompatible
+      : !detail.data.run_support
+        ? copy.workflowRunSupportUnavailable
+        : !workflowSupportsScheduledRun(detail.data.run_support)
+          ? runSupportCopy[detail.data.run_support.reason]
+          : detail.data.compatibility.runnable !== true
+            ? copy.workflowRunIncompatible
+            : !workflowTrustAllowsRun(detail.data.trust_state)
+              ? copy.workflowRunUntrusted
               : !detail.data.coordinator.healthy
                 ? copy.workflowRunCoordinatorUnavailable
                 : null

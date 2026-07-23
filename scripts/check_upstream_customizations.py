@@ -16,6 +16,7 @@ import yaml
 
 
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
+_EPHEMERAL_COVERAGE_PATHS = frozenset({".superpowers/sdd/progress.md"})
 _REQUIRED = {
     "id", "change_class", "owner", "files", "owned_symbols", "tests",
     "expected_commit_subject", "upstream_candidate", "merge_guidance",
@@ -231,6 +232,7 @@ def validate_diff_coverage(data: dict[str, Any], repo: Path, diff_range: str) ->
             )
             if (
                 path in covered
+                or path in _EPHEMERAL_COVERAGE_PATHS
                 or path.startswith(always_ignored_prefixes)
                 or (
                     path.startswith(additive_prefixes)

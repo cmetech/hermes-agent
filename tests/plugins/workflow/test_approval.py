@@ -1,12 +1,25 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import json
+import time
+
+import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import register_cli
-from plugins.workflow.models import ApprovalDecision
+from plugins.workflow.executors.approval import ApprovalExecutor
+from plugins.workflow.executors.base import NodeExecutionContext
+from plugins.workflow.models import (
+    ApprovalDecision,
+    DeadlineBudget,
+    RunExecutionLimits,
+    WorkflowNode,
+    freeze_value,
+)
+from plugins.workflow.resources import VariableContext
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
@@ -129,6 +142,81 @@ class ReworkRunner:
         )
 
 
+def test_approval_rework_request_maps_every_run_execution_limit_exactly(tmp_path):
+    runner = ReworkRunner()
+    limits = RunExecutionLimits(
+        max_parallel_nodes=2,
+        max_total_workers=3,
+        ai_idle_timeout_seconds=11,
+        ai_wall_timeout_seconds=37,
+        provider_request_timeout_seconds=7,
+        combined_retries=4,
+        subprocess_timeout_seconds=19,
+        process_tree_rss_bytes=128 * 1024 * 1024,
+        process_tree_cpu_seconds=13,
+        max_descendants=3,
+        cooperative_shutdown_seconds=1.5,
+        term_grace_seconds=2.5,
+        kill_reap_grace_seconds=3.5,
+    )
+    node = WorkflowNode(
+        id="review",
+        node_type="approval",
+        value=freeze_value({
+            "message": "Approve?",
+            "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+        }),
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({}),
+    )
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    budget = DeadlineBudget.create(
+        now=10,
+        wall_seconds=limits.ai_wall_timeout_seconds,
+        idle_seconds=limits.ai_idle_timeout_seconds,
+        provider_seconds=limits.provider_request_timeout_seconds,
+    )
+    context = NodeExecutionContext(
+        run_id="run-1",
+        run_directory=run_directory,
+        node=node,
+        attempt_id="attempt-1",
+        workflow_options=freeze_value({"provider": "fake", "model": "fake"}),
+        variable_context=VariableContext(workflow_id="run-1"),
+        node_state=freeze_value({
+            "approval_rework": {"reason": "missing evidence"},
+        }),
+        execution_limits=limits,
+        deadline_budget=budget,
+        monotonic=lambda: 10,
+    )
+
+    result = ApprovalExecutor(runner).execute(context)
+
+    assert result.status == "paused"
+    request = runner.requests[0]
+    assert request.idle_timeout_seconds == limits.ai_idle_timeout_seconds
+    assert request.wall_timeout_seconds == limits.ai_wall_timeout_seconds
+    assert (
+        request.provider_request_timeout_seconds
+        == limits.provider_request_timeout_seconds
+    )
+    assert request.max_api_attempts == limits.combined_retries
+    assert request.max_process_tree_rss_bytes == limits.process_tree_rss_bytes
+    assert request.max_process_tree_cpu_seconds == limits.process_tree_cpu_seconds
+    assert request.max_descendants == limits.max_descendants
+    assert (
+        request.cooperative_shutdown_seconds
+        == limits.cooperative_shutdown_seconds
+    )
+    assert request.term_grace_seconds == limits.term_grace_seconds
+    assert request.kill_reap_grace_seconds == limits.kill_reap_grace_seconds
+    assert request.max_iterations == 90
+
+
 def test_rejection_runs_bounded_rework_with_reason_then_cancels(
     tmp_path, workflow_writer
 ):
@@ -180,6 +268,241 @@ def test_rejection_runs_bounded_rework_with_reason_then_cancels(
     )
     assert exhausted.outcome == "applied"
     assert store.load_run(admitted.run_id)["status"] == "cancelled"
+
+
+def test_scheduler_uses_ai_deadline_for_approval_rework(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "bounded-rework",
+        name="bounded-rework",
+        nodes=[{
+            "id": "review",
+            "approval": {
+                "message": "Approve?",
+                "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+            },
+        }],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "limits:\n"
+        "  ai_idle_timeout_seconds: 11\n"
+        "  ai_wall_timeout_seconds: 37\n"
+        "  provider_request_timeout_seconds: 7\n"
+        "  subprocess_timeout_seconds: 19\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "bounded-rework-home")
+    admitted = _start(store, package, key="bounded-rework")
+    runner = ReworkRunner()
+    now = time.monotonic()
+    scheduler = RunScheduler(store, agent_runner=runner, monotonic=lambda: now)
+    first_pause = scheduler.advance(admitted.run_id)
+    pending = first_pause["nodes"]["review"]["pending_interaction"]
+    store.reject_run(
+        admitted.run_id,
+        reason="missing evidence",
+        expected_state_version=first_pause["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+
+    scheduler.advance(admitted.run_id)
+
+    request = runner.requests[0]
+    assert request.idle_timeout_seconds == 11
+    assert request.wall_timeout_seconds == 37
+    assert request.provider_request_timeout_seconds == 7
+
+
+@pytest.mark.parametrize(
+    "reported_provider_attempts",
+    [None, -1],
+    ids=["missing", "negative"],
+)
+def test_failed_approval_rework_conservatively_accounts_provider_attempts(
+    tmp_path, workflow_writer, reported_provider_attempts
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "failed-rework",
+        name="failed-rework",
+        nodes=[{
+            "id": "review",
+            "approval": {
+                "message": "Approve?",
+                "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+            },
+            "retry": {"max_attempts": 5, "delay_ms": 1000, "on_error": "all"},
+        }],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "limits: {combined_retries: 2}\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "failed-rework-home")
+    admitted = _start(store, package, key="failed-rework")
+
+    class FailedReworkRunner:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            audit = {"failure_kind": "provider_timeout"}
+            if reported_provider_attempts is not None:
+                audit["provider_attempts"] = reported_provider_attempts
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="failed-rework",
+                provider="fake",
+                model="fake",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit=audit,
+            )
+
+    runner = FailedReworkRunner()
+    scheduler = RunScheduler(store, agent_runner=runner)
+    first_pause = scheduler.advance(admitted.run_id)
+    pending = first_pause["nodes"]["review"]["pending_interaction"]
+    store.reject_run(
+        admitted.run_id,
+        reason="missing evidence",
+        expected_state_version=first_pause["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+
+    result = scheduler.advance(admitted.run_id)
+
+    assert result["status"] == "failed"
+    assert len(runner.requests) == 1
+    assert runner.requests[0].max_api_attempts == 2
+    assert result["nodes"]["review"]["retry_consumed"] == 2
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (OSError("provider connection failed"), "network_error"),
+        (RuntimeError("approval agent failed"), "agent_execution_failed"),
+    ],
+)
+def test_approval_runner_exception_consumes_grant_without_refresh(
+    tmp_path, workflow_writer, failure, expected_code
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "crashed-rework",
+        name="crashed-rework",
+        nodes=[{
+            "id": "review",
+            "approval": {
+                "message": "Approve?",
+                "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+            },
+            "retry": {"max_attempts": 5, "delay_ms": 1000, "on_error": "all"},
+        }],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "limits: {combined_retries: 2}\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "crashed-rework-home")
+    admitted = _start(store, package, key="crashed-rework")
+
+    class CrashedReworkRunner:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            raise failure
+
+    now = datetime(2026, 7, 21, tzinfo=timezone.utc)
+    runner = CrashedReworkRunner()
+    scheduler = RunScheduler(
+        store,
+        agent_runner=runner,
+        utcnow=lambda: now,
+        jitter=lambda: 0.5,
+    )
+    first_pause = scheduler.advance(admitted.run_id)
+    pending = first_pause["nodes"]["review"]["pending_interaction"]
+    store.reject_run(
+        admitted.run_id,
+        reason="missing evidence",
+        expected_state_version=first_pause["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+
+    failed = scheduler.advance(admitted.run_id)
+    now += timedelta(seconds=1)
+    replay = scheduler.advance(admitted.run_id)
+
+    assert failed["status"] == "failed"
+    assert replay["status"] == "failed"
+    assert [request.max_api_attempts for request in runner.requests] == [2]
+    assert failed["last_error"]["code"] == expected_code
+    assert failed["nodes"]["review"]["retry_consumed"] == 2
+    attempt = failed["nodes"]["review"]["attempts"][-1]
+    assert attempt["error_code"] == expected_code
+    assert attempt["metadata"]["provider_attempts"] == 1
+    assert attempt["metadata"]["retry_consumed"] == 2
+
+
+def test_approval_permission_error_stays_authorization_without_provider_charge(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "denied-rework",
+        name="denied-rework",
+        nodes=[{
+            "id": "review",
+            "approval": {
+                "message": "Approve?",
+                "on_reject": {"prompt": "Revise: $REJECTION_REASON"},
+            },
+            "retry": {"max_attempts": 5, "delay_ms": 1000, "on_error": "all"},
+        }],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "limits: {combined_retries: 3}\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "denied-rework-home")
+    admitted = _start(store, package, key="denied-rework")
+
+    class DeniedReworkRunner:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            raise PermissionError("workflow provider override is not authorized")
+
+    runner = DeniedReworkRunner()
+    scheduler = RunScheduler(store, agent_runner=runner)
+    first_pause = scheduler.advance(admitted.run_id)
+    pending = first_pause["nodes"]["review"]["pending_interaction"]
+    store.reject_run(
+        admitted.run_id,
+        reason="missing evidence",
+        expected_state_version=first_pause["state_version"],
+        interaction_id=pending["interaction_id"],
+    )
+
+    failed = scheduler.advance(admitted.run_id)
+    replay = scheduler.advance(admitted.run_id)
+
+    assert failed["status"] == "failed"
+    assert replay["status"] == "failed"
+    assert [request.max_api_attempts for request in runner.requests] == [3]
+    assert failed["last_error"]["code"] == "authorization"
+    assert failed["nodes"]["review"]["retry_consumed"] == 1
+    attempt = failed["nodes"]["review"]["attempts"][-1]
+    assert attempt["error_code"] == "authorization"
+    assert "provider_attempts" not in attempt["metadata"]
+    assert attempt["metadata"]["retry_consumed"] == 1
 
 
 class ToolApprovalRunner:

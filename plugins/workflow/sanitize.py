@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from pathlib import PurePath
 from typing import Mapping
+
+from plugins.workflow.schedule_time import (
+    ScheduleInstantError,
+    normalize_rfc3339_instant,
+    run_is_scheduled_wait,
+)
 
 
 _SECRET_KEY = re.compile(
@@ -20,8 +27,6 @@ _PORTABLE_COMPONENT_MAX_UNITS = 255
 _TEXT_INPUT_SUFFIX = ".txt"
 _PROJECTION_MAX_CHARS = 16_384
 _TRUNCATION_SUFFIX = "…[TRUNCATED]"
-
-
 def workflow_input_name_is_portable(name: object, *, max_length: int = 128) -> bool:
     """Return whether a name is one portable filename segment on every host OS."""
     if not isinstance(name, str):
@@ -129,8 +134,36 @@ def sanitize_projection(value: object, *, key: str = "", depth: int = 0) -> obje
     return sanitize_projection(str(value), key=key, depth=depth + 1)
 
 
+def public_run_projection(
+    value: Mapping[str, object], *, now: datetime | None = None
+) -> dict[str, object]:
+    """Project a run while keeping durable admission metadata server-private."""
+    projected = sanitize_projection(value)
+    if not isinstance(projected, dict):
+        raise TypeError("run projection must be a mapping")
+    metadata = value.get("run_metadata")
+    projected.pop("run_metadata", None)
+    if not isinstance(metadata, Mapping):
+        return projected
+    schedule_at = metadata.get("schedule_at")
+    try:
+        canonical_schedule_at = normalize_rfc3339_instant(schedule_at)
+    except ScheduleInstantError:
+        return projected
+    if schedule_at != canonical_schedule_at:
+        return projected
+    projected["schedule_at"] = canonical_schedule_at
+    if run_is_scheduled_wait(
+        value,
+        observed=now or datetime.now(timezone.utc),
+    ):
+        projected["presentation_state"] = "scheduled_wait"
+    return projected
+
+
 __all__ = [
     "projection_key_is_secret",
+    "public_run_projection",
     "sanitize_evidence_bytes",
     "sanitize_projection",
     "sanitize_text",

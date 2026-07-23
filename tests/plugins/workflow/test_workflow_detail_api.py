@@ -700,6 +700,91 @@ def test_workflow_detail_is_full_read_only_preflight_with_coordinator_down(
     assert _tree_snapshot(home) == before
 
 
+def test_workflow_detail_matches_catalog_declared_text_projection(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    path = workflow_writer(
+        home / "workflows", name="bounded-text", filename="bounded-text.yaml"
+    )
+    path.with_name("bounded-text.hermes.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "delivery_defaults": {
+                    "inputs": {
+                        "arguments": {
+                            "kind": "text",
+                            "required": True,
+                            "max_bytes": 80 * 1024,
+                            "default": "SECRET_ARGUMENT_DEFAULT",
+                        },
+                        "summary": {
+                            "kind": "text",
+                            "required": False,
+                            "max_bytes": 2048,
+                        },
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    router = _module().router
+    client = TestClient(_app(router, token=_reader()))
+
+    catalog_response = client.get("/api/plugins/workflow/workflows")
+    detail_response = client.get(
+        "/api/plugins/workflow/workflows/bounded-text",
+        params={"catalog_source": "profile"},
+    )
+
+    assert catalog_response.status_code == detail_response.status_code == 200
+    catalog_row = next(
+        item
+        for item in catalog_response.json()["items"]
+        if item.get("source") == "profile" and item.get("name") == "bounded-text"
+    )
+    detail = detail_response.json()
+    assert (
+        detail["inputs"]
+        == catalog_row["inputs"]
+        == [
+            {
+                "name": "arguments",
+                "type": "text",
+                "required": True,
+                "max_bytes": 64 * 1024,
+            },
+            {
+                "name": "summary",
+                "type": "text",
+                "required": False,
+                "max_bytes": 2048,
+            },
+        ]
+    )
+    assert (
+        detail["supported_inputs"]
+        == catalog_row["supported_inputs"]
+        == {
+            "supported": True,
+            "reason": "flat_inputs",
+        }
+    )
+    assert (
+        detail["run_support"]
+        == catalog_row["run_support"]
+        == {
+            "supported": True,
+            "reason": "supported",
+        }
+    )
+    assert b"SECRET_ARGUMENT_DEFAULT" not in catalog_response.content
+    assert b"SECRET_ARGUMENT_DEFAULT" not in detail_response.content
+
+
 def test_workflow_detail_topology_matches_plain_cli_show_json(
     tmp_path, monkeypatch, workflow_writer, capsys
 ) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import stat
@@ -16,7 +17,19 @@ from plugins.workflow.cli import (
     show_package,
 )
 from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.input_contract import (
+    API_INPUT_VALUE_MAX_BYTES,
+    WorkflowInputContractError,
+    workflow_input_declarations,
+)
 from plugins.workflow.models import WorkflowPackage, WorkflowValidationError
+from plugins.workflow.runner_binding import (
+    ExecutionCapabilityContext,
+    WorkflowRunnerBinding,
+    assess_package_execution,
+    background_execution_context,
+    production_workflow_runner_binding,
+)
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.sanitize import (
     sanitize_projection,
@@ -32,6 +45,9 @@ from plugins.workflow.trust import (
     build_risk_summary,
 )
 
+
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from plugins.workflow.showcase import ShowcaseScenario, VerifiedShowcasePackage
 
@@ -46,7 +62,7 @@ CATALOG_MAX_RESOURCE_FILES = 512
 CATALOG_MAX_RESOURCE_REQUEST_BYTES = 2 * CATALOG_MAX_RESOURCE_TOTAL_BYTES
 CATALOG_MAX_TRUST_STORE_BYTES = 4 * 1024 * 1024
 _PROFILE_STATE_DIRECTORIES = frozenset({"runs", ".staging", ".quarantine", ".locks"})
-_SUPPORTED_INPUT_TYPES = frozenset({"string", "number", "boolean", "enum"})
+_SUPPORTED_INPUT_TYPES = frozenset({"text", "string", "number", "boolean", "enum"})
 _RICH_INPUT_FIELDS = frozenset({"items", "properties", "schema"})
 _ENUM_INPUT_FIELDS = ("values", "enum", "options", "choices")
 _ENUM_MAX_CHOICES = 128
@@ -57,6 +73,7 @@ CatalogTrustState = Literal["trusted", "untrusted", "verified_bundled"]
 CatalogRunSupportReason = Literal[
     "supported",
     "unsupported_inputs",
+    "schedule_required",
     "showcase_cli_required",
 ]
 
@@ -65,6 +82,7 @@ class CatalogInput(TypedDict):
     name: str
     type: str
     required: bool
+    max_bytes: NotRequired[int]
 
 
 class SupportedInputs(TypedDict):
@@ -86,6 +104,7 @@ class CatalogEntry(TypedDict):
     name: str
     version: str
     description: str
+    requires_ai: bool
     source: CatalogSource
     precedence: int
     trust_state: CatalogTrustState
@@ -348,9 +367,16 @@ def _input_projection(
     if not isinstance(raw_inputs, Mapping) or len(raw_inputs) > 64:
         return [], {"supported": False, "reason": "unsupported_input_shape"}
 
+    try:
+        declarations = workflow_input_declarations(package)
+    except WorkflowInputContractError:
+        declarations = None
+
     inputs: list[CatalogInput] = []
     unsupported_type = False
-    unsupported_shape = not workflow_input_names_are_portable(raw_inputs)
+    unsupported_shape = declarations is None or not workflow_input_names_are_portable(
+        raw_inputs
+    )
     for raw_name, raw in sorted(raw_inputs.items(), key=lambda item: str(item[0])):
         if (
             not isinstance(raw_name, str)
@@ -359,6 +385,7 @@ def _input_projection(
         ):
             unsupported_shape = True
             continue
+        declaration = declarations.get(raw_name) if declarations is not None else None
         declared_type = raw.get("type", raw.get("kind"))
         if "type" in raw and "kind" in raw and raw.get("type") != raw.get("kind"):
             unsupported_shape = True
@@ -379,11 +406,17 @@ def _input_projection(
             unsupported_type = True
         if declared_type == "enum" and not _enum_choices_supported(raw):
             unsupported_shape = True
-        inputs.append({
+        projected: CatalogInput = {
             "name": raw_name,
             "type": declared_type,
             "required": required,
-        })
+        }
+        if declaration is not None and declared_type == "text":
+            projected["max_bytes"] = declaration.byte_bound(
+                channel="text",
+                store_limit=API_INPUT_VALUE_MAX_BYTES,
+            )
+        inputs.append(projected)
 
     if unsupported_type:
         classification: SupportedInputs = {
@@ -404,17 +437,66 @@ def workflow_catalog_run_support(
     package: WorkflowPackage,
     *,
     showcase_scenario: "ShowcaseScenario | None" = None,
+    input_support: SupportedInputs | None = None,
+    schedule_at: str | None = None,
 ) -> CatalogRunSupport:
     """Derive Desktop background-run support from authenticated server data."""
-    _inputs, input_support = _input_projection(package)
+    if input_support is None:
+        if showcase_scenario is None:
+            _inputs, input_support = _input_projection(package)
+        else:
+            _inputs, input_support = _showcase_input_projection(
+                package, showcase_scenario
+            )
     if not input_support["supported"]:
         return {"supported": False, "reason": "unsupported_inputs"}
     if showcase_scenario is not None:
         from plugins.workflow.showcase import showcase_background_api_eligible
 
-        if not showcase_background_api_eligible(showcase_scenario):
+        if showcase_scenario.requires_network:
+            return {"supported": False, "reason": "showcase_cli_required"}
+        if showcase_scenario.interaction_mode == "schedule":
+            if schedule_at is None:
+                return {"supported": False, "reason": "schedule_required"}
+        elif not showcase_background_api_eligible(showcase_scenario):
             return {"supported": False, "reason": "showcase_cli_required"}
     return {"supported": True, "reason": "supported"}
+
+
+def _showcase_input_projection(
+    package: WorkflowPackage,
+    scenario: "ShowcaseScenario",
+) -> tuple[list[CatalogInput], SupportedInputs]:
+    """Project only digest-authenticated public fields and bundled fixtures."""
+    inputs, support = _input_projection(package)
+    bindings = dict(scenario.input_value_bindings)
+    fixtures = frozenset(scenario.input_fixtures)
+    target_to_public = {target: public for public, target in bindings.items()}
+    projected: list[CatalogInput] = []
+    unsupported = support["reason"] == "unsupported_input_shape"
+    for item in inputs:
+        rendered = dict(item)
+        internal_name = rendered["name"]
+        rendered["name"] = target_to_public.get(internal_name, internal_name)
+        if (
+            rendered["type"] not in _SUPPORTED_INPUT_TYPES
+            and not (internal_name in fixtures and rendered["type"] == "file")
+        ):
+            unsupported = True
+        projected.append(rendered)
+    if unsupported:
+        return projected, {
+            "supported": False,
+            "reason": (
+                "unsupported_input_shape"
+                if support["reason"] == "unsupported_input_shape"
+                else "unsupported_input_type"
+            ),
+        }
+    return sorted(projected, key=lambda item: item["name"]), {
+        "supported": True,
+        "reason": "flat_inputs" if projected else "parameterless",
+    }
 
 
 def _compatibility_projection(compatibility) -> dict[str, object]:
@@ -494,20 +576,27 @@ def _catalog_entry(
     resource_budget: WorkflowResourceReadBudget,
     *,
     verified_showcase: "VerifiedShowcasePackage | None" = None,
+    execution_context: ExecutionCapabilityContext,
 ) -> CatalogEntry:
     # The CLI show projection is the established body-free catalog contract.
-    compatibility = (
-        verified_showcase.compatibility
-        if verified_showcase is not None
-        else assess_compatibility(package)
+    compatibility, risk = assess_package_execution(
+        package,
+        execution_context,
+        read_budget=resource_budget,
     )
+    if (
+        verified_showcase is not None
+        and risk.package_digest != verified_showcase.package_digest
+    ):
+        raise WorkflowCatalogInvalidDefinitionError(
+            "verified showcase projection does not match authenticated package"
+        )
     shown = qualify_workflow_catalog_package(
         package,
         compatibility=compatibility,
     )
     if verified_showcase is None:
         assert trust_store is not None and trust_snapshot is not None
-        risk = build_risk_summary(package, compatibility, read_budget=resource_budget)
         trust_state: CatalogTrustState = trust_store.check_snapshot(
             trust_snapshot,
             risk.package_digest,
@@ -519,7 +608,12 @@ def _catalog_entry(
         trust_state = "verified_bundled"
         version = str(verified_showcase.scenario.package_version)
         showcase_scenario = verified_showcase.scenario
-    inputs, supported_inputs = _input_projection(package)
+    if showcase_scenario is None:
+        inputs, supported_inputs = _input_projection(package)
+    else:
+        inputs, supported_inputs = _showcase_input_projection(
+            package, showcase_scenario
+        )
     entry: CatalogEntry = {
         "name": (
             str(verified_showcase.scenario.id)
@@ -528,6 +622,9 @@ def _catalog_entry(
         ),
         "version": version,
         "description": str(shown["definition"]["description"]),
+        "requires_ai": bool(
+            showcase_scenario is not None and showcase_scenario.requires_ai
+        ),
         "source": str(shown["source"]),
         "precedence": int(shown["precedence"]),
         "trust_state": trust_state,
@@ -536,6 +633,7 @@ def _catalog_entry(
         "run_support": workflow_catalog_run_support(
             package,
             showcase_scenario=showcase_scenario,
+            input_support=supported_inputs,
         ),
     }
     if verified_showcase is not None:
@@ -544,10 +642,14 @@ def _catalog_entry(
 
 
 def build_workflow_catalog(
-    *, hermes_home: str | Path, workdir: str | Path
+    *,
+    hermes_home: str | Path,
+    workdir: str | Path,
+    runner_binding: WorkflowRunnerBinding | None = None,
 ) -> tuple[list[CatalogItem], bool]:
     """Return at most 500 stable entries without executing workflow code."""
     home = Path(hermes_home).expanduser().resolve()
+    binding = runner_binding or production_workflow_runner_binding()
     discovered, truncated = _discover_catalog(
         Path(workdir).expanduser().resolve(), home
     )
@@ -565,7 +667,19 @@ def build_workflow_catalog(
         )
     except WorkflowResourceCapacityError:
         truncated = True
-    except (OSError, UnicodeError, ValueError):
+    except FileNotFoundError as exc:
+        logger.info(
+            "workflow showcase catalog verification unavailable: %s",
+            type(exc).__name__,
+        )
+        # A stripped distribution is trusted for nothing, but it must not
+        # suppress independently discovered user workflows.
+        verified_showcases = {}
+    except (OSError, UnicodeError, ValueError) as exc:
+        logger.warning(
+            "workflow showcase catalog verification failed: %s",
+            type(exc).__name__,
+        )
         # A stripped or integrity-failed distribution is trusted for nothing,
         # but it must not suppress independently discovered user workflows.
         verified_showcases = {}
@@ -579,21 +693,33 @@ def build_workflow_catalog(
             "workflow catalog trust classification is unavailable"
         ) from exc
     showcase_items: list[CatalogEntry] = []
-    for verified in verified_showcases.values():
-        projection_budget = WorkflowResourceReadBudget(
-            max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
-            max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
-            max_files=CATALOG_MAX_RESOURCE_FILES,
-        )
-        showcase_items.append(
-            _catalog_entry(
-                verified.package,
-                None,
-                None,
-                projection_budget,
-                verified_showcase=verified,
+    try:
+        for verified in verified_showcases.values():
+            showcase_items.append(
+                _catalog_entry(
+                    verified.package,
+                    None,
+                    None,
+                    showcase_budget,
+                    verified_showcase=verified,
+                    execution_context=background_execution_context(
+                        binding,
+                        requires_ai=verified.scenario.requires_ai,
+                    ),
+                )
             )
+    except (
+        WorkflowCatalogCapacityError,
+        WorkflowCatalogInvalidDefinitionError,
+        WorkflowResourceCapacityError,
+        WorkflowValidationError,
+        OSError,
+    ) as exc:
+        logger.warning(
+            "workflow showcase catalog projection verification failed: %s",
+            type(exc).__name__,
         )
+        showcase_items = []
 
     user_limit = max(0, CATALOG_LIMIT - len(showcase_items))
     if len(discovered) > user_limit:
@@ -623,6 +749,10 @@ def build_workflow_catalog(
                     trust_store,
                     trust_snapshot,
                     resource_budget,
+                    execution_context=background_execution_context(
+                        binding,
+                        requires_ai=None,
+                    ),
                 )
             )
         except (WorkflowCatalogCapacityError, WorkflowResourceCapacityError):
@@ -692,6 +822,7 @@ def build_workflow_detail(
     hermes_home: str | Path,
     workdir: str | Path,
     catalog_source: CatalogSource | None = None,
+    runner_binding: WorkflowRunnerBinding | None = None,
 ) -> dict[str, object]:
     """Return one bounded, redacted, read-only workflow preflight projection."""
     if not isinstance(name, str) or not name.strip() or len(name) > 128:
@@ -699,6 +830,7 @@ def build_workflow_detail(
     if catalog_source not in {None, "project", "profile", "showcase"}:
         raise WorkflowDetailNotFoundError(name)
     home = Path(hermes_home).expanduser().resolve()
+    binding = runner_binding or production_workflow_runner_binding()
     resource_budget = WorkflowResourceReadBudget(
         max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
         max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
@@ -750,28 +882,33 @@ def build_workflow_detail(
                 )
             raise WorkflowDetailNotFoundError(name)
 
-    compatibility = (
-        verified_showcase.compatibility
-        if verified_showcase is not None
-        else assess_compatibility(package)
+    execution_context = background_execution_context(
+        binding,
+        requires_ai=(
+            verified_showcase.scenario.requires_ai
+            if verified_showcase is not None
+            else None
+        ),
     )
+    try:
+        compatibility, risk = assess_package_execution(
+            package,
+            execution_context,
+            read_budget=resource_budget,
+        )
+    except WorkflowResourceCapacityError as exc:
+        raise WorkflowCatalogCapacityError(
+            "workflow detail resource limit exceeded"
+        ) from exc
+    except WorkflowValidationError as exc:
+        raise WorkflowCatalogInvalidDefinitionError(
+            "workflow detail contains an invalid package resource"
+        ) from exc
     shown = qualify_workflow_catalog_package(
         package,
         compatibility=compatibility,
     )
     if verified_showcase is None:
-        try:
-            risk = build_risk_summary(
-                package, compatibility, read_budget=resource_budget
-            )
-        except WorkflowResourceCapacityError as exc:
-            raise WorkflowCatalogCapacityError(
-                "workflow detail resource limit exceeded"
-            ) from exc
-        except WorkflowValidationError as exc:
-            raise WorkflowCatalogInvalidDefinitionError(
-                "workflow detail contains an invalid package resource"
-            ) from exc
         try:
             trust_store = WorkflowTrustStore(home)
             trust_snapshot = trust_store.snapshot_read_only(
@@ -789,11 +926,15 @@ def build_workflow_detail(
         version = "1"
         showcase_scenario = None
     else:
-        risk = verified_showcase.risk
         trust_state = "verified_bundled"
         version = str(verified_showcase.scenario.package_version)
         showcase_scenario = verified_showcase.scenario
-    inputs, supported_inputs = _input_projection(package)
+    if showcase_scenario is None:
+        inputs, supported_inputs = _input_projection(package)
+    else:
+        inputs, supported_inputs = _showcase_input_projection(
+            package, showcase_scenario
+        )
     warnings = [str(item) for item in shown["topology_warnings"]]
     mermaid = shown["topology_mermaid"]
     omitted = None
@@ -814,6 +955,9 @@ def build_workflow_detail(
         ),
         "version": version,
         "description": str(shown["definition"]["description"]),
+        "requires_ai": bool(
+            showcase_scenario is not None and showcase_scenario.requires_ai
+        ),
         "source": str(shown["source"]),
         "precedence": int(shown["precedence"]),
         "trust_state": trust_state,
@@ -822,6 +966,7 @@ def build_workflow_detail(
         "run_support": workflow_catalog_run_support(
             package,
             showcase_scenario=showcase_scenario,
+            input_support=supported_inputs,
         ),
         "risk_summary": risk.to_dict(),
         "compatibility": _compatibility_projection(compatibility),

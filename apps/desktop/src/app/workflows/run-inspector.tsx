@@ -69,7 +69,7 @@ function EvidenceItems({
 }
 
 export function RunInspector({ actionsDisabled = false, events = [], onAction, run }: RunInspectorProps) {
-  const { t } = useI18n()
+  const { locale, t } = useI18n()
   const copy = t.operations
   const profile = getApiRequestProfile() ?? 'default'
   const [tab, setTab] = useState<InspectorTab>('overview')
@@ -97,6 +97,9 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
   const currentNode = run.current_nodes?.[0]
   const provenance = run.provenance
   const coordinator = run.coordinator
+  const scheduledAt =
+    run.presentation_state === 'scheduled_wait' && typeof run.schedule_at === 'string' ? run.schedule_at : null
+  const scheduled = scheduledAt !== null
 
   return (
     <aside aria-label={`${run.workflow} run inspector`} className="min-w-0 py-5">
@@ -119,7 +122,20 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
         {tab === 'overview' ? (
           <dl className="grid grid-cols-[minmax(8rem,auto)_1fr] gap-x-4 gap-y-1 text-sm">
             <dt>{copy.status}</dt>
-            <dd>{run.status}</dd>
+            <dd>{scheduled ? copy.workflowScheduled : run.status}</dd>
+            {scheduledAt ? (
+              <>
+                <dt>{copy.workflowScheduledAt}</dt>
+                <dd className="grid gap-0.5">
+                  <span>
+                    {copy.workflowScheduledLocal}: <span>{new Date(scheduledAt).toLocaleString(locale)}</span>
+                  </span>
+                  <span className="font-mono text-xs">
+                    {copy.workflowScheduledCanonical}: <span>{scheduledAt}</span>
+                  </span>
+                </dd>
+              </>
+            ) : null}
             <dt>{copy.health}</dt>
             <dd>{run.health}</dd>
             <dt>{copy.origin}</dt>

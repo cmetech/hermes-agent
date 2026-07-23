@@ -7,7 +7,8 @@ from pathlib import Path
 import time
 from typing import Any, BinaryIO, Callable, Mapping, Protocol
 
-from plugins.workflow.models import DeadlineBudget, WorkflowNode
+from plugins.workflow.entitlement import AIEntitlementResolution
+from plugins.workflow.models import DeadlineBudget, RunExecutionLimits, WorkflowNode
 from plugins.workflow.store import ArtifactRef
 from tools.managed_process import (
     ProcessIdentity,
@@ -34,6 +35,10 @@ class NodeExecutionContext:
     )
     node_state: Mapping[str, object] = field(default_factory=dict)
     operator_scope: str = "local"
+    ai_entitlement: AIEntitlementResolution = field(
+        default_factory=lambda: AIEntitlementResolution("real")
+    )
+    execution_limits: RunExecutionLimits | None = None
     resource_limits: ProcessResourceLimits = field(
         default_factory=ProcessResourceLimits
     )
@@ -65,6 +70,37 @@ class NodeExecutionResult:
     error_code: str | None = None
     error_message: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
+
+
+def validated_provider_retry_count(
+    value: object,
+    *,
+    granted_attempts: int,
+) -> int | None:
+    """Return an exact internal retry count only when it fits the grant."""
+    if (
+        isinstance(granted_attempts, bool)
+        or not isinstance(granted_attempts, int)
+        or granted_attempts <= 0
+    ):
+        raise ValueError("granted provider attempts must be a positive integer")
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value < granted_attempts
+    ):
+        return value
+    return None
+
+
+def conservative_provider_retry_count(
+    value: object,
+    *,
+    granted_attempts: int,
+) -> int:
+    """Return an exact internal retry count or conservatively charge the grant."""
+    exact = validated_provider_retry_count(value, granted_attempts=granted_attempts)
+    return exact if exact is not None else granted_attempts - 1
 
 
 class BoundedProcessOutput:
@@ -125,5 +161,7 @@ __all__ = [
     "NodeExecutionContext",
     "NodeExecutionResult",
     "NodeExecutor",
+    "conservative_provider_retry_count",
     "process_tree_active",
+    "validated_provider_retry_count",
 ]

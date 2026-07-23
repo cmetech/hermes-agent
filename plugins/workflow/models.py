@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import math
 from pathlib import Path
 from types import MappingProxyType
@@ -242,6 +242,45 @@ class DeadlineBudget:
         return float(now) >= self.wall_deadline
 
 
+@dataclass(frozen=True, slots=True)
+class RunExecutionLimits:
+    """Immutable limits that may vary between workflow runs."""
+
+    max_parallel_nodes: int = 4
+    max_total_workers: int = 4
+    ai_idle_timeout_seconds: float = 300.0
+    ai_wall_timeout_seconds: float = 1800.0
+    provider_request_timeout_seconds: float = 300.0
+    combined_retries: int = 5
+    subprocess_timeout_seconds: float = 120.0
+    process_tree_rss_bytes: int = 2048 * 1024 * 1024
+    process_tree_cpu_seconds: float = 900.0
+    max_descendants: int = 32
+    cooperative_shutdown_seconds: float = 5.0
+    term_grace_seconds: float = 5.0
+    kill_reap_grace_seconds: float = 2.0
+
+    @classmethod
+    def resolve(
+        cls,
+        profile: "WorkflowRuntimeConfig",
+        *,
+        sidecar_limits: Mapping[str, Any] | None = None,
+        sidecar_resources: Mapping[str, Any] | None = None,
+    ) -> "RunExecutionLimits":
+        """Tighten a frozen profile with one immutable run sidecar."""
+        if not isinstance(profile, WorkflowRuntimeConfig):
+            raise TypeError("profile must be WorkflowRuntimeConfig")
+        tightened = WorkflowRuntimeConfig.from_mapping(
+            asdict(profile),
+            sidecar_limits=sidecar_limits,
+            sidecar_resources=sidecar_resources,
+        )
+        return cls(**{
+            name: getattr(tightened, name) for name in cls.__dataclass_fields__
+        })
+
+
 @dataclass(frozen=True)
 class WorkflowRuntimeConfig:
     """Resolved profile lifecycle limits, optionally tightened by a sidecar."""
@@ -369,4 +408,20 @@ class WorkflowRuntimeConfig:
             elif isinstance(value, bool) or not isinstance(value, int | float):
                 raise ValueError(f"{name} must be a number")
             tightened[name] = min(current, value)
+        wall = tightened.get(
+            "ai_wall_timeout_seconds", resolved.ai_wall_timeout_seconds
+        )
+        tightened["ai_idle_timeout_seconds"] = min(
+            tightened.get(
+                "ai_idle_timeout_seconds", resolved.ai_idle_timeout_seconds
+            ),
+            wall,
+        )
+        tightened["provider_request_timeout_seconds"] = min(
+            tightened.get(
+                "provider_request_timeout_seconds",
+                resolved.provider_request_timeout_seconds,
+            ),
+            wall,
+        )
         return cls(**tightened)

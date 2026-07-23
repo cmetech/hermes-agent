@@ -34,6 +34,8 @@ import re
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent.model_metadata import is_anthropic_bedrock_model
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -431,28 +433,6 @@ def _model_supports_tool_use(model_id: str) -> bool:
     """
     model_lower = model_id.lower()
     return not any(pattern in model_lower for pattern in _NON_TOOL_CALLING_PATTERNS)
-
-
-def is_anthropic_bedrock_model(model_id: str) -> bool:
-    """Return True if the model is an Anthropic Claude model on Bedrock.
-
-    These models should use the AnthropicBedrock SDK path for full feature
-    parity (prompt caching, thinking budgets, adaptive thinking).
-    Non-Claude models use the Converse API path.
-
-    Matches:
-      - ``anthropic.claude-*`` (foundation model IDs)
-      - ``us.anthropic.claude-*`` (US inference profiles)
-      - ``global.anthropic.claude-*`` (global inference profiles)
-      - ``eu.anthropic.claude-*`` (EU inference profiles)
-    """
-    model_lower = model_id.lower()
-    # Strip regional prefix if present
-    for prefix in ("us.", "global.", "eu.", "ap.", "jp."):
-        if model_lower.startswith(prefix):
-            model_lower = model_lower[len(prefix):]
-            break
-    return model_lower.startswith("anthropic.claude")
 
 
 # ---------------------------------------------------------------------------

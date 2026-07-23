@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Iterator, Literal, Mapping
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hermes_constants import get_hermes_home
 from plugins.workflow.actions import MUTATION_ACTIONS, mutation_is_valid
@@ -30,7 +30,7 @@ from plugins.workflow.runtime import (
     WorkflowApiRuntime,
     WorkflowRetentionPolicy,
 )
-from plugins.workflow.sanitize import sanitize_projection
+from plugins.workflow.sanitize import public_run_projection, sanitize_projection
 from plugins.workflow.store import JournalRecoveryError, RunStore
 
 
@@ -66,6 +66,10 @@ async def _router_lifespan(_app):
 
 
 router = APIRouter(lifespan=_router_lifespan)
+
+
+def _schedule_now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 _ALL_WORKFLOW_CAPABILITIES = frozenset({"read", "write", "delivery", "admin"})
@@ -199,6 +203,7 @@ class WorkflowCatalogInput(BaseModel):
     name: str = Field(..., min_length=1, max_length=128)
     type: str = Field(..., min_length=1, max_length=64)
     required: bool
+    max_bytes: int | None = Field(None, gt=0, exclude_if=lambda value: value is None)
 
 
 class WorkflowCatalogInputSupport(BaseModel):
@@ -220,6 +225,7 @@ class WorkflowCatalogRunSupport(BaseModel):
     reason: Literal[
         "supported",
         "unsupported_inputs",
+        "schedule_required",
         "showcase_cli_required",
     ]
 
@@ -230,6 +236,7 @@ class WorkflowCatalogEntry(BaseModel):
     name: str = Field(..., min_length=1, max_length=128)
     version: str = Field(..., min_length=1, max_length=32)
     description: str = Field(..., max_length=16_400)
+    requires_ai: bool
     source: Literal["project", "profile", "showcase"]
     precedence: Literal[1, 2, 3]
     trust_state: Literal["trusted", "untrusted", "verified_bundled"]
@@ -278,6 +285,7 @@ class WorkflowDetailResponse(BaseModel):
     name: str = Field(..., min_length=1, max_length=128)
     version: str = Field(..., min_length=1, max_length=32)
     description: str = Field(..., max_length=16_384)
+    requires_ai: bool
     source: str = Field(..., min_length=1, max_length=64)
     precedence: int
     trust_state: Literal["trusted", "untrusted", "verified_bundled"]
@@ -467,11 +475,18 @@ def _authorized_runs(
     )
 
 
-def _load_authorized(store: RunStore, run_id: str, operator: WorkflowAuthority):
+def _load_authorized(
+    store: RunStore,
+    run_id: str,
+    operator: WorkflowAuthority,
+    *,
+    now: datetime | None = None,
+):
     try:
         return store.get_run_status(
             run_id,
             operator_scope=None if operator.unrestricted else operator.scope,
+            **({"now": now} if now is not None else {}),
         )
     except JournalRecoveryError as exc:
         raise HTTPException(
@@ -787,7 +802,6 @@ def list_runs(
     cursor_scope = (
         f"{operator.cursor_scope}:{view}:{retention.terminal_board_days}"
     )
-    observed_at = datetime.now(timezone.utc)
     after = None
     if cursor:
         payload = _decode_cursor(cursor, kind="runs", scope=cursor_scope)
@@ -811,6 +825,8 @@ def list_runs(
                 status_code=410,
                 detail={"code": "cursor_expired", "cursor_reset": True},
             ) from exc
+    else:
+        observed_at = _schedule_now_utc()
     with _store_lease() as store:
         runs = list(
             _authorized_runs(
@@ -839,7 +855,7 @@ def list_runs(
         })
     return {
         "schema_version": 1,
-        "runs": sanitize_projection(page),
+        "runs": [public_run_projection(item, now=observed_at) for item in page],
         "next_cursor": next_cursor,
     }
 
@@ -852,34 +868,70 @@ class StartRunRequest(BaseModel):
     values: dict[str, str] = Field(default_factory=dict)
     idempotency_key: str = Field(..., min_length=1, max_length=512)
     concurrency_policy: Literal["queue", "allow", "forbid"] = "queue"
+    schedule_at: object | None = Field(
+        None,
+        json_schema_extra={
+            "anyOf": [
+                {"type": "string", "format": "date-time"},
+                {"type": "null"},
+            ]
+        },
+    )
 
-    @model_validator(mode="after")
-    def validate_bounds(self):
-        if not self.workflow.strip():
+    @model_validator(mode="before")
+    @classmethod
+    def redact_invalid_values_for_validation(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        if "values" not in data:
+            return data
+        values = data.get("values")
+        values_are_valid = isinstance(values, dict)
+        if values_are_valid:
+            for name, value in values.items():
+                if not isinstance(name, str) or not isinstance(value, str):
+                    values_are_valid = False
+                    break
+                try:
+                    name.encode("utf-8")
+                    value.encode("utf-8")
+                except UnicodeEncodeError:
+                    values_are_valid = False
+                    break
+
+        if values_are_valid:
+            from plugins.workflow.catalog_api import (
+                desktop_input_name_is_representable,
+            )
+            from plugins.workflow.sanitize import workflow_input_names_are_portable
+
+            values_are_valid = (
+                len(values) <= 64
+                and workflow_input_names_are_portable(values)
+                and all(desktop_input_name_is_representable(name) for name in values)
+            )
+        if values_are_valid:
+            return data
+
+        # A model-level error includes the whole request. Let Pydantic reject
+        # one safe field sentinel instead of retaining any raw input values.
+        safe_data = dict(data)
+        safe_data["values"] = None
+        return safe_data
+
+    @field_validator("workflow")
+    @classmethod
+    def validate_workflow_nonblank(cls, value: str) -> str:
+        if not value.strip():
             raise ValueError("workflow must not be blank")
-        if not self.idempotency_key.strip():
+        return value
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_idempotency_key_nonblank(cls, value: str) -> str:
+        if not value.strip():
             raise ValueError("idempotency_key must not be blank")
-        if len(self.values) > 64:
-            raise ValueError("values contains too many entries")
-        total = 0
-        from plugins.workflow.catalog_api import (
-            desktop_input_name_is_representable,
-        )
-        from plugins.workflow.sanitize import workflow_input_names_are_portable
-
-        if not workflow_input_names_are_portable(self.values):
-            raise ValueError("value names must be portable and distinct")
-
-        for key, value in self.values.items():
-            if not desktop_input_name_is_representable(key):
-                raise ValueError("value names must be bounded non-empty text")
-            encoded = value.encode("utf-8")
-            if len(encoded) > 64 * 1024:
-                raise ValueError("value exceeds the API input limit")
-            total += len(key.encode("utf-8")) + len(encoded)
-        if total > 256 * 1024:
-            raise ValueError("values exceed the aggregate API input limit")
-        return self
+        return value
 
 
 @router.post("/runs", status_code=202)
@@ -893,7 +945,9 @@ def post_runs(
     from plugins.workflow.api_admission import (
         ApiAdmissionAuthority,
         ApiAdmissionError,
+        normalize_api_schedule_at,
         start_api_run,
+        validate_api_value_bounds,
     )
 
     authority = ApiAdmissionAuthority(
@@ -906,6 +960,12 @@ def post_runs(
         return_route=operator.return_route,
     )
     try:
+        schedule_now_utc = _schedule_now_utc()
+        schedule_at = normalize_api_schedule_at(
+            request.schedule_at,
+            now_utc=schedule_now_utc,
+        )
+        values = validate_api_value_bounds(request.values)
         with _store_lease() as store:
             result = start_api_run(
                 store,
@@ -914,10 +974,12 @@ def post_runs(
                 user_home=Path.home(),
                 workflow_name=request.workflow,
                 catalog_source=request.catalog_source,
-                values=request.values,
+                values=values,
                 idempotency_key=request.idempotency_key,
                 concurrency_policy=request.concurrency_policy,
                 authority=authority,
+                schedule_at=schedule_at,
+                schedule_now_utc=schedule_now_utc,
             )
     except ApiAdmissionError as exc:
         raise HTTPException(
@@ -940,8 +1002,12 @@ def get_run(
 ):
     operator = _verified_operator(request, operator_scope)
     operator.require("read")
+    observed_at = _schedule_now_utc()
     with _store_lease() as store:
-        return sanitize_projection(_load_authorized(store, run_id, operator))
+        return public_run_projection(
+            _load_authorized(store, run_id, operator, now=observed_at),
+            now=observed_at,
+        )
 
 
 def _attention_origin(run: Mapping[str, object]) -> str:
@@ -1342,8 +1408,9 @@ def mutate_run(
     operator = _verified_operator(request_context, operator_scope)
     operator.require("write")
     scope = None if operator.unrestricted else operator.scope
+    observed_at = _schedule_now_utc()
     with _store_lease() as store:
-        current = _load_authorized(store, run_id, operator)
+        current = _load_authorized(store, run_id, operator, now=observed_at)
         if action not in MUTATION_ACTIONS:
             raise HTTPException(status_code=404, detail={"code": "action_not_found"})
         if action in {"approve", "reject", "provide-input", "reconcile"} and (
@@ -1364,13 +1431,16 @@ def mutate_run(
                 status_code=409,
                 detail={
                     "code": "invalid_transition",
-                    "current": sanitize_projection(current),
+                    "current": public_run_projection(current, now=observed_at),
                 },
             )
         if int(current["state_version"]) != request.expected_version:
             raise HTTPException(
                 status_code=409,
-                detail={"code": "stale_state", "current": sanitize_projection(current)},
+                detail={
+                    "code": "stale_state",
+                    "current": public_run_projection(current, now=observed_at),
+                },
             )
         try:
             if action == "approve":
@@ -1465,8 +1535,14 @@ def mutate_run(
                 status_code=409,
                 detail={
                     "code": "stale_state",
-                    "current": sanitize_projection(
-                        _load_authorized(store, run_id, operator)
+                    "current": public_run_projection(
+                        _load_authorized(
+                            store,
+                            run_id,
+                            operator,
+                            now=observed_at,
+                        ),
+                        now=observed_at,
                     ),
                 },
             ) from exc
@@ -1474,4 +1550,7 @@ def mutate_run(
             raise HTTPException(
                 status_code=409, detail={"code": "invalid_transition"}
             ) from exc
-        return sanitize_projection(_load_authorized(store, run_id, operator))
+        return public_run_projection(
+            _load_authorized(store, run_id, operator, now=observed_at),
+            now=observed_at,
+        )

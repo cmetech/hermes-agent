@@ -125,6 +125,7 @@ export interface WorkflowCoordinatorSnapshot {
 }
 
 export interface WorkflowDefinitionInput {
+  max_bytes?: number
   name: string
   required: boolean
   type: string
@@ -139,7 +140,7 @@ export type WorkflowCatalogSource = 'profile' | 'project' | 'showcase'
 export type WorkflowTrustState = 'trusted' | 'untrusted' | 'verified_bundled'
 
 export interface WorkflowRunSupport {
-  reason: 'showcase_cli_required' | 'supported' | 'unsupported_inputs'
+  reason: 'schedule_required' | 'showcase_cli_required' | 'supported' | 'unsupported_inputs'
   supported: boolean
 }
 
@@ -149,6 +150,7 @@ export interface WorkflowDefinition {
   inputs: WorkflowDefinitionInput[]
   name: string
   precedence: 1 | 2 | 3
+  requires_ai?: boolean
   run_support?: WorkflowRunSupport
   source: WorkflowCatalogSource
   supported_inputs: WorkflowDefinitionInputSupport
@@ -207,11 +209,13 @@ export interface WorkflowRunSnapshot {
   health: string
   next_actions: string[]
   pending_interaction?: null | Record<string, unknown>
+  presentation_state?: null | string
   previous_node?: null | string
   provenance?: WorkflowProvenance
   progress: WorkflowProgress
   queue_position?: null | number
   run_id: string
+  schedule_at?: null | string
   state_version: number
   status: string
   restored_to_history?: boolean

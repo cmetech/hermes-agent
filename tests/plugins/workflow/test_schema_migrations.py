@@ -70,7 +70,7 @@ def _schema_manifest(store: RunStore) -> tuple[object, ...]:
 def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
     tmp_path: Path,
 ) -> None:
-    assert _STORE_SCHEMA_VERSION == 13
+    assert _STORE_SCHEMA_VERSION == 14
     manifest = json.loads((FIXTURE / "fixture-manifest.json").read_text())
     _assert_fixture_hashes(manifest)
     expected = manifest["expected"]
@@ -151,6 +151,7 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             "queue_sequence",
             "pause_lane_policy",
             "lane_state",
+            "scheduled_at",
         } <= columns
         tables = {
             row["name"]
@@ -227,6 +228,7 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             "coordinator_wakes_pending",
             "runs_concurrency",
             "runs_coordinator_scan",
+            "runs_scheduled_queue",
             "worker_claims_lease",
             "workflow_notification_dead_letter",
             "workflow_notification_delivery",
@@ -234,6 +236,15 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
             "workflow_notification_fact_run",
             "workflow_notification_retention",
         } <= indexes
+        scheduled_index_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' "
+            "AND name='runs_scheduled_queue'"
+        ).fetchone()[0]
+        assert "".join(scheduled_index_sql.lower().split()) == (
+            "createindexruns_scheduled_queueonruns(scheduled_at,created_at,run_id)"
+            "whereadmission_state='published'andstatus='queued'"
+            "andscheduled_atisnotnull"
+        )
         runs_schema = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='runs'"
         ).fetchone()[0]
@@ -277,6 +288,7 @@ def test_pre_amendment_v209_store_reaches_current_full_schema_idempotently(
     assert migrated["queue_sequence"] is None
     assert migrated["pause_lane_policy"] == "hold"
     assert migrated["lane_state"] == "released"
+    assert migrated["scheduled_at"] is None
     assert queue_counter is not None
     assert int(queue_counter["value"]) >= 0
 

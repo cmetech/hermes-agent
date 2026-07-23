@@ -61,6 +61,10 @@ hermes workflow doctor NAME
 
 Add `--json` for automation-safe output.
 
+### Select a package through the API
+
+For API detail and run requests, a name without `catalog_source` resolves the user-precedence package. To target the verified bundled showcase when it has the same name as a user package, send `catalog_source=showcase`.
+
 ### Desktop state and recovery guide
 
 | State                                     | What Desktop shows                                                        | Operator action                                                             |

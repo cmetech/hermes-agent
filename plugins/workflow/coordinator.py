@@ -28,10 +28,28 @@ from plugins.workflow.lease_clock import (
     lease_is_fresh,
 )
 from plugins.workflow.models import ExecutionFence
+from plugins.workflow.schedule_time import run_is_scheduled_wait
 from tools.managed_process import ProcessIdentity
 
 
 logger = logging.getLogger(__name__)
+_MAX_SWEEP_DELAY_SECONDS = 5.0
+
+
+def _select_sweep_run_ids(
+    ordered_run_ids: list[str],
+    periodic_run_ids: list[str],
+    scheduled_continuation_run_ids: list[str] | None = None,
+) -> list[str]:
+    if len(ordered_run_ids) <= 100:
+        return ordered_run_ids
+    reserved: list[str] = []
+    for run_ids in (periodic_run_ids, scheduled_continuation_run_ids or []):
+        if run_ids and run_ids[0] not in reserved:
+            reserved.append(run_ids[0])
+    return reserved + [
+        run_id for run_id in ordered_run_ids if run_id not in reserved
+    ][: 100 - len(reserved)]
 
 
 class WorkflowCoordinatorService:
@@ -51,6 +69,7 @@ class WorkflowCoordinatorService:
         sweep_backoff_seconds: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0, 60.0),
         utcnow: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        runner_binding=None,
     ) -> None:
         for name, value in (
             ("heartbeat_seconds", heartbeat_seconds),
@@ -87,8 +106,13 @@ class WorkflowCoordinatorService:
         self.sweep_backoff_seconds = tuple(float(value) for value in sweep_backoff_seconds)
         self._utcnow = utcnow or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic
+        self._runner_binding = runner_binding
         self._boot_id = current_boot_id()
         self._notification_repair_due_at = 0.0
+        self._scheduled_sweep_cursor: tuple[str, str] | None = None
+        self._scheduled_sweep_observed_at: datetime | None = None
+        self._scheduled_sweep_queue_sequence_fence: int | None = None
+        self._repair_revalidation_cursor: int | None = None
         self._health_lock = threading.Lock()
         self._health = BackgroundServiceHealth(
             state="starting",
@@ -173,19 +197,25 @@ class WorkflowCoordinatorService:
             eligible_at = self._monotonic() + self.web_election_grace_seconds
         return self._monotonic() >= eligible_at, eligible_at
 
-    @staticmethod
-    def _scheduler(run_store, *, fence: ExecutionFence):
-        from agent.plugin_agent import PluginAgentRunner
+    def _scheduler(self, run_store, *, fence: ExecutionFence):
         from hermes_cli.profiles import get_active_profile_name
         from plugins.workflow.cli import _runtime_config, _scheduler
+        from plugins.workflow import runner_binding as runner_binding_module
 
         runtime = _runtime_config(run_store.hermes_home)
+        binding = (
+            self._runner_binding
+            if self._runner_binding is not None
+            else runner_binding_module.production_workflow_runner_binding()
+        )
         scheduler = _scheduler(
             run_store,
             runtime,
-            agent_runner=PluginAgentRunner(plugin_id="workflow"),
+            runner_binding=binding,
             profile_name=get_active_profile_name(),
             owner_id=f"coordinator:{fence.owner_id}:{fence.owner_epoch}",
+            utcnow=self._utcnow,
+            monotonic=self._monotonic,
         )
         scheduler.execution_fence = fence
         return scheduler
@@ -301,22 +331,87 @@ class WorkflowCoordinatorService:
             now=now,
             limit=100,
         )
+        fresh_scheduled, _fresh_scheduled_cursor, _fresh_scheduled_exhausted = (
+            run_store.scheduled_coordinator_candidates(
+                after=None,
+                now=now,
+                limit=100,
+            )
+        )
+        if self._scheduled_sweep_observed_at is None:
+            self._scheduled_sweep_cursor = None
+            (
+                self._scheduled_sweep_observed_at,
+                self._scheduled_sweep_queue_sequence_fence,
+            ) = run_store.scheduled_coordinator_generation(
+                now=now,
+            )
+        scheduled_observed_at = self._scheduled_sweep_observed_at
+        assert scheduled_observed_at is not None
+        scheduled_fence = self._scheduled_sweep_queue_sequence_fence
+        assert scheduled_fence is not None
+        scheduled_continuation, _scheduled_cursor, scheduled_exhausted = (
+            run_store.scheduled_coordinator_candidates(
+                after=self._scheduled_sweep_cursor,
+                now=scheduled_observed_at,
+                through_queue_sequence=scheduled_fence,
+                limit=100,
+            )
+        )
+        scheduled_by_run = {
+            str(row["run_id"]): row
+            for row in (*fresh_scheduled, *scheduled_continuation)
+        }
         periodic, _page_cursor, page_exhausted = run_store.coordinator_candidates(
             after=cursor,
+            now=now,
             limit=100,
         )
         wake_by_run: dict[str, list[object]] = {}
         for wake in wakes:
             wake_by_run.setdefault(wake.run_id, []).append(wake)
-        wake_run_ids = list(wake_by_run)
         periodic_by_run = {str(row["run_id"]): row for row in periodic}
-        ordered_run_ids = wake_run_ids + [
-            run_id for run_id in periodic_by_run if run_id not in wake_by_run
+        indexed_by_run = {**scheduled_by_run, **periodic_by_run}
+        uncorroborated_wake_ids: list[str] = []
+        for run_id in wake_by_run:
+            if run_id in indexed_by_run:
+                continue
+            try:
+                projection = run_store.load_run(run_id)
+                run_store._scheduled_at_from_projection(projection)
+                created_at = str(projection["created_at"])
+            except Exception:
+                uncorroborated_wake_ids.append(run_id)
+            else:
+                if run_is_scheduled_wait(projection, observed=now):
+                    for wake in wake_by_run[run_id]:
+                        coordinator_store.complete_wake(
+                            wake.generation,
+                            identity,
+                            epoch=epoch,
+                            now=self._utcnow().astimezone(timezone.utc),
+                            outcome="scheduled_not_due",
+                        )
+                    continue
+                indexed_by_run[run_id] = {
+                    "run_id": run_id,
+                    "created_at": created_at,
+                }
+        indexed_run_ids = [
+            str(row["run_id"])
+            for row in sorted(
+                indexed_by_run.values(),
+                key=lambda row: (str(row["created_at"]), str(row["run_id"])),
+            )
         ]
+        ordered_run_ids = _select_sweep_run_ids(
+            uncorroborated_wake_ids + indexed_run_ids,
+            [str(row["run_id"]) for row in periodic],
+            [str(row["run_id"]) for row in scheduled_continuation],
+        )
         actionable_work = False
         progress_at: datetime | None = None
         processed_runs: set[str] = set()
-        processed_periodic_cursor = cursor
         for run_id in ordered_run_ids:
             if self._monotonic() >= deadline:
                 break
@@ -324,7 +419,11 @@ class WorkflowCoordinatorService:
             run_actionable = False
             try:
                 before = run_store.load_run(run_id)
-                if before.get("execution_mode") == "foreground":
+                run_store._scheduled_at_from_projection(before)
+                scheduled_not_due = run_is_scheduled_wait(before, observed=now)
+                if scheduled_not_due:
+                    outcome = "scheduled_not_due"
+                elif before.get("execution_mode") == "foreground":
                     try:
                         run_store.adopt_expired_foreground(run_id, fence, now)
                     except ForegroundExecutionConflict:
@@ -333,9 +432,11 @@ class WorkflowCoordinatorService:
                         before = run_store.load_run(run_id)
                         outcome = "foreground_adopted"
                         run_actionable = True
-                if before.get("execution_mode") == "background" and before.get(
-                    "status"
-                ) in {"queued", "running", "waiting_retry"}:
+                if (
+                    not scheduled_not_due
+                    and before.get("execution_mode") == "background"
+                    and before.get("status") in {"queued", "running", "waiting_retry"}
+                ):
                     stalled = run_store.record_stall_if_due(
                         run_id,
                         fence=fence,
@@ -373,15 +474,47 @@ class WorkflowCoordinatorService:
                     now=self._utcnow().astimezone(timezone.utc),
                     outcome=outcome,
                 )
+        (
+            repair_candidate,
+            repair_cursor,
+            repair_page_exhausted,
+        ) = run_store.repair_revalidation_candidate(
+            after=self._repair_revalidation_cursor,
+        )
+        if repair_candidate is not None:
+            if run_store.revalidate_run_repair(
+                str(repair_candidate["run_id"]),
+                str(repair_candidate["reason_code"]),
+            ):
+                actionable_work = True
+                progress_at = self._utcnow().astimezone(timezone.utc)
+            self._repair_revalidation_cursor = repair_cursor
+        elif repair_page_exhausted:
+            self._repair_revalidation_cursor = None
+        else:
+            self._repair_revalidation_cursor = repair_cursor
         processed_page = True
+        processed_periodic_cursor = cursor
         for row in periodic:
-            if str(row["run_id"]) not in processed_runs:
+            run_id = str(row["run_id"])
+            if run_id not in processed_runs:
                 processed_page = False
                 break
-            processed_periodic_cursor = (
-                str(row["created_at"]),
-                str(row["run_id"]),
-            )
+            processed_periodic_cursor = (str(row["created_at"]), run_id)
+        scheduled_processed = True
+        scheduled_cursor = self._scheduled_sweep_cursor
+        for row in scheduled_continuation:
+            run_id = str(row["run_id"])
+            if run_id not in processed_runs:
+                scheduled_processed = False
+                break
+            scheduled_cursor = (str(row["created_at"]), run_id)
+        if scheduled_exhausted and scheduled_processed:
+            self._scheduled_sweep_cursor = None
+            self._scheduled_sweep_observed_at = None
+            self._scheduled_sweep_queue_sequence_fence = None
+        else:
+            self._scheduled_sweep_cursor = scheduled_cursor
         next_cursor = (
             None
             if page_exhausted and processed_page
@@ -398,6 +531,10 @@ class WorkflowCoordinatorService:
         identity: CoordinatorIdentity,
         epoch: int,
     ) -> bool:
+        self._scheduled_sweep_cursor = None
+        self._scheduled_sweep_observed_at = None
+        self._scheduled_sweep_queue_sequence_fence = None
+        self._repair_revalidation_cursor = None
         scheduler = self._scheduler(
             run_store,
             fence=ExecutionFence(identity.owner_id, epoch),
@@ -434,9 +571,9 @@ class WorkflowCoordinatorService:
                             backoff_index + 1,
                             len(self.sweep_backoff_seconds) - 1,
                         )
-                    next_sweep = (
-                        self._monotonic()
-                        + self.sweep_backoff_seconds[backoff_index]
+                    next_sweep = self._monotonic() + min(
+                        self.sweep_backoff_seconds[backoff_index],
+                        _MAX_SWEEP_DELAY_SECONDS,
                     )
 
                 now_monotonic = self._monotonic()
@@ -477,6 +614,7 @@ class WorkflowCoordinatorService:
                     )
 
                 wait_for = min(
+                    _MAX_SWEEP_DELAY_SECONDS,
                     max(0.001, heartbeat_due - self._monotonic()),
                     max(0.001, next_sweep - self._monotonic())
                     if future is None
