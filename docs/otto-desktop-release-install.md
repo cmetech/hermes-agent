@@ -236,3 +236,5 @@ Real install testing surfaced several places that pointed at upstream Hermes. Al
 - Design of record: `docs/superpowers/specs/2026-07-12-otto-desktop-release-install-design.md`
 - OTTO customization surface + merge rules: workspace `CLAUDE.md`
 - Run OTTO from source (dev): `hermes-agent/DEV.md`
+- Workflow v3.0.3 Windows release UAT:
+  `docs/2026-07-23-workflow-v3.0.3-windows-uat.md`
