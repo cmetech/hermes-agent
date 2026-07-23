@@ -2135,6 +2135,7 @@ upstream_changes:
   - tests/plugins/workflow/test_catalog_api.py
   owned_symbols:
   - catalog showcase verification log signal
+  - exact class-only catalog log assertions
   - workflow_catalog_run_support input_support reuse
   tests:
   - tests/plugins/workflow/test_catalog_api.py
@@ -2143,7 +2144,8 @@ upstream_changes:
   merge_guidance: >-
     Preserve fail-closed showcase omission while logging only the verification
     exception class: absent bundle directories are informational and all other
-    verification failures are warnings. Never log bundle paths or exception text.
+    verification failures are warnings. Assert the exact class-only message in
+    tests; never log bundle paths or exception text.
     Reuse the already computed input-support classification in catalog and detail
     projections so each row performs one input projection.
   removal_condition: Remove when upstream provides equivalent sanitized showcase
@@ -2713,7 +2715,10 @@ upstream_changes:
   owned_symbols:
   - authenticated one-shot scheduling middleware E2E
   - scheduled early-wake zero-execution proof
+  - singleton completed run_admitted wake proof
   - scheduled checkpoint exactly-once proof
+  - successful schedule-revalidation projection and promotion proof
+  - singleton terminal run_succeeded reconstruction proof
   - cancel-before-fire retained-evidence proof
   - coordinator restart and index-reconstruction scheduling parity
   - scheduled AI fire-time capability matrix

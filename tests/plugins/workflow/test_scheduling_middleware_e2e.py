@@ -335,12 +335,15 @@ def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
         assert runner.requests == []
         assert _ProviderTrap.requests == 0
         with store._connect() as connection:
-            wake = connection.execute(
-                "SELECT outcome, completed_at FROM coordinator_wakes WHERE run_id=?",
+            wakes = connection.execute(
+                "SELECT reason_code, outcome, completed_at "
+                "FROM coordinator_wakes WHERE run_id=?",
                 (run_id,),
-            ).fetchone()
-        assert wake["outcome"] == "scheduled_not_due"
-        assert wake["completed_at"] is not None
+            ).fetchall()
+        assert len(wakes) == 1
+        assert wakes[0]["reason_code"] == "run_admitted"
+        assert wakes[0]["outcome"] == "scheduled_not_due"
+        assert wakes[0]["completed_at"] is not None
         assert (
             coordinator.pending_wakes(identity, epoch=epoch, now=clocks.wall, limit=100)
             == ()
@@ -354,7 +357,13 @@ def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
         terminal = _wait_for_terminal(store, run_id)
 
         assert terminal["status"] == "succeeded"
-        assert len(_run_events(store, run_id, "run_promoted")) == 1
+        assert terminal["schedule_revalidation"] == {
+            "execution_identity": terminal["run_metadata"]["execution_identity"],
+            "admission_state_version": 1,
+        }
+        promoted = _run_events(store, run_id, "run_promoted")
+        assert len(promoted) == 1
+        assert promoted[0]["payload"] == {"schedule_revalidated": True}
         assert len(_run_events(store, run_id, "node_succeeded")) == 1
         artifact = next(
             item
@@ -531,6 +540,7 @@ def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
         assert terminal["run_metadata"]["schedule_at"] == schedule_at
         assert len(_run_events(rebuilt, run_id, "run_promoted")) == 1
         assert len(_run_events(rebuilt, run_id, "node_succeeded")) == 1
+        assert len(_run_events(rebuilt, run_id, "run_succeeded")) == 1
         assert runner.requests == []
         assert _ProviderTrap.requests == 0
     finally:

@@ -557,12 +557,15 @@ def test_workflow_catalog_missing_bundle_degrades_to_user_rows(
     assert not any(
         item.get("source") == "showcase" for item in response.json()["items"]
     )
-    assert any(
-        record.name == "plugins.workflow.catalog_api"
-        and record.levelno == logging.INFO
-        and "FileNotFoundError" in record.getMessage()
+    signals = [
+        record.getMessage()
         for record in caplog.records
-    )
+        if record.name == "plugins.workflow.catalog_api"
+        and record.levelno == logging.INFO
+    ]
+    assert signals == [
+        "workflow showcase catalog verification unavailable: FileNotFoundError"
+    ]
 
 
 def test_workflow_catalog_tamper_invalidates_cache_and_omits_entire_bundle(
@@ -620,8 +623,9 @@ def test_workflow_catalog_tamper_invalidates_cache_and_omits_entire_bundle(
         if record.name == "plugins.workflow.catalog_api"
         and record.levelno == logging.WARNING
     ]
-    assert any("ShowcaseCatalogError" in message for message in warnings)
-    assert all(str(copied) not in message for message in warnings)
+    assert warnings == [
+        "workflow showcase catalog verification failed: ShowcaseCatalogError"
+    ]
 
 
 def test_workflow_catalog_and_detail_project_inputs_once_per_row(
