@@ -2790,8 +2790,12 @@ upstream_changes:
   change_class: workflow-documentation
   owner: workflow-orchestration
   files:
+  - .superpowers/sdd/revision-7-adversarial-remediation-report.md
+  - docs/backlog/v3.0.3-release-review-deferrals.md
   - docs/reviews/2026-07-23-workflow-v3.0.3-verification.md
   owned_symbols:
+  - Workflow v3.0.3 Revision 7 adversarial remediation evidence
+  - adversarial lower-confidence and pre-existing disposition register
   - Workflow v3.0.3 Revision 7 final verification mapping
   - failure-table-to-test mapping
   - final gate and baseline-delta evidence
@@ -2809,9 +2813,11 @@ upstream_changes:
   upstream_candidate: true
   merge_guidance: >-
     Preserve the exact release-gate counts and SHA evidence, named-coverage and
-    failure-table mappings, carried-finding dispositions, exact paired-brand
-    rehearsal SHA, and honest manual-only status together. Deferred backlog files
-    are non-normative and must not be interpreted as widening Revision 7.
+    failure-table mappings, accepted adversarial remediation evidence,
+    carried-finding and lower-confidence/pre-existing dispositions, exact
+    paired-brand rehearsal SHA, and honest manual-only status together.
+    Deferred backlog files are non-normative and must not be interpreted as
+    widening Revision 7.
   removal_condition: Remove after equivalent v3.0.3 verification evidence and
     deferred-work dispositions are carried in the upstream release record.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
