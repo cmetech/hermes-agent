@@ -72,6 +72,7 @@ upstream_changes:
   owner: workflow-orchestration
   files:
   - .superpowers/sdd/task-2-report.md
+  - .superpowers/sdd/task-6-report.md
   - .github/workflows/ci.yml
   - plugins/workflow/api_admission.py
   - plugins/workflow/catalog_api.py
@@ -95,9 +96,11 @@ upstream_changes:
   - assess_package_execution
   - production_workflow_runner_binding
   - raw authenticated showcase cache
+  - catalog, detail, and admission verified showcase cache reuse
   - context-specific compatibility and risk projection
   - coordinator runner-binding injection
   - fire-time AI entitlement corroboration
+  - scheduled fire-time forced showcase verification
   tests:
   - tests/plugins/workflow/test_runner_binding.py
   - tests/plugins/workflow/test_ai_entitlement.py
@@ -119,6 +122,11 @@ upstream_changes:
     runs must admit; incapable contexts must return the typed compatibility
     refusal before any durable residue or provider traffic. Keep capability
     selection internal and reject caller-supplied runner or capability authority.
+    Let catalog, detail, and admission share one context-free authenticated
+    showcase cache entry, while every warm hit recomputes the live bundle tree
+    signature under the generation guard before restoring cached bytes. Reserve
+    forced full verification for scheduled fire-time revalidation; admission
+    must still recompute compatibility and risk for its current execution context.
   removal_condition: Remove when upstream provides an equivalent immutable
     runner binding, context-derived compatibility projection, raw-only showcase
     cache, and fail-closed capability admission across every execution surface.

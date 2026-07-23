@@ -26,6 +26,7 @@ from plugins.workflow.runner_binding import (
     WorkflowRunnerBinding,
     execution_capability_context,
 )
+import plugins.workflow.api_admission as api_admission_module
 import plugins.workflow.showcase as showcase_module
 import plugins.workflow.runner_binding as runner_binding_module
 import plugins.workflow.coordinator as coordinator_module
@@ -377,6 +378,91 @@ def test_same_raw_cache_recomputes_capable_and_incapable_showcase_projections(
     assert capable_detail["risk_summary"]["risk_digest"] != (
         incapable_detail["risk_summary"]["risk_digest"]
     )
+
+
+def test_showcase_admission_reuses_signature_checked_verified_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    home = tmp_path / "home"
+    capable = _binding(runtime_managed=True)
+    initial_catalog, _ = build_workflow_catalog(
+        hermes_home=home,
+        workdir=tmp_path,
+        runner_binding=capable,
+    )
+    cache_entry = next(iter(showcase_module._VERIFIED_SHOWCASE_CACHE.values()))
+    generation = showcase_module._VERIFIED_SHOWCASE_CACHE_GENERATION
+    verification_calls = 0
+    projection_calls = 0
+    original_verify = showcase_module._verify_and_cache_showcase_packages
+    original_assess = api_admission_module.assess_package_execution
+
+    def counted_verify(*args, **kwargs):
+        nonlocal verification_calls
+        verification_calls += 1
+        return original_verify(*args, **kwargs)
+
+    def counted_assess(*args, **kwargs):
+        nonlocal projection_calls
+        projection_calls += 1
+        return original_assess(*args, **kwargs)
+
+    monkeypatch.setattr(
+        showcase_module,
+        "_verify_and_cache_showcase_packages",
+        counted_verify,
+    )
+    monkeypatch.setattr(
+        api_admission_module,
+        "assess_package_execution",
+        counted_assess,
+    )
+    monkeypatch.setattr(
+        "agent.skill_commands.build_preloaded_skills_prompt",
+        lambda *_args, **_kwargs: ("authenticated ascii skill", ["ascii-art"], []),
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+
+    admitted = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=tmp_path,
+        user_home=tmp_path,
+        workflow_name="ai-extensions",
+        values={},
+        idempotency_key="cached-capable-ai",
+        concurrency_policy="queue",
+        authority=_authority(),
+        catalog_source="showcase",
+        runner_binding=capable,
+    )
+    subsequent_catalog, _ = build_workflow_catalog(
+        hermes_home=home,
+        workdir=tmp_path,
+        runner_binding=capable,
+    )
+    detail = build_workflow_detail(
+        "ai-extensions",
+        hermes_home=home,
+        workdir=tmp_path,
+        catalog_source="showcase",
+        runner_binding=capable,
+    )
+
+    def ai_row(items):
+        return next(item for item in items if item["name"] == "ai-extensions")
+
+    assert verification_calls == 0
+    assert next(iter(showcase_module._VERIFIED_SHOWCASE_CACHE.values())) is cache_entry
+    assert showcase_module._VERIFIED_SHOWCASE_CACHE_GENERATION == generation
+    assert projection_calls == 1
+    assert admitted["status"] in {"queued", "running"}
+    assert ai_row(initial_catalog)["compatibility"]["runnable"] is True
+    assert ai_row(subsequent_catalog)["compatibility"]["runnable"] is True
+    assert detail["compatibility"]["runnable"] is True
 
 
 def test_showcase_admission_uses_server_binding_and_incapable_is_zero_residue(

@@ -243,7 +243,6 @@ def start_api_run(
             verified_showcase = load_verified_showcase_package(
                 workflow_name,
                 read_budget=resource_budget,
-                force_reverify=True,
             )
         except WorkflowResourceCapacityError as exc:
             raise ApiAdmissionError(
