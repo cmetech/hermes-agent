@@ -4238,6 +4238,7 @@ class RunStore:
                         projection,
                         "run_failed",
                         {"reason_code": "schedule_overlap_forbidden"},
+                        defer_notification=True,
                     )
                     self._sync_integrity_index(
                         connection,

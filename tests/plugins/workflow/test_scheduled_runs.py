@@ -16,6 +16,8 @@ from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import ExecutionFence
+from plugins.workflow.notifications import NotificationOutbox
+import plugins.workflow.notifications as notifications_module
 from plugins.workflow.sanitize import public_run_projection
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
@@ -349,6 +351,86 @@ def test_due_scheduled_run_preserves_declared_overlap_policy_before_claim(
         )
     assert claims == 0
     assert store.load_run(active.run_id)["status"] == "running"
+
+
+def test_forbid_overlap_defers_outbox_until_after_promotion_transaction(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clocks = _Clocks(datetime(2026, 1, 3, 12, 0, tzinfo=UTC))
+    store = RunStore(tmp_path / "home", lease_clock=clocks.lease_sample)
+    _leader(store, clocks, name="forbid-overlap-leader")
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="forbid-overlap",
+    )
+    active = _admit(
+        store,
+        package,
+        key="active",
+        schedule_at=None,
+        concurrency_key="shared",
+        concurrency_policy="allow",
+    )
+    due = clocks.wall + timedelta(minutes=1)
+    scheduled = _admit(
+        store,
+        package,
+        key="scheduled",
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        concurrency_key="shared",
+        concurrency_policy="forbid",
+    )
+    clocks.wall = due
+    outbox = NotificationOutbox(store)
+
+    class _FailingNotificationOutbox:
+        def __init__(self, _store) -> None:
+            pass
+
+        def record(self, **kwargs) -> str:
+            raise AssertionError("outbox record called during promotion transaction")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            notifications_module,
+            "NotificationOutbox",
+            _FailingNotificationOutbox,
+        )
+        promoted = store.try_promote_run(scheduled.run_id, now=clocks.wall)
+
+    projection = store.load_run(scheduled.run_id)
+    events = store.tail_events(scheduled.run_id)
+    with store._connect() as connection:
+        claims = connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (scheduled.run_id,)
+        ).fetchone()[0]
+
+    assert promoted is False
+    assert projection["status"] == "failed"
+    assert projection["last_error"]["code"] == "schedule_overlap_forbidden"
+    assert [event["event_type"] for event in events].count("run_failed") == 1
+    assert claims == 0
+    assert store.load_run(active.run_id)["status"] == "running"
+
+    assert outbox.reconcile_journal() == 1
+    facts = outbox.history(run_id=scheduled.run_id)
+    assert len(facts) == 1
+    assert facts[0]["kind"] == "failure"
+    with store._connect() as connection:
+        fact_count = connection.execute(
+            "SELECT COUNT(*) FROM workflow_notification_facts WHERE run_id=?",
+            (scheduled.run_id,),
+        ).fetchone()[0]
+        outbox_count = connection.execute(
+            "SELECT COUNT(*) FROM workflow_notification_outbox WHERE run_id=?",
+            (scheduled.run_id,),
+        ).fetchone()[0]
+    assert (fact_count, outbox_count) == (1, 1)
+    assert outbox.reconcile_journal() == 0
+    assert len(outbox.history(run_id=scheduled.run_id)) == 1
 
 
 def test_backward_wall_jump_restores_scheduled_wait_without_losing_fairness(

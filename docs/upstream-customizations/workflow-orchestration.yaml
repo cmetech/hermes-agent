@@ -2617,8 +2617,10 @@ upstream_changes:
     journal. At due promotion, evaluate the declared overlap policy atomically:
     allow may overlap subject to capacity, queue materializes its original
     position while waiting for the active lane, and forbid records terminal
-    schedule_overlap_forbidden before any node claim. Public list, detail, and
-    mutation projections must derive scheduled_wait only while the canonical
+    schedule_overlap_forbidden before any node claim, deferring outbox
+    projection until after the promotion transaction so terminal evidence
+    remains journal-repairable. Public list, detail, and mutation projections
+    must derive scheduled_wait only while the canonical
     instant is still future. A backward wall jump after a due run materializes
     in the immediate queue must atomically clear its position and blocker while
     preserving the original sequence. Run list status, presentation, retention
