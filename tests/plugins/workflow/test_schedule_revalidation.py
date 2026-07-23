@@ -778,6 +778,36 @@ def test_unchanged_scheduled_user_revalidates_and_runs_once(
     assert len(promoted) == 1
 
 
+def test_scheduled_user_with_catalog_sized_trust_store_promotes(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, _package, run_id, due, _coordinator, identity, epoch, _context = (
+        _admit_scheduled_user(
+            home,
+            workflow_writer,
+            name="scheduled-catalog-sized-trust-store",
+            binding=binding,
+        )
+    )
+    trust = WorkflowTrustStore(home)
+    payload = json.loads(trust.path.read_text(encoding="utf-8"))
+    payload["padding"] = "x" * (1024 * 1024)
+    trust.path.write_text(json.dumps(payload), encoding="utf-8")
+    trust.lock_path.unlink()
+
+    assert 1024 * 1024 < trust.path.stat().st_size < 4 * 1024 * 1024
+
+    result = _advance_with_binding(store, run_id, due, identity, epoch, binding)
+
+    assert result["status"] == "succeeded"
+    assert not trust.lock_path.exists()
+
+
 def test_unscheduled_admission_and_execution_do_not_gain_revalidation_state(
     tmp_path: Path,
     monkeypatch,

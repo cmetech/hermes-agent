@@ -2654,6 +2654,7 @@ upstream_changes:
   change_class: workflow-security
   owner: workflow-orchestration
   files:
+  - .superpowers/sdd/task-4-report.md
   - .github/workflows/ci.yml
   - plugins/workflow/api_admission.py
   - plugins/workflow/runner_binding.py
@@ -2713,7 +2714,10 @@ upstream_changes:
     isolate that failure so an advance-all peer still runs. Preserve exception
     propagation for ordinary and legacy scheduled runs without server admission
     evidence. Valid-but-changed package bytes must still reach promotion-bound
-    full-tree verification. Defer notification writes while the promotion
+    full-tree verification. Keep admission/fire-time trust-store byte bounds in
+    parity through the canonical catalog ceiling, while preserving the one
+    bounded read-only, lock-file-free fire-time snapshot. Defer notification
+    writes while the promotion
     transaction is open and rely on its durable wake/journal reconciliation. A
     crash before promotion may revalidate after restart; a durably correlated
     promotion continues without duplicate promotion or revalidation. Keep immediate

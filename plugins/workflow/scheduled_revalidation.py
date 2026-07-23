@@ -10,7 +10,10 @@ from pathlib import Path
 import re
 from typing import Mapping
 
-from plugins.workflow.catalog_api import resolve_workflow_catalog_package
+from plugins.workflow.catalog_api import (
+    CATALOG_MAX_TRUST_STORE_BYTES,
+    resolve_workflow_catalog_package,
+)
 from plugins.workflow.runner_binding import (
     ExecutionCapabilityContext,
     WorkflowRunnerBinding,
@@ -27,7 +30,6 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RESOURCE_FILE_BYTES = 1024 * 1024
 _RESOURCE_TOTAL_BYTES = 8 * 1024 * 1024
 _RESOURCE_FILES = 512
-_TRUST_STORE_BYTES = 1024 * 1024
 _SOURCE_IDENTITY_CHARS = 512
 _MUTABLE_RUN_FILES = frozenset({
     ".lock",
@@ -357,7 +359,7 @@ def revalidate_scheduled_run(
                 read_budget=budget,
             )
             trust = WorkflowTrustStore(Path(hermes_home)).snapshot_read_only(
-                max_bytes=_TRUST_STORE_BYTES
+                max_bytes=CATALOG_MAX_TRUST_STORE_BYTES
             )
         except ScheduledRunRevalidationError:
             raise
