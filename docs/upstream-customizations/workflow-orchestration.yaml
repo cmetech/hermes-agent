@@ -40,6 +40,10 @@ coverage:
       was re-emitted by 5691622a0a910d830f5cdc5ddb9fea3e0ea19bd7.
   - commit: d3e40b9c7187b57df83886dbcb1fc586a9254ada
     reason: Scratch-only Task 1.7 SDD report untracking cleanup.
+  - commit: 2e6123f44f4941659e78b262c6aa1fa62c6265e9
+    reason: Separate user-requested AI development support materials.
+  - commit: 3cf760eec5ecf2651536a81b30d2df327bb127f7
+    reason: Merge-only commit for the separate AI development support materials.
 upstream_changes:
 - id: brand-aware-version-label
   change_class: branding-generic

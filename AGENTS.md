@@ -4,6 +4,22 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+## Branch Terminology — `base` Is Our Development Main
+
+In this fork's day-to-day development workflow, a developer saying **"main"**
+means the `base` branch unless they explicitly say **literal `main`**,
+`origin/main`, or **upstream main**. Start work from `base`, merge completed
+feature work back into `base`, and treat `base` as the default branch for
+release and branch-cleanup decisions.
+
+The literal `main` branch is synchronization-only. Its sole purpose is to pull
+changes from the Hermes fork and merge those upstream updates into `base`.
+Never develop, commit, start feature branches, target pull requests, build
+releases, or merge feature work on literal `main`. Do not switch to or delete
+branches relative to literal `main` merely because a developer used the
+shorthand "main." When branch intent matters, resolve ambiguous references in
+favor of `base` and verify the relevant refs before mutating Git state.
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a
