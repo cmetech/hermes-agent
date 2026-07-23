@@ -15,6 +15,7 @@ import shutil
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -24,6 +25,7 @@ import pytest
 import yaml
 
 from agent.plugin_agent import PluginAgentRunner, PluginAgentRunResult
+from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.admission import RunAdmissionRequest
 import plugins.workflow.api_admission as api_admission_module
 from plugins.workflow.api_admission import (
@@ -37,11 +39,13 @@ from plugins.workflow.compat import (
     CompatibilityReport,
     assess_compatibility,
 )
+from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import (
     CoordinatorHealthSnapshotError,
     CoordinatorIdentity,
     CoordinatorStore,
 )
+from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
@@ -848,6 +852,68 @@ def test_run_list_and_detail_expose_only_public_schedule_projection(
     assert b"run_metadata" not in canary_detail
 
 
+def test_run_list_uses_one_injected_clock_for_status_and_public_projection(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="scheduled-list-clock")
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    run_id = _start_scheduled_mutation_run(store, package, key="list-clock")
+    second_run_id = _start_scheduled_mutation_run(
+        store, package, key="list-clock-second"
+    )
+    due = datetime.fromisoformat(SCHEDULE_AT.replace("Z", "+00:00"))
+    before_due = due - timedelta(microseconds=1)
+    after_due = due + timedelta(microseconds=1)
+    store._lease_clock = lambda: LeaseClockSample(after_due, 100.0, "list-clock")
+    module = _module()
+    samples = 0
+    request_now = before_due
+
+    def request_clock() -> datetime:
+        nonlocal samples
+        samples += 1
+        return request_now
+
+    @contextmanager
+    def store_lease():
+        yield store
+
+    monkeypatch.setattr(module, "_schedule_now_utc", request_clock)
+    monkeypatch.setattr(module, "_store_lease", store_lease)
+
+    response = TestClient(_app(module.router)).get(
+        "/api/plugins/workflow/runs?view=all&limit=1"
+    )
+
+    assert response.status_code == 200
+    first_page = response.json()
+    item = first_page["runs"][0]
+    assert samples == 1
+    assert item["presentation_state"] == "scheduled_wait"
+    assert item["blocking_reason"] == "scheduled_wait"
+    assert item["queue_position"] is None
+    assert first_page["next_cursor"] is not None
+
+    request_now = after_due
+    second_response = TestClient(_app(module.router)).get(
+        "/api/plugins/workflow/runs?view=all&limit=1"
+        f"&cursor={first_page['next_cursor']}"
+    )
+
+    assert second_response.status_code == 200
+    second_item = second_response.json()["runs"][0]
+    assert samples == 1
+    assert {item["run_id"], second_item["run_id"]} == {run_id, second_run_id}
+    assert second_item["presentation_state"] == "scheduled_wait"
+    assert second_item["blocking_reason"] == "scheduled_wait"
+    assert second_item["queue_position"] is None
+
+
 def _scheduled_mutation_canaries() -> dict[str, str]:
     return {
         "catalog_source": "CATALOG-CANARY",
@@ -909,7 +975,8 @@ def test_scheduled_mutation_success_uses_public_run_projection(
     run_directory = store.run_directory(run_id)
     journal_before = (run_directory / "events.jsonl").read_bytes()
 
-    response = TestClient(_app(_router())).post(
+    client = TestClient(_app(_router()))
+    response = client.post(
         f"/api/plugins/workflow/runs/{run_id}/cancel",
         json={"expected_version": current["state_version"]},
     )
@@ -942,6 +1009,51 @@ def test_scheduled_mutation_success_uses_public_run_projection(
             ).fetchone()[0]
             == 0
         )
+
+    observed_at = datetime.now(timezone.utc)
+    coordinator = CoordinatorStore(restarted.database)
+    lease = coordinator.observe(now=observed_at)
+    assert lease is not None
+    identity = CoordinatorIdentity(
+        owner_id="api-test",
+        host_kind="web",
+        host_instance_id="api-test",
+        pid=1,
+        process_start_time=None,
+    )
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(host_kind="web", host_instance_id="api-test"),
+        hermes_home=home,
+        utcnow=lambda: observed_at,
+    )
+    scheduler = MagicMock()
+    service._sweep_once(
+        restarted,
+        coordinator,
+        identity,
+        lease.epoch,
+        scheduler,
+    )
+    scheduler.submit.assert_not_called()
+    assert coordinator.pending_wakes(
+        identity,
+        epoch=lease.epoch,
+        now=observed_at,
+        limit=100,
+    ) == ()
+    with restarted._connect() as connection:
+        wake_outcomes = {
+            row["outcome"]
+            for row in connection.execute(
+                "SELECT outcome FROM coordinator_wakes WHERE run_id=?", (run_id,)
+            )
+        }
+    assert wake_outcomes == {"not_actionable"}
+
+    cleanup = client.get("/api/plugins/workflow/cleanup/preview?older_than=0d")
+    assert cleanup.status_code == 200
+    assert run_id in cleanup.json()["run_ids"]
+    assert run_directory.is_dir()
 
 
 @pytest.mark.parametrize(

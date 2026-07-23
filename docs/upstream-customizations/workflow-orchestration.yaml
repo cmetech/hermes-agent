@@ -2512,7 +2512,10 @@ upstream_changes:
   - due scheduled allow queue forbid policy preservation
   - schedule_overlap_forbidden terminal evidence
   - due-aware public run presentation
+  - backward-clock scheduled-wait queue dematerialization
+  - request-scoped list status and projection clock
   - cancel-before-due immutable evidence retention
+  - cancelled scheduled wake completion and cleanup eligibility
   - scheduled foreground and retry isolation
   tests:
   - tests/plugins/workflow/test_desktop_api.py
@@ -2532,9 +2535,14 @@ upstream_changes:
     position while waiting for the active lane, and forbid records terminal
     schedule_overlap_forbidden before any node claim. Public list, detail, and
     mutation projections must derive scheduled_wait only while the canonical
-    instant is still future, from the same request-scoped clock where available.
-    Keep ordinary unscheduled promotion, foreground recovery, retry timing, and
-    cleanup retention behavior unchanged.
+    instant is still future. A backward wall jump after a due run materializes
+    in the immediate queue must atomically clear its position and blocker while
+    preserving the original sequence. Run list status, presentation, retention
+    cutoff, and cursor pages must share one server-owned request observation.
+    Cancelled scheduled wakes complete without submission, and the retained
+    evidence enters ordinary terminal cleanup eligibility rather than receiving
+    schedule-specific deletion. Keep ordinary unscheduled promotion, foreground
+    recovery, retry timing, and cleanup retention behavior unchanged.
   removal_condition: Remove when upstream carries equivalent future-scheduled
     isolation across every queued consumer, atomic due-time overlap behavior,
     and cancel-before-fire evidence retention.

@@ -351,6 +351,63 @@ def test_due_scheduled_run_preserves_declared_overlap_policy_before_claim(
     assert store.load_run(active.run_id)["status"] == "running"
 
 
+def test_backward_wall_jump_restores_scheduled_wait_without_losing_fairness(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 1, 3, 13, 0, tzinfo=UTC))
+    store = RunStore(tmp_path / "home", lease_clock=clocks.lease_sample)
+    _leader(store, clocks, name="backward-wait-leader")
+    package = _package(
+        workflow_writer,
+        tmp_path / "backward-package",
+        name="backward-scheduled-wait",
+    )
+    active = _admit(
+        store,
+        package,
+        key="active",
+        schedule_at=None,
+        concurrency_key="shared",
+        concurrency_policy="allow",
+    )
+    due = clocks.wall + timedelta(minutes=1)
+    scheduled = _admit(
+        store,
+        package,
+        key="scheduled",
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        concurrency_key="shared",
+        concurrency_policy="queue",
+    )
+    original_sequence = store.load_run(scheduled.run_id)["queue_sequence"]
+
+    clocks.wall = due
+    assert store.try_promote_run(scheduled.run_id, now=clocks.wall) is False
+    blocked = store.load_run(scheduled.run_id)
+    assert blocked["queue_position"] == original_sequence
+    assert blocked["blocked_by_run_id"] == active.run_id
+
+    clocks.wall = due - timedelta(microseconds=1)
+    assert store.try_promote_run(scheduled.run_id, now=clocks.wall) is False
+    waiting = store.load_run(scheduled.run_id)
+    assert waiting["queue_sequence"] == original_sequence
+    assert waiting["queue_position"] is None
+    assert waiting["blocked_by_run_id"] is None
+    with store._connect() as connection:
+        indexed = connection.execute(
+            "SELECT queue_sequence, queue_position, blocked_by_run_id "
+            "FROM runs WHERE run_id=?",
+            (scheduled.run_id,),
+        ).fetchone()
+    assert tuple(indexed) == (original_sequence, None, None)
+    public = public_run_projection(
+        store.get_run_status(scheduled.run_id), now=clocks.wall
+    )
+    assert public["presentation_state"] == "scheduled_wait"
+    assert public["blocking_reason"] == "scheduled_wait"
+
+
 def test_scheduled_run_uses_existing_retry_clock_only_after_it_fires(
     tmp_path: Path,
     workflow_writer,

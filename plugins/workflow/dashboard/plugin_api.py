@@ -794,7 +794,6 @@ def list_runs(
     cursor_scope = (
         f"{operator.cursor_scope}:{view}:{retention.terminal_board_days}"
     )
-    observed_at = datetime.now(timezone.utc)
     after = None
     if cursor:
         payload = _decode_cursor(cursor, kind="runs", scope=cursor_scope)
@@ -818,6 +817,8 @@ def list_runs(
                 status_code=410,
                 detail={"code": "cursor_expired", "cursor_reset": True},
             ) from exc
+    else:
+        observed_at = _schedule_now_utc()
     with _store_lease() as store:
         runs = list(
             _authorized_runs(

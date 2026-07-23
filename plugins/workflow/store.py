@@ -3937,7 +3937,28 @@ class RunStore:
                     if now is None:
                         raise ValueError("now is required for scheduled promotion")
                     if rfc3339_instant_is_after(scheduled_at, now):
-                        connection.rollback()
+                        if (
+                            projection.get("queue_position") is not None
+                            or projection.get("blocked_by_run_id") is not None
+                        ):
+                            projection["queue_position"] = None
+                            projection["blocked_by_run_id"] = None
+                            self._append_locked(
+                                directory,
+                                projection,
+                                "run_scheduled_wait",
+                                {"reason_code": "clock_before_schedule"},
+                            )
+                            self._sync_integrity_index(
+                                connection,
+                                projection=projection,
+                                journal_sha256=_sha256(
+                                    (directory / "events.jsonl").read_bytes()
+                                ),
+                            )
+                            connection.commit()
+                        else:
+                            connection.rollback()
                         return False
                 sequence = row["queue_sequence"]
                 if sequence is None:
@@ -4442,7 +4463,9 @@ class RunStore:
             run_id = str(row["run_id"])
             try:
                 result = self.get_run_status(
-                    run_id, operator_scope=operator_scope
+                    run_id,
+                    operator_scope=operator_scope,
+                    now=observed_at,
                 )
             except (
                 JournalRecoveryError,
@@ -5232,13 +5255,26 @@ class RunStore:
                 connection.close()
 
     def get_run_status(
-        self, run_id: str, *, operator_scope: str | None = None
+        self,
+        run_id: str,
+        *,
+        operator_scope: str | None = None,
+        now: datetime | None = None,
     ) -> dict[str, object]:
         run = self.load_run(run_id, operator_scope=operator_scope)
         if not isinstance(run.get("provenance"), Mapping):
             run["provenance"] = legacy_projection_provenance(run)
         observed_sample = self._lease_clock()
-        observed_at = observed_sample.utc_now
+        observed_at = now or observed_sample.utc_now
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        observed_at = observed_at.astimezone(timezone.utc)
+        if now is not None:
+            observed_sample = LeaseClockSample(
+                observed_at,
+                observed_sample.monotonic_now,
+                observed_sample.boot_id,
+            )
         nodes = run.get("nodes", {})
         node_values = list(nodes.values()) if isinstance(nodes, dict) else []
         completed = sum(
