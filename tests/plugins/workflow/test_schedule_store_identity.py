@@ -506,6 +506,59 @@ def test_genuine_v13_migration_backfills_schedule_and_is_idempotent(
     assert _indexed_run(reopened, run_id)["scheduled_at"] == SCHEDULE_AT
 
 
+def test_v13_migration_scopes_uncorroborated_published_evidence_to_one_run(
+    tmp_path: Path, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home, max_executing_runs=0)
+    healthy_run_id = _admit_scheduled(
+        store, workflow_writer, tmp_path, name="scheduled-v13-healthy"
+    )
+    damaged_run_id = _admit_scheduled(
+        store, workflow_writer, tmp_path, name="scheduled-v13-damaged"
+    )
+    with store._connect() as connection:
+        generation = connection.execute(
+            "SELECT value FROM store_metadata WHERE key='generation'"
+        ).fetchone()["value"]
+
+    _downgrade_to_v13_without_schedule(store)
+    damaged_projection_path = store.run_directory(damaged_run_id) / "run.json"
+    damaged_projection = json.loads(
+        damaged_projection_path.read_text(encoding="utf-8")
+    )
+    damaged_projection["run_metadata"]["schedule_at"] = CORRUPT_SCHEDULE_AT
+    damaged_projection_path.write_text(
+        json.dumps(damaged_projection), encoding="utf-8"
+    )
+
+    restarted = RunStore(home, max_executing_runs=0)
+
+    with restarted._connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert (
+            connection.execute(
+                "SELECT value FROM store_metadata WHERE key='generation'"
+            ).fetchone()["value"]
+            == generation
+        )
+    assert not tuple(restarted.quarantine_root.glob("admission-index-*"))
+    assert _indexed_run(restarted, healthy_run_id)["scheduled_at"] == SCHEDULE_AT
+    assert _indexed_run(restarted, damaged_run_id)["scheduled_at"] is None
+    assert damaged_projection_path.is_file()
+    assert restarted._active_run_repair_reasons(healthy_run_id) == ()
+    assert restarted._active_run_repair_reasons(damaged_run_id) == (
+        "run_evidence_uncorroborated",
+    )
+    assert restarted.storage_health() == {"status": "healthy", "reasons": []}
+
+    unrelated_run_id = _admit_scheduled(
+        restarted, workflow_writer, tmp_path, name="scheduled-v13-unrelated"
+    )
+    assert _indexed_run(restarted, unrelated_run_id)["scheduled_at"] == SCHEDULE_AT
+
+
 def _schema_sql(store: RunStore) -> tuple[tuple[str, str, str], ...]:
     with store._connect() as connection:
         return tuple(

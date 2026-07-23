@@ -2434,6 +2434,7 @@ upstream_changes:
   change_class: workflow-runtime
   owner: workflow-orchestration
   files:
+  - .superpowers/sdd/task-5-remediation-report.md
   - plugins/workflow/store.py
   - scripts/test_workflow_merge_gate.sh
   - tests/plugins/workflow/test_installed_distribution_e2e.py
@@ -2447,6 +2448,7 @@ upstream_changes:
   - scheduled namespace and journal reconstruction
   - reserved scheduled migration composition
   - incomplete reserved namespace carry-through
+  - published scheduled backfill fault isolation
   - namespace migration run-before-SQL lock order
   - deterministic namespace lock-order probe
   tests:
@@ -2464,6 +2466,10 @@ upstream_changes:
     recovery. Namespace rebuilds must never copy a source SQL scheduled_at value.
     Backfill corroborated final evidence for both published and reserved rows,
     while leaving incomplete reserved rows for normal reservation reconciliation.
+    During v13-to-v14 backfill, leave uncorroborated published rows indexed with
+    a null derived schedule for ordinary run-scoped reconciliation; preserve the
+    admission index and generation, avoid global repair, and keep unrelated
+    admission usable.
     When legacy namespace migration encounters an uncorroborated reserved row
     whose final run directory is absent, retain its conflict-safe start digest,
     derive its namespace, force the scheduled query value to null, and carry

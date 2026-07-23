@@ -1210,12 +1210,8 @@ class RunStore:
                 ValueError,
                 json.JSONDecodeError,
                 JournalRecoveryError,
-            ) as exc:
-                if row["admission_state"] == "reserved":
-                    continue
-                raise sqlite3.DatabaseError(
-                    "scheduled run migration evidence is uncorroborated"
-                ) from exc
+            ):
+                continue
             connection.execute(
                 "UPDATE runs SET scheduled_at=? WHERE run_id=?",
                 (scheduled_at, row["run_id"]),
