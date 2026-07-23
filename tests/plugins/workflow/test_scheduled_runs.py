@@ -1219,6 +1219,129 @@ def test_unrecoverable_migrated_run_does_not_block_healthy_scheduled_sweep(
     assert repaired_schedule == due
 
 
+@pytest.mark.parametrize(
+    "projection_damage",
+    ("rewritten", "malformed", "wrong-run"),
+)
+def test_v13_migration_revalidates_rewritten_projection_before_later_submission(
+    tmp_path: Path,
+    workflow_writer,
+    projection_damage: str,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 3, 13, 0, tzinfo=UTC))
+    home = tmp_path / "home"
+    store = RunStore(
+        home,
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    coordinator, identity, epoch = _leader(
+        store,
+        clocks,
+        name="migration-projection-recovery",
+    )
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="migration-projection-recovery",
+    )
+    due = (clocks.wall - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    healthy = _admit(store, package, key="healthy", schedule_at=due)
+    damaged = _admit(store, package, key="damaged", schedule_at=due)
+    authoritative = store.load_run(damaged.run_id)
+    _complete_pending_wakes(
+        coordinator,
+        identity,
+        epoch,
+        now=clocks.wall,
+    )
+    damaged_projection_path = store.run_directory(damaged.run_id) / "run.json"
+    if projection_damage in {"rewritten", "wrong-run"}:
+        rewritten = json.loads(damaged_projection_path.read_text(encoding="utf-8"))
+        if projection_damage == "rewritten":
+            rewritten["run_metadata"]["schedule_at"] = (
+                (clocks.wall - timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
+            )
+        else:
+            rewritten["run_id"] = healthy.run_id
+        damaged_projection_path.write_text(json.dumps(rewritten), encoding="utf-8")
+    else:
+        damaged_projection_path.write_bytes(b"{not-json")
+
+    with sqlite3.connect(store.database) as connection:
+        connection.execute("DROP INDEX runs_scheduled_queue")
+        connection.execute("ALTER TABLE runs DROP COLUMN scheduled_at")
+        connection.execute("PRAGMA user_version=13")
+
+    restarted = RunStore(
+        home,
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+
+    with restarted._connect() as connection:
+        rows = {
+            str(row["run_id"]): row
+            for row in connection.execute(
+                "SELECT run_id, admission_state, status, scheduled_at "
+                "FROM runs WHERE run_id IN (?, ?)",
+                (healthy.run_id, damaged.run_id),
+            ).fetchall()
+        }
+    assert tuple(rows[healthy.run_id])[1:] == ("published", "queued", due)
+    assert tuple(rows[damaged.run_id])[1:] == ("published", "queued", None)
+    assert restarted._active_run_repair_reasons(healthy.run_id) == ()
+    assert restarted._active_run_repair_reasons(damaged.run_id) == (
+        "run_evidence_uncorroborated",
+    )
+
+    scheduler = MagicMock()
+    scheduler.submit.return_value = True
+    service = _service(home, clocks)
+
+    service._sweep_once(
+        restarted,
+        coordinator,
+        identity,
+        epoch,
+        scheduler,
+    )
+
+    assert [call.args[0] for call in scheduler.submit.call_args_list] == [
+        healthy.run_id
+    ]
+    scheduler.reset_mock()
+    for _attempt in range(4):
+        clocks.monotonic_value += 1
+        service._sweep_once(
+            restarted,
+            coordinator,
+            identity,
+            epoch,
+            scheduler,
+        )
+        if damaged.run_id in {call.args[0] for call in scheduler.submit.call_args_list}:
+            break
+
+    assert damaged.run_id in {call.args[0] for call in scheduler.submit.call_args_list}
+    assert restarted._active_run_repair_reasons(damaged.run_id) == ()
+    assert (
+        json.loads(damaged_projection_path.read_text(encoding="utf-8")) == authoritative
+    )
+    with restarted._connect() as connection:
+        repaired_schedule = connection.execute(
+            "SELECT scheduled_at FROM runs WHERE run_id=?",
+            (damaged.run_id,),
+        ).fetchone()["scheduled_at"]
+    assert repaired_schedule == due
+    assert any(
+        event["run_id"] == damaged.run_id
+        and event["reason_code"] == "run_evidence_uncorroborated"
+        and event["outcome"] == "repair_verified"
+        for event in restarted.list_repair_events()
+    )
+
+
 def test_restored_legacy_effect_policy_is_revalidated_before_submission(
     tmp_path: Path,
     workflow_writer,

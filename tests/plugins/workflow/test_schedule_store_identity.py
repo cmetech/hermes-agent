@@ -589,6 +589,36 @@ def test_v13_migration_scopes_uncorroborated_published_evidence_to_one_run(
     assert _indexed_run(restarted, unrelated_run_id)["scheduled_at"] == SCHEDULE_AT
 
 
+def test_first_load_after_v13_repair_rebuild_resynchronizes_schedule(
+    tmp_path: Path, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home, max_executing_runs=0)
+    run_id = _admit_scheduled(
+        store, workflow_writer, tmp_path, name="scheduled-v13-first-load"
+    )
+    authoritative = store.load_run(run_id)
+    _downgrade_to_v13_without_schedule(store)
+    projection_path = store.run_directory(run_id) / "run.json"
+    rewritten = json.loads(projection_path.read_text(encoding="utf-8"))
+    rewritten["run_metadata"]["schedule_at"] = CORRUPT_SCHEDULE_AT
+    projection_path.write_text(json.dumps(rewritten), encoding="utf-8")
+
+    migrated = RunStore(home, max_executing_runs=0)
+
+    assert _indexed_run(migrated, run_id)["scheduled_at"] is None
+    assert migrated._active_run_repair_reasons(run_id) == (
+        "run_evidence_uncorroborated",
+    )
+
+    rebuilt = migrated.load_run(run_id)
+
+    assert rebuilt == authoritative
+    assert rebuilt["run_metadata"]["schedule_at"] == SCHEDULE_AT
+    assert _indexed_run(migrated, run_id)["scheduled_at"] == SCHEDULE_AT
+    assert migrated._active_run_repair_reasons(run_id) == ()
+
+
 def _schema_sql(store: RunStore) -> tuple[tuple[str, str, str], ...]:
     with store._connect() as connection:
         return tuple(

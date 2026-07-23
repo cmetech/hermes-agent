@@ -1594,6 +1594,55 @@ class RunStore:
         _atomic_bytes(journal_path, normalized)
         return normalized
 
+    def _adopt_rebuilt_repair_projection(
+        self,
+        directory: Path,
+        *,
+        run_id: str,
+        projection_data: bytes,
+        journal_data: bytes,
+        policy_data: bytes | None,
+    ) -> tuple[dict[str, object], str]:
+        rebuilt = self._rebuild_projection(
+            directory,
+            run_id=run_id,
+            journal_data=journal_data,
+        )
+        rebuilt_data = (
+            json.dumps(
+                rebuilt,
+                sort_keys=True,
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        if (
+            len(rebuilt_data) + len(journal_data) + len(policy_data or b"")
+            > self.max_run_bytes
+        ):
+            raise StorageQuotaError("rebuilt projection exceeds run quota")
+        projection_path = directory / "run.json"
+        journal_path = directory / "events.jsonl"
+        if (
+            self._read_bounded_repair_evidence(
+                projection_path,
+                max_bytes=len(projection_data),
+            )
+            != projection_data
+        ):
+            raise JournalRecoveryError("run projection changed during revalidation")
+        if (
+            self._read_bounded_repair_evidence(
+                journal_path,
+                max_bytes=len(journal_data),
+            )
+            != journal_data
+        ):
+            raise JournalRecoveryError("run journal changed during revalidation")
+        _atomic_bytes(projection_path, rebuilt_data)
+        return rebuilt, _sha256(journal_data)
+
     def revalidate_run_repair(
         self,
         run_id: str,
@@ -1639,14 +1688,27 @@ class RunStore:
                         directory / "policy.yaml",
                         max_bytes=remaining_bytes,
                     )
-                projection, _, journal_sha256 = (
-                    self._corroborate_run_evidence_locked(
+                try:
+                    projection, _, journal_sha256 = (
+                        self._corroborate_run_evidence_locked(
+                            directory,
+                            run_id=run_id,
+                            projection_data=projection_data,
+                            journal_data=journal_data,
+                        )
+                    )
+                except (
+                    JournalRecoveryError,
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                ):
+                    projection, journal_sha256 = self._adopt_rebuilt_repair_projection(
                         directory,
                         run_id=run_id,
                         projection_data=projection_data,
                         journal_data=journal_data,
+                        policy_data=policy_data,
                     )
-                )
                 if journal_sha256 is None:
                     raise JournalRecoveryError("run journal digest is missing")
                 scheduled_at = self._scheduled_at_from_projection(projection)
@@ -3908,11 +3970,18 @@ class RunStore:
                     outcome="repair_required",
                 )
                 raise
+            scheduled_at = self._scheduled_at_from_projection(rebuilt)
             _atomic_json(path, rebuilt)
             with self._connect() as connection:
                 connection.execute(
-                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
-                    (rebuilt["status"], rebuilt["updated_at"], run_id),
+                    "UPDATE runs SET status=?, updated_at=?, scheduled_at=? "
+                    "WHERE run_id=?",
+                    (
+                        rebuilt["status"],
+                        rebuilt["updated_at"],
+                        scheduled_at,
+                        run_id,
+                    ),
                 )
                 self._sync_integrity_index(
                     connection,
