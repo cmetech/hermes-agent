@@ -543,6 +543,19 @@ class RunScheduler:
             sidecar_resources=resources,
         )
 
+    def _prepare_run_package(self, run_id: str, schedule_revalidation):
+        try:
+            package = self._load_run_package(run_id)
+            return package, self._run_execution_limits(package)
+        except Exception:
+            if schedule_revalidation is None:
+                raise
+            self.store._fail_scheduled_package_preparation(
+                run_id,
+                schedule_revalidation,
+            )
+            return None
+
     def _authorize_scheduled_promotion(
         self,
         run_id: str,
@@ -993,8 +1006,10 @@ class RunScheduler:
             )
             if not authorized:
                 return self.store.load_run(run_id)
-        package = self._load_run_package(run_id)
-        execution_limits = self._run_execution_limits(package)
+        prepared_package = self._prepare_run_package(run_id, authorization)
+        if prepared_package is None:
+            return self.store.load_run(run_id)
+        package, execution_limits = prepared_package
         by_id = {node.id: node for node in package.definition.nodes}
         foreground_owner_id, foreground_owner_epoch = self._foreground_claim_token(
             self.store.load_run(run_id)
@@ -1159,14 +1174,21 @@ class RunScheduler:
             authorizations[run_id] = authorization
             authorized_run_ids.append(run_id)
         run_ids = authorized_run_ids
-        packages = {
-            run_id: self._load_run_package(run_id)
-            for run_id in run_ids
-        }
-        execution_limits = {
-            run_id: self._run_execution_limits(package)
-            for run_id, package in packages.items()
-        }
+        packages = {}
+        execution_limits = {}
+        prepared_run_ids = []
+        for run_id in run_ids:
+            prepared_package = self._prepare_run_package(
+                run_id,
+                authorizations[run_id],
+            )
+            if prepared_package is None:
+                continue
+            package, limits = prepared_package
+            packages[run_id] = package
+            execution_limits[run_id] = limits
+            prepared_run_ids.append(run_id)
+        run_ids = prepared_run_ids
         foreground_tokens = {
             run_id: self._foreground_claim_token(self.store.load_run(run_id))
             for run_id in run_ids

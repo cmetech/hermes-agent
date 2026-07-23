@@ -3965,12 +3965,23 @@ class RunStore:
         run_id: str,
         projection: Mapping[str, object],
     ) -> None:
+        verified = self._invalidate_scheduled_promotion_authorization(
+            authorization,
+            run_id,
+        )
+        verified._verify(projection)
+
+    def _invalidate_scheduled_promotion_authorization(
+        self,
+        authorization: object,
+        run_id: str,
+    ) -> _ScheduledPromotionAuthorization:
         verified = self._validate_scheduled_promotion_authorization(
             authorization,
             run_id,
         )
         verified._consumed = True
-        verified._verify(projection)
+        return verified
 
     def _fail_scheduled_revalidation_locked(
         self,
@@ -4043,6 +4054,60 @@ class RunStore:
                     or int(projection.get("state_version", -1))
                     != expected_state_version
                 ):
+                    connection.rollback()
+                    return False
+                self._fail_scheduled_revalidation_locked(
+                    connection,
+                    directory,
+                    projection,
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+        self._notify_coordinator()
+        return True
+
+    def _fail_scheduled_package_preparation(
+        self,
+        run_id: str,
+        authorization: object,
+    ) -> bool:
+        """Consume server authority and fail a queued run whose package cannot load."""
+        directory = self.run_directory(run_id)
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self._invalidate_scheduled_promotion_authorization(
+                    authorization,
+                    run_id,
+                )
+                row = connection.execute(
+                    "SELECT status, scheduled_at FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(run_id)
+                projection = json.loads((directory / "run.json").read_text())
+                scheduled_at = self._scheduled_at_from_projection(
+                    projection,
+                    indexed=row["scheduled_at"],
+                )
+                metadata = projection.get("run_metadata")
+                if (
+                    scheduled_at is None
+                    or not isinstance(metadata, Mapping)
+                    or not isinstance(metadata.get("execution_identity"), str)
+                ):
+                    raise RuntimeError(
+                        "scheduled package failure requires server admission evidence"
+                    )
+                if row["status"] != "queued":
                     connection.rollback()
                     return False
                 self._fail_scheduled_revalidation_locked(

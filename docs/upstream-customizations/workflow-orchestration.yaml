@@ -2575,9 +2575,12 @@ upstream_changes:
   - scheduled_execution_context
   - revalidate_scheduled_run
   - RunScheduler._authorize_scheduled_promotion
+  - RunScheduler._prepare_run_package
   - _ScheduledPromotionAuthorization
   - RunStore._scheduled_promotion_authorization
   - RunStore._consume_scheduled_promotion_authorization
+  - RunStore._invalidate_scheduled_promotion_authorization
+  - RunStore._fail_scheduled_package_preparation
   - RunStore.fail_scheduled_revalidation
   - scheduled promotion authorization correlation
   - schedule_revalidation_failed terminal evidence
@@ -2601,12 +2604,19 @@ upstream_changes:
     authority. Missing, corrupt, revoked, replaced, restamped, or
     capability-incompatible evidence must atomically terminalize as
     schedule_revalidation_failed with zero claims while retaining immutable run
-    evidence. Defer notification writes while the promotion transaction is open and
-    rely on its durable wake/journal reconciliation. A crash before promotion may
-    revalidate after restart; a durably correlated promotion continues without
-    duplicate promotion or revalidation. Keep immediate and unscheduled metadata,
-    start digests, execution, and failure behavior byte-identical, with no
-    caller-supplied capability and no consent or token contract.
+    evidence. If a newly scheduled run's sealed package becomes invalid or
+    unreadable after the eager check but before execution-path package preparation,
+    consume its opaque authorization and record the same typed failure atomically;
+    isolate that failure so an advance-all peer still runs. Preserve exception
+    propagation for ordinary and legacy scheduled runs without server admission
+    evidence. Valid-but-changed package bytes must still reach promotion-bound
+    full-tree verification. Defer notification writes while the promotion
+    transaction is open and rely on its durable wake/journal reconciliation. A
+    crash before promotion may revalidate after restart; a durably correlated
+    promotion continues without duplicate promotion or revalidation. Keep immediate
+    and unscheduled metadata, start digests, execution, and failure behavior
+    byte-identical, with no caller-supplied capability and no consent or token
+    contract.
   removal_condition: Remove when upstream provides equivalent scheduled-only
     read-only fire-time authorization, atomic zero-claim terminal failure, durable
     crash correlation, actual runner/runtime revalidation, and exact release-gate

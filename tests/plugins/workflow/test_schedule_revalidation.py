@@ -1148,6 +1148,235 @@ def test_live_trust_change_after_package_load_fails_at_atomic_promotion(
         )
 
 
+@pytest.mark.parametrize(
+    ("relative_path", "invalid_bytes"),
+    [
+        pytest.param("definition.yaml", b"nodes: [\n", id="definition"),
+        pytest.param("policy.yaml", b"limits: [\n", id="policy"),
+    ],
+)
+def test_invalid_sealed_package_before_single_load_is_terminal(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+    relative_path: str,
+    invalid_bytes: bytes,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, _package, run_id, due, _coordinator, identity, epoch, _context = (
+        _admit_scheduled_user(
+            home,
+            workflow_writer,
+            name="scheduled-invalid-single-load",
+            binding=binding,
+        )
+    )
+    scheduler = RunScheduler(
+        store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=lambda: due,
+    )
+    original_authorize = scheduler._authorize_scheduled_promotion
+    authorization = None
+
+    def authorize_then_corrupt(loaded_run_id: str, projection):
+        nonlocal authorization
+        result = original_authorize(loaded_run_id, projection)
+        authorization = result[1]
+        (store.run_directory(loaded_run_id) / relative_path).write_bytes(invalid_bytes)
+        return result
+
+    monkeypatch.setattr(
+        scheduler,
+        "_authorize_scheduled_promotion",
+        authorize_then_corrupt,
+    )
+    try:
+        result = scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert result["status"] == "failed"
+    assert result["last_error"]["code"] == "schedule_revalidation_failed"
+    assert (store.run_directory(run_id) / relative_path).read_bytes() == invalid_bytes
+    assert authorization is not None
+    with pytest.raises(RuntimeError, match="already consumed"):
+        store._consume_scheduled_promotion_authorization(
+            authorization,
+            run_id,
+            store.load_run(run_id),
+        )
+    with store._connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_valid_changed_definition_after_eager_check_fails_at_promotion_boundary(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, _package, run_id, due, _coordinator, identity, epoch, _context = (
+        _admit_scheduled_user(
+            home,
+            workflow_writer,
+            name="scheduled-valid-changed-load",
+            binding=binding,
+        )
+    )
+    scheduler = RunScheduler(
+        store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=lambda: due,
+    )
+    original_authorize = scheduler._authorize_scheduled_promotion
+
+    def authorize_then_change(loaded_run_id: str, projection):
+        result = original_authorize(loaded_run_id, projection)
+        definition = store.run_directory(loaded_run_id) / "definition.yaml"
+        definition.write_bytes(definition.read_bytes() + b"\n# valid change\n")
+        return result
+
+    monkeypatch.setattr(
+        scheduler,
+        "_authorize_scheduled_promotion",
+        authorize_then_change,
+    )
+    try:
+        result = scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert result["status"] == "failed"
+    assert result["last_error"]["code"] == "schedule_revalidation_failed"
+    with store._connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_invalid_scheduled_package_does_not_abort_valid_advance_all_peer(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, _package, invalid_id, due, _coordinator, identity, epoch, _context = (
+        _admit_scheduled_user(
+            home,
+            workflow_writer,
+            name="scheduled-invalid-batch-load",
+            binding=binding,
+        )
+    )
+    valid_package, _valid_context = _trusted_profile_package(
+        home,
+        workflow_writer,
+        name="scheduled-valid-batch-peer",
+        binding=binding,
+    )
+    valid = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=tmp_path,
+        user_home=tmp_path,
+        workflow_name=valid_package.definition.name,
+        values={},
+        idempotency_key="scheduled-valid-batch-peer",
+        concurrency_policy="queue",
+        authority=_authority(),
+        catalog_source="profile",
+        runner_binding=binding,
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        schedule_now_utc=due - timedelta(seconds=10),
+    )
+    valid_id = str(valid["run_id"])
+    scheduler = RunScheduler(
+        store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=lambda: due,
+    )
+    original_authorize = scheduler._authorize_scheduled_promotion
+    invalid_definition = b"nodes: [\n"
+    invalid_authorization = None
+
+    def authorize_then_corrupt(loaded_run_id: str, projection):
+        nonlocal invalid_authorization
+        result = original_authorize(loaded_run_id, projection)
+        if loaded_run_id == invalid_id:
+            invalid_authorization = result[1]
+            (store.run_directory(loaded_run_id) / "definition.yaml").write_bytes(
+                invalid_definition
+            )
+        return result
+
+    monkeypatch.setattr(
+        scheduler,
+        "_authorize_scheduled_promotion",
+        authorize_then_corrupt,
+    )
+    try:
+        results = scheduler.advance_all([invalid_id, valid_id])
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    invalid_result = store.load_run(invalid_id)
+    assert invalid_result["status"] == "failed"
+    assert invalid_result["last_error"]["code"] == "schedule_revalidation_failed"
+    assert results[valid_id]["status"] == "succeeded"
+    assert (store.run_directory(invalid_id) / "definition.yaml").read_bytes() == (
+        invalid_definition
+    )
+    assert invalid_authorization is not None
+    with pytest.raises(RuntimeError, match="already consumed"):
+        store._consume_scheduled_promotion_authorization(
+            invalid_authorization,
+            invalid_id,
+            store.load_run(invalid_id),
+        )
+    with store._connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (invalid_id,)
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_package_preparation_error_without_server_authorization_propagates(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    scheduler = RunScheduler(RunStore(tmp_path / "home"))
+
+    def fail_load(_run_id: str):
+        raise RuntimeError("ordinary package load failure")
+
+    monkeypatch.setattr(scheduler, "_load_run_package", fail_load)
+    try:
+        with pytest.raises(RuntimeError, match="ordinary package load failure"):
+            scheduler._prepare_run_package("ordinary-or-legacy", None)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+
 def test_projected_revalidation_fields_cannot_forge_promotion_authority(
     tmp_path: Path,
     monkeypatch,
