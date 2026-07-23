@@ -448,14 +448,32 @@ def start_api_run(
         )
         concurrency_key = f"showcase:{verified_showcase.scenario.id}"
     if schedule_at is not None:
+        showcase_scenario_digest = None
+        if verified_showcase is not None:
+            from plugins.workflow.scheduled_revalidation import (
+                showcase_scenario_digest as digest_showcase_scenario,
+            )
+
+            showcase_scenario_digest = digest_showcase_scenario(
+                verified_showcase.scenario
+            )
         run_metadata = {
             **dict(run_metadata or {}),
             "catalog_source": (
                 "showcase" if verified_showcase is not None else str(package.source)
             ),
+            "execution_identity": execution_context.identity_digest,
+            "package_digest": package_digest.sha256,
             "risk_digest": risk.risk_digest,
             "schedule_at": schedule_at,
+            "sealed_definition_digest": hashlib.sha256(
+                (prepared.staging_directory / "definition.yaml").read_bytes()
+            ).hexdigest(),
+            "sealed_input_digest": prepared.input_manifest_digest,
+            "sealed_policy_digest": prepared.policy_digest,
         }
+        if showcase_scenario_digest is not None:
+            run_metadata["showcase_scenario_digest"] = showcase_scenario_digest
 
     admitted = store.start_run(
         RunAdmissionRequest(

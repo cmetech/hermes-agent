@@ -2431,9 +2431,10 @@ upstream_changes:
     through the 512-character durable metadata boundary, rejection of the first
     oversized canonical value, trailing-zero equivalence, and a test-injected
     current instant. Keep
-    schedule-only metadata limited to
-    canonical schedule_at plus server-derived catalog_source and risk_digest;
-    existing top-level definition, policy, and input digests remain authoritative.
+    schedule-only metadata starts with canonical schedule_at plus server-derived
+    catalog_source and risk_digest and is extended only by the exact identities
+    required by workflow-scheduled-fire-time-revalidation; existing top-level
+    definition, policy, and input digests remain authoritative.
     Future runs must publish queued in background without node execution. Equivalent
     offset forms must join one idempotent identity, distinct instants must conflict,
     and journal recovery must reproduce the request digest. Keep unscheduled
@@ -2550,4 +2551,55 @@ upstream_changes:
   removal_condition: Remove when upstream carries equivalent future-scheduled
     isolation across every queued consumer, atomic due-time overlap behavior,
     and cancel-before-fire evidence retention.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-scheduled-fire-time-revalidation
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/runner_binding.py
+  - plugins/workflow/scheduled_revalidation.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/store.py
+  - scripts/test_workflow_merge_gate.sh
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_schedule_revalidation.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - ExecutionCapabilityContext.identity_digest
+  - ScheduledRunRevalidation
+  - ScheduledRunRevalidationError
+  - showcase_scenario_digest
+  - scheduled_execution_context
+  - revalidate_scheduled_run
+  - RunScheduler._authorize_scheduled_promotion
+  - RunStore.fail_scheduled_revalidation
+  - scheduled promotion authorization correlation
+  - schedule_revalidation_failed terminal evidence
+  - scheduled revalidation release-gate membership
+  tests:
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_schedule_revalidation.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'fix(workflow): revalidate scheduled authorization'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve scheduled-only exact catalog, package, sealed definition/policy/input,
+    context-dependent risk, execution-context, and authenticated showcase scenario
+    and bundle identity at admission. Immediately before atomic due promotion and
+    before any claim, force-resolve the exact catalog source, recompute compatibility
+    before risk under the coordinator's actual server-owned runner and runtime, and
+    require current exact user trust or force-reverified showcase identity. Missing,
+    corrupt, revoked, replaced, restamped, or capability-incompatible evidence must
+    atomically terminalize as schedule_revalidation_failed with zero claims while
+    retaining immutable run evidence. A crash before promotion may revalidate after
+    restart; a durably correlated promotion continues without duplicate promotion or
+    revalidation. Keep immediate and unscheduled metadata, start digests, execution,
+    and failure behavior byte-identical, with no caller-supplied capability and no
+    consent or token contract.
+  removal_condition: Remove when upstream provides equivalent scheduled-only
+    read-only fire-time authorization, atomic zero-claim terminal failure, durable
+    crash correlation, actual runner/runtime revalidation, and exact release-gate
+    coverage without changing immediate-run identity or behavior.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

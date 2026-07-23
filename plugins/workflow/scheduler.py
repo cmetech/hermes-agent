@@ -543,6 +543,64 @@ class RunScheduler:
             sidecar_resources=resources,
         )
 
+    def _authorize_scheduled_promotion(
+        self,
+        run_id: str,
+        projection: Mapping[str, object],
+    ):
+        metadata = projection.get("run_metadata")
+        if not isinstance(metadata, Mapping) or not isinstance(
+            metadata.get("schedule_at"), str
+        ):
+            return True, None
+        if self.execution_fence is None or self.runner_binding is None:
+            # Legacy schedule-only projections predate fire-time evidence and
+            # retain their existing direct-scheduler behavior. New admissions
+            # cannot promote without the coordinator's actual execution context.
+            if not isinstance(metadata.get("execution_identity"), str):
+                return True, None
+            self.store.fail_scheduled_revalidation(
+                run_id,
+                expected_state_version=int(projection.get("state_version", -1)),
+            )
+            return False, None
+        try:
+            from plugins.workflow.scheduled_revalidation import (
+                revalidate_scheduled_run,
+                scheduled_execution_context,
+            )
+
+            context = scheduled_execution_context(projection, self.runner_binding)
+            authorization = revalidate_scheduled_run(
+                projection,
+                context,
+                hermes_home=self.store.hermes_home,
+                workdir=Path.cwd(),
+                run_directory=self.store.run_directory(run_id),
+            )
+        except Exception:
+            self.store.fail_scheduled_revalidation(
+                run_id,
+                expected_state_version=int(projection.get("state_version", -1)),
+            )
+            return False, None
+        return True, authorization
+
+    def _try_promote(
+        self,
+        run_id: str,
+        *,
+        now: datetime,
+        schedule_revalidation,
+    ) -> bool:
+        if schedule_revalidation is None:
+            return self.store.try_promote_run(run_id, now=now)
+        return self.store.try_promote_run(
+            run_id,
+            now=now,
+            schedule_revalidation=schedule_revalidation,
+        )
+
     def _node_timeout(
         self,
         node: WorkflowNode,
@@ -910,8 +968,17 @@ class RunScheduler:
         if self._shutdown.is_set():
             return self.store.load_run(run_id)
         if max_nodes is None:
-            return self.advance_all([run_id])[run_id]
+            advanced = self.advance_all([run_id])
+            return advanced.get(run_id, self.store.load_run(run_id))
         executed = 0
+        initial = self.store.load_run(run_id)
+        authorization = None
+        if initial["status"] == "queued":
+            authorized, authorization = self._authorize_scheduled_promotion(
+                run_id, initial
+            )
+            if not authorized:
+                return self.store.load_run(run_id)
         package = self._load_run_package(run_id)
         execution_limits = self._run_execution_limits(package)
         by_id = {node.id: node for node in package.definition.nodes}
@@ -934,7 +1001,11 @@ class RunScheduler:
                 )
                 projection = self.store.load_run(run_id)
                 if projection["status"] == "queued":
-                    if not self.store.try_promote_run(run_id, now=self._utcnow()):
+                    if not self._try_promote(
+                        run_id,
+                        now=self._utcnow(),
+                        schedule_revalidation=authorization,
+                    ):
                         break
                 self.store.wake_due_retries(run_id, now=self._utcnow())
                 self._resolve_graph(run_id, package.definition.nodes)
@@ -1060,6 +1131,20 @@ class RunScheduler:
     def advance_all(self, run_ids: Iterable[str]):
         """Replenish ready work fairly across runs under one bounded pool."""
         run_ids = list(dict.fromkeys(run_ids))
+        authorizations = {}
+        authorized_run_ids = []
+        for run_id in run_ids:
+            projection = self.store.load_run(run_id)
+            authorization = None
+            if projection["status"] == "queued":
+                authorized, authorization = self._authorize_scheduled_promotion(
+                    run_id, projection
+                )
+                if not authorized:
+                    continue
+            authorizations[run_id] = authorization
+            authorized_run_ids.append(run_id)
+        run_ids = authorized_run_ids
         packages = {
             run_id: self._load_run_package(run_id)
             for run_id in run_ids
@@ -1102,7 +1187,11 @@ class RunScheduler:
                     )
                     projection = self.store.load_run(run_id)
                     if projection["status"] == "queued":
-                        self.store.try_promote_run(run_id, now=self._utcnow())
+                        self._try_promote(
+                            run_id,
+                            now=self._utcnow(),
+                            schedule_revalidation=authorizations[run_id],
+                        )
                     self.store.wake_due_retries(run_id, now=self._utcnow())
                     self._resolve_graph(run_id, packages[run_id].definition.nodes)
                     projection = self.store.load_run(run_id)

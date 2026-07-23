@@ -3912,7 +3912,84 @@ class RunStore:
         self._notify_coordinator()
         return projection
 
-    def try_promote_run(self, run_id: str, *, now: datetime | None = None) -> bool:
+    def fail_scheduled_revalidation(
+        self,
+        run_id: str,
+        *,
+        expected_state_version: int,
+    ) -> bool:
+        """Atomically terminalize a still-queued scheduled run before claim."""
+        directory = self.run_directory(run_id)
+        with workflow_lock(self.admission_lock), workflow_lock(
+            self._run_lock_path(run_id)
+        ):
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT status, scheduled_at FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(run_id)
+                projection = json.loads((directory / "run.json").read_text())
+                self._scheduled_at_from_projection(
+                    projection,
+                    indexed=row["scheduled_at"],
+                )
+                if (
+                    row["status"] != "queued"
+                    or int(projection.get("state_version", -1))
+                    != expected_state_version
+                ):
+                    connection.rollback()
+                    return False
+                projection["status"] = "failed"
+                projection["queue_position"] = None
+                projection["queue_sequence"] = None
+                projection["blocked_by_run_id"] = None
+                projection["last_error"] = {
+                    "code": "schedule_revalidation_failed",
+                    "message": "scheduled run authorization changed before execution",
+                }
+                for node in projection["nodes"].values():
+                    if node["state"] not in {"succeeded", "failed", "skipped"}:
+                        node.pop("claim", None)
+                        node["state"] = "cancelled"
+                self._append_locked(
+                    directory,
+                    projection,
+                    "run_failed",
+                    {"reason_code": "schedule_revalidation_failed"},
+                )
+                self._sync_integrity_index(
+                    connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                self._record_coordinator_wake(
+                    connection,
+                    run_id=run_id,
+                    reason_code="run_failed",
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+        self._notify_coordinator()
+        return True
+
+    def try_promote_run(
+        self,
+        run_id: str,
+        *,
+        now: datetime | None = None,
+        schedule_revalidation=None,
+    ) -> bool:
         directory = self.run_directory(run_id)
         with workflow_lock(self.admission_lock), workflow_lock(
             self._run_lock_path(run_id)
@@ -3960,6 +4037,24 @@ class RunStore:
                         else:
                             connection.rollback()
                         return False
+                    metadata = projection.get("run_metadata")
+                    if not isinstance(metadata, Mapping):
+                        raise RuntimeError("scheduled revalidation metadata missing")
+                    if (
+                        isinstance(metadata.get("execution_identity"), str)
+                        and schedule_revalidation is None
+                    ):
+                        connection.rollback()
+                        return False
+                    if schedule_revalidation is not None:
+                        if (
+                            schedule_revalidation.run_id != run_id
+                            or schedule_revalidation.state_version
+                            != int(projection.get("state_version", -1))
+                            or schedule_revalidation.execution_identity
+                            != str(metadata.get("execution_identity") or "")
+                        ):
+                            raise RuntimeError("scheduled revalidation is stale")
                 sequence = row["queue_sequence"]
                 if sequence is None:
                     sequence = self._next_queue_sequence(connection)
@@ -4058,7 +4153,26 @@ class RunStore:
                 projection["queue_position"] = None
                 projection["queue_sequence"] = None
                 projection["blocked_by_run_id"] = None
-                self._append_locked(directory, projection, "run_promoted")
+                if scheduled_at is not None and schedule_revalidation is not None:
+                    projection["schedule_revalidation"] = {
+                        "execution_identity": (
+                            schedule_revalidation.execution_identity
+                        ),
+                        "admission_state_version": (
+                            schedule_revalidation.state_version
+                        ),
+                    }
+                self._append_locked(
+                    directory,
+                    projection,
+                    "run_promoted",
+                    (
+                        {"schedule_revalidated": True}
+                        if scheduled_at is not None
+                        and schedule_revalidation is not None
+                        else None
+                    ),
+                )
                 self._sync_integrity_index(
                     connection,
                     projection=projection,

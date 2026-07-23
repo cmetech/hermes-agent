@@ -47,6 +47,10 @@ from plugins.workflow.coordinator_store import (
 )
 from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.notifications import NotificationOutbox
+from plugins.workflow.runner_binding import (
+    background_execution_context,
+    production_workflow_runner_binding,
+)
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
@@ -664,10 +668,20 @@ def test_future_schedule_is_queued_with_server_owned_identity_and_no_execution(
     assert run["status"] == "queued"
     assert run["execution_mode"] == "background"
     assert run["started_at"] is None
+    run_directory = store.run_directory(result["run_id"])
     assert run["run_metadata"] == {
         "catalog_source": "profile",
+        "execution_identity": background_execution_context(
+            production_workflow_runner_binding(), requires_ai=None
+        ).identity_digest,
+        "package_digest": risk.package_digest,
         "risk_digest": risk.risk_digest,
         "schedule_at": SCHEDULE_AT,
+        "sealed_definition_digest": sha256(
+            (run_directory / "definition.yaml").read_bytes()
+        ).hexdigest(),
+        "sealed_input_digest": run["input_manifest_digest"],
+        "sealed_policy_digest": run["policy_digest"],
     }
     assert all(node["state"] == "ready" for node in run["nodes"].values())
     with store._connect() as connection:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from typing import TYPE_CHECKING, Literal, Mapping
 
 from hermes_cli.config import get_compatible_custom_providers, read_raw_config
@@ -36,6 +38,28 @@ class ExecutionCapabilityContext:
     runner_capabilities: RunnerCapabilities
     runtime_capabilities: ExecutionRuntimeCapabilities
     mcp_available: bool
+
+    @property
+    def identity_digest(self) -> str:
+        """Return the canonical identity sealed for scheduled revalidation."""
+        material = json.dumps(
+            {
+                "entitlement": self.entitlement.value,
+                "entitlement_error": self.entitlement.error_code,
+                "mcp_available": self.mcp_available,
+                "runner_starts_request_mcp": (
+                    self.runner_capabilities.starts_request_mcp
+                ),
+                "runtime_api_mode": self.runtime_capabilities.api_mode,
+                "runtime_hermes_managed_tool_loop": (
+                    self.runtime_capabilities.hermes_managed_tool_loop
+                ),
+                "surface": self.surface,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(material).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
