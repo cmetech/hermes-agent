@@ -51,6 +51,7 @@ from plugins.workflow.runner_binding import (
     background_execution_context,
     production_workflow_runner_binding,
 )
+from plugins.workflow.scheduled_revalidation import sealed_snapshot_digest
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
@@ -671,6 +672,8 @@ def test_future_schedule_is_queued_with_server_owned_identity_and_no_execution(
     run_directory = store.run_directory(result["run_id"])
     assert run["run_metadata"] == {
         "catalog_source": "profile",
+        "catalog_source_relative": "scheduled-api.yaml",
+        "catalog_source_root": str((home / "workflows").resolve()),
         "execution_identity": background_execution_context(
             production_workflow_runner_binding(), requires_ai=None
         ).identity_digest,
@@ -682,6 +685,7 @@ def test_future_schedule_is_queued_with_server_owned_identity_and_no_execution(
         ).hexdigest(),
         "sealed_input_digest": run["input_manifest_digest"],
         "sealed_policy_digest": run["policy_digest"],
+        "sealed_snapshot_digest": sealed_snapshot_digest(run_directory),
     }
     assert all(node["state"] == "ready" for node in run["nodes"].values())
     with store._connect() as connection:

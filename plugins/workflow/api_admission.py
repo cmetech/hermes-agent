@@ -409,6 +409,27 @@ def start_api_run(
             retryable=True,
         )
 
+    catalog_source_root = None
+    catalog_source_relative = None
+    if schedule_at is not None and verified_showcase is None:
+        from plugins.workflow.scheduled_revalidation import (
+            ScheduledRunRevalidationError,
+            scheduled_catalog_source_identity,
+        )
+
+        try:
+            catalog_source_root, catalog_source_relative = (
+                scheduled_catalog_source_identity(
+                    package,
+                    hermes_home=home,
+                    workdir=Path(workdir).resolve(),
+                )
+            )
+        except (ScheduledRunRevalidationError, OSError, ValueError) as exc:
+            raise ApiAdmissionError(
+                "workflow_catalog_source_invalid", status_code=409
+            ) from exc
+
     try:
         prepared = store.prepare_run_snapshot(
             package,
@@ -448,6 +469,19 @@ def start_api_run(
         )
         concurrency_key = f"showcase:{verified_showcase.scenario.id}"
     if schedule_at is not None:
+        from plugins.workflow.scheduled_revalidation import (
+            ScheduledRunRevalidationError,
+            sealed_snapshot_digest,
+        )
+
+        try:
+            scheduled_snapshot_digest = sealed_snapshot_digest(
+                prepared.staging_directory
+            )
+        except ScheduledRunRevalidationError as exc:
+            shutil.rmtree(prepared.staging_directory, ignore_errors=True)
+            raise ApiAdmissionError("workflow_package_changed", status_code=409) from exc
+
         showcase_scenario_digest = None
         if verified_showcase is not None:
             from plugins.workflow.scheduled_revalidation import (
@@ -471,7 +505,11 @@ def start_api_run(
             ).hexdigest(),
             "sealed_input_digest": prepared.input_manifest_digest,
             "sealed_policy_digest": prepared.policy_digest,
+            "sealed_snapshot_digest": scheduled_snapshot_digest,
         }
+        if catalog_source_root is not None and catalog_source_relative is not None:
+            run_metadata["catalog_source_root"] = catalog_source_root
+            run_metadata["catalog_source_relative"] = catalog_source_relative
         if showcase_scenario_digest is not None:
             run_metadata["showcase_scenario_digest"] = showcase_scenario_digest
 

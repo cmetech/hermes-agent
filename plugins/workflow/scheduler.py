@@ -568,15 +568,29 @@ class RunScheduler:
             from plugins.workflow.scheduled_revalidation import (
                 revalidate_scheduled_run,
                 scheduled_execution_context,
+                verify_sealed_snapshot,
+            )
+            run_directory = self.store.run_directory(run_id)
+            verify_sealed_snapshot(
+                projection,
+                run_directory=run_directory,
             )
 
-            context = scheduled_execution_context(projection, self.runner_binding)
-            authorization = revalidate_scheduled_run(
-                projection,
-                context,
-                hermes_home=self.store.hermes_home,
-                workdir=Path.cwd(),
-                run_directory=self.store.run_directory(run_id),
+            def verify(current_projection: Mapping[str, object]) -> None:
+                context = scheduled_execution_context(
+                    current_projection,
+                    self.runner_binding,
+                )
+                revalidate_scheduled_run(
+                    current_projection,
+                    context,
+                    hermes_home=self.store.hermes_home,
+                    run_directory=run_directory,
+                )
+
+            authorization = self.store._scheduled_promotion_authorization(
+                run_id,
+                verify,
             )
         except Exception:
             self.store.fail_scheduled_revalidation(

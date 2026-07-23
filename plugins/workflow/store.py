@@ -88,6 +88,23 @@ class ForegroundExecutionConflict(RuntimeError):
     """A foreground owner transition lost its exact state/epoch comparison."""
 
 
+class _ScheduledPromotionAuthorization:
+    """Store-instance-owned, one-use fire-time verifier."""
+
+    __slots__ = ("_consumed", "_run_id", "_store_identity", "_verify")
+
+    def __init__(
+        self,
+        store_identity: object,
+        run_id: str,
+        verify: Callable[[Mapping[str, object]], None],
+    ) -> None:
+        self._store_identity = store_identity
+        self._run_id = run_id
+        self._verify = verify
+        self._consumed = False
+
+
 class _ClosingConnection(sqlite3.Connection):
     """Preserve sqlite transaction semantics and release the handle on exit."""
 
@@ -382,6 +399,7 @@ class RunStore:
         self._notification_repair_timeout_lock = threading.Lock()
         self._notification_repair_timeout_run_id: str | None = None
         self._notification_repair_timeout_count = 0
+        self._scheduled_authorization_identity = object()
         self._admission_open = True
         self._initialized = False
         self._initialize()
@@ -3912,6 +3930,89 @@ class RunStore:
         self._notify_coordinator()
         return projection
 
+    def _scheduled_promotion_authorization(
+        self,
+        run_id: str,
+        verify: Callable[[Mapping[str, object]], None],
+    ) -> _ScheduledPromotionAuthorization:
+        if not isinstance(run_id, str) or not run_id or not callable(verify):
+            raise ValueError("scheduled authorization requires a run and verifier")
+        return _ScheduledPromotionAuthorization(
+            self._scheduled_authorization_identity,
+            run_id,
+            verify,
+        )
+
+    def _validate_scheduled_promotion_authorization(
+        self,
+        authorization: object,
+        run_id: str,
+    ) -> _ScheduledPromotionAuthorization:
+        if (
+            type(authorization) is not _ScheduledPromotionAuthorization
+            or authorization._store_identity is not self._scheduled_authorization_identity
+        ):
+            raise RuntimeError("opaque scheduled authorization is required")
+        if authorization._run_id != run_id:
+            raise RuntimeError("scheduled authorization belongs to a different run")
+        if authorization._consumed:
+            raise RuntimeError("scheduled authorization was already consumed")
+        return authorization
+
+    def _consume_scheduled_promotion_authorization(
+        self,
+        authorization: object,
+        run_id: str,
+        projection: Mapping[str, object],
+    ) -> None:
+        verified = self._validate_scheduled_promotion_authorization(
+            authorization,
+            run_id,
+        )
+        verified._consumed = True
+        verified._verify(projection)
+
+    def _fail_scheduled_revalidation_locked(
+        self,
+        connection: sqlite3.Connection,
+        directory: Path,
+        projection: dict[str, object],
+    ) -> None:
+        projection["status"] = "failed"
+        projection["queue_position"] = None
+        projection["queue_sequence"] = None
+        projection["blocked_by_run_id"] = None
+        projection["last_error"] = {
+            "code": "schedule_revalidation_failed",
+            "message": "scheduled run authorization changed before execution",
+        }
+        nodes = projection.get("nodes")
+        if not isinstance(nodes, Mapping):
+            raise RuntimeError("scheduled run nodes are missing")
+        for node in nodes.values():
+            if not isinstance(node, dict):
+                raise RuntimeError("scheduled run node is malformed")
+            if node["state"] not in {"succeeded", "failed", "skipped"}:
+                node.pop("claim", None)
+                node["state"] = "cancelled"
+        self._append_locked(
+            directory,
+            projection,
+            "run_failed",
+            {"reason_code": "schedule_revalidation_failed"},
+            defer_notification=True,
+        )
+        self._sync_integrity_index(
+            connection,
+            projection=projection,
+            journal_sha256=_sha256((directory / "events.jsonl").read_bytes()),
+        )
+        self._record_coordinator_wake(
+            connection,
+            run_id=str(projection["run_id"]),
+            reason_code="run_failed",
+        )
+
     def fail_scheduled_revalidation(
         self,
         run_id: str,
@@ -3944,35 +4045,10 @@ class RunStore:
                 ):
                     connection.rollback()
                     return False
-                projection["status"] = "failed"
-                projection["queue_position"] = None
-                projection["queue_sequence"] = None
-                projection["blocked_by_run_id"] = None
-                projection["last_error"] = {
-                    "code": "schedule_revalidation_failed",
-                    "message": "scheduled run authorization changed before execution",
-                }
-                for node in projection["nodes"].values():
-                    if node["state"] not in {"succeeded", "failed", "skipped"}:
-                        node.pop("claim", None)
-                        node["state"] = "cancelled"
-                self._append_locked(
+                self._fail_scheduled_revalidation_locked(
+                    connection,
                     directory,
                     projection,
-                    "run_failed",
-                    {"reason_code": "schedule_revalidation_failed"},
-                )
-                self._sync_integrity_index(
-                    connection,
-                    projection=projection,
-                    journal_sha256=_sha256(
-                        (directory / "events.jsonl").read_bytes()
-                    ),
-                )
-                self._record_coordinator_wake(
-                    connection,
-                    run_id=run_id,
-                    reason_code="run_failed",
                 )
                 connection.commit()
             except BaseException:
@@ -4047,14 +4123,10 @@ class RunStore:
                         connection.rollback()
                         return False
                     if schedule_revalidation is not None:
-                        if (
-                            schedule_revalidation.run_id != run_id
-                            or schedule_revalidation.state_version
-                            != int(projection.get("state_version", -1))
-                            or schedule_revalidation.execution_identity
-                            != str(metadata.get("execution_identity") or "")
-                        ):
-                            raise RuntimeError("scheduled revalidation is stale")
+                        self._validate_scheduled_promotion_authorization(
+                            schedule_revalidation,
+                            run_id,
+                        )
                 sequence = row["queue_sequence"]
                 if sequence is None:
                     sequence = self._next_queue_sequence(connection)
@@ -4147,6 +4219,36 @@ class RunStore:
                     else:
                         connection.rollback()
                     return False
+                admission_state_version = int(projection.get("state_version", -1))
+                execution_identity = ""
+                if scheduled_at is not None and schedule_revalidation is not None:
+                    metadata = projection.get("run_metadata")
+                    if not isinstance(metadata, Mapping):
+                        raise RuntimeError("scheduled revalidation metadata missing")
+                    execution_identity = str(
+                        metadata.get("execution_identity") or ""
+                    )
+                    try:
+                        self._consume_scheduled_promotion_authorization(
+                            schedule_revalidation,
+                            run_id,
+                            projection,
+                        )
+                    except Exception as exc:
+                        from plugins.workflow.scheduled_revalidation import (
+                            ScheduledRunRevalidationError,
+                        )
+
+                        if not isinstance(exc, ScheduledRunRevalidationError):
+                            raise
+                        self._fail_scheduled_revalidation_locked(
+                            connection,
+                            directory,
+                            projection,
+                        )
+                        connection.commit()
+                        self._notify_coordinator()
+                        return False
                 event_now = _utc_now()
                 projection["status"] = "running"
                 projection["started_at"] = event_now
@@ -4155,12 +4257,8 @@ class RunStore:
                 projection["blocked_by_run_id"] = None
                 if scheduled_at is not None and schedule_revalidation is not None:
                     projection["schedule_revalidation"] = {
-                        "execution_identity": (
-                            schedule_revalidation.execution_identity
-                        ),
-                        "admission_state_version": (
-                            schedule_revalidation.state_version
-                        ),
+                        "execution_identity": execution_identity,
+                        "admission_state_version": admission_state_version,
                     }
                 self._append_locked(
                     directory,

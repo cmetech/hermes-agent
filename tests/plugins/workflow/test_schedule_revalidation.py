@@ -6,6 +6,8 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import shutil
+import time
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -276,10 +278,17 @@ def test_scheduled_admission_persists_exact_fire_time_identity(
     run = store.load_run(str(result["run_id"]))
     metadata = run["run_metadata"]
     assert metadata["catalog_source"] == "profile"
+    assert metadata["catalog_source_root"] == str((home / "workflows").resolve())
+    assert metadata["catalog_source_relative"] == ("scheduled-fire-time-identity.yaml")
     assert metadata["package_digest"] == run["definition_digest"]
     assert metadata["risk_digest"]
     assert metadata["execution_identity"]
     assert metadata["execution_identity"] == context.identity_digest
+    assert metadata["sealed_snapshot_digest"] == (
+        scheduled_revalidation_module.sealed_snapshot_digest(
+            store.run_directory(str(result["run_id"]))
+        )
+    )
     assert "showcase_scenario_digest" not in metadata
     assert run["policy_digest"]
     assert run["input_manifest_digest"]
@@ -366,6 +375,11 @@ def test_real_coordinator_revalidates_revoked_user_trust_before_any_claim(
     )
     try:
         service._sweep_once(store, coordinator, identity, epoch, scheduler)
+        deadline = time.monotonic() + 2
+        while (
+            store.load_run(run_id)["status"] == "queued" and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
     finally:
         scheduler.shutdown(deadline_seconds=2)
 
@@ -837,10 +851,20 @@ def test_sealed_snapshot_mismatch_is_terminal_and_retained(
         )
 
 
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "sealed_definition_digest",
+        "sealed_snapshot_digest",
+        "catalog_source_root",
+        "catalog_source_relative",
+    ],
+)
 def test_missing_persisted_identity_fails_closed_before_claim(
     tmp_path: Path,
     monkeypatch,
     workflow_writer,
+    missing_field: str,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -854,7 +878,7 @@ def test_missing_persisted_identity_fails_closed_before_claim(
         )
     )
     metadata = dict(store.load_run(run_id)["run_metadata"])
-    metadata.pop("sealed_definition_digest")
+    metadata.pop(missing_field)
     store.append_event(
         run_id,
         "test_identity_corrupted",
@@ -944,12 +968,17 @@ def test_crash_after_revalidation_before_promotion_revalidates_after_restart(
         "revalidate_scheduled_run",
         count_revalidation,
     )
-    original_promote = store.try_promote_run
+    original_consume = store._consume_scheduled_promotion_authorization
 
-    def crash_before_promotion(*_args, **_kwargs):
+    def crash_before_promotion(*args, **kwargs):
+        original_consume(*args, **kwargs)
         raise RuntimeError("injected crash before promotion")
 
-    monkeypatch.setattr(store, "try_promote_run", crash_before_promotion)
+    monkeypatch.setattr(
+        store,
+        "_consume_scheduled_promotion_authorization",
+        crash_before_promotion,
+    )
     first = RunScheduler(
         store,
         runner_binding=binding,
@@ -960,7 +989,11 @@ def test_crash_after_revalidation_before_promotion_revalidates_after_restart(
         first.advance(run_id, max_nodes=1)
     first.shutdown(deadline_seconds=2)
     assert store.load_run(run_id)["status"] == "queued"
-    monkeypatch.setattr(store, "try_promote_run", original_promote)
+    monkeypatch.setattr(
+        store,
+        "_consume_scheduled_promotion_authorization",
+        original_consume,
+    )
 
     restarted = RunStore(home)
     result = _advance_with_binding(
@@ -1055,4 +1088,404 @@ def test_crash_after_promotion_before_claim_continues_correlated_run_once(
             if event["event_type"] == "run_promoted"
         ])
         == 1
+    )
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["single", "advance-all"])
+def test_live_trust_change_after_package_load_fails_at_atomic_promotion(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+    batch: bool,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, package, run_id, due, _coordinator, identity, epoch, _context = (
+        _admit_scheduled_user(
+            home,
+            workflow_writer,
+            name=f"scheduled-atomic-trust-{batch}",
+            binding=binding,
+        )
+    )
+    scheduler = RunScheduler(
+        store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=lambda: due,
+    )
+    original_load = scheduler._load_run_package
+    mutated = False
+
+    def load_then_revoke(loaded_run_id: str):
+        nonlocal mutated
+        sealed = original_load(loaded_run_id)
+        if not mutated:
+            mutated = True
+            assert WorkflowTrustStore(home).revoke(
+                compute_package_digest(package).sha256
+            )
+        return sealed
+
+    monkeypatch.setattr(scheduler, "_load_run_package", load_then_revoke)
+    try:
+        if batch:
+            result = scheduler.advance_all([run_id])[run_id]
+        else:
+            result = scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert result["status"] == "failed"
+    assert result["last_error"]["code"] == "schedule_revalidation_failed"
+    with store._connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_projected_revalidation_fields_cannot_forge_promotion_authority(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, _package, run_id, due, _coordinator, _identity, _epoch, _context = (
+        _admit_scheduled_user(
+            home,
+            workflow_writer,
+            name="scheduled-forged-authorization",
+            binding=binding,
+        )
+    )
+    projection = store.load_run(run_id)
+    forged = SimpleNamespace(
+        run_id=run_id,
+        state_version=projection["state_version"],
+        execution_identity=projection["run_metadata"]["execution_identity"],
+    )
+
+    with pytest.raises(RuntimeError, match="opaque scheduled authorization"):
+        store.try_promote_run(
+            run_id,
+            now=due,
+            schedule_revalidation=forged,
+        )
+
+    assert store.load_run(run_id)["status"] == "queued"
+
+
+def test_store_owned_authorization_is_one_use_and_cannot_cross_runs(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, _package, first_id, due, _coordinator, _identity, _epoch, _context = (
+        _admit_scheduled_user(
+            home,
+            workflow_writer,
+            name="scheduled-opaque-first",
+            binding=binding,
+        )
+    )
+    second_package, _second_context = _trusted_profile_package(
+        home,
+        workflow_writer,
+        name="scheduled-opaque-second",
+        binding=binding,
+    )
+    second = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=tmp_path,
+        user_home=tmp_path,
+        workflow_name=second_package.definition.name,
+        values={},
+        idempotency_key="scheduled-opaque-second",
+        concurrency_policy="queue",
+        authority=_authority(),
+        catalog_source="profile",
+        runner_binding=binding,
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        schedule_now_utc=due - timedelta(seconds=10),
+    )
+    second_id = str(second["run_id"])
+    factory = getattr(store, "_scheduled_promotion_authorization", None)
+    consume = getattr(store, "_consume_scheduled_promotion_authorization", None)
+    assert callable(factory)
+    assert callable(consume)
+    calls = 0
+
+    def verify(_projection):
+        nonlocal calls
+        calls += 1
+
+    authorization = factory(first_id, verify)
+    with pytest.raises(RuntimeError, match="different run"):
+        store.try_promote_run(
+            second_id,
+            now=due,
+            schedule_revalidation=authorization,
+        )
+    consume(authorization, first_id, store.load_run(first_id))
+    with pytest.raises(RuntimeError, match="already consumed"):
+        consume(authorization, first_id, store.load_run(first_id))
+    assert calls == 1
+    assert store.load_run(first_id)["status"] == "queued"
+    assert store.load_run(second_id)["status"] == "queued"
+
+
+def _admit_resource_rich_scheduled_user(
+    home: Path,
+    workflow_writer,
+    monkeypatch,
+    *,
+    binding: WorkflowRunnerBinding,
+):
+    (home / "commands").mkdir(parents=True)
+    (home / "commands/inspect.md").write_text("Inspect safely.", encoding="utf-8")
+    (home / "scripts").mkdir()
+    (home / "scripts/helper.py").write_text("print('ok')\n", encoding="utf-8")
+    (home / "mcp").mkdir()
+    (home / "mcp/echo.yaml").write_text(
+        "command: python\nargs: [servers/echo.py]\n",
+        encoding="utf-8",
+    )
+    (home / "servers").mkdir()
+    (home / "servers/echo.py").write_text("print('echo')\n", encoding="utf-8")
+    path = workflow_writer(
+        home / "workflows",
+        name="scheduled-rich-snapshot",
+        filename="scheduled-rich-snapshot.yaml",
+        nodes=[
+            {
+                "id": "inspect",
+                "command": "inspect",
+                "skills": ["parent-skill"],
+                "mcp": "mcp/echo.yaml",
+                "agents": {
+                    "reviewer": {
+                        "description": "review",
+                        "prompt": "inspect",
+                        "skills": ["child-skill"],
+                    }
+                },
+            },
+            {
+                "id": "script",
+                "script": "helper",
+                "runtime": "uv",
+                "depends_on": ["inspect"],
+            },
+        ],
+    )
+    path.with_name("scheduled-rich-snapshot.hermes.yaml").write_text(
+        "delivery_defaults:\n"
+        "  inputs:\n"
+        "    note: {type: text, required: true}\n"
+        "limits:\n"
+        "  max_parallel_nodes: 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "agent.skill_commands.build_preloaded_skills_prompt",
+        lambda names, task_id=None: (f"skill:{','.join(names)}", names, []),
+    )
+    package = load_workflow(path)
+    context = background_execution_context(binding, requires_ai=None)
+    _compatibility, risk = assess_package_execution(package, context)
+    WorkflowTrustStore(home).trust(
+        compute_package_digest(package).sha256,
+        actor="schedule-revalidation-test",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    _coordinator, identity, epoch = _healthy_coordinator(store)
+    due = datetime.now(UTC) + timedelta(seconds=10)
+    admitted = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=home.parent,
+        user_home=home.parent,
+        workflow_name=package.definition.name,
+        values={"note": "sealed input"},
+        idempotency_key="scheduled-rich-snapshot",
+        concurrency_policy="queue",
+        authority=_authority(),
+        catalog_source="profile",
+        runner_binding=binding,
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        schedule_now_utc=due - timedelta(seconds=10),
+    )
+    return store, str(admitted["run_id"]), due, identity, epoch
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "commands/inspect.md",
+        "scripts/helper.py",
+        "mcp/echo.yaml",
+        "servers/echo.py",
+        "inputs.json",
+        "inputs/note.txt",
+        "node-skills/inspect.md",
+        "node-agent-skills/inspect/reviewer.md",
+    ],
+)
+def test_every_execution_readable_sealed_resource_is_revalidated(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+    relative_path: str,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, run_id, due, identity, epoch = _admit_resource_rich_scheduled_user(
+        home,
+        workflow_writer,
+        monkeypatch,
+        binding=binding,
+    )
+    target = store.run_directory(run_id) / relative_path
+    target.write_bytes(target.read_bytes() + b"\nchanged")
+
+    failed = _advance_with_binding(store, run_id, due, identity, epoch, binding)
+
+    assert failed["status"] == "failed"
+    assert failed["last_error"]["code"] == "schedule_revalidation_failed"
+    with store._connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def _admit_scheduled_project(
+    home: Path,
+    workdir: Path,
+    workflow_writer,
+    *,
+    binding: WorkflowRunnerBinding,
+):
+    path = workflow_writer(
+        workdir / ".hermes/workflows",
+        name="exact-project-source",
+        description=f"source:{workdir.name}",
+        filename="exact-project-source.yaml",
+    )
+    path.with_name("exact-project-source.hermes.yaml").write_text(
+        "limits:\n  max_parallel_nodes: 1\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(path, source="project", precedence=1)
+    context = background_execution_context(binding, requires_ai=None)
+    _compatibility, risk = assess_package_execution(package, context)
+    WorkflowTrustStore(home).trust(
+        compute_package_digest(package).sha256,
+        actor="schedule-revalidation-test",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    _coordinator, identity, epoch = _healthy_coordinator(store)
+    due = datetime.now(UTC) + timedelta(seconds=10)
+    admitted = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=workdir,
+        user_home=home.parent,
+        workflow_name=package.definition.name,
+        values={},
+        idempotency_key=f"scheduled-project-{workdir.name}",
+        concurrency_policy="queue",
+        authority=_authority(),
+        catalog_source="project",
+        runner_binding=binding,
+        schedule_at=due.isoformat().replace("+00:00", "Z"),
+        schedule_now_utc=due - timedelta(seconds=10),
+    )
+    return store, package, str(admitted["run_id"]), due, identity, epoch
+
+
+@pytest.mark.parametrize(
+    ("original_change", "expected_status"),
+    [
+        pytest.param("unchanged", "succeeded", id="cwd-changed-original-retained"),
+        pytest.param("deleted", "failed", id="deleted-never-falls-back"),
+        pytest.param("replaced", "failed", id="replaced-never-falls-back"),
+    ],
+)
+def test_scheduled_project_revalidates_exact_admission_source_not_current_cwd(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+    original_change: str,
+    expected_status: str,
+) -> None:
+    home = tmp_path / "home"
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, package_a, run_id, due, identity, epoch = _admit_scheduled_project(
+        home,
+        project_a,
+        workflow_writer,
+        binding=binding,
+    )
+    original_bytes = package_a.workflow_path.read_bytes()
+    project_b_path = workflow_writer(
+        project_b / ".hermes/workflows",
+        name="exact-project-source",
+        description=(
+            "source:project-b" if original_change == "unchanged" else "source:project-a"
+        ),
+        filename="exact-project-source.yaml",
+    )
+    project_b_path.with_name("exact-project-source.hermes.yaml").write_text(
+        "limits:\n  max_parallel_nodes: 1\n",
+        encoding="utf-8",
+    )
+    if original_change in {"deleted", "replaced"}:
+        project_b_path.write_bytes(original_bytes)
+    if original_change == "deleted":
+        package_a.workflow_path.unlink()
+    elif original_change == "replaced":
+        package_a.workflow_path.write_bytes(original_bytes + b"\n# replaced\n")
+    monkeypatch.chdir(project_b)
+    if original_change == "unchanged":
+        projection = store.load_run(run_id)
+        scheduled_revalidation_module.revalidate_scheduled_run(
+            projection,
+            scheduled_revalidation_module.scheduled_execution_context(
+                projection,
+                binding,
+            ),
+            hermes_home=home,
+            run_directory=store.run_directory(run_id),
+        )
+
+    result = _advance_with_binding(store, run_id, due, identity, epoch, binding)
+
+    assert result["status"] == expected_status
+    if expected_status == "failed":
+        assert result["last_error"]["code"] == "schedule_revalidation_failed"
+    assert result["run_metadata"]["catalog_source"] == "project"
+    assert result["run_metadata"]["catalog_source_root"] == str(
+        (project_a / ".hermes/workflows").resolve()
+    )
+    assert result["run_metadata"]["catalog_source_relative"] == (
+        "exact-project-source.yaml"
     )

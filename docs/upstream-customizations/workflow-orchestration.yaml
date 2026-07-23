@@ -2568,12 +2568,16 @@ upstream_changes:
   - tests/scripts/test_workflow_merge_gate.py
   owned_symbols:
   - ExecutionCapabilityContext.identity_digest
-  - ScheduledRunRevalidation
   - ScheduledRunRevalidationError
   - showcase_scenario_digest
+  - sealed_snapshot_digest
+  - scheduled_catalog_source_identity
   - scheduled_execution_context
   - revalidate_scheduled_run
   - RunScheduler._authorize_scheduled_promotion
+  - _ScheduledPromotionAuthorization
+  - RunStore._scheduled_promotion_authorization
+  - RunStore._consume_scheduled_promotion_authorization
   - RunStore.fail_scheduled_revalidation
   - scheduled promotion authorization correlation
   - schedule_revalidation_failed terminal evidence
@@ -2585,19 +2589,24 @@ upstream_changes:
   expected_commit_subject: 'fix(workflow): revalidate scheduled authorization'
   upstream_candidate: true
   merge_guidance: >-
-    Preserve scheduled-only exact catalog, package, sealed definition/policy/input,
+    Preserve scheduled-only exact canonical catalog root plus relative source,
+    package, every immutable execution-readable sealed snapshot byte,
     context-dependent risk, execution-context, and authenticated showcase scenario
     and bundle identity at admission. Immediately before atomic due promotion and
-    before any claim, force-resolve the exact catalog source, recompute compatibility
-    before risk under the coordinator's actual server-owned runner and runtime, and
-    require current exact user trust or force-reverified showcase identity. Missing,
-    corrupt, revoked, replaced, restamped, or capability-incompatible evidence must
-    atomically terminalize as schedule_revalidation_failed with zero claims while
-    retaining immutable run evidence. A crash before promotion may revalidate after
-    restart; a durably correlated promotion continues without duplicate promotion or
-    revalidation. Keep immediate and unscheduled metadata, start digests, execution,
-    and failure behavior byte-identical, with no caller-supplied capability and no
-    consent or token contract.
+    before any claim, consume a store-instance-owned opaque one-use verifier against
+    the current locked projection, force-resolve the exact original catalog source,
+    recompute compatibility before risk under the coordinator's actual server-owned
+    runner and runtime, and require current exact user trust or force-reverified
+    showcase identity. Projected fields, cross-run handles, and replay cannot confer
+    authority. Missing, corrupt, revoked, replaced, restamped, or
+    capability-incompatible evidence must atomically terminalize as
+    schedule_revalidation_failed with zero claims while retaining immutable run
+    evidence. Defer notification writes while the promotion transaction is open and
+    rely on its durable wake/journal reconciliation. A crash before promotion may
+    revalidate after restart; a durably correlated promotion continues without
+    duplicate promotion or revalidation. Keep immediate and unscheduled metadata,
+    start digests, execution, and failure behavior byte-identical, with no
+    caller-supplied capability and no consent or token contract.
   removal_condition: Remove when upstream provides equivalent scheduled-only
     read-only fire-time authorization, atomic zero-claim terminal failure, durable
     crash correlation, actual runner/runtime revalidation, and exact release-gate
