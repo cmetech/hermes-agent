@@ -112,6 +112,7 @@ class WorkflowCoordinatorService:
         self._scheduled_sweep_cursor: tuple[str, str] | None = None
         self._scheduled_sweep_observed_at: datetime | None = None
         self._scheduled_sweep_queue_sequence_fence: int | None = None
+        self._repair_revalidation_cursor: int | None = None
         self._health_lock = threading.Lock()
         self._health = BackgroundServiceHealth(
             state="starting",
@@ -473,6 +474,25 @@ class WorkflowCoordinatorService:
                     now=self._utcnow().astimezone(timezone.utc),
                     outcome=outcome,
                 )
+        (
+            repair_candidate,
+            repair_cursor,
+            repair_page_exhausted,
+        ) = run_store.repair_revalidation_candidate(
+            after=self._repair_revalidation_cursor,
+        )
+        if repair_candidate is not None:
+            if run_store.revalidate_run_repair(
+                str(repair_candidate["run_id"]),
+                str(repair_candidate["reason_code"]),
+            ):
+                actionable_work = True
+                progress_at = self._utcnow().astimezone(timezone.utc)
+            self._repair_revalidation_cursor = repair_cursor
+        elif repair_page_exhausted:
+            self._repair_revalidation_cursor = None
+        else:
+            self._repair_revalidation_cursor = repair_cursor
         processed_page = True
         processed_periodic_cursor = cursor
         for row in periodic:
@@ -514,6 +534,7 @@ class WorkflowCoordinatorService:
         self._scheduled_sweep_cursor = None
         self._scheduled_sweep_observed_at = None
         self._scheduled_sweep_queue_sequence_fence = None
+        self._repair_revalidation_cursor = None
         scheduler = self._scheduler(
             run_store,
             fence=ExecutionFence(identity.owner_id, epoch),

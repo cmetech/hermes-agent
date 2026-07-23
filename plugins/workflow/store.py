@@ -152,6 +152,12 @@ _RUN_SCOPED_REPAIR_REASONS = frozenset(
         "run_evidence_uncorroborated",
     }
 )
+_UNATTENDED_REVALIDATION_REASONS = frozenset(
+    {
+        "legacy_effect_policy_uncorroborated",
+        "run_evidence_uncorroborated",
+    }
+)
 _RUN_SCOPED_REPAIR_REASON_ORDER = tuple(sorted(_RUN_SCOPED_REPAIR_REASONS))
 _RUN_SCOPED_REPAIR_REASON_SQL = ",".join(
     f"'{reason}'" for reason in _RUN_SCOPED_REPAIR_REASON_ORDER
@@ -570,6 +576,8 @@ class RunStore:
                         journal_sha256 TEXT,
                         payload_json TEXT NOT NULL DEFAULT '{}'
                     );
+                    CREATE INDEX IF NOT EXISTS repair_events_run_reason_sequence
+                    ON repair_events(run_id, reason_code, sequence DESC);
                     CREATE TABLE IF NOT EXISTS cleanup_previews (
                         token_digest TEXT PRIMARY KEY,
                         created_at TEXT NOT NULL,
@@ -1448,6 +1456,169 @@ class RunStore:
                 (run_id, *_RUN_SCOPED_REPAIR_REASON_ORDER),
             ).fetchall()
         return tuple(str(row["reason_code"]) for row in rows)
+
+    def repair_revalidation_candidate(
+        self,
+        *,
+        after: int | None,
+        limit: int = 64,
+    ) -> tuple[dict[str, object] | None, int | None, bool]:
+        """Return one active evidence repair from a bounded event-log page."""
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT sequence, run_id, reason_code, outcome "
+                "FROM repair_events WHERE sequence>? "
+                "ORDER BY sequence LIMIT ?",
+                (after or 0, limit),
+            ).fetchall()
+            for row in rows:
+                reason_code = str(row["reason_code"])
+                run_id = row["run_id"]
+                if (
+                    run_id is None
+                    or reason_code not in _UNATTENDED_REVALIDATION_REASONS
+                    or str(row["outcome"]) != "repair_required"
+                ):
+                    continue
+                latest = connection.execute(
+                    "SELECT sequence, outcome FROM repair_events "
+                    "WHERE run_id=? AND reason_code=? "
+                    "ORDER BY sequence DESC LIMIT 1",
+                    (run_id, reason_code),
+                ).fetchone()
+                published = connection.execute(
+                    "SELECT 1 FROM runs WHERE run_id=? "
+                    "AND admission_state='published'",
+                    (run_id,),
+                ).fetchone()
+                if (
+                    latest is not None
+                    and int(latest["sequence"]) == int(row["sequence"])
+                    and str(latest["outcome"]) == "repair_required"
+                    and published is not None
+                ):
+                    return (
+                        {
+                            "sequence": int(row["sequence"]),
+                            "run_id": str(run_id),
+                            "reason_code": reason_code,
+                        },
+                        int(row["sequence"]),
+                        False,
+                    )
+        next_cursor = int(rows[-1]["sequence"]) if rows else after
+        return None, next_cursor, len(rows) < limit
+
+    @staticmethod
+    def _legacy_effect_policy_nodes(
+        directory: Path,
+        projection: Mapping[str, object],
+    ) -> list[str]:
+        policy_bytes = (directory / "policy.yaml").read_bytes()
+        expected_digest = projection.get("policy_digest")
+        if not isinstance(expected_digest, str) or not expected_digest:
+            raise JournalRecoveryError("legacy workflow policy digest is missing")
+        if not hmac.compare_digest(_sha256(policy_bytes), expected_digest):
+            raise JournalRecoveryError("legacy workflow policy digest mismatch")
+        document = yaml.safe_load(policy_bytes) or {}
+        if not isinstance(document, Mapping):
+            raise JournalRecoveryError("legacy workflow policy is malformed")
+        outward = document.get("outward_action_nodes", [])
+        if not isinstance(outward, list) or any(
+            not isinstance(candidate, str) for candidate in outward
+        ):
+            raise JournalRecoveryError("legacy outward-action policy is malformed")
+        return outward
+
+    def revalidate_run_repair(
+        self,
+        run_id: str,
+        reason_code: str,
+        *,
+        lock_timeout_seconds: float = 0.05,
+    ) -> bool:
+        """Revalidate one repair within the coordinator's unattended budget."""
+        if reason_code not in _UNATTENDED_REVALIDATION_REASONS:
+            raise ValueError("repair reason is not eligible for unattended revalidation")
+        if lock_timeout_seconds <= 0:
+            raise ValueError("revalidation lock budget must be positive")
+        directory = self.run_directory(run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(run_id),
+                timeout_seconds=lock_timeout_seconds,
+            ):
+                if reason_code not in self._active_run_repair_reasons(run_id):
+                    return False
+                evidence_paths = [
+                    directory / "run.json",
+                    directory / "events.jsonl",
+                ]
+                if reason_code == "legacy_effect_policy_uncorroborated":
+                    evidence_paths.append(directory / "policy.yaml")
+                if (directory / "events.jsonl").stat().st_size > self.max_journal_bytes:
+                    return False
+                if any(
+                    path.stat().st_size > self.max_run_bytes
+                    for path in evidence_paths
+                    if path.name != "events.jsonl"
+                ):
+                    return False
+                projection, _, journal_sha256 = (
+                    self._corroborate_run_evidence_locked(
+                        directory,
+                        run_id=run_id,
+                    )
+                )
+                if journal_sha256 is None:
+                    raise JournalRecoveryError("run journal digest is missing")
+                scheduled_at = self._scheduled_at_from_projection(projection)
+                with self._connect() as connection:
+                    indexed = connection.execute(
+                        "SELECT scheduled_at FROM runs WHERE run_id=?",
+                        (run_id,),
+                    ).fetchone()
+                    if indexed is None:
+                        return False
+                    if indexed["scheduled_at"] != scheduled_at:
+                        connection.execute(
+                            "UPDATE runs SET scheduled_at=? WHERE run_id=?",
+                            (scheduled_at, run_id),
+                        )
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=journal_sha256,
+                    )
+                if reason_code == "legacy_effect_policy_uncorroborated":
+                    self._legacy_effect_policy_nodes(directory, projection)
+                if "run_evidence_uncorroborated" in self._active_run_repair_reasons(
+                    run_id
+                ):
+                    self._transition_run_repair(
+                        "run_evidence_uncorroborated",
+                        run_id=run_id,
+                        outcome="repair_verified",
+                    )
+                self._transition_run_repair(
+                    reason_code,
+                    run_id=run_id,
+                    outcome="repair_verified",
+                )
+                return True
+        except (
+            JournalRecoveryError,
+            KeyError,
+            OSError,
+            ValueError,
+            WorkflowLockTimeout,
+            json.JSONDecodeError,
+            sqlite3.Error,
+            yaml.YAMLError,
+        ):
+            return False
 
     def _note_notification_repair_timeout(self, run_id: str) -> int:
         """Count consecutive repair-lock timeouts for one cursor-blocking run."""
@@ -5881,22 +6052,8 @@ class RunStore:
         if isinstance(persisted, list):
             return "outward" if node_id in persisted else "replay_safe"
         directory = self.run_directory(run_id)
-        policy_path = directory / "policy.yaml"
         try:
-            policy_bytes = policy_path.read_bytes()
-            expected_digest = str(run["policy_digest"])
-            if not hmac.compare_digest(_sha256(policy_bytes), expected_digest):
-                raise JournalRecoveryError("legacy workflow policy digest mismatch")
-            document = yaml.safe_load(policy_bytes) or {}
-            if not isinstance(document, Mapping):
-                raise JournalRecoveryError("legacy workflow policy is malformed")
-            outward = document.get("outward_action_nodes", [])
-            if not isinstance(outward, list) or any(
-                not isinstance(candidate, str) for candidate in outward
-            ):
-                raise JournalRecoveryError(
-                    "legacy outward-action policy is malformed"
-                )
+            outward = self._legacy_effect_policy_nodes(directory, run)
         except (OSError, KeyError, yaml.YAMLError, JournalRecoveryError):
             self._transition_run_repair(
                 "legacy_effect_policy_uncorroborated",

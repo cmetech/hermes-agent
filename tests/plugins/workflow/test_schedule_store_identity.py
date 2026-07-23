@@ -129,6 +129,26 @@ def test_fresh_scheduled_publication_derives_query_column_and_uses_partial_index
     assert any("runs_scheduled_queue" in str(row["detail"]) for row in plan)
 
 
+def test_current_store_reinstalls_run_repair_lookup_index_on_every_open(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    store = RunStore(home)
+    with store._connect() as connection:
+        connection.execute("DROP INDEX IF EXISTS repair_events_run_reason_sequence")
+
+    reopened = RunStore(home)
+
+    with reopened._connect() as connection:
+        columns = tuple(
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA index_info(repair_events_run_reason_sequence)"
+            ).fetchall()
+        )
+    assert columns == ("run_id", "reason_code", "sequence")
+
+
 def test_submicrosecond_schedule_survives_index_and_journal_recovery(
     tmp_path: Path, workflow_writer
 ) -> None:

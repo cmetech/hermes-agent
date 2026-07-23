@@ -3,10 +3,12 @@ from __future__ import annotations
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 import inspect
+import json
 import os
 from pathlib import Path
 import sqlite3
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -18,6 +20,7 @@ import plugins.workflow.coordinator as coordinator_module
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.lease_clock import LeaseClockSample
+from plugins.workflow.locks import workflow_lock
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.notifications import NotificationOutbox
 import plugins.workflow.notifications as notifications_module
@@ -115,6 +118,26 @@ def _admit(
     )
     assert result.run_id is not None
     return result
+
+
+def _rewrite_as_legacy_policy_projection(store: RunStore, run_id: str):
+    directory = store.run_directory(run_id)
+    projection_path = directory / "run.json"
+    projection = json.loads(projection_path.read_text(encoding="utf-8"))
+    projection.pop("outward_action_nodes")
+    encoded_frames = []
+    for line in (directory / "events.jsonl").read_text(encoding="utf-8").splitlines():
+        event = json.loads(line)
+        event["projection"].pop("outward_action_nodes")
+        event["projection_sha256"] = store_module._projection_digest(
+            event["projection"]
+        )
+        event.pop("frame_sha256")
+        _framed, encoded = store_module._encode_journal_frame(event)
+        encoded_frames.append(encoded)
+    projection_path.write_text(json.dumps(projection), encoding="utf-8")
+    (directory / "events.jsonl").write_bytes(b"".join(encoded_frames))
+    return store.load_run(run_id)
 
 
 def test_future_scheduled_run_isolated_from_immediate_queue_consumers(
@@ -898,6 +921,128 @@ def test_active_run_repairs_do_not_consume_coordinator_candidate_pages(
     }
 
 
+def test_coordinator_repair_filters_use_bounded_composite_index_lookups(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 2, 13, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(store, clocks, name="repair-filter-index")
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="repair-filter-index",
+    )
+    due = (clocks.wall - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    ordinary_run_id = _admit(
+        store,
+        package,
+        key="ordinary",
+        schedule_at=None,
+    ).run_id
+    scheduled_run_id = _admit(
+        store,
+        package,
+        key="scheduled",
+        schedule_at=due,
+    ).run_id
+
+    with store._connect() as connection:
+        ordinary_plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT runs.run_id FROM runs WHERE "
+            "runs.admission_state='published' AND runs.status='queued' "
+            "AND runs.scheduled_at IS NULL AND "
+            + store_module._RUN_SCOPED_REPAIR_EXCLUSION_SQL
+        ).fetchall()
+        scheduled_plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT runs.run_id FROM runs "
+            "INDEXED BY runs_scheduled_queue WHERE "
+            "runs.admission_state='published' AND runs.status='queued' "
+            "AND runs.scheduled_at IS NOT NULL AND runs.scheduled_at<? AND "
+            + store_module._RUN_SCOPED_REPAIR_EXCLUSION_SQL,
+            (due,),
+        ).fetchall()
+    for plan in (ordinary_plan, scheduled_plan):
+        details = tuple(str(row["detail"]) for row in plan)
+        assert not any(detail == "SCAN repair" for detail in details)
+        assert sum(
+            "repair_events_run_reason_sequence" in detail for detail in details
+        ) >= 2
+
+    original_connect = store._connect
+
+    def count_opcodes(call):
+        opcode_count = 0
+
+        def counted_connect():
+            connection = original_connect()
+
+            def count_opcode() -> int:
+                nonlocal opcode_count
+                opcode_count += 1
+                return 0
+
+            connection.set_progress_handler(count_opcode, 1)
+            return connection
+
+        monkeypatch.setattr(store, "_connect", counted_connect)
+        try:
+            result = call()
+        finally:
+            monkeypatch.setattr(store, "_connect", original_connect)
+        return result, opcode_count
+
+    (_ordinary_before, _cursor, _exhausted), ordinary_before = count_opcodes(
+        lambda: store.coordinator_candidates(
+            after=None,
+            now=clocks.wall,
+            limit=100,
+        )
+    )
+    (_scheduled_before, _cursor, _exhausted), scheduled_before = count_opcodes(
+        lambda: store.scheduled_coordinator_candidates(
+            after=None,
+            now=clocks.wall,
+            limit=100,
+        )
+    )
+    with store._connect() as connection:
+        connection.execute(
+            "WITH RECURSIVE history(value) AS ("
+            "SELECT 1 UNION ALL SELECT value+1 FROM history WHERE value<10000"
+            ") INSERT INTO repair_events ("
+            "detected_at, reason_code, outcome, run_id, payload_json"
+            ") SELECT ?, 'unrelated_history', 'evidence_preserved', "
+            "'unrelated-' || value, '{}' FROM history",
+            (clocks.wall.isoformat(),),
+        )
+
+    (ordinary_after_rows, _cursor, _exhausted), ordinary_after = count_opcodes(
+        lambda: store.coordinator_candidates(
+            after=None,
+            now=clocks.wall,
+            limit=100,
+        )
+    )
+    (scheduled_after_rows, _cursor, _exhausted), scheduled_after = count_opcodes(
+        lambda: store.scheduled_coordinator_candidates(
+            after=None,
+            now=clocks.wall,
+            limit=100,
+        )
+    )
+
+    assert [row["run_id"] for row in ordinary_after_rows] == [ordinary_run_id]
+    assert [row["run_id"] for row in scheduled_after_rows] == [scheduled_run_id]
+    assert ordinary_after <= ordinary_before + 500
+    assert scheduled_after <= scheduled_before + 500
+
+
 def test_unrecoverable_migrated_run_does_not_block_healthy_scheduled_sweep(
     tmp_path: Path,
     workflow_writer,
@@ -953,6 +1098,7 @@ def test_unrecoverable_migrated_run_does_not_block_healthy_scheduled_sweep(
     damaged_journal = damaged_directory / "events.jsonl"
     frames = damaged_journal.read_bytes().splitlines(keepends=True)
     assert len(frames) == 2
+    original_journal = b"".join(frames)
     corrupted_journal = frames[0] + b"{not-json}\n" + frames[1]
     damaged_journal.write_bytes(corrupted_journal)
 
@@ -980,6 +1126,7 @@ def test_unrecoverable_migrated_run_does_not_block_healthy_scheduled_sweep(
     scheduler = MagicMock()
     scheduler.submit.return_value = True
     service = _service(home, clocks)
+    service.notification_repair_seconds = 0.01
 
     actionable, _cursor, _progress = service._sweep_once(
         restarted,
@@ -998,6 +1145,347 @@ def test_unrecoverable_migrated_run_does_not_block_healthy_scheduled_sweep(
         damaged.run_id
     )
     assert not tuple(restarted.quarantine_root.glob("admission-index-*"))
+
+    damaged_journal.write_bytes(original_journal)
+    scheduler.reset_mock()
+    for _attempt in range(4):
+        clocks.monotonic_value += 1
+        service._sweep_once(
+            restarted,
+            coordinator,
+            identity,
+            epoch,
+            scheduler,
+        )
+        if damaged.run_id in {
+            call.args[0] for call in scheduler.submit.call_args_list
+        }:
+            break
+
+    assert damaged.run_id in {
+        call.args[0] for call in scheduler.submit.call_args_list
+    }
+    assert restarted._active_run_repair_reasons(damaged.run_id) == ()
+    with restarted._connect() as connection:
+        repaired_schedule = connection.execute(
+            "SELECT scheduled_at FROM runs WHERE run_id=?",
+            (damaged.run_id,),
+        ).fetchone()["scheduled_at"]
+    assert repaired_schedule == due
+
+
+def test_restored_legacy_effect_policy_is_revalidated_before_submission(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 4, 12, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    coordinator, identity, epoch = _leader(
+        store,
+        clocks,
+        name="legacy-policy-revalidation",
+    )
+    workflow_path = workflow_writer(
+        tmp_path / "package",
+        name="legacy-policy-revalidation",
+    )
+    workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml").write_text(
+        "outward_action_nodes:\n- start\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow_path)
+    admitted = _admit(
+        store,
+        package,
+        key="legacy-policy",
+        schedule_at=None,
+    )
+    legacy_projection = _rewrite_as_legacy_policy_projection(
+        store,
+        admitted.run_id,
+    )
+    for wake in coordinator.pending_wakes(
+        identity,
+        epoch=epoch,
+        now=clocks.wall,
+    ):
+        assert coordinator.complete_wake(
+            wake.generation,
+            identity,
+            epoch=epoch,
+            now=clocks.wall,
+            outcome="test_setup",
+        )
+    policy = store.run_directory(admitted.run_id) / "policy.yaml"
+    original_policy = policy.read_bytes()
+    policy.write_text("outward_action_nodes: []\n", encoding="utf-8")
+    with pytest.raises(JournalRecoveryError, match="policy digest mismatch"):
+        store.node_effect_classification(
+            admitted.run_id,
+            "start",
+            projection=legacy_projection,
+        )
+    policy.write_bytes(original_policy)
+
+    scheduler = MagicMock()
+    scheduler.submit.return_value = True
+    service = _service(tmp_path / "home", clocks)
+
+    service._sweep_once(
+        store,
+        coordinator,
+        identity,
+        epoch,
+        scheduler,
+    )
+    service._sweep_once(
+        store,
+        coordinator,
+        identity,
+        epoch,
+        scheduler,
+    )
+
+    assert [call.args[0] for call in scheduler.submit.call_args_list] == [
+        admitted.run_id
+    ]
+    assert store._active_run_repair_reasons(admitted.run_id) == ()
+
+
+def test_repair_revalidation_cursor_bypasses_locked_and_corrupt_rows(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 5, 12, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        max_queued_runs=10,
+        max_nonterminal_runs=10,
+        lease_clock=clocks.lease_sample,
+    )
+    coordinator, identity, epoch = _leader(
+        store,
+        clocks,
+        name="repair-revalidation-fairness",
+    )
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="repair-revalidation-fairness",
+    )
+    locked = _admit(store, package, key="locked", schedule_at=None)
+    corrupt = [
+        _admit(store, package, key=f"corrupt-{index}", schedule_at=None)
+        for index in range(5)
+    ]
+    recoverable = _admit(store, package, key="recoverable", schedule_at=None)
+    healthy = _admit(store, package, key="healthy", schedule_at=None)
+    for wake in coordinator.pending_wakes(
+        identity,
+        epoch=epoch,
+        now=clocks.wall,
+    ):
+        assert coordinator.complete_wake(
+            wake.generation,
+            identity,
+            epoch=epoch,
+            now=clocks.wall,
+            outcome="test_setup",
+        )
+    for admitted in corrupt:
+        journal = store.run_directory(admitted.run_id) / "events.jsonl"
+        with journal.open("ab") as stream:
+            stream.write(b"{not-json}\n")
+    for admitted in (locked, *corrupt, recoverable):
+        assert store._transition_run_repair(
+            "run_evidence_uncorroborated",
+            run_id=admitted.run_id,
+            outcome="repair_required",
+        )
+
+    ready = threading.Event()
+    release = threading.Event()
+
+    def hold_oldest_lock() -> None:
+        with workflow_lock(store._run_lock_path(locked.run_id)):
+            ready.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_oldest_lock)
+    holder.start()
+    assert ready.wait(timeout=1)
+    scheduler = MagicMock()
+    scheduler.submit.return_value = True
+    service = _service(tmp_path / "home", clocks)
+    try:
+        started = time.monotonic()
+        service._sweep_once(
+            store,
+            coordinator,
+            identity,
+            epoch,
+            scheduler,
+        )
+        first_elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        holder.join(timeout=2)
+    assert not holder.is_alive()
+    assert first_elapsed < 0.5
+    assert healthy.run_id in {
+        call.args[0] for call in scheduler.submit.call_args_list
+    }
+
+    for _attempt in range(len(corrupt) + 2):
+        service._sweep_once(
+            store,
+            coordinator,
+            identity,
+            epoch,
+            scheduler,
+        )
+        if recoverable.run_id in {
+            call.args[0] for call in scheduler.submit.call_args_list
+        }:
+            break
+
+    assert recoverable.run_id in {
+        call.args[0] for call in scheduler.submit.call_args_list
+    }
+    assert store._active_run_repair_reasons(recoverable.run_id) == ()
+    assert all(
+        "run_evidence_uncorroborated"
+        in store._active_run_repair_reasons(admitted.run_id)
+        for admitted in corrupt
+    )
+
+
+def test_revalidation_lane_leaves_notification_repairs_to_outbox_cadence(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 6, 11, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(store, clocks, name="notification-repair-ownership")
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="notification-repair-ownership",
+    )
+    notification = _admit(store, package, key="notification", schedule_at=None)
+    evidence = _admit(store, package, key="evidence", schedule_at=None)
+    assert store._transition_run_repair(
+        "notification_reconciliation_unverified",
+        run_id=notification.run_id,
+        outcome="repair_required",
+    )
+    assert store._transition_run_repair(
+        "run_evidence_uncorroborated",
+        run_id=evidence.run_id,
+        outcome="repair_required",
+    )
+
+    candidate, cursor, exhausted = store.repair_revalidation_candidate(
+        after=None,
+    )
+
+    assert candidate == {
+        "sequence": cursor,
+        "run_id": evidence.run_id,
+        "reason_code": "run_evidence_uncorroborated",
+    }
+    assert exhausted is False
+    assert store._active_run_repair_reasons(notification.run_id) == (
+        "notification_reconciliation_unverified",
+    )
+
+
+def test_repair_revalidation_accepts_valid_journal_above_fixed_probe_sizes(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 6, 12, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        max_run_bytes=16 * 1024 * 1024,
+        max_journal_bytes=8 * 1024 * 1024,
+        lease_clock=clocks.lease_sample,
+    )
+    coordinator, identity, epoch = _leader(
+        store,
+        clocks,
+        name="large-repair-revalidation",
+    )
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="large-repair-revalidation",
+    )
+    admitted = _admit(store, package, key="large", schedule_at=None)
+    journal = store.run_directory(admitted.run_id) / "events.jsonl"
+    store.append_event(
+        admitted.run_id,
+        "semantic_progress",
+        {"step": "large-frame"},
+    )
+    frames = journal.read_bytes().splitlines(keepends=True)
+    event = json.loads(frames[-1])
+    event["payload"] = {"padding": "x" * (4 * 1024 * 1024)}
+    event.pop("frame_sha256")
+    _framed, encoded = store_module._encode_journal_frame(event)
+    journal.write_bytes(b"".join((*frames[:-1], encoded)))
+    assert journal.stat().st_size > 4 * 1024 * 1024
+    store.load_run(admitted.run_id)
+    for wake in coordinator.pending_wakes(
+        identity,
+        epoch=epoch,
+        now=clocks.wall,
+    ):
+        assert coordinator.complete_wake(
+            wake.generation,
+            identity,
+            epoch=epoch,
+            now=clocks.wall,
+            outcome="test_setup",
+        )
+    assert store._transition_run_repair(
+        "run_evidence_uncorroborated",
+        run_id=admitted.run_id,
+        outcome="repair_required",
+    )
+    scheduler = MagicMock()
+    scheduler.submit.return_value = True
+    service = _service(tmp_path / "home", clocks)
+
+    service._sweep_once(
+        store,
+        coordinator,
+        identity,
+        epoch,
+        scheduler,
+    )
+    service._sweep_once(
+        store,
+        coordinator,
+        identity,
+        epoch,
+        scheduler,
+    )
+
+    assert admitted.run_id in {
+        call.args[0] for call in scheduler.submit.call_args_list
+    }
+    assert store._active_run_repair_reasons(admitted.run_id) == ()
 
 
 def test_real_sweep_rescues_newly_due_work_behind_both_active_cursors(

@@ -2644,15 +2644,24 @@ upstream_changes:
   owner: workflow-orchestration
   files:
   - .superpowers/sdd/task-10-report.md
+  - plugins/workflow/coordinator.py
   - plugins/workflow/store.py
+  - tests/plugins/workflow/test_coordinator.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
   - tests/plugins/workflow/test_scheduled_runs.py
   owned_symbols:
   - RunStore active run-repair coordinator exclusion
+  - repair_events run/reason/descending-sequence lookup index
+  - bounded repair-event keyset revalidation lane
+  - full-journal and legacy-policy unattended repair corroboration
+  - leadership-term repair cursor reset
   - ordinary and scheduled candidate page repair isolation
   - v13 unrecoverable scheduled evidence sweep isolation
   tests:
+  - tests/plugins/workflow/test_coordinator.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
   - tests/plugins/workflow/test_scheduled_runs.py
-  expected_commit_subject: 'fix(workflow): isolate repair-marked coordinator rows'
+  expected_commit_subject: 'fix(workflow): revalidate isolated repair rows'
   upstream_candidate: true
   merge_guidance: >-
     Exclude a run from both ordinary and exact-due scheduled coordinator
@@ -2662,11 +2671,20 @@ upstream_changes:
     or abort projection parity checks for healthy peers. Preserve the scheduled
     index range branches, exact due-time comparison, queue-sequence generation
     fence, created-at/run-id cursor order, and parity validation for every
-    selected healthy row. A later repair_verified transition must restore
-    eligibility. Never delete, quarantine, rewrite, infer, or clear the damaged
-    run's durable evidence as part of coordinator selection.
+    selected healthy row. Back every latest-transition lookup with the
+    always-installed run/reason/descending-sequence index. After healthy
+    submissions, advance an event-sequence cursor through at most one eligible
+    evidence or legacy-policy repair per sweep, with a bounded lock wait and
+    full journal-body corroboration within configured store quotas. Validate
+    legacy policy digest and schema before recording repair_verified; leave
+    notification repairs to the outbox cadence. Advance past locked or
+    irreparable rows for fairness, reset the cursor on a new leadership term,
+    and eventually retry after wrapping the event log. A later repair_verified
+    transition must restore eligibility. Never delete, quarantine, rewrite, or
+    infer damaged durable evidence.
   removal_condition: Remove when upstream provides equivalent latest-transition
-    run-repair isolation inside both bounded coordinator candidate queries.
+    run-repair isolation, indexed lookup cost, and fair unattended evidence
+    revalidation.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-scheduled-queued-consumer-isolation
   change_class: workflow-runtime
