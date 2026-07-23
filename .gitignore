@@ -31,6 +31,8 @@ data/
 test_durations.json
 .pytest-cache/
 tmp/
+# Root-level packaging and release bundles are generated artifacts.
+/dist/
 temp_vision_images/
 hermes-*/*
 examples/
