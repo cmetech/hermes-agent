@@ -107,6 +107,7 @@ class WorkflowCoordinatorService:
         self._runner_binding = runner_binding
         self._boot_id = current_boot_id()
         self._notification_repair_due_at = 0.0
+        self._scheduled_sweep_cursor: tuple[str, str] | None = None
         self._health_lock = threading.Lock()
         self._health = BackgroundServiceHealth(
             state="starting",
@@ -325,9 +326,9 @@ class WorkflowCoordinatorService:
             now=now,
             limit=100,
         )
-        scheduled, _scheduled_cursor, _scheduled_exhausted = (
+        scheduled, _scheduled_cursor, scheduled_exhausted = (
             run_store.scheduled_coordinator_candidates(
-                after=None,
+                after=self._scheduled_sweep_cursor,
                 now=now,
                 limit=100,
             )
@@ -368,21 +369,20 @@ class WorkflowCoordinatorService:
                     "run_id": run_id,
                     "created_at": created_at,
                 }
+        indexed_run_ids = [
+            str(row["run_id"])
+            for row in sorted(
+                indexed_by_run.values(),
+                key=lambda row: (str(row["created_at"]), str(row["run_id"])),
+            )
+        ]
         ordered_run_ids = _select_sweep_run_ids(
-            uncorroborated_wake_ids
-            + [
-                str(row["run_id"])
-                for row in sorted(
-                    indexed_by_run.values(),
-                    key=lambda row: (str(row["created_at"]), str(row["run_id"])),
-                )
-            ],
+            uncorroborated_wake_ids + indexed_run_ids,
             [str(row["run_id"]) for row in periodic],
         )
         actionable_work = False
         progress_at: datetime | None = None
         processed_runs: set[str] = set()
-        processed_periodic_cursor = cursor
         for run_id in ordered_run_ids:
             if self._monotonic() >= deadline:
                 break
@@ -446,14 +446,26 @@ class WorkflowCoordinatorService:
                     outcome=outcome,
                 )
         processed_page = True
+        processed_periodic_cursor = cursor
         for row in periodic:
-            if str(row["run_id"]) not in processed_runs:
+            run_id = str(row["run_id"])
+            if run_id not in processed_runs:
                 processed_page = False
                 break
-            processed_periodic_cursor = (
-                str(row["created_at"]),
-                str(row["run_id"]),
-            )
+            processed_periodic_cursor = (str(row["created_at"]), run_id)
+        scheduled_processed = True
+        scheduled_cursor = self._scheduled_sweep_cursor
+        for row in scheduled:
+            run_id = str(row["run_id"])
+            if run_id not in processed_runs:
+                scheduled_processed = False
+                break
+            scheduled_cursor = (str(row["created_at"]), run_id)
+        self._scheduled_sweep_cursor = (
+            None
+            if scheduled_exhausted and scheduled_processed
+            else scheduled_cursor
+        )
         next_cursor = (
             None
             if page_exhausted and processed_page
@@ -470,6 +482,7 @@ class WorkflowCoordinatorService:
         identity: CoordinatorIdentity,
         epoch: int,
     ) -> bool:
+        self._scheduled_sweep_cursor = None
         scheduler = self._scheduler(
             run_store,
             fence=ExecutionFence(identity.owner_id, epoch),

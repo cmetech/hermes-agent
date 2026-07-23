@@ -836,6 +836,55 @@ def test_verified_loader_generation_change_prevents_stale_warm_hit_return(
     assert stale_checked["approval-gate"] is forced["approval-gate"]
 
 
+def test_verified_loader_rechecks_generation_after_restoring_warm_cache_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield copied
+
+    def budget() -> WorkflowResourceReadBudget:
+        return WorkflowResourceReadBudget(
+            max_file_bytes=1024 * 1024,
+            max_total_bytes=8 * 1024 * 1024,
+            max_files=512,
+        )
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    initial = showcase_module.load_verified_showcase_packages(read_budget=budget())
+    initial_package = initial["approval-gate"]
+    restore_started = threading.Event()
+    release_restore = threading.Event()
+    original_restore = showcase_module._restore_cached_resources
+
+    def pausing_restore(read_budget, cached):
+        original_restore(read_budget, cached)
+        restore_started.set()
+        release_restore.wait(timeout=5)
+
+    monkeypatch.setattr(showcase_module, "_restore_cached_resources", pausing_restore)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        stale_candidate = executor.submit(
+            showcase_module.load_verified_showcase_packages, read_budget=budget()
+        )
+        assert restore_started.wait(timeout=2)
+        forced = executor.submit(
+            showcase_module.load_verified_showcase_packages,
+            read_budget=budget(),
+            force_reverify=True,
+        ).result(timeout=5)
+        release_restore.set()
+        current = stale_candidate.result(timeout=5)
+
+    assert forced["approval-gate"] is not initial_package
+    assert current["approval-gate"] is forced["approval-gate"]
+
+
 def test_verified_loader_parses_only_digest_authenticated_package_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

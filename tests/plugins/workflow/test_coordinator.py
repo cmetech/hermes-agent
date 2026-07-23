@@ -1450,6 +1450,132 @@ def test_sweep_cursor_never_skips_page_prefix_when_wake_consumes_budget(
     )
 
 
+def test_scheduled_due_pages_advance_past_a_stably_lane_blocked_first_page(
+    tmp_path, workflow_writer
+) -> None:
+    now = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
+    store = RunStore(
+        tmp_path,
+        max_queued_runs=102,
+        max_nonterminal_runs=102,
+        max_start_requests_per_minute=200,
+    )
+    coordinator = CoordinatorStore(store.database)
+    identity = _identity("scheduled-page")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    package = load_workflow(workflow_writer(tmp_path / "package", name="scheduled-page"))
+
+    def admit(index: int, *, concurrency_key: str) -> str:
+        prepared = store.prepare_run_snapshot(package)
+        return store.start_run(
+            RunAdmissionRequest(
+                workflow_name=package.definition.name,
+                definition_digest=prepared.definition_digest,
+                policy_digest=prepared.policy_digest,
+                input_manifest_digest=prepared.input_manifest_digest,
+                trigger_source="api",
+                idempotency_key=f"scheduled-page-{index:03d}",
+                concurrency_key=concurrency_key,
+                concurrency_policy="queue",
+                execution_mode="background",
+                run_metadata={"schedule_at": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")},
+            ),
+            immutable_snapshot=prepared,
+        ).run_id
+
+    blocked = [admit(index, concurrency_key="blocked-lane") for index in range(100)]
+    independent = admit(100, concurrency_key="independent-lane")
+    for wake in coordinator.pending_wakes(identity, epoch=leadership.lease.epoch, now=now):
+        assert coordinator.complete_wake(
+            wake.generation, identity, epoch=leadership.lease.epoch, now=now, outcome="test_setup"
+        )
+
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(host_kind="gateway", host_instance_id="scheduled-page"),
+        hermes_home=tmp_path,
+        utcnow=lambda: now,
+        monotonic=lambda: 0.0,
+    )
+    scheduler = MagicMock()
+    scheduler.submit.side_effect = lambda run_id, _fence: run_id == independent
+
+    _first_actionable, cursor, _first_progress = service._sweep_once(
+        store, coordinator, identity, leadership.lease.epoch, scheduler
+    )
+    second_actionable, second_periodic_cursor, _second_progress = service._sweep_once(
+        store, coordinator, identity, leadership.lease.epoch, scheduler, cursor=cursor
+    )
+
+    submitted = [call.args[0] for call in scheduler.submit.call_args_list]
+    assert submitted.count(independent) == 1
+    assert second_actionable is True
+    assert len(submitted[:100]) == 100
+    assert len(submitted[100:]) == 1
+    assert cursor is None
+    assert second_periodic_cursor is None
+    assert set(submitted[:100]) == set(blocked)
+
+
+def test_new_leadership_term_restarts_scheduled_paging_at_page_one(
+    tmp_path, workflow_writer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
+    store = RunStore(tmp_path, max_queued_runs=2, max_start_requests_per_minute=10)
+    coordinator = CoordinatorStore(store.database)
+    identity = _identity("scheduled-restart")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    package = load_workflow(workflow_writer(tmp_path / "package", name="scheduled-restart"))
+    run_ids = []
+    for index in range(2):
+        prepared = store.prepare_run_snapshot(package)
+        run_ids.append(
+            store.start_run(
+                RunAdmissionRequest(
+                    workflow_name=package.definition.name,
+                    definition_digest=prepared.definition_digest,
+                    policy_digest=prepared.policy_digest,
+                    input_manifest_digest=prepared.input_manifest_digest,
+                    trigger_source="api",
+                    idempotency_key=f"scheduled-restart-{index}",
+                    concurrency_key=f"scheduled-restart-{index}",
+                    execution_mode="background",
+                    run_metadata={"schedule_at": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")},
+                ),
+                immutable_snapshot=prepared,
+            ).run_id
+        )
+    for wake in coordinator.pending_wakes(identity, epoch=leadership.lease.epoch, now=now):
+        assert coordinator.complete_wake(
+            wake.generation, identity, epoch=leadership.lease.epoch, now=now, outcome="test_setup"
+        )
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(host_kind="gateway", host_instance_id="scheduled-restart"),
+        hermes_home=tmp_path,
+        utcnow=lambda: now,
+        monotonic=lambda: 0.0,
+    )
+    service._scheduled_sweep_cursor = (store.load_run(run_ids[-1])["created_at"], run_ids[-1])
+    leadership_scheduler = MagicMock()
+    leadership_scheduler.shutdown_deadline_seconds = 1.0
+    monkeypatch.setattr(service, "_scheduler", lambda *_args, **_kwargs: leadership_scheduler)
+    stopped = threading.Event()
+    stopped.set()
+
+    assert service._lead(
+        stopped,
+        run_store=store,
+        coordinator_store=coordinator,
+        identity=identity,
+        epoch=leadership.lease.epoch,
+    ) is True
+    assert service._scheduled_sweep_cursor is None
+
+    scheduler = MagicMock()
+    scheduler.submit.return_value = False
+    service._sweep_once(store, coordinator, identity, leadership.lease.epoch, scheduler)
+    assert scheduler.submit.call_args_list[0].args[0] == run_ids[0]
+
+
 def test_foreground_and_background_admission_are_fenced_by_live_leader(
     tmp_path, workflow_writer
 ) -> None:

@@ -777,8 +777,33 @@ def _load_verified_showcase_cache_hit(
             _VERIFIED_SHOWCASE_CACHE_GENERATION += 1
             _VERIFIED_SHOWCASE_CACHE.clear()
     if cache_hit:
-        _restore_cached_resources(read_budget, cached)
-        return dict(cached.packages)
+        previous_contents = dict(read_budget._contents)
+        previous_aliases = dict(read_budget._aliases)
+        previous_files_read = read_budget.files_read
+        previous_bytes_read = read_budget.bytes_read
+        try:
+            _restore_cached_resources(read_budget, cached)
+        except Exception:
+            read_budget._contents.clear()
+            read_budget._contents.update(previous_contents)
+            read_budget._aliases.clear()
+            read_budget._aliases.update(previous_aliases)
+            read_budget.files_read = previous_files_read
+            read_budget.bytes_read = previous_bytes_read
+            raise
+        with _VERIFIED_SHOWCASE_CACHE_LOCK:
+            current = (
+                generation == _VERIFIED_SHOWCASE_CACHE_GENERATION
+                and _VERIFIED_SHOWCASE_CACHE.get(bundle_digest) is cached
+            )
+        if current:
+            return dict(cached.packages)
+        read_budget._contents.clear()
+        read_budget._contents.update(previous_contents)
+        read_budget._aliases.clear()
+        read_budget._aliases.update(previous_aliases)
+        read_budget.files_read = previous_files_read
+        read_budget.bytes_read = previous_bytes_read
     return None
 
 
