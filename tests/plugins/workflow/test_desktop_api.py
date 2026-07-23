@@ -947,6 +947,146 @@ def _start_scheduled_mutation_run(store, package, *, key: str):
     return result.run_id
 
 
+def _scheduled_due_boundary_run(home, workflow_writer, *, name: str):
+    due = datetime.fromisoformat(SCHEDULE_AT.replace("Z", "+00:00"))
+    before_due = due - timedelta(microseconds=1)
+    after_due = due + timedelta(microseconds=1)
+    wall = [before_due]
+
+    def lease_clock() -> LeaseClockSample:
+        return LeaseClockSample(wall[0], 100.0, f"{name}-clock")
+
+    store = RunStore(home, lease_clock=lease_clock)
+    coordinator = CoordinatorStore(store.database, clock=lease_clock)
+    identity = CoordinatorIdentity(
+        owner_id=f"{name}-leader",
+        host_kind="web",
+        host_instance_id=f"{name}-leader",
+        pid=1,
+        process_start_time=None,
+    )
+    acquired = coordinator.try_acquire(
+        identity,
+        now=before_due,
+        lease_seconds=60,
+    )
+    assert acquired.is_leader
+    package = load_workflow(workflow_writer(home / "package", name=name))
+    run_id = _start_scheduled_mutation_run(store, package, key=name)
+    wall[0] = after_due
+    return store, run_id, before_due
+
+
+def test_run_detail_uses_one_clock_for_status_and_public_projection(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store, run_id, before_due = _scheduled_due_boundary_run(
+        home, workflow_writer, name="detail-boundary"
+    )
+    module = _module()
+    samples = 0
+    status_clocks = []
+    original_get_run_status = store.get_run_status
+
+    def request_clock() -> datetime:
+        nonlocal samples
+        samples += 1
+        return before_due
+
+    def tracked_get_run_status(tracked_run_id, **kwargs):
+        status_clocks.append(kwargs.get("now"))
+        return original_get_run_status(tracked_run_id, **kwargs)
+
+    @contextmanager
+    def store_lease():
+        yield store
+
+    monkeypatch.setattr(store, "get_run_status", tracked_get_run_status)
+    monkeypatch.setattr(module, "_schedule_now_utc", request_clock)
+    monkeypatch.setattr(module, "_store_lease", store_lease)
+
+    response = TestClient(_app(module.router)).get(
+        f"/api/plugins/workflow/runs/{run_id}"
+    )
+
+    assert response.status_code == 200
+    assert samples == 1
+    assert status_clocks == [before_due]
+    assert response.json()["presentation_state"] == "scheduled_wait"
+    assert response.json()["blocking_reason"] == "scheduled_wait"
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_version_delta", "expected_code", "waiting"),
+    [
+        ("cancel", 0, None, False),
+        ("cancel", -1, "stale_state", True),
+        ("archive", 0, "invalid_transition", True),
+    ],
+)
+def test_scheduled_mutation_response_uses_one_clock_across_due_boundary(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    action,
+    expected_version_delta,
+    expected_code,
+    waiting,
+) -> None:
+    home = tmp_path / f"home-{action}-{expected_code or 'success'}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store, run_id, before_due = _scheduled_due_boundary_run(
+        home,
+        workflow_writer,
+        name=f"mutation-boundary-{action}-{expected_code or 'success'}",
+    )
+    current = store.get_run_status(run_id, now=before_due)
+    module = _module()
+    samples = 0
+    status_clocks = []
+    original_get_run_status = store.get_run_status
+
+    def request_clock() -> datetime:
+        nonlocal samples
+        samples += 1
+        return before_due
+
+    def tracked_get_run_status(tracked_run_id, **kwargs):
+        status_clocks.append(kwargs.get("now"))
+        return original_get_run_status(tracked_run_id, **kwargs)
+
+    @contextmanager
+    def store_lease():
+        yield store
+
+    monkeypatch.setattr(store, "get_run_status", tracked_get_run_status)
+    monkeypatch.setattr(module, "_schedule_now_utc", request_clock)
+    monkeypatch.setattr(module, "_store_lease", store_lease)
+
+    response = TestClient(_app(module.router)).post(
+        f"/api/plugins/workflow/runs/{run_id}/{action}",
+        json={
+            "expected_version": current["state_version"] + expected_version_delta
+        },
+    )
+
+    assert samples == 1
+    assert status_clocks
+    assert set(status_clocks) == {before_due}
+    if expected_code is None:
+        assert response.status_code == 200
+        projection = response.json()
+    else:
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == expected_code
+        projection = response.json()["detail"]["current"]
+    _assert_public_scheduled_mutation_projection(projection, waiting=waiting)
+    if waiting:
+        assert projection["blocking_reason"] == "scheduled_wait"
+
+
 def _assert_public_scheduled_mutation_projection(
     projection: dict[str, object], *, waiting: bool
 ) -> None:

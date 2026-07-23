@@ -2514,6 +2514,7 @@ upstream_changes:
   - due-aware public run presentation
   - backward-clock scheduled-wait queue dematerialization
   - request-scoped list status and projection clock
+  - request-scoped detail and mutation response clocks
   - cancel-before-due immutable evidence retention
   - cancelled scheduled wake completion and cleanup eligibility
   - scheduled foreground and retry isolation
@@ -2539,6 +2540,9 @@ upstream_changes:
     in the immediate queue must atomically clear its position and blocker while
     preserving the original sequence. Run list status, presentation, retention
     cutoff, and cursor pages must share one server-owned request observation.
+    Run detail plus every mutation success, current-state, stale-state, and
+    invalid-transition projection must likewise derive status and presentation
+    from one server-owned observation for that response.
     Cancelled scheduled wakes complete without submission, and the retained
     evidence enters ordinary terminal cleanup eligibility rather than receiving
     schedule-specific deletion. Keep ordinary unscheduled promotion, foreground

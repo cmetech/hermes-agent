@@ -474,11 +474,18 @@ def _authorized_runs(
     )
 
 
-def _load_authorized(store: RunStore, run_id: str, operator: WorkflowAuthority):
+def _load_authorized(
+    store: RunStore,
+    run_id: str,
+    operator: WorkflowAuthority,
+    *,
+    now: datetime | None = None,
+):
     try:
         return store.get_run_status(
             run_id,
             operator_scope=None if operator.unrestricted else operator.scope,
+            **({"now": now} if now is not None else {}),
         )
     except JournalRecoveryError as exc:
         raise HTTPException(
@@ -994,10 +1001,11 @@ def get_run(
 ):
     operator = _verified_operator(request, operator_scope)
     operator.require("read")
+    observed_at = _schedule_now_utc()
     with _store_lease() as store:
         return public_run_projection(
-            _load_authorized(store, run_id, operator),
-            now=_schedule_now_utc(),
+            _load_authorized(store, run_id, operator, now=observed_at),
+            now=observed_at,
         )
 
 
@@ -1399,8 +1407,9 @@ def mutate_run(
     operator = _verified_operator(request_context, operator_scope)
     operator.require("write")
     scope = None if operator.unrestricted else operator.scope
+    observed_at = _schedule_now_utc()
     with _store_lease() as store:
-        current = _load_authorized(store, run_id, operator)
+        current = _load_authorized(store, run_id, operator, now=observed_at)
         if action not in MUTATION_ACTIONS:
             raise HTTPException(status_code=404, detail={"code": "action_not_found"})
         if action in {"approve", "reject", "provide-input", "reconcile"} and (
@@ -1421,7 +1430,7 @@ def mutate_run(
                 status_code=409,
                 detail={
                     "code": "invalid_transition",
-                    "current": public_run_projection(current, now=_schedule_now_utc()),
+                    "current": public_run_projection(current, now=observed_at),
                 },
             )
         if int(current["state_version"]) != request.expected_version:
@@ -1429,7 +1438,7 @@ def mutate_run(
                 status_code=409,
                 detail={
                     "code": "stale_state",
-                    "current": public_run_projection(current, now=_schedule_now_utc()),
+                    "current": public_run_projection(current, now=observed_at),
                 },
             )
         try:
@@ -1526,8 +1535,13 @@ def mutate_run(
                 detail={
                     "code": "stale_state",
                     "current": public_run_projection(
-                        _load_authorized(store, run_id, operator),
-                        now=_schedule_now_utc(),
+                        _load_authorized(
+                            store,
+                            run_id,
+                            operator,
+                            now=observed_at,
+                        ),
+                        now=observed_at,
                     ),
                 },
             ) from exc
@@ -1536,6 +1550,6 @@ def mutate_run(
                 status_code=409, detail={"code": "invalid_transition"}
             ) from exc
         return public_run_projection(
-            _load_authorized(store, run_id, operator),
-            now=_schedule_now_utc(),
+            _load_authorized(store, run_id, operator, now=observed_at),
+            now=observed_at,
         )
