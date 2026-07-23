@@ -2537,6 +2537,7 @@ upstream_changes:
   change_class: workflow-runtime
   owner: workflow-orchestration
   files:
+  - .superpowers/sdd/task-3-report.md
   - plugins/workflow/cli.py
   - plugins/workflow/coordinator.py
   - plugins/workflow/scheduler.py
@@ -2549,7 +2550,7 @@ upstream_changes:
   - RunStore ordinary and exact index-ranged scheduled coordinator candidate streams
   - RunStore.try_promote_run atomic due recheck
   - WorkflowCoordinatorService scheduled_not_due wake completion
-  - WorkflowCoordinatorService globally fair actionable candidate and wake merge
+  - WorkflowCoordinatorService deterministic merge with saturated periodic liveness
   - WorkflowCoordinatorService five-second monotonic sweep bound
   - coordinator-to-scheduler wall and monotonic clock threading
   - RunScheduler promotion wall-clock sampling
@@ -2568,20 +2569,27 @@ upstream_changes:
     polling; let the bounded indexed scan rediscover it when due. Complete
     not-due scheduled wakes outside the execution-order budget, then merge the
     oldest current-due scheduled rows, ordinary cursor page, and actionable
-    wakes into one globally bounded original created-at/run-id prefix. Re-sample
-    the current due prefix on every sweep so consecutive forward jumps cannot be
-    hidden behind a stale cursor. Split exact SQL due bounds into index-native
-    range/equality branches derived from the six-digit observed clock, excluding
-    arbitrary-precision same-second future rows before the bounded created-order
-    sort and projection corroboration, including the canonical prefix case where
-    a longer fraction sorts before the exact microsecond string.
+    wakes in deterministic created-at/run-id order. Preserve that exact global
+    order whenever the merged set fits the hard 100-run budget. Under
+    saturation, reserve the oldest row from the current periodic ordinary-cursor
+    page, process it first for deadline-safe liveness, and fill the remaining
+    99 slots from the normal order excluding that row. Preserve source ordering,
+    never duplicate the reserved row, and advance the ordinary cursor only
+    through its actually processed prefix. Re-sample the current due prefix on
+    every sweep so consecutive forward jumps cannot be hidden behind a stale
+    cursor. Split exact SQL due bounds into index-native range/equality branches
+    derived from the six-digit observed clock, excluding arbitrary-precision
+    same-second future rows before the bounded created-order sort and projection
+    corroboration, including the canonical prefix case where a longer fraction
+    sorts before the exact microsecond string.
     Recheck due under the admission lock, run lock, and promotion transaction so
     a backward wall jump refuses the compare-and-set and a later due sample
     promotes exactly once. Keep every backoff and local-wake timeout at or below
     five monotonic seconds, independent of far-future wall time and local offset.
   removal_condition: Remove when upstream provides equivalent exact due-aware
     coordinator paging, one-shot early-wake deferral, atomic promotion recheck,
-    injected scheduler clocks, and five-second monotonic sweep bounds.
+    saturated periodic-page liveness, prefix-safe cursor advancement, injected
+    scheduler clocks, and five-second monotonic sweep bounds.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-scheduled-queued-consumer-isolation
   change_class: workflow-runtime

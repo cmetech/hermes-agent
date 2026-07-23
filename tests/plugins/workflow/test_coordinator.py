@@ -12,6 +12,7 @@ import pytest
 
 from hermes_cli.plugin_services import BackgroundServiceContext
 from hermes_cli.plugin_invocation import DeliveryReceipt
+import plugins.workflow.coordinator as coordinator_module
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import (
     CoordinatorIdentity,
@@ -1177,6 +1178,40 @@ def test_scheduler_submit_is_nonblocking_deduplicated_and_avoids_head_of_line(
     assert second_completed.wait(timeout=1)
     release_first.set()
     scheduler.shutdown(deadline_seconds=2)
+
+
+def test_sweep_selection_preserves_global_order_below_budget() -> None:
+    ordered = ["scheduled-0", "periodic-0", "scheduled-1"]
+
+    selected = coordinator_module._select_sweep_run_ids(
+        ordered,
+        ["periodic-0"],
+    )
+
+    assert selected == ordered
+
+
+def test_sweep_selection_reserves_periodic_head_before_saturated_prefix() -> None:
+    scheduled = [f"scheduled-{index:03d}" for index in range(100)]
+
+    selected = coordinator_module._select_sweep_run_ids(
+        [*scheduled, "periodic-0", "periodic-1"],
+        ["periodic-0", "periodic-1"],
+    )
+
+    assert selected == ["periodic-0", *scheduled[:99]]
+
+
+def test_sweep_selection_does_not_duplicate_reserved_head_in_prefix() -> None:
+    scheduled = [f"scheduled-{index:03d}" for index in range(100)]
+
+    selected = coordinator_module._select_sweep_run_ids(
+        ["periodic-0", *scheduled],
+        ["periodic-0"],
+    )
+
+    assert selected == ["periodic-0", *scheduled[:99]]
+    assert selected.count("periodic-0") == 1
 
 
 def test_idle_backoff_uses_actionable_work_not_rows_seen(

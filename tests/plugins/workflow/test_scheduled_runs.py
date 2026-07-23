@@ -976,8 +976,111 @@ def test_due_and_ordinary_candidates_share_one_global_admission_order(
     service._sweep_once(store, coordinator, identity, epoch, scheduler)
 
     submitted = [call.args[0] for call in scheduler.submit.call_args_list]
-    assert set(submitted[:51]) == {run.run_id for run in scheduled}
-    assert submitted[51] == ordinary.run_id
+    assert submitted == [run.run_id for run in scheduled] + [ordinary.run_id]
+
+
+def test_full_due_backlog_cannot_starve_periodic_running_page(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 4, 12, 0, tzinfo=UTC))
+    due = clocks.wall + timedelta(hours=1)
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=4,
+        max_queued_runs=100,
+        max_nonterminal_runs=104,
+        max_start_requests_per_minute=104,
+        lease_clock=clocks.lease_sample,
+    )
+    coordinator, identity, epoch = _leader(
+        store,
+        clocks,
+        name="full-due-backlog",
+    )
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="full-due-backlog",
+    )
+    scheduled = [
+        _admit(
+            store,
+            package,
+            key=f"older-scheduled-{index:03d}",
+            schedule_at=due.isoformat().replace("+00:00", "Z"),
+        )
+        for index in range(100)
+    ]
+    periodic = [
+        _admit(
+            store,
+            package,
+            key=f"later-running-{index:03d}",
+            schedule_at=None,
+            concurrency_policy="allow",
+        )
+        for index in range(4)
+    ]
+    assert all(
+        store.load_run(run.run_id)["status"] == "running" for run in periodic
+    )
+    assert max(
+        store.load_run(run.run_id)["created_at"] for run in scheduled
+    ) < min(store.load_run(run.run_id)["created_at"] for run in periodic)
+    clocks.wall = due
+    _complete_pending_wakes(coordinator, identity, epoch, now=clocks.wall)
+    service = _service(tmp_path / "home", clocks)
+    submissions_by_sweep: list[list[str]] = []
+
+    class DeadlineScheduler:
+        def begin_sweep(self) -> None:
+            submissions_by_sweep.append([])
+
+        def submit(self, run_id: str, fence: ExecutionFence) -> bool:
+            assert fence == ExecutionFence(identity.owner_id, epoch)
+            submissions_by_sweep[-1].append(run_id)
+            clocks.monotonic_value += 2.1
+            return True
+
+    scheduler = DeadlineScheduler()
+    cursor = None
+    observed_cursors = []
+    for _ in range(4):
+        scheduler.begin_sweep()
+        _actionable, cursor, _progress = service._sweep_once(
+            store,
+            coordinator,
+            identity,
+            epoch,
+            scheduler,
+            cursor,
+        )
+        observed_cursors.append(cursor)
+
+    periodic_ids = [run.run_id for run in periodic]
+    submitted_periodic = [
+        run_id
+        for sweep in submissions_by_sweep
+        for run_id in sweep
+        if run_id in periodic_ids
+    ]
+    expected_cursors = [
+        (
+            store.load_run(run.run_id)["created_at"],
+            run.run_id,
+        )
+        for run in periodic[:-1]
+    ] + [None]
+    assert (submitted_periodic, observed_cursors) == (
+        periodic_ids,
+        expected_cursors,
+    )
+    assert submissions_by_sweep[0][0] in periodic_ids
+    assert [sweep[0] for sweep in submissions_by_sweep] == periodic_ids
+    assert all(len(sweep) == 1 for sweep in submissions_by_sweep)
+    assert all(len(sweep) == len(set(sweep)) for sweep in submissions_by_sweep)
+    assert observed_cursors == expected_cursors
 
 
 def test_newer_pending_wake_does_not_bypass_older_due_admissions(

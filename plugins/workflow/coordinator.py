@@ -36,6 +36,20 @@ logger = logging.getLogger(__name__)
 _MAX_SWEEP_DELAY_SECONDS = 5.0
 
 
+def _select_sweep_run_ids(
+    ordered_run_ids: list[str],
+    periodic_run_ids: list[str],
+) -> list[str]:
+    if len(ordered_run_ids) <= 100:
+        return ordered_run_ids
+    if not periodic_run_ids:
+        return ordered_run_ids[:100]
+    periodic_head = periodic_run_ids[0]
+    return [periodic_head] + [
+        run_id for run_id in ordered_run_ids if run_id != periodic_head
+    ][:99]
+
+
 class WorkflowCoordinatorService:
     """Elect and heartbeat one workflow coordinator without model authority."""
 
@@ -354,13 +368,17 @@ class WorkflowCoordinatorService:
                     "run_id": run_id,
                     "created_at": created_at,
                 }
-        ordered_run_ids = uncorroborated_wake_ids + [
-            str(row["run_id"])
-            for row in sorted(
-                indexed_by_run.values(),
-                key=lambda row: (str(row["created_at"]), str(row["run_id"])),
-            )[: max(0, 100 - len(uncorroborated_wake_ids))]
-        ]
+        ordered_run_ids = _select_sweep_run_ids(
+            uncorroborated_wake_ids
+            + [
+                str(row["run_id"])
+                for row in sorted(
+                    indexed_by_run.values(),
+                    key=lambda row: (str(row["created_at"]), str(row["run_id"])),
+                )
+            ],
+            [str(row["run_id"]) for row in periodic],
+        )
         actionable_work = False
         progress_at: datetime | None = None
         processed_runs: set[str] = set()
