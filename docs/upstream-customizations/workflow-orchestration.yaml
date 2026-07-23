@@ -2747,3 +2747,32 @@ upstream_changes:
     deterministic one-shot scheduling E2E and exact cross-platform release-gate
     coverage for recovery, clocks, cancellation, and fire-time authorization.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-v3-0-3-final-verification
+  change_class: workflow-documentation
+  owner: workflow-orchestration
+  files:
+  - docs/reviews/2026-07-23-workflow-v3.0.3-verification.md
+  owned_symbols:
+  - Workflow v3.0.3 Revision 7 final verification mapping
+  - failure-table-to-test mapping
+  - final gate and baseline-delta evidence
+  - paired-brand and manual-only handoff status
+  - non-normative v3.0.3 deferred-work register
+  tests:
+  - tests/scripts/test_workflow_merge_gate.py
+  - tests/plugins/workflow/test_ai_entitlement.py
+  - tests/plugins/workflow/test_node_mcp.py
+  - tests/plugins/workflow/test_schedule_store_identity.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  - tests/plugins/workflow/test_schedule_revalidation.py
+  - tests/plugins/workflow/test_scheduling_middleware_e2e.py
+  expected_commit_subject: 'docs(workflow): verify v3.0.3 revision 7'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve the exact release-gate counts and SHA evidence, named-coverage and
+    failure-table mappings, carried-finding dispositions, paired-brand
+    rehearsal, and honest manual-only status together. Deferred backlog files
+    are non-normative and must not be interpreted as widening Revision 7.
+  removal_condition: Remove after equivalent v3.0.3 verification evidence and
+    deferred-work dispositions are carried in the upstream release record.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
