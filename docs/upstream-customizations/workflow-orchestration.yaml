@@ -2756,7 +2756,7 @@ upstream_changes:
   - Workflow v3.0.3 Revision 7 final verification mapping
   - failure-table-to-test mapping
   - final gate and baseline-delta evidence
-  - paired-brand and manual-only handoff status
+  - exact paired-brand SHA and manual-only handoff status
   - non-normative v3.0.3 deferred-work register
   tests:
   - tests/scripts/test_workflow_merge_gate.py
@@ -2770,8 +2770,8 @@ upstream_changes:
   upstream_candidate: true
   merge_guidance: >-
     Preserve the exact release-gate counts and SHA evidence, named-coverage and
-    failure-table mappings, carried-finding dispositions, paired-brand
-    rehearsal, and honest manual-only status together. Deferred backlog files
+    failure-table mappings, carried-finding dispositions, exact paired-brand
+    rehearsal SHA, and honest manual-only status together. Deferred backlog files
     are non-normative and must not be interpreted as widening Revision 7.
   removal_condition: Remove after equivalent v3.0.3 verification evidence and
     deferred-work dispositions are carried in the upstream release record.
