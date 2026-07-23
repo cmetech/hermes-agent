@@ -1214,6 +1214,19 @@ def test_sweep_selection_does_not_duplicate_reserved_head_in_prefix() -> None:
     assert selected.count("periodic-0") == 1
 
 
+def test_sweep_selection_reserves_periodic_and_scheduled_continuation_heads() -> None:
+    fresh = [f"fresh-{index:03d}" for index in range(100)]
+
+    selected = coordinator_module._select_sweep_run_ids(
+        [*fresh, "continuation-0", "periodic-0"],
+        ["periodic-0"],
+        ["continuation-0"],
+    )
+
+    assert selected == ["periodic-0", "continuation-0", *fresh[:98]]
+    assert len(selected) == 100
+
+
 def test_idle_backoff_uses_actionable_work_not_rows_seen(
     tmp_path, workflow_writer
 ) -> None:
@@ -1510,10 +1523,128 @@ def test_scheduled_due_pages_advance_past_a_stably_lane_blocked_first_page(
     assert submitted.count(independent) == 1
     assert second_actionable is True
     assert len(submitted[:100]) == 100
-    assert len(submitted[100:]) == 1
+    assert len(submitted[100:]) == 100
+    assert submitted[100] == independent
     assert cursor is None
     assert second_periodic_cursor is None
     assert set(submitted[:100]) == set(blocked)
+
+
+def test_scheduled_due_prefix_is_resampled_during_a_sustained_forward_stream(
+    tmp_path, workflow_writer
+) -> None:
+    now = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "scheduled-stream"))
+    store = RunStore(
+        tmp_path,
+        max_queued_runs=400,
+        max_nonterminal_runs=400,
+        max_start_requests_per_minute=1000,
+        lease_clock=clock,
+    )
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    identity = _identity("scheduled-stream")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    package = load_workflow(
+        workflow_writer(tmp_path / "package", name="scheduled-stream")
+    )
+
+    def admit(index: str, *, schedule_at: datetime) -> str:
+        prepared = store.prepare_run_snapshot(package)
+        result = store.start_run(
+            RunAdmissionRequest(
+                workflow_name=package.definition.name,
+                definition_digest=prepared.definition_digest,
+                policy_digest=prepared.policy_digest,
+                input_manifest_digest=prepared.input_manifest_digest,
+                trigger_source="api",
+                idempotency_key=f"scheduled-stream-{index}",
+                concurrency_key=f"scheduled-stream-{index}",
+                concurrency_policy="queue",
+                execution_mode="background",
+                run_metadata={
+                    "schedule_at": schedule_at.isoformat().replace("+00:00", "Z")
+                },
+            ),
+            immutable_snapshot=prepared,
+        )
+        assert result.run_id is not None
+        return result.run_id
+
+    def drain_wakes() -> None:
+        while wakes := coordinator.pending_wakes(
+            identity,
+            epoch=leadership.lease.epoch,
+            now=clock.sample.utc_now,
+        ):
+            for wake in wakes:
+                assert coordinator.complete_wake(
+                    wake.generation,
+                    identity,
+                    epoch=leadership.lease.epoch,
+                    now=clock.sample.utc_now,
+                    outcome="test_setup",
+                )
+
+    target = admit("target", schedule_at=now + timedelta(seconds=1))
+    for index in range(101):
+        admit(f"initial-{index:03d}", schedule_at=now - timedelta(seconds=1))
+    drain_wakes()
+
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(
+            host_kind="gateway",
+            host_instance_id="scheduled-stream",
+        ),
+        hermes_home=tmp_path,
+        utcnow=lambda: clock.sample.utc_now,
+        monotonic=lambda: clock.sample.monotonic_now,
+    )
+    scheduler = MagicMock()
+    scheduler.submit.side_effect = lambda run_id, _fence: run_id == target
+
+    _actionable, periodic_cursor, _progress = service._sweep_once(
+        store,
+        coordinator,
+        identity,
+        leadership.lease.epoch,
+        scheduler,
+    )
+    target_projection = store.load_run(target)
+    target_key = (str(target_projection["created_at"]), target)
+    assert service._scheduled_sweep_cursor is not None
+    assert service._scheduled_sweep_cursor > target_key
+
+    clock.sample = LeaseClockSample(
+        now + timedelta(seconds=2),
+        102.0,
+        "scheduled-stream",
+    )
+    unfenced_cursor = service._scheduled_sweep_cursor
+    for wave in range(2):
+        for index in range(100):
+            admit(
+                f"wave-{wave}-{index:03d}",
+                schedule_at=clock.sample.utc_now - timedelta(seconds=1),
+            )
+        drain_wakes()
+        _page, unfenced_cursor, exhausted = store.scheduled_coordinator_candidates(
+            after=unfenced_cursor,
+            now=clock.sample.utc_now,
+            limit=100,
+        )
+        assert exhausted is False
+        _actionable, periodic_cursor, _progress = service._sweep_once(
+            store,
+            coordinator,
+            identity,
+            leadership.lease.epoch,
+            scheduler,
+            cursor=periodic_cursor,
+        )
+
+    submitted = [call.args[0] for call in scheduler.submit.call_args_list]
+    assert target in submitted
 
 
 def test_new_leadership_term_restarts_scheduled_paging_at_page_one(
@@ -1555,6 +1686,8 @@ def test_new_leadership_term_restarts_scheduled_paging_at_page_one(
         monotonic=lambda: 0.0,
     )
     service._scheduled_sweep_cursor = (store.load_run(run_ids[-1])["created_at"], run_ids[-1])
+    service._scheduled_sweep_observed_at = now - timedelta(minutes=1)
+    service._scheduled_sweep_high_water = service._scheduled_sweep_cursor
     leadership_scheduler = MagicMock()
     leadership_scheduler.shutdown_deadline_seconds = 1.0
     monkeypatch.setattr(service, "_scheduler", lambda *_args, **_kwargs: leadership_scheduler)
@@ -1569,6 +1702,8 @@ def test_new_leadership_term_restarts_scheduled_paging_at_page_one(
         epoch=leadership.lease.epoch,
     ) is True
     assert service._scheduled_sweep_cursor is None
+    assert service._scheduled_sweep_observed_at is None
+    assert service._scheduled_sweep_high_water is None
 
     scheduler = MagicMock()
     scheduler.submit.return_value = False

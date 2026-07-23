@@ -857,20 +857,55 @@ def test_verified_loader_rechecks_generation_after_restoring_warm_cache_bytes(
     showcase_module._clear_verified_showcase_cache_for_tests()
     initial = showcase_module.load_verified_showcase_packages(read_budget=budget())
     initial_package = initial["approval-gate"]
+    request_budget = budget()
+    request_owned_path = (tmp_path / "request-owned.bin").resolve()
+    request_owned_alias = tmp_path / "request-owned-alias.bin"
+    request_owned_bytes = b"request-owned"
+    request_budget._contents[request_owned_path] = request_owned_bytes
+    request_budget.remember_alias(request_owned_alias, request_owned_path)
+    request_budget.files_read = 1
+    request_budget.bytes_read = len(request_owned_bytes)
+    contents_container = request_budget._contents
+    aliases_container = request_budget._aliases
     restore_started = threading.Event()
     release_restore = threading.Event()
+    rollback_observed = threading.Event()
+    release_retry = threading.Event()
     original_restore = showcase_module._restore_cached_resources
+    original_cache_hit = showcase_module._load_verified_showcase_cache_hit
+    before_restore: dict[str, object] = {}
 
     def pausing_restore(read_budget, cached):
         original_restore(read_budget, cached)
         restore_started.set()
         release_restore.wait(timeout=5)
 
+    def observing_cache_hit(**kwargs):
+        read_budget = kwargs["read_budget"]
+        if read_budget is request_budget and not before_restore:
+            before_restore.update(
+                contents=dict(read_budget._contents),
+                aliases=dict(read_budget._aliases),
+                files_read=read_budget.files_read,
+                bytes_read=read_budget.bytes_read,
+            )
+        result = original_cache_hit(**kwargs)
+        if read_budget is request_budget and result is None:
+            rollback_observed.set()
+            release_retry.wait(timeout=5)
+        return result
+
     monkeypatch.setattr(showcase_module, "_restore_cached_resources", pausing_restore)
+    monkeypatch.setattr(
+        showcase_module,
+        "_load_verified_showcase_cache_hit",
+        observing_cache_hit,
+    )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         stale_candidate = executor.submit(
-            showcase_module.load_verified_showcase_packages, read_budget=budget()
+            showcase_module.load_verified_showcase_packages,
+            read_budget=request_budget,
         )
         assert restore_started.wait(timeout=2)
         forced = executor.submit(
@@ -879,6 +914,21 @@ def test_verified_loader_rechecks_generation_after_restoring_warm_cache_bytes(
             force_reverify=True,
         ).result(timeout=5)
         release_restore.set()
+        assert rollback_observed.wait(timeout=2)
+        assert request_budget._contents is contents_container
+        assert request_budget._aliases is aliases_container
+        assert request_budget._contents == before_restore["contents"]
+        assert request_budget._aliases == before_restore["aliases"]
+        assert request_budget.files_read == before_restore["files_read"]
+        assert request_budget.bytes_read == before_restore["bytes_read"]
+        assert request_budget._contents[request_owned_path] == request_owned_bytes
+        assert (
+            request_budget._aliases[
+                WorkflowResourceReadBudget._logical_key(request_owned_alias)
+            ]
+            == request_owned_path
+        )
+        release_retry.set()
         current = stale_candidate.result(timeout=5)
 
     assert forced["approval-gate"] is not initial_package

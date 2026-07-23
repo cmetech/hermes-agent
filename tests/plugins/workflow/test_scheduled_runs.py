@@ -1295,6 +1295,63 @@ def test_exact_future_schedule_filtering_is_bounded_and_eventually_eligible(
     assert future_ids <= discovered
 
 
+def test_scheduled_candidate_generation_fixes_due_time_and_high_water(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    clocks = _Clocks(datetime(2026, 4, 4, 12, 0, tzinfo=UTC))
+    store = RunStore(
+        tmp_path / "home",
+        max_executing_runs=0,
+        max_queued_runs=4,
+        max_nonterminal_runs=4,
+        max_start_requests_per_minute=10,
+        lease_clock=clocks.lease_sample,
+    )
+    _leader(store, clocks, name="scheduled-generation-fence")
+    package = _package(
+        workflow_writer,
+        tmp_path / "package",
+        name="scheduled-generation-fence",
+    )
+    captured = [
+        _admit(
+            store,
+            package,
+            key=f"captured-{index}",
+            schedule_at="2026-04-04T11:59:00Z",
+        ).run_id
+        for index in range(2)
+    ]
+    generation_observed, high_water = store.scheduled_coordinator_generation(
+        now=clocks.wall
+    )
+    assert generation_observed == clocks.wall
+    assert high_water is not None
+    later = _admit(
+        store,
+        package,
+        key="later",
+        schedule_at="2026-04-04T11:59:00Z",
+    ).run_id
+
+    fenced, _cursor, exhausted = store.scheduled_coordinator_candidates(
+        after=None,
+        now=generation_observed,
+        through=high_water,
+        limit=100,
+    )
+    unfenced, _cursor, _exhausted = store.scheduled_coordinator_candidates(
+        after=None,
+        now=clocks.wall,
+        limit=100,
+    )
+
+    assert [row["run_id"] for row in fenced] == captured
+    assert exhausted is True
+    assert [row["run_id"] for row in unfenced] == [*captured, later]
+
+
 def test_scheduled_due_query_vm_work_is_bounded_before_future_rows(
     tmp_path: Path,
     workflow_writer,
