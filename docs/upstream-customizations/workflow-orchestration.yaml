@@ -2896,6 +2896,7 @@ upstream_changes:
   owner: workflow-orchestration
   files:
   - .superpowers/sdd/revision-7-adversarial-remediation-report.md
+  - .superpowers/sdd/task-12-report.md
   - docs/backlog/v3.0.3-release-review-deferrals.md
   - docs/reviews/2026-07-23-workflow-v3.0.3-verification.md
   owned_symbols:
@@ -2904,8 +2905,11 @@ upstream_changes:
   - Workflow v3.0.3 Revision 7 final verification mapping
   - failure-table-to-test mapping
   - historical plan-completion gate and baseline-delta evidence
-  - final remediated 51cd5c302 automated-gate evidence
-  - final review verdict and documentation-finding closure
+  - first adversarial-remediation 51cd5c302 automated-gate evidence
+  - final FV-RT-A 6e1dc254cba7 remediation evidence
+  - final verified 70e4b1d8f branch-gate evidence
+  - Task 10 and Task 11 implementation-review dispositions
+  - branch-merge versus release-readiness disposition
   - exact seven OUTSTANDING manual-only release gates
   - exact paired-brand SHA and manual-only handoff status
   - non-normative v3.0.3 deferred-work register
@@ -2917,22 +2921,27 @@ upstream_changes:
   - tests/plugins/workflow/test_scheduled_runs.py
   - tests/plugins/workflow/test_schedule_revalidation.py
   - tests/plugins/workflow/test_scheduling_middleware_e2e.py
-  expected_commit_subject: 'docs(workflow): refresh final verification evidence'
+  expected_commit_subject: 'docs(workflow): record final runtime remediation'
   upstream_candidate: true
   merge_guidance: >-
-    Preserve the historical a6be8121e plan-completion gate separately from the
-    final remediated 51cd5c302 production evidence. Do not imply the historical
-    1,045-test base gate reran at the final SHA. Retain the exact final 536/536
-    Strategy A matrix, its unchanged scheduler timing failure followed by the
-    isolated 19/19 diagnostic and clean full rerun, installed-distribution
-    1/1, Desktop 144/144 across 16 files, both TypeScript projects, merge
-    inventory 26/26, lint/customization/diff/protected-surface checks, and the
-    final APPROVE verdict with Critical 0 and Important 0. Keep named-coverage
-    and failure-table mappings, accepted adversarial remediation evidence,
-    carried-finding and lower-confidence/pre-existing dispositions, exact
-    paired-brand rehearsal SHA, and all seven manual-only gates explicitly
-    OUTSTANDING until operator evidence exists. Deferred backlog files are
-    non-normative and must not be interpreted as widening Revision 7.
+    Preserve three distinct evidence eras: historical a6be8121e
+    plan-completion, first adversarial-remediation 51cd5c302, and final FV-RT-A
+    runtime-remediation 6e1dc254cba7 with verified branch HEAD 70e4b1d8f. Do
+    not imply the historical 1,045-test base gate reran at either remediation
+    SHA. Retain the final 23-file 591/591 matrix and its exact 552/552 original
+    Strategy A subtotal, the first 590/1 timing result, isolated 1/1 and
+    coordinator 39/39 diagnostics, installed-distribution 1/1, Desktop 144/144
+    across 16 files, both TypeScript projects, merge inventory 26/26,
+    customization tests 9/9 and live exit 0, lint/diff/commit/protected-surface
+    checks, Task 10 APPROVE with Critical 0 / Important 0 / Low 0, and Task 11
+    approved implementation with its report-wording-only Low. Keep
+    named-coverage and failure-table mappings, earlier 536/536 adversarial
+    remediation evidence, carried-finding and
+    lower-confidence/pre-existing dispositions, exact paired-brand rehearsal
+    SHA, and all seven manual-only gates explicitly OUTSTANDING until operator
+    evidence exists. Branch merge readiness must remain distinct from release
+    readiness, which is BLOCKED only on those manual gates. Deferred backlog
+    files are non-normative and must not be interpreted as widening Revision 7.
   removal_condition: Remove after equivalent v3.0.3 verification evidence and
     deferred-work dispositions are carried in the upstream release record.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
