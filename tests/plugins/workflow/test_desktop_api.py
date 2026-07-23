@@ -28,6 +28,7 @@ from agent.plugin_agent import PluginAgentRunner, PluginAgentRunResult
 from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.admission import RunAdmissionRequest
 import plugins.workflow.api_admission as api_admission_module
+from plugins.workflow.catalog_api import workflow_catalog_run_support
 from plugins.workflow.api_admission import (
     ApiAdmissionAuthority,
     ApiAdmissionError,
@@ -730,6 +731,51 @@ def test_authenticated_scheduling_showcase_accepts_a_future_schedule(
     assert run["run_metadata"]["showcase_id"] == "scheduling"
     assert run["run_metadata"]["catalog_source"] == "showcase"
     assert run["run_metadata"]["schedule_at"] == SCHEDULE_AT
+
+
+def test_server_run_support_receives_future_schedule_for_package_general_admission(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _trusted_catalog_workflow(home, workflow_writer, name="future-user-package")
+    store = RunStore(home)
+    _healthy_coordinator(store)
+    observed: list[str | None] = []
+    original = workflow_catalog_run_support
+
+    def recording_support(package, **kwargs):
+        observed.append(kwargs.get("schedule_at"))
+        return original(package, **kwargs)
+
+    monkeypatch.setattr(
+        "plugins.workflow.catalog_api.workflow_catalog_run_support",
+        recording_support,
+    )
+
+    result = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=tmp_path,
+        user_home=tmp_path,
+        workflow_name="future-user-package",
+        values={},
+        idempotency_key="future-user-package",
+        concurrency_policy="queue",
+        authority=ApiAdmissionAuthority(
+            principal="schedule-policy-test",
+            namespace="schedule-policy-test",
+            operator_scope=None,
+            source_instance="desktop:test",
+            assurance="local_admin_claim",
+            trigger_source="desktop",
+        ),
+        schedule_at=SCHEDULE_AT,
+        schedule_now_utc=SCHEDULE_NOW,
+    )
+
+    assert result["status"] == "queued"
+    assert observed == [SCHEDULE_AT]
 
 
 def test_schedule_identity_joins_equivalent_offsets_conflicts_on_change_and_recovers(

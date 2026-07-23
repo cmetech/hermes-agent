@@ -165,12 +165,24 @@ def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compa
         "ai-extensions": {"supported": True, "reason": "supported"},
         "scheduling": {
             "supported": False,
-            "reason": "showcase_cli_required",
+            "reason": "schedule_required",
         },
     }
     assert sum(row["supported"] for row in support_table.values()) == 4
     assert showcase_rows["ai-extensions"]["compatibility"]["runnable"] is False
     assert payload["truncated"] is False
+
+    scheduling_detail = _detail_get(
+        _module().router,
+        "scheduling",
+        source="showcase",
+        token=_reader(),
+    )
+    assert scheduling_detail.status_code == 200
+    assert scheduling_detail.json()["run_support"] == {
+        "supported": False,
+        "reason": "schedule_required",
+    }
 
 
 def test_workflow_catalog_projects_authenticated_requires_ai_for_every_row(

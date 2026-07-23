@@ -73,6 +73,7 @@ CatalogTrustState = Literal["trusted", "untrusted", "verified_bundled"]
 CatalogRunSupportReason = Literal[
     "supported",
     "unsupported_inputs",
+    "schedule_required",
     "showcase_cli_required",
 ]
 
@@ -437,6 +438,7 @@ def workflow_catalog_run_support(
     *,
     showcase_scenario: "ShowcaseScenario | None" = None,
     input_support: SupportedInputs | None = None,
+    schedule_at: str | None = None,
 ) -> CatalogRunSupport:
     """Derive Desktop background-run support from authenticated server data."""
     if input_support is None:
@@ -451,6 +453,10 @@ def workflow_catalog_run_support(
     if showcase_scenario is not None:
         from plugins.workflow.showcase import showcase_background_api_eligible
 
+        if showcase_scenario.interaction_mode == "schedule":
+            if schedule_at is None:
+                return {"supported": False, "reason": "schedule_required"}
+            return {"supported": True, "reason": "supported"}
         if not showcase_background_api_eligible(showcase_scenario):
             return {"supported": False, "reason": "showcase_cli_required"}
     return {"supported": True, "reason": "supported"}

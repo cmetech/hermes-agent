@@ -5,6 +5,7 @@ export interface StartWorkflowRunRequest {
   catalogSource: WorkflowCatalogSource
   concurrencyPolicy: 'allow' | 'forbid' | 'queue'
   idempotencyKey: string
+  scheduleAt?: string
   values: Record<string, string>
   workflow: string
 }
@@ -102,6 +103,7 @@ export async function startWorkflowRun(
       catalog_source: request.catalogSource,
       concurrency_policy: request.concurrencyPolicy,
       idempotency_key: request.idempotencyKey,
+      ...(request.scheduleAt ? { schedule_at: request.scheduleAt } : {}),
       values: request.values,
       workflow: request.workflow
     },

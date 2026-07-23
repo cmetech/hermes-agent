@@ -225,6 +225,7 @@ class WorkflowCatalogRunSupport(BaseModel):
     reason: Literal[
         "supported",
         "unsupported_inputs",
+        "schedule_required",
         "showcase_cli_required",
     ]
 

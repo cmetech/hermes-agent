@@ -15,7 +15,7 @@ import { listWorkflowDefinitions } from '@/lib/hermes-api'
 import { Eye, Play } from '@/lib/icons'
 import type { WorkflowDefinition, WorkflowDefinitionError } from '@/types/hermes'
 
-import { workflowTrustAllowsRun } from './catalog-run-policy'
+import { workflowSupportsScheduledRun, workflowTrustAllowsRun } from './catalog-run-policy'
 
 const WORKFLOW_DOCS_URL =
   'https://github.com/cmetech/hermes-agent/blob/base/website/docs/user-guide/features/workflows.md'
@@ -60,6 +60,7 @@ function CatalogRow({
   const runReasonId = useId()
 
   const runSupportCopy = {
+    schedule_required: null,
     showcase_cli_required: t.operations.workflowRunShowcaseFromCli,
     supported: null,
     unsupported_inputs: t.operations.workflowRunUnsupportedInputs
@@ -67,7 +68,7 @@ function CatalogRow({
 
   const runDisabledReason = !item.run_support
     ? t.operations.workflowRunSupportUnavailable
-    : !item.run_support.supported
+    : !workflowSupportsScheduledRun(item.run_support)
       ? runSupportCopy[item.run_support.reason]
       : item.compatibility?.runnable === false
         ? t.operations.workflowRunIncompatible

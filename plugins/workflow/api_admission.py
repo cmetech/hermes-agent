@@ -272,18 +272,15 @@ def start_api_run(
         showcase_scenario=(
             verified_showcase.scenario if verified_showcase is not None else None
         ),
+        schedule_at=schedule_at,
     )
     scenario = verified_showcase.scenario if verified_showcase is not None else None
-    schedule_required = bool(
-        scenario is not None and scenario.interaction_mode == "schedule"
-    )
-    if schedule_required and schedule_at is None:
+    if run_support["reason"] == "schedule_required":
         raise ApiAdmissionError("workflow_schedule_required", status_code=409)
     if not run_support["supported"]:
         if run_support["reason"] == "unsupported_inputs":
             raise ApiAdmissionError("workflow_inputs_unsupported", status_code=422)
-        if not (schedule_required and schedule_at is not None):
-            raise ApiAdmissionError("workflow_showcase_cli_required", status_code=409)
+        raise ApiAdmissionError("workflow_showcase_cli_required", status_code=409)
 
     value_bindings = (
         getattr(scenario, "input_value_bindings", None) if scenario is not None else None

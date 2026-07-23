@@ -220,6 +220,7 @@ describe('Review & Run workflow dialog', () => {
     const dialog = await openReviewDialog()
     expect(within(dialog).getByText('Checks a release before deployment.')).toBeTruthy()
     expect(within(dialog).queryByRole('group', { name: 'Inputs' })).toBeNull()
+    expect(within(dialog).getByRole('button', { name: 'Run later' })).toBeTruthy()
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start workflow' }))
 
     await waitFor(() => {
@@ -249,6 +250,60 @@ describe('Review & Run workflow dialog', () => {
     expect((await screen.findByRole('tab', { name: 'Active board' })).getAttribute('aria-selected')).toBe('true')
     expect($workflowSelectedRunId.get()).toBe('run-created')
     expect($notifications.get()[0]?.message).toBe('Started')
+  })
+
+  it('derives schedule eligibility from run support and normalizes the local picker instant', async () => {
+    catalogDefinition = definition({
+      run_support: { reason: 'schedule_required', supported: false },
+      source: 'showcase',
+      trust_state: 'verified_bundled'
+    })
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        ...catalogDefinition,
+        definition: { inputs: {}, name: WORKFLOW_NAME }
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    const immediate = within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement
+    expect(immediate.disabled).toBe(true)
+    const picker = within(dialog).getByLabelText('Run at') as HTMLInputElement
+    fireEvent.change(picker, { target: { value: '2099-01-02T04:04' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Run later' }))
+
+    const canonical = new Date(2099, 0, 2, 4, 4).toISOString().replace('.000Z', 'Z')
+    await waitFor(() =>
+      expect(apiStructured).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            schedule_at: canonical,
+            workflow: WORKFLOW_NAME
+          }),
+          method: 'POST',
+          path: '/api/plugins/workflow/runs'
+        })
+      )
+    )
+  })
+
+  it.each([
+    ['', 'Choose a future date and time.'],
+    ['2020-01-02T04:04', 'Choose a future date and time.']
+  ])('blocks invalid Run later picker value %j with accessible localized feedback', async (value, message) => {
+    renderView()
+    const dialog = await openReviewDialog()
+    const picker = within(dialog).getByLabelText('Run at')
+
+    if (value) {
+      fireEvent.change(picker, { target: { value } })
+    }
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Run later' }))
+
+    expect((await within(dialog).findByRole('alert')).textContent).toContain(message)
+    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(0)
   })
 
   it('uses typed controls, serializes flat values as strings, and binds preflight plus start to the opening profile', async () => {
@@ -623,6 +678,22 @@ describe('Review & Run workflow dialog', () => {
     expect(within(dialog).queryByRole('button', { name: 'Retry' })).toBeNull()
     expect(screen.getByRole('tab', { hidden: true, name: 'Workflows' }).getAttribute('aria-selected')).toBe('true')
     expect($workflowSelectedRunId.get()).toBeNull()
+  })
+
+  it('renders the server-authoritative typed schedule rejection on a Run later race', async () => {
+    startHandler = async () => ({
+      body: { detail: { code: 'workflow_schedule_invalid', retryable: false } },
+      ok: false,
+      status: 422
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    fireEvent.change(within(dialog).getByLabelText('Run at'), { target: { value: '2099-01-02T04:04' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Run later' }))
+
+    expect(await within(dialog).findByText('Choose a future date and time.')).toBeTruthy()
+    expect(within(dialog).queryByText('The workflow inputs were not accepted.')).toBeNull()
   })
 
   it('maps the FastAPI 422 loc/msg array to the rejected input field', async () => {

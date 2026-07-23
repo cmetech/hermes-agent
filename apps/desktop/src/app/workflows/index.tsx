@@ -250,8 +250,14 @@ export function WorkflowsView() {
   const nextCursor = pages.at(-1)?.next_cursor ?? null
 
   const model = useMemo(
-    () => workflowBoardModel(runItems, { nextCursor, scopeLabel: t.operations.workflows, stale: runs.isError }),
-    [nextCursor, runItems, runs.isError, t.operations.workflows]
+    () =>
+      workflowBoardModel(runItems, {
+        nextCursor,
+        scheduledLabel: t.operations.workflowScheduled,
+        scopeLabel: t.operations.workflows,
+        stale: runs.isError
+      }),
+    [nextCursor, runItems, runs.isError, t.operations.workflowScheduled, t.operations.workflows]
   )
 
   if (view !== 'workflows' && runs.isLoading) {

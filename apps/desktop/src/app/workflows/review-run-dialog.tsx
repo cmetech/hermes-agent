@@ -23,7 +23,11 @@ import { startWorkflowRun, WorkflowApiError } from '@/lib/hermes-api'
 import { Play } from '@/lib/icons'
 import type { WorkflowDefinition, WorkflowDefinitionInput, WorkflowDetail } from '@/types/hermes'
 
-import { workflowTrustAllowsRun } from './catalog-run-policy'
+import {
+  workflowSupportsImmediateRun,
+  workflowSupportsScheduledRun,
+  workflowTrustAllowsRun
+} from './catalog-run-policy'
 import { workflowDetailQueryOptions } from './detail-query'
 
 type FlatInputValue = boolean | number | string | undefined
@@ -37,6 +41,7 @@ interface AdmissionError {
     | 'coordinator'
     | 'network'
     | 'profile'
+    | 'schedule'
     | 'showcase_cli'
     | 'showcase_verification'
     | 'validation'
@@ -101,6 +106,10 @@ function admissionError(error: unknown): AdmissionError {
     return { kind: 'compatibility' }
   }
 
+  if (error.code === 'workflow_schedule_invalid' || error.code === 'workflow_schedule_required') {
+    return { kind: 'schedule' }
+  }
+
   if (error.code === 'workflow_showcase_cli_required') {
     return { kind: 'showcase_cli' }
   }
@@ -124,6 +133,40 @@ function initialValues(inputs: readonly WorkflowDefinitionInput[]): Record<strin
   return Object.fromEntries(
     inputs.map(input => [input.name, input.required ? (input.type === 'boolean' ? false : '') : undefined])
   )
+}
+
+export function canonicalWorkflowScheduleAt(value: string, now = new Date()): string | null {
+  const matched =
+    /^(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})T(?<hour>\d{2}):(?<minute>\d{2})(?::(?<second>\d{2}))?$/.exec(
+      value
+    )
+
+  if (!matched?.groups) {
+    return null
+  }
+
+  const year = Number(matched.groups.year)
+  const month = Number(matched.groups.month) - 1
+  const day = Number(matched.groups.day)
+  const hour = Number(matched.groups.hour)
+  const minute = Number(matched.groups.minute)
+  const second = Number(matched.groups.second ?? '0')
+  const instant = new Date(year, month, day, hour, minute, second)
+
+  if (
+    !Number.isFinite(instant.getTime()) ||
+    instant.getFullYear() !== year ||
+    instant.getMonth() !== month ||
+    instant.getDate() !== day ||
+    instant.getHours() !== hour ||
+    instant.getMinutes() !== minute ||
+    instant.getSeconds() !== second ||
+    instant.getTime() <= now.getTime()
+  ) {
+    return null
+  }
+
+  return instant.toISOString().replace('.000Z', 'Z')
 }
 
 function PreflightLoader({ label }: { label: string }) {
@@ -356,6 +399,9 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
   const [preflightAttempt, setPreflightAttempt] = useState(0)
   const [values, setValues] = useState<Record<string, FlatInputValue>>({})
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
+  const [scheduleAt, setScheduleAt] = useState('')
+  const [scheduleError, setScheduleError] = useState(false)
+  const [retryScheduleAt, setRetryScheduleAt] = useState<string | null>(null)
   const [error, setError] = useState<AdmissionError | null>(null)
   const [admittedRun, setAdmittedRun] = useState<AdmittedRun | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -397,8 +443,16 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
     }
   }, [preflightAttempt, profile, queryClient, workflow.name, workflow.source])
 
-  const submit = async () => {
+  const submit = async (scheduled = false, canonicalRetry?: string) => {
     if (!detail || submitInFlight.current) {
+      return
+    }
+
+    const canonicalScheduleAt = scheduled ? (canonicalRetry ?? canonicalWorkflowScheduleAt(scheduleAt)) : undefined
+
+    if (scheduled && !canonicalScheduleAt) {
+      setScheduleError(true)
+
       return
     }
 
@@ -447,6 +501,8 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
     setSubmitting(true)
     setError(null)
     setFieldErrors({})
+    setScheduleError(false)
+    setRetryScheduleAt(canonicalScheduleAt ?? null)
 
     let run = admittedRun
 
@@ -457,6 +513,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
             catalogSource: workflow.source,
             concurrencyPolicy: 'queue',
             idempotencyKey,
+            ...(canonicalScheduleAt ? { scheduleAt: canonicalScheduleAt } : {}),
             values: wireValues,
             workflow: workflow.name
           },
@@ -517,6 +574,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
   const runSupport = detail?.run_support
 
   const runSupportCopy = {
+    schedule_required: null,
     showcase_cli_required: copy.workflowRunShowcaseFromCli,
     supported: null,
     unsupported_inputs: copy.workflowRunUnsupportedInputs
@@ -525,7 +583,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
   const runDisabledReason =
     detail && !runSupport
       ? copy.workflowRunSupportUnavailable
-      : detail && runSupport?.supported === false
+      : detail && runSupport && !workflowSupportsScheduledRun(runSupport)
         ? runSupportCopy[runSupport.reason]
         : detail && detail.compatibility.runnable !== true
           ? copy.workflowRunIncompatible
@@ -535,9 +593,12 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
               ? copy.workflowRunCoordinatorUnavailable
               : null
 
-  const runSupportMessage = runSupport?.supported === false || !runSupport ? runDisabledReason : null
+  const runSupportMessage =
+    (runSupport?.supported === false && runSupport.reason !== 'schedule_required') || !runSupport
+      ? runDisabledReason
+      : null
 
-  const blocked =
+  const commonBlocked =
     !detail ||
     Boolean(runDisabledReason) ||
     detail.inputs.some(
@@ -547,6 +608,8 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
         new TextEncoder().encode(String(values[input.name] ?? '')).byteLength > input.max_bytes
     ) ||
     detail.inputs.some(input => input.type === 'enum' && enumValues(detail, input.name).length === 0)
+  const immediateBlocked = commonBlocked || !workflowSupportsImmediateRun(runSupport)
+  const scheduledBlocked = commonBlocked || !workflowSupportsScheduledRun(runSupport)
 
   const admissionErrorMessages: Partial<Record<AdmissionError['kind'], string>> = {
     catalog_source: copy.workflowRunCatalogSourceInvalid,
@@ -555,6 +618,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
     coordinator: copy.workflowRunCoordinatorUnavailable,
     network: copy.workflowRunNetworkError,
     profile: copy.workflowRunProfileUnavailable,
+    schedule: copy.workflowRunScheduleInvalid,
     showcase_cli: copy.workflowRunShowcaseFromCli,
     showcase_verification: copy.workflowRunShowcaseVerificationFailed
   }
@@ -629,6 +693,31 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
                 ))}
               </fieldset>
             ) : null}
+            {!admittedRun ? (
+              <section className="grid gap-1 border-t border-(--ui-stroke-tertiary) pt-3">
+                <label className="text-xs font-medium text-(--ui-text-primary)" htmlFor="workflow-run-at">
+                  {copy.workflowRunAt}
+                </label>
+                <Input
+                  aria-describedby={scheduleError ? 'workflow-run-at-error' : undefined}
+                  aria-invalid={scheduleError}
+                  id="workflow-run-at"
+                  onChange={event => {
+                    setScheduleAt(event.target.value)
+                    setScheduleError(false)
+                  }}
+                  size="sm"
+                  type="datetime-local"
+                  value={scheduleAt}
+                />
+                <p className="text-xs text-(--ui-text-tertiary)">{copy.workflowRunLaterDescription}</p>
+                {scheduleError ? (
+                  <p className="text-xs text-destructive" id="workflow-run-at-error" role="alert">
+                    {copy.workflowRunScheduleInvalid}
+                  </p>
+                ) : null}
+              </section>
+            ) : null}
             {runSupportMessage ? (
               <Alert variant="warning">
                 <AlertDescription>{runSupportMessage}</AlertDescription>
@@ -662,7 +751,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
                   {error?.kind === 'coordinator' || error?.kind === 'network' || error?.kind === 'profile' ? (
                     <Button
                       disabled={submitting}
-                      onClick={() => void submit()}
+                      onClick={() => void submit(retryScheduleAt !== null, retryScheduleAt ?? undefined)}
                       size="xs"
                       type="button"
                       variant="secondary"
@@ -677,7 +766,15 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
         ) : null}
         {!admittedRun ? (
           <DialogFooter>
-            <Button disabled={blocked || submitting} onClick={() => void submit()} type="button">
+            <Button
+              disabled={scheduledBlocked || submitting}
+              onClick={() => void submit(true)}
+              type="button"
+              variant="secondary"
+            >
+              {copy.workflowRunLater}
+            </Button>
+            <Button disabled={immediateBlocked || submitting} onClick={() => void submit()} type="button">
               {copy.workflowRunStart}
             </Button>
           </DialogFooter>

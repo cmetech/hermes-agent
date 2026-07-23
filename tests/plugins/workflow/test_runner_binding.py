@@ -355,6 +355,42 @@ def test_showcase_admission_uses_server_binding_and_incapable_is_zero_residue(
     assert list(incapable_store.staging_root.iterdir()) == []
 
 
+def test_ai_showcase_can_be_scheduled_with_capable_server_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "agent.skill_commands.build_preloaded_skills_prompt",
+        lambda *_args, **_kwargs: ("authenticated ascii skill", ["ascii-art"], []),
+    )
+    store = RunStore(tmp_path / "scheduled-ai")
+    _healthy_coordinator(store)
+    schedule_at = "2099-01-02T03:04:05Z"
+
+    admitted = start_api_run(
+        store,
+        hermes_home=store.hermes_home,
+        workdir=tmp_path,
+        user_home=tmp_path,
+        workflow_name="ai-extensions",
+        values={},
+        idempotency_key="scheduled-capable-ai",
+        concurrency_policy="queue",
+        authority=_authority(),
+        catalog_source="showcase",
+        runner_binding=_binding(runtime_managed=True),
+        schedule_at=schedule_at,
+        schedule_now_utc=datetime(2099, 1, 1, tzinfo=timezone.utc),
+    )
+
+    run = store.get_run_status(str(admitted["run_id"]))
+    assert admitted["status"] == "queued"
+    assert run["status"] == "queued"
+    assert run["started_at"] is None
+    assert run["run_metadata"]["showcase_id"] == "ai-extensions"
+    assert run["run_metadata"]["schedule_at"] == schedule_at
+
+
 def test_package_mcp_capability_is_general_for_trusted_user_workflow(
     tmp_path: Path,
     workflow_writer,

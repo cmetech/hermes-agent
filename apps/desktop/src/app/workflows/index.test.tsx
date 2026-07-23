@@ -329,7 +329,7 @@ describe('WorkflowsView', () => {
         definition({
           name: 'scheduling',
           precedence: 3,
-          run_support: { reason: 'showcase_cli_required', supported: false },
+          run_support: { reason: 'schedule_required', supported: false },
           source: 'showcase',
           trust_state: 'verified_bundled'
         })
@@ -356,13 +356,17 @@ describe('WorkflowsView', () => {
     for (const row of rows.slice(3)) {
       expect(row.textContent).toContain('Bundled showcase')
       expect(row.textContent).toContain('verified bundle')
+      expect((within(row).getByRole('button', { name: 'View' }) as HTMLButtonElement).disabled).toBe(false)
+    }
+
+    for (const row of rows.slice(3, 4)) {
       const runButton = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
       expect(runButton.disabled).toBe(true)
       expect(document.getElementById(runButton.getAttribute('aria-describedby')!)?.textContent).toBe(
         'Run this bundled showcase from the CLI.'
       )
-      expect((within(row).getByRole('button', { name: 'View' }) as HTMLButtonElement).disabled).toBe(false)
     }
+    expect((within(rows[4]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
   })
 
   it('opens the workflow View dialog from the catalog action', async () => {
@@ -699,6 +703,27 @@ describe('WorkflowsView', () => {
     const cancel = await screen.findByRole('button', { name: 'Cancel' })
     expect((cancel as HTMLButtonElement).disabled).toBe(false)
     expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull()
+  })
+
+  it('renders the server-derived scheduled wait with localized and canonical instants', async () => {
+    const scheduleAt = '2099-01-02T03:04:05Z'
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    getWorkflowRun.mockResolvedValue(
+      run({
+        blocking_reason: 'scheduled_wait',
+        next_actions: ['cancel'],
+        presentation_state: 'scheduled_wait',
+        schedule_at: scheduleAt,
+        status: 'queued'
+      })
+    )
+
+    await renderView(client)
+
+    expect(await screen.findByText('Scheduled')).toBeTruthy()
+    expect(screen.getByText(scheduleAt)).toBeTruthy()
+    expect(screen.getByText(new Date(scheduleAt).toLocaleString())).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(false)
   })
 
   it('replaces event history when the backend reports a cursor gap', async () => {

@@ -140,7 +140,7 @@ export type WorkflowCatalogSource = 'profile' | 'project' | 'showcase'
 export type WorkflowTrustState = 'trusted' | 'untrusted' | 'verified_bundled'
 
 export interface WorkflowRunSupport {
-  reason: 'showcase_cli_required' | 'supported' | 'unsupported_inputs'
+  reason: 'schedule_required' | 'showcase_cli_required' | 'supported' | 'unsupported_inputs'
   supported: boolean
 }
 

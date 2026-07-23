@@ -20,7 +20,7 @@ import { WorkflowApiError } from '@/lib/hermes-api'
 import { Eye, Play } from '@/lib/icons'
 import type { WorkflowDefinition } from '@/types/hermes'
 
-import { workflowTrustAllowsRun } from './catalog-run-policy'
+import { workflowSupportsScheduledRun, workflowTrustAllowsRun } from './catalog-run-policy'
 import { useWorkflowDetailQuery } from './detail-query'
 
 const MermaidRenderer = lazy(() => import('@/components/assistant-ui/embeds/mermaid-embed'))
@@ -99,6 +99,7 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
   )
 
   const runSupportCopy = {
+    schedule_required: null,
     showcase_cli_required: copy.workflowRunShowcaseFromCli,
     supported: null,
     unsupported_inputs: copy.workflowRunUnsupportedInputs
@@ -110,7 +111,7 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
       ? copy.workflowViewRunLoading
       : !detail.data.run_support
         ? copy.workflowRunSupportUnavailable
-        : !detail.data.run_support.supported
+        : !workflowSupportsScheduledRun(detail.data.run_support)
           ? runSupportCopy[detail.data.run_support.reason]
           : detail.data.compatibility.runnable !== true
             ? copy.workflowRunIncompatible

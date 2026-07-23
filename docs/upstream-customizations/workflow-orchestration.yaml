@@ -2200,6 +2200,75 @@ upstream_changes:
   removal_condition: Remove when upstream Desktop derives every workflow Run
     affordance from the same authoritative reason and compatibility contract.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-desktop-one-shot-scheduling
+  change_class: desktop-workflows
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/adapter.ts
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/catalog-run-policy.ts
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/run-inspector.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/languages.test.ts
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - apps/desktop/src/lib/hermes-api.ts
+  - apps/desktop/src/types/hermes.ts
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_runner_binding.py
+  owned_symbols:
+  - CatalogRunSupportReason.schedule_required
+  - workflow_catalog_run_support schedule projection
+  - StartWorkflowRunRequest.scheduleAt
+  - workflowSupportsImmediateRun
+  - workflowSupportsScheduledRun
+  - canonicalWorkflowScheduleAt
+  - ReviewRunDialog Run later action
+  - scheduled_wait Desktop presentation
+  - four-locale one-shot scheduling copy
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_runner_binding.py
+  - tests/plugins/workflow/test_showcase_schedule_e2e.py
+  - tests/plugins/workflow/test_showcase_ai_e2e.py
+  - apps/desktop/src/lib/hermes-api.test.ts
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
+  - apps/desktop/src/i18n/languages.test.ts
+  expected_commit_subject: 'feat(workflow): add Desktop one-shot scheduling'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve server-derived scheduling eligibility: a scheduling
+    interaction without a time is schedule_required, while a canonical future
+    schedule_at is supported. Desktop must consume that typed reason, keep
+    immediate request bodies unchanged, normalize a timezone-aware local picker
+    to canonical UTC, and use the existing one-shot workflow scheduler and
+    cancellation mutation. Keep compatibility, trust, input, coordinator, and
+    execution-capability gates authoritative on the server. Do not introduce
+    recurrence, a Cron bridge, consent machinery, caller-supplied capabilities,
+    or showcase-ID policy in the renderer.
+  removal_condition: Remove when upstream exposes equivalent server-authoritative
+    one-shot workflow scheduling in Desktop with typed support projection,
+    canonical time handling, scheduled-wait presentation, and four-locale
+    coverage while retaining the separate legacy CLI Cron showcase.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-run-execution-limits
   change_class: workflow-runtime
   owner: workflow-orchestration
