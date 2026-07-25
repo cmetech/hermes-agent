@@ -151,6 +151,30 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _stale_run_error(tool: str, task_id: str, exc: kb.TaskMutationConflict) -> str:
+    """Turn a lost run claim into actionable guidance for the agent.
+
+    Without this, these mutations fall through to each handler's outer
+    ``except Exception``, which does two unhelpful things: it replaces the
+    curated message with ``str(exc)`` (just "stale mutation for <id>"), and it
+    calls ``logger.exception`` -- emitting a full ERROR-level stack trace for a
+    routine, expected outcome, which buries real errors in the log.
+
+    A stale run is recoverable and NOT a reason to give up on the task, so the
+    message says exactly what to do next; a bare error string tends to make the
+    model block or abandon the run instead of re-reading and retrying.
+    """
+    current = exc.current
+    run = current.current_run_id if current.current_run_id is not None else "none"
+    return tool_error(
+        f"{tool}: your run is no longer the current run for {task_id} "
+        f"(task is {current.status}, current run {run}). Another worker or an "
+        f"operator reclaimed this task, so your mutation was rejected and "
+        f"nothing changed. Re-read the task with kanban_get before deciding "
+        f"whether to continue -- do not retry blindly."
+    )
+
+
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -673,6 +697,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
                 )
+            except kb.TaskMutationConflict as exc:
+                return _stale_run_error("kanban_complete", tid, exc)
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
                     f"kanban_complete could not preserve the declared artifacts: "
@@ -766,12 +792,15 @@ def _handle_block(args: dict, **kw) -> str:
                 f"completion judge will evaluate it."
             )
         try:
-            ok = kb.block_task(
-                conn, tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id(tid),
-            )
+            try:
+                ok = kb.block_task(
+                    conn, tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id(tid),
+                )
+            except kb.TaskMutationConflict as exc:
+                return _stale_run_error("kanban_block", tid, exc)
             if not ok:
                 return tool_error(
                     f"could not block {tid} (unknown id or not in "
@@ -830,12 +859,19 @@ def _handle_heartbeat(args: dict, **kw) -> str:
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
             kb.heartbeat_claim(conn, tid, claimer=claim_lock)
 
-            ok = kb.heartbeat_worker(
-                conn,
-                tid,
-                note=note,
-                expected_run_id=_worker_run_id(tid),
-            )
+            try:
+                ok = kb.heartbeat_worker(
+                    conn,
+                    tid,
+                    note=note,
+                    expected_run_id=_worker_run_id(tid),
+                )
+            except kb.TaskMutationConflict as exc:
+                # DEFENSIVE, not currently reachable -- heartbeat_worker returns
+                # False on a stale run instead of raising (it is the only
+                # expected_run_id mutation that skips the precondition path).
+                # See the matching note in hermes_cli/kanban.py::_cmd_heartbeat.
+                return _stale_run_error("kanban_heartbeat", tid, exc)
             if not ok:
                 return tool_error(
                     f"could not heartbeat {tid} (unknown id or not running)"
