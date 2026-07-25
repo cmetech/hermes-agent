@@ -18,7 +18,12 @@ const WORKFLOW_NAME = 'Portable contract'
 const IDEMPOTENCY_KEY = '11111111-2222-4333-8444-555555555555'
 const profileRouting = vi.hoisted(() => ({ ensureGatewayProfile: vi.fn() }))
 
-vi.mock('@/store/profile', () => ({
+// Spread the REAL module and override only the side-effecting actions. An
+// exhaustive hand-written mock breaks at collection time whenever upstream adds
+// an export the code under test imports (v0.19.0 added normalizeProfileKey and
+// $activeGatewayProfile, which is what broke this suite); spreading self-heals.
+vi.mock('@/store/profile', async importOriginal => ({
+  ...(await importOriginal<typeof import('@/store/profile')>()),
   $newChatProfile: { set: vi.fn() },
   cycleProfile: vi.fn(),
   ensureGatewayProfile: profileRouting.ensureGatewayProfile,
