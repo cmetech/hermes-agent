@@ -375,6 +375,33 @@ browser:
   # after this period of no activity between agent loops (default: 120 = 2 minutes)
   inactivity_timeout: 120
 
+  # ---------------------------------------------------------------------------
+  # Named browser profiles (optional). Absent => exactly today's behaviour.
+  #
+  # A profile is a named browser identity. `ephemeral` is the disposable browser
+  # used today (agent-browser's bundled Chrome for Testing) and can NEVER be
+  # granted trusted_origins. `enrolled` launches the OS-installed corporate
+  # browser with a persistent profile directory, so it holds a live SSO/mTLS
+  # session and can reach internal/intranet sites and forms.
+  #
+  # trusted_origins is the ONLY thing that opens private/internal addresses, and
+  # it does so per-origin. Cloud-metadata endpoints stay blocked regardless.
+  # profiles:
+  #   enrolled:
+  #     kind: enrolled
+  #     executable: auto        # auto-resolves OS-installed Edge, then Chrome
+  #     user_data_dir: "${HERMES_HOME}/browser-profiles/enrolled"
+  #     cdp_port: 9222
+  #     headed: true            # visible, so you can complete interactive sign-in
+  #     trusted_origins:
+  #       - "https://wiki.corp.example"
+  #       - "https://*.corp.example"   # strict subdomains only, not the apex
+  #
+  # Profile the AGENT's own browser tools use when nothing else is bound. Set
+  # this to browse enterprise pages and fill enterprise forms by natural
+  # language. Grants access ONLY to that profile's trusted_origins.
+  # default_profile: enrolled
+
 # =============================================================================
 # Tool Loop Guardrails
 # =============================================================================

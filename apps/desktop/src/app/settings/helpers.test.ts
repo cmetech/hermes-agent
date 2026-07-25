@@ -30,6 +30,63 @@ describe('settings helpers', () => {
     expect(fieldCopyForSchemaKey(FIELD_DESCRIPTIONS, 'desktop.repo_scan_exclude_paths')).toBeTruthy()
   })
 
+  it('surfaces enrolled-browser trusted origins in Safety with user-facing copy', () => {
+    // Enterprise/intranet browsing is opt-in per-origin. These two keys are the
+    // whole user-facing surface for it, and they sit beside the existing browser
+    // private-URL keys because they gate the same capability.
+    const safety = SECTIONS.find(section => section.id === 'safety')
+
+    expect(safety?.keys).toEqual(
+      expect.arrayContaining([
+        'browser.default_profile',
+        'browser.profiles.enrolled.trusted_origins'
+      ])
+    )
+    expect(fieldCopyForSchemaKey(FIELD_LABELS, 'browser.default_profile')).toBeTruthy()
+    expect(
+      fieldCopyForSchemaKey(FIELD_LABELS, 'browser.profiles.enrolled.trusted_origins')
+    ).toBeTruthy()
+    expect(fieldCopyForSchemaKey(FIELD_DESCRIPTIONS, 'browser.default_profile')).toBeTruthy()
+    expect(
+      fieldCopyForSchemaKey(FIELD_DESCRIPTIONS, 'browser.profiles.enrolled.trusted_origins')
+    ).toBeTruthy()
+  })
+
+  it('maps the deep enrolled-origins schema key to a camelCase copy key', () => {
+    // The copy tree is camelCase per segment; a 4-segment key must still resolve
+    // or the field renders with a raw dotted path as its label.
+    expect(schemaKeyToFieldCopyKey('browser.profiles.enrolled.trusted_origins')).toBe(
+      'browser.profiles.enrolled.trustedOrigins'
+    )
+  })
+
+  it('renders trusted origins as a list editor once the profile exists', () => {
+    // inferFieldSchema drives the widget from the value's runtime type, so an
+    // array must produce the add/remove list control rather than a text input.
+    const config = {
+      browser: {
+        default_profile: 'enrolled',
+        profiles: { enrolled: { trusted_origins: ['https://wiki.corp.example'] } }
+      }
+    } as unknown as HermesConfigRecord
+
+    const entries = sectionFieldEntries({}, config).get('safety') ?? []
+    const origins = entries.find(([key]) => key === 'browser.profiles.enrolled.trusted_origins')
+
+    expect(origins?.[1].type).toBe('list')
+    expect(
+      entries.find(([key]) => key === 'browser.default_profile')?.[1].type
+    ).toBe('string')
+  })
+
+  it('hides the enrolled keys until the profile exists in config', () => {
+    // sectionFieldEntries omits absent keys, so an untouched config must not show
+    // a dead origins field for a profile the user has not created.
+    const entries = sectionFieldEntries({}, {} as HermesConfigRecord).get('safety') ?? []
+
+    expect(entries.some(([key]) => key.startsWith('browser.profiles.'))).toBe(false)
+  })
+
   it('does not shadow the backend schema options for memory.provider', () => {
     // memory.provider options are discovery-driven and served by the backend
     // config schema (merged per-request); enumOptionsFor must return undefined

@@ -1,0 +1,125 @@
+schema_version: 1
+feature: browser-profiles
+# Persistent enrolled-browser profiles: let a corporate browser holding a live
+# SSO/mTLS session reach the internal origins it explicitly lists, so the agent
+# can read enterprise pages and complete enterprise FORMS by natural language.
+#
+# Design: docs/plans/2026-07-20-persistent-enrolled-browser-session-design.md
+# Plan:   docs/superpowers/plans/2026-07-25-browser-session-manager.md
+#
+# Why this manifest exists: the workspace-level surface table and the
+# otto-upstream-merge grep list live OUTSIDE any git repository (the workspace
+# root is not a repo), so they do not travel with the branch and are invisible
+# to a merge performed from another checkout. This ledger is in-repo, versioned,
+# and machine-checkable via scripts/check_upstream_customizations.py.
+coverage:
+  base_commit: 507a53c8348fe52cee101e05907b7045cb6cfbe0
+  excluded_commits:
+  - commit: 8294b55cd4aac775d1f4f0c0ee40407060767f5d
+    reason: Docs-only merge of the pre-existing Option B design proposal.
+  - commit: caf1d043bf8f400e7ee38403ddd54ddde70fc8d9
+    reason: Docs-only design revision and implementation plan.
+  - commit: 85f18517c707f3d3b71486d8fae956dbead98f02
+    reason: Docs-only plan addition (Task 9).
+  - commit: 1fc302ea01c435555a5c4a1c316017e00907c162
+    reason: Separate user-requested install-time dashboard build design.
+upstream_changes:
+- id: browser-profile-ssrf-trust-seam
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - tools/browser_tool.py
+  - tools/browser_profiles.py
+  - tools/browser_session_registry.py
+  - tools/browser_session_manager.py
+  - cli-config.yaml.example
+  - tests/tools/test_browser_profiles.py
+  - tests/tools/test_browser_profile_trust_seam.py
+  - tests/tools/test_browser_session_manager.py
+  - tests/tools/test_browser_session_signin.py
+  - tests/tools/test_browser_default_profile.py
+  owned_symbols:
+  - _session_trusts_url
+  - _snapshot_blocked_url
+  - _expression_targets_private_url
+  - _current_page_private_url
+  tests:
+  - tests/tools/test_browser_profiles.py
+  - tests/tools/test_browser_profile_trust_seam.py
+  - tests/tools/test_browser_session_manager.py
+  - tests/tools/test_browser_session_signin.py
+  - tests/tools/test_browser_default_profile.py
+  - tests/tools/test_browser_console_ssrf.py
+  - tests/tools/test_browser_ssrf_local.py
+  - tests/tools/test_browser_snapshot_ssrf.py
+  - tests/tools/test_browser_get_images_ssrf.py
+  - tests/tools/test_browser_private_page_action_guard.py
+  - tests/tools/test_browser_hybrid_routing.py
+  - tests/tools/test_browser_camofox_private_page_guard.py
+  expected_commit_subject: 'feat(browser): origin-scoped SSRF trust seam for browser profiles'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge, never --theirs. Upstream's _is_local_backend() returns False
+    for ANY CDP override, so _eval_ssrf_guard_active blocks every internal
+    origin for an enrolled profile attached over CDP. The seam adds a
+    fail-closed _session_trusts_url helper plus one guard line in each
+    private-URL predicate, scoped to (session, origin) rather than exempting a
+    whole session. The always-blocked cloud-metadata floor is evaluated FIRST at
+    every site and is never trusted. _current_page_private_url also feeds
+    _blocked_private_page_action, so click/type/press on a trusted internal page
+    are covered transitively -- that path is what makes enterprise forms work,
+    and silently losing it degrades forms without failing any build. The
+    session_key parameter defaults to None, so the untouched upstream browser
+    SSRF suite must stay green unedited; if it needs editing, the merge dropped
+    or altered the seam. Mutable session state deliberately lives in
+    tools/browser_session_registry.py to keep the shared-file footprint minimal.
+    Guard sites covered: eval pre-scan and post-eval page recheck
+    (_expression_targets_private_url / _current_page_private_url), browser_navigate's
+    private-address block, and browser_snapshot + browser_vision via the shared
+    _snapshot_blocked_url helper -- if upstream re-inlines either snapshot or
+    vision comparison back to `not _is_safe_url(_current_url)`, the enrolled
+    profile silently loses the ability to READ internal pages while still being
+    able to navigate to them, which looks like a flaky page rather than a
+    regression. browser.default_profile (browser_session_registry.default_profile_name)
+    is what lets the AGENT's bare task_id inherit the profile; without it only
+    scripted acquire() callers get enrolled access.
+  removal_condition: >-
+    Remove when upstream provides a first-class per-profile or per-origin trust
+    model for private-network browser access (for example an allowlist attached
+    to a CDP-attached session), making the local seam redundant.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+- id: browser-profile-settings-surface
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - apps/desktop/src/app/settings/constants.ts
+  - apps/desktop/src/app/settings/helpers.test.ts
+  owned_symbols:
+  - SECTIONS
+  - FIELD_LABELS
+  - FIELD_DESCRIPTIONS
+  tests:
+  - apps/desktop/src/app/settings/helpers.test.ts
+  expected_commit_subject: 'feat(desktop): expose enrolled-browser trusted origins in Settings'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Adds two keys to the Safety section of SECTIONS
+    (browser.default_profile, browser.profiles.enrolled.trusted_origins) plus
+    their FIELD_LABELS and FIELD_DESCRIPTIONS copy. They sit beside the
+    pre-existing browser.allow_private_urls / browser.auto_local_for_private_urls
+    keys because they gate the same capability. No new component: config-field
+    already renders type 'list', which inferFieldSchema derives from an array
+    value. These are ADDITIVE array entries and object keys, so upstream
+    reordering or extending either structure merges cleanly -- but a whole-file
+    rewrite of constants.ts drops them with no conflict and no test failure other
+    than the named test, which is why that test asserts both the SECTIONS
+    membership and the copy lookups. The trusted_origins field only renders once
+    the profile exists in config (sectionFieldEntries omits absent keys); this is
+    intended, not a bug. The allowPrivateUrls description deliberately steers
+    users toward per-origin trust instead of the blunt global switch -- keep that
+    wording or the UI invites the less safe option.
+  removal_condition: >-
+    Remove alongside browser-profile-ssrf-trust-seam, or when a dedicated browser
+    profiles panel replaces these Advanced keys (planned follow-up, deferred until
+    the enrolled launcher is verified on a managed corporate machine).
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
