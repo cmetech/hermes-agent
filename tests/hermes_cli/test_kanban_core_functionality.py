@@ -1536,12 +1536,23 @@ def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
         run2 = kb.latest_run(conn, tid)
         assert run2.id != run1.id
 
-        assert not kb.complete_task(
-            conn,
-            tid,
-            summary="late stale completion",
-            expected_run_id=run1.id,
-        )
+        # Since mutation preconditions landed, a stale expected_run_id is an
+        # explicit conflict rather than a falsy return. The old `assert not`
+        # conflated three different outcomes -- stale run, unknown id, already
+        # terminal -- which is exactly why the exception exists.
+        with pytest.raises(kb.TaskMutationConflict) as excinfo:
+            kb.complete_task(
+                conn,
+                tid,
+                summary="late stale completion",
+                expected_run_id=run1.id,
+            )
+        # The snapshot must describe the run that WON, so a caller can report
+        # something more useful than "it failed".
+        assert excinfo.value.current.task_id == tid
+        assert excinfo.value.current.status == "running"
+        assert excinfo.value.current.current_run_id == run2.id
+
         task = kb.get_task(conn, tid)
         assert task.status == "running"
         assert task.current_run_id == run2.id
@@ -1577,8 +1588,20 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         run2 = kb.latest_run(conn, tid)
         assert run2.id != run1.id
 
+        # NOTE the deliberate asymmetry between these two.
+        #
+        # heartbeat_worker is the only expected_run_id mutation that does NOT
+        # route through _with_expected_run/_check_mutation_precondition: it
+        # resolves staleness with a conditional UPDATE (AND current_run_id = ?)
+        # and returns False. So it still returns falsy and must NOT be
+        # "tidied" into the pytest.raises shape below -- that would fail.
         assert not kb.heartbeat_worker(conn, tid, note="late", expected_run_id=run1.id)
-        assert not kb.block_task(conn, tid, reason="late block", expected_run_id=run1.id)
+
+        # block_task DOES use preconditions, so a stale run is a conflict.
+        with pytest.raises(kb.TaskMutationConflict) as excinfo:
+            kb.block_task(conn, tid, reason="late block", expected_run_id=run1.id)
+        assert excinfo.value.current.current_run_id == run2.id
+
         task = kb.get_task(conn, tid)
         assert task.status == "running"
         assert task.current_run_id == run2.id
@@ -1980,13 +2003,19 @@ def test_archive_of_ready_task_does_not_create_spurious_run(kanban_home):
         conn.close()
 
 
-def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
-    """Dashboard drag-drop running->ready must close the active run.
+# 4f8cd4622 deleted the private _set_status_direct these two tests imported.
+# Dashboard status changes now flow through the public update_task /
+# bulk_update handlers with a _mutation_precondition, so they are exercised
+# through update_task rather than reinstated against kanban_db.set_task_status
+# directly -- the behaviour under test belongs to the dashboard PATCH path, and
+# testing the kanban_db primitive instead would leave that path uncovered.
+#
+# update_task opens its own connection via _conn(), which resolves to the same
+# HERMES_HOME database the kanban_home fixture points at.
 
-    Importing _set_status_direct directly to simulate the PATCH handler
-    without spinning up FastAPI.
-    """
-    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
+    """Dashboard drag-drop running->ready must close the active run."""
+    from plugins.kanban.dashboard.plugin_api import UpdateTaskBody, update_task
 
     conn = kb.connect()
     try:
@@ -1995,10 +2024,16 @@ def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
         open_run = kb.latest_run(conn, tid)
         assert open_run.ended_at is None
         prev_run_id = open_run.id
+    finally:
+        conn.close()
 
-        # Simulate yanking the worker back to the queue.
-        assert _set_status_direct(conn, tid, "ready") is True
+    # Simulate yanking the worker back to the queue. 'running' is not in
+    # (blocked, scheduled), so update_task routes this to set_task_status,
+    # which ends the open run with outcome 'reclaimed'.
+    update_task(tid, UpdateTaskBody(status="ready"), board=None)
 
+    conn = kb.connect()
+    try:
         task = kb.get_task(conn, tid)
         assert task.status == "ready"
         assert task.current_run_id is None
@@ -2011,7 +2046,7 @@ def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
 
 def test_dashboard_direct_status_change_within_same_state_is_noop_for_runs(kanban_home):
     """todo -> ready on an unclaimed task must not create any run rows."""
-    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+    from plugins.kanban.dashboard.plugin_api import UpdateTaskBody, update_task
 
     conn = kb.connect()
     try:
@@ -2019,7 +2054,15 @@ def test_dashboard_direct_status_change_within_same_state_is_noop_for_runs(kanba
         # Force to todo for the sake of the test.
         conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
         conn.commit()
-        assert _set_status_direct(conn, tid, "ready") is True
+    finally:
+        conn.close()
+
+    update_task(tid, UpdateTaskBody(status="ready"), board=None)
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "ready"
+        # The task was never running, so no run may be opened OR closed.
         assert kb.list_runs(conn, tid) == []
     finally:
         conn.close()
@@ -4172,8 +4215,29 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         assert len(reclaim_evs) == 1
         assert reclaim_evs[0].get("manual") is True
         assert reclaim_evs[0].get("reason") == "test reason"
-        assert reclaim_evs[0].get("termination_attempted") is True
-        assert reclaim_evs[0].get("terminated") is True
+        # The reclaim event is now written INSIDE the write txn, before the
+        # worker is signalled, so it can only record that a termination is
+        # pending -- the outcome lands on a separate reclaim_termination event
+        # afterwards. Asserting the outcome here would be asserting a field
+        # that no longer exists on this event.
+        assert reclaim_evs[0].get("termination_pending") is True
+
+        # Follow the outcome to where it moved, so splitting the events did not
+        # quietly drop this coverage. _worker_survived_termination still reads
+        # termination_attempted + host_local + terminated, so these fields are
+        # load-bearing, just on the other event.
+        termination_evs = [
+            _json.loads(r["payload"])
+            for r in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND "
+                "kind='reclaim_termination'",
+                (t,),
+            )
+        ]
+        assert len(termination_evs) == 1
+        assert termination_evs[0].get("host_local") is True
+        assert termination_evs[0].get("termination_attempted") is True
+        assert termination_evs[0].get("terminated") is True
         assert killed == [signal.SIGTERM]
     finally:
         conn.close()
