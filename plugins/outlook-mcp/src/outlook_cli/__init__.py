@@ -17,7 +17,9 @@ def run(*args: str) -> str:
             cmd.append(f"-{a[2:]}")
         else:
             cmd.append(a)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL
+    )
     if result.returncode != 0 and result.stderr:
         return f"Error: {result.stderr.strip()}"
     return result.stdout.strip()
