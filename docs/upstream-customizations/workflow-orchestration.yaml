@@ -492,7 +492,7 @@ upstream_changes:
   owner: workflow-orchestration
   files:
   - apps/desktop/src/app/routes.ts
-  - apps/desktop/src/app/desktop-controller.tsx
+  - apps/desktop/src/app/contrib/surfaces.tsx
   - apps/desktop/src/app/chat/sidebar/index.tsx
   - apps/desktop/src/app/types.ts
   - apps/desktop/src/app/routes.test.ts
@@ -519,7 +519,6 @@ upstream_changes:
   - apps/desktop/src/i18n/en.ts
   - apps/desktop/src/i18n/ja.ts
   - apps/desktop/src/i18n/zh.ts
-  - apps/desktop/src/types/hermes.ts
   - apps/desktop/src/i18n/zh-hant.ts
   owned_symbols:
   - WORKFLOWS_ROUTE
@@ -530,19 +529,42 @@ upstream_changes:
   - apps/desktop/src/app/routes.test.ts
   - apps/desktop/src/app/workflows/adapter.test.ts
   - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/kanban/index.test.tsx
   - apps/desktop/src/app/kanban/adapter.test.ts
   - apps/desktop/src/app/kanban/kanban-operations.e2e.test.tsx
   - apps/desktop/src/components/activity-board/activity-board.test.tsx
   - apps/desktop/src/components/activity-board/activity-board.performance.test.tsx
   expected_commit_subject: 'feat(desktop): integrate workflow operations navigation'
   upstream_candidate: true
-  merge_guidance: Preserve separate Workflow and Kanban lifecycle authorities,
-    durable non-overlay routes, profile-scoped REST calls, extension-safe chat,
-    and complete locale/navigation composition while reconciling upstream shell
-    changes.
+  merge_guidance: >-
+    Preserve separate Workflow and Kanban lifecycle authorities, durable
+    non-overlay routes, profile-scoped REST calls, extension-safe chat, and
+    complete locale/navigation composition while reconciling upstream shell
+    changes. The shell host MOVES across upstream refactors: v0.19.0 retired
+    apps/desktop/src/app/desktop-controller.tsx (upstream 369d0eeef, "views as
+    contributions") and WorkflowsView/KanbanView are now registered in
+    apps/desktop/src/app/contrib/surfaces.tsx. When upstream moves the shell
+    again, re-point this entry's files at the new host rather than deleting the
+    path — a stale path makes check_upstream_customizations.py abort, which
+    silently disables this ledger's protection for EVERY entry, not just this
+    one (that is how the v0.19.0 tooltip regression below went unnoticed).
+    Also note upstream v0.19.0 gated Radix tooltip focus-opens to keyboard
+    focus (suppressNonKeyboardFocusOpen in components/ui/tooltip.tsx); the
+    disabled-Run a11y assertion in workflows/index.test.tsx must emulate
+    :focus-visible because jsdom does not mark programmatic .focus() as
+    keyboard focus. Real Tab focus is unaffected. Finally, the dialog suites
+    mock @/store/profile by SPREADING the real module via importOriginal and
+    overriding only the side-effecting actions. Do not convert these back to an
+    exhaustive hand-written factory: v0.19.0 added normalizeProfileKey and
+    $activeGatewayProfile, and a factory missing either fails the whole suite at
+    COLLECTION time (reported as "no tests", not as an assertion failure), which
+    is easy to misread as an infrastructure problem rather than drift.
   removal_condition: Remove when Hermes upstream provides equivalent native
     Workflow and Kanban operations pages over the same generic APIs.
-  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
 - id: desktop-workflow-stale-recovery
   change_class: desktop-composition-generic
   owner: workflow-orchestration

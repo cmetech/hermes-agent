@@ -593,13 +593,31 @@ describe('WorkflowsView', () => {
     )
 
     expect(keyboardStops).toEqual([view, runExplanation])
-    keyboardStops[0]!.focus()
-    expect(document.activeElement).toBe(view)
-    keyboardStops[1]!.focus()
-    expect(document.activeElement).toBe(runExplanation)
-    expect((await screen.findByRole('tooltip')).textContent).toContain(
-      'Run is unavailable because this workflow uses unsupported input fields.'
-    )
+
+    // Upstream v0.19.0 gated Radix's focus-open to KEYBOARD focus
+    // (suppressNonKeyboardFocusOpen in components/ui/tooltip.tsx), so a menu
+    // closing no longer leaves a stale tip over its trigger. jsdom does not
+    // mark a programmatic .focus() as :focus-visible, so without this the
+    // guard cancels a tooltip that a real Tab focus DOES show. Emulate
+    // keyboard focus for the focused element only — same technique as
+    // upstream's own tooltip.test.tsx, which stubs `matches`.
+    const originalMatches = HTMLElement.prototype.matches
+    HTMLElement.prototype.matches = function (selector: string) {
+      if (selector === ':focus-visible') return this === document.activeElement
+      return originalMatches.call(this, selector)
+    }
+
+    try {
+      keyboardStops[0]!.focus()
+      expect(document.activeElement).toBe(view)
+      keyboardStops[1]!.focus()
+      expect(document.activeElement).toBe(runExplanation)
+      expect((await screen.findByRole('tooltip')).textContent).toContain(
+        'Run is unavailable because this workflow uses unsupported input fields.'
+      )
+    } finally {
+      HTMLElement.prototype.matches = originalMatches
+    }
     const untrustedView = within(rows[2]!).getByRole('button', { name: 'View' }) as HTMLButtonElement
     const untrustedRun = within(rows[2]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement
     expect(untrustedView.disabled).toBe(false)
