@@ -1418,12 +1418,25 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        ok = kb.heartbeat_worker(
-            conn,
-            args.task_id,
-            note=getattr(args, "note", None),
-            expected_run_id=_worker_run_id_for(args.task_id),
-        )
+        try:
+            ok = kb.heartbeat_worker(
+                conn,
+                args.task_id,
+                note=getattr(args, "note", None),
+                expected_run_id=_worker_run_id_for(args.task_id),
+            )
+        except kb.TaskMutationConflict as exc:
+            # DEFENSIVE, not currently reachable: heartbeat_worker is the one
+            # expected_run_id mutation that does NOT go through
+            # _with_expected_run/_check_mutation_precondition -- it resolves
+            # staleness with a conditional UPDATE and returns False, so the
+            # `if not ok` branch below is still live for it. The guard is here
+            # so that giving heartbeat the same precondition treatment as its
+            # siblings cannot silently reintroduce the raw traceback this
+            # commit removes. Pinned by
+            # test_heartbeat_worker_returns_false_rather_than_raising.
+            _report_stale_run("heartbeat", args.task_id, exc)
+            return 1
     if not ok:
         print(f"cannot heartbeat {args.task_id} (not running?)", file=sys.stderr)
         return 1
@@ -2104,6 +2117,32 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _report_stale_run(action: str, task_id: str, exc: kb.TaskMutationConflict) -> None:
+    """Report a lost run claim on stderr, without a traceback.
+
+    A stale ``expected_run_id`` used to make these mutations return falsy, which
+    the surrounding ``if not ...:`` branches already handled. Since mutation
+    preconditions landed it raises :class:`kb.TaskMutationConflict` instead, so
+    an unhandled stale claim reaches the user as a raw Python traceback and the
+    old message became unreachable for this case.
+
+    The distinction is the whole point of the exception, so this message must
+    stay distinct from the generic "unknown id or terminal state" one: there,
+    the task is unusable; here the task is perfectly fine and *this worker* has
+    simply stopped being the one running it -- which is recoverable by re-reading
+    the task. ``exc.current`` is a snapshot of the winning state, so name it.
+    """
+    current = exc.current
+    run = current.current_run_id if current.current_run_id is not None else "none"
+    print(
+        f"cannot {action} {task_id}: this worker's run is no longer the current "
+        f"run for the task (task is {current.status}, current run {run}). "
+        "Another worker or an operator reclaimed it -- re-read the task before "
+        "retrying.",
+        file=sys.stderr,
+    )
+
+
 def _worker_run_id_for(task_id: str) -> Optional[int]:
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return None
@@ -2191,13 +2230,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                         failed.append(tid)
                         continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.TaskMutationConflict as exc:
+                _report_stale_run("complete", tid, exc)
+                failed.append(tid)
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
@@ -2243,13 +2288,19 @@ def _cmd_block(args: argparse.Namespace) -> int:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                blocked = kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.TaskMutationConflict as exc:
+                _report_stale_run("block", tid, exc)
+                failed.append(tid)
+                continue
+            if not blocked:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
@@ -2279,12 +2330,18 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
-            if not kb.schedule_task(
-                conn,
-                tid,
-                reason=reason,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                scheduled = kb.schedule_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.TaskMutationConflict as exc:
+                _report_stale_run("schedule", tid, exc)
+                failed.append(tid)
+                continue
+            if not scheduled:
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
             else:

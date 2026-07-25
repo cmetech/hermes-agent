@@ -4,6 +4,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
@@ -32,15 +33,44 @@ def test_real_read_tool_binaries_confirm_option_ownership(
     assert completed.stdout == expected_output
 
 
+# These cases assert that a REAL binary executes a '-leading-dash' operand as a
+# program -- the threat that justifies detect_dangerous_command flagging the
+# flag at all. The existing shutil.which() guard inside the test is not enough
+# for sort/man: macOS ships both, but as BSD builds whose behaviour under these
+# specific flags differs from the GNU/coreutils and man-db builds the assertion
+# was written against, so the payload never fires and the test fails for a
+# reason unrelated to the detector.
+#
+# Verified empirically: these three fail on macOS and pass on Linux. CI runs
+# ubuntu-latest, so coverage of the actual threat model is unchanged -- this
+# only stops a macOS dev box from reporting three permanent red herrings, which
+# is what made the local suite untrustworthy.
+#
+# Deliberately gated on "is Linux" rather than "is not macOS": any non-GNU
+# userland (BSD, busybox) has the same mismatch. rg is a single upstream Rust
+# binary and behaves identically everywhere, so its two cases stay unmarked;
+# ag is already handled by the which() guard.
+gnu_userland_only = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="asserts GNU/man-db exec behaviour; BSD builds of sort/man differ (CI is Linux)",
+)
+
+
 @pytest.mark.parametrize(
     ("tool", "args", "stdin", "needs_tty"),
     [
         ("rg", ["--pre", "-payload-marker", "needle", "{input}"], None, False),
         ("rg", ["--hostname-bin=-payload-marker", "needle", "{input}"], None, False),
-        ("sort", ["--buffer-size=1K", "--compress-program", "-payload-marker"], "{bulk}", False),
+        pytest.param(
+            "sort",
+            ["--buffer-size=1K", "--compress-program", "-payload-marker"],
+            "{bulk}",
+            False,
+            marks=gnu_userland_only,
+        ),
         ("ag", ["--pager=-payload-marker", "needle", "{input}"], None, True),
-        ("man", ["--pager", "-payload-marker", "ls"], None, True),
-        ("man", ["-P", "-payload-marker", "ls"], None, True),
+        pytest.param("man", ["--pager", "-payload-marker", "ls"], None, True, marks=gnu_userland_only),
+        pytest.param("man", ["-P", "-payload-marker", "ls"], None, True, marks=gnu_userland_only),
     ],
 )
 def test_real_binaries_execute_leading_dash_program_payload(

@@ -1,0 +1,73 @@
+schema_version: 1
+feature: platform-test-skips
+# Platform guards on upstream tests that cannot pass off their target platform.
+#
+# All three files are upstream-owned. None of these edits changes what is
+# tested on CI (ubuntu-latest) -- they only stop a macOS developer machine from
+# reporting 8 permanent failures that look identical to real regressions.
+#
+# Why this matters enough to ledger: an untrustworthy local suite is how the
+# preceding drift went unnoticed. One session lost hours to a local `.venv` that
+# silently skipped 1309 tests, and a later session had to run the full suite
+# twice (~50 min each) purely to prove that 71 failures were pre-existing noise.
+# A green local baseline makes the next real regression visible on sight.
+#
+# These are strong upstream candidates -- upstream presumably runs Linux CI and
+# has simply never needed the guards -- but until upstream takes them, a merge
+# that rewrites any of these files silently restores the red herrings.
+upstream_changes:
+- id: platform-guarded-upstream-tests
+  change_class: test-infrastructure
+  owner: downstream-test-reliability
+  files:
+  - tests/test_live_system_guard_self_test.py
+  - tests/tools/test_execution_flag_detection.py
+  - tests/tools/test_computer_use.py
+  owned_symbols:
+  - requires_systemctl
+  - gnu_userland_only
+  - test_linux_default_capture_skips_gnome_shell_helper
+  tests:
+  - tests/test_live_system_guard_self_test.py
+  - tests/tools/test_execution_flag_detection.py
+  - tests/tools/test_computer_use.py
+  expected_commit_subject: 'test: guard 8 platform-specific tests so the local suite is trustworthy'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Three independent guards; re-apply any that a merge drops.
+    None may be widened into a blanket skip of its file.
+
+    (1) tests/test_live_system_guard_self_test.py -- `requires_systemctl`
+    (shutil.which, NOT sys.platform, because a systemd-less Linux container has
+    the same problem) on the FOUR `*_passes_through` tests only. This file is a
+    deliberate canary protecting a live gateway from being SIGTERMed by tests
+    (PR #23397), so weakening it is dangerous: the guard-ENFORCEMENT tests (the
+    `*_blocked` ones) must keep running on every platform. They can, because the
+    guard raises RuntimeError before the binary is ever invoked -- only the
+    "and it still permits harmless reads" half needs a real systemctl. If a
+    merge adds a new pass-through case, it needs the mark; if it adds a new
+    blocked case, it must NOT get the mark.
+
+    (2) tests/tools/test_execution_flag_detection.py -- `gnu_userland_only` on
+    exactly three params of test_real_binaries_execute_leading_dash_program_payload
+    (sort --compress-program, man --pager, man -P). The test's own
+    shutil.which() guard is insufficient: macOS ships sort and man, but as BSD
+    builds whose behaviour under these flags differs from the coreutils/man-db
+    builds the assertion targets, so the payload never fires. The two rg params
+    stay unmarked (single upstream Rust binary, identical everywhere) and ag is
+    already covered by which(). Gated on `sys.platform != "linux"` rather than
+    "is macOS" so any non-GNU userland (BSD, busybox) is covered.
+
+    (3) tests/tools/test_computer_use.py -- skipif on
+    test_linux_default_capture_skips_gnome_shell_helper. This one is Linux-only
+    in PRODUCTION code, not merely in its fixture: cua_backend consults the
+    gnome-shell skip-list only behind `sys.platform == "linux"`
+    (cua_backend.py:338; the skip-list helper early-returns off Linux at :214).
+    Because the test is fully mocked it RUNS on macOS and asserts a branch that
+    cannot be taken. If upstream ever makes that skip cross-platform, delete
+    this guard rather than the assertion.
+  removal_condition: >-
+    Remove a guard when upstream adds its own equivalent, or when the underlying
+    behaviour stops being platform-conditional (for guard 3, when cua_backend's
+    gnome-shell skip is no longer gated on sys.platform).
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
