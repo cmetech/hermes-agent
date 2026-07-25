@@ -28,7 +28,8 @@ CDP via the existing `browser_supervisor`, `pytest` via `scripts/run_tests.sh`.
 - **Enrolled-browser rule (spec §5):** the launcher MUST resolve the *enrolled* browser (OS cert store) and MUST NOT use agent-browser's bundled Chrome for Testing for an enrolled profile. That distinction is the entire reason mTLS works.
 - **Hard isolation rule (spec §5):** profile is fixed at `acquire()`. An untrusted external site must never be driven through the `enrolled` profile.
 - **Governance (spec §6a):** Task 4 is the FIRST OTTO edit to `tools/browser_tool.py`. Its surface-table rows, paired `AGENTS.md`, and merge-skill greps ship in the SAME commit as the hook. Non-negotiable.
-- **Brand gate:** `node scripts/brand/generate.mjs otto --check` and `... loop24 --check` must both print 8/8 OK. No brand emitter is touched by this work, so a failure means something went wrong.
+- **Brand gate — does NOT run on `base`.** Corrected 2026-07-25 during execution: `generate <brand> --check` FAILS on `base` **by design** (base is the neutral branch; the 8 emitter-covered files hold upstream Hermes values, so brand-config/intro/home report Hermes). Verified: `base` reports `name: expected "OTTO", got "Hermes"` etc. with a clean tree. This work touches none of the 8 emitters (`providerEmitter`, `pyprojectScriptsEmitter`, `skinEmitter`, `packageJsonEmitter`, `mainIdentityEmitter`, `brandConfigEmitter`, `introEmitter`, `homeEmitter`), so the gate is simply **not applicable here** — run it after merging `base → otto` / `base → loop24`, per the merge procedure. Do not "fix" a base-branch `--check` failure.
+- **Governance ledger:** the authoritative, versioned record for this work is `docs/upstream-customizations/browser-profiles.yaml`, validated with `venv/bin/python scripts/check_upstream_customizations.py --manifest docs/upstream-customizations/browser-profiles.yaml`. The workspace `CLAUDE.md`/`AGENTS.md` surface table and the `otto-upstream-merge` grep list live **outside any git repo** (the workspace root is not a repository), so they are a convenience layer only — keep them updated, but the ledger is what travels with the branch.
 
 ---
 
@@ -952,14 +953,21 @@ cd /Users/coreyellis/code/github.com/cmetech/otto_hermes && cmp CLAUDE.md AGENTS
 ```
 Expected: `pair OK`
 
-- [ ] **Step 6: Verify the brand gate is unaffected**
+- [ ] **Step 6: Validate the in-repo governance ledger**
+
+The versioned record is `docs/upstream-customizations/browser-profiles.yaml`
+(see Global Constraints — the workspace surface table is not version
+controlled). Validate it and its coverage:
 
 ```bash
-node scripts/brand/generate.mjs otto --check
-node scripts/brand/generate.mjs loop24 --check
+venv/bin/python scripts/check_upstream_customizations.py \
+  --manifest docs/upstream-customizations/browser-profiles.yaml
+venv/bin/python scripts/check_upstream_customizations.py \
+  --manifest docs/upstream-customizations/browser-profiles.yaml \
+  --diff 507a53c8348fe52cee101e05907b7045cb6cfbe0..HEAD
 ```
-Expected: both print 8/8 OK. No emitter is touched by this work; a failure means
-something unrelated broke.
+Expected: exit 0 from both. Do **not** run `generate <brand> --check` here — it
+fails on `base` by design (see Global Constraints).
 
 - [ ] **Step 7: Commit (code + governance together — never split)**
 
@@ -1786,12 +1794,16 @@ not noise (AGENTS.md flake policy).
 - [ ] **Step 4: Verify governance survived and brands gate green**
 
 ```bash
-git grep -c '_session_trusts_url' -- tools/browser_tool.py     # expect >=3
+git grep -c '_session_trusts_url' -- tools/browser_tool.py     # expect >=6 after Task 9
 ls tools/browser_profiles.py tools/browser_session_registry.py tools/browser_session_manager.py
-node scripts/brand/generate.mjs otto --check                    # 8/8 OK
-node scripts/brand/generate.mjs loop24 --check                  # 8/8 OK
+venv/bin/python scripts/check_upstream_customizations.py \
+  --manifest docs/upstream-customizations/browser-profiles.yaml   # exit 0
 cd /Users/coreyellis/code/github.com/cmetech/otto_hermes && cmp CLAUDE.md AGENTS.md && echo "pair OK"
 ```
+
+The brand gate belongs to the per-brand merge, not to this branch: after
+`base → otto` / `base → loop24`, `generate <brand> --check` must print 8/8 OK
+there. It fails on `base` by design.
 
 - [ ] **Step 5: Commit**
 
