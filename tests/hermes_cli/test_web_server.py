@@ -299,6 +299,23 @@ class TestSessionTokenInjection:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def _show_all_channels(monkeypatch):
+    """Neutralize the brand channel allowlist for catalog-derivation tests.
+
+    The messaging-catalog tests assert the catalog is derived from the Platform
+    enum + plugin registry (the upstream invariant). A brand's channel allowlist
+    (``curation.channels.allow``) is an orthogonal product filter with its own
+    coverage (see the brand-channel tests + the catalog=len(allowlist) gate), so
+    it is disabled here so the derivation itself is what's under test — otherwise
+    a branded default (e.g. OTTO's 11-channel allowlist) hides signal/weixin/
+    plugin platforms and these tests fail for a reason unrelated to derivation.
+    """
+    monkeypatch.setattr(
+        "hermes_cli.brand_config.visible_platform_ids", lambda *a, **k: None
+    )
+
+
 class TestWebServerEndpoints:
     """Test the FastAPI REST endpoints using Starlette TestClient."""
 
@@ -3726,7 +3743,7 @@ class TestWebServerEndpoints:
         assert data["AWS_REGION"]["category"] == "provider"
         assert data["AWS_PROFILE"]["provider"] == "bedrock"
 
-    def test_platform_scoped_messaging_env_vars_are_channel_managed(self):
+    def test_platform_scoped_messaging_env_vars_are_channel_managed(self, _show_all_channels):
         from hermes_cli.web_server import (
             _MESSAGING_KEYS_PAGE_KEYS,
             _build_catalog_entry,
@@ -4640,7 +4657,7 @@ class TestWebServerEndpoints:
         assert "App-Level Tokens" in fields["SLACK_APP_TOKEN"]["help"]
         assert "Copy member ID" in fields["SLACK_ALLOWED_USERS"]["help"]
 
-    def test_weixin_messaging_metadata_describes_personal_ilink_setup(self):
+    def test_weixin_messaging_metadata_describes_personal_ilink_setup(self, _show_all_channels):
         resp = self.client.get("/api/messaging/platforms")
 
         assert resp.status_code == 200
@@ -4687,7 +4704,7 @@ class TestWebServerEndpoints:
             "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/google_chat"
         )
 
-    def test_messaging_catalog_covers_gateway_platforms(self):
+    def test_messaging_catalog_covers_gateway_platforms(self, _show_all_channels):
         """Catalog is derived from the Platform enum, so every built-in shows up."""
         from gateway.config import Platform
 
@@ -4699,7 +4716,7 @@ class TestWebServerEndpoints:
                 continue
             assert member.value in platforms, f"Missing gateway platform {member.value} from /api/messaging/platforms"
 
-    def test_messaging_catalog_includes_plugin_platforms(self, monkeypatch):
+    def test_messaging_catalog_includes_plugin_platforms(self, monkeypatch, _show_all_channels):
         """Plugin-registered adapters appear in the catalog without per-platform code."""
         from gateway.platform_registry import PlatformEntry, platform_registry
 
