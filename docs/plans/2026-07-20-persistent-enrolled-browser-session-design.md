@@ -1,13 +1,93 @@
 # Design — Persistent enrolled-browser session (Option B)
 
 **Date:** 2026-07-20
-**Status:** Proposal. Nothing implemented.
+**Status:** Approved with revisions — see §0 (Revision 2026-07-25). Nothing
+implemented. Implementation plan:
+`docs/superpowers/plans/2026-07-25-browser-session-manager.md`.
 **Target branch:** `base` (brand-agnostic capability — golden rule: additive,
 upstream-mergeable). Never a brand branch.
 **Relationship to the confluence skill:** ADDITIVE. The `confluence-research`
 skill stays exactly as shipped. This is the shared substrate it (and future
 internal-site skills) will *optionally* consume once proven. We keep both until
 the browser tool is confident in all scenarios.
+
+---
+
+## 0. Revision — 2026-07-25 (post upstream Hermes v0.19.0)
+
+This design was written 2026-07-20. Upstream merge `d4966edba` (Hermes v0.19.0)
+landed afterwards and changed **188 lines of `tools/browser_tool.py`** plus 52
+lines of `skills/computer-use/SKILL.md`. Every code claim below was re-verified
+on `base` on 2026-07-25. Results:
+
+**Claims that HOLD (unchanged):**
+- `browser_tool.py` drives agent-browser (115 refs); the 11 Playwright refs are
+  Chromium install/cache plumbing only, no driver. §2's "converge on
+  agent-browser" stands.
+- `browser_supervisor.py` is still `"One supervisor per (task_id, cdp_url)
+  pair"` and browser-identity-agnostic. §6's "supervisor unchanged" stands.
+- `browser_tool.py` / `browser_supervisor.py` are still PURE UPSTREAM (zero OTTO
+  hooks). §6a's mandatory-registration requirement stands and is now the
+  higher-risk item, given the 188-line churn.
+
+**§5 is SUPERSEDED — the eval security baseline inverted.** v0.19.0 added
+`browser.restrict_evaluate` and made the sensitive-primitive denylist
+**opt-in, OFF by default** (upstream's reasoning: it gated on primitive *names*
+like `fetch`/`cookie`, blocking legitimate DOM extraction without preventing
+real exfiltration). `browser.allow_unsafe_evaluate` now only overrides
+`restrict_evaluate` back off. Therefore §5's premise — "`default`/ephemeral →
+denylist ON (current safe behaviour, preserved)" — is **false as of v0.19.0**.
+Per-profile trust is still a net improvement, but it would be *tightening* the
+ephemeral default rather than preserving it. Treat that as a deliberate decision,
+not a freebie.
+
+**NEW BLOCKER — the CDP attach path trips the SSRF guard.** Egress is now gated
+by:
+
+```python
+_eval_ssrf_guard_active = (not _is_local_backend()
+                           and not _is_local_sidecar_key(key)
+                           and not _allow_private_urls())
+```
+
+and `_is_local_backend()` **returns False on any CDP override** — deliberately,
+so a model-driven navigate cannot reach internal services via an off-host
+Chrome. This design attaches enrolled Edge over CDP (`cdp_port: 9222`), so an
+internal Confluence host that resolves to a private IP would be **blocked**, for
+eval-fetch *and* navigate/snapshot. The design's central technique does not work
+as written on v0.19.0.
+
+**Resolution (decided 2026-07-25): integrate with the SSRF guard at
+per-session, origin-scoped granularity.** Upstream's hybrid-routing "local
+sidecar" already exempts a session from the guard via a session-key suffix
+(`_is_local_sidecar_key`, `_LOCAL_SUFFIX = "::local"`) — that is the correct
+granularity to mirror. Trust is evaluated per (session, URL) against the
+profile's `trusted_origins`, NOT as a blanket session exemption. The global
+`browser.allow_private_urls` escape hatch is explicitly REJECTED as the
+mechanism: it disables private-URL protection for every session, including
+ephemeral external browsing.
+
+**NEW, helpful:** v0.19.0 added `browser.headed` + `AGENT_BROWSER_HEADED`
+(`_is_headed_mode()`), which partly covers §3's `sess.signin()` visible-launch
+need. It is global config, so this design makes headed a **per-profile**
+property; the enrolled launcher owns it (enrolled sessions attach via `--cdp`
+and never reach the `--session` local launcher where `--headed` is appended).
+
+**Desktop half — decided 2026-07-25: extend upstream `computer_use`, do NOT
+fork.** The ultimate goal is two natural-language tools: browser page control
+(`browser_*`) and desktop control (`computer_use`). Both already exist upstream;
+`computer_use` is a registered toolset (`tools/computer_use/`, cua-driver
+backend, `tools_config.py:120`) and is not brand-excluded today. v0.19.0
+invested substantially in it (background-first verify→escalate ladder,
+`delivery_mode`/`bring_to_front`, structured `effect`/`escalation`/`code`
+verdicts). Accordingly
+`docs/2026-07-23-hermes-computer-use-reliability-planning-prompt.md` — which
+proposed a downstream-owned `cua_desktop` tool + `cua-desktop` skill with
+upstream `computer_use` hidden for OTTO/LOOP24 — is **SUPERSEDED**. Forking
+would permanently reimplement work upstream is doing well and would add a large
+OTTO surface to govern, which is the same golden-rule tension as §6a one level
+up. The desktop half is therefore out of scope for this design's plan and needs
+only a thin downstream layer (skill guidance / curation) if anything.
 
 ---
 
@@ -125,6 +205,13 @@ path, it does not replace anything. Isolation between them is a hard rule
 (§5), riding on the supervisor's existing per-`(task_id, cdp_url)` isolation.
 
 ## 5. Security — per-profile eval policy (a net improvement)
+
+> **SUPERSEDED by §0 (2026-07-25).** The baseline described in this section
+> changed in upstream v0.19.0: the denylist is now opt-in
+> (`browser.restrict_evaluate`, default OFF) and egress is gated by the SSRF
+> guard instead. The per-profile/per-origin *intent* below is retained; the
+> mechanism is now an origin-scoped hook into `_eval_ssrf_guard_active`'s
+> predicates, not a replacement for `allow_unsafe_evaluate`. Read §0 first.
 
 Today `browser.allow_unsafe_evaluate` is a single GLOBAL switch: all-or-nothing
 `fetch`/network eval. This replaces it with per-profile / per-origin trust:
