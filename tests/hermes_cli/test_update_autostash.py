@@ -8,6 +8,22 @@ import pytest
 from hermes_cli import config as hermes_config
 from hermes_cli import main as hermes_main
 
+# The branch a bare `hermes update` targets, derived from production instead of
+# hardcoded.
+#
+# These tests were written against upstream, where that is "main". This fork
+# deliberately defaults to its brand branch (_resolve_update_branch: a bare
+# `otto update` must never target `main`, which here is the upstream-Hermes
+# mirror -- doing so would silently replace the brand with stock Hermes). A
+# literal "main" below therefore asserts UPSTREAM's behaviour, not ours, and
+# every one of these tests failed on both macOS and Linux CI as a result.
+#
+# Deriving it keeps the tests honest in both directions: they follow a change to
+# the fork's default, and they keep passing if upstream ever changes theirs.
+# The sibling test_cmd_update.py was updated for this when the default moved;
+# this file was missed, which is the whole bug.
+UPDATE_BRANCH = hermes_main._resolve_update_branch(SimpleNamespace())
+
 
 # ---------------------------------------------------------------------------
 # Managed-uv compatibility for tests that patch shutil.which
@@ -411,13 +427,13 @@ def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypa
 
     def fake_run(cmd, **kwargs):
         recorded.append(cmd)
-        if cmd == ["git", "fetch", "origin", "main"]:
+        if cmd == ["git", "fetch", "origin", UPDATE_BRANCH]:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
-            return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
-        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+            return SimpleNamespace(stdout=f"{UPDATE_BRANCH}\n", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", f"HEAD..origin/{UPDATE_BRANCH}", "--count"]:
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
-        if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
+        if cmd == ["git", "pull", "--ff-only", "origin", UPDATE_BRANCH]:
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         if cmd == ["/usr/bin/uv", "pip", "install", "-e", ".[all]"]:
             raise CalledProcessError(returncode=1, cmd=cmd)
@@ -460,13 +476,13 @@ def test_cmd_update_succeeds_with_extras(monkeypatch, tmp_path):
 
     def fake_run(cmd, **kwargs):
         recorded.append(cmd)
-        if cmd == ["git", "fetch", "origin", "main"]:
+        if cmd == ["git", "fetch", "origin", UPDATE_BRANCH]:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
-            return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
-        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+            return SimpleNamespace(stdout=f"{UPDATE_BRANCH}\n", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", f"HEAD..origin/{UPDATE_BRANCH}", "--count"]:
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
-        if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
+        if cmd == ["git", "pull", "--ff-only", "origin", UPDATE_BRANCH]:
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -532,7 +548,7 @@ def test_install_heartbeat_prints_when_dependency_install_is_silent(monkeypatch,
 # ---------------------------------------------------------------------------
 
 def _make_update_side_effect(
-    current_branch="main",
+    current_branch=UPDATE_BRANCH,
     commit_count="3",
     ff_only_fails=False,
     reset_fails=False,
@@ -551,7 +567,7 @@ def _make_update_side_effect(
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
-        if "checkout" in joined and "main" in joined:
+        if "checkout" in joined and UPDATE_BRANCH in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
             return SimpleNamespace(stdout=f"{commit_count}\n", stderr="", returncode=0)
@@ -584,7 +600,7 @@ def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path
 
     reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
     assert len(reset_calls) == 1
-    assert reset_calls[0] == ["git", "reset", "--hard", "origin/main"]
+    assert reset_calls[0] == ["git", "reset", "--hard", f"origin/{UPDATE_BRANCH}"]
 
     out = capsys.readouterr().out
     assert "Fast-forward not possible" in out
@@ -618,12 +634,12 @@ def test_cmd_update_switches_to_main_from_feature_branch(monkeypatch, tmp_path, 
 
     hermes_main.cmd_update(SimpleNamespace())
 
-    checkout_calls = [c for c in recorded if "checkout" in c and "main" in c]
+    checkout_calls = [c for c in recorded if "checkout" in c and UPDATE_BRANCH in c]
     assert len(checkout_calls) == 1
 
     out = capsys.readouterr().out
     assert "fix/something" in out
-    assert "switching to main" in out
+    assert f"switching to {UPDATE_BRANCH}" in out
 
 
 def test_cmd_update_switches_to_main_from_detached_head(monkeypatch, tmp_path, capsys):
@@ -636,7 +652,7 @@ def test_cmd_update_switches_to_main_from_detached_head(monkeypatch, tmp_path, c
 
     hermes_main.cmd_update(SimpleNamespace())
 
-    checkout_calls = [c for c in recorded if "checkout" in c and "main" in c]
+    checkout_calls = [c for c in recorded if "checkout" in c and UPDATE_BRANCH in c]
     assert len(checkout_calls) == 1
 
     out = capsys.readouterr().out
@@ -704,7 +720,7 @@ def test_cmd_update_fetch_is_scoped_to_target_branch(monkeypatch, tmp_path):
     hermes_main.cmd_update(SimpleNamespace())
 
     fetch_calls = [c for c in recorded if "fetch" in c]
-    assert fetch_calls == [["git", "fetch", "origin", "main"]]
+    assert fetch_calls == [["git", "fetch", "origin", UPDATE_BRANCH]]
     assert ["git", "fetch", "origin"] not in recorded
 
 
