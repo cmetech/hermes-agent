@@ -1519,12 +1519,21 @@ def test_get_platform_tools_feishu_tools_not_on_other_platforms():
         assert "feishu_drive" not in enabled, f"feishu_drive leaked onto {plat}"
 
 
-def test_get_effective_configurable_toolsets_dedupes_bundled_plugins():
+def test_get_effective_configurable_toolsets_dedupes_bundled_plugins(monkeypatch):
     """Bundled plugins (plugins/spotify) share their toolset key with the
     built-in CONFIGURABLE_TOOLSETS entry. The effective list must not list
     them twice — otherwise `hermes tools` → "reconfigure existing" shows
     the same toolset two rows in a row.
     """
+    # Isolate the subject: this asserts DEDUPE, not brand curation. This fork's
+    # curation.tools.excludeToolsets hides spotify, so without neutralising the
+    # exclusion the spotify assertion below fails for an unrelated reason.
+    # _get_effective_configurable_toolsets imports this symbol lazily, so
+    # patching the attribute is enough.
+    import hermes_cli.brand_config as _brand_config
+
+    monkeypatch.setattr(_brand_config, "active_excluded_toolsets", lambda: set())
+
     from hermes_cli.tools_config import _get_effective_configurable_toolsets
 
     all_ts = _get_effective_configurable_toolsets()

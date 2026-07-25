@@ -69,7 +69,16 @@ class TestYuanbaoConfig:
         assert config.extra["app_id"] == "test_key"
         assert config.extra["app_secret"] == "test_secret"
 
-    def test_get_connected_platforms_requires_key_and_secret(self):
+    def test_get_connected_platforms_requires_key_and_secret(self, monkeypatch):
+        # Isolate the subject under test: this asserts the key+secret rule, not
+        # channel curation. This fork's brand channel allowlist does not include
+        # yuanbao, so without neutralising the filter the second assertion fails
+        # for a reason unrelated to what the test is checking.
+        # gateway.config._brand_visible_platform_ids exists as a module-level
+        # indirection precisely so tests can patch it (None => no restriction);
+        # same pattern as tests/hermes_cli/test_channel_filter.py.
+        monkeypatch.setattr("gateway.config._brand_visible_platform_ids", lambda: None)
+
         # Only key, no secret → not in connected list
         gw_only_key = GatewayConfig(
             platforms={

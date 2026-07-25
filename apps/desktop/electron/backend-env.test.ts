@@ -7,9 +7,11 @@ import {
   appendUniquePathEntries,
   buildDesktopBackendEnv,
   buildDesktopBackendPath,
+  INHERITED_PYTHON_ENV_VARS,
   normalizeHermesHomeRoot,
   pathEnvKey,
-  POSIX_SANE_PATH_ENTRIES
+  POSIX_SANE_PATH_ENTRIES,
+  scrubInheritedPythonEnv
 } from './backend-env'
 
 test('desktop backend PATH adds Hermes-managed bins and missing POSIX sane entries', () => {
@@ -50,7 +52,7 @@ test('desktop backend PATH preserves first occurrence and avoids duplicates', ()
   )
 })
 
-test('buildDesktopBackendEnv extends PYTHONPATH and backend PATH together', () => {
+test('buildDesktopBackendEnv sets our own PYTHONPATH and backend PATH together', () => {
   const env = buildDesktopBackendEnv({
     hermesHome: '/Users/test/.hermes',
     pythonPathEntries: ['/repo/hermes-agent'],
@@ -63,9 +65,70 @@ test('buildDesktopBackendEnv extends PYTHONPATH and backend PATH together', () =
     pathModule: path.posix
   })
 
-  assert.equal(env.PYTHONPATH, '/repo/hermes-agent:/existing/pythonpath')
+  // The inherited PYTHONPATH is deliberately DROPPED, not appended: a
+  // corporate baseline that sets PYTHONPATH/PYTHONHOME machine-wide drags every
+  // Python subprocess onto a foreign stdlib ("SRE module mismatch"). We run the
+  // interpreter we deliver, against the modules we deliver.
+  assert.equal(env.PYTHONPATH, '/repo/hermes-agent')
   assert.ok(env.PATH.startsWith('/Users/test/.hermes/node/bin:/Users/test/.hermes/hermes-agent/venv/bin:'))
   assert.ok(env.PATH.includes('/opt/homebrew/bin'))
+})
+
+test('buildDesktopBackendEnv neutralizes every inherited Python env var', () => {
+  const env = buildDesktopBackendEnv({
+    hermesHome: '/Users/test/.hermes',
+    pythonPathEntries: ['/repo/hermes-agent'],
+    venvRoot: '/Users/test/.hermes/hermes-agent/venv',
+    currentEnv: {
+      PATH: '/usr/bin:/bin',
+      PYTHONHOME: '/opt/corp/python310',
+      PYTHONPATH: '/existing/pythonpath',
+      PYTHONSTARTUP: '/etc/pythonstart.py',
+      PYTHONEXECUTABLE: '/opt/corp/python310/bin/python',
+      PYTHONUSERBASE: '/opt/corp/site'
+    },
+    platform: 'darwin',
+    pathModule: path.posix
+  })
+
+  // `undefined` is how a spawn env drops a variable the parent still carries:
+  // node's spawn skips undefined values instead of exporting an empty string.
+  for (const name of INHERITED_PYTHON_ENV_VARS) {
+    if (name === 'PYTHONPATH') {
+      continue
+    }
+
+    assert.ok(name in env, `${name} must be explicitly present so spawn drops it`)
+    assert.equal(env[name], undefined, `${name} must not reach the backend`)
+  }
+
+  assert.equal(env.PYTHONNOUSERSITE, '1')
+})
+
+test('scrubInheritedPythonEnv strips the inherited Python family and reports what it removed', () => {
+  const env: Record<string, string | undefined> = {
+    PATH: '/usr/bin',
+    PYTHONHOME: 'C:\\Python\\Python310',
+    PYTHONPATH: 'C:\\corp\\lib',
+    HERMES_HOME: '/Users/test/.hermes'
+  }
+
+  const removed = scrubInheritedPythonEnv(env)
+
+  assert.deepEqual(removed, ['PYTHONHOME', 'PYTHONPATH'])
+  assert.equal('PYTHONHOME' in env, false)
+  assert.equal('PYTHONPATH' in env, false)
+  assert.equal(env.PYTHONNOUSERSITE, '1')
+  // Unrelated variables are untouched.
+  assert.equal(env.PATH, '/usr/bin')
+  assert.equal(env.HERMES_HOME, '/Users/test/.hermes')
+})
+
+test('scrubInheritedPythonEnv is a no-op report when nothing was inherited', () => {
+  const env: Record<string, string | undefined> = { PATH: '/usr/bin' }
+
+  assert.deepEqual(scrubInheritedPythonEnv(env), [])
+  assert.equal(env.PYTHONNOUSERSITE, '1')
 })
 
 test('normalizeHermesHomeRoot maps profile homes back to the global Hermes root', () => {

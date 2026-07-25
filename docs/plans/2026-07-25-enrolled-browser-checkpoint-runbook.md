@@ -1,7 +1,7 @@
 # Checkpoint Runbook — enrolled-browser profile on a corporate laptop
 
-**Version under test:** OTTO / LOOP24 **v4.0.1**
-**Source commits:** otto `ba7c0f4686130acffd8512dbeea3691246a4a301`, loop24 `484f80a764bc68c32651ee0c72cbe565e9bf36c3`
+**Version under test:** OTTO / LOOP24 **v4.0.2**
+**Source commits:** otto `257bebfb0539624c499767bd03d69c450f5edd3e`, loop24 `34f480181242d8f026653d1725e0543d02ce84bc`
 **Purpose:** validate the four things that are currently **unproven** — everything
 below was verified against mocks only.
 
@@ -36,13 +36,19 @@ it will work without being listed — but list it anyway for consistency.
 
 ## Step 1 — Install
 
-Download the **v4.0.1** installer from
-<https://github.com/cmetech/otto/releases> (`OTTO-4.0.1-win-x64.exe`) and run it.
-It is published as a **prerelease** — expected for a checkpoint build.
+Either run the one-liner in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/cmetech/otto/main/install.ps1 | iex
+```
+
+or download `OTTO-4.0.2-win-x64.exe` from
+<https://github.com/cmetech/otto/releases> and run it. Published as a **full
+release** (not a prerelease).
 
 First launch clones the source and builds locally, so allow several minutes.
 
-**Expected:** app opens; Settings → About shows **4.0.1**.
+**Expected:** app opens; Settings → About shows **4.0.2**.
 
 ## Step 2 — Configure the profile
 
@@ -179,7 +185,7 @@ security regression and more serious than any failure above.
 
 ## Step 10 — Confirm LOOP24 too
 
-Install LOOP24 v4.0.1 from <https://github.com/cmetech/loop24/releases> and repeat
+Install LOOP24 v4.0.2 from <https://github.com/cmetech/loop24/releases> and repeat
 Steps 2–6. Both brands ship the identical capability from the same `base` commit;
 this confirms the brand overlay didn't disturb it.
 

@@ -1,0 +1,78 @@
+schema_version: 1
+feature: desktop-test-infra
+# Test-infrastructure repairs to upstream desktop test config. Both entries fix
+# upstream defects rather than adding downstream behaviour, so both are strong
+# upstream_candidates — but until upstream takes them, a merge that rewrites
+# either file silently restores the defect.
+coverage:
+  base_commit: c38874511d67d9fd42da9fd7f65df146bf7ceeb0
+  excluded_commits: []
+upstream_changes:
+- id: electron-node-test-runner-split
+  change_class: test-infrastructure
+  owner: downstream-test-reliability
+  files:
+  - apps/desktop/vitest.config.ts
+  - apps/desktop/package.json
+  owned_symbols:
+  - NODE_TEST_FILES
+  - test:electron:node
+  - check:test:electron:node
+  tests:
+  - apps/desktop/electron/brand-scope.test.ts
+  - apps/desktop/electron/release-update.test.ts
+  - apps/desktop/electron/structured-api-channel.test.ts
+  - apps/desktop/electron/structured-api-response.test.ts
+  expected_commit_subject: 'fix(desktop): run the node:test electron suites and unbreak the vitest electron project'
+  upstream_candidate: true
+  merge_guidance: >-
+    Four files under electron/ use the node:test runner (import test from
+    'node:test'), not vitest; their headers say "Run with: npx tsx --test".
+    Vitest's electron project glob (electron/**/*.test.ts) collected them but
+    could not execute them, so each reported "No test suite found", the electron
+    project exited 1, and their 34 assertions never ran -- including coverage of
+    the v1.0.5 brand-coexistence predicates (brand-scope) and the release-based
+    update helpers (release-update), both downstream-owned. The fix excludes
+    them from the vitest project via NODE_TEST_FILES and runs them through a new
+    test:electron:node script, surfaced to CI as check:test:electron:node
+    (js-tests.yml auto-discovers any check:* script per workspace, so no
+    workflow edit is required) and added to the aggregate `check` script. On
+    merge: UNION. If upstream rewrites vitest.config.ts, re-apply the exclude or
+    the electron project fails again; if upstream rewrites package.json scripts,
+    re-add both scripts or the 34 assertions silently stop running with NO test
+    failure anywhere -- the dangerous case, because a passing suite then means
+    less than it appears. Keep NODE_TEST_FILES in sync with any file whose
+    header says "Run with: npx tsx --test"; a node:test file left in the glob
+    breaks the electron project, and a vitest file wrongly listed disappears
+    from coverage.
+  removal_condition: >-
+    Remove when upstream either migrates these four files to vitest or adds its
+    own node:test runner script, making the split redundant.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+- id: profile-theme-dark-default-assertion
+  change_class: branding-generic
+  owner: downstream-branding
+  files:
+  - apps/desktop/src/themes/profile-theme.test.ts
+  owned_symbols:
+  - cases
+  tests:
+  - apps/desktop/src/themes/profile-theme.test.ts
+  expected_commit_subject: 'fix(desktop): assert this fork''s dark first-run default'
+  upstream_candidate: false
+  merge_guidance: >-
+    This fork defaults the theme mode to dark on first run (normalizeMode in
+    apps/desktop/src/themes/context.tsx, registered in the workspace surface
+    table); upstream defaults to light. The per-profile table in
+    profile-theme.test.ts therefore asserts fallback 'dark', with 'light' used
+    as the assignable value so the "keeps each profile on its own value" case
+    stays meaningful rather than passing vacuously against an identical
+    fallback. On merge, if upstream edits this table, re-apply BOTH changes
+    together -- flipping fallback back to 'light' fails against our context.ts,
+    and flipping fallback without also moving the assignable value produces a
+    green but vacuous test. Same class as the otto-only test_skin_engine.py
+    default-skin assertions.
+  removal_condition: >-
+    Remove if the dark first-run default is ever reverted to upstream's light,
+    or moved out of context.tsx into brand-scoped configuration.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
