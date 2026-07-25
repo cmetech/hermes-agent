@@ -457,6 +457,11 @@ upstream_changes:
   - tests/hermes_cli/test_kanban_db.py
   - tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py
   - tests/hermes_cli/test_kanban_dispatch_lock.py
+  # Added after the fact: these carry the stale-run and reclaim-event
+  # assertions for this contract. Their absence here is why the contract
+  # change drifted away from its callers unnoticed for a release cycle.
+  - tests/hermes_cli/test_kanban_core_functionality.py
+  - tests/hermes_cli/test_kanban_stale_run_callers.py
   expected_commit_subject: 'feat(kanban): add mutation preconditions'
   upstream_candidate: true
   merge_guidance: Preserve same-transaction optional compare-and-set checks,
@@ -466,6 +471,57 @@ upstream_changes:
   removal_condition: Remove when Hermes upstream provides equivalent generic
     task mutation preconditions and stale-worker-safe reclaim behavior.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: kanban-mutation-conflict-callers
+  change_class: kanban-persistence-generic
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/kanban.py
+  - tools/kanban_tools.py
+  - tests/hermes_cli/test_kanban_stale_run_callers.py
+  owned_symbols:
+  - _report_stale_run
+  - _stale_run_error
+  tests:
+  - tests/hermes_cli/test_kanban_stale_run_callers.py
+  - tests/hermes_cli/test_kanban_core_functionality.py
+  expected_commit_subject: "fix(kanban): handle a superseded run at every expected_run_id caller"
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. This is the CALLER half of kanban-mutation-preconditions
+    and must not be separated from it: that entry changed a stale
+    expected_run_id from "returns falsy" to "raises TaskMutationConflict",
+    which silently made every caller's `if not <mutation>:` branch unreachable
+    for the stale case. Only the dashboard was updated at the time; the four
+    CLI sites in hermes_cli/kanban.py (_cmd_heartbeat, _cmd_complete,
+    _cmd_block, _cmd_schedule) printed a raw Python traceback and the three
+    agent-tool sites in tools/kanban_tools.py fell through to their outer
+    `except Exception`, losing the curated message and emitting an
+    ERROR-level stack trace for a routine outcome.
+
+    Two properties a merge must preserve. FIRST, the stale message stays
+    DISTINCT from the pre-existing "unknown id or terminal state" wording --
+    telling those apart is the entire reason the exception exists (there the
+    task is unusable; here the task is fine and this worker merely stopped
+    owning it, which is recoverable by re-reading). SECOND, the agent-tool
+    catch stays in the SPECIFIC handler, ahead of the catch-all, or the
+    logger.exception noise returns.
+
+    Note the deliberate asymmetry: heartbeat_worker does NOT raise. It is the
+    only expected_run_id mutation that skips
+    _with_expected_run/_check_mutation_precondition, resolving staleness with a
+    conditional UPDATE and returning False, so its `if not ok` branch is still
+    live. Its two TaskMutationConflict guards are therefore defensive and
+    currently unreachable -- do not delete them as dead code; they are what
+    stops a later conversion of heartbeat_worker from silently restoring the
+    traceback. test_heartbeat_worker_returns_false_rather_than_raising pins
+    the current behaviour so that conversion cannot happen unnoticed.
+
+    tools/kanban_tools.py:309 (heartbeat_current_worker_from_env) is
+    intentionally untouched -- it already degrades correctly to logger.debug.
+  removal_condition: >-
+    Remove together with kanban-mutation-preconditions, or when upstream
+    provides an equivalent conflict type whose callers it maintains itself.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
 - id: kanban-desktop-rest
   change_class: kanban-rest-adapter
   owner: workflow-orchestration
@@ -479,6 +535,9 @@ upstream_changes:
   - _mutation_precondition
   tests:
   - tests/plugins/test_kanban_dashboard_plugin.py
+  # update_task/bulk_update replaced the private _set_status_direct; the
+  # run-closure behaviour that move had to preserve is asserted here.
+  - tests/hermes_cli/test_kanban_core_functionality.py
   expected_commit_subject: 'feat(kanban): harden desktop board api'
   upstream_candidate: true
   merge_guidance: Reconcile bounded board/task/event pagination and optional

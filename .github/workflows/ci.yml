@@ -17,7 +17,23 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    # ``base`` is this fork's development main -- literal ``main`` is
+    # upstream-sync only and never receives feature work. With ``[main]``
+    # alone, no Python or JS test ever ran on any branch we actually develop
+    # on, which is how a broken customization ledger survived a full release
+    # cycle and how the kanban expected_run_id contract drifted away from its
+    # callers unnoticed.
+    #
+    # NOT yet a required check: the first runs are advisory on purpose. Roughly
+    # 15 suite failures are still undiagnosed and may be macOS-only artifacts
+    # of the dev box rather than real -- this run is what classifies them. Add
+    # branch protection once it is green, not before; an always-red check
+    # teaches everyone to ignore it.
+    #
+    # Brand branches (otto, loop24) are deliberately excluded for now: they are
+    # generated overlays of base, so base covers the shared code. Add them if a
+    # brand-restamp regression ever escapes.
+    branches: [main, base]
 
 permissions:
   contents: read
