@@ -1902,6 +1902,17 @@ class TestCaptureAppFilterNoMatch:
         assert backend._active_window_id == 2
         assert backend._last_app == "Chrome"
 
+    # The behaviour under test is Linux-only in PRODUCTION code, not just in
+    # this fixture: cua_backend._pick_default_window only consults the
+    # gnome-shell helper skip-list behind `sys.platform == "linux"`
+    # (cua_backend.py:338, and the skip-list helper itself early-returns off
+    # Linux at :214). Everything here is mocked, so the test happily RUNS on
+    # macOS -- it just asserts a branch that cannot be taken, picking the
+    # helper window (pid 100) instead of Chrome (pid 200).
+    @pytest.mark.skipif(
+        sys.platform != "linux",
+        reason="gnome-shell helper skip is gated on sys.platform == 'linux' in cua_backend",
+    )
     def test_linux_default_capture_skips_gnome_shell_helper(self):
         windows = [
             {"app_name": "", "pid": 100, "window_id": 1,
