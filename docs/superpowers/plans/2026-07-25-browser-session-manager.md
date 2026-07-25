@@ -1808,12 +1808,377 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
+### Task 9: Wire the agent's own tools to the enrolled profile (enterprise pages + forms)
+
+**This is the task that makes the priority use case work.** Tasks 1–8 give
+*scripts and skills* the enrolled browser. This task gives it to **the agent
+answering you in natural language**, so "open this internal page and fill in the
+form" works.
+
+Two problems to close:
+
+1. **Binding.** The agent's browser tools key their session on `task_id`
+   (default `"default"`), but `acquire()` binds under `profile::<name>`. Those
+   keys never match, so the Task 4 trust check never fires for agent tool calls.
+2. **Guard coverage.** Task 4 covered the eval paths. Verified 2026-07-25, that
+   also covers `click`/`type`/`press` for free — `_blocked_private_page_action`
+   (line 3364) delegates to `_current_page_private_url`, which Task 4 makes
+   profile-aware. **Forms therefore work once binding is fixed.** Still
+   uncovered: `browser_navigate`, `browser_snapshot`, `browser_vision`.
+
+**Files:**
+- Modify: `tools/browser_session_registry.py` (default-profile fallback)
+- Modify: `tools/browser_tool.py` — navigate guard (~line 2877), snapshot guard (~line 3084), vision guard (~line 4070 block)
+- Modify: `/Users/coreyellis/code/github.com/cmetech/otto_hermes/.claude/skills/otto-upstream-merge/SKILL.md` (grep counts change)
+- Modify: `cli-config.yaml.example`
+- Test: `tests/tools/test_browser_default_profile.py`
+
+**Interfaces:**
+- Consumes: `session_trusts_url` (Task 4), `get_profile` (Task 1).
+- Produces: `browser_session_registry.default_profile_name() -> str | None`; `session_trusts_url` gains a config fallback for unbound sessions.
+
+**Design note — why the fallback lives in the registry.** Binding at session
+creation would mean another hook inside `_get_session_info` (line ~2079), a
+heavily-churned upstream function. Instead, an **unbound** session falls back to
+`browser.default_profile` from config. All new logic stays in our own module and
+`browser_tool.py` gains no additional hook for binding — only the three guard
+lines. Smaller §6a surface, same result.
+
+Trust remains origin-scoped: setting `default_profile: enrolled` grants access
+**only** to that profile's `trusted_origins`, never to private addresses at
+large.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/tools/test_browser_default_profile.py`:
+
+```python
+"""The agent's own browser tools inherit the configured default profile.
+
+Without this, only scripts calling acquire() get the enrolled browser; the
+agent answering in natural language stays blocked on internal pages.
+"""
+
+import pytest
+
+from tools import browser_profiles, browser_session_registry, browser_tool
+
+INTERNAL = "https://wiki.corp.example/display/TEAM/Onboarding"
+OTHER_INTERNAL = "https://intranet.other.example/secret"
+
+ENROLLED = browser_profiles.BrowserProfile(
+    name="enrolled",
+    kind=browser_profiles.KIND_ENROLLED,
+    trusted_origins=("https://wiki.corp.example",),
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean():
+    browser_session_registry.clear()
+    yield
+    browser_session_registry.clear()
+
+
+@pytest.fixture()
+def _default_enrolled(monkeypatch):
+    monkeypatch.setattr(
+        browser_profiles, "get_profile", lambda n: ENROLLED if n == "enrolled" else None
+    )
+    monkeypatch.setattr(
+        browser_session_registry, "default_profile_name", lambda: "enrolled"
+    )
+
+
+class TestDefaultProfileFallback:
+    def test_unbound_session_uses_default_profile(self, _default_enrolled):
+        """The agent's bare task_id has no binding — config must supply it."""
+        assert browser_session_registry.session_trusts_url("default", INTERNAL)
+
+    def test_default_profile_is_still_origin_scoped(self, _default_enrolled):
+        """Falling back must not grant blanket private-network access."""
+        assert not browser_session_registry.session_trusts_url("default", OTHER_INTERNAL)
+
+    def test_no_default_configured_trusts_nothing(self, monkeypatch):
+        monkeypatch.setattr(browser_session_registry, "default_profile_name", lambda: None)
+        assert not browser_session_registry.session_trusts_url("default", INTERNAL)
+
+    def test_explicit_binding_wins_over_default(self, monkeypatch, _default_enrolled):
+        """An acquired session keeps its own profile, ignoring the default."""
+        monkeypatch.setattr(
+            browser_profiles, "get_profile",
+            lambda n: ENROLLED if n == "enrolled"
+            else browser_profiles.BrowserProfile(name="default"),
+        )
+        browser_session_registry.bind("default", "default")  # ephemeral
+        assert not browser_session_registry.session_trusts_url("default", INTERNAL)
+
+    def test_default_profile_name_reads_config(self, monkeypatch):
+        monkeypatch.setattr(
+            browser_session_registry, "_read_config",
+            lambda: {"browser": {"default_profile": "enrolled"}},
+        )
+        assert browser_session_registry.default_profile_name() == "enrolled"
+
+    def test_default_profile_name_absent_is_none(self, monkeypatch):
+        monkeypatch.setattr(browser_session_registry, "_read_config", lambda: {})
+        assert browser_session_registry.default_profile_name() is None
+
+
+class TestNavigateGuard:
+    """browser_navigate must permit a trusted internal origin."""
+
+    @pytest.fixture(autouse=True)
+    def _patches(self, monkeypatch, _default_enrolled):
+        monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
+        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+        monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: False)
+        monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda url: False)
+        monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(browser_tool, "check_website_access", lambda url: None)
+        monkeypatch.setattr(
+            browser_tool, "_get_session_info",
+            lambda task_id: {"session_name": "s", "bb_session_id": None,
+                             "cdp_url": None, "features": {}, "_first_nav": False},
+        )
+        monkeypatch.setattr(
+            browser_tool, "_run_browser_command",
+            lambda *a, **kw: {"success": True, "data": {"title": "OK", "url": INTERNAL}},
+        )
+
+    def test_trusted_internal_url_is_permitted(self):
+        out = browser_tool.browser_navigate(INTERNAL, task_id="default")
+        assert "private or internal address" not in out
+
+    def test_untrusted_internal_url_is_still_blocked(self):
+        out = browser_tool.browser_navigate(OTHER_INTERNAL, task_id="default")
+        assert "private or internal address" in out
+
+    def test_metadata_floor_still_fires(self, monkeypatch):
+        """The always-blocked cloud-metadata floor outranks profile trust."""
+        monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda url: True)
+        out = browser_tool.browser_navigate(INTERNAL, task_id="default")
+        assert "cloud metadata endpoint" in out
+
+
+class TestSnapshotGuard:
+    def test_trusted_internal_page_snapshot_is_permitted(self, monkeypatch, _default_enrolled):
+        monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
+        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+        monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: False)
+        assert browser_tool._snapshot_blocked_url("default", INTERNAL) is None
+
+    def test_untrusted_internal_page_snapshot_is_blocked(self, monkeypatch, _default_enrolled):
+        monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
+        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+        monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: False)
+        assert browser_tool._snapshot_blocked_url("default", OTHER_INTERNAL) == OTHER_INTERNAL
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `scripts/run_tests.sh tests/tools/test_browser_default_profile.py -v`
+Expected: FAIL — no attribute `default_profile_name`
+
+- [ ] **Step 3a: Add the config fallback to the registry**
+
+In `tools/browser_session_registry.py`, add:
+
+```python
+def _read_config() -> dict:
+    """Read raw config. Separate function so tests can monkeypatch it."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        return read_raw_config() or {}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("browser_session_registry: could not read config: %s", exc)
+        return {}
+
+
+def default_profile_name() -> Optional[str]:
+    """Return ``browser.default_profile``, or None when unset.
+
+    This is what lets the AGENT's own browser tools reach enterprise pages: the
+    agent keys sessions on its bare ``task_id``, which nothing binds explicitly.
+    Rather than hooking session creation inside the heavily-churned
+    ``_get_session_info``, an unbound session falls back to this config value.
+
+    Trust stays origin-scoped — the named profile's ``trusted_origins`` still
+    decide which hosts are reachable.
+    """
+    cfg = _read_config()
+    browser_cfg = cfg.get("browser") if isinstance(cfg, dict) else None
+    if not isinstance(browser_cfg, dict):
+        return None
+    name = str(browser_cfg.get("default_profile", "") or "").strip()
+    return name or None
+```
+
+and change `session_trusts_url` to fall back:
+
+```python
+def session_trusts_url(session_key: str, url: str) -> bool:
+    """Return True when ``session_key``'s profile explicitly trusts ``url``.
+
+    Resolution order: an explicit ``bind()`` wins; otherwise
+    ``browser.default_profile`` applies. An explicitly-bound ephemeral session
+    therefore does NOT silently inherit enrolled trust.
+
+    SECURITY: gates private-network access. Denies on any unexpected input.
+    """
+    name = profile_for(session_key) or default_profile_name()
+    if not name:
+        return False
+    try:
+        from tools.browser_profiles import get_profile, is_origin_trusted
+
+        return is_origin_trusted(get_profile(name), url)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("session_trusts_url: denying after error: %s", exc)
+        return False
+```
+
+- [ ] **Step 3b: Thread trust into the navigate guard**
+
+In `tools/browser_tool.py`, the private-address block (~line 2877). The
+always-blocked metadata floor immediately above it stays **untouched and
+unconditional**:
+
+```python
+    if (
+        not _is_local_backend()
+        and not auto_local_this_nav
+        and not _allow_private_urls()
+        and not _is_safe_url(url)
+        # OTTO: an enrolled profile may reach the internal origins it lists.
+        and not _session_trusts_url(nav_session_key, url)
+    ):
+```
+
+- [ ] **Step 3c: Extract and reuse a snapshot/vision guard helper**
+
+`browser_snapshot` and `browser_vision` each inline the same probe-and-compare
+block. Add one shared helper next to `_session_trusts_url` so the trust check
+exists in a single place rather than being duplicated twice:
+
+```python
+def _snapshot_blocked_url(effective_task_id: str, current_url: str) -> Optional[str]:
+    """Return ``current_url`` when a snapshot/screenshot of it must be withheld.
+
+    Shared by browser_snapshot and browser_vision. OTTO: a URL whose origin the
+    session's browser profile trusts is NOT withheld — that is the whole point
+    of the enrolled profile (reading internal pages). The always-blocked
+    cloud-metadata floor is checked first and is never trusted.
+    """
+    if not current_url:
+        return None
+    if _is_always_blocked_url(current_url):
+        return current_url
+    if not _is_safe_url(current_url) and not _session_trusts_url(
+        effective_task_id, current_url
+    ):
+        return current_url
+    return None
+```
+
+Then in **both** guards replace the inline comparison. In `browser_snapshot`
+(~line 3084) change:
+
+```python
+                    if _current_url and not _is_safe_url(_current_url):
+```
+
+to:
+
+```python
+                    if _snapshot_blocked_url(effective_task_id, _current_url):
+```
+
+Apply the identical replacement in `browser_vision`'s block (~line 4070). Read
+each block first — the local variable names differ between the two.
+
+- [ ] **Step 4: Run tests to verify they pass, and that nothing regressed**
+
+```bash
+scripts/run_tests.sh tests/tools/test_browser_default_profile.py -v
+scripts/run_tests.sh tests/tools/test_browser_profile_trust_seam.py \
+                     tests/tools/test_browser_console_ssrf.py \
+                     tests/tools/test_browser_ssrf_local.py \
+                     tests/tools/test_browser_snapshot_ssrf.py \
+                     tests/tools/test_browser_get_images_ssrf.py \
+                     tests/tools/test_browser_private_page_action_guard.py \
+                     tests/tools/test_browser_hybrid_routing.py \
+                     tests/tools/test_browser_camofox_private_page_guard.py -v
+```
+Expected: PASS. The existing suite must stay green **unedited** — with no
+`browser.default_profile` configured, `default_profile_name()` returns None and
+every guard behaves exactly as upstream.
+
+- [ ] **Step 5: Confirm form controls are actually reachable**
+
+The click/type/press path is covered transitively via
+`_blocked_private_page_action` → `_current_page_private_url`. Prove it rather
+than assuming:
+
+```bash
+scripts/run_tests.sh tests/tools/test_browser_private_page_action_guard.py -v
+git grep -n '_current_page_private_url' -- tools/browser_tool.py
+```
+Expected: the action-guard suite passes, and `_blocked_private_page_action` is
+visibly among the callers of the now-profile-aware `_current_page_private_url`.
+
+- [ ] **Step 6: Document the config and update the §6a greps**
+
+Add to `cli-config.yaml.example` under `browser:`:
+
+```yaml
+  # Profile the agent's own browser tools use when nothing else is bound.
+  # Set this to reach enterprise/intranet pages and forms by natural language.
+  # Grants access ONLY to the named profile's trusted_origins.
+  # default_profile: enrolled
+```
+
+Update the grep in `.claude/skills/otto-upstream-merge/SKILL.md` — the count
+rises now that the seam covers navigate, snapshot, and vision:
+
+```bash
+git grep -c '_session_trusts_url' -- tools/browser_tool.py                       # >=6 — helper + eval x2 + navigate + _snapshot_blocked_url (shared by snapshot & vision)
+git grep -c '_snapshot_blocked_url' -- tools/browser_tool.py                     # >=3 — helper def + snapshot guard + vision guard
+git grep -c 'default_profile_name' -- tools/browser_session_registry.py          # >=2 — def + session_trusts_url fallback
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add tools/browser_session_registry.py tools/browser_tool.py \
+        cli-config.yaml.example tests/tools/test_browser_default_profile.py
+git commit -m "feat(browser): let the agent's own tools use the enrolled profile
+
+Tasks 1-8 gave scripts and skills the enrolled browser; the agent answering in
+natural language stayed blocked, because it keys sessions on a bare task_id
+that nothing binds. Unbound sessions now fall back to browser.default_profile,
+so 'open this internal page and fill the form' works.
+
+Extends the trust seam to navigate, snapshot, and vision. click/type/press were
+already covered transitively via _blocked_private_page_action ->
+_current_page_private_url. Trust stays origin-scoped and the always-blocked
+cloud-metadata floor outranks it everywhere.
+
+Fallback lives in our own registry module so no hook is added to the
+heavily-churned _get_session_info.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
 ## Deferred / out of scope
 
 These are recorded so they are not silently lost.
 
 - **Desktop half.** Decided 2026-07-25: extend upstream `computer_use`, do not fork. `docs/2026-07-23-hermes-computer-use-reliability-planning-prompt.md` is superseded. If a downstream layer is wanted later (natural-language skill guidance, brand curation), that is a separate small plan — no `cua_desktop` tool, no hiding upstream `computer_use`.
-- **`/browser --profile enrolled` chat-command flag** (spec §8 q4). Deliberately excluded: the command surface lives in the shared upstream file and would widen the §6a footprint. Config-default plus the importable `acquire()` covers the use cases in this plan.
+- **`/browser --profile enrolled` chat-command flag** (spec §8 q4). Still excluded — but Task 9 makes it unnecessary for the priority use case: `browser.default_profile` gives the agent enrolled access by config, so a per-call flag is only needed to switch profiles mid-conversation. Revisit if that need appears.
 - **Flipping the confluence default to `session-manager`** (spec §7 stage 3). Requires real-environment proof first.
 - **Retiring the skill's private Edge launcher** (spec §7 stage 3). Not before `/browser` is trusted for internal *and* external.
 - **Ephemeral-profile eval tightening.** Spec §5 assumed the denylist was on by default; v0.19.0 made it opt-in (`browser.restrict_evaluate`). Whether to tighten the ephemeral default is now a separate product decision, not part of this plan.
@@ -1825,6 +2190,7 @@ These are recorded so they are not silently lost.
 - `acquire("enrolled")` launches the enrolled browser, persists the profile, and a same-origin fetch to a `trusted_origins` host returns 200 in the real corporate environment.
 - Eval `fetch` to a NON-trusted origin under `enrolled` is DENIED.
 - Eval `fetch` under `default`/ephemeral is DENIED.
-- The always-blocked cloud-metadata floor is denied even for a trusted enrolled session.
+- The always-blocked cloud-metadata floor is denied even for a trusted enrolled session — at every guard site (navigate, eval, snapshot, vision, page actions).
+- **Enterprise priority:** with `browser.default_profile: enrolled`, a natural-language request navigates to a listed internal origin, snapshots it, and completes a form (`browser_type` + `browser_click`) without hitting a guard.
 - Confluence `SessionManagerBackend` produces byte-identical Markdown to the Playwright backend for the same page.
 - `generate <brand> --check` 8/8 on otto and loop24; `cmp CLAUDE.md AGENTS.md` clean; the three §6a greps all return their expected counts.
