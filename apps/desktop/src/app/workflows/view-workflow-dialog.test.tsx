@@ -29,7 +29,12 @@ vi.mock('@/components/assistant-ui/embeds/mermaid-embed', () => ({
   }
 }))
 
-vi.mock('@/store/profile', () => ({
+// Spread the REAL module and override only the side-effecting actions. An
+// exhaustive hand-written mock breaks at collection time whenever upstream adds
+// an export the code under test imports (v0.19.0 added normalizeProfileKey and
+// $activeGatewayProfile, which is what broke this suite); spreading self-heals.
+vi.mock('@/store/profile', async importOriginal => ({
+  ...(await importOriginal<typeof import('@/store/profile')>()),
   $newChatProfile: { set: vi.fn() },
   cycleProfile: vi.fn(),
   ensureGatewayProfile: profileRouting.ensureGatewayProfile,
