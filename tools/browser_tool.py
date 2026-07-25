@@ -2879,6 +2879,10 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         and not auto_local_this_nav
         and not _allow_private_urls()
         and not _is_safe_url(url)
+        # OTTO: an enrolled profile may reach the internal origins it lists.
+        # The always-blocked metadata floor above is unconditional and outranks
+        # this, so a trusted profile can never reach IMDS.
+        and not _session_trusts_url(nav_session_key, url)
     ):
         return json.dumps({
             "success": False,
@@ -3081,7 +3085,7 @@ def browser_snapshot(
                         _url_result.get("data", {}).get("result", "")
                         .strip().strip('"').strip("'")
                     )
-                    if _current_url and not _is_safe_url(_current_url):
+                    if _snapshot_blocked_url(effective_task_id, _current_url):
                         return json.dumps({
                             "success": False,
                             "error": (
@@ -3478,19 +3482,73 @@ def _eval_ssrf_guard_active(effective_task_id: str) -> bool:
 _JS_URL_LITERAL_RE = re.compile(r"""https?://[^\s'"`)\]<>]+""", re.IGNORECASE)
 
 
-def _expression_targets_private_url(expression: str) -> Optional[str]:
+def _session_trusts_url(session_key: Optional[str], url: str) -> bool:
+    """OTTO: return True when this session's browser profile trusts ``url``.
+
+    Origin-scoped escape hatch for the private-network guards. An ``enrolled``
+    profile (a corporate browser holding a live SSO/mTLS session, attached over
+    CDP) must be able to reach the internal origins it explicitly lists — but
+    ``_is_local_backend()`` returns False for any CDP override, so without this
+    the guards block the entire enrolled use case.
+
+    Mirrors upstream's per-session ``_is_local_sidecar_key`` exemption, but
+    scoped to (session, origin) rather than the whole session. Fails CLOSED.
+
+    See docs/plans/2026-07-20-persistent-enrolled-browser-session-design.md §0.
+    """
+    if not session_key:
+        return False
+    try:
+        from tools.browser_session_registry import session_trusts_url as _trusts
+
+        return _trusts(session_key, url)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _snapshot_blocked_url(effective_task_id: str, current_url: str) -> Optional[str]:
+    """Return ``current_url`` when a snapshot/screenshot of it must be withheld.
+
+    Shared by browser_snapshot and browser_vision (both previously inlined the
+    same comparison). OTTO: a URL whose origin the session's browser profile
+    trusts is NOT withheld — reading internal pages is the entire point of the
+    enrolled profile. The always-blocked cloud-metadata floor is checked first
+    and is never trusted.
+    """
+    if not current_url:
+        return None
+    if _is_always_blocked_url(current_url):
+        return current_url
+    if not _is_safe_url(current_url) and not _session_trusts_url(
+        effective_task_id, current_url
+    ):
+        return current_url
+    return None
+
+
+def _expression_targets_private_url(
+    expression: str, session_key: Optional[str] = None
+) -> Optional[str]:
     """Return the first private/always-blocked URL literal in a JS expression.
 
     Best-effort: scans for ``http(s)://...`` literals (fetch/XHR/navigation
     targets the agent may have embedded) and returns the first one that targets
     a private/internal address or the always-blocked cloud-metadata floor.
     Returns ``None`` when no such literal is found.
+
+    ``session_key`` is OTTO's origin-scoped trust hook: a literal whose origin
+    the session's browser profile explicitly trusts is not reported. The
+    always-blocked cloud-metadata floor is checked FIRST and is never trusted.
     """
     if not isinstance(expression, str):
         return None
     for match in _JS_URL_LITERAL_RE.findall(expression):
         candidate = match.rstrip(".,;")
-        if _is_always_blocked_url(candidate) or not _is_safe_url(candidate):
+        if _is_always_blocked_url(candidate):
+            return candidate
+        if not _is_safe_url(candidate):
+            if _session_trusts_url(session_key, candidate):
+                continue
             return candidate
     return None
 
@@ -3514,8 +3572,15 @@ def _current_page_private_url(effective_task_id: str) -> Optional[str]:
                 url_result.get("data", {}).get("result", "")
                 .strip().strip('"').strip("'")
             )
-            if current_url and (
-                _is_always_blocked_url(current_url) or not _is_safe_url(current_url)
+            if current_url and _is_always_blocked_url(current_url):
+                return current_url
+            # OTTO: an enrolled profile may read the internal origins it lists.
+            # This also covers click/type/press via _blocked_private_page_action,
+            # which is what makes enterprise forms usable.
+            if (
+                current_url
+                and not _is_safe_url(current_url)
+                and not _session_trusts_url(effective_task_id, current_url)
             ):
                 return current_url
     except Exception as exc:
@@ -3681,7 +3746,9 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     effective_task_id = _last_session_key(task_id or "default")
 
     if _eval_ssrf_guard_active(effective_task_id):
-        blocked_literal = _expression_targets_private_url(expression)
+        blocked_literal = _expression_targets_private_url(
+            expression, session_key=effective_task_id
+        )
         if blocked_literal:
             return json.dumps({
                 "success": False,
@@ -4080,7 +4147,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                     _url_result.get("data", {}).get("result", "")
                     .strip().strip('"').strip("'")
                 )
-                if _current_url and not _is_safe_url(_current_url):
+                if _snapshot_blocked_url(effective_task_id, _current_url):
                     return json.dumps({
                         "success": False,
                         "error": (
