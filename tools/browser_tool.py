@@ -2879,6 +2879,10 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         and not auto_local_this_nav
         and not _allow_private_urls()
         and not _is_safe_url(url)
+        # OTTO: an enrolled profile may reach the internal origins it lists.
+        # The always-blocked metadata floor above is unconditional and outranks
+        # this, so a trusted profile can never reach IMDS.
+        and not _session_trusts_url(nav_session_key, url)
     ):
         return json.dumps({
             "success": False,
@@ -3081,7 +3085,7 @@ def browser_snapshot(
                         _url_result.get("data", {}).get("result", "")
                         .strip().strip('"').strip("'")
                     )
-                    if _current_url and not _is_safe_url(_current_url):
+                    if _snapshot_blocked_url(effective_task_id, _current_url):
                         return json.dumps({
                             "success": False,
                             "error": (
@@ -3500,6 +3504,26 @@ def _session_trusts_url(session_key: Optional[str], url: str) -> bool:
         return _trusts(session_key, url)
     except Exception:  # noqa: BLE001
         return False
+
+
+def _snapshot_blocked_url(effective_task_id: str, current_url: str) -> Optional[str]:
+    """Return ``current_url`` when a snapshot/screenshot of it must be withheld.
+
+    Shared by browser_snapshot and browser_vision (both previously inlined the
+    same comparison). OTTO: a URL whose origin the session's browser profile
+    trusts is NOT withheld — reading internal pages is the entire point of the
+    enrolled profile. The always-blocked cloud-metadata floor is checked first
+    and is never trusted.
+    """
+    if not current_url:
+        return None
+    if _is_always_blocked_url(current_url):
+        return current_url
+    if not _is_safe_url(current_url) and not _session_trusts_url(
+        effective_task_id, current_url
+    ):
+        return current_url
+    return None
 
 
 def _expression_targets_private_url(
@@ -4123,7 +4147,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                     _url_result.get("data", {}).get("result", "")
                     .strip().strip('"').strip("'")
                 )
-                if _current_url and not _is_safe_url(_current_url):
+                if _snapshot_blocked_url(effective_task_id, _current_url):
                     return json.dumps({
                         "success": False,
                         "error": (

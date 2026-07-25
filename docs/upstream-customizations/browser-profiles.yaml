@@ -31,20 +31,31 @@ upstream_changes:
   - tools/browser_tool.py
   - tools/browser_profiles.py
   - tools/browser_session_registry.py
+  - tools/browser_session_manager.py
+  - cli-config.yaml.example
   - tests/tools/test_browser_profiles.py
   - tests/tools/test_browser_profile_trust_seam.py
+  - tests/tools/test_browser_session_manager.py
+  - tests/tools/test_browser_session_signin.py
+  - tests/tools/test_browser_default_profile.py
   owned_symbols:
   - _session_trusts_url
+  - _snapshot_blocked_url
   - _expression_targets_private_url
   - _current_page_private_url
   tests:
   - tests/tools/test_browser_profiles.py
   - tests/tools/test_browser_profile_trust_seam.py
+  - tests/tools/test_browser_session_manager.py
+  - tests/tools/test_browser_session_signin.py
+  - tests/tools/test_browser_default_profile.py
   - tests/tools/test_browser_console_ssrf.py
   - tests/tools/test_browser_ssrf_local.py
   - tests/tools/test_browser_snapshot_ssrf.py
+  - tests/tools/test_browser_get_images_ssrf.py
   - tests/tools/test_browser_private_page_action_guard.py
   - tests/tools/test_browser_hybrid_routing.py
+  - tests/tools/test_browser_camofox_private_page_guard.py
   expected_commit_subject: 'feat(browser): origin-scoped SSRF trust seam for browser profiles'
   upstream_candidate: true
   merge_guidance: >-
@@ -62,6 +73,16 @@ upstream_changes:
     SSRF suite must stay green unedited; if it needs editing, the merge dropped
     or altered the seam. Mutable session state deliberately lives in
     tools/browser_session_registry.py to keep the shared-file footprint minimal.
+    Guard sites covered: eval pre-scan and post-eval page recheck
+    (_expression_targets_private_url / _current_page_private_url), browser_navigate's
+    private-address block, and browser_snapshot + browser_vision via the shared
+    _snapshot_blocked_url helper -- if upstream re-inlines either snapshot or
+    vision comparison back to `not _is_safe_url(_current_url)`, the enrolled
+    profile silently loses the ability to READ internal pages while still being
+    able to navigate to them, which looks like a flaky page rather than a
+    regression. browser.default_profile (browser_session_registry.default_profile_name)
+    is what lets the AGENT's bare task_id inherit the profile; without it only
+    scripted acquire() callers get enrolled access.
   removal_condition: >-
     Remove when upstream provides a first-class per-profile or per-origin trust
     model for private-network browser access (for example an allowlist attached
