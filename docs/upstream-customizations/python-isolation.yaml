@@ -1,0 +1,153 @@
+schema_version: 1
+feature: python-isolation
+# Deliver our own Python and ignore the machine's, for install AND runtime.
+#
+# A first install on a corporate Windows laptop died at the `dependencies`
+# stage with `AssertionError: SRE module mismatch` from sre_compile.py. The venv
+# was correctly created from C:\Python311\python.exe; uv's isolated build
+# backend then loaded the stdlib from C:\Python\Python310\lib. PYTHONHOME set at
+# Machine scope overrides an interpreter's own stdlib location, so it poisons
+# every Python subprocess -- and grandchildren such as a build backend --
+# regardless of which interpreter was launched.
+#
+# Two independent defects, both of which had to be fixed:
+#   (A) the installers preferred a DISCOVERED interpreter (`uv python find`
+#       matches PATH), so they adopted the machine's Python in the first place;
+#   (B) the inherited Python environment was never scrubbed, so even a correct
+#       interpreter was poisoned.
+# (A) alone is insufficient: a managed 3.11 under PYTHONHOME=...Python310 fails
+# identically.
+#
+# The user's shell is NOT a fix surface. The Electron app spawns the install and
+# inherits Machine/User-scope environment directly, which is why clearing these
+# in a PowerShell session did not help and the fix must live in the installer
+# and the app's spawn environment.
+#
+# Why this manifest exists: the workspace-level surface table and the
+# otto-upstream-merge grep list live OUTSIDE any git repository, so they do not
+# travel with the branch and are invisible to a merge performed from another
+# checkout. This ledger is in-repo, versioned, and machine-checkable via
+# scripts/check_upstream_customizations.py.
+upstream_changes:
+- id: desktop-backend-python-env-isolation
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - apps/desktop/electron/backend-env.ts
+  - apps/desktop/electron/main.ts
+  - apps/desktop/electron/windows-hermes-path.ts
+  - apps/desktop/electron/backend-env.test.ts
+  owned_symbols:
+  - INHERITED_PYTHON_ENV_VARS
+  - scrubInheritedPythonEnv
+  - SCRUBBED_PYTHON_ENV_VARS
+  - buildDesktopBackendEnv
+  tests:
+  - apps/desktop/electron/backend-env.test.ts
+  expected_commit_subject: 'fix(desktop): stop propagating inherited Python env into the backend'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge, never --theirs. Two cooperating pieces, and losing either
+    one silently restores the bug:
+
+    (1) main.ts calls scrubInheritedPythonEnv(process.env) immediately after
+    HERMES_HOME is resolved, before anything can spawn. That single call is what
+    makes the guarantee structural rather than per-site: nearly every child
+    process in main.ts is built as `{ ...process.env, ... }`, so ~15 spawn sites
+    -- and any added later -- are covered by construction. If upstream moves or
+    rewrites the module preamble, the call must stay ABOVE the first spawn. It
+    is deliberately not logged at that point: rememberLog's backing array
+    (hermesLog) is declared further down the module, so calling it there hits
+    the temporal dead zone; the log line lives in app.whenReady() and reads from
+    SCRUBBED_PYTHON_ENV_VARS.
+
+    (2) buildDesktopBackendEnv no longer appends currentEnv.PYTHONPATH. Upstream
+    built PYTHONPATH as [...pythonPathEntries, currentEnv.PYTHONPATH]; that
+    append is precisely how a corporate PYTHONPATH reached the backend at
+    runtime. It also emits each INHERITED_PYTHON_ENV_VARS key as `undefined`
+    (node's spawn skips undefined values rather than exporting them empty) plus
+    PYTHONNOUSERSITE=1, which covers callers that build a spawn env from
+    something other than the already-scrubbed process.env.
+
+    The two canImportHermesCli probes (isActiveRuntimeUsable in main.ts and the
+    venv-Hermes resolver in windows-hermes-path.ts) must likewise pass OUR
+    checkout only. Restoring `process.env.PYTHONPATH` there lets a foreign
+    hermes_cli satisfy the probe, so a broken venv is reported healthy and the
+    bootstrap that would have repaired it is skipped -- a failure that looks
+    like a flaky backend rather than an env-var regression.
+
+    Reverting any of this produces NO build error and NO test failure other than
+    backend-env.test.ts, which is why that test asserts the dropped inherited
+    PYTHONPATH explicitly rather than only the entries we add.
+  removal_condition: >-
+    Remove when Electron (or the backend launcher) gains a first-class way to
+    spawn a child with a curated environment instead of inheriting the parent's,
+    making an explicit scrub of process.env unnecessary.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+- id: installer-managed-python-and-env-scrub
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - scripts/install.ps1
+  - scripts/install.sh
+  - hermes_cli/config.py
+  - hermes_cli/main.py
+  - tests/test_install_python_isolation.py
+  - tests/hermes_cli/test_uv_subprocess_env.py
+  owned_symbols:
+  - Get-ManagedPythonPath
+  - find_managed_python
+  - INHERITED_PYTHON_ENV_VARS
+  - _uv_subprocess_env
+  - _hermes_scrub_python_var
+  tests:
+  - tests/test_install_python_isolation.py
+  - tests/hermes_cli/test_uv_subprocess_env.py
+  expected_commit_subject: 'fix(install): use the Python we deliver, not the machine''s'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. The load-bearing detail is that `uv python find <version>`
+    ALSO matches interpreters discovered on PATH or in the registry. Both
+    installers therefore resolve through a --managed-python wrapper
+    (Get-ManagedPythonPath in install.ps1, find_managed_python in install.sh)
+    and create the venv from that RESOLVED ABSOLUTE PATH. If a merge restores
+    `uv venv venv --python $PythonVersion` / `--python "$PYTHON_VERSION"`, uv is
+    free to match a system interpreter again and the fix is gone with no test
+    failure on the shell side.
+
+    Both resolvers deliberately return empty rather than falling through to an
+    unrestricted find, so a caller can never be handed a system interpreter
+    believing it is managed. Both installers re-resolve rather than trusting an
+    exported value, because each `-Stage NAME` / `--stage NAME` runs in a fresh
+    process -- the same constraint that produced Resolve-AvailablePythonVersion.
+
+    Test-Python no longer short-circuits on `uv python find` before installing;
+    that short-circuit WAS the defect, and it printed a reassuring
+    "Python found: Python 3.11.0" while adopting the wrong interpreter. Keep the
+    discovered-interpreter tier at the END as an explicitly warned fallback (a
+    blocked python-build-standalone download must not brick an install), and
+    keep its candidate list leading with $PythonVersion -- it is now the only
+    tier that finds a system 3.11.
+
+    The top-of-file scrub blocks must run for the WHOLE install, not per
+    command: the failure occurred in a GRANDCHILD process (uv -> build backend)
+    which inherits whatever is left set. They also clear UV_PYTHON_PREFERENCE
+    and UV_NO_MANAGED_PYTHON, because `only-system` in the environment both
+    re-forces the machine's interpreter and makes --managed-python a hard
+    argument conflict in uv.
+
+    install.ps1 must stay pure ASCII (test_install_ps1_ascii_only.py) -- the
+    scrub block's warning uses no box-drawing or dash characters for that
+    reason. install.sh's Termux branch is deliberately untouched: Termux has no
+    uv-managed Python option and must keep using pkg Python.
+
+    hermes_cli/main.py's _uv_subprocess_env replaces four copies of a scrub that
+    was gated on _is_termux_env. The hazard is not Termux-specific; Termux was
+    just where it was hit first. It reads config.INHERITED_PYTHON_ENV_VARS,
+    which is also spliced into _ENV_VAR_NAME_DENYLIST so the write-gate and the
+    spawn-scrub cannot drift apart.
+  removal_condition: >-
+    Remove when uv defaults to managed-only interpreter selection (making the
+    --managed-python wrappers redundant) AND the desktop no longer spawns
+    installs from a process that inherits machine-scope environment.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6

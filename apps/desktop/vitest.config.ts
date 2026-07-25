@@ -16,11 +16,25 @@ const reactUi: TestProjectConfiguration = {
   }
 }
 
+// Files under electron/ that use the node:test runner (`import test from
+// 'node:test'`) rather than vitest. Vitest's glob collects them but cannot
+// execute them, so each reported "No test suite found" and failed the electron
+// project — while their assertions never ran at all. They are run instead by
+// the `check:test:electron-node` script (tsx --test). Keep this list in sync
+// with any file whose header says "Run with: npx tsx --test".
+const NODE_TEST_FILES = [
+  'electron/brand-scope.test.ts',
+  'electron/release-update.test.ts',
+  'electron/structured-api-channel.test.ts',
+  'electron/structured-api-response.test.ts'
+]
+
 const electronNative: TestProjectConfiguration = {
   test: {
     name: 'electron',
     environment: 'node',
-    include: ['electron/**/*.test.ts', 'scripts/**.test.{ts,mjs}']
+    include: ['electron/**/*.test.ts', 'scripts/**.test.{ts,mjs}'],
+    exclude: ['**/node_modules/**', '**/dist/**', ...NODE_TEST_FILES]
   }
 }
 

@@ -672,7 +672,7 @@ _apply_profile_override()
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
-from hermes_cli.config import get_hermes_home
+from hermes_cli.config import INHERITED_PYTHON_ENV_VARS, get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
 load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
@@ -7042,10 +7042,7 @@ def _update_via_zip(args):
     if not uv_bin:
         uv_bin = _ensure_uv_for_termux(pip_cmd)
     if uv_bin:
-        uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
-        if _is_termux_env(uv_env):
-            uv_env.pop("PYTHONPATH", None)
-            uv_env.pop("PYTHONHOME", None)
+        uv_env = _uv_subprocess_env()
         _install_python_dependencies_with_optional_fallback([uv_bin, "pip"], env=uv_env)
     else:
         # Use sys.executable to explicitly call the venv's pip module,
@@ -7996,10 +7993,7 @@ def _recover_core_update_marker_locked() -> None:
 
         uv_bin = ensure_uv()
         if uv_bin:
-            uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
-            if _is_termux_env(uv_env):
-                uv_env.pop("PYTHONPATH", None)
-                uv_env.pop("PYTHONHOME", None)
+            uv_env = _uv_subprocess_env()
             _install_python_dependencies_with_optional_fallback(
                 [uv_bin, "pip"],
                 env=uv_env,
@@ -8079,11 +8073,7 @@ def _default_venv_install_target() -> tuple[list[str], dict[str, str] | None]:
     except Exception:
         uv_bin = None
     if uv_bin:
-        env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
-        if _is_termux_env(env):
-            env.pop("PYTHONPATH", None)
-            env.pop("PYTHONHOME", None)
-        return [uv_bin, "pip"], env
+        return [uv_bin, "pip"], _uv_subprocess_env()
     return [sys.executable, "-m", "pip"], None
 
 
@@ -9206,6 +9196,31 @@ def _resolve_install_target_python(
 
 def _is_termux_env(env: dict[str, str] | None = None) -> bool:
     return _is_termux_startup_environment(env)
+
+
+def _uv_subprocess_env() -> dict[str, str]:
+    """Environment for invoking uv against our venv, with inherited Python
+    redirection stripped.
+
+    The scrub used to be gated on Termux, but the hazard is not Termux-specific:
+    a managed corporate Windows baseline that sets ``PYTHONHOME`` at Machine
+    scope kills the dependency install with ``AssertionError: SRE module
+    mismatch``, because ``PYTHONHOME`` overrides an interpreter's own stdlib
+    location and uv's isolated build backend inherits it. Termux was simply
+    where we hit it first.
+
+    ``PYTHONNOUSERSITE`` is set rather than cleared: uv only ever needs the venv
+    we point it at, and a stale user-site build is another way to get a
+    mismatched module.
+    """
+    env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+
+    for name in INHERITED_PYTHON_ENV_VARS:
+        env.pop(name, None)
+
+    env["PYTHONNOUSERSITE"] = "1"
+
+    return env
 
 
 def _is_android_python() -> bool:
@@ -11304,10 +11319,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
         install_group = "all"
 
         if uv_bin:
-            uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+            uv_env = _uv_subprocess_env()
             if _is_termux_env(uv_env):
-                uv_env.pop("PYTHONPATH", None)
-                uv_env.pop("PYTHONHOME", None)
                 install_group = "termux-all"
                 print("  → Termux detected: using uv + curated termux-all optional profile...")
             if _is_termux_env(uv_env) and _is_android_python():

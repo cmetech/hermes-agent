@@ -33,7 +33,7 @@ import nodePty from 'node-pty'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
+import { buildDesktopBackendEnv, normalizeHermesHomeRoot, scrubInheritedPythonEnv } from './backend-env'
 import { canImportHermesCli, shouldTrustHermesOverride, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure } from './backend-start-failure'
@@ -533,6 +533,22 @@ function resolveHermesHome() {
 }
 
 const HERMES_HOME = resolveHermesHome()
+
+// Own the Python environment before anything can be spawned.
+//
+// Nearly every child process here is built as `{ ...process.env, ... }`, so
+// scrubbing process.env ONCE is what makes the guarantee structural: a spawn
+// site added later inherits the fix instead of having to remember it. This is
+// the runtime half of "use the Python we deliver, never the user's" -- the
+// installers own the other half. See INHERITED_PYTHON_ENV_VARS in backend-env
+// for why an inherited PYTHONHOME is fatal rather than merely untidy, and note
+// that a user clearing these in their shell CANNOT fix it: the app inherits
+// Machine/User-scope environment directly.
+//
+// Logged from app.whenReady() rather than here -- rememberLog's backing array
+// is declared further down this module, so calling it at this point would hit
+// the temporal dead zone.
+const SCRUBBED_PYTHON_ENV_VARS = scrubInheritedPythonEnv(process.env)
 
 function hermesManagedNodePathEntries() {
   // NOTE: keep this ordering in sync with iter_hermes_node_dirs() in
@@ -3454,8 +3470,11 @@ function isActiveRuntimeUsable() {
     isHermesSourceRoot(ACTIVE_HERMES_ROOT) &&
     fileExists(venvPython) &&
     canImportHermesCli(venvPython, {
+      // Our checkout only -- never the inherited PYTHONPATH. Probing with the
+      // user's PYTHONPATH on would let a foreign hermes_cli satisfy this check
+      // and mark a broken venv usable.
       env: {
-        PYTHONPATH: [ACTIVE_HERMES_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter)
+        PYTHONPATH: ACTIVE_HERMES_ROOT
       }
     })
   )
@@ -11021,6 +11040,16 @@ app.on('open-url', (event, url) => {
 })
 
 app.whenReady().then(() => {
+  if (SCRUBBED_PYTHON_ENV_VARS.length) {
+    // Self-diagnosing: without this line a later interpreter/stdlib mismatch
+    // surfaces as a bare "SRE module mismatch" with nothing pointing at the
+    // machine-scope environment that caused it.
+    rememberLog(
+      `[python] ignoring inherited ${SCRUBBED_PYTHON_ENV_VARS.join(', ')} for this session; ` +
+        'the backend uses the interpreter and modules Hermes installed'
+    )
+  }
+
   const systemCa = installWindowsSystemCaTrust(tls)
 
   if (systemCa.applied) {

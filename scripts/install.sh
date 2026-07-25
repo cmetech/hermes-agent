@@ -16,16 +16,51 @@
 set -e
 
 # Guard against environment leakage when the installer is launched from another
-# Python-driven tool session (e.g. Hermes terminal tool). A pre-set PYTHONPATH
-# can force pip/entrypoints to import a different checkout than the one being
-# installed, which makes fresh installs appear broken or stale.
-if [ -n "${PYTHONPATH:-}" ]; then
-    echo "⚠ Ignoring inherited PYTHONPATH during install to avoid module shadowing"
-    unset PYTHONPATH
-fi
-if [ -n "${PYTHONHOME:-}" ]; then
-    echo "⚠ Ignoring inherited PYTHONHOME during install"
-    unset PYTHONHOME
+# Python-driven tool session (e.g. Hermes terminal tool) or, far worse, on a
+# machine whose managed baseline sets these at system scope.
+#
+# PYTHONPATH can force pip/entrypoints to import a different checkout than the
+# one being installed, which makes fresh installs appear broken or stale.
+# PYTHONHOME is the dangerous one: it OVERRIDES an interpreter's own stdlib
+# location, so every Python subprocess -- including uv's isolated build backend,
+# which is where it actually bit us -- is dragged onto whatever stdlib that path
+# holds. Against a different minor version the process dies with
+#   AssertionError: SRE module mismatch
+# from sre_compile.py, because the compiled _sre extension's MAGIC belongs to
+# the real interpreter while the .py stdlib belongs to the impostor.
+#
+# Scrubbed for the WHOLE run, not per command: the failure occurred in a
+# grandchild process (uv -> build backend), which inherits whatever we leave set.
+_hermes_scrubbed_python_env=""
+_hermes_scrub_python_var() {
+    # $1 = variable name, $2 = its value expanded by the caller.
+    if [ -n "$2" ]; then
+        _hermes_scrubbed_python_env="$_hermes_scrubbed_python_env $1"
+    fi
+    unset "$1"
+}
+_hermes_scrub_python_var PYTHONHOME "${PYTHONHOME:-}"
+_hermes_scrub_python_var PYTHONPATH "${PYTHONPATH:-}"
+_hermes_scrub_python_var PYTHONSTARTUP "${PYTHONSTARTUP:-}"
+_hermes_scrub_python_var PYTHONEXECUTABLE "${PYTHONEXECUTABLE:-}"
+_hermes_scrub_python_var PYTHONUSERBASE "${PYTHONUSERBASE:-}"
+
+# Never import from the user site directory; the install only ever needs the
+# venv it creates, and a stale user-site build is another way to get a mismatch.
+export PYTHONNOUSERSITE=1
+
+# uv reads its interpreter policy from the environment too. UV_PYTHON_PREFERENCE
+# =only-system (or UV_NO_MANAGED_PYTHON) would both force the user's interpreter
+# back on us AND make `--managed-python` below a hard argument conflict, so our
+# choice has to win here as well.
+unset UV_PYTHON_PREFERENCE
+unset UV_NO_MANAGED_PYTHON
+
+if [ -n "$_hermes_scrubbed_python_env" ]; then
+    # Named explicitly: the resulting failure mode is otherwise an opaque
+    # interpreter crash with nothing pointing back at the environment.
+    echo "⚠ Ignoring inherited Python environment for this install:$_hermes_scrubbed_python_env"
+    echo "  (they would override the interpreter this installer provides)"
 fi
 
 # Prevent uv from discovering config files (uv.toml, pyproject.toml) from the
@@ -612,6 +647,32 @@ install_uv() {
     fi
 }
 
+# Echo the path of a uv-MANAGED interpreter for $1, or fail (non-zero, no
+# output) when none is installed.
+#
+# `uv python find <version>` on its own also matches interpreters discovered on
+# PATH, which is precisely how a first install picked C:\Python311\python.exe on
+# a machine that also carried an IT-managed C:\Python\Python310 -- and then had
+# the build backend load the 3.10 stdlib underneath it. --managed-python
+# restricts the search to interpreters uv itself installed.
+#
+# Also the cross-process resolver: each `--stage NAME` runs in a fresh shell, so
+# the PYTHON_PATH that check_python settled on does NOT survive into the venv
+# stage. Callers re-resolve here instead of trusting an exported value.
+# --managed-python is unknown to older uv builds; that just yields a non-zero
+# exit here and the caller degrades to the discovered interpreter, which is the
+# pre-existing behaviour.
+find_managed_python() {
+    local version="${1:-$PYTHON_VERSION}"
+    local found
+
+    found="$("$UV_CMD" python find --managed-python "$version" 2>/dev/null)" || return 1
+    [ -n "$found" ] || return 1
+    [ -x "$found" ] || return 1
+
+    printf '%s' "$found"
+}
+
 check_python() {
     if [ "$DISTRO" = "termux" ]; then
         log_info "Checking Termux Python..."
@@ -634,25 +695,44 @@ check_python() {
 
     log_info "Checking Python $PYTHON_VERSION..."
 
-    # Let uv handle Python — it can download and manage Python versions
-    # First check if a suitable Python is already available
-    if PYTHON_PATH="$("$UV_CMD" python find "$PYTHON_VERSION" 2>/dev/null)"; then
+    # Provision the interpreter WE deliver rather than adopting whatever the
+    # machine happens to ship. `uv python install` is idempotent, so this is a
+    # cheap no-op on a re-run or an already-managed machine.
+    # Output stays visible: this can be a multi-MB download and the original
+    # code showed its progress. The retry is for an older uv that does not know
+    # --managed-python (plain `uv python install` still provisions a MANAGED
+    # interpreter, so only the flag needs dropping); a genuinely blocked
+    # download attempts twice before the fallback tier below takes over.
+    log_info "Provisioning uv-managed Python $PYTHON_VERSION..."
+    "$UV_CMD" python install --managed-python "$PYTHON_VERSION" ||
+        "$UV_CMD" python install "$PYTHON_VERSION" ||
+        true
+
+    if PYTHON_PATH="$(find_managed_python "$PYTHON_VERSION")"; then
         PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
-        log_success "Python found: $PYTHON_FOUND_VERSION"
+        # Name the interpreter AND its provenance: the old "Python found:
+        # Python 3.11.0" said nothing about which of the machine's Pythons had
+        # been picked, which is what made the original failure hard to spot.
+        log_success "Using uv-managed Python: $PYTHON_FOUND_VERSION ($PYTHON_PATH)"
         return 0
     fi
 
-    # Python not found — use uv to install it (no sudo needed!)
-    log_info "Python $PYTHON_VERSION not found, installing via uv..."
-    if "$UV_CMD" python install "$PYTHON_VERSION"; then
-        PYTHON_PATH="$("$UV_CMD" python find "$PYTHON_VERSION")"
+    # No managed interpreter: the download can be blocked by a proxy, the CDN
+    # can be unreachable, or the platform may have no python-build-standalone
+    # build. Falling back to a discovered interpreter keeps those machines
+    # installable -- but say so loudly and name the path, because this is
+    # exactly the configuration that produced the SRE-mismatch failure and a
+    # later crash is unreadable without this line.
+    if PYTHON_PATH="$("$UV_CMD" python find "$PYTHON_VERSION" 2>/dev/null)"; then
         PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
-        log_success "Python installed: $PYTHON_FOUND_VERSION"
-    else
-        log_error "Failed to install Python $PYTHON_VERSION"
-        log_info "Install Python $PYTHON_VERSION manually, then re-run this script"
-        exit 1
+        log_warn "Could not provision a uv-managed Python; falling back to the system interpreter"
+        log_warn "  $PYTHON_FOUND_VERSION ($PYTHON_PATH)"
+        return 0
     fi
+
+    log_error "Failed to provision Python $PYTHON_VERSION"
+    log_info "Install Python $PYTHON_VERSION manually, then re-run this script"
+    exit 1
 }
 
 # Best-effort automatic git provisioning, mirroring install.ps1's Install-Git
@@ -1369,8 +1449,22 @@ setup_venv() {
         rm -rf venv
     fi
 
-    # uv creates the venv and pins the Python version in one step
-    $UV_CMD venv venv --python "$PYTHON_VERSION"
+    # uv creates the venv and pins the Python version in one step.
+    #
+    # Re-resolve the MANAGED interpreter and pass its absolute path rather than
+    # the bare version string: `--python 3.11` lets uv match a system 3.11 all
+    # over again, so a venv created here could be rooted at the very
+    # interpreter check_python declined to use. Re-resolving (instead of
+    # trusting an exported PYTHON_PATH) is required because each --stage runs
+    # in its own process.
+    local venv_python
+    if venv_python="$(find_managed_python "$PYTHON_VERSION")"; then
+        log_info "Using uv-managed interpreter: $venv_python"
+        $UV_CMD venv venv --python "$venv_python"
+    else
+        log_warn "No uv-managed Python $PYTHON_VERSION; creating the venv from a discovered interpreter"
+        $UV_CMD venv venv --python "$PYTHON_VERSION"
+    fi
 
     # Neutralize any inherited UV_PYTHON (e.g. UV_PYTHON=3.14 left in the
     # user's shell env). uv honours UV_PYTHON over an existing venv for the

@@ -195,14 +195,40 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # by the operator out-of-band, or pre-existing) keep working. The
 # point is that the dashboard's writable surface cannot escalate by
 # planting them.
+# Python variables that redirect an interpreter away from its own stdlib or
+# module set. Named separately from the denylist below because they have a
+# SECOND consumer: anything that spawns Python (or spawns uv, which spawns
+# Python) must strip these from the inherited environment, not merely refuse to
+# write them.
+#
+# ``PYTHONHOME`` is the dangerous one -- it OVERRIDES an interpreter's own
+# stdlib location, so a machine-scope value pointing at a different minor
+# version kills every Python subprocess with ``AssertionError: SRE module
+# mismatch`` (the compiled ``_sre`` extension's MAGIC vs ``sre_compile.py``'s),
+# including grandchildren such as uv's isolated build backend.
+#
+# ``PYTHONNOUSERSITE`` is deliberately absent: scrubbers SET it to "1" rather
+# than clearing it. It stays on the write denylist below.
+#
+# Mirrored by INHERITED_PYTHON_ENV_VARS in apps/desktop/electron/backend-env.ts
+# and the scrub blocks at the top of scripts/install.sh and scripts/install.ps1
+# -- those run before any Python exists, so they cannot import this.
+INHERITED_PYTHON_ENV_VARS: tuple[str, ...] = (
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PYTHONEXECUTABLE",
+    "PYTHONUSERBASE",
+)
+
 _ENV_VAR_NAME_DENYLIST: frozenset[str] = frozenset({
     # Loader / linker
     "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG",
     "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
     "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_FALLBACK_FRAMEWORK_PATH",
     # Python
-    "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE",
-    "PYTHONEXECUTABLE", "PYTHONNOUSERSITE",
+    *INHERITED_PYTHON_ENV_VARS,
+    "PYTHONNOUSERSITE",
     # Node
     "NODE_OPTIONS", "NODE_PATH",
     # General

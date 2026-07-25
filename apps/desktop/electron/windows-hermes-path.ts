@@ -260,10 +260,10 @@ export function resolveVenvHermesCommand(
 
   if (
     !canImportHermesCli(python, {
+      // Our checkout only -- the inherited PYTHONPATH is deliberately excluded
+      // so a foreign hermes_cli cannot make a broken venv probe as healthy.
       env: {
-        PYTHONPATH: [...(directoryExists(root) ? [root] : []), process.env.PYTHONPATH]
-          .filter((entry): entry is string => Boolean(entry))
-          .join(path.delimiter)
+        PYTHONPATH: directoryExists(root) ? root : ''
       }
     })
   ) {

@@ -509,6 +509,9 @@ class ManagedProcessTree:
         windows_job = _WindowsJob.create() if _IS_WINDOWS else None
         process = None
         try:
+            # noqa: subprocess-stdin — stdin IS set: kwargs.setdefault("stdin",
+            # subprocess.DEVNULL) above. The scanner reads the call text only and
+            # cannot see kwargs populated earlier in the function.
             process = subprocess.Popen(list(argv), **kwargs)
             if windows_job is not None:
                 windows_job.assign(int(process._handle))

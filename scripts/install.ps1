@@ -143,6 +143,55 @@ foreach ($tmpVar in @('TEMP', 'TMP')) {
 }
 
 # ============================================================================
+# Inherited Python environment
+# ============================================================================
+# A managed corporate baseline commonly sets PYTHONHOME (sometimes PYTHONPATH)
+# at Machine scope. PYTHONHOME OVERRIDES an interpreter's own stdlib location,
+# so every Python subprocess is dragged onto whatever stdlib that path holds --
+# regardless of which interpreter was launched. Against a different minor
+# version the process dies inside sre_compile.py with
+#   AssertionError: SRE module mismatch
+# because the compiled _sre extension's MAGIC belongs to the real interpreter
+# while the .py stdlib belongs to the impostor. That is exactly how a first
+# install failed on a laptop carrying both C:\Python311 and C:\Python\Python310:
+# the venv was correctly created from 3.11, then uv's isolated build backend
+# loaded the 3.10 stdlib underneath it and the `dependencies` stage died.
+#
+# Scrubbed for the WHOLE run rather than per command, because the failure was in
+# a GRANDCHILD process (uv -> build backend) which inherits whatever we leave
+# set. And it must be scrubbed HERE rather than documented as user guidance: the
+# desktop app spawns this script and inherits Machine/User-scope environment
+# directly, so clearing these in a PowerShell session never reaches it.
+#
+# Mirrors the Python entries of _ENV_VAR_NAME_DENYLIST in hermes_cli/config.py
+# and INHERITED_PYTHON_ENV_VARS in apps/desktop/electron/backend-env.ts.
+$ScrubbedPythonEnvVars = @()
+foreach ($pyVar in @('PYTHONHOME', 'PYTHONPATH', 'PYTHONSTARTUP', 'PYTHONEXECUTABLE', 'PYTHONUSERBASE')) {
+    if (Test-Path "Env:$pyVar") {
+        $ScrubbedPythonEnvVars += $pyVar
+        Remove-Item "Env:$pyVar" -ErrorAction SilentlyContinue
+    }
+}
+
+# Never import from the user site directory either; the install only ever needs
+# the venv it creates, and a stale user-site build is another mismatch source.
+$env:PYTHONNOUSERSITE = "1"
+
+# uv reads its interpreter policy from the environment too. UV_PYTHON_PREFERENCE
+# = only-system (or UV_NO_MANAGED_PYTHON) would both re-force the machine's
+# interpreter on us AND make the -ManagedPython resolution below a hard argument
+# conflict, so our choice has to win here as well.
+Remove-Item Env:UV_PYTHON_PREFERENCE -ErrorAction SilentlyContinue
+Remove-Item Env:UV_NO_MANAGED_PYTHON -ErrorAction SilentlyContinue
+
+if ($ScrubbedPythonEnvVars.Count -gt 0) {
+    # Named explicitly: the resulting failure is otherwise an opaque interpreter
+    # crash with nothing pointing back at the environment that caused it.
+    Write-Host "Ignoring inherited Python environment for this install: $($ScrubbedPythonEnvVars -join ', ')" -ForegroundColor Yellow
+    Write-Host "  (they would override the interpreter this installer provides)" -ForegroundColor DarkGray
+}
+
+# ============================================================================
 # Configuration
 # ============================================================================
 
@@ -579,6 +628,48 @@ function Resolve-UvCmd {
     throw "uv is not installed. Run install.ps1 -Stage uv first."
 }
 
+function Get-ManagedPythonPath {
+    <#
+    .SYNOPSIS
+    Absolute path of a uv-MANAGED interpreter for $Version, or $null if uv has
+    not installed one.
+
+    .DESCRIPTION
+    `uv python find <version>` on its own ALSO matches interpreters discovered
+    on PATH or in the registry. That is how a first install picked the machine's
+    C:\Python311\python.exe on a laptop that also carried an IT-managed
+    C:\Python\Python310 -- and then had the build backend load the 3.10 stdlib
+    underneath it ("SRE module mismatch"). --managed-python restricts the search
+    to interpreters uv itself installed, which is the only kind we control.
+
+    Returns $null rather than throwing when the flag is unknown (older uv) or no
+    managed interpreter exists, so callers can degrade to the previous
+    discovery behaviour instead of failing the install outright.
+    #>
+    param([string]$Version = $PythonVersion)
+
+    $prevEAP = $ErrorActionPreference
+    try {
+        # uv writes progress to stderr; under EAP=Stop that is a terminating
+        # NativeCommandError even on success (see Install-Uv for the full note).
+        $ErrorActionPreference = "Continue"
+        $found = & $UvCmd python find --managed-python $Version 2>$null
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $prevEAP
+
+        if ($exitCode -eq 0 -and $found) {
+            $resolved = ([string](@($found)[0])).Trim()
+            if ($resolved -and (Test-Path -LiteralPath $resolved)) {
+                return $resolved
+            }
+        }
+    } catch {
+        if ($prevEAP) { $ErrorActionPreference = $prevEAP }
+    }
+
+    return $null
+}
+
 function Resolve-AvailablePythonVersion {
     # Return the first Python minor version uv can actually find, preferring the
     # requested $PythonVersion and then $PythonFallbackVersions.  Returns $null
@@ -591,11 +682,20 @@ function Resolve-AvailablePythonVersion {
     # survive into the ``venv`` stage's process -- there $PythonVersion is back
     # at its "3.11" default.  Consumers re-resolve here instead of trusting that
     # default, which is exactly the propagation gap behind issue #50769.
-    $candidates = @($PythonVersion) + $PythonFallbackVersions
+    # Managed interpreters are preferred over discovered ones at every candidate
+    # version, so a machine that has BOTH a managed 3.11 and a system 3.11
+    # settles on the managed one -- see Get-ManagedPythonPath.
+    $candidates = @()
     $seen = @{}
-    foreach ($ver in $candidates) {
+    foreach ($ver in (@($PythonVersion) + $PythonFallbackVersions)) {
         if (-not $ver -or $seen.ContainsKey($ver)) { continue }
         $seen[$ver] = $true
+        $candidates += $ver
+    }
+    foreach ($ver in $candidates) {
+        if (Get-ManagedPythonPath $ver) { return $ver }
+    }
+    foreach ($ver in $candidates) {
         try {
             $found = & $UvCmd python find $ver 2>$null
             if ($found) { return $ver }
@@ -606,19 +706,13 @@ function Resolve-AvailablePythonVersion {
 
 function Test-Python {
     Write-Info "Checking Python $PythonVersion..."
-    
-    # Let uv find or install Python
-    try {
-        $pythonPath = & $UvCmd python find $PythonVersion 2>$null
-        if ($pythonPath) {
-            $ver = & $pythonPath --version 2>$null
-            Write-Success "Python found: $ver"
-            return $true
-        }
-    } catch { }
-    
-    # Python not found -- use uv to install it (no admin needed!)
-    Write-Info "Python $PythonVersion not found, installing via uv..."
+
+    # Provision the interpreter WE deliver instead of adopting whatever the
+    # machine happens to ship. Deliberately no `uv python find` short-circuit
+    # first: that is what silently selected a system interpreter (and printed a
+    # reassuring "Python found: Python 3.11.0" while doing it). `uv python
+    # install` is idempotent, so this is a cheap no-op once provisioned.
+    Write-Info "Provisioning uv-managed Python $PythonVersion (no admin needed)..."
     # Capture EAP outside the try block so the catch's restore call always
     # has a meaningful value (see Install-Uv for the full rationale).
     $prevEAP = $ErrorActionPreference
@@ -634,16 +728,26 @@ function Test-Python {
         # semantics or stderr noise.  This fix was previously landed as
         # commit ec1714e71 and then lost in a release squash; reapplied here.
         $ErrorActionPreference = "Continue"
-        $uvOutput = & $UvCmd python install $PythonVersion 2>&1
+        $uvOutput = & $UvCmd python install --managed-python $PythonVersion 2>&1
         $uvExitCode = $LASTEXITCODE
+        if ($uvExitCode -ne 0 -and ("$uvOutput" -match 'unexpected argument|unrecognized')) {
+            # Older uv builds do not know --managed-python; plain
+            # `uv python install` provisions a managed interpreter anyway, so
+            # only the flag needs dropping. Gated on the ARGUMENT error rather
+            # than on any failure, so a blocked download is not paid for twice.
+            $uvOutput = & $UvCmd python install $PythonVersion 2>&1
+            $uvExitCode = $LASTEXITCODE
+        }
         $ErrorActionPreference = $prevEAP
 
-        # Check if Python is now available (more reliable than exit code
-        # since uv may return non-zero due to "already installed" etc.)
-        $pythonPath = & $UvCmd python find $PythonVersion 2>$null
-        if ($pythonPath) {
-            $ver = & $pythonPath --version 2>$null
-            Write-Success "Python installed: $ver"
+        # Resolve the MANAGED interpreter (more reliable than the exit code,
+        # since uv may return non-zero for "already installed"). Restricted to
+        # managed on purpose: an unrestricted find here would happily report
+        # success against the machine's own Python.
+        $managedPython = Get-ManagedPythonPath $PythonVersion
+        if ($managedPython) {
+            $ver = & $managedPython --version 2>$null
+            Write-Success "Using uv-managed Python: $ver ($managedPython)"
             return $true
         }
 
@@ -658,14 +762,35 @@ function Test-Python {
         Write-Warn "uv python install error: $_"
     }
 
-    # Fallback: check if ANY Python 3.10+ is already available on the system
-    Write-Info "Trying to find any existing Python 3.10+..."
+    # Fallback 1: a MANAGED interpreter at another supported minor version.
+    # Still an interpreter we own, so it keeps the isolation guarantee.
     foreach ($fallbackVer in $PythonFallbackVersions) {
+        $managedFallback = Get-ManagedPythonPath $fallbackVer
+        if ($managedFallback) {
+            $ver = & $managedFallback --version 2>$null
+            Write-Success "Using uv-managed Python: $ver ($managedFallback)"
+            $script:PythonVersion = $fallbackVer
+            return $true
+        }
+    }
+
+    # Fallback 2: a DISCOVERED interpreter. Reached when the managed download
+    # is unavailable -- a blocking proxy, an unreachable CDN, or a platform with
+    # no python-build-standalone build. Keeping this tier means those machines
+    # stay installable, but it is announced loudly and by path: this is exactly
+    # the configuration that produced the SRE-mismatch failure, and a later
+    # crash is unreadable without a line saying which interpreter was used.
+    # The requested version leads the candidate list here: the pre-existing
+    # `uv python find $PythonVersion` short-circuit at the top of this function
+    # is gone (it was the defect), so this tier is what still finds a system
+    # 3.11 when no managed interpreter could be provisioned at all.
+    Write-Warn "Could not provision a uv-managed Python; looking for an existing Python 3.10+..."
+    foreach ($fallbackVer in (@($PythonVersion) + $PythonFallbackVersions)) {
         try {
             $pythonPath = & $UvCmd python find $fallbackVer 2>$null
             if ($pythonPath) {
                 $ver = & $pythonPath --version 2>$null
-                Write-Success "Found fallback: $ver"
+                Write-Warn "Falling back to a system interpreter: $ver ($pythonPath)"
                 $script:PythonVersion = $fallbackVer
                 return $true
             }
@@ -1971,11 +2096,25 @@ function Install-Venv {
         Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue
     }
     
+    # Resolve the MANAGED interpreter and pass its absolute path, rather than
+    # the bare version string. `--python 3.11` lets uv match a system 3.11 all
+    # over again, so the venv could end up rooted at the very interpreter
+    # Test-Python declined to use. Re-resolving here (instead of trusting a
+    # value Test-Python computed) is required because under Hermes-Setup.exe
+    # each `-Stage NAME` runs in a fresh powershell.exe.
+    $ManagedPythonExe = Get-ManagedPythonPath $PythonVersion
+
     # uv creates the venv and pins the Python version in one step.  uv emits
     # normal progress such as "Using CPython ..." on stderr; under Windows
     # PowerShell 5.1 with EAP=Stop that stderr is a NativeCommandError unless
     # we temporarily relax EAP and trust $LASTEXITCODE for real failures.
-    Invoke-NativeWithRelaxedErrorAction { & $UvCmd venv venv --python $PythonVersion }
+    if ($ManagedPythonExe) {
+        Write-Info "Using uv-managed interpreter: $ManagedPythonExe"
+        Invoke-NativeWithRelaxedErrorAction { & $UvCmd venv venv --python $ManagedPythonExe }
+    } else {
+        Write-Warn "No uv-managed Python $PythonVersion; creating the venv from a discovered interpreter"
+        Invoke-NativeWithRelaxedErrorAction { & $UvCmd venv venv --python $PythonVersion }
+    }
     # Relaxing EAP above means a *genuine* uv-venv failure (exit != 0) no longer
     # aborts on its own. Capture $LASTEXITCODE immediately and fail fast, so the
     # `venv` stage can't falsely report success (and Invoke-Stage can't emit
