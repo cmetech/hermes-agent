@@ -1025,6 +1025,32 @@ agent-browser's client-daemon wedged on Windows during testing (`eval` hung
 until a full restart). `acquire()` therefore runs `close --all` first and uses
 bounded timeouts.
 
+> **Execution correction (2026-07-25).** The launcher sketched below was wrong in
+> three ways, all of which the `confluence-research` skill already solved and
+> field-verified against corporate Edge on 2026-07-19
+> (`skills/ericsson/confluence-research/scripts/backends.py`, `_cdp_alive` +
+> `ensure_edge_cdp`, lines 81–128). **Port that logic; do not write fresh
+> launcher code.** The three fixes:
+>
+> 1. **Attach-or-launch, not always-launch.** Probe `GET <cdp>/json/version`
+>    first and reuse a browser that is already listening — the common real case
+>    (the user opened Edge themselves, or a prior run's browser still holds the
+>    profile directory and port). Always launching either fails to bind the port
+>    or silently does the wrong thing.
+> 2. **Detached spawn.** `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on
+>    Windows, `start_new_session=True` on POSIX. Without it the browser dies with
+>    the parent process or holds its console.
+> 3. **Readiness wait.** Poll `_cdp_alive()` for ~15s (30 × 0.5s) after
+>    launching. Returning the CDP URL immediately is a race: the caller attaches
+>    before Edge is listening.
+>
+> Also mirror the skill's `shutil.which` fallback in executable resolution —
+> `os.path.exists` alone misses a browser that is on PATH but not at a
+> hard-coded location.
+>
+> Bonus: porting this makes Task 7 nearly free — the skill's own backend
+> collapses to a thin wrapper over the shared manager.
+
 - [ ] **Step 1: Write the failing test**
 
 Create `tests/tools/test_browser_session_manager.py`:
