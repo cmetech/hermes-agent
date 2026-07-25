@@ -18,7 +18,10 @@ const cases = [
     b: 'midnight',
     junk: 'nope'
   },
-  { name: 'mode', pref: modePref as unknown as Pref, fallback: 'light', a: 'dark', b: 'system', junk: 'dusk' }
+  // fallback is 'dark', not upstream's 'light': normalizeMode in ./context
+  // defaults to dark on first run (this fork's default) while still honoring a
+  // user's saved 'light'/'system'. Registered in the workspace surface table.
+  { name: 'mode', pref: modePref as unknown as Pref, fallback: 'dark', a: 'light', b: 'system', junk: 'dusk' }
 ]
 
 describe.each(cases)('per-profile $name', ({ pref, fallback, a, b, junk }) => {
