@@ -78,6 +78,60 @@ class TestLoadProfiles:
         assert browser_profiles.get_profile("default").trusted_origins == ()
 
 
+class TestMisconfiguredTrustedOrigins:
+    """A string instead of a list must warn, not silently trust nothing.
+
+    `hermes config set` coerces only bool/int/float, so
+    `config set ...trusted_origins "https://a,https://b"` stores a STRING. The
+    parser correctly refuses to trust it, but silently — the user would see no
+    access and no explanation.
+    """
+
+    def _cfg(self, origins):
+        return {
+            "browser": {
+                "profiles": {
+                    "enrolled": {"kind": "enrolled", "trusted_origins": origins}
+                }
+            }
+        }
+
+    def test_string_origins_grant_no_trust(self, monkeypatch):
+        monkeypatch.setattr(
+            browser_profiles, "_read_config",
+            lambda: self._cfg("https://wiki.corp.example,https://jira.corp.example"),
+        )
+        assert browser_profiles.get_profile("enrolled").trusted_origins == ()
+
+    def test_string_origins_log_a_warning(self, monkeypatch, caplog):
+        monkeypatch.setattr(
+            browser_profiles, "_read_config", lambda: self._cfg("https://wiki.corp.example")
+        )
+        with caplog.at_level("WARNING"):
+            browser_profiles.get_profile("enrolled")
+        assert any(
+            "trusted_origins" in r.message and "list" in r.message for r in caplog.records
+        ), f"expected a trusted_origins list warning, got: {[r.message for r in caplog.records]}"
+
+    def test_proper_list_does_not_warn(self, monkeypatch, caplog):
+        monkeypatch.setattr(
+            browser_profiles, "_read_config", lambda: self._cfg(["https://wiki.corp.example"])
+        )
+        with caplog.at_level("WARNING"):
+            prof = browser_profiles.get_profile("enrolled")
+        assert prof.trusted_origins == ("https://wiki.corp.example",)
+        assert not [r for r in caplog.records if "trusted_origins" in r.message]
+
+    def test_absent_origins_do_not_warn(self, monkeypatch, caplog):
+        monkeypatch.setattr(
+            browser_profiles, "_read_config",
+            lambda: {"browser": {"profiles": {"enrolled": {"kind": "enrolled"}}}},
+        )
+        with caplog.at_level("WARNING"):
+            browser_profiles.get_profile("enrolled")
+        assert not [r for r in caplog.records if "trusted_origins" in r.message]
+
+
 def _enrolled(*origins):
     return browser_profiles.BrowserProfile(
         name="enrolled",

@@ -94,6 +94,19 @@ def _parse_one(name: str, raw: Any) -> Optional[BrowserProfile]:
         raw_origins = raw.get("trusted_origins") or []
         if isinstance(raw_origins, (list, tuple)):
             origins = tuple(str(o).strip() for o in raw_origins if str(o).strip())
+        elif raw_origins:
+            # Loud, because the failure is otherwise invisible: `hermes config
+            # set` coerces only bool/int/float, so
+            # `config set ...trusted_origins "https://a,https://b"` stores a
+            # STRING. We refuse to trust it (fail closed), which would look
+            # like "the profile just doesn't work" with nothing to debug.
+            logger.warning(
+                "browser profile %r: trusted_origins must be a LIST of origins, got %s "
+                "— no origins are trusted. Use `hermes config edit` and write:\n"
+                "  trusted_origins:\n    - \"https://host.example\"\n"
+                "(`hermes config set` cannot create a list.)",
+                name, type(raw_origins).__name__,
+            )
 
     try:
         port = int(raw.get("cdp_port", DEFAULT_CDP_PORT))

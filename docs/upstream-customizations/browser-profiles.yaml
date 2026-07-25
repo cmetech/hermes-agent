@@ -88,3 +88,38 @@ upstream_changes:
     model for private-network browser access (for example an allowlist attached
     to a CDP-attached session), making the local seam redundant.
   last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+- id: browser-profile-settings-surface
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - apps/desktop/src/app/settings/constants.ts
+  - apps/desktop/src/app/settings/helpers.test.ts
+  owned_symbols:
+  - SECTIONS
+  - FIELD_LABELS
+  - FIELD_DESCRIPTIONS
+  tests:
+  - apps/desktop/src/app/settings/helpers.test.ts
+  expected_commit_subject: 'feat(desktop): expose enrolled-browser trusted origins in Settings'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Adds two keys to the Safety section of SECTIONS
+    (browser.default_profile, browser.profiles.enrolled.trusted_origins) plus
+    their FIELD_LABELS and FIELD_DESCRIPTIONS copy. They sit beside the
+    pre-existing browser.allow_private_urls / browser.auto_local_for_private_urls
+    keys because they gate the same capability. No new component: config-field
+    already renders type 'list', which inferFieldSchema derives from an array
+    value. These are ADDITIVE array entries and object keys, so upstream
+    reordering or extending either structure merges cleanly -- but a whole-file
+    rewrite of constants.ts drops them with no conflict and no test failure other
+    than the named test, which is why that test asserts both the SECTIONS
+    membership and the copy lookups. The trusted_origins field only renders once
+    the profile exists in config (sectionFieldEntries omits absent keys); this is
+    intended, not a bug. The allowPrivateUrls description deliberately steers
+    users toward per-origin trust instead of the blunt global switch -- keep that
+    wording or the UI invites the less safe option.
+  removal_condition: >-
+    Remove alongside browser-profile-ssrf-trust-seam, or when a dedicated browser
+    profiles panel replaces these Advanced keys (planned follow-up, deferred until
+    the enrolled launcher is verified on a managed corporate machine).
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6

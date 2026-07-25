@@ -435,7 +435,9 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
   },
   browser: {
     allowPrivateUrls: 'Browser Private URLs',
-    autoLocalForPrivateUrls: 'Local Browser For Private URLs'
+    autoLocalForPrivateUrls: 'Local Browser For Private URLs',
+    defaultProfile: 'Browser Profile For Internal Sites',
+    'profiles.enrolled.trustedOrigins': 'Trusted Internal Origins'
   },
   checkpoints: {
     enabled: 'File Checkpoints',
@@ -587,6 +589,14 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
   security: {
     redactSecrets: 'Hide detected secrets from model-visible content when possible.'
   },
+  browser: {
+    allowPrivateUrls:
+      'Lets the browser reach ANY private or internal address. Prefer Trusted Internal Origins below, which grants access to specific sites only.',
+    defaultProfile:
+      'Browser profile used for internal sites. Set to "enrolled" to use your signed-in corporate browser so intranet pages and forms work.',
+    'profiles.enrolled.trustedOrigins':
+      'Internal sites the corporate browser may open, one origin per entry (e.g. https://wiki.example.com, or https://*.example.com for subdomains). Nothing else private is reachable, and cloud metadata endpoints stay blocked.'
+  },
   checkpoints: {
     enabled: 'Create rollback snapshots before file edits.'
   },
@@ -678,6 +688,8 @@ export const SECTIONS: DesktopConfigSection[] = [
       'security.allow_private_urls',
       'browser.allow_private_urls',
       'browser.auto_local_for_private_urls',
+      'browser.default_profile',
+      'browser.profiles.enrolled.trusted_origins',
       'checkpoints.enabled'
     ]
   },
