@@ -23,6 +23,7 @@ import yaml
 
 from hermes_constants import get_hermes_home
 from plugins.workflow.language import language_projection
+from plugins.workflow.language_schema import workflow_authoring_contract
 from plugins.workflow.compat import (
     ARCHON_TOOL_ALIASES,
     CompatibilityFinding,
@@ -600,6 +601,16 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         dest="workflow_action", parser_class=_WorkflowArgumentParser
     )
 
+    schema_parser = actions.add_parser(
+        "schema", help="Print the workflow authoring contract"
+    )
+    schema_parser.add_argument(
+        "--profile",
+        choices=("hermes-legacy", "archon-2026-07"),
+        default="archon-2026-07",
+    )
+    _json_flag(schema_parser)
+
     list_parser = actions.add_parser(
         "list", aliases=["ls"], help="List discovered workflows"
     )
@@ -849,6 +860,22 @@ def _emit(payload: object, *, as_json: bool) -> None:
         print(payload)
     else:
         print(payload)
+
+
+def _cmd_schema(args: argparse.Namespace) -> int:
+    contract = workflow_authoring_contract(WorkflowLanguageProfile(args.profile))
+    if args.json:
+        print(
+            json.dumps(
+                contract,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        print(json.dumps(contract, sort_keys=True, ensure_ascii=False, indent=2))
+    return 0
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
@@ -2229,7 +2256,7 @@ def workflow_command(
     action = getattr(args, "workflow_action", None)
     if not action:
         print(
-            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|archive|restore|cleanup|reset-sessions|showcase}",
+            "Usage: hermes workflow {schema|list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|archive|restore|cleanup|reset-sessions|showcase}",
             file=sys.stderr,
         )
         return 2
@@ -2238,6 +2265,8 @@ def workflow_command(
         command += f" {args.showcase_action}"
     _MACHINE_COMMAND.set(command)
     try:
+        if action == "schema":
+            return _cmd_schema(args)
         if action in {"list", "ls"}:
             return _cmd_list(args)
         if action == "show":

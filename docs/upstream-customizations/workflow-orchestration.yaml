@@ -3291,3 +3291,51 @@ upstream_changes:
     and tree identity revalidation, and pre-language legacy compatibility
     without a database migration.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-language-schema-cli
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/main.py
+  - plugins/workflow/language_schema.py
+  - plugins/workflow/schema.py
+  - plugins/workflow/cli.py
+  - tests/hermes_cli/test_apply_profile_override.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_cli.py
+  owned_symbols:
+  - WorkflowFieldSpec
+  - FieldCompatibility
+  - FIELD_INVENTORY
+  - definition_field_names
+  - common_node_field_names
+  - sidecar_field_names
+  - nested parser field inventory accessors
+  - definition_json_schema
+  - sidecar_json_schema
+  - compatibility_code_catalog
+  - workflow_authoring_contract
+  - workflow schema CLI command
+  - workflow schema local profile option routing
+  tests:
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_cli.py
+  - tests/hermes_cli/test_apply_profile_override.py
+  expected_commit_subject: 'feat(workflow): publish authoring schema'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve one immutable dependency-neutral inventory as the parser and
+    generated Draft 2020-12 schema field authority. Keep semantic validation
+    in schema.py, legacy top-level unknown fields permissive with warnings,
+    Archon unknown fields strict, companion fields strict under both profiles,
+    and every deferred annotation aligned with the runtime's stable finding
+    code, blocking status, and enforcement phase. The bounded schema command
+    must run before workflow discovery without filesystem mutation, model,
+    MCP, or network calls and emit deterministic compact JSON. Preserve global
+    Hermes profile selection while leaving the nested workflow schema
+    language-profile option for plugin dispatch.
+  removal_condition: >-
+    Remove when upstream provides an equivalent bounded versioned workflow
+    authoring contract driven by the loader's field authority, truthful
+    profile-specific compatibility annotations, and a side-effect-free CLI
+    projection whose local profile selector is not consumed globally.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

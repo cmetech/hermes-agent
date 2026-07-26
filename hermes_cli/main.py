@@ -516,6 +516,20 @@ def _apply_profile_override() -> None:
             return False
         return True
 
+    def _inside_workflow_schema_args(index: int) -> bool:
+        """Return true for the workflow schema command's language profile.
+
+        This early parser cannot load plugin argparse trees without defeating
+        its dependency-free purpose. Keep the exception at the narrow nested
+        command boundary that owns a distinct ``--profile`` option.
+        """
+        try:
+            workflow_index = argv.index("workflow", 0, index)
+            argv.index("schema", workflow_index + 1, index)
+        except ValueError:
+            return False
+        return True
+
     def _resolve_sudo_user_profile_env(name: str) -> str | None:
         """Resolve `sudo hermes -p <name>` against the invoking user's home.
 
@@ -567,6 +581,12 @@ def _apply_profile_override() -> None:
             break
         if arg == "--args" and _inside_mcp_add_args(i):
             break
+        if arg == "--profile" and _inside_workflow_schema_args(i):
+            i += 2
+            continue
+        if arg.startswith("--profile=") and _inside_workflow_schema_args(i):
+            i += 1
+            continue
         if arg in {"--profile", "-p"} and i + 1 < len(argv):
             profile_name = argv[i + 1]
             consume = 2

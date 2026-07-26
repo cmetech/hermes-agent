@@ -18,6 +18,21 @@ from plugins.workflow.language import (
     normalize_workflow,
     resolve_language_profile,
 )
+from plugins.workflow.language_schema import (
+    NODE_TYPES,
+    agent_field_names,
+    approval_field_names,
+    approval_reject_field_names,
+    common_node_field_names,
+    definition_field_names,
+    hook_entry_field_names,
+    hook_event_names,
+    hook_response_field_names,
+    hook_specific_field_names,
+    loop_field_names,
+    retry_field_names,
+    sidecar_field_names,
+)
 from plugins.workflow.models import (
     ValidationIssue,
     WorkflowDefinition,
@@ -29,7 +44,6 @@ from plugins.workflow.models import (
     freeze_value,
 )
 
-NODE_TYPES = ("command", "prompt", "bash", "script", "loop", "approval", "cancel")
 TRIGGER_RULES = (
     "all_success",
     "one_success",
@@ -38,99 +52,18 @@ TRIGGER_RULES = (
 )
 CONTEXT_VALUES = ("fresh", "shared")
 SCRIPT_RUNTIMES = ("bun", "uv")
-TOP_LEVEL_FIELDS = frozenset({
-    "name",
-    "description",
-    "nodes",
-    "provider",
-    "model",
-    "modelReasoningEffort",
-    "webSearchMode",
-    "interactive",
-    "requires",
-    "worktree",
-    "tags",
-    "persist_sessions",
-    "effort",
-    "thinking",
-    "fallbackModel",
-    "betas",
-    "sandbox",
-})
-COMMON_NODE_FIELDS = frozenset({
-    "id",
-    *NODE_TYPES,
-    "depends_on",
-    "when",
-    "trigger_rule",
-    "context",
-    "idle_timeout",
-    "retry",
-    "always_run",
-    "output_type",
-    "persist_session",
-    "provider",
-    "model",
-    "output_format",
-    "allowed_tools",
-    "denied_tools",
-    "hooks",
-    "mcp",
-    "skills",
-    "agents",
-    "effort",
-    "thinking",
-    "maxBudgetUsd",
-    "systemPrompt",
-    "fallbackModel",
-    "betas",
-    "sandbox",
-    "runtime",
-    "deps",
-    "timeout",
-})
-HOOK_EVENTS = frozenset({
-    "PreToolUse",
-    "PostToolUse",
-    "PostToolUseFailure",
-    "Notification",
-    "Stop",
-    "SubagentStart",
-    "SubagentStop",
-    "PreCompact",
-    "SessionStart",
-    "SessionEnd",
-    "UserPromptSubmit",
-    "PermissionRequest",
-    "Setup",
-    "TeammateIdle",
-    "TaskCompleted",
-    "Elicitation",
-    "ElicitationResult",
-    "InstructionsLoaded",
-    "ConfigChange",
-    "WorktreeCreate",
-    "WorktreeRemove",
-})
-HOOK_RESPONSE_FIELDS = frozenset({
-    "hookSpecificOutput",
-    "systemMessage",
-    "continue",
-    "decision",
-    "stopReason",
-    "suppressOutput",
-})
-HOOK_SPECIFIC_FIELDS = frozenset({
-    "hookEventName",
-    "permissionDecision",
-    "permissionDecisionReason",
-    "updatedInput",
-    "additionalContext",
-    "updatedMCPToolOutput",
-    "action",
-    "content",
-})
-RETRY_FIELDS = frozenset({"max_attempts", "on_error", "delay_ms"})
+TOP_LEVEL_FIELDS = definition_field_names()
+COMMON_NODE_FIELDS = common_node_field_names()
+HOOK_EVENTS = hook_event_names()
+HOOK_ENTRY_FIELDS = hook_entry_field_names()
+HOOK_RESPONSE_FIELDS = hook_response_field_names()
+HOOK_SPECIFIC_FIELDS = hook_specific_field_names()
+RETRY_FIELDS = retry_field_names()
+LOOP_FIELDS = loop_field_names()
+APPROVAL_FIELDS = approval_field_names()
+APPROVAL_REJECT_FIELDS = approval_reject_field_names()
+AGENT_FIELDS = agent_field_names()
+SIDECAR_FIELDS = sidecar_field_names()
 _CONTROL_OR_ANSI = re.compile(r"[\x00-\x1f\x7f-\x9f]|\x1b\[")
 _SAFE_NAME = re.compile(r"^[^\s/\\]+$")
 _WHEN_REFERENCE = re.compile(r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*", re.UNICODE)
@@ -145,23 +78,6 @@ _WHEN_EXPRESSION = re.compile(
 )
 _INLINE_SCRIPT_METACHAR = re.compile(r"[\s;(){}&|<>$`\"']")
 _MAX_YAML_BYTES = 2 * 1024 * 1024
-_SIDECAR_FIELDS = frozenset({
-    "language_compatibility",
-    "delivery_defaults",
-    "required_services",
-    "retention",
-    "tags",
-    "outward_action_nodes",
-    "outward_action_policy",
-    "execution_environment",
-    "overlap_policy",
-    "pause_lane_policy",
-    "concurrency_key",
-    "limits",
-    "resource_limits",
-    "required_secrets",
-    "scheduling",
-})
 
 
 def _issue(
@@ -333,7 +249,7 @@ def _validate_hook_fields(hooks_value: Any, path: str) -> None:
         for index, entry_value in enumerate(entries_value):
             entry_path = f"{path}.{event}[{index}]"
             entry = _mapping(entry_value, entry_path)
-            unknown_entry = sorted(set(entry) - {"matcher", "response", "timeout"})
+            unknown_entry = sorted(set(entry) - HOOK_ENTRY_FIELDS)
             if unknown_entry:
                 _fail(
                     entry_path,
@@ -435,16 +351,7 @@ def _validate_agents(value: Any, path: str) -> None:
             )
         agent = _mapping(raw_agent, agent_path)
         unknown = sorted(
-            set(agent)
-            - {
-                "description",
-                "prompt",
-                "model",
-                "tools",
-                "disallowedTools",
-                "skills",
-                "maxTurns",
-            }
+            set(agent) - AGENT_FIELDS
         )
         if unknown:
             _fail(
@@ -540,16 +447,7 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
     if node_type == "loop":
         loop = _mapping(value, f"{path}.loop")
         unknown = sorted(
-            set(loop)
-            - {
-                "prompt",
-                "until",
-                "max_iterations",
-                "fresh_context",
-                "until_bash",
-                "interactive",
-                "gate_message",
-            }
+            set(loop) - LOOP_FIELDS
         )
         if unknown:
             _fail(
@@ -578,7 +476,7 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
             )
     if node_type == "approval":
         approval = _mapping(value, f"{path}.approval")
-        unknown = sorted(set(approval) - {"message", "capture_response", "on_reject"})
+        unknown = sorted(set(approval) - APPROVAL_FIELDS)
         if unknown:
             _fail(
                 f"{path}.approval",
@@ -588,7 +486,7 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
         _string(approval.get("message"), f"{path}.approval.message")
         if "on_reject" in approval:
             on_reject = _mapping(approval["on_reject"], f"{path}.approval.on_reject")
-            if set(on_reject) - {"prompt", "max_attempts"}:
+            if set(on_reject) - APPROVAL_REJECT_FIELDS:
                 _fail(
                     f"{path}.approval.on_reject",
                     "unknown_approval_field",
@@ -802,7 +700,7 @@ def _parse_sidecar(
             "sidecar_authority",
             f"workflow sidecar cannot set trust or graph topology: {sorted(forbidden)[0]}",
         )
-    unknown = sorted(set(sidecar) - _SIDECAR_FIELDS)
+    unknown = sorted(set(sidecar) - SIDECAR_FIELDS)
     if unknown:
         _fail(
             "sidecar",

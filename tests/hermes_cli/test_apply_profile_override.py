@@ -199,6 +199,30 @@ class TestApplyProfileOverrideHermesHomeGuard:
         assert os.environ.get("HERMES_HOME") is None
         assert sys.argv == argv
 
+    def test_workflow_schema_language_profile_is_not_consumed(
+        self, tmp_path, monkeypatch
+    ):
+        """A nested command's documented --profile option stays local."""
+        argv = [
+            "hermes",
+            "workflow",
+            "schema",
+            "--profile",
+            "archon-2026-07",
+            "--json",
+        ]
+
+        result = _run_apply_profile_override(
+            tmp_path,
+            monkeypatch,
+            hermes_home=None,
+            active_profile=None,
+            argv=argv,
+        )
+
+        assert result is None
+        assert sys.argv == argv
+
     def test_profile_after_chat_subcommand_is_still_consumed(self, tmp_path, monkeypatch):
         """Profile flags historically work after normal Hermes subcommands."""
         result = _run_apply_profile_override(
@@ -322,4 +346,3 @@ class TestSupervisedChildIgnoresStickyProfile:
         result = os.environ.get("HERMES_HOME")
         assert result is not None
         assert result.endswith("coder")
-

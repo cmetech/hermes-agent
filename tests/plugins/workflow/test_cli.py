@@ -151,6 +151,65 @@ def test_cli_module_has_no_agent_provider_network_or_mcp_runtime_imports():
     assert imports.isdisjoint({"run_agent", "model_tools", "mcp", "requests", "httpx"})
 
 
+@pytest.mark.parametrize(
+    ("arguments", "expected_profile"),
+    [
+        (["schema", "--json"], "archon-2026-07"),
+        (["schema", "--profile", "hermes-legacy", "--json"], "hermes-legacy"),
+    ],
+)
+def test_schema_json_selects_profile_without_workflow_discovery(
+    arguments, expected_profile, tmp_path, capsys, monkeypatch
+):
+    workdir = tmp_path / "missing-workflow-directory"
+    profile = tmp_path / "missing-profile-directory"
+
+    def unexpected_call(*_args, **_kwargs):
+        raise AssertionError("schema must not discover workflows or call runtimes")
+
+    monkeypatch.setattr("plugins.workflow.cli._discover", unexpected_call)
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(profile),
+        *arguments,
+    ])
+
+    assert args.func(args, agent_runner=unexpected_call) == 0
+    output = capsys.readouterr()
+    contract = json.loads(output.out)
+    assert output.err == ""
+    assert contract["profile"] == expected_profile
+    assert not workdir.exists()
+    assert not profile.exists()
+
+
+def test_schema_json_is_compact_and_byte_deterministic(capsys):
+    parser = _parser()
+
+    first = parser.parse_args(["schema", "--json"])
+    assert first.func(first) == 0
+    first_output = capsys.readouterr().out
+    second = parser.parse_args(["schema", "--json"])
+    assert second.func(second) == 0
+    second_output = capsys.readouterr().out
+
+    assert first_output == second_output
+    assert first_output.count("\n") == 1
+    assert ": " not in first_output
+
+
+def test_schema_text_is_indented_json(capsys):
+    args = _parser().parse_args(["schema", "--profile", "hermes-legacy"])
+
+    assert args.func(args) == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert json.loads(output.out)["profile"] == "hermes-legacy"
+    assert "\n  \"compatibility_codes\"" in output.out
+
+
 def test_list_and_show_json_are_stable_and_redacted(workflow_writer, tmp_path, capsys):
     workdir = tmp_path / "repo"
     _write(workflow_writer, workdir)
