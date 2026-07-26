@@ -28,6 +28,7 @@ Design: docs/plans/2026-07-20-persistent-enrolled-browser-session-design.md
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import shutil
@@ -86,12 +87,37 @@ def _cdp_url_for(profile: browser_profiles.BrowserProfile) -> str:
 
 
 def _cdp_alive(cdp_url: str) -> bool:
-    """Return True when something is already serving CDP at ``cdp_url``."""
+    """Return True when something is already serving CDP at ``cdp_url``.
+
+    Liveness only -- no identity check. Used for the POST-launch readiness
+    poll, where we just spawned the browser ourselves and identity is already
+    known; do not use this to decide whether to reuse a PRE-existing listener.
+    """
     try:
         urllib.request.urlopen(f"{cdp_url}/json/version", timeout=CDP_PROBE_TIMEOUT_S)
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def _cdp_browser_identity(cdp_url: str) -> Optional[str]:
+    """Return the ``Browser`` string from /json/version, or None.
+
+    Reusing whatever answers on the port lets an unrelated listener -- or
+    another profile's browser -- inherit this profile's trust (EBL-004).
+    Fails CLOSED: any connection error, timeout, non-JSON body, missing
+    ``Browser`` key, or empty value returns None, which must lead to
+    launching our own browser, never to reusing the unknown listener.
+    """
+    try:
+        with urllib.request.urlopen(
+            f"{cdp_url}/json/version", timeout=CDP_PROBE_TIMEOUT_S
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+        browser = str(payload.get("Browser") or "").strip()
+        return browser or None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _spawn_browser(executable: str, args: List[str]) -> None:
@@ -119,8 +145,12 @@ def _ensure_enrolled_cdp(profile: browser_profiles.BrowserProfile, headless: boo
     """
     cdp_url = _cdp_url_for(profile)
 
-    if _cdp_alive(cdp_url):
-        logger.info("browser profile %r: CDP already listening; reusing", profile.name)
+    identity = _cdp_browser_identity(cdp_url)
+    if identity:
+        logger.info(
+            "browser profile %r: reusing CDP listener on %s (%s)",
+            profile.name, cdp_url, identity,
+        )
         return cdp_url
 
     executable = browser_profiles.resolve_executable(profile)

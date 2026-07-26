@@ -78,6 +78,34 @@ class TestLoadProfiles:
         assert browser_profiles.get_profile("default").trusted_origins == ()
 
 
+class TestPortCollision:
+    def test_duplicate_enrolled_ports_are_rejected(self, monkeypatch, caplog):
+        """Two profiles on one port bind one profile's trust to another's browser."""
+        monkeypatch.setattr(
+            browser_profiles, "_read_config",
+            lambda: {"browser": {"profiles": {
+                "a": {"kind": "enrolled", "cdp_port": 9222},
+                "b": {"kind": "enrolled", "cdp_port": 9222},
+            }}},
+        )
+        with caplog.at_level("WARNING"):
+            profiles = browser_profiles.load_profiles()
+        assert "a" in profiles
+        assert "b" not in profiles
+        assert any("cdp_port" in r.message for r in caplog.records)
+
+    def test_distinct_ports_both_load(self, monkeypatch):
+        monkeypatch.setattr(
+            browser_profiles, "_read_config",
+            lambda: {"browser": {"profiles": {
+                "a": {"kind": "enrolled", "cdp_port": 9222},
+                "b": {"kind": "enrolled", "cdp_port": 9333},
+            }}},
+        )
+        profiles = browser_profiles.load_profiles()
+        assert {"a", "b"} <= set(profiles)
+
+
 class TestMisconfiguredTrustedOrigins:
     """A string instead of a list must warn, not silently trust nothing.
 

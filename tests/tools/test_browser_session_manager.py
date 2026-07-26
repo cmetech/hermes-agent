@@ -65,7 +65,9 @@ def _cdp_dead_then_alive(calls, alive_after=2):
 class TestAcquireAttachOrLaunch:
     def test_reuses_already_running_browser_without_launching(self, monkeypatch, _stub_env):
         """The common real case: Edge is already listening on the debug port."""
-        monkeypatch.setattr(browser_session_manager, "_cdp_alive", lambda url: True)
+        monkeypatch.setattr(
+            browser_session_manager, "_cdp_browser_identity", lambda url: "Chrome/125.0"
+        )
         sess = browser_session_manager.acquire(profile="enrolled")
         assert _stub_env["spawned"] == []          # nothing launched
         assert sess.cdp_url == "http://127.0.0.1:9222"
@@ -200,3 +202,29 @@ class TestSpawnIsDetached:
         )
         browser_session_manager._spawn_browser("msedge.exe", ["--foo"])
         assert seen["kw"].get("creationflags") == 0x8 | 0x200
+
+
+class TestEndpointIdentity:
+    def test_foreign_listener_is_not_reused(self, monkeypatch):
+        """Any HTTP responder on the port must not be trusted as our browser."""
+        monkeypatch.setattr(
+            browser_session_manager, "_cdp_browser_identity", lambda url: None
+        )
+        monkeypatch.setattr(browser_session_manager, "_run_daemon_hygiene", lambda: None)
+        monkeypatch.setattr(
+            browser_profiles, "resolve_executable", lambda p: "/nonexistent/chrome"
+        )
+        # The identity check must be what gates reuse, not liveness — so the
+        # post-launch readiness poll never succeeds (nothing real is
+        # launched) and the profile never exposes CDP. Real makedirs/spawn
+        # are stubbed out: they are launch-mechanics side effects, not what
+        # this test is verifying.
+        monkeypatch.setattr(browser_session_manager.os, "makedirs", lambda *a, **kw: None)
+        monkeypatch.setattr(browser_session_manager, "_spawn_browser", lambda exe, args: None)
+        monkeypatch.setattr(browser_session_manager.time, "sleep", lambda s: None)
+        monkeypatch.setattr(browser_session_manager, "_cdp_alive", lambda url: False)
+        profile = browser_profiles.BrowserProfile(
+            name="corp", kind=browser_profiles.KIND_ENROLLED, cdp_port=9222
+        )
+        with pytest.raises(browser_session_manager.ProfileError):
+            browser_session_manager._ensure_enrolled_cdp(profile, headless=True)

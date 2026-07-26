@@ -131,6 +131,7 @@ def load_profiles() -> Dict[str, BrowserProfile]:
     config can never break ``/browser``.
     """
     profiles: Dict[str, BrowserProfile] = {DEFAULT_PROFILE_NAME: _builtin_default()}
+    used_ports: Dict[int, str] = {}
 
     cfg = _read_config()
     browser_cfg = cfg.get("browser") if isinstance(cfg, dict) else None
@@ -147,7 +148,10 @@ def load_profiles() -> Dict[str, BrowserProfile]:
             continue
         if key == DEFAULT_PROFILE_NAME:
             # Config may tune the default profile but never grant it trust,
-            # and never promote it to enrolled.
+            # and never promote it to enrolled. Do this BEFORE the port-
+            # collision check below: the reserved default profile is always
+            # ephemeral and never launches a browser on cdp_port, so it must
+            # never participate in (or be dropped by) that check.
             parsed = BrowserProfile(
                 name=DEFAULT_PROFILE_NAME,
                 kind=KIND_EPHEMERAL,
@@ -157,6 +161,16 @@ def load_profiles() -> Dict[str, BrowserProfile]:
                 trusted_origins=(),
                 headed=parsed.headed,
             )
+        if parsed.is_enrolled:
+            if parsed.cdp_port in used_ports:
+                logger.warning(
+                    "browser profile %r reuses cdp_port %d (already used by %r); "
+                    "ignoring it. Two profiles on one port make one profile's "
+                    "trust apply to the other's browser. Give each a unique port.",
+                    key, parsed.cdp_port, used_ports[parsed.cdp_port],
+                )
+                continue
+            used_ports[parsed.cdp_port] = key
         profiles[key] = parsed
     return profiles
 
