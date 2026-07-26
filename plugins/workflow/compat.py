@@ -3,28 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from enum import StrEnum
 from typing import TYPE_CHECKING, AbstractSet, Literal, Mapping
 
-from plugins.workflow.models import WorkflowPackage
+from plugins.workflow.models import (
+    CompatibilityFinding,
+    CompatibilityLevel,
+    WorkflowPackage,
+)
 
 if TYPE_CHECKING:
     from plugins.workflow.trust import WorkflowRiskSummary
-
-
-class CompatibilityLevel(StrEnum):
-    PORTABLE = "portable"
-    MAPPED = "mapped"
-    UNSUPPORTED = "unsupported"
-
-
-@dataclass(frozen=True)
-class CompatibilityFinding:
-    path: str
-    level: CompatibilityLevel
-    message: str
-    blocking: bool
-    code: str = "compatibility"
 
 
 @dataclass(frozen=True)
@@ -157,9 +145,22 @@ def _finding(
     level: CompatibilityLevel,
     message: str,
     *,
+    code: str,
     blocking: bool = False,
+    severity: str | None = None,
 ) -> None:
-    findings.append(CompatibilityFinding(path, level, message, blocking))
+    if any(finding.code == code and finding.path == path for finding in findings):
+        return
+    findings.append(
+        CompatibilityFinding(
+            path=path,
+            level=level,
+            message=message,
+            blocking=blocking,
+            code=code,
+            severity=severity or ("error" if blocking else "info"),
+        )
+    )
 
 
 def _provider_for(package: WorkflowPackage, node_index: int | None = None) -> str:
@@ -187,6 +188,7 @@ def _check_provider_field(
             path,
             CompatibilityLevel.MAPPED,
             f"{field} maps through {provider} capability {required}",
+            code="provider_field_mapped",
         )
     else:
         _finding(
@@ -194,6 +196,7 @@ def _check_provider_field(
             path,
             CompatibilityLevel.UNSUPPORTED,
             f"provider {provider} does not advertise {required} required by {field}",
+            code="provider_field_unsupported",
             blocking=True,
         )
 
@@ -211,7 +214,7 @@ def assess_compatibility(
     tools = available_tools
     services = available_services
     capabilities = provider_capabilities or {}
-    findings: list[CompatibilityFinding] = []
+    findings = list(package.compatibility_findings)
     options = package.definition.options
 
     for issue in package.validation_issues:
@@ -220,7 +223,9 @@ def assess_compatibility(
             issue.path,
             CompatibilityLevel.UNSUPPORTED,
             issue.message,
+            code=issue.code,
             blocking=issue.blocking,
+            severity=issue.severity,
         )
 
     for field in ("provider", "model"):
@@ -230,6 +235,7 @@ def assess_compatibility(
                 field,
                 CompatibilityLevel.MAPPED,
                 f"{field} resolves through Hermes provider profiles",
+                code="provider_profile_resolution",
             )
     if "persist_sessions" in options:
         _finding(
@@ -237,6 +243,7 @@ def assess_compatibility(
             "persist_sessions",
             CompatibilityLevel.MAPPED,
             "persist_sessions maps to the workflow node-session registry",
+            code="persistent_session_fingerprint",
         )
     for field in ("interactive", "tags"):
         if field in options:
@@ -245,6 +252,7 @@ def assess_compatibility(
                 field,
                 CompatibilityLevel.MAPPED,
                 f"{field} maps to Hermes invocation metadata",
+                code="invocation_metadata",
             )
     if "requires" in options:
         for index, service in enumerate(options["requires"]):
@@ -256,6 +264,7 @@ def assess_compatibility(
                 if missing
                 else CompatibilityLevel.MAPPED,
                 f"required service {service} {'is not configured' if missing else 'will be checked during preflight'}",
+                code="required_service",
                 blocking=missing,
             )
     if "worktree" in options:
@@ -266,6 +275,7 @@ def assess_compatibility(
                 "worktree.enabled",
                 CompatibilityLevel.UNSUPPORTED,
                 "workflow requires an explicitly supplied isolated workdir",
+                code="worktree_requirement",
                 blocking=True,
             )
         else:
@@ -274,6 +284,7 @@ def assess_compatibility(
                 "worktree",
                 CompatibilityLevel.MAPPED,
                 "caller-supplied workdir preserves worktree isolation",
+                code="worktree_requirement",
             )
     for field in _PROVIDER_FIELDS:
         if field in options:
@@ -294,6 +305,7 @@ def assess_compatibility(
                 f"{prefix}.context",
                 CompatibilityLevel.MAPPED,
                 "shared context resumes only a cache-fingerprint-compatible predecessor",
+                code="shared_context_fingerprint",
             )
         if node.node_type not in {"command", "prompt"}:
             for field in sorted(_AI_ONLY_FIELDS.intersection(node_options)):
@@ -302,6 +314,7 @@ def assess_compatibility(
                     f"{prefix}.{field}",
                     CompatibilityLevel.UNSUPPORTED,
                     f"{field} applies only to command and prompt nodes",
+                    code="field_not_applicable",
                     blocking=True,
                 )
             continue
@@ -311,6 +324,7 @@ def assess_compatibility(
                 f"{prefix}.persist_session",
                 CompatibilityLevel.MAPPED,
                 "persist_session maps to the profile-scoped node-session registry",
+                code="persistent_session_fingerprint",
             )
         for list_field in ("allowed_tools", "denied_tools"):
             for tool_index, requested in enumerate(node_options.get(list_field, ())):
@@ -323,6 +337,7 @@ def assess_compatibility(
                         path,
                         CompatibilityLevel.UNSUPPORTED,
                         f"unknown Archon tool alias: {requested}",
+                        code="unknown_tool_alias",
                         blocking=True,
                     )
                     continue
@@ -332,6 +347,7 @@ def assess_compatibility(
                         path,
                         CompatibilityLevel.UNSUPPORTED,
                         f"mapped Hermes tool is unavailable: {requested} -> {target}",
+                        code="unavailable_tool",
                         blocking=True,
                     )
                 else:
@@ -340,6 +356,7 @@ def assess_compatibility(
                         path,
                         CompatibilityLevel.MAPPED,
                         f"tool alias maps {requested} -> {target}",
+                        code="tool_alias_mapped",
                     )
         if "skills" in node_options:
             _finding(
@@ -347,6 +364,7 @@ def assess_compatibility(
                 f"{prefix}.skills",
                 CompatibilityLevel.MAPPED,
                 "skills are snapshotted into the node user message",
+                code="skill_snapshot",
             )
         if "mcp" in node_options:
             _finding(
@@ -358,6 +376,7 @@ def assess_compatibility(
                 "MCP servers start only inside the isolated node worker"
                 if mcp_available
                 else "Hermes MCP support is not available",
+                code="mcp_isolation",
                 blocking=not mcp_available,
             )
         if "agents" in node_options:
@@ -366,6 +385,7 @@ def assess_compatibility(
                 f"{prefix}.agents",
                 CompatibilityLevel.MAPPED,
                 "inline agents map to bounded workflow_agent child workers",
+                code="inline_agent_bounds",
             )
         for field in ("provider", "model"):
             if field in node_options:
@@ -374,6 +394,7 @@ def assess_compatibility(
                     f"{prefix}.{field}",
                     CompatibilityLevel.MAPPED,
                     f"{field} resolves through Hermes provider profiles",
+                    code="provider_profile_resolution",
                 )
         for field in (
             "effort",
@@ -400,6 +421,7 @@ def assess_compatibility(
                 "systemPrompt cannot change inside a shared cached session"
                 if shared
                 else "systemPrompt is fixed at fresh worker creation",
+                code="system_prompt_context",
                 blocking=shared,
             )
         for event in node_options.get("hooks", {}):
@@ -411,6 +433,7 @@ def assess_compatibility(
                         path,
                         CompatibilityLevel.UNSUPPORTED,
                         f"{event} requires MCP support",
+                        code="hook_unsupported",
                         blocking=True,
                     )
                 else:
@@ -419,6 +442,7 @@ def assess_compatibility(
                         path,
                         CompatibilityLevel.MAPPED,
                         f"{event} maps to isolated Hermes worker lifecycle",
+                        code="hook_mapped",
                     )
             elif event in UNSUPPORTED_HOOK_EVENTS:
                 _finding(
@@ -426,6 +450,7 @@ def assess_compatibility(
                     path,
                     CompatibilityLevel.UNSUPPORTED,
                     f"{event} has no equivalent Hermes node-worker contract",
+                    code="hook_unsupported",
                     blocking=True,
                 )
 

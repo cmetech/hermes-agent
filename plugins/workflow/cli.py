@@ -22,6 +22,7 @@ from typing import AbstractSet, Callable, Iterable, Mapping
 import yaml
 
 from hermes_constants import get_hermes_home
+from plugins.workflow.language import language_projection
 from plugins.workflow.compat import (
     ARCHON_TOOL_ALIASES,
     CompatibilityFinding,
@@ -35,6 +36,7 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.discovery import discover_workflows
 from plugins.workflow.models import (
     ValidationIssue,
+    WorkflowLanguageProfile,
     WorkflowPackage,
     WorkflowRuntimeConfig,
     WorkflowValidationError,
@@ -898,12 +900,22 @@ def _cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _language_payload(package: WorkflowPackage) -> dict[str, object]:
+    metadata = package.language
+    payload = language_projection(metadata)
+    payload["legacy"] = (
+        metadata.effective_profile is WorkflowLanguageProfile.HERMES_LEGACY
+    )
+    return payload
+
+
 def _cmd_validate(args: argparse.Namespace) -> int:
     package = _resolve(args, args.name)
     issues = validate_package(package)
     payload = {
         "name": package.definition.name,
         "valid": not any(issue.blocking for issue in issues),
+        "language": _language_payload(package),
         "issues": [
             {
                 "path": issue.path,
@@ -929,6 +941,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         print(
             f"{package.definition.name}: {'valid' if payload['valid'] else 'invalid'}"
         )
+        print(f"Language: {payload['language']['effective_profile']}")
         for issue in payload["issues"]:
             print(f"- {issue['severity']}: {issue['path']}: {issue['message']}")
     return 0 if payload["valid"] else EXIT_BLOCKING_FINDING
@@ -955,49 +968,8 @@ def _doctor_finding(
         message=message,
         blocking=blocking,
         code=code,
+        severity="error" if blocking else "info",
     )
-
-
-def _compatibility_code(finding: CompatibilityFinding) -> str:
-    message = finding.message.lower()
-    if "unknown archon tool alias" in message:
-        return "unknown_tool_alias"
-    if "mapped hermes tool is unavailable" in message:
-        return "unavailable_tool"
-    if ".hooks." in finding.path:
-        return "hook_unsupported" if finding.blocking else "hook_mapped"
-    if "provider" in message and "does not advertise" in message:
-        return "provider_field_unsupported"
-    if finding.path.endswith("persist_session") or finding.path == "persist_sessions":
-        return "persistent_session_fingerprint"
-    if finding.path.endswith(".mcp"):
-        return "mcp_isolation"
-    if finding.path.endswith(".skills"):
-        return "skill_snapshot"
-    if finding.path.endswith(".agents"):
-        return "inline_agent_bounds"
-    if finding.path.endswith("output_format"):
-        return "output_schema_enforcement"
-    if finding.path.startswith("requires["):
-        return "required_service"
-    if finding.path.startswith("worktree"):
-        return "worktree_requirement"
-    return finding.code
-
-
-def _coded_compatibility_findings(
-    report: CompatibilityReport,
-) -> list[CompatibilityFinding]:
-    return [
-        CompatibilityFinding(
-            path=finding.path,
-            level=finding.level,
-            message=finding.message,
-            blocking=finding.blocking,
-            code=_compatibility_code(finding),
-        )
-        for finding in report.findings
-    ]
 
 
 def _input_requirements(
@@ -1188,7 +1160,7 @@ def doctor_package(
         isolated_workdir=isolated_workdir,
         mcp_available=mcp_available,
     )
-    findings = _coded_compatibility_findings(compatibility)
+    findings = list(compatibility.findings)
     findings.extend(
         _provider_override_findings(package, hermes_home=hermes_home)
     )
@@ -1390,6 +1362,7 @@ def doctor_package(
         )
     )
 
+    findings = list({(finding.code, finding.path): finding for finding in findings}.values())
     trust_state = WorkflowTrustStore(hermes_home).check(
         package_digest.sha256, risk_digest=risk.risk_digest
     )
@@ -1421,6 +1394,7 @@ def _doctor_payload(
     payload = report.to_dict()
     payload.update({
         "name": package.definition.name,
+        "language": _language_payload(package),
         "compatibility": _doctor_compatibility_level(report.findings).value,
         "remediation": (
             "Resolve blocking compatibility findings, then rerun doctor and trust the current digest."
@@ -1477,16 +1451,7 @@ def _doctor_payload(
             "Resolve blocking findings for the requested mode, then rerun doctor."
         )
     if compat_report:
-        payload["compatibility_findings"] = [
-            {
-                "path": finding.path,
-                "level": finding.level.value,
-                "message": finding.message,
-                "blocking": finding.blocking,
-                "code": finding.code,
-            }
-            for finding in report.findings
-        ]
+        payload["compatibility_findings"] = list(payload.get("findings", []))
     return payload
 
 
@@ -1513,8 +1478,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     else:
         print(f"Workflow: {payload['name']}")
         print(f"Package digest: {payload['package_digest']}")
-        print(f"Risk digest: {payload['risk_digest']}")
+        print(f"Risk digest: {payload['risk_summary']['risk_digest']}")
         print(f"Compatibility: {payload['compatibility']}")
+        print(f"Language: {payload['language']['effective_profile']}")
         print(
             "Execution environment: "
             f"{payload['risk_summary']['execution_environment']}"

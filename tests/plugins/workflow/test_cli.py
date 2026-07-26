@@ -278,12 +278,32 @@ def test_validate_doctor_trust_and_untrust(workflow_writer, tmp_path, capsys):
 
     args = parser.parse_args([*common, "validate", "sample", "--json"])
     assert args.func(args) == 0
-    assert _json_result(capsys)["valid"] is True
+    validation = _json_result(capsys)
+    assert validation["valid"] is True
+    assert validation["language"] == {
+        "declared_profile": None,
+        "effective_profile": "hermes-legacy",
+        "normalizer_version": 1,
+        "normalized_definition_digest": load_workflow(
+            path
+        ).language.normalized_definition_digest,
+        "legacy": True,
+    }
 
     args = parser.parse_args([*common, "doctor", "sample", "--compat-report", "--json"])
     assert args.func(args) == 0
     doctor = _json_result(capsys)
     assert doctor["package_digest"]
+    assert doctor["language"] == validation["language"]
+    legacy = next(
+        finding
+        for finding in doctor["findings"]
+        if finding["code"] == "legacy_language_profile"
+    )
+    assert legacy["severity"] == "warning"
+    assert legacy["effective_profile"] == "hermes-legacy"
+    assert legacy["migration"]
+    assert doctor["compatibility_findings"] == doctor["findings"]
     assert "SECRET_BODY" not in json.dumps(doctor)
 
     args = parser.parse_args([
@@ -315,6 +335,24 @@ def test_validate_doctor_trust_and_untrust(workflow_writer, tmp_path, capsys):
     args = parser.parse_args([*common, "untrust", "sample", "--json"])
     assert args.func(args) == 0
     assert _json_result(capsys)["status"] == "untrusted"
+
+
+def test_validate_and_doctor_text_include_effective_language_profile(
+    workflow_writer, tmp_path, capsys
+):
+    workdir = tmp_path / "repo"
+    _write(workflow_writer, workdir)
+    profile = tmp_path / "profile"
+    parser = _parser()
+    common = ["--workdir", str(workdir), "--hermes-home", str(profile)]
+
+    validate_args = parser.parse_args([*common, "validate", "sample"])
+    assert validate_args.func(validate_args) == 0
+    assert "Language: hermes-legacy" in capsys.readouterr().out
+
+    doctor_args = parser.parse_args([*common, "doctor", "sample"])
+    assert doctor_args.func(doctor_args) == 0
+    assert "Language: hermes-legacy" in capsys.readouterr().out
 
 
 def test_trust_rejects_package_mutation_during_admission(

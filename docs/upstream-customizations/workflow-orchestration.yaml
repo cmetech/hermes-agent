@@ -3148,3 +3148,49 @@ upstream_changes:
     versioned workflow normalization boundary with deterministic semantic
     fingerprints.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-language-profile-normalization
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/language.py
+  - plugins/workflow/models.py
+  - plugins/workflow/schema.py
+  - plugins/workflow/discovery.py
+  - plugins/workflow/compat.py
+  - plugins/workflow/cli.py
+  owned_symbols:
+  - CompatibilityLevel
+  - CompatibilityFinding
+  - WorkflowPackage.source_definition
+  - WorkflowPackage.language
+  - WorkflowPackage.compatibility_findings
+  - language_compatibility_findings
+  - profile-aware unknown top-level field policy
+  - companion-aware discovery cache signature
+  - stable compatibility finding codes
+  - validate and doctor language projections
+  tests:
+  - tests/plugins/workflow/test_schema.py
+  - tests/plugins/workflow/test_discovery.py
+  - tests/plugins/workflow/test_compat_matrix.py
+  - tests/plugins/workflow/test_cli.py
+  - tests/plugins/workflow/test_catalog_api.py
+  expected_commit_subject: 'feat(workflow): normalize declared language profiles'
+  upstream_candidate: true
+  merge_guidance: >-
+    Resolve and validate the companion language profile before applying
+    profile-dependent workflow field policy, call the versioned normalizer
+    exactly once per load, retain the immutable source definition alongside the
+    normalized execution definition, and include companion create, edit, and
+    delete identity in discovery caching. Preserve one dependency-neutral
+    compatibility finding runtime type, backend-issued stable codes and profile
+    metadata, and identical validate and doctor language projections. Workflows
+    without a declaration and explicit hermes-legacy workflows must remain
+    permissive with actionable warnings; declared archon-2026-07 workflows must
+    fail closed only for invalid or currently unenforceable semantics.
+  removal_condition: >-
+    Remove when upstream provides equivalent profile-before-policy loading,
+    companion-aware cache invalidation, source and normalized package contracts,
+    stable coded compatibility findings, and CLI language projections while
+    preserving legacy behavior and Archon fail-closed semantics.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

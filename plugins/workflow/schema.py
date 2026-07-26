@@ -11,11 +11,19 @@ from typing import Any
 
 import yaml
 
+from plugins.workflow.language import (
+    WORKFLOW_NORMALIZER_VERSION,
+    WorkflowLanguageCompatibilityError,
+    language_compatibility_findings,
+    normalize_workflow,
+    resolve_language_profile,
+)
 from plugins.workflow.models import (
     ValidationIssue,
     WorkflowDefinition,
     WorkflowNode,
     WorkflowPackage,
+    WorkflowLanguageProfile,
     WorkflowRuntimeConfig,
     WorkflowValidationError,
     freeze_value,
@@ -138,6 +146,7 @@ _WHEN_EXPRESSION = re.compile(
 _INLINE_SCRIPT_METACHAR = re.compile(r"[\s;(){}&|<>$`\"']")
 _MAX_YAML_BYTES = 2 * 1024 * 1024
 _SIDECAR_FIELDS = frozenset({
+    "language_compatibility",
     "delivery_defaults",
     "required_services",
     "retention",
@@ -774,7 +783,6 @@ def _validate_graph(nodes: tuple[WorkflowNode, ...]) -> None:
 
 def _parse_sidecar(
     sidecar_path: Path,
-    node_ids: frozenset[str],
     data: bytes,
 ) -> tuple[Path, Mapping[str, Any]]:
     try:
@@ -825,13 +833,6 @@ def _parse_sidecar(
             "invalid_sidecar",
             "outward_action_nodes must be a list of node identifiers",
         )
-    for node_id in outward:
-        if node_id not in node_ids:
-            _fail(
-                "sidecar.outward_action_nodes",
-                "unknown_sidecar_node",
-                f"outward_action_nodes references unknown node: {node_id}",
-            )
     if "required_secrets" in sidecar:
         secrets = sidecar["required_secrets"]
         if not isinstance(secrets, list) or any(
@@ -870,9 +871,19 @@ def _parse_sidecar(
     return sidecar_path, freeze_value(sidecar)
 
 
-def _load_sidecar(
-    path: Path, node_ids: frozenset[str]
-) -> tuple[Path | None, Mapping[str, Any]]:
+def _validate_sidecar_node_references(
+    sidecar: Mapping[str, Any], node_ids: frozenset[str]
+) -> None:
+    for node_id in sidecar.get("outward_action_nodes", ()):
+        if node_id not in node_ids:
+            _fail(
+                "sidecar.outward_action_nodes",
+                "unknown_sidecar_node",
+                f"outward_action_nodes references unknown node: {node_id}",
+            )
+
+
+def _load_sidecar(path: Path) -> tuple[Path | None, Mapping[str, Any]]:
     sidecar_path = path.with_name(f"{path.stem}.hermes.yaml")
     if not sidecar_path.is_file():
         return None, freeze_value({})
@@ -880,7 +891,7 @@ def _load_sidecar(
         data = sidecar_path.read_bytes()
     except OSError as exc:
         _fail("sidecar", "invalid_sidecar", f"invalid workflow sidecar: {exc}")
-    return _parse_sidecar(sidecar_path, node_ids, data)
+    return _parse_sidecar(sidecar_path, data)
 
 
 def _package_root(path: Path) -> Path:
@@ -963,7 +974,36 @@ def _load_workflow_bytes(
             "self_trust",
             "workflow package cannot declare trust",
         )
+    if sidecar_bytes is _READ_SIDECAR_FROM_DISK:
+        sidecar_path, sidecar = _load_sidecar(workflow_path)
+    elif sidecar_bytes is None:
+        sidecar_path, sidecar = None, freeze_value({})
+    else:
+        assert isinstance(sidecar_bytes, bytes)
+        sidecar_path, sidecar = _parse_sidecar(
+            workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml"),
+            sidecar_bytes,
+        )
+    try:
+        selection = resolve_language_profile(sidecar)
+    except WorkflowLanguageCompatibilityError as exc:
+        _fail("sidecar.language_compatibility", exc.code, str(exc))
     unknown_top = sorted(set(document) - TOP_LEVEL_FIELDS)
+    if (
+        unknown_top
+        and selection.effective_profile is WorkflowLanguageProfile.ARCHON_2026_07
+    ):
+        raise WorkflowValidationError(
+            tuple(
+                ValidationIssue(
+                    path=field,
+                    code="archon_unknown_top_level_field",
+                    message=f"Archon profile does not support top-level field: {field}",
+                    source_line=top_lines.get(field),
+                )
+                for field in unknown_top
+            )
+        )
     issues = tuple(
         ValidationIssue(
             path=field,
@@ -1007,25 +1047,25 @@ def _load_workflow_bytes(
         source_path=workflow_path,
     )
     node_ids = frozenset(node.id for node in nodes)
-    if sidecar_bytes is _READ_SIDECAR_FROM_DISK:
-        sidecar_path, sidecar = _load_sidecar(workflow_path, node_ids)
-    elif sidecar_bytes is None:
-        sidecar_path, sidecar = None, freeze_value({})
-    else:
-        assert isinstance(sidecar_bytes, bytes)
-        sidecar_path, sidecar = _parse_sidecar(
-            workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml"),
-            node_ids,
-            sidecar_bytes,
-        )
+    _validate_sidecar_node_references(sidecar, node_ids)
+    normalized = normalize_workflow(
+        definition,
+        selection=selection,
+        normalizer_version=WORKFLOW_NORMALIZER_VERSION,
+    )
     return WorkflowPackage(
-        definition=definition,
+        source_definition=definition,
+        definition=normalized.definition,
         root=_package_root(workflow_path),
         workflow_path=workflow_path,
         sidecar_path=sidecar_path,
         sidecar=sidecar,
         source=source,
         precedence=precedence,
+        language=normalized.metadata,
+        compatibility_findings=language_compatibility_findings(
+            definition, normalized.metadata
+        ),
         validation_issues=issues,
     )
 

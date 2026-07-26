@@ -132,8 +132,31 @@ class WorkflowLanguageMetadata:
     normalized_definition_digest: str
 
 
+class CompatibilityLevel(StrEnum):
+    PORTABLE = "portable"
+    MAPPED = "mapped"
+    UNSUPPORTED = "unsupported"
+
+
+@dataclass(frozen=True)
+class CompatibilityFinding:
+    path: str
+    level: CompatibilityLevel
+    message: str
+    blocking: bool
+    code: str = "compatibility"
+    severity: str | None = None
+    effective_profile: WorkflowLanguageProfile | None = None
+    migration: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.severity is None:
+            object.__setattr__(self, "severity", "error" if self.blocking else "info")
+
+
 @dataclass(frozen=True)
 class WorkflowPackage:
+    source_definition: WorkflowDefinition
     definition: WorkflowDefinition
     root: Path
     workflow_path: Path
@@ -141,6 +164,8 @@ class WorkflowPackage:
     sidecar: Mapping[str, Any]
     source: str
     precedence: int
+    language: WorkflowLanguageMetadata
+    compatibility_findings: tuple[CompatibilityFinding, ...]
     validation_issues: tuple[ValidationIssue, ...] = ()
 
 

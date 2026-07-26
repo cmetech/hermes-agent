@@ -137,3 +137,42 @@ def test_successful_parse_cache_invalidates_on_content_change(
 
     assert first.definition.description == "first"
     assert second.definition.description == "other"
+
+
+def test_parse_cache_invalidates_when_companion_is_created_edited_and_deleted(
+    workflow_writer, tmp_path
+):
+    clear_discovery_cache()
+    workdir = tmp_path / "repo"
+    path = workflow_writer(workdir / ".hermes" / "workflows", name="cached")
+    companion = path.with_name(f"{path.stem}.hermes.yaml")
+
+    absent = discover_workflows(
+        workdir, tmp_path / "profile", tmp_path / "home"
+    )[0]
+    companion.write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    created = discover_workflows(
+        workdir, tmp_path / "profile", tmp_path / "home"
+    )[0]
+    created_stat = companion.stat()
+    companion.write_text(
+        "language_compatibility: hermes-legacy \n", encoding="utf-8"
+    )
+    os.utime(
+        companion,
+        ns=(created_stat.st_atime_ns, created_stat.st_mtime_ns),
+    )
+    edited = discover_workflows(
+        workdir, tmp_path / "profile", tmp_path / "home"
+    )[0]
+    companion.unlink()
+    deleted = discover_workflows(
+        workdir, tmp_path / "profile", tmp_path / "home"
+    )[0]
+
+    assert absent.language.declared_profile is None
+    assert created.language.effective_profile.value == "archon-2026-07"
+    assert edited.language.declared_profile.value == "hermes-legacy"
+    assert deleted.language.declared_profile is None

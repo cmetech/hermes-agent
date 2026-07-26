@@ -11,6 +11,8 @@ import math
 from typing import Any, Mapping
 
 from plugins.workflow.models import (
+    CompatibilityFinding,
+    CompatibilityLevel,
     WorkflowDefinition,
     WorkflowLanguageMetadata,
     WorkflowLanguageProfile,
@@ -104,6 +106,150 @@ def normalize_workflow(
     # Version 1 is an identity normalizer. Future versions may transform at
     # this single, explicit boundary without changing source diagnostics.
     return NormalizedWorkflow(definition=source_definition, metadata=metadata)
+
+
+def language_compatibility_findings(
+    source_definition: WorkflowDefinition,
+    metadata: WorkflowLanguageMetadata,
+) -> tuple[CompatibilityFinding, ...]:
+    """Return profile-specific language findings for one source definition."""
+    profile = metadata.effective_profile
+    findings: list[CompatibilityFinding] = []
+
+    def add(
+        path: str,
+        code: str,
+        message: str,
+        migration: str,
+        *,
+        blocking: bool,
+    ) -> None:
+        findings.append(
+            CompatibilityFinding(
+                path=path,
+                level=(
+                    CompatibilityLevel.UNSUPPORTED
+                    if blocking
+                    else CompatibilityLevel.MAPPED
+                ),
+                message=message,
+                blocking=blocking,
+                code=code,
+                severity="error" if blocking else "warning",
+                effective_profile=profile,
+                migration=migration,
+            )
+        )
+
+    if profile is WorkflowLanguageProfile.HERMES_LEGACY:
+        add(
+            "sidecar.language_compatibility",
+            "legacy_language_profile",
+            "workflow uses permissive Hermes legacy language semantics",
+            "Declare archon-2026-07 after workflow doctor reports no blocking findings.",
+            blocking=False,
+        )
+
+    for index, node in enumerate(source_definition.nodes):
+        options = node.options
+        prefix = f"nodes[{index}]"
+        if profile is WorkflowLanguageProfile.HERMES_LEGACY:
+            if "timeout" in options:
+                add(
+                    f"{prefix}.timeout",
+                    "legacy_timeout_seconds",
+                    "legacy timeout is interpreted in seconds",
+                    "Convert timeout seconds to milliseconds before changing profiles.",
+                    blocking=False,
+                )
+            retry = options.get("retry")
+            if isinstance(retry, Mapping) and "max_attempts" in retry:
+                add(
+                    f"{prefix}.retry.max_attempts",
+                    "legacy_retry_total_attempts",
+                    "legacy retry.max_attempts counts total attempts",
+                    "Account for Archon retry-count semantics in Phase 3 before changing profiles.",
+                    blocking=False,
+                )
+            if "output_format" in options:
+                add(
+                    f"{prefix}.output_format",
+                    "legacy_output_format_post_validation",
+                    "legacy output_format is validated after model execution",
+                    "Wait for Phase 2 output-format enforcement before changing profiles.",
+                    blocking=False,
+                )
+            if "output_type" in options:
+                add(
+                    f"{prefix}.output_type",
+                    "legacy_output_type_not_published",
+                    "legacy output_type does not publish a typed artifact",
+                    "Wait for Phase 2 typed artifacts before changing profiles.",
+                    blocking=False,
+                )
+            continue
+
+        if "timeout" in options:
+            add(
+                f"{prefix}.timeout",
+                "archon_timeout_semantics_unavailable",
+                "Archon timeout semantics are not enforceable in Phase 1",
+                "Remove timeout or wait for Phase 3 timeout semantics.",
+                blocking=True,
+            )
+        if "retry" in options:
+            add(
+                f"{prefix}.retry",
+                "archon_retry_semantics_unavailable",
+                "Archon retry semantics are not enforceable in Phase 1",
+                "Remove retry or wait for Phase 3 retry semantics.",
+                blocking=True,
+            )
+        if "output_format" in options:
+            add(
+                f"{prefix}.output_format",
+                "archon_output_format_unavailable",
+                "Archon output_format enforcement is not available in Phase 1",
+                "Remove output_format or wait for Phase 2 enforcement.",
+                blocking=True,
+            )
+        if "output_type" in options:
+            add(
+                f"{prefix}.output_type",
+                "archon_output_type_unavailable",
+                "Archon output_type artifacts are not available in Phase 1",
+                "Remove output_type or wait for Phase 2 typed artifacts.",
+                blocking=True,
+            )
+        if "maxBudgetUsd" in options:
+            add(
+                f"{prefix}.maxBudgetUsd",
+                "archon_budget_enforcement_unavailable",
+                "Archon budget enforcement is not available in Phase 1",
+                "Remove maxBudgetUsd or wait for Phase 5 budget enforcement.",
+                blocking=True,
+            )
+        if "sandbox" in options:
+            add(
+                f"{prefix}.sandbox",
+                "archon_sandbox_enforcement_unavailable",
+                "Archon sandbox enforcement is not available in Phase 1",
+                "Remove sandbox or wait for Phase 5 sandbox enforcement.",
+                blocking=True,
+            )
+
+    if (
+        profile is WorkflowLanguageProfile.ARCHON_2026_07
+        and "sandbox" in source_definition.options
+    ):
+        add(
+            "sandbox",
+            "archon_sandbox_enforcement_unavailable",
+            "Archon sandbox enforcement is not available in Phase 1",
+            "Remove sandbox or wait for Phase 5 sandbox enforcement.",
+            blocking=True,
+        )
+    return tuple(findings)
 
 
 def bind_semantic_fingerprint(

@@ -331,6 +331,13 @@ def test_workflow_catalog_keeps_isolation_incompatibility_scenario_local(
     assert rows["approval-gate"]["compatibility"]["runnable"] is False
     assert rows["approval-gate"]["compatibility"]["findings"] == [
         {
+            "blocking": False,
+            "code": "legacy_language_profile",
+            "level": "mapped",
+            "message": "workflow uses permissive Hermes legacy language semantics",
+            "path": "sidecar.language_compatibility",
+        },
+        {
             "blocking": True,
             "code": "execution_environment_unavailable",
             "level": "unsupported",
