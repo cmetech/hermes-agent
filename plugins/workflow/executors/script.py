@@ -81,7 +81,10 @@ class ScriptExecutor:
                     "-e",
                     variables.render_prompt(str(node.value)),
                 ], warnings
-            resource = ResourceResolver(context.run_directory).script(
+            resource = ResourceResolver(
+                context.run_directory,
+                sealed_paths=context.sealed_resource_paths,
+            ).script(
                 str(node.value), runtime=runtime
             )
             return [runtime_path, "--no-env-file", "run", str(resource.path)], warnings
@@ -91,7 +94,10 @@ class ScriptExecutor:
         if inline:
             argv.extend(("python", "-c", variables.render_prompt(str(node.value))))
         else:
-            resource = ResourceResolver(context.run_directory).script(
+            resource = ResourceResolver(
+                context.run_directory,
+                sealed_paths=context.sealed_resource_paths,
+            ).script(
                 str(node.value), runtime=runtime
             )
             argv.extend(("python", str(resource.path)))

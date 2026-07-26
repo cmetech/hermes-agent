@@ -1763,7 +1763,7 @@ def _admit_resource_rich_scheduled_user(
                 "id": "inspect",
                 "command": "inspect",
                 "skills": ["parent-skill"],
-                "mcp": "mcp/echo.yaml",
+                "mcp": "echo",
                 "agents": {
                     "reviewer": {
                         "description": "review",
@@ -1863,6 +1863,46 @@ def test_every_execution_readable_sealed_resource_is_revalidated(
             ).fetchone()[0]
             == 0
         )
+
+
+@pytest.mark.parametrize(
+    ("shadow_relative", "content"),
+    [
+        pytest.param(
+            "scripts/helper",
+            "print('unsealed script shadow')\n",
+            id="script-extensionless",
+        ),
+        pytest.param(
+            "mcp/echo",
+            "command: python\nargs: [-c, 'print(2)']\n",
+            id="mcp-extensionless",
+        ),
+    ],
+)
+def test_scheduled_revalidation_rejects_unsealed_resource_precedence_shadow(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+    shadow_relative: str,
+    content: str,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, run_id, due, identity, epoch = _admit_resource_rich_scheduled_user(
+        home,
+        workflow_writer,
+        monkeypatch,
+        binding=binding,
+    )
+    shadow = store.run_directory(run_id) / shadow_relative
+    shadow.write_text(content, encoding="utf-8")
+
+    failed = _advance_with_binding(store, run_id, due, identity, epoch, binding)
+
+    assert failed["status"] == "failed"
+    assert failed["last_error"]["code"] == "schedule_revalidation_failed"
 
 
 def _admit_scheduled_project(

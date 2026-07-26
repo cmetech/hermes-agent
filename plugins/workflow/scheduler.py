@@ -45,7 +45,7 @@ from plugins.workflow.models import (
     WorkflowRuntimeConfig,
 )
 from plugins.workflow.resources import VariableContext
-from plugins.workflow.schema import load_workflow_snapshot
+from plugins.workflow.schema import is_inline_script, load_workflow_snapshot
 from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.store import NodeClaim, RunStore, StorageQuotaError
 from tools.managed_process import ProcessResourceLimits, TerminationPolicy
@@ -328,6 +328,7 @@ class RunScheduler:
         self._active_runs: set[str] = set()
         self._submitted_runs: set[str] = set()
         self._active_executions = 0
+        self._verified_sealed_paths: dict[str, frozenset[str] | None] = {}
         self._submission_pool = ThreadPoolExecutor(
             max_workers=self.max_parallel_nodes,
             thread_name_prefix="workflow-run",
@@ -527,6 +528,8 @@ class RunScheduler:
             self.store.transition_pending_nodes(run_id, transitions)
 
     def _load_run_package(self, run_id: str) -> WorkflowPackage:
+        with self._activity:
+            self._verified_sealed_paths.pop(run_id, None)
         run_directory = self.store.run_directory(run_id)
         definition = run_directory / "definition.yaml"
         policy = run_directory / "policy.yaml"
@@ -573,6 +576,7 @@ class RunScheduler:
             )
 
         projected_snapshot_digest = projection.get("sealed_snapshot_digest")
+        verified_sealed_paths: frozenset[str] | None = None
         if snapshot is not None:
             if (
                 not isinstance(projected_snapshot_digest, str)
@@ -596,6 +600,7 @@ class RunScheduler:
                 raise integrity_error("sealed workflow tree is unreadable") from exc
             if actual_snapshot_digest != projected_snapshot_digest:
                 raise integrity_error("sealed workflow tree identity changed")
+            verified_sealed_paths = frozenset(sealed_paths)
         elif projected_snapshot_digest is not None:
             raise WorkflowLanguageCompatibilityError(
                 "workflow_language_snapshot_missing",
@@ -632,7 +637,73 @@ class RunScheduler:
                 expected_package_digest,
                 snapshot,
             )
+        else:
+            verified_sealed_paths = self._legacy_resource_paths(
+                package, run_directory=run_directory
+            )
+        with self._activity:
+            self._verified_sealed_paths[run_id] = verified_sealed_paths
         return package
+
+    @staticmethod
+    def _legacy_resource_paths(
+        package: WorkflowPackage, *, run_directory: Path
+    ) -> frozenset[str]:
+        """Bind legacy resolution while rejecting ambiguous shadow candidates."""
+        sealed_package = replace(package, root=run_directory)
+
+        def reject_ambiguous(candidates: tuple[Path, ...], kind: str) -> None:
+            existing = tuple(
+                path
+                for path in dict.fromkeys(candidates)
+                if path.exists() or path.is_symlink()
+            )
+            if len(existing) > 1:
+                raise WorkflowLanguageCompatibilityError(
+                    "workflow_snapshot_integrity_mismatch",
+                    f"pre-language workflow has ambiguous {kind} resources",
+                )
+
+        for node in sealed_package.definition.nodes:
+            if (
+                node.node_type == "script"
+                and isinstance(node.value, str)
+                and not is_inline_script(node.value)
+            ):
+                base = sealed_package.root / "scripts" / node.value
+                if node.options["runtime"] == "uv":
+                    reject_ambiguous((base, base.with_suffix(".py")), "script")
+                else:
+                    reject_ambiguous(
+                        (base, base.with_suffix(".ts"), base.with_suffix(".js")),
+                        "script",
+                    )
+            mcp_value = node.options.get("mcp")
+            references = (
+                (mcp_value,)
+                if isinstance(mcp_value, str)
+                else tuple(mcp_value or ())
+                if isinstance(mcp_value, tuple)
+                else ()
+            )
+            for reference in references:
+                direct = sealed_package.root / reference
+                reject_ambiguous(
+                    (
+                        direct,
+                        sealed_package.root / "mcp" / reference,
+                        (sealed_package.root / "mcp" / reference).with_suffix(
+                            ".yaml"
+                        ),
+                    ),
+                    "MCP",
+                )
+
+        from plugins.workflow.trust import compute_package_digest
+
+        return frozenset(
+            compute_package_digest(sealed_package).covered_relative_paths
+        )
 
     def _run_execution_limits(self, package: WorkflowPackage) -> RunExecutionLimits:
         limits = package.sidecar.get("limits", {})
@@ -653,7 +724,9 @@ class RunScheduler:
     def _prepare_run_package(self, run_id: str, schedule_revalidation):
         try:
             package = self._load_run_package(run_id)
-            return package, self._run_execution_limits(package)
+            with self._activity:
+                sealed_paths = self._verified_sealed_paths.pop(run_id, None)
+            return package, self._run_execution_limits(package), sealed_paths
         except Exception:
             if schedule_revalidation is None:
                 raise
@@ -783,6 +856,7 @@ class RunScheduler:
         package,
         projection: dict[str, object],
         execution_limits: RunExecutionLimits,
+        sealed_resource_paths: frozenset[str] | None,
     ) -> None:
         with self._activity:
             self._active_executions += 1
@@ -974,6 +1048,7 @@ class RunScheduler:
                                     claim, identity, cleaned=cleaned
                                 )
                             ),
+                            sealed_resource_paths=sealed_resource_paths,
                             monotonic=self._monotonic,
                             termination_policy=TerminationPolicy(
                                 cooperative_grace_seconds=(
@@ -1116,7 +1191,7 @@ class RunScheduler:
         prepared_package = self._prepare_run_package(run_id, authorization)
         if prepared_package is None:
             return self.store.load_run(run_id)
-        package, execution_limits = prepared_package
+        package, execution_limits, sealed_resource_paths = prepared_package
         by_id = {node.id: node for node in package.definition.nodes}
         foreground_owner_id, foreground_owner_epoch = self._foreground_claim_token(
             self.store.load_run(run_id)
@@ -1224,6 +1299,7 @@ class RunScheduler:
                             package,
                             snapshot,
                             execution_limits,
+                            sealed_resource_paths,
                         )
                         for claim, node, snapshot in claims
                     ]
@@ -1283,6 +1359,7 @@ class RunScheduler:
         run_ids = authorized_run_ids
         packages = {}
         execution_limits = {}
+        sealed_resource_paths = {}
         prepared_run_ids = []
         for run_id in run_ids:
             prepared_package = self._prepare_run_package(
@@ -1291,9 +1368,10 @@ class RunScheduler:
             )
             if prepared_package is None:
                 continue
-            package, limits = prepared_package
+            package, limits, paths = prepared_package
             packages[run_id] = package
             execution_limits[run_id] = limits
+            sealed_resource_paths[run_id] = paths
             prepared_run_ids.append(run_id)
         run_ids = prepared_run_ids
         foreground_tokens = {
@@ -1438,6 +1516,7 @@ class RunScheduler:
                             packages[run_id],
                             snapshots[run_id],
                             execution_limits[run_id],
+                            sealed_resource_paths[run_id],
                         ))
                         fair_cursor = (active.index(run_id) + 1) % len(active)
                         claimed_this_round = True
@@ -1453,6 +1532,7 @@ class RunScheduler:
                         _package,
                         _snapshot,
                         _limits,
+                        _sealed_paths,
                     ) in claims:
                         self.store.release_claim_before_execution(claim)
                     break

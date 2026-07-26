@@ -91,7 +91,10 @@ class AgentNodeExecutor:
         node = context.node
         if node.node_type == "command":
             template = (
-                ResourceResolver(context.run_directory).command(str(node.value)).body
+                ResourceResolver(
+                    context.run_directory,
+                    sealed_paths=context.sealed_resource_paths,
+                ).command(str(node.value)).body
             )
         else:
             template = str(node.value)
@@ -271,7 +274,10 @@ class AgentNodeExecutor:
                 for entry in entries
             )
             mcp_servers = (
-                ResourceResolver(context.run_directory).mcp_servers(
+                ResourceResolver(
+                    context.run_directory,
+                    sealed_paths=context.sealed_resource_paths,
+                ).mcp_servers(
                     str(node.options["mcp"])
                 )
                 if "mcp" in node.options

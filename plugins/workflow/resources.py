@@ -8,7 +8,7 @@ import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Mapping
+from typing import Iterable, Mapping
 
 import yaml
 
@@ -70,12 +70,28 @@ class ResourceResolver:
     """Resolve package resources without permitting path traversal."""
 
     def __init__(
-        self, package_root: str | Path, *, global_root: str | Path | None = None
+        self,
+        package_root: str | Path,
+        *,
+        global_root: str | Path | None = None,
+        sealed_paths: Iterable[str] | None = None,
     ):
         self.package_root = Path(package_root).resolve()
         self.global_root = (
             Path(global_root).resolve() if global_root is not None else None
         )
+        self.sealed_paths = (
+            frozenset(sealed_paths) if sealed_paths is not None else None
+        )
+
+    def _is_sealed(self, path: Path) -> bool:
+        if self.sealed_paths is None:
+            return True
+        try:
+            relative = path.relative_to(self.package_root).as_posix()
+        except ValueError:
+            return False
+        return relative in self.sealed_paths
 
     def command(self, name: str) -> CommandResource:
         if not isinstance(name, str) or not _COMMAND_NAME.fullmatch(name):
@@ -91,7 +107,11 @@ class ResourceResolver:
                 resolved.relative_to(root)
             except (FileNotFoundError, OSError, ValueError):
                 continue
-            if candidate.is_symlink() or not resolved.is_file():
+            if (
+                candidate.is_symlink()
+                or not resolved.is_file()
+                or not self._is_sealed(resolved)
+            ):
                 continue
             return self._parse_command(resolved)
         raise FileNotFoundError(f"command resource is missing: {name}")
@@ -130,7 +150,11 @@ class ResourceResolver:
                     resolved.relative_to(root / "scripts")
                 except (FileNotFoundError, OSError, ValueError):
                     continue
-                if candidate.is_symlink() or not resolved.is_file():
+                if (
+                    candidate.is_symlink()
+                    or not resolved.is_file()
+                    or not self._is_sealed(resolved)
+                ):
                     continue
                 return ScriptResource(path=resolved, runtime=runtime)
         raise FileNotFoundError(f"script resource is missing: {name}")
@@ -158,7 +182,11 @@ class ResourceResolver:
                 resolved.relative_to(self.package_root)
             except (FileNotFoundError, OSError, ValueError):
                 continue
-            if not candidate.is_symlink() and resolved.is_file():
+            if (
+                not candidate.is_symlink()
+                and resolved.is_file()
+                and self._is_sealed(resolved)
+            ):
                 path = resolved
                 break
         if path is None:

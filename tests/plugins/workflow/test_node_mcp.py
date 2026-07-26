@@ -178,6 +178,43 @@ def test_snapshotted_mcp_definition_is_contained_and_keeps_env_references_raw(tm
     assert "secret-value" not in json.dumps(servers)
 
 
+def test_mcp_resolver_ignores_resolver_visible_mutable_output(tmp_path):
+    root = tmp_path / "run"
+    (root / "artifacts").mkdir(parents=True)
+    (root / "artifacts" / "echo").write_text(
+        "command: shadow\n", encoding="utf-8"
+    )
+    sealed = root / "mcp" / "artifacts" / "echo.yaml"
+    sealed.parent.mkdir(parents=True)
+    sealed.write_text("command: sealed\n", encoding="utf-8")
+
+    servers = ResourceResolver(
+        root, sealed_paths={"mcp/artifacts/echo.yaml"}
+    ).mcp_servers("artifacts/echo")
+
+    assert servers["echo"]["command"] == "sealed"
+
+
+def test_node_executor_resolves_only_scheduler_verified_mcp_resource(tmp_path):
+    run = tmp_path / "run"
+    (run / "mcp").mkdir(parents=True)
+    (run / "mcp" / "echo").write_text("command: shadow\n", encoding="utf-8")
+    (run / "mcp" / "echo.yaml").write_text(
+        "command: sealed\n", encoding="utf-8"
+    )
+    runner = FakeAgentRunner("done")
+    context = _context(
+        tmp_path,
+        _node("mcp-node", "work", mcp="echo"),
+        sealed_resource_paths=frozenset({"mcp/echo.yaml"}),
+    )
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "succeeded"
+    assert runner.requests[0].mcp_servers["echo"]["command"] == "sealed"
+
+
 def test_node_executor_passes_only_its_snapshotted_mcp_mapping(tmp_path):
     run = tmp_path / "run"
     (run / "mcp").mkdir(parents=True)

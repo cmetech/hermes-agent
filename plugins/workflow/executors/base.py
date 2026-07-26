@@ -52,6 +52,7 @@ class NodeExecutionContext:
     spawn_failed: Callable[[str, str], bool] | None = None
     process_started: Callable[[ProcessIdentity], bool] | None = None
     process_stopped: Callable[[ProcessIdentity, bool], None] | None = None
+    sealed_resource_paths: frozenset[str] | None = None
     monotonic: Callable[[], float] = time.monotonic
     termination_policy: TerminationPolicy = field(
         default_factory=lambda: TerminationPolicy(

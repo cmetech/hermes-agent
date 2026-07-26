@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import shutil
@@ -32,6 +33,40 @@ def test_named_script_prefers_exact_package_resource_before_runtime_suffix(
 
     assert resource.path == exact.resolve()
     assert resource.runtime == "uv"
+
+
+def test_named_script_ignores_unsealed_extensionless_shadow(tmp_path: Path) -> None:
+    package = tmp_path / "package"
+    scripts = package / "scripts"
+    scripts.mkdir(parents=True)
+    shadow = scripts / "diagnose"
+    shadow.write_text("print('shadow')\n", encoding="utf-8")
+    sealed = scripts / "diagnose.py"
+    sealed.write_text("print('sealed')\n", encoding="utf-8")
+
+    resource = ResourceResolver(
+        package, sealed_paths={"scripts/diagnose.py"}
+    ).script("diagnose", runtime="uv")
+
+    assert resource.path == sealed.resolve()
+
+
+def test_script_executor_resolves_only_scheduler_verified_resources(
+    tmp_path: Path,
+) -> None:
+    scripts = tmp_path / "run" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "diagnose").write_text("print('shadow')\n", encoding="utf-8")
+    sealed = scripts / "diagnose.py"
+    sealed.write_text("print('sealed')\n", encoding="utf-8")
+    context = replace(
+        _context(tmp_path, runtime="uv", script="diagnose"),
+        sealed_resource_paths=frozenset({"scripts/diagnose.py"}),
+    )
+
+    argv, _warnings = ScriptExecutor()._argv(context, "/fake/uv")
+
+    assert argv[-1] == str(sealed.resolve())
 
 
 @pytest.mark.parametrize(

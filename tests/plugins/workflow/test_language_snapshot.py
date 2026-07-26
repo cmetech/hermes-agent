@@ -208,10 +208,76 @@ def test_resume_ignores_post_admission_artifacts_outside_sealed_paths(
     artifact = store.run_directory(admitted.run_id) / "artifacts" / "output.txt"
     artifact.parent.mkdir()
     artifact.write_text("legitimate runtime output\n", encoding="utf-8")
+    node_output = (
+        store.run_directory(admitted.run_id)
+        / "nodes"
+        / "start"
+        / "attempt-1"
+        / "stdout.txt"
+    )
+    node_output.parent.mkdir(parents=True)
+    node_output.write_text("legitimate node output\n", encoding="utf-8")
 
     loaded = _load_with_scheduler(store, admitted.run_id)
 
     assert loaded.definition.name == "archon-2026-07-snapshot"
+
+
+def test_resume_rejects_symlink_inside_mutable_output_root(
+    tmp_path, workflow_writer
+):
+    package = _profile_package(workflow_writer, tmp_path, profile="archon-2026-07")
+    store = RunStore(tmp_path / "home")
+    _prepared, admitted = _start(store, package, key="mutable-output-symlink")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    artifacts = store.run_directory(admitted.run_id) / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "escape").symlink_to(outside)
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        _load_with_scheduler(store, admitted.run_id)
+
+    assert exc.value.code == "workflow_snapshot_integrity_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("resource_kind", "shadow_relative"),
+    [
+        pytest.param("script", "scripts/helper", id="script-extensionless"),
+        pytest.param("mcp", "mcp/echo", id="mcp-extensionless"),
+    ],
+)
+def test_resume_rejects_unsealed_resource_precedence_shadow(
+    tmp_path, workflow_writer, resource_kind, shadow_relative
+):
+    root = tmp_path / resource_kind
+    if resource_kind == "script":
+        nodes = [{"id": "use", "script": "helper", "runtime": "uv"}]
+        resource = root / "scripts" / "helper.py"
+        resource_data = "print('sealed')\n"
+        shadow_data = "print('shadow')\n"
+    else:
+        nodes = [{"id": "use", "prompt": "Use MCP", "mcp": "echo"}]
+        resource = root / "mcp" / "echo.yaml"
+        resource_data = "command: python\nargs: [-c, 'print(1)']\n"
+        shadow_data = "command: python\nargs: [-c, 'print(2)']\n"
+    resource.parent.mkdir(parents=True)
+    resource.write_text(resource_data, encoding="utf-8")
+    package = load_workflow(
+        workflow_writer(root, name=f"{resource_kind}-shadow", nodes=nodes)
+    )
+    store = RunStore(tmp_path / "home")
+    _prepared, admitted = _start(
+        store, package, key=f"{resource_kind}-precedence-shadow"
+    )
+    shadow = store.run_directory(admitted.run_id) / shadow_relative
+    shadow.write_text(shadow_data, encoding="utf-8")
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        _load_with_scheduler(store, admitted.run_id)
+
+    assert exc.value.code == "workflow_snapshot_integrity_mismatch"
 
 
 def test_resume_rejects_unjournaled_unknown_normalizer_rewrite(
@@ -451,6 +517,45 @@ def test_legacy_snapshot_without_language_metadata_still_loads(
     loaded = _load_with_scheduler(store, admitted.run_id)
 
     assert loaded.language.effective_profile.value == "hermes-legacy"
+
+
+def test_pre_language_legacy_snapshot_rejects_executable_shadow(
+    tmp_path, workflow_writer
+):
+    root = tmp_path / "legacy-script"
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "helper.py").write_text("print('sealed')\n", encoding="utf-8")
+    package = load_workflow(
+        workflow_writer(
+            root,
+            name="legacy-script-shadow",
+            nodes=[{"id": "use", "script": "helper", "runtime": "uv"}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = _prepare_pre_language_snapshot(store, package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="legacy-script-shadow",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    (store.run_directory(admitted.run_id) / "scripts" / "helper").write_text(
+        "print('shadow')\n", encoding="utf-8"
+    )
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        _load_with_scheduler(store, admitted.run_id)
+
+    assert exc.value.code == "workflow_snapshot_integrity_mismatch"
 
 
 def test_new_legacy_snapshot_without_language_metadata_fails_closed(

@@ -3216,8 +3216,14 @@ upstream_changes:
   - plugins/workflow/store.py
   - plugins/workflow/scheduler.py
   - plugins/workflow/scheduled_revalidation.py
+  - plugins/workflow/resources.py
+  - plugins/workflow/executors/base.py
+  - plugins/workflow/executors/script.py
+  - plugins/workflow/executors/ai.py
   - tests/plugins/workflow/test_language_snapshot.py
   - tests/plugins/workflow/test_schedule_revalidation.py
+  - tests/plugins/workflow/test_script_executor.py
+  - tests/plugins/workflow/test_node_mcp.py
   owned_symbols:
   - WorkflowLanguageSnapshot
   - make_language_snapshot
@@ -3234,11 +3240,15 @@ upstream_changes:
   - read_sealed_snapshot_paths
   - sealed_snapshot_digest admitted-path verification
   - verify_sealed_snapshot language identity verification
+  - NodeExecutionContext.sealed_resource_paths
+  - ResourceResolver sealed-path candidate authorization
   tests:
   - tests/plugins/workflow/test_language_snapshot.py
   - tests/plugins/workflow/test_schedule_revalidation.py
   - tests/plugins/workflow/test_fault_injection.py
   - tests/plugins/workflow/test_performance_bounds.py
+  - tests/plugins/workflow/test_script_executor.py
+  - tests/plugins/workflow/test_node_mcp.py
   expected_commit_subject: 'feat(workflow): pin workflow semantics at admission'
   upstream_candidate: true
   merge_guidance: >-
@@ -3249,23 +3259,31 @@ upstream_changes:
     sealed_paths allow-list in resources.json and project the resulting
     whole-package sealed_snapshot_digest through the journal. Resume must verify
     raw policy and resources hashes, the exact admitted definition, policy,
-    inputs, skills, and package-resource bytes, and equality between projected
-    and sealed language metadata before parsing execution semantics. Legitimate
-    post-admission runtime artifacts remain outside that admitted path set.
+    inputs, skills, and package-resource bytes, equality between projected and
+    sealed language metadata, and absence of every unsealed current-tree entry
+    before parsing execution semantics. Only the code-owned nodes/ and
+    artifacts/ output roots plus exact .lock, run.json, and events.jsonl files
+    are mutable exceptions; symlinks remain forbidden. Bind command, script,
+    and MCP resolution to the journal-corroborated sealed path set so
+    higher-precedence additions and resolver-visible mutable outputs cannot
+    become executable resources.
     Select the pinned supported normalizer and fail closed with typed invalid,
     unsupported-profile, unsupported-version, missing, mismatch, or snapshot
     integrity errors before node execution. Preserve positional
     PreparedRunSnapshot compatibility by appending defaulted fields. Preserve
     the pre-language fallback only for snapshots with neither language nor
-    sealed-tree projection whose policy resolves to hermes-legacy; declared
-    Archon and new-format snapshots without language metadata remain invalid.
+    sealed-tree projection whose policy resolves to hermes-legacy; reject
+    ambiguous legacy script/MCP precedence candidates and bind the surviving
+    legacy resource set for execution. Declared Archon and new-format snapshots
+    without language metadata remain invalid.
     Scheduled revalidation must compare projection and resources language plus
     sealed-tree identities, while not-due coordinator polling stays bounded and
     does not reopen installed workflow definitions.
   removal_condition: >-
     Remove when upstream provides equivalent package-bound semantic admission
     pinning, journal-backed admitted-tree identity, sealed-byte-only resume,
-    typed fail-closed verification, scheduled language and tree identity
+    typed fail-closed verification, default-deny current-tree validation,
+    resolver-bound admitted resources, scheduled language and tree identity
     revalidation, and pre-language legacy compatibility without a database
     migration.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

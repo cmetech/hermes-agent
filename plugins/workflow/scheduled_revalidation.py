@@ -42,6 +42,10 @@ _MUTABLE_RUN_FILES = frozenset({
     "events.jsonl",
     "run.json",
 })
+# These are the only namespaces written by node executors after admission.
+# They remain non-authoritative: resource resolution is separately restricted
+# to journal-corroborated sealed paths.
+_MUTABLE_RUN_ROOTS = frozenset({"artifacts", "nodes"})
 
 
 class ScheduledRunRevalidationError(RuntimeError):
@@ -102,25 +106,61 @@ def sealed_snapshot_digest(
     snapshot_root = Path(root)
     entries: list[tuple[str, Path]] = []
     if relative_paths is not None:
-        for relative in read_sealed_snapshot_paths(tuple(relative_paths)):
-            path = snapshot_root.joinpath(*PurePosixPath(relative).parts)
+        sealed_paths = read_sealed_snapshot_paths(tuple(relative_paths))
+        sealed_set = frozenset(sealed_paths)
+        sealed_directories = {
+            parent.as_posix()
+            for relative in sealed_paths
+            for parent in PurePosixPath(relative).parents
+            if parent.as_posix() != "."
+        }
+        pending = [snapshot_root]
+        while pending:
+            directory = pending.pop()
             try:
-                current = snapshot_root
-                for part in PurePosixPath(relative).parts[:-1]:
-                    current /= part
-                    if current.is_symlink() or not current.is_dir():
-                        raise ScheduledRunRevalidationError(
-                            "sealed snapshot path is invalid"
-                        )
-                if path.is_symlink() or not path.is_file():
-                    raise ScheduledRunRevalidationError(
-                        "sealed snapshot path is invalid"
-                    )
+                children = tuple(os.scandir(directory))
             except OSError as exc:
                 raise ScheduledRunRevalidationError(
                     "sealed snapshot is unreadable"
                 ) from exc
-            entries.append((relative, path))
+            for entry in children:
+                path = Path(entry.path)
+                relative = path.relative_to(snapshot_root).as_posix()
+                first_part = PurePosixPath(relative).parts[0]
+                try:
+                    if entry.is_symlink():
+                        raise ScheduledRunRevalidationError(
+                            "sealed snapshot contains a symlink"
+                        )
+                    if entry.is_dir(follow_symlinks=False):
+                        if (
+                            first_part not in _MUTABLE_RUN_ROOTS
+                            and relative not in sealed_directories
+                        ):
+                            raise ScheduledRunRevalidationError(
+                                "sealed snapshot contains an unsealed path"
+                            )
+                        pending.append(path)
+                    elif entry.is_file(follow_symlinks=False):
+                        if relative in sealed_set:
+                            entries.append((relative, path))
+                        elif (
+                            relative not in _MUTABLE_RUN_FILES
+                            and first_part not in _MUTABLE_RUN_ROOTS
+                        ):
+                            raise ScheduledRunRevalidationError(
+                                "sealed snapshot contains an unsealed path"
+                            )
+                    else:
+                        raise ScheduledRunRevalidationError(
+                            "sealed snapshot contains a special file"
+                        )
+                except OSError as exc:
+                    raise ScheduledRunRevalidationError(
+                        "sealed snapshot is unreadable"
+                    ) from exc
+        if {relative for relative, _path in entries} != sealed_set:
+            raise ScheduledRunRevalidationError("sealed snapshot path is missing")
     else:
         pending = [snapshot_root]
         while pending:
