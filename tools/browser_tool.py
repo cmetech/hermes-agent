@@ -492,17 +492,43 @@ def _get_cdp_override() -> str:
 _session_cdp_lock = threading.Lock()
 _session_cdp_urls: Dict[str, str] = {}
 
+# Per-key locks so exactly one thread acquires a given session's browser.
+# The dict lock alone is not enough: acquire() runs `close --all` hygiene, so a
+# second concurrent acquire tears down the first session mid-navigation (EBL-003).
+_session_cdp_keylocks: Dict[str, threading.Lock] = {}
+# Live BrowserSession handles, so cleanup can release() exactly once (EBL-005).
+_session_handles: Dict[str, Any] = {}
+
+
+def _session_cdp_keylock(session_key: str) -> threading.Lock:
+    with _session_cdp_lock:
+        return _session_cdp_keylocks.setdefault(session_key, threading.Lock())
+
 
 def _reset_session_cdp_cache() -> None:
     """Drop every memoized enrolled CDP endpoint. Test helper."""
     with _session_cdp_lock:
         _session_cdp_urls.clear()
+        _session_cdp_keylocks.clear()
+        _session_handles.clear()
 
 
 def _forget_session_cdp_url(session_key: str) -> None:
     """Drop one session's memoized endpoint; called when its session is reaped."""
     with _session_cdp_lock:
         _session_cdp_urls.pop(str(session_key), None)
+
+
+def _release_session_handle(session_key: str) -> None:
+    """Release this session's browser handle, unbinding its profile. Idempotent."""
+    with _session_cdp_lock:
+        handle = _session_handles.pop(str(session_key), None)
+    if handle is None:
+        return
+    try:
+        handle.release()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("releasing browser session %s failed: %s", session_key, exc)
 
 
 def _session_browser_profile(session_key: Optional[str]):
@@ -598,15 +624,25 @@ def _session_cdp_url(session_key: Optional[str]) -> str:
 
     from tools.browser_session_manager import ProfileError, acquire
 
-    session = acquire(profile.name, session_key=key, attach_global=False)
-    cdp_url = _resolve_cdp_override(str(session.cdp_url or ""))
-    if not cdp_url:
-        raise ProfileError(
-            f"browser profile {profile.name!r} exposed no CDP endpoint"
-        )
-    with _session_cdp_lock:
-        _session_cdp_urls[key] = cdp_url
-    return cdp_url
+    with _session_cdp_keylock(key):
+        # Re-check under the key lock: another thread may have published while
+        # we waited. Without this the loser acquires a second browser and its
+        # `close --all` hygiene tears down the winner's session.
+        with _session_cdp_lock:
+            cached = _session_cdp_urls.get(key)
+        if cached:
+            return cached
+
+        session = acquire(profile.name, session_key=key, attach_global=False)
+        cdp_url = _resolve_cdp_override(str(session.cdp_url or ""))
+        if not cdp_url:
+            raise ProfileError(
+                f"browser profile {profile.name!r} exposed no CDP endpoint"
+            )
+        with _session_cdp_lock:
+            _session_cdp_urls[key] = cdp_url
+            _session_handles[key] = session
+        return cdp_url
 
 
 def _get_dialog_policy_config() -> Tuple[str, float]:
@@ -4740,10 +4776,13 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     else:
         logger.debug("No active session found for task_id: %s", task_id)
 
-    # OTTO: drop this session's memoized enrolled CDP endpoint — the browser
-    # behind it may be gone, so a later session must acquire rather than reuse a
-    # stale URL. Outside the branch above: an acquire that succeeded before
-    # session registration failed leaves a memo with no _active_sessions entry.
+    # OTTO: drop this session's memoized endpoint AND release its browser handle.
+    # release() unbinds the registry; without it the key keeps internal-origin
+    # trust after cleanup and even after browser.default_profile is turned off
+    # (review finding EBL-005). Outside the branch above: an acquire that
+    # succeeded before session registration failed leaves state with no
+    # _active_sessions entry.
+    _release_session_handle(task_id)
     _forget_session_cdp_url(task_id)
 
 

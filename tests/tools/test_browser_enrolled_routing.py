@@ -229,3 +229,69 @@ class TestNoGlobalEndpointLeak:
         monkeypatch.setattr(browser_session_manager, "_run_daemon_hygiene", lambda: None)
         browser_session_manager.acquire("corp", session_key="scripted")
         assert os.environ["BROWSER_CDP_URL"] == "http://127.0.0.1:9333"
+
+
+import threading
+
+
+class TestAcquireLifecycle:
+    def test_concurrent_misses_acquire_once(self, monkeypatch, _default_enrolled):
+        """EBL-003: acquire() runs `close --all`; a second one tears down the first."""
+        monkeypatch.setattr(browser_tool, "_resolve_cdp_override", lambda u: u)
+        browser_tool._reset_session_cdp_cache()
+        barrier, calls, lock = threading.Barrier(2, timeout=5), [], threading.Lock()
+
+        def _slow_acquire(profile, headless=None, session_key=None, attach_global=True):
+            with lock:
+                calls.append(session_key)
+                n = len(calls)
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return browser_session_manager.BrowserSession(
+                session_key=session_key, profile=ENROLLED,
+                cdp_url=f"http://127.0.0.1:922{n}",
+            )
+
+        monkeypatch.setattr(browser_session_manager, "acquire", _slow_acquire)
+        results = []
+        threads = [
+            threading.Thread(target=lambda: results.append(
+                browser_tool._session_cdp_url("t::enrolled")))
+            for _ in range(2)
+        ]
+        for t in threads:
+            t.start()
+        barrier.abort()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert len(calls) == 1, f"acquire ran {len(calls)} times"
+        assert len(set(results)) == 1, f"threads got different endpoints: {results}"
+
+    def test_cleanup_releases_the_binding(self, monkeypatch, _default_enrolled):
+        """EBL-005: acquire() binds the registry; nothing released it."""
+        # Isolate from any endpoint memoized under this same key by an earlier
+        # test in this file (run_tests.sh isolates per-file, not per-test, so
+        # module-level caches persist across tests unless reset).
+        browser_tool._reset_session_cdp_cache()
+        monkeypatch.setattr(browser_tool, "_resolve_cdp_override", lambda u: u)
+        monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(browser_tool, "_stop_cdp_supervisor", lambda t: None)
+
+        def _binding_acquire(profile, headless=None, session_key=None, attach_global=True):
+            browser_session_registry.bind(session_key, profile)
+            return browser_session_manager.BrowserSession(
+                session_key=session_key, profile=ENROLLED, cdp_url="http://127.0.0.1:9222"
+            )
+
+        monkeypatch.setattr(browser_session_manager, "acquire", _binding_acquire)
+        browser_tool._session_cdp_url("t::enrolled")
+        assert browser_session_registry.profile_for("t::enrolled") == "corp"
+
+        browser_tool._cleanup_single_browser_session("t::enrolled")
+        assert browser_session_registry.profile_for("t::enrolled") is None
+
+        monkeypatch.setattr(browser_session_registry, "default_profile_name", lambda: None)
+        assert not browser_session_registry.session_trusts_url("t::enrolled", TRUSTED)
