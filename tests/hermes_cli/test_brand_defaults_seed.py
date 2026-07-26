@@ -98,6 +98,9 @@ def test_fail_safe_on_bad_descriptor(tmp_path, monkeypatch, fake_config):
 
 ENROLLED_DEFAULTS = {
     "browser": {
+        # Seeded EMPTY, not omitted: the Settings switch only renders for a
+        # key present in the config, and empty is what reads as "no profile".
+        "default_profile": "",
         "profiles": {
             "enrolled": {
                 "cdp_port": 9222,
@@ -132,12 +135,18 @@ def test_seeds_the_enrolled_profile_from_the_capability_manifest(tmp_path, monke
     assert isinstance(profile["trusted_origins"], list)
 
 
-def test_does_not_activate_the_profile(tmp_path, monkeypatch, fake_config):
-    """Seeded but inert: activating it is the user's decision, via the toggle.
+def test_seeds_the_activation_key_empty_so_the_toggle_renders(tmp_path, monkeypatch, fake_config):
+    """Seeded but inert — and the key must EXIST, or the switch never appears.
 
-    Writing default_profile here would route every unbound agent browsing
-    session through the corporate browser, so arbitrary external pages would
-    share a browser identity with live SSO cookies.
+    v4.2.0 shipped without this and the toggle was unreachable.
+    sectionFieldEntries omits any key absent from both the served schema and the
+    config, and browser.default_profile is in neither: not in DEFAULT_CONFIG (so
+    not in CONFIG_SCHEMA), and deliberately not seeded. The result was a feature
+    that could only be enabled by the hand-editing it existed to remove.
+
+    Empty is what keeps it inert: default_profile_name() returns `name or None`,
+    so "" resolves to no profile. Assert emptiness, NOT absence -- absence is
+    what broke it.
     """
     _brand(monkeypatch, {})
     _capability_defaults(monkeypatch, ENROLLED_DEFAULTS)
@@ -145,7 +154,9 @@ def test_does_not_activate_the_profile(tmp_path, monkeypatch, fake_config):
 
     cs.seed_brand_defaults(home)
 
-    assert "default_profile" not in fake_config["cfg"]["browser"]
+    browser = fake_config["cfg"]["browser"]
+    assert "default_profile" in browser, "the toggle cannot render without the key"
+    assert browser["default_profile"] == "", "seeded active would route all browsing through the corporate profile"
 
 
 def test_never_overwrites_a_value_the_user_already_set(tmp_path, monkeypatch, fake_config):
@@ -220,4 +231,4 @@ def test_the_vendored_ericsson_manifest_really_carries_the_enrolled_profile():
     assert profile["headed"] is True
     assert profile["trusted_origins"] == ["https://*.ericsson.com", "https://*.ericsson.net"]
     # Activation is the user's decision, made through the Settings toggle.
-    assert "default_profile" not in defaults["browser"]
+    assert defaults["browser"]["default_profile"] == ""
