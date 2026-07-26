@@ -8,6 +8,8 @@ import os
 import shutil
 import stat
 import sys
+import threading
+import time
 from contextvars import ContextVar, Token
 from pathlib import Path
 
@@ -563,6 +565,30 @@ def with_hermes_node_path(env: dict[str, str] | None = None) -> dict[str, str]:
     return merged
 
 
+# The exec probe below spawns a process, and callers hit it far more often than
+# its cost suggests: get_nous_subscription_features asks twice, and
+# /api/tools/toolsets calls that once per toolset directly plus once more inside
+# _visible_providers -- roughly 24 spawns to render a list of toolset names.
+# Cheap where process creation is cheap; on a managed Windows machine, where EDR
+# scans each binary on first execution, it pushed that request past the desktop's
+# 15s abort and the page rendered nothing at all.
+#
+# Validating by exec is deliberate and must stay (issue #48521: a dangling
+# symlink passes `which` and fails only on exec), so the answer is remembered
+# rather than the check skipped. The TTL bounds staleness so a browser installed
+# mid-session is picked up shortly, matching _ACCOUNT_INFO_CACHE_TTL
+# (hermes_cli/nous_account.py) and _check_fn_cached (tools/registry.py).
+_AGENT_BROWSER_PROBE_TTL = 60.0
+_agent_browser_probe_cache: dict[str, tuple[float, bool]] = {}
+_agent_browser_probe_lock = threading.Lock()
+
+
+def reset_agent_browser_runnable_cache() -> None:
+    """Drop memoized probe results (tests; and after an install/update)."""
+    with _agent_browser_probe_lock:
+        _agent_browser_probe_cache.clear()
+
+
 def agent_browser_runnable(path: str | None) -> bool:
     """Return True only when *path* is an agent-browser CLI that actually runs.
 
@@ -594,6 +620,15 @@ def agent_browser_runnable(path: str | None) -> bool:
     # never even spawn a subprocess for the broken-link case.
     if not os.path.exists(path) or not os.access(path, os.X_OK):
         return False
+
+    # Memoized per path: only the exec probe below is expensive, and the checks
+    # above are cheap enough to repeat. See _AGENT_BROWSER_PROBE_TTL.
+    now = time.monotonic()
+    with _agent_browser_probe_lock:
+        cached = _agent_browser_probe_cache.get(path)
+        if cached is not None and (now - cached[0]) < _AGENT_BROWSER_PROBE_TTL:
+            return cached[1]
+
     import subprocess
 
     try:
@@ -606,9 +641,15 @@ def agent_browser_runnable(path: str | None) -> bool:
             env=with_hermes_node_path(),
             creationflags=windows_hide_flags(),
         )
+        runnable = result.returncode == 0
     except (OSError, subprocess.TimeoutExpired, ValueError):
-        return False
-    return result.returncode == 0
+        runnable = False
+
+    # A negative is cached too: a hung binary costs the full 10s timeout, and
+    # re-paying that on every caller is the worst case this exists to prevent.
+    with _agent_browser_probe_lock:
+        _agent_browser_probe_cache[path] = (time.monotonic(), runnable)
+    return runnable
 
 
 def _legacy_path_has_content(path: Path) -> bool:

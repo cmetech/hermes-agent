@@ -1,0 +1,85 @@
+schema_version: 1
+feature: agent-browser-probe-cache
+# Rendering a list of toolset names must not spawn two dozen processes.
+#
+# Settings -> Capabilities and Settings -> Tools rendered nothing on first click
+# on a corporate Windows laptop, worked on the second, and were instant on the
+# third. Not a hang: GET /api/tools/toolsets simply cost more than the desktop
+# would wait. DEFAULT_FETCH_TIMEOUT_MS is 15_000
+# (apps/desktop/electron/hardening.ts), so the renderer aborted while the
+# backend carried on, finished, and warmed everything it had touched.
+#
+# The cost was traced by measurement, and two earlier hypotheses were wrong:
+#   * NOT module imports. resolve_toolset() totals 0.000s.
+#   * NOT the Nous portal lookup. get_nous_portal_account_info caches on a 60s
+#     TTL and measured 0.044s cold, 0.001s warm.
+#
+# cProfile put 0.98s of a 1.11s sample inside select.poll -- waiting on spawned
+# processes. agent_browser_runnable() validates the CLI by EXEC'ing
+# `--version`, _has_agent_browser calls it twice per
+# get_nous_subscription_features, and the handler reaches that function once per
+# toolset directly plus once more inside _visible_providers (which calls it
+# again at tools_config.py:2589). Roughly 24 process spawns per request.
+#
+# Cheap where process creation is cheap. On a managed Windows machine, where EDR
+# scans each binary on first execution, it exceeded the client's budget -- which
+# is also exactly why the second click was fast: the scanner had cached its
+# verdicts, not our code.
+#
+# Measured effect of the fix on macOS, where spawns are cheap:
+#   _toolset_has_keys  1.018s -> 0.067s   (15x)
+#   whole handler      1.327s -> 0.262s   (5x)
+# The Windows improvement should be larger, since spawn cost dominated there.
+upstream_changes:
+- id: agent-browser-runnable-memoized
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - hermes_constants.py
+  - tests/test_hermes_constants.py
+  owned_symbols:
+  - agent_browser_runnable
+  - reset_agent_browser_runnable_cache
+  - _AGENT_BROWSER_PROBE_TTL
+  - _agent_browser_probe_cache
+  tests:
+  - tests/test_hermes_constants.py
+  expected_commit_subject: 'perf(tools): stop respawning the agent-browser probe on every caller'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. This is a pure performance fix with no brand coupling and is
+    a strong upstream candidate -- it is the same bug class as 53ecfd973
+    ("stop importing modules from spawning a subprocess").
+
+    Do NOT "simplify" this by removing the exec probe. Validating by execution is
+    deliberate: issue #48521 describes a dangling global symlink left by
+    agent-browser's npm postinstall, which `which` still reports and which fails
+    only at exec with 127. A presence check would silently break every browser
+    tool. The fix remembers the answer; it does not stop asking.
+
+    Negative results are cached too, and that is deliberate: the probe carries
+    timeout=10, so a wedged binary costs ten seconds, and re-paying that per
+    caller is the worst case this exists to prevent.
+
+    The TTL is what keeps it honest -- a browser installed mid-session is picked
+    up within 60s. It matches _ACCOUNT_INFO_CACHE_TTL (hermes_cli/nous_account.py)
+    and the ~30s TTL on _check_fn_cached (tools/registry.py); keep it in that
+    family rather than making it permanent.
+
+    The cheap checks (empty path, the `npx agent-browser` two-token form, the
+    exists/X_OK stat) stay OUTSIDE the cache on purpose. They cost nothing, and
+    keeping the dangling-symlink rejection ahead of the cache means a broken link
+    is never memoized as an answer about a path that may later become valid.
+
+    reset_agent_browser_runnable_cache() exists for tests and for callers that
+    replace the binary (install/update). If upstream adds an install path that
+    swaps agent-browser in place, call it there rather than shortening the TTL.
+
+    hermes_constants.py documents itself as import-safe with no dependencies;
+    `threading` and `time` are stdlib and spawn nothing, which is the property
+    that matters for that claim.
+  removal_condition: >-
+    Remove when agent-browser exposes a way to validate the CLI without
+    executing it (a manifest or a resolvable version marker), making the probe
+    cheap enough that memoizing it is pointless.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
