@@ -85,7 +85,15 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
     )
     (repo / "tests").mkdir()
     (repo / "tests/test_invariant.py").write_text(
-        "def test_synthetic_invariant():\n    assert True\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "import sys\n\n"
+        "def test_synthetic_invariant():\n"
+        "    for name in ('HERMES_PYTHON', 'PYTEST_ADDOPTS', 'PYTHON_BIN', "
+        "'WORKFLOW_MERGE_GATE_FAST'):\n"
+        "        assert name not in os.environ\n"
+        "    assert os.environ['WORKFLOW_LEDGER_PRESERVED_PROBE'] == 'preserved'\n"
+        "    assert Path(sys.executable).is_absolute()\n"
     )
     (repo / "unmanaged.txt").write_text("common\n")
     (repo / "apps/desktop").mkdir(parents=True)
@@ -197,8 +205,11 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
 
 def _run_synthetic(repo: Path, report: Path, *extra: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
+    env["HERMES_PYTHON"] = "/orchestration-only/hermes-python"
+    env["PYTEST_ADDOPTS"] = "--orchestration-only-option"
     env["PYTHON_BIN"] = sys.executable
     env["WORKFLOW_MERGE_GATE_FAST"] = "1"
+    env["WORKFLOW_LEDGER_PRESERVED_PROBE"] = "preserved"
     return subprocess.run(
         [
             REHEARSAL,

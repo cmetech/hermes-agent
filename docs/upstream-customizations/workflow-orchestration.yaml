@@ -3697,3 +3697,28 @@ upstream_changes:
     distinguishes actual execution from references, records real outcomes,
     and retains exact bounded paths without unbounded labels.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-ledger-subprocess-environment-isolation
+  change_class: workflow-testing
+  owner: workflow-orchestration
+  files:
+  - scripts/run_workflow_ledger_invariants.py
+  - tests/scripts/test_workflow_upstream_merge.py
+  owned_symbols:
+  - absolute virtualenv-preserving Python test interpreter
+  - scrubbed orchestration-only subprocess controls
+  - preserved ordinary invariant-test environment
+  tests:
+  - tests/scripts/test_workflow_upstream_merge.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'fix(workflow): isolate ledger test environments'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve the active virtualenv entry point without resolving it to a base
+    interpreter, and remove only orchestration-specific Python and merge-gate
+    controls from each invariant-test child. Ordinary environment values must
+    remain available to the test process.
+  removal_condition: >-
+    Remove when upstream provides equivalent per-test evidence execution that
+    cannot inherit orchestration-only interpreter or pytest controls and still
+    retains the selected virtualenv and ordinary required environment.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

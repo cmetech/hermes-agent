@@ -42,7 +42,9 @@ def _kind(path: str) -> str:
 
 def _command(repo: Path, path: str, kind: str) -> tuple[list[str], Path]:
     if kind == "python":
-        command = [sys.executable, "-m", "pytest", "-q", path]
+        # Keep the absolute virtualenv entry point.  Resolving the symlink to
+        # uv's base interpreter would silently discard the venv/site-packages.
+        command = [str(Path(sys.executable).absolute()), "-m", "pytest", "-q", path]
         if path == "tests/plugins/workflow/test_installed_distribution_e2e.py":
             command.extend(["-m", "integration"])
         return command, repo
@@ -60,6 +62,13 @@ def _command(repo: Path, path: str, kind: str) -> tuple[list[str], Path]:
 def _execute(repo: Path, path: str, kind: str, platform: str) -> dict[str, Any]:
     command, cwd = _command(repo, path, kind)
     env = os.environ.copy()
+    for inherited in (
+        "HERMES_PYTHON",
+        "PYTEST_ADDOPTS",
+        "PYTHON_BIN",
+        "WORKFLOW_MERGE_GATE_FAST",
+    ):
+        env.pop(inherited, None)
     env.update(
         {
             "HERMES_OFFLINE": "1",
