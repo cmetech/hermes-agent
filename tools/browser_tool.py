@@ -531,6 +531,34 @@ def _release_session_handle(session_key: str) -> None:
         logger.debug("releasing browser session %s failed: %s", session_key, exc)
 
 
+_DEAD_CDP_MARKERS = (
+    "econnrefused", "connection refused", "websocket", "target closed",
+    "browser has disconnected", "connect econn",
+)
+
+
+def _evict_dead_enrolled_session(session_key: str) -> None:
+    """Drop an enrolled session whose browser is gone, so the next call relaunches.
+
+    The memo and _active_sessions have no liveness notion, so a closed or
+    crashed browser would keep being driven at a dead endpoint while activity
+    refreshes hold off the idle reaper (review finding EBL-009).
+
+    Must NOT take the per-key lock (_session_cdp_keylock): that lock is held
+    across a slow acquire(), and eviction can run from a command path while
+    another thread is mid-acquire for the same key. This only takes the short
+    dict lock (via _release_session_handle / _forget_session_cdp_url) and
+    _cleanup_lock, one at a time -- mirroring _release_session_handle's own
+    ordering -- so it can never deadlock against an in-flight acquire.
+    """
+    if not _is_enrolled_session_key(session_key):
+        return
+    _release_session_handle(session_key)
+    _forget_session_cdp_url(session_key)
+    with _cleanup_lock:
+        _active_sessions.pop(session_key, None)
+
+
 def _session_browser_profile(session_key: Optional[str]):
     """OTTO: return the ``BrowserProfile`` this session drives, or None.
 
@@ -2831,6 +2859,19 @@ def _run_browser_command(
         else:
             fallback_result = _run_chrome_fallback_command(task_id, command, args, timeout)
         return _annotate_lightpanda_fallback(fallback_result, fallback_reason)
+
+    # OTTO: an enrolled session whose browser died must not keep being driven at
+    # a dead endpoint. Evict so the NEXT command relaunches once; do not retry
+    # here, because the command that just failed may not be idempotent (review
+    # finding EBL-009).
+    if not result.get("success") and _is_enrolled_session_key(task_id):
+        error_text = str(result.get("error", "")).lower()
+        if any(marker in error_text for marker in _DEAD_CDP_MARKERS):
+            logger.warning(
+                "enrolled browser for %s appears gone (%s); evicting so the next "
+                "command relaunches", task_id, result.get("error"),
+            )
+            _evict_dead_enrolled_session(task_id)
 
     return result
 

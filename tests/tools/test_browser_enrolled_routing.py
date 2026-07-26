@@ -445,3 +445,27 @@ class TestRedirectParity:
     def test_redirect_to_cloud_metadata_is_blocked(self, monkeypatch):
         out = self._navigate_landing_on(monkeypatch, "http://169.254.169.254/latest")
         assert "cloud metadata endpoint" in out
+
+
+class TestDeadEndpointRecovery:
+    def test_connection_failure_permits_one_reacquire(self, monkeypatch, _default_enrolled):
+        monkeypatch.setattr(browser_tool, "_resolve_cdp_override", lambda u: u)
+        browser_tool._reset_session_cdp_cache()
+        calls = []
+
+        def _acq(profile, headless=None, session_key=None, attach_global=True):
+            calls.append(session_key)
+            return browser_session_manager.BrowserSession(
+                session_key=session_key, profile=ENROLLED,
+                cdp_url=f"http://127.0.0.1:922{len(calls)}",
+            )
+
+        monkeypatch.setattr(browser_session_manager, "acquire", _acq)
+        first = browser_tool._session_cdp_url("t::enrolled")
+        browser_tool._evict_dead_enrolled_session("t::enrolled")
+        second = browser_tool._session_cdp_url("t::enrolled")
+        assert len(calls) == 2
+        assert first != second
+
+    def test_eviction_is_a_noop_for_a_bare_key(self, _default_enrolled):
+        browser_tool._evict_dead_enrolled_session("t")  # must not raise
