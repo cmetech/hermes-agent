@@ -24,6 +24,23 @@
     }
   ],
   "personas": [],
+  "configDefaults": {
+    "browser": {
+      "profiles": {
+        "enrolled": {
+          "kind": "enrolled",
+          "executable": "auto",
+          "user_data_dir": "${HERMES_HOME}/browser-profiles/enrolled",
+          "cdp_port": 9222,
+          "headed": true,
+          "trusted_origins": [
+            "https://*.ericsson.com",
+            "https://*.ericsson.net"
+          ]
+        }
+      }
+    }
+  },
   "env": [
     {
       "key": "JIRA_BASE_URL",
