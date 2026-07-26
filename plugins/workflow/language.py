@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from hashlib import sha256
 import json
+import math
 from typing import Any, Mapping
 
 from plugins.workflow.models import (
@@ -142,6 +143,12 @@ def _json_safe(value: Any) -> Any:
         return [_json_safe(item) for item in value]
     if isinstance(value, frozenset | set):
         return sorted((_json_safe(item) for item in value), key=_canonical_json)
+    if isinstance(value, float) and not math.isfinite(value):
+        return {
+            "__yaml_scalar__": "nonfinite-float",
+            "kind": "nan" if math.isnan(value) else "infinity",
+            "sign": "negative" if math.copysign(1.0, value) < 0 else "positive",
+        }
     if isinstance(value, datetime):
         return {"__yaml_scalar__": "timestamp", "value": value.isoformat()}
     if isinstance(value, date):

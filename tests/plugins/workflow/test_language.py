@@ -181,24 +181,40 @@ ignored_binary: !!binary |
     )
 
 
-def test_nonfinite_yaml_float_is_rejected_by_strict_json_normalization(tmp_path):
-    path = tmp_path / "nonfinite.yaml"
-    path.write_text(
-        """\
-name: nonfinite
+def test_nonfinite_yaml_floats_normalize_without_nonstandard_json_numbers(tmp_path):
+    digests = {}
+    selection = resolve_language_profile({})
+    for label, scalar in (("nan", ".nan"), ("positive", ".inf"), ("negative", "-.inf")):
+        workflow = f"""\
+name: nonfinite-{label}
 description: Non-finite scalar fixture
 nodes:
   - id: start
     bash: \"true\"
-ignored_float: .nan
-""",
-        encoding="utf-8",
-    )
-    package = load_workflow(path)
+ignored_float: {scalar}
+"""
+        installed_path = tmp_path / label / "installed.yaml"
+        sealed_path = tmp_path / label / "sealed" / "definition.yaml"
+        installed_path.parent.mkdir()
+        sealed_path.parent.mkdir()
+        installed_path.write_text(workflow, encoding="utf-8")
+        sealed_path.write_text(workflow, encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Out of range float values are not JSON compliant"):
-        normalize_workflow(
-            package.definition,
-            selection=resolve_language_profile({}),
+        installed = normalize_workflow(
+            load_workflow(installed_path).definition,
+            selection=selection,
             normalizer_version=1,
         )
+        sealed = normalize_workflow(
+            load_workflow(sealed_path).definition,
+            selection=selection,
+            normalizer_version=1,
+        )
+
+        assert (
+            installed.metadata.normalized_definition_digest
+            == sealed.metadata.normalized_definition_digest
+        )
+        digests[label] = installed.metadata.normalized_definition_digest
+
+    assert len(set(digests.values())) == 3
