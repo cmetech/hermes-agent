@@ -86,6 +86,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_showcase_distribution_e2e.py \
       tests/plugins/workflow/test_portable_compatibility_e2e.py \
       tests/plugins/workflow/test_journal_reserve_fanout.py \
+      tests/plugins/workflow/test_quarantine_replace_retry.py \
       tests/hermes_cli/test_capability_staging.py \
       tests/hermes_cli/test_baked_seed.py \
       tests/test_packaging_metadata.py

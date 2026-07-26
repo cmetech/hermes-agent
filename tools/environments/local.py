@@ -3,7 +3,6 @@
 import logging
 import ntpath
 import os
-import platform
 import re
 import shutil
 import signal
@@ -16,7 +15,9 @@ from pathlib import Path
 from tools.environments.base import BaseEnvironment, _pipe_stdin
 from hermes_cli._subprocess_compat import windows_hide_flags
 
-_IS_WINDOWS = platform.system() == "Windows"
+# os.name, not platform.system(): the latter spawns `cmd /c ver` on Windows and
+# this runs at import time. See the matching note in hermes_cli/config.py.
+_IS_WINDOWS = os.name == "nt"
 
 logger = logging.getLogger(__name__)
 

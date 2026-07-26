@@ -16,7 +16,6 @@ browser tool needs agent-browser).
 from __future__ import annotations
 
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -25,7 +24,9 @@ from pathlib import Path
 from hermes_constants import agent_browser_runnable
 from tools.environments.local import hermes_subprocess_env
 
-_IS_WINDOWS = platform.system() == "Windows"
+# os.name, not platform.system(): the latter spawns `cmd /c ver` on Windows and
+# this runs at import time. See the matching note in hermes_cli/config.py.
+_IS_WINDOWS = os.name == "nt"
 
 _DEP_CHECKS = {
     "node": lambda: shutil.which("node") is not None,

@@ -356,7 +356,10 @@ def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
         assert actionable is True
         terminal = _wait_for_terminal(store, run_id)
 
-        assert terminal["status"] == "succeeded"
+        # Surface last_error: a bare status comparison told us only
+        # "failed != succeeded" on Windows CI, with no way to tell whether
+        # the node crashed, the runtime was missing, or a lease expired.
+        assert terminal["status"] == "succeeded", terminal.get("last_error")
         assert terminal["schedule_revalidation"] == {
             "execution_identity": terminal["run_metadata"]["execution_identity"],
             "admission_state_version": 1,
@@ -536,7 +539,10 @@ def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
         finally:
             scheduler.shutdown(deadline_seconds=5)
 
-        assert terminal["status"] == "succeeded"
+        # Surface last_error: a bare status comparison told us only
+        # "failed != succeeded" on Windows CI, with no way to tell whether
+        # the node crashed, the runtime was missing, or a lease expired.
+        assert terminal["status"] == "succeeded", terminal.get("last_error")
         assert terminal["run_metadata"]["schedule_at"] == schedule_at
         assert len(_run_events(rebuilt, run_id, "run_promoted")) == 1
         assert len(_run_events(rebuilt, run_id, "node_succeeded")) == 1

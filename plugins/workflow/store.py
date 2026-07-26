@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import hmac
 import json
@@ -300,14 +301,40 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def _replace_with_retry(source: str | Path, target: str | Path) -> None:
-    for attempt in range(5):
+    """Rename across the quarantine boundary, tolerating Windows file locking.
+
+    POSIX renames an open file happily. Windows refuses with WinError 32 while
+    ANY handle is open, which makes this the fragile step in damaged-index
+    quarantine (`_preserve_damaged_index`) -- precisely the path taken when a
+    store is already unhealthy, so failing here turns a recoverable corrupt
+    index into an unhandled PermissionError.
+
+    Two things keep a handle alive past the point the code "closed" it:
+
+    * A connection still referenced by a live traceback. Any caller holding an
+      exception -- pytest.raises, or production code that captured the error to
+      report it -- keeps the raising frame, its locals, and therefore the
+      sqlite3 connection alive until collected. gc.collect() reaps those.
+    * Delayed handle release by the OS or an antivirus scanner mid-scan, which
+      is common on Windows CI and on corporate laptops with real-time scanning.
+      Only waiting fixes that, and the original ~0.15s total was far too short.
+
+    The retry budget below is ~6.4s, which is cheap relative to losing the
+    index, and is never paid on the healthy path.
+    """
+    attempts = 8
+    for attempt in range(attempts):
         try:
             os.replace(source, target)
             return
         except PermissionError:
-            if attempt == 4:
+            if attempt == attempts - 1:
                 raise
-            time.sleep(0.01 * (2**attempt))
+            if attempt == 0:
+                # Cheapest cause first: drop connections that are unreachable
+                # except through a retained traceback.
+                gc.collect()
+            time.sleep(0.05 * (2**attempt))
 
 
 def _durable_replace(source: str | Path, target: str | Path) -> None:
