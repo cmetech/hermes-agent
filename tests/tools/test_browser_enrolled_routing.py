@@ -142,3 +142,16 @@ class TestNavigationRouting:
     def test_no_default_profile_never_routes_enrolled(self, monkeypatch):
         monkeypatch.setattr(browser_session_registry, "default_profile_name", lambda: None)
         assert browser_tool._navigation_session_key("t", TRUSTED) == "t"
+
+
+class TestGuardTrustScoping:
+    def test_enrolled_key_is_trusted(self, _default_enrolled):
+        assert browser_session_registry.session_trusts_url("t::enrolled", TRUSTED)
+
+    def test_bare_key_is_not_trusted(self, _default_enrolled):
+        """Routing sends trusted origins to the enrolled key, so the ephemeral
+        session has no reason to reach internal origins."""
+        assert not browser_session_registry.session_trusts_url("t", TRUSTED)
+
+    def test_enrolled_key_is_still_origin_scoped(self, _default_enrolled):
+        assert not browser_session_registry.session_trusts_url("t::enrolled", UNTRUSTED_PRIVATE)

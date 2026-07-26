@@ -37,17 +37,22 @@ def _default_enrolled(monkeypatch):
 
 
 class TestDefaultProfileFallback:
-    def test_unbound_session_uses_default_profile(self, _default_enrolled):
-        """The agent's bare task_id has no binding — config must supply it."""
-        assert browser_session_registry.session_trusts_url("default", INTERNAL)
+    def test_enrolled_key_uses_default_profile(self, _default_enrolled):
+        """A key routing created for a trusted origin has no explicit binding
+        — config must supply the profile via the enrolled suffix."""
+        assert browser_session_registry.session_trusts_url("default::enrolled", INTERNAL)
+
+    def test_bare_key_no_longer_inherits_trust(self, _default_enrolled):
+        """Superseded by per-navigation routing: trusted origins get their own key."""
+        assert not browser_session_registry.session_trusts_url("default", INTERNAL)
 
     def test_default_profile_is_still_origin_scoped(self, _default_enrolled):
         """Falling back must not grant blanket private-network access."""
-        assert not browser_session_registry.session_trusts_url("default", OTHER_INTERNAL)
+        assert not browser_session_registry.session_trusts_url("default::enrolled", OTHER_INTERNAL)
 
     def test_no_default_configured_trusts_nothing(self, monkeypatch):
         monkeypatch.setattr(browser_session_registry, "default_profile_name", lambda: None)
-        assert not browser_session_registry.session_trusts_url("default", INTERNAL)
+        assert not browser_session_registry.session_trusts_url("default::enrolled", INTERNAL)
 
     def test_explicit_binding_wins_over_default(self, monkeypatch, _default_enrolled):
         """An acquired ephemeral session must NOT inherit enrolled trust."""
@@ -93,18 +98,21 @@ class TestSnapshotGuardHelper:
         monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda url: False)
 
     def test_trusted_internal_page_is_permitted(self, _default_enrolled):
-        assert browser_tool._snapshot_blocked_url("default", INTERNAL) is None
+        assert browser_tool._snapshot_blocked_url("default::enrolled", INTERNAL) is None
 
     def test_untrusted_internal_page_is_blocked(self, _default_enrolled):
-        assert browser_tool._snapshot_blocked_url("default", OTHER_INTERNAL) == OTHER_INTERNAL
+        assert (
+            browser_tool._snapshot_blocked_url("default::enrolled", OTHER_INTERNAL)
+            == OTHER_INTERNAL
+        )
 
     def test_blocked_without_any_profile(self, monkeypatch):
         monkeypatch.setattr(browser_session_registry, "default_profile_name", lambda: None)
-        assert browser_tool._snapshot_blocked_url("default", INTERNAL) == INTERNAL
+        assert browser_tool._snapshot_blocked_url("default::enrolled", INTERNAL) == INTERNAL
 
     def test_metadata_floor_outranks_trust(self, monkeypatch, _default_enrolled):
         monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda url: True)
-        assert browser_tool._snapshot_blocked_url("default", INTERNAL) == INTERNAL
+        assert browser_tool._snapshot_blocked_url("default::enrolled", INTERNAL) == INTERNAL
 
     def test_empty_url_is_not_blocked(self, _default_enrolled):
         assert browser_tool._snapshot_blocked_url("default", "") is None

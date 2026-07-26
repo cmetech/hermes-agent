@@ -134,13 +134,23 @@ def session_trusts_url(session_key: str, url: str) -> bool:
     """Return True when ``session_key``'s profile explicitly trusts ``url``.
 
     Resolution order: an explicit ``bind()`` wins; otherwise
-    ``browser.default_profile`` applies. An explicitly-bound ephemeral session
-    therefore does NOT silently inherit enrolled trust.
+    ``browser.default_profile`` applies ONLY to a key that per-navigation
+    routing created for a trusted origin (suffixed ``::enrolled``). A bare
+    (ephemeral) key inherits nothing -- routing already sends any origin the
+    default profile trusts to the enrolled key, so the ephemeral session has
+    no reason to reach internal origins. An explicitly-bound ephemeral
+    session therefore does NOT silently inherit enrolled trust either.
 
     SECURITY: gates private-network access. Denies on any unexpected input —
     no profile at all, unknown profile, ephemeral profile, or unparseable URL.
     """
-    name = profile_for(session_key) or default_profile_name()
+    name = profile_for(session_key)
+    if not name:
+        # The default profile applies only to a key routing created for a
+        # trusted origin. A bare (ephemeral) key inherits nothing.
+        if not str(session_key).endswith("::enrolled"):
+            return False
+        name = default_profile_name()
     if not name:
         return False
     try:
