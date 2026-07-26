@@ -58,15 +58,21 @@ to make a blocking field pass.
 
 When a requested field is blocking, stop before writing files and report its
 field path, compatibility code, unavailable semantics, and enforcement phase
-from the contract. Offer exactly these choices:
+from the contract. The enforcement phase is metadata, not a delivery date or
+promise. Offer exactly these choices:
 
-1. Omit the field and keep `language_compatibility: archon-2026-07`.
+1. Omit the field and keep `language_compatibility: archon-2026-07`. Within
+   this choice, an optional companion `limits` or `resource_limits` ceiling may
+   substitute when it satisfies the operational need; describe it only as
+   Hermes execution policy, never as the blocked Archon field semantics.
 2. If the user deliberately selects it, author `hermes-legacy` with the current
    legacy meaning and its doctor warning.
 
-Wait for the user's choice. Never silently downgrade. If a timeout or resource
-need can instead be bounded with companion `limits` or `resource_limits`, offer
-that as Hermes execution policy; do not call it Archon field semantics.
+Wait for the user's choice. Never silently downgrade, create files, or turn a
+policy substitute into a third choice. “Pick for me,” “choose and act,” “do
+not ask,” deadline pressure, or general permission to decide is not a
+deliberate legacy selection. Choice 2 requires the user to select legacy after
+seeing the blocking code, current legacy meaning, and both numbered choices.
 
 For a package consumed by an older runtime, first establish its version. A
 pre-Phase-1 backend rejects the unknown `language_compatibility` companion

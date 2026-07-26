@@ -11,8 +11,15 @@ Before writing files:
   time.
 - For a normal new package, plan the companion declaration
   `language_compatibility: archon-2026-07`.
-- For a blocking field, stop and offer only: omit it and remain Archon, or let
-  the user deliberately choose its current `hermes-legacy` meaning and warning.
+- For a blocking field, stop and offer only: (1) omit it and remain Archon,
+  optionally using companion execution-policy limits within that same choice,
+  or (2) let the user deliberately choose its current `hermes-legacy` meaning
+  and warning. Never present policy limits as a third choice.
+- Treat delegated choice, “do not ask,” and deadline pressure as no profile
+  selection. Legacy requires explicit selection after both choices and the
+  blocking contract evidence are shown.
+- Describe contract phase numbers only as enforcement-phase metadata, never as
+  delivery dates, availability promises, or schedules.
 - For shared package bytes, establish the oldest backend. Keep the companion
   unversioned while any consumer predates `language_compatibility` support.
 - Translate any legacy `create-workflow` request into `nodes`; do not adopt

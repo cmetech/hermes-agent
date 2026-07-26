@@ -8,9 +8,10 @@ PRODUCT_CLI workflow schema --profile archon-2026-07 --json
 ```
 
 Use `definition_schema` for portable YAML, `sidecar_schema` for the Hermes
-companion, and `compatibility_codes` for field status and migration phase. A
-field annotated `x-hermes-status: blocking` is not available under that
-profile even when its JSON shape is structurally valid.
+companion, and `compatibility_codes` for field status and enforcement-phase
+metadata. An enforcement phase is not a delivery date or promise. A field
+annotated `x-hermes-status: blocking` is not available under that profile even
+when its JSON shape is structurally valid.
 
 ## Package layout
 
@@ -45,19 +46,24 @@ because older strict companion parsers reject the new field. An explicit
 
 Phase 1 intentionally blocks these Archon declarations:
 
-| Field | Contract code | Available Archon phase | Current legacy meaning |
+| Field | Archon contract code | Archon enforcement phase | Current legacy meaning and warning code |
 | --- | --- | ---: | --- |
-| AI `output_format` | `archon_output_format_unavailable` | 2 | Post-generation JSON Schema validation, with warning. |
-| Any `output_type` | `archon_output_type_unavailable` | 2 | Accepted but no typed artifact is published. |
-| Bash/script `timeout` | `archon_timeout_semantics_unavailable` | 3 | Positive seconds. |
-| Node `retry` | `archon_retry_semantics_unavailable` | 3 | `max_attempts` counts total attempts; `delay_ms` is milliseconds. |
+| AI `output_format` | `archon_output_format_unavailable` | 2 | Post-generation JSON Schema validation; `legacy_output_format_post_validation`. |
+| Any `output_type` | `archon_output_type_unavailable` | 2 | Accepted but no typed artifact is published; `legacy_output_type_not_published`. |
+| Bash/script `timeout` | `archon_timeout_semantics_unavailable` | 3 | Positive seconds; `legacy_timeout_seconds`. |
+| Node `retry` | `archon_retry_semantics_unavailable` | 3 | `max_attempts` counts total attempts and `delay_ms` is milliseconds; `legacy_retry_total_attempts`. |
 | `maxBudgetUsd` | `archon_budget_enforcement_unavailable` | 5 | Provider-capability mapping only; not a portable guarantee. |
 | Workflow/node `sandbox` | `archon_sandbox_enforcement_unavailable` | 5 | Provider/backend capability only; resource limits are not a sandbox. |
 
 When one is requested, apply the two-choice recipe in the parent skill. Do not
 rewrite the request into legacy silently. Companion `limits` and
-`resource_limits` may tighten Hermes execution policy without claiming the
-deferred Archon semantics.
+`resource_limits` may be included inside the omit-and-remain-Archon choice to
+tighten Hermes execution policy without claiming the blocked Archon semantics;
+they are not a third choice.
+
+Selecting effective or explicit legacy also produces the profile warning
+`legacy_language_profile`. Phase numbers above only report the generated
+contract's enforcement-phase metadata; they do not promise when support ships.
 
 ## Portable YAML shape
 

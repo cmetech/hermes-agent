@@ -84,7 +84,27 @@ doctor, and the normal digest-bound trust review again.
 | **Enforced** | Phase 1 validates and executes the stated structural/runtime meaning. |
 | **Mapped** | Hermes supplies an equivalent through its agent, provider, tool, or policy system. Doctor decides whether the selected environment has that capability. |
 | **Legacy-only** | The current meaning is preserved under `hermes-legacy`, usually with a warning; it is not an Archon-profile guarantee. |
-| **Blocked pending Phase N** | The generated Archon contract carries `x-hermes-status: blocking`. Remove the field or wait for the named phase; schema shape alone does not make it runnable. |
+| **Blocked pending Phase N** | The generated Archon contract carries `x-hermes-status: blocking`. The number is enforcement-phase metadata, not a delivery date or availability promise; schema shape alone does not make the field runnable. |
+
+### Generated compatibility codes
+
+The current generated envelopes publish all of these stable codes. An
+enforcement phase classifies the contract dependency; it does not promise when
+support ships.
+
+| Profile | Code | Fields | Status | Enforcement phase |
+| --- | --- | --- | --- | ---: |
+| Archon | `archon_output_format_unavailable` | `nodes[].output_format` | Blocking | 2 |
+| Archon | `archon_output_type_unavailable` | `nodes[].output_type` | Blocking | 2 |
+| Archon | `archon_retry_semantics_unavailable` | `nodes[].retry` | Blocking | 3 |
+| Archon | `archon_timeout_semantics_unavailable` | `nodes[].timeout` | Blocking | 3 |
+| Archon | `archon_budget_enforcement_unavailable` | `nodes[].maxBudgetUsd` | Blocking | 5 |
+| Archon | `archon_sandbox_enforcement_unavailable` | `sandbox`, `nodes[].sandbox` | Blocking | 5 |
+| Legacy | `legacy_language_profile` | `sidecar.language_compatibility` | Warning | 1 |
+| Legacy | `legacy_output_format_post_validation` | `nodes[].output_format` | Warning | 2 |
+| Legacy | `legacy_output_type_not_published` | `nodes[].output_type` | Warning | 2 |
+| Legacy | `legacy_retry_total_attempts` | `nodes[].retry.max_attempts` | Warning | 3 |
+| Legacy | `legacy_timeout_seconds` | `nodes[].timeout` | Warning | 3 |
 
 ## Portable definition inventory
 
@@ -149,10 +169,11 @@ dependencies, and references are validated as one acyclic graph.
 
 For `bash` and `script`, node `timeout` is a positive number interpreted as
 seconds only under `hermes-legacy`. Archon timeout semantics are blocked in
-Phase 1 and arrive in Phase 3
-(`archon_timeout_semantics_unavailable`). Use companion
-`limits.subprocess_timeout_seconds` today when a package only needs a stricter
-Hermes process-policy ceiling; that is not an Archon `timeout` conversion.
+Phase 1, with enforcement-phase metadata 3
+(`archon_timeout_semantics_unavailable`); no delivery timing is promised. Use
+companion `limits.subprocess_timeout_seconds` today when a package only needs a
+stricter Hermes process-policy ceiling; that is not an Archon `timeout`
+conversion.
 
 ### Command and prompt fields
 
@@ -400,9 +421,10 @@ Archon node `timeout` field.
    backends) and run `workflow validate`.
 2. Run `workflow doctor --compat-report --json` and review every stable legacy
    warning and environment mapping.
-3. Convert units or semantics only after their implementing phase is available.
-   In Phase 1, do not convert `output_format`, `output_type`, `timeout`,
-   `retry`, `maxBudgetUsd`, or `sandbox` into Archon claims.
+3. Convert units or semantics only when a later generated contract no longer
+   blocks them. An enforcement-phase number alone is not evidence of
+   availability. In Phase 1, do not convert `output_format`, `output_type`,
+   `timeout`, `retry`, `maxBudgetUsd`, or `sandbox` into Archon claims.
 4. Remove any blocker, then declare
    `language_compatibility: archon-2026-07` in the companion.
 5. Rerun validate and doctor. Review and trust the new exact digest before a
