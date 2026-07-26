@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LOOP24 Workflow Studio — Explorer-first mockup</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #090a0d;
+      --panel: #101218;
+      --panel-2: #151821;
+      --panel-3: #1b1f2a;
+      --line: #292e3b;
+      --muted: #8a91a3;
+      --text: #f5f6f8;
+      --gold: #fad22d;
+      --gold-soft: #8a6d1a;
+      --blue: #4d97ed;
+      --blue-soft: #162d4a;
+      --green: #20cf83;
+      --red: #ff5252;
+      --orange: #ff9d3b;
+      --purple: #ae8dff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-width: 1180px;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 85% 0%, rgba(77,151,237,.10), transparent 34%),
+        radial-gradient(circle at 10% 100%, rgba(250,210,45,.06), transparent 32%),
+        var(--bg);
+      color: var(--text);
+      font: 13px/1.4 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    button { font: inherit; }
+    .page { max-width: 1500px; margin: 0 auto; padding: 28px; }
+    .intro { display: flex; align-items: end; justify-content: space-between; gap: 32px; margin-bottom: 18px; }
+    .eyebrow { color: var(--gold); font-size: 11px; font-weight: 750; letter-spacing: .18em; text-transform: uppercase; }
+    h1 { font-size: 26px; line-height: 1.15; margin: 5px 0 6px; letter-spacing: -.02em; }
+    .intro p { color: var(--muted); margin: 0; max-width: 720px; }
+    .legend { display: flex; align-items: center; gap: 13px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .legend span::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: 1px; }
+    .legend .y::before { background: var(--gold); }
+    .legend .g::before { background: var(--green); }
+    .legend .b::before { background: var(--blue); }
+
+    .window {
+      overflow: hidden;
+      border: 1px solid #343947;
+      border-radius: 14px;
+      background: var(--panel);
+      box-shadow: 0 30px 90px rgba(0,0,0,.46), inset 0 1px rgba(255,255,255,.035);
+    }
+    .titlebar { height: 48px; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; border-bottom: 1px solid var(--line); background: #0d0f14; padding: 0 14px; }
+    .traffic { display: flex; gap: 7px; }
+    .traffic i { width: 11px; height: 11px; border-radius: 50%; background: #393d48; }
+    .traffic i:nth-child(1) { background: #ff5f57; } .traffic i:nth-child(2) { background: #febc2e; } .traffic i:nth-child(3) { background: #28c840; }
+    .brand { display: flex; align-items: center; gap: 9px; font-weight: 760; letter-spacing: .02em; }
+    .brand-mark { position: relative; width: 24px; height: 24px; border-radius: 7px; background: #0c0c0c; border: 1px solid #33445d; display: grid; place-items: center; color: var(--blue); font-size: 10px; font-weight: 900; box-shadow: 0 0 16px rgba(77,151,237,.15); }
+    .brand small { color: var(--muted); font-weight: 500; }
+    .window-actions { justify-self: end; display: flex; gap: 8px; }
+    .top-button { border: 1px solid var(--line); background: var(--panel-2); color: #dce0e9; border-radius: 7px; padding: 6px 10px; }
+    .top-button.primary { border-color: #78651e; background: #2b260d; color: #ffe463; }
+
+    .workbench { height: 690px; display: grid; grid-template-columns: 47px 270px minmax(520px, 1fr) 302px; }
+    .rail { border-right: 1px solid var(--line); background: #0d0f14; display: flex; flex-direction: column; align-items: center; padding: 8px 0; gap: 5px; }
+    .rail-button { width: 34px; height: 34px; border: 0; border-radius: 8px; background: transparent; color: #6f7687; display: grid; place-items: center; font-size: 16px; position: relative; }
+    .rail-button.active { background: #23200d; color: var(--gold); }
+    .rail-button.active::before { content:""; position:absolute; left:-7px; top:7px; bottom:7px; width:2px; background:var(--gold); border-radius:2px; }
+    .rail-spacer { flex: 1; }
+    .update-dot { position:absolute; right:4px; top:4px; width:7px; height:7px; border-radius:50%; background:var(--blue); box-shadow:0 0 0 2px #0d0f14; }
+
+    .explorer { border-right: 1px solid var(--line); background: var(--panel); display: flex; min-width: 0; flex-direction: column; }
+    .pane-head { height: 42px; display: flex; align-items: center; justify-content: space-between; padding: 0 11px 0 13px; border-bottom: 1px solid var(--line); }
+    .pane-head strong { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: #b2b7c3; }
+    .icon-actions { display:flex; gap:4px; color:var(--muted); }
+    .icon-actions span { width:24px; height:24px; border-radius:6px; display:grid; place-items:center; }
+    .root-chip { margin: 9px; padding: 8px 9px; background: #171a22; border:1px solid var(--line); border-radius:8px; }
+    .root-row { display:flex; align-items:center; gap:7px; min-width:0; }
+    .root-row b { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+    .root-path { color:var(--muted); font-size:10px; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .tree { padding: 2px 7px 10px; overflow: auto; flex:1; }
+    .tree-section { display:flex; align-items:center; gap:6px; color:#c9cdd7; font-size:10px; letter-spacing:.08em; text-transform:uppercase; font-weight:700; padding:8px 4px 5px; }
+    .tree-row { height:28px; border-radius:6px; display:flex; align-items:center; gap:6px; color:#afb5c3; padding:0 7px; white-space:nowrap; }
+    .tree-row:hover { background:#191c25; }
+    .tree-row.active { background:#25220f; color:#fff2a3; }
+    .tree-row.level-1 { padding-left:19px; }
+    .tree-row.level-2 { padding-left:35px; }
+    .tree-row.level-3 { padding-left:51px; }
+    .chev { width:8px; color:#72798a; }
+    .file-icon { width:16px; text-align:center; color:var(--gold); }
+    .companion { color:var(--blue); }
+    .resource { color:#6d7484; }
+    .tree-name { overflow:hidden; text-overflow:ellipsis; }
+    .badge { margin-left:auto; font-size:9px; border-radius:8px; padding:1px 5px; color:#0a130e; background:var(--green); font-weight:800; }
+    .badge.modified { color:#2b2200; background:var(--gold); }
+    .badge.warn { color:#201309; background:var(--orange); }
+    .explorer-foot { border-top:1px solid var(--line); padding:9px; display:grid; gap:6px; }
+    .open-button { width:100%; border:1px solid #64571e; background:#25210c; color:#f9de63; padding:7px; border-radius:7px; }
+    .hint { color:var(--muted); text-align:center; font-size:9px; }
+
+    .main { min-width:0; display:flex; flex-direction:column; background:#0f1117; }
+    .tabs { height:42px; display:flex; align-items:end; border-bottom:1px solid var(--line); background:#0d0f14; padding-left:8px; }
+    .tab { height:34px; display:flex; align-items:center; gap:7px; padding:0 12px; color:var(--muted); border-right:1px solid #20242e; border-top:2px solid transparent; }
+    .tab.active { color:#f1f2f5; background:#0f1117; border-top-color:var(--gold); }
+    .tab .dot { width:7px; height:7px; border-radius:50%; background:var(--gold); }
+    .editor-toolbar { height:45px; border-bottom:1px solid var(--line); display:flex; align-items:center; padding:0 10px; gap:8px; }
+    .segmented { display:flex; border:1px solid var(--line); border-radius:7px; overflow:hidden; }
+    .segment { border:0; border-right:1px solid var(--line); background:#141720; color:#8f96a6; padding:6px 10px; font-size:11px; }
+    .segment:last-child { border-right:0; }
+    .segment.active { background:#2a260e; color:#ffe567; }
+    .tool-sep { width:1px; height:22px; background:var(--line); margin:0 2px; }
+    .ghost-button { border:1px solid var(--line); background:#141720; color:#aeb4c2; border-radius:7px; padding:6px 9px; font-size:11px; }
+    .editor-title { margin-left:auto; color:var(--muted); font-size:10px; }
+
+    .canvas { position:relative; flex:1; overflow:hidden; background-color:#0d1015; background-image: radial-gradient(#2b303b 1px, transparent 1px); background-size:20px 20px; }
+    .edge { position:absolute; height:2px; transform-origin:left center; background:#566174; z-index:1; }
+    .edge::after { content:""; position:absolute; right:-1px; top:-4px; border-left:7px solid #566174; border-top:5px solid transparent; border-bottom:5px solid transparent; }
+    .edge.e1 { width:156px; left:202px; top:236px; transform:rotate(-23deg); }
+    .edge.e2 { width:155px; left:202px; top:237px; transform:rotate(23deg); }
+    .edge.e3 { width:161px; left:480px; top:177px; transform:rotate(24deg); }
+    .edge.e4 { width:160px; left:480px; top:296px; transform:rotate(-24deg); }
+    .node { position:absolute; width:174px; min-height:76px; border:1px solid #363c49; background:#171a22; border-radius:10px; box-shadow:0 8px 22px rgba(0,0,0,.28); z-index:2; overflow:hidden; }
+    .node.selected { border-color:var(--gold); box-shadow:0 0 0 2px rgba(250,210,45,.16), 0 8px 22px rgba(0,0,0,.3); }
+    .node::before { content:""; position:absolute; top:0; bottom:0; left:0; width:3px; background:var(--blue); }
+    .node.shell::before { background:var(--orange); }
+    .node.approval::before { background:var(--green); }
+    .node.n1 { left:38px; top:197px; }
+    .node.n2 { left:345px; top:121px; }
+    .node.n3 { left:345px; top:272px; }
+    .node.n4 { left:630px; top:197px; }
+    .node-head { padding:10px 10px 4px 13px; display:flex; align-items:center; gap:7px; }
+    .type-pill { padding:2px 6px; border-radius:7px; color:#a9d1ff; background:#172e4c; font-size:8px; font-weight:850; letter-spacing:.05em; }
+    .shell .type-pill { color:#ffd0a1; background:#412613; }
+    .approval .type-pill { color:#9ef0c9; background:#143a2a; }
+    .node-title { font-size:11px; font-weight:750; overflow:hidden; text-overflow:ellipsis; }
+    .node-preview { color:var(--muted); font:9px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; padding:0 10px 10px 13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .handle { position:absolute; width:8px; height:8px; border-radius:50%; background:#8691a5; left:calc(50% - 4px); }
+    .handle.in { top:-5px; } .handle.out { bottom:-5px; }
+    .minimap { position:absolute; right:13px; bottom:13px; width:124px; height:76px; border:1px solid var(--line); background:rgba(16,18,24,.9); border-radius:7px; padding:8px; }
+    .mini-node { position:absolute; height:8px; width:17px; background:#3d506a; border-radius:2px; }
+    .zoom { position:absolute; left:12px; bottom:12px; display:flex; border:1px solid var(--line); border-radius:7px; overflow:hidden; background:#12151c; }
+    .zoom span { width:27px; height:26px; display:grid; place-items:center; border-right:1px solid var(--line); color:var(--muted); }
+    .zoom span:last-child { border-right:0; width:42px; font-size:9px; }
+
+    .inspector { border-left:1px solid var(--line); background:var(--panel); min-width:0; display:flex; flex-direction:column; }
+    .inspector-head { height:42px; border-bottom:1px solid var(--line); padding:0 12px; display:flex; align-items:center; }
+    .inspector-head b { flex:1; font-size:11px; }
+    .inspector-tabs { display:flex; border-bottom:1px solid var(--line); height:37px; padding:0 9px; gap:11px; align-items:end; }
+    .inspector-tab { padding:0 2px 8px; color:var(--muted); font-size:10px; }
+    .inspector-tab.active { color:#fff; border-bottom:2px solid var(--gold); }
+    .form { padding:13px; overflow:auto; flex:1; }
+    .field { margin-bottom:12px; }
+    .field label { display:flex; justify-content:space-between; color:#9ca3b2; font-size:9px; font-weight:750; letter-spacing:.08em; text-transform:uppercase; margin-bottom:5px; }
+    .required { color:var(--gold); }
+    .input { min-height:31px; border:1px solid #343947; border-radius:7px; background:#171a22; color:#e7e9ee; padding:7px 8px; font:10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .input.multiline { min-height:74px; }
+    .doc-tip { border:1px solid #2b3e57; background:#131f2d; border-radius:8px; padding:9px; color:#9eb7d4; font-size:10px; margin-top:14px; }
+    .doc-tip b { color:#c8e0fc; display:block; margin-bottom:3px; }
+    .schema-note { display:flex; gap:6px; align-items:center; color:#73daa9; font-size:9px; margin:9px 0 2px; }
+
+    .statusbar { height:28px; display:flex; align-items:center; padding:0 10px; border-top:1px solid #6d5d1b; background:#1c1909; color:#d7cc91; font-size:10px; gap:14px; }
+    .statusbar .push { margin-left:auto; }
+    .statusbar .ok { color:#73e1ac; }
+    .statusbar .update { color:#8ec2f7; }
+
+    .callouts { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-top:14px; }
+    .callout { border:1px solid #2a2f3b; border-radius:9px; background:rgba(17,19,25,.86); padding:11px; color:#a7adbb; font-size:11px; }
+    .callout b { color:#eef0f4; display:block; margin-bottom:4px; }
+    .callout em { color:var(--gold); font-style:normal; }
+    .choice-row { margin-top:16px; display:flex; align-items:center; justify-content:space-between; gap:14px; }
+    .choice-row p { margin:0; color:var(--muted); font-size:11px; }
+    .choice { cursor:pointer; border:1px solid #64571e; color:#ffe461; background:#25210c; border-radius:8px; padding:8px 14px; font-weight:750; }
+    .choice.selected { outline:2px solid rgba(250,210,45,.35); background:#342e0d; }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="intro">
+      <div>
+        <div class="eyebrow">Recommended desktop workspace</div>
+        <h1>Explorer-first workflow authoring</h1>
+        <p>Select a folder once, navigate paired YAML workflows from a real tree, and switch between canvas, YAML, and documentation without leaving the workspace.</p>
+      </div>
+      <div class="legend"><span class="y">LOOP24 theme</span><span class="g">valid DAG</span><span class="b">companion policy</span></div>
+    </div>
+
+    <section class="window">
+      <header class="titlebar">
+        <div class="traffic"><i></i><i></i><i></i></div>
+        <div class="brand"><span class="brand-mark">24</span> LOOP24 <small>Workflow Studio</small></div>
+        <div class="window-actions"><button class="top-button">Examples</button><button class="top-button primary">Open Folder</button></div>
+      </header>
+
+      <div class="workbench">
+        <nav class="rail" aria-label="Activity rail">
+          <button class="rail-button active" title="Explorer">▱</button>
+          <button class="rail-button" title="Node library">◇</button>
+          <button class="rail-button" title="Examples">▦</button>
+          <button class="rail-button" title="Git">⑂</button>
+          <span class="rail-spacer"></span>
+          <button class="rail-button" title="Settings">⚙<i class="update-dot"></i></button>
+        </nav>
+
+        <aside class="explorer">
+          <div class="pane-head"><strong>Explorer</strong><div class="icon-actions"><span>↻</span><span>⋯</span></div></div>
+          <div class="root-chip">
+            <div class="root-row"><span>▾</span><b>support-automation</b><span class="badge">GIT</span></div>
+            <div class="root-path">~/workflows/support-automation</div>
+          </div>
+          <div class="tree">
+            <div class="tree-section"><span>▾</span> Workflow packages</div>
+            <div class="tree-row active level-1"><span class="chev">▾</span><span class="file-icon">◆</span><span class="tree-name">incident-response</span><span class="badge modified">M</span></div>
+            <div class="tree-row level-2"><span class="chev"></span><span class="file-icon">Y</span><span class="tree-name">incident-response.yaml</span></div>
+            <div class="tree-row level-2"><span class="chev"></span><span class="file-icon companion">H</span><span class="tree-name">incident-response.hermes.yaml</span></div>
+            <div class="tree-row level-1"><span class="chev">›</span><span class="file-icon">◆</span><span class="tree-name">daily-triage</span></div>
+            <div class="tree-row level-1"><span class="chev">›</span><span class="file-icon">◆</span><span class="tree-name">release-check</span><span class="badge warn">!</span></div>
+
+            <div class="tree-section"><span>▾</span> Package files</div>
+            <div class="tree-row level-1"><span class="chev">›</span><span class="file-icon resource">▰</span><span class="tree-name">commands</span></div>
+            <div class="tree-row level-1"><span class="chev">▾</span><span class="file-icon resource">▰</span><span class="tree-name">scripts</span></div>
+            <div class="tree-row level-2"><span class="chev"></span><span class="file-icon resource">•</span><span class="tree-name">normalize.py</span></div>
+            <div class="tree-row level-1"><span class="chev">›</span><span class="file-icon resource">▰</span><span class="tree-name">mcp</span></div>
+          </div>
+          <div class="explorer-foot">
+            <button class="open-button">Open another folder…</button>
+            <div class="hint">Drop a folder or YAML file anywhere to open it</div>
+          </div>
+        </aside>
+
+        <section class="main">
+          <div class="tabs">
+            <div class="tab active"><span class="dot"></span>incident-response.yaml</div>
+            <div class="tab">incident-response.hermes.yaml</div>
+          </div>
+          <div class="editor-toolbar">
+            <div class="segmented"><button class="segment active">Visual</button><button class="segment">Split</button><button class="segment">YAML</button></div>
+            <div class="tool-sep"></div>
+            <button class="ghost-button">＋ Node</button>
+            <button class="ghost-button">Arrange</button>
+            <button class="ghost-button">Validate</button>
+            <div class="editor-title">archon-2026-07 · contract v1</div>
+          </div>
+          <div class="canvas">
+            <div class="edge e1"></div><div class="edge e2"></div><div class="edge e3"></div><div class="edge e4"></div>
+            <article class="node n1 shell"><span class="handle in"></span><span class="handle out"></span><div class="node-head"><span class="type-pill">BASH</span><span class="node-title">collect</span></div><div class="node-preview">python scripts/normalize.py</div></article>
+            <article class="node n2 selected"><span class="handle in"></span><span class="handle out"></span><div class="node-head"><span class="type-pill">PROMPT</span><span class="node-title">classify</span></div><div class="node-preview">Classify the incident severity…</div></article>
+            <article class="node n3"><span class="handle in"></span><span class="handle out"></span><div class="node-head"><span class="type-pill">COMMAND</span><span class="node-title">summarize</span></div><div class="node-preview">incident-summary</div></article>
+            <article class="node n4 approval"><span class="handle in"></span><span class="handle out"></span><div class="node-head"><span class="type-pill">APPROVAL</span><span class="node-title">publish</span></div><div class="node-preview">Review before outward action</div></article>
+            <div class="zoom"><span>−</span><span>＋</span><span>82%</span></div>
+            <div class="minimap"><i class="mini-node" style="left:12px;top:34px"></i><i class="mini-node" style="left:48px;top:19px"></i><i class="mini-node" style="left:48px;top:47px"></i><i class="mini-node" style="left:88px;top:34px;background:#2d6e51"></i></div>
+          </div>
+        </section>
+
+        <aside class="inspector">
+          <div class="inspector-head"><b>classify</b><span style="color:var(--muted)">×</span></div>
+          <div class="inspector-tabs"><span class="inspector-tab active">General</span><span class="inspector-tab">Execution</span><span class="inspector-tab">Advanced</span><span class="inspector-tab">Docs</span></div>
+          <div class="form">
+            <div class="schema-note">● Valid against bundled contract</div>
+            <div class="field"><label>Node ID <span class="required">Required</span></label><div class="input">classify</div></div>
+            <div class="field"><label>Node type <span class="required">Required</span></label><div class="input">prompt ▾</div></div>
+            <div class="field"><label>Prompt <span class="required">Required</span></label><div class="input multiline">Classify the incident severity using $collect.output…</div></div>
+            <div class="field"><label>Dependencies</label><div class="input">collect</div></div>
+            <div class="field"><label>Trigger rule</label><div class="input">all_success ▾</div></div>
+            <div class="doc-tip"><b>Prompt node</b>Runs one isolated AI request. References must point to completed upstream nodes. Open the Docs tab for every available field and example.</div>
+          </div>
+        </aside>
+      </div>
+
+      <footer class="statusbar">
+        <span>⑂ base</span><span>1 modified</span><span class="ok">✓ YAML + DAG valid</span><span>4 nodes · 4 edges</span><span class="push">UTF-8 · Spaces: 2</span><span class="update">Update 0.2.0 available</span>
+      </footer>
+    </section>
+
+    <section class="callouts">
+      <div class="callout"><b>Open and select</b>Native <em>Open Folder</em>, recent folders, drag-and-drop, and optional command-line path opening.</div>
+      <div class="callout"><b>Workflow pairing</b>The tree groups <em>name.yaml</em> with <em>name.hermes.yaml</em> while still exposing each document as a tab.</div>
+      <div class="callout"><b>Context without scope creep</b>Resource folders appear for orientation, but v1 edits and exports only the two YAML documents.</div>
+      <div class="callout"><b>Git at a glance</b>Branch and status are visible; Save and Create Version remain separate, explicit actions.</div>
+    </section>
+
+    <div class="choice-row">
+      <p>The activity rail lets the same sidebar switch between Explorer, node palette, examples, Git history, and settings without crowding the canvas.</p>
+      <button class="choice" data-choice="approve-explorer-layout" onclick="toggleSelect(this)">This layout direction works</button>
+    </div>
+  </main>
+</body>
+</html>
