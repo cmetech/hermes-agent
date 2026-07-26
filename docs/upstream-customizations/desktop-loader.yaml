@@ -1,0 +1,99 @@
+schema_version: 1
+feature: desktop-loader
+# The loading spinner must never be able to freeze the app.
+#
+# On a corporate Windows laptop the desktop app became fully unresponsive while
+# the Capabilities page loaded -- clicks did nothing, the page never rendered.
+# The same build was fine on an unmanaged machine, and total process memory was
+# ~1 GB, so this was never resource pressure.
+#
+# desktop.log showed `[renderer] webContents became unresponsive` repeating, and
+# pausing the renderer in DevTools produced a call stack composed entirely of
+# `a` -> requestAnimationFrame inside the Loader component. The backend was
+# exonerated by measurement: every call GET /api/skills makes totals ~1.45s in a
+# cold process (_find_all_skills 0.16s for 62 skills). The data was never
+# expensive to produce; the renderer never got far enough to process it.
+#
+# Upstream's Loader ran a requestAnimationFrame loop that, every frame, rebuilt a
+# 241-point SVG path (re-parsed by the SVG engine) and issued four setAttribute
+# calls per particle -- ~314 DOM writes and ~319 curve evaluations per frame, at
+# 78 particles. Where a frame cannot finish inside its budget, rAF re-queues
+# immediately and the main thread is never idle. The failure is self
+# perpetuating and maximally bad: the spinner shown WHILE a page loads is what
+# prevents the page from loading.
+#
+# Half that work was provably dead: particleFor derives opacity and radius from
+# the particle index alone, so both are constant for the component's lifetime and
+# were being rewritten every frame regardless.
+#
+# Why this manifest exists: the workspace-level surface table lives OUTSIDE any
+# git repository, so it does not travel with the branch and is invisible to a
+# merge performed from another checkout. This ledger is in-repo, versioned, and
+# machine-checkable via scripts/check_upstream_customizations.py.
+upstream_changes:
+- id: desktop-loader-declarative-animation
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - apps/desktop/src/components/ui/loader-native.tsx
+  - apps/desktop/src/components/ui/loader.test.tsx
+  - apps/desktop/src/components/ui/loader.tsx
+  owned_symbols:
+  - NativeLoader
+  - FROZEN_DETAIL_SCALE
+  - Loader
+  tests:
+  - apps/desktop/src/components/ui/loader.test.tsx
+  expected_commit_subject: 'fix(desktop): stop the loading spinner freezing the renderer'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge, never --theirs. All three time-varying quantities --
+    rotation, path shape, particle position -- are declarative animations that
+    upstream expresses imperatively. The fix describes them once and lets
+    Chromium run them, so nothing executes per frame and there is no JS loop that
+    can starve the main thread. On a slow or software-rasterized renderer this
+    degrades to visible jank instead of a freeze, which is a stronger guarantee
+    than any "detect we are falling behind and downgrade" heuristic.
+
+    The footprint is deliberately lopsided. loader-native.tsx and
+    loader.test.tsx are absent upstream and cannot conflict. loader.tsx keeps
+    only four `export` keywords (LOADER_CURVES, buildPath, particleFor,
+    LoaderProps -- loader-native imports all four, so the upstream curve table
+    and geometry helpers remain the single source of truth) and a Loader body
+    reduced to `return <NativeLoader {...props} />`. Upstream may churn the rest
+    of the file freely.
+
+    THE FAILURE MODE TO GUARD IS A SILENT REVERT. An upstream rewrite of
+    loader.tsx can drop the delegation with NO conflict, NO build error and NO
+    type error: the app compiles, looks identical, and freezes again on slow
+    machines. Nothing in the type system or the build can catch it. That is why
+    loader.test.tsx renders every one of the 21 LOADER_TYPES with
+    requestAnimationFrame stubbed and asserts it is never called -- a
+    behavioural assertion, so it holds however upstream restructures the file.
+    If that test is ever deleted or weakened as "flaky", the protection is gone.
+
+    detailScale is frozen at 0.76, the midpoint of the 0.52..1.0 range
+    detailScaleFor produces. The curve no longer breathes. This was traded away
+    deliberately and with the product owner's agreement: a `d` that never changes
+    is what allows the path to be computed once, which is what makes everything
+    else declarative. Restoring the pulse means restoring a per-frame path
+    rebuild, so do not "fix" it back.
+
+    The particles use `offset-path` + an animated `offset-distance`, with a
+    distinct negative animation-delay per particle reproducing the trail spacing
+    that the imperative version got by subtracting tailOffset * trailSpan from
+    the head's progress. If a future Chromium breaks offset-path on SVG
+    elements, the agreed fallback is a single stroked path with an animated
+    stroke-dashoffset -- visually a comet streak rather than discrete dots,
+    accepted in advance. Do NOT fall back to a rAF loop.
+
+    Keyframes are inlined in a <style> element rather than added to styles.css,
+    which is shared with upstream; keeping our footprint to files upstream does
+    not have is what makes this survive merges.
+  removal_condition: >-
+    Remove when upstream's own Loader no longer drives its animation from a
+    per-frame JavaScript callback -- i.e. when `requestAnimationFrame` no longer
+    appears in loader.tsx and the animation is expressed declaratively there.
+    At that point delete loader-native.tsx and the delegation, but KEEP
+    loader.test.tsx: the no-frames assertion is what stops the loop returning.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
