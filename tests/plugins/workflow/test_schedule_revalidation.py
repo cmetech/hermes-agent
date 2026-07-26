@@ -562,6 +562,9 @@ def test_sealed_snapshot_revalidation_includes_language_identity(
         (store.run_directory(run_id) / "resources.json").read_bytes()
     )
     assert run["language"] == resources["language"]
+    assert run["sealed_snapshot_digest"] == run["run_metadata"][
+        "sealed_snapshot_digest"
+    ]
     changed = dict(run)
     changed["language"] = {
         **run["language"],
@@ -571,6 +574,17 @@ def test_sealed_snapshot_revalidation_includes_language_identity(
     with pytest.raises(
         scheduled_revalidation_module.ScheduledRunRevalidationError,
         match="language identity changed",
+    ):
+        scheduled_revalidation_module.verify_sealed_snapshot(
+            changed,
+            run_directory=store.run_directory(run_id),
+        )
+
+    changed = dict(run)
+    changed["sealed_snapshot_digest"] = "0" * 64
+    with pytest.raises(
+        scheduled_revalidation_module.ScheduledRunRevalidationError,
+        match="snapshot identity changed",
     ):
         scheduled_revalidation_module.verify_sealed_snapshot(
             changed,

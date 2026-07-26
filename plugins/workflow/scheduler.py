@@ -7,6 +7,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+import hashlib
 import json
 import math
 import os
@@ -57,6 +58,7 @@ _CLAUSE = re.compile(
     r"(?P<right>'[^']*'|\"[^\"]*\"|-?(?:\d+(?:\.\d*)?|\.\d+))\s*$",
     re.UNICODE,
 )
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ConditionEvaluationError(ValueError):
@@ -529,23 +531,93 @@ class RunScheduler:
         definition = run_directory / "definition.yaml"
         policy = run_directory / "policy.yaml"
         projection = self.store.load_run(run_id)
-        resources = json.loads((run_directory / "resources.json").read_bytes())
-        if not isinstance(resources, Mapping):
-            raise WorkflowLanguageCompatibilityError(
-                "workflow_language_snapshot_invalid",
-                "workflow resources snapshot must be a mapping",
+        resources_path = run_directory / "resources.json"
+
+        def integrity_error(message: str) -> WorkflowLanguageCompatibilityError:
+            return WorkflowLanguageCompatibilityError(
+                "workflow_snapshot_integrity_mismatch",
+                message,
             )
+
+        try:
+            definition_bytes = definition.read_bytes()
+            policy_bytes = policy.read_bytes() if policy.is_file() else b"{}\n"
+            resources_bytes = resources_path.read_bytes()
+        except OSError as exc:
+            raise integrity_error("sealed workflow snapshot is unreadable") from exc
+
+        expected_policy_digest = projection.get("policy_digest")
+        expected_resources_digest = projection.get("input_manifest_digest")
+        if (
+            not isinstance(expected_policy_digest, str)
+            or _SHA256.fullmatch(expected_policy_digest) is None
+            or not isinstance(expected_resources_digest, str)
+            or _SHA256.fullmatch(expected_resources_digest) is None
+            or hashlib.sha256(policy_bytes).hexdigest() != expected_policy_digest
+            or hashlib.sha256(resources_bytes).hexdigest()
+            != expected_resources_digest
+        ):
+            raise integrity_error("sealed workflow snapshot digest changed")
+
+        try:
+            resources = json.loads(resources_bytes)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise integrity_error("sealed workflow resources are malformed") from exc
+        if not isinstance(resources, Mapping):
+            raise integrity_error("sealed workflow resources must be a mapping")
+        projected_snapshot = read_language_snapshot(projection.get("language"))
         snapshot = read_language_snapshot(resources.get("language"))
+        if projected_snapshot != snapshot:
+            raise integrity_error(
+                "projected workflow language identity differs from sealed resources"
+            )
+
+        projected_snapshot_digest = projection.get("sealed_snapshot_digest")
+        if snapshot is not None:
+            if (
+                not isinstance(projected_snapshot_digest, str)
+                or _SHA256.fullmatch(projected_snapshot_digest) is None
+            ):
+                raise integrity_error("sealed workflow tree identity is missing")
+            from plugins.workflow.scheduled_revalidation import (
+                ScheduledRunRevalidationError,
+                read_sealed_snapshot_paths,
+                sealed_snapshot_digest,
+            )
+
+            try:
+                sealed_paths = read_sealed_snapshot_paths(
+                    resources.get("sealed_paths")
+                )
+                actual_snapshot_digest = sealed_snapshot_digest(
+                    run_directory, relative_paths=sealed_paths
+                )
+            except ScheduledRunRevalidationError as exc:
+                raise integrity_error("sealed workflow tree is unreadable") from exc
+            if actual_snapshot_digest != projected_snapshot_digest:
+                raise integrity_error("sealed workflow tree identity changed")
+        elif projected_snapshot_digest is not None:
+            raise WorkflowLanguageCompatibilityError(
+                "workflow_language_snapshot_missing",
+                "new workflow snapshot is missing admitted language metadata",
+            )
+
         package = load_workflow_snapshot(
             definition,
-            workflow_bytes=definition.read_bytes(),
-            sidecar_bytes=policy.read_bytes() if policy.is_file() else None,
+            workflow_bytes=definition_bytes,
+            sidecar_bytes=policy_bytes if policy.is_file() else None,
             normalizer_version=(
                 snapshot.normalizer_version
                 if snapshot is not None
                 else WORKFLOW_NORMALIZER_VERSION
             ),
         )
+        expected_package_digest = projection.get("definition_digest")
+        if (
+            not isinstance(expected_package_digest, str)
+            or _SHA256.fullmatch(expected_package_digest) is None
+        ):
+            raise integrity_error("trusted workflow package identity is missing")
         if snapshot is None and (
             package.language.effective_profile
             is not WorkflowLanguageProfile.HERMES_LEGACY
@@ -557,7 +629,7 @@ class RunScheduler:
         if snapshot is not None:
             verify_language_snapshot(
                 package,
-                str(projection["definition_digest"]),
+                expected_package_digest,
                 snapshot,
             )
         return package

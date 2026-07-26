@@ -3038,17 +3038,35 @@ class RunStore:
                 input_manifest, sort_keys=True, separators=(",", ":")
             ).encode()
             (staging / "inputs.json").write_bytes(manifest_data)
+            sealed_paths = sorted(
+                {
+                    path.relative_to(staging).as_posix()
+                    for path in staging.rglob("*")
+                    if path.is_file()
+                    and path.relative_to(staging).as_posix()
+                    != ".snapshot-owner.json"
+                }
+                | {"resources.json"}
+            )
             snapshot_manifest = json.dumps(
                 {
                     "inputs_sha256": _sha256(manifest_data),
                     "node_skills": node_skill_digests,
                     "node_agent_skills": node_agent_skill_digests,
                     "language": language,
+                    "sealed_paths": sealed_paths,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode()
             (staging / "resources.json").write_bytes(snapshot_manifest)
+            from plugins.workflow.scheduled_revalidation import (
+                sealed_snapshot_digest,
+            )
+
+            snapshot_digest = sealed_snapshot_digest(
+                staging, relative_paths=sealed_paths
+            )
             nodes = tuple(
                 {
                     "id": node.id,
@@ -3080,6 +3098,7 @@ class RunStore:
                     for node_id in package.sidecar.get("outward_action_nodes", ())
                 ),
                 language=language,
+                sealed_snapshot_digest=snapshot_digest,
             )
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
@@ -3283,6 +3302,7 @@ class RunStore:
             dict(snapshot.input_digests),
             snapshot.outward_action_nodes,
             dict(snapshot.language) if snapshot.language is not None else None,
+            snapshot.sealed_snapshot_digest,
         )
 
     @staticmethod
@@ -3772,6 +3792,7 @@ class RunStore:
             "language": (
                 dict(snapshot.language) if snapshot.language is not None else None
             ),
+            "sealed_snapshot_digest": snapshot.sealed_snapshot_digest,
             "admission_disposition": disposition,
             "queue_position": queue_position,
             "queue_sequence": queue_sequence,

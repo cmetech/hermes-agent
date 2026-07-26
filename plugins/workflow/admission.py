@@ -58,6 +58,7 @@ class PreparedRunSnapshot:
     input_digests: Mapping[str, str] = None  # type: ignore[assignment]
     outward_action_nodes: tuple[str, ...] = ()
     language: Mapping[str, object] | None = None
+    sealed_snapshot_digest: str | None = None
 
     def __post_init__(self) -> None:
         if self.input_digests is None:

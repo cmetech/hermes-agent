@@ -3224,10 +3224,15 @@ upstream_changes:
   - read_language_snapshot
   - verify_language_snapshot
   - PreparedRunSnapshot.language
+  - PreparedRunSnapshot.sealed_snapshot_digest
   - resources.json language metadata
+  - resources.json sealed_paths metadata
   - run projection language metadata
+  - run projection sealed_snapshot_digest
   - load_workflow_snapshot normalizer_version pin
   - RunScheduler._load_run_package sealed language verification
+  - read_sealed_snapshot_paths
+  - sealed_snapshot_digest admitted-path verification
   - verify_sealed_snapshot language identity verification
   tests:
   - tests/plugins/workflow/test_language_snapshot.py
@@ -3240,20 +3245,27 @@ upstream_changes:
     Seal effective_profile, normalizer_version, normalized_definition_digest,
     and the package-bound semantic_fingerprint into the existing bounded
     resources.json snapshot and mirror that exact object into the durable run
-    projection without adding SQLite columns. Resume must parse only the sealed
-    definition, policy, and resources bytes, select the pinned supported
-    normalizer, and fail closed with typed invalid, unsupported-profile,
-    unsupported-version, missing, or mismatch errors before node execution.
-    Preserve positional PreparedRunSnapshot compatibility by keeping language
-    as the final defaulted field. Preserve the pre-language fallback only when
-    sealed policy resolution is hermes-legacy; declared Archon snapshots without
-    language metadata remain invalid. Scheduled revalidation must compare the
-    projected language object with resources.json after whole-file digest
-    verification, while not-due coordinator polling stays bounded and does not
-    reopen installed workflow definitions.
+    projection without adding SQLite columns. Record a bounded canonical
+    sealed_paths allow-list in resources.json and project the resulting
+    whole-package sealed_snapshot_digest through the journal. Resume must verify
+    raw policy and resources hashes, the exact admitted definition, policy,
+    inputs, skills, and package-resource bytes, and equality between projected
+    and sealed language metadata before parsing execution semantics. Legitimate
+    post-admission runtime artifacts remain outside that admitted path set.
+    Select the pinned supported normalizer and fail closed with typed invalid,
+    unsupported-profile, unsupported-version, missing, mismatch, or snapshot
+    integrity errors before node execution. Preserve positional
+    PreparedRunSnapshot compatibility by appending defaulted fields. Preserve
+    the pre-language fallback only for snapshots with neither language nor
+    sealed-tree projection whose policy resolves to hermes-legacy; declared
+    Archon and new-format snapshots without language metadata remain invalid.
+    Scheduled revalidation must compare projection and resources language plus
+    sealed-tree identities, while not-due coordinator polling stays bounded and
+    does not reopen installed workflow definitions.
   removal_condition: >-
     Remove when upstream provides equivalent package-bound semantic admission
-    pinning, sealed-byte-only resume, typed fail-closed verification, scheduled
-    language identity revalidation, and pre-language legacy compatibility
-    without a database migration.
+    pinning, journal-backed admitted-tree identity, sealed-byte-only resume,
+    typed fail-closed verification, scheduled language and tree identity
+    revalidation, and pre-language legacy compatibility without a database
+    migration.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
