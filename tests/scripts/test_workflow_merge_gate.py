@@ -126,25 +126,51 @@ def test_runner_binding_contract_is_in_merge_gate_and_native_matrix() -> None:
     assert path not in WORKFLOW_GATE_OPTOUTS
 
 
+def _portability_matrix() -> dict:
+    return yaml.safe_load(CI.read_text())["jobs"]["workflow-portability"]["strategy"][
+        "matrix"
+    ]
+
+
+def _portability_files() -> list[str]:
+    """Every test file the native portability job runs, across all slices.
+
+    The job is sliced (os x slice) because it outgrew a single 30-minute
+    runner, so the file list now lives in the matrix rather than inline in the
+    run step. The contract these tests protect is unchanged: each pinned path
+    runs exactly once, on all three operating systems.
+    """
+    files: list[str] = []
+    for entry in _portability_matrix()["slice"]:
+        files.extend(entry["files"].split())
+    return files
+
+
+def test_portability_slices_cover_every_pinned_file_exactly_once() -> None:
+    files = _portability_files()
+
+    # Two slices running the same file is wasted Windows minutes on the job
+    # that already outgrew its budget once.
+    assert len(files) == len(set(files)), "a test file is pinned in two slices"
+    for path in files:
+        assert CI.read_text().count(path) == 1
+    # The slice lists are hand-maintained, so a typo would otherwise only
+    # surface as a confusing "file or directory not found" inside CI.
+    missing = [path for path in files if not (ROOT / path).is_file()]
+    assert not missing, f"portability slices name files that do not exist: {missing}"
+
+
 def test_laptop_diagnostic_middleware_e2e_is_exactly_pinned_in_release_gates() -> None:
     path = "tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py"
 
-    workflow = yaml.safe_load(CI.read_text())
-    portability = workflow["jobs"]["workflow-portability"]
-    portability_run = next(
-        step["run"]
-        for step in portability["steps"]
-        if step.get("name") == "Run portable workflow and installed-showcase gates"
-    )
-
     assert GATE.read_text().count(path) == 1
     assert CI.read_text().count(path) == 1
-    assert portability["strategy"]["matrix"]["os"] == [
+    assert _portability_matrix()["os"] == [
         "ubuntu-latest",
         "macos-latest",
         "windows-latest",
     ]
-    assert portability_run.count(path) == 1
+    assert _portability_files().count(path) == 1
     assert GATE.read_text().count(
         "tests/plugins/workflow/test_installed_distribution_e2e.py"
     ) == 1
@@ -153,22 +179,14 @@ def test_laptop_diagnostic_middleware_e2e_is_exactly_pinned_in_release_gates() -
 def test_ai_extensions_middleware_e2e_is_exactly_pinned_in_release_gates() -> None:
     path = "tests/plugins/workflow/test_ai_extensions_middleware_e2e.py"
 
-    workflow = yaml.safe_load(CI.read_text())
-    portability = workflow["jobs"]["workflow-portability"]
-    portability_run = next(
-        step["run"]
-        for step in portability["steps"]
-        if step.get("name") == "Run portable workflow and installed-showcase gates"
-    )
-
     assert GATE.read_text().count(path) == 1
     assert CI.read_text().count(path) == 1
-    assert portability["strategy"]["matrix"]["os"] == [
+    assert _portability_matrix()["os"] == [
         "ubuntu-latest",
         "macos-latest",
         "windows-latest",
     ]
-    assert portability_run.count(path) == 1
+    assert _portability_files().count(path) == 1
     assert path not in WORKFLOW_GATE_OPTOUTS
     assert GATE.read_text().count("tests/plugins/workflow/test_node_mcp.py") == 1
     assert CI.read_text().count("tests/plugins/workflow/test_node_mcp.py") == 1

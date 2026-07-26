@@ -830,9 +830,24 @@ upstream_changes:
   - tests/plugins/workflow/test_process_lifecycle_soak.py
   expected_commit_subject: 'test(workflow): enforce production and merge gates'
   upstream_candidate: true
-  merge_guidance: Preserve the credential-free Linux, macOS, and Windows matrix
-    and its installed-showcase and process-lifecycle assertions while reconciling
-    upstream CI orchestration changes.
+  merge_guidance: >-
+    Preserve the credential-free Linux, macOS, and Windows matrix and its
+    installed-showcase and process-lifecycle assertions while reconciling
+    upstream CI orchestration changes. The job is now SLICED (os x slice, four
+    slices) and the file list lives in the matrix rather than inline in the run
+    step, so a merge that restores a single inline list silently reintroduces
+    the failure this fixed: the job last passed on 2026-07-21 in 18 minutes with
+    19 files, then grew to 28 and took 40m40s on Windows against a 30-minute
+    budget, so it was killed at ~64% on every run and the aggregate gate could
+    never go green. Windows is roughly 14x slower than macOS on these
+    admission/backlog tests (a directory copy plus an fsync'd SQLite write per
+    admission), so slices are balanced on measured WINDOWS seconds --
+    1155/659/548/74 -- not on test count. Keep test_scheduled_runs.py alone in
+    slice 1: at 1155s it is 47% of the job, so it bounds the critical path and
+    pairing it with anything makes that slice the new timeout risk. On merge:
+    UNION, keep `os` as the three-entry list (tests assert it literally), keep
+    the step name "Run portable workflow and installed-showcase gates", and
+    re-balance from fresh Windows timings rather than assuming these hold.
   removal_condition: Remove when upstream CI provides equivalent native
     all-platform portable-workflow and installed-showcase coverage.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
