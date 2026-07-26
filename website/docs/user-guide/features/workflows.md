@@ -8,6 +8,18 @@ description: "Discover, inspect, trust, run, and operate durable workflow packag
 
 Hermes workflows are durable, resumable packages that coordinate commands, prompts, scripts, approvals, and other supported nodes. The same profile-scoped catalog and run state back the CLI and the Desktop app.
 
+## Language profiles
+
+Existing unversioned packages retain `hermes-legacy` behavior. New packages can
+opt into the fail-closed `archon-2026-07` contract by declaring it in the
+Hermes companion file. Archon-profile packages require a Phase-1-capable
+backend; keep workflow directories shared with older runtimes unversioned until
+every consumer recognizes the declaration.
+
+See the [Workflow YAML reference](./workflow-yaml-reference) for the generated
+schema commands, complete field inventory, current Phase 1 status, examples,
+and migration steps.
+
 ## Browse the catalog
 
 Open **Workflows** in the Desktop sidebar to see the catalog for the selected profile. Each row shows the package name, version, description, trust state, supported inputs, and whether it came from the profile, current project, or the bundled showcase collection. A user workflow and a showcase with the same name remain separate rows; **Project**, **Profile**, and **Bundled showcase** identify which package View and Run target.
