@@ -549,6 +549,42 @@ def _workflow_schema_action_index(argv: list[str]) -> int | None:
     return None
 
 
+def _parse_workflow_schema_candidate(argv: list[str]):
+    """Parse one candidate with the same bounded authorities as normal dispatch."""
+    if _workflow_schema_action_index(argv) is None:
+        return None
+
+    from hermes_cli._parser import build_top_level_parser
+    from plugins.workflow.schema_cli import configure_schema_parser
+
+    parser, subparsers, _chat_parser = build_top_level_parser()
+    workflow_parser = subparsers.add_parser("workflow")
+    workflow_parser.add_argument("--workdir", help=argparse.SUPPRESS)
+    workflow_parser.add_argument("--hermes-home", help=argparse.SUPPRESS)
+    actions = workflow_parser.add_subparsers(dest="workflow_action")
+    schema_parser = actions.add_parser(
+        "schema", help="Print the workflow authoring contract"
+    )
+    configure_schema_parser(schema_parser)
+    return parser.parse_args(argv)
+
+
+def _normal_dispatch_target(args) -> str | None:
+    """Resolve the command selected by main's established dispatch precedence."""
+    if args is None:
+        return None
+    if getattr(args, "version", False):
+        return "version"
+    if getattr(args, "oneshot", None):
+        return "oneshot"
+    command = getattr(args, "command", None)
+    if command is None:
+        return "chat"
+    if command == "workflow" and getattr(args, "workflow_action", None) == "schema":
+        return "workflow-schema"
+    return command
+
+
 def _apply_profile_override() -> None:
     """Pre-parse --profile/-p and set HERMES_HOME before imports."""
     argv = sys.argv[1:]
@@ -728,8 +764,10 @@ def _apply_profile_override() -> None:
 
 
 _apply_profile_override()
+_WORKFLOW_SCHEMA_EARLY_ARGV = tuple(sys.argv[1:])
+_WORKFLOW_SCHEMA_EARLY_ARGS = _parse_workflow_schema_candidate(sys.argv[1:])
 _WORKFLOW_SCHEMA_READONLY_STARTUP = (
-    _workflow_schema_action_index(sys.argv[1:]) is not None
+    _normal_dispatch_target(_WORKFLOW_SCHEMA_EARLY_ARGS) == "workflow-schema"
 )
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
@@ -14525,22 +14563,17 @@ def cmd_claw(args):
 
 def _try_workflow_schema_readonly() -> bool:
     """Serve exact schema introspection before any mutating CLI startup seam."""
-    if _workflow_schema_action_index(sys.argv[1:]) is None:
+    current_argv = tuple(sys.argv[1:])
+    args = (
+        _WORKFLOW_SCHEMA_EARLY_ARGS
+        if current_argv == _WORKFLOW_SCHEMA_EARLY_ARGV
+        else _parse_workflow_schema_candidate(list(current_argv))
+    )
+    if _normal_dispatch_target(args) != "workflow-schema":
         return False
 
-    from hermes_cli._parser import build_top_level_parser
-    from plugins.workflow.schema_cli import configure_schema_parser, emit_schema
+    from plugins.workflow.schema_cli import emit_schema
 
-    parser, subparsers, _chat_parser = build_top_level_parser()
-    workflow_parser = subparsers.add_parser("workflow")
-    workflow_parser.add_argument("--workdir", help=argparse.SUPPRESS)
-    workflow_parser.add_argument("--hermes-home", help=argparse.SUPPRESS)
-    actions = workflow_parser.add_subparsers(dest="workflow_action")
-    schema_parser = actions.add_parser(
-        "schema", help="Print the workflow authoring contract"
-    )
-    configure_schema_parser(schema_parser)
-    args = parser.parse_args(sys.argv[1:])
     emit_schema(args)
     return True
 

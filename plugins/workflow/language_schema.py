@@ -427,7 +427,7 @@ STRUCTURAL_REQUIREMENTS = (
         when_field="interactive",
         equals=True,
         required_field="gate_message",
-        required_shape="nonempty_string",
+        required_shape="json_truthy",
     ),
 )
 
@@ -500,6 +500,19 @@ def _field_status(
     return next(item for item in spec.compatibility if item.profile is profile)
 
 
+def _json_truthy_schema() -> dict[str, Any]:
+    """Describe exactly the JSON values accepted by Python truth testing."""
+    return {
+        "oneOf": [
+            {"const": True},
+            {"type": "number", "not": {"const": 0}},
+            {"type": "string", "minLength": 1},
+            {"type": "array", "minItems": 1},
+            {"type": "object", "minProperties": 1},
+        ]
+    }
+
+
 def _schema_for_shape(
     shape: str,
     profile: WorkflowLanguageProfile,
@@ -508,6 +521,8 @@ def _schema_for_shape(
 ) -> dict[str, Any]:
     if shape == "any":
         return {}
+    if shape == "json_truthy":
+        return _json_truthy_schema()
     if shape == "string":
         return {"type": "string"}
     if shape == "nonempty_string":

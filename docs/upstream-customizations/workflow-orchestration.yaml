@@ -3308,6 +3308,7 @@ upstream_changes:
   - FieldCompatibility
   - StructuralRequirement
   - STRUCTURAL_REQUIREMENTS
+  - JSON truthiness schema helper
   - FIELD_INVENTORY
   - definition_field_names
   - common_node_field_names
@@ -3321,6 +3322,7 @@ upstream_changes:
   - configure_schema_parser
   - emit_schema
   - exact top-level workflow schema action resolution
+  - parsed normal dispatch target precedence
   - workflow schema local and global profile option routing
   - workflow schema read-only startup bypass
   tests:
@@ -3337,7 +3339,7 @@ upstream_changes:
     and every deferred annotation aligned with the runtime's stable finding
     code, blocking status, and enforcement phase. Derive nested structural
     requirements from immutable inventory metadata, including script runtime,
-    interactive-loop gate (including a nonempty conditional message),
+    interactive-loop gate (including exact loader-compatible JSON truthiness),
     event-bound hook output (including loader-valid explicit null), retry,
     approval, and inline-agent shapes; keep graph references, resource paths, provider
     capabilities, and runtime compatibility with the loader rather than
@@ -3346,8 +3348,11 @@ upstream_changes:
     filesystem mutation, model, MCP, or network calls while emitting
     deterministic compact JSON. Compose the bounded early parser from Hermes'
     top-level argparse authority and the same schema-child argument registrar
-    and emitter used by plugin dispatch. Success, help, and every parse error
-    must complete before startup exactly once with normal argparse semantics.
+    and emitter used by plugin dispatch. Derive early eligibility from the
+    parsed namespace using normal dispatch precedence: top-level version and
+    oneshot modes must keep their established output, exit, and startup
+    behavior instead of being mistaken for schema requests. Success, help, and
+    every parse error must complete before startup exactly once with normal argparse semantics.
     Resolve the exact top-level workflow/schema action so positional values
     cannot steal profile ownership or unknown pre-command flags invoke schema;
     preserve historical global profile placement while leaving only that

@@ -436,6 +436,39 @@ def test_packaged_schema_keeps_global_and_child_profiles_distinct(
     assert not hermes_home.exists()
 
 
+@pytest.mark.parametrize("version_flag", ["--version", "-V"])
+def test_packaged_schema_defers_to_normal_version_precedence(tmp_path, version_flag):
+    completed, before, after, home, hermes_home = _run_packaged_schema(
+        tmp_path, [version_flag, "workflow", "schema", "--json"]
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert "Install directory:" in completed.stdout
+    assert '"schema_version"' not in completed.stdout
+    assert before == ((), ())
+    assert after != before
+    assert not home.exists()
+    assert hermes_home.exists()
+
+
+@pytest.mark.parametrize("oneshot_flag", ["--oneshot", "-z"])
+def test_packaged_schema_defers_to_normal_oneshot_precedence(tmp_path, oneshot_flag):
+    completed, before, after, home, hermes_home = _run_packaged_schema(
+        tmp_path,
+        [oneshot_flag, "precedence probe", "workflow", "schema", "--json"],
+    )
+
+    assert completed.returncode == 1
+    assert '"schema_version"' not in completed.stdout
+    assert '"schema_version"' not in completed.stderr
+    assert "forbidden runtime import:" in completed.stderr
+    assert before == ((), ())
+    assert after != before
+    assert not home.exists()
+    assert hermes_home.exists()
+
+
 def test_list_and_show_json_are_stable_and_redacted(workflow_writer, tmp_path, capsys):
     workdir = tmp_path / "repo"
     _write(workflow_writer, workdir)

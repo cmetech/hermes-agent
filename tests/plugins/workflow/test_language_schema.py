@@ -207,34 +207,6 @@ def test_every_node_kind_has_schema_loader_structural_parity(node, expected):
         pytest.param(
             {
                 "id": "n",
-                "loop": {
-                    "prompt": "again",
-                    "until": "done",
-                    "max_iterations": 2,
-                    "interactive": True,
-                    "gate_message": "",
-                },
-            },
-            False,
-            id="interactive-loop-rejects-empty-gate-message",
-        ),
-        pytest.param(
-            {
-                "id": "n",
-                "loop": {
-                    "prompt": "again",
-                    "until": "done",
-                    "max_iterations": 2,
-                    "interactive": True,
-                    "gate_message": None,
-                },
-            },
-            False,
-            id="interactive-loop-rejects-null-gate-message",
-        ),
-        pytest.param(
-            {
-                "id": "n",
                 "bash": "false",
                 "retry": {"max_attempts": 2, "delay_ms": 1000, "on_error": "all"},
             },
@@ -357,6 +329,38 @@ def test_every_node_kind_has_schema_loader_structural_parity(node, expected):
 )
 def test_nested_shapes_have_schema_loader_structural_parity(node, expected):
     assert _structural_outcomes(_workflow(node)) == (expected, expected)
+
+
+@pytest.mark.parametrize(
+    ("gate_message", "expected"),
+    [
+        pytest.param(1, True, id="truthy-number"),
+        pytest.param(["next"], True, id="truthy-list"),
+        pytest.param({"message": "next"}, True, id="truthy-object"),
+        pytest.param(True, True, id="truthy-boolean"),
+        pytest.param(None, False, id="falsey-null"),
+        pytest.param("", False, id="falsey-string"),
+        pytest.param([], False, id="falsey-list"),
+        pytest.param({}, False, id="falsey-object"),
+        pytest.param(False, False, id="falsey-boolean"),
+        pytest.param(0, False, id="falsey-number"),
+    ],
+)
+def test_interactive_gate_message_json_truthiness_matches_loader(
+    gate_message, expected
+):
+    document = _workflow({
+        "id": "n",
+        "loop": {
+            "prompt": "again",
+            "until": "done",
+            "max_iterations": 2,
+            "interactive": True,
+            "gate_message": gate_message,
+        },
+    })
+
+    assert _structural_outcomes(document) == (expected, expected)
 
 
 @pytest.mark.parametrize(
