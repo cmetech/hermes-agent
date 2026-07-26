@@ -302,11 +302,12 @@ def verify_sealed_snapshot(
     run: Mapping[str, object],
     *,
     run_directory: Path,
+    read_budget: WorkflowResourceReadBudget | None = None,
 ) -> None:
     definition = run_directory / "definition.yaml"
     policy = run_directory / "policy.yaml"
     resources = run_directory / "resources.json"
-    budget = WorkflowResourceReadBudget(
+    budget = read_budget or WorkflowResourceReadBudget(
         max_file_bytes=_RESOURCE_FILE_BYTES,
         max_total_bytes=_RESOURCE_TOTAL_BYTES,
         max_files=_RESOURCE_FILES,
@@ -442,6 +443,7 @@ def revalidate_scheduled_run(
     *,
     hermes_home: str | Path,
     run_directory: str | Path,
+    read_budget: WorkflowResourceReadBudget | None = None,
 ) -> None:
     """Reauthorize one scheduled run without mutating its durable state."""
     metadata = run.get("run_metadata")
@@ -460,12 +462,15 @@ def revalidate_scheduled_run(
     risk_identity = _required_digest(metadata, "risk_digest")
     if package_identity != str(run.get("definition_digest")):
         raise ScheduledRunRevalidationError("admission package identity changed")
-    verify_sealed_snapshot(run, run_directory=Path(run_directory))
-
-    budget = WorkflowResourceReadBudget(
+    budget = read_budget or WorkflowResourceReadBudget(
         max_file_bytes=_RESOURCE_FILE_BYTES,
         max_total_bytes=_RESOURCE_TOTAL_BYTES,
         max_files=_RESOURCE_FILES,
+    )
+    verify_sealed_snapshot(
+        run,
+        run_directory=Path(run_directory),
+        read_budget=budget,
     )
     source = metadata.get("catalog_source")
     if source == "showcase":

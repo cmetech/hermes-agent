@@ -93,17 +93,25 @@ class ForegroundExecutionConflict(RuntimeError):
 class _ScheduledPromotionAuthorization:
     """Store-instance-owned, one-use fire-time verifier."""
 
-    __slots__ = ("_consumed", "_run_id", "_store_identity", "_verify")
+    __slots__ = (
+        "_consumed",
+        "_resource_read_budget",
+        "_run_id",
+        "_store_identity",
+        "_verify",
+    )
 
     def __init__(
         self,
         store_identity: object,
         run_id: str,
         verify: Callable[[Mapping[str, object]], None],
+        resource_read_budget: WorkflowResourceReadBudget | None,
     ) -> None:
         self._store_identity = store_identity
         self._run_id = run_id
         self._verify = verify
+        self._resource_read_budget = resource_read_budget
         self._consumed = False
 
 
@@ -4423,6 +4431,8 @@ class RunStore:
         self,
         run_id: str,
         verify: Callable[[Mapping[str, object]], None],
+        *,
+        resource_read_budget: WorkflowResourceReadBudget | None = None,
     ) -> _ScheduledPromotionAuthorization:
         if not isinstance(run_id, str) or not run_id or not callable(verify):
             raise ValueError("scheduled authorization requires a run and verifier")
@@ -4430,7 +4440,19 @@ class RunStore:
             self._scheduled_authorization_identity,
             run_id,
             verify,
+            resource_read_budget,
         )
+
+    def _scheduled_promotion_read_budget(
+        self,
+        authorization: object,
+        run_id: str,
+    ) -> WorkflowResourceReadBudget | None:
+        verified = self._validate_scheduled_promotion_authorization(
+            authorization,
+            run_id,
+        )
+        return verified._resource_read_budget
 
     def _validate_scheduled_promotion_authorization(
         self,

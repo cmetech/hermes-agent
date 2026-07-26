@@ -1280,6 +1280,68 @@ def test_crash_after_revalidation_before_promotion_revalidates_after_restart(
     )
 
 
+def test_fire_time_revalidation_and_package_prep_share_one_resource_budget(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, _package, run_id, due, _coordinator, identity, epoch, _context = (
+        _admit_scheduled_user(
+            home,
+            workflow_writer,
+            name="scheduled-shared-resource-budget",
+            binding=binding,
+        )
+    )
+    observed: list[object] = []
+    original_verify = scheduled_revalidation_module.verify_sealed_snapshot
+    original_revalidate = scheduled_revalidation_module.revalidate_scheduled_run
+
+    def record_verify(*args, **kwargs):
+        observed.append(kwargs.get("read_budget"))
+        return original_verify(*args, **kwargs)
+
+    def record_revalidate(*args, **kwargs):
+        observed.append(kwargs.get("read_budget"))
+        return original_revalidate(*args, **kwargs)
+
+    monkeypatch.setattr(
+        scheduled_revalidation_module,
+        "verify_sealed_snapshot",
+        record_verify,
+    )
+    monkeypatch.setattr(
+        scheduled_revalidation_module,
+        "revalidate_scheduled_run",
+        record_revalidate,
+    )
+    scheduler = RunScheduler(
+        store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=lambda: due,
+    )
+    original_load = scheduler._load_verified_run_package
+
+    def record_load(target_run_id, *, read_budget=None):
+        observed.append(read_budget)
+        return original_load(target_run_id, read_budget=read_budget)
+
+    monkeypatch.setattr(scheduler, "_load_verified_run_package", record_load)
+    try:
+        result = scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert result["status"] == "succeeded"
+    assert observed
+    assert observed[0] is not None
+    assert {id(budget) for budget in observed} == {id(observed[0])}
+
+
 def test_crash_after_promotion_before_claim_continues_correlated_run_once(
     tmp_path: Path,
     monkeypatch,
@@ -1381,9 +1443,9 @@ def test_live_trust_change_after_package_load_fails_at_atomic_promotion(
     original_load = scheduler._load_verified_run_package
     mutated = False
 
-    def load_then_revoke(loaded_run_id: str):
+    def load_then_revoke(loaded_run_id: str, *, read_budget=None):
         nonlocal mutated
-        sealed = original_load(loaded_run_id)
+        sealed = original_load(loaded_run_id, read_budget=read_budget)
         if not mutated:
             mutated = True
             assert WorkflowTrustStore(home).revoke(

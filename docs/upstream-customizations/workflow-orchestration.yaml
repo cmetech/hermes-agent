@@ -3266,6 +3266,10 @@ upstream_changes:
   - ResourceResolver sealed-byte-exclusive resource reads
   - WorkflowResourceReadBudget.from_authenticated
   - WorkflowResourceReadBudget canonical shared-run accounting
+  - verify_sealed_snapshot shared fire-time read budget
+  - revalidate_scheduled_run shared fire-time read budget
+  - _ScheduledPromotionAuthorization resource read budget authority
+  - RunScheduler scheduled promotion-to-package budget threading
   - authoritative workflow resource capacity limits
   - AuthenticatedExecutionMaterializer
   - AuthenticatedExecutionMaterializer canonical closure materialization
@@ -3378,8 +3382,12 @@ upstream_changes:
     commands, npx servers, inline Python without sealed dependencies, and remote
     servers retain their existing launch behavior.
     Scheduled revalidation must compare projection and resources language plus
-    sealed-tree identities, while not-due coordinator polling stays bounded and
-    does not reopen installed workflow definitions.
+    sealed-tree identities. One canonical-deduplicated WorkflowResourceReadBudget
+    and byte cache must span fire-time sealed-snapshot verification, live catalog
+    revalidation, transactional promotion authorization, and verified package
+    preparation; boundary identity checks remain live while cached bytes are
+    never charged twice. Not-due coordinator polling stays bounded and does not
+    reopen installed workflow definitions.
   removal_condition: >-
     Remove when upstream provides equivalent package-bound semantic admission
     pinning, journal-backed admitted-tree identity, sealed-byte-only resume,

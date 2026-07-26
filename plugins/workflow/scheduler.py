@@ -574,14 +574,17 @@ class RunScheduler:
             self.store.transition_pending_nodes(run_id, transitions)
 
     def _load_verified_run_package(
-        self, run_id: str
+        self,
+        run_id: str,
+        *,
+        read_budget: WorkflowResourceReadBudget | None = None,
     ) -> tuple[WorkflowPackage, frozenset[str], Mapping[str, bytes]]:
         run_directory = self.store.run_directory(run_id)
         definition = run_directory / "definition.yaml"
         policy = run_directory / "policy.yaml"
         projection = self.store.load_run(run_id)
         resources_path = run_directory / "resources.json"
-        read_budget = WorkflowResourceReadBudget(
+        read_budget = read_budget or WorkflowResourceReadBudget(
             max_file_bytes=WORKFLOW_RESOURCE_MAX_FILE_BYTES,
             max_total_bytes=WORKFLOW_RESOURCE_MAX_TOTAL_BYTES,
             max_files=WORKFLOW_RESOURCE_MAX_FILES,
@@ -1444,7 +1447,25 @@ class RunScheduler:
 
     def _prepare_run_package(self, run_id: str, schedule_revalidation):
         try:
-            package, sealed_paths, sealed_bytes = self._load_verified_run_package(run_id)
+            read_budget = (
+                self.store._scheduled_promotion_read_budget(
+                    schedule_revalidation,
+                    run_id,
+                )
+                if schedule_revalidation is not None
+                else None
+            )
+            if read_budget is None:
+                package, sealed_paths, sealed_bytes = (
+                    self._load_verified_run_package(run_id)
+                )
+            else:
+                package, sealed_paths, sealed_bytes = (
+                    self._load_verified_run_package(
+                        run_id,
+                        read_budget=read_budget,
+                    )
+                )
             return (
                 package,
                 self._run_execution_limits(package),
@@ -1488,9 +1509,15 @@ class RunScheduler:
                 verify_sealed_snapshot,
             )
             run_directory = self.store.run_directory(run_id)
+            read_budget = WorkflowResourceReadBudget(
+                max_file_bytes=WORKFLOW_RESOURCE_MAX_FILE_BYTES,
+                max_total_bytes=WORKFLOW_RESOURCE_MAX_TOTAL_BYTES,
+                max_files=WORKFLOW_RESOURCE_MAX_FILES,
+            )
             verify_sealed_snapshot(
                 projection,
                 run_directory=run_directory,
+                read_budget=read_budget,
             )
 
             def verify(current_projection: Mapping[str, object]) -> None:
@@ -1503,11 +1530,13 @@ class RunScheduler:
                     context,
                     hermes_home=self.store.hermes_home,
                     run_directory=run_directory,
+                    read_budget=read_budget,
                 )
 
             authorization = self.store._scheduled_promotion_authorization(
                 run_id,
                 verify,
+                resource_read_budget=read_budget,
             )
         except Exception:
             self.store.fail_scheduled_revalidation(
