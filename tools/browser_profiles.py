@@ -229,27 +229,39 @@ def is_origin_trusted(profile: Optional[BrowserProfile], url: str) -> bool:
 def _enrolled_candidates() -> List[str]:
     """Return likely enrolled-browser executable paths for this platform.
 
-    Edge is listed first: on a managed corporate device it is the browser
-    enrolled with the OS certificate store, which is what makes mTLS work.
+    Chrome is listed first, Edge second. Both are policy-managed on a corporate
+    device and both read the OS certificate store, which is what makes mTLS
+    work; confirmed on the target fleet 2026-07-26 that Chrome reaches internal
+    sites, so it is the one the user actually browses with.
+
     We deliberately do NOT include agent-browser's bundled Chrome for Testing —
-    it is the UNMANAGED browser that fails corporate mTLS/SSO.
+    a different binary, not merely a different profile, and the one browser that
+    cannot present machine certificates. That exclusion is the point of this
+    list, not an incidental detail.
     """
     if sys.platform == "win32":
         program_files = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
         program_files64 = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+        # Per-user installs are common where the fleet blocks machine-wide ones.
+        local_app_data = os.environ.get("LOCALAPPDATA", r"C:\Users\Default\AppData\Local")
         return [
+            os.path.join(program_files64, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(program_files, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe"),
             os.path.join(program_files, "Microsoft", "Edge", "Application", "msedge.exe"),
             os.path.join(program_files64, "Microsoft", "Edge", "Application", "msedge.exe"),
         ]
     if sys.platform == "darwin":
         return [
-            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
         ]
     return [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/opt/google/chrome/chrome",
         "/usr/bin/microsoft-edge",
         "/usr/bin/microsoft-edge-stable",
-        "/usr/bin/google-chrome",
     ]
 
 

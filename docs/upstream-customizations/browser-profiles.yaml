@@ -88,6 +88,107 @@ upstream_changes:
     model for private-network browser access (for example an allowlist attached
     to a CDP-attached session), making the local seam redundant.
   last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+- id: enrolled-browser-launch-wiring
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - tools/browser_tool.py
+  - tools/browser_profiles.py
+  - tools/browser_session_registry.py
+  - tests/tools/test_browser_enrolled_launch.py
+  - tests/tools/test_browser_profiles.py
+  owned_symbols:
+  - _session_cdp_url
+  - _session_browser_profile
+  - _session_uses_enrolled_browser
+  - _default_profile_launchable
+  - _forget_session_cdp_url
+  - _reset_session_cdp_cache
+  - default_profile_launchable
+  - _enrolled_candidates
+  tests:
+  - tests/tools/test_browser_enrolled_launch.py
+  - tests/tools/test_browser_profiles.py
+  - tests/tools/test_browser_hybrid_routing.py
+  - tests/tools/test_browser_cdp_override.py
+  - tests/tools/test_browser_chromium_check.py
+  - tests/tools/test_browser_ssrf_local.py
+  expected_commit_subject: 'feat(browser): drive the real installed browser for enrolled profiles'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge, never --theirs. This is the LAUNCH half of the enrolled
+    profile; browser-profile-ssrf-trust-seam is only the TRUST half. Before it,
+    nothing in the repo called browser_session_manager.acquire(), so
+    browser.default_profile granted a session internal-origin trust while it
+    still drove agent-browser's bundled Chrome for Testing -- the guard opened
+    the door and the wrong browser walked through. Losing this reintroduces
+    exactly that state, and it presents as an mTLS or connectivity failure on
+    internal sites rather than as a missing feature.
+
+    Three pieces, and the ORDER between them is a correctness constraint, not a
+    preference.
+
+    (1) _enrolled_candidates() in browser_profiles.py lists Chrome BEFORE Edge on
+    all three platforms and includes real Windows Chrome paths (Program Files,
+    Program Files (x86), and LOCALAPPDATA for per-user installs). What must never
+    be relaxed is the exclusion of agent-browser's bundled Chrome for Testing:
+    it is a different binary, not merely a different profile, and it is the one
+    browser that cannot present machine certificates. Adding it would silently
+    reinstate the original bug. The order itself is a fleet observation (Chrome
+    is policy-managed on the target fleet, confirmed 2026-07-26), so flipping it
+    back is a config decision, not a regression -- the exclusion is not.
+
+    (2) _session_cdp_url(session_key) in browser_tool.py is the wiring, and
+    mirrors how _session_trusts_url was introduced: one delegating helper plus a
+    call-site swap. It resolves the session's profile (explicit bind, else
+    browser.default_profile) and, when enrolled, returns
+    acquire(profile, session_key=...).cdp_url; otherwise it returns
+    _get_cdp_override() unchanged, so BROWSER_CDP_URL / browser.cdp_url
+    precedence and /browser connect are untouched. The single launch call site is
+    _get_session_info, guarded by `"" if force_local else ...` so hybrid-routing
+    sidecars keep their deliberately local Chromium -- matching the previous code,
+    where the value was ignored whenever force_local was set.
+
+    Two properties inside it are load-bearing and neither is enforced by types.
+    MEMOIZATION per session_key is not an optimization: acquire() runs
+    _run_daemon_hygiene(), which executes `close --all`, so calling it per tool
+    invocation tears the browser down between navigate and click. A FAILED
+    acquire must NOT be cached (a transient launch failure has to be able to
+    recover) and must propagate: acquire() raises ProfileError rather than
+    falling back to the unmanaged bundled browser, and preserving that is the
+    entire point -- a silent fallback fails corporate mTLS and reads as a broken
+    connection instead of a misconfigured profile.
+
+    The Chromium fast-fail gate in _run_browser_command consults the PURE
+    predicate _session_uses_enrolled_browser, never _session_cdp_url. That
+    distinction matters: cleanup_browser routes its `close` through
+    _run_browser_command, so acquiring there would launch a browser in order to
+    close one.
+
+    Unswapped call sites (_is_local_mode, _is_local_backend,
+    _ensure_cdp_supervisor) stay correct because acquire() exports
+    BROWSER_CDP_URL via _attach_cdp, so _get_cdp_override() already returns the
+    enrolled endpoint by the time they run. That side effect is part of acquire's
+    contract; if upstream churn makes it unreliable, swap those sites rather than
+    duplicating the resolution.
+
+    (3) check_browser_requirements() gains an early return for a launchable
+    enrolled default profile, beside the existing _get_cdp_override() one. This
+    must land only AFTER (2). On its own it advertises browser tools that then
+    launch agent-browser with no Chromium and hang until the command timeout --
+    the failure the comment above that Chromium check already warns about. It is
+    scoped to "would actually work" (toggle on AND executable resolves), mirroring
+    the Termux branch's rule against advertising a tool that fails on first use;
+    the underlying predicate lives in browser_session_registry so the footprint in
+    the churned file stays a thin fail-closed delegator.
+
+    The untouched upstream browser SSRF and hybrid-routing suites must stay green
+    UNEDITED. If either needs editing after a merge, the merge altered this seam.
+  removal_condition: >-
+    Remove when upstream can drive a user-supplied, already-installed browser
+    binary with a persistent user-data-dir as a first-class session backend,
+    making the local acquire()/CDP wiring redundant.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
 - id: browser-profile-settings-surface
   change_class: capability-generic
   owner: downstream-edge-capability

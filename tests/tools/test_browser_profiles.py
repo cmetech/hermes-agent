@@ -240,3 +240,48 @@ class TestResolveExecutable:
         assert any("Edge" in c for c in browser_profiles._enrolled_candidates())
         monkeypatch.setattr(browser_profiles.sys, "platform", "darwin")
         assert any("Microsoft Edge" in c for c in browser_profiles._enrolled_candidates())
+
+
+class TestCandidateOrder:
+    """Chrome first, Edge fallback — confirmed against the target fleet 2026-07-26.
+
+    Chrome reaches internal sites there, so it is policy-managed. The bundled
+    Chrome for Testing stays excluded on every platform: it is a different
+    binary, and the one browser that cannot present machine certificates.
+    """
+
+    PLATFORMS = ("win32", "darwin", "linux")
+
+    def _candidates(self, monkeypatch, platform):
+        monkeypatch.setattr(browser_profiles.sys, "platform", platform)
+        return browser_profiles._enrolled_candidates()
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_chrome_is_preferred_over_edge(self, monkeypatch, platform):
+        candidates = self._candidates(monkeypatch, platform)
+        first_chrome = next(i for i, c in enumerate(candidates) if "hrome" in c)
+        first_edge = next(i for i, c in enumerate(candidates) if "dge" in c)
+        assert first_chrome < first_edge
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_both_browsers_are_offered(self, monkeypatch, platform):
+        candidates = self._candidates(monkeypatch, platform)
+        assert any("hrome" in c for c in candidates)
+        assert any("dge" in c for c in candidates)
+
+    def test_windows_lists_real_chrome_paths(self, monkeypatch):
+        candidates = self._candidates(monkeypatch, "win32")
+        assert any(c.lower().endswith("chrome.exe") for c in candidates)
+        assert any(
+            "Google" in c and "Chrome" in c and "Application" in c for c in candidates
+        )
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_chrome_for_testing_is_never_a_candidate(self, monkeypatch, platform):
+        """The bundled throwaway browser is precisely what this list excludes."""
+        for candidate in self._candidates(monkeypatch, platform):
+            lowered = candidate.lower().replace(" ", "-")
+            assert "chrome-for-testing" not in lowered
+            assert "chrome-headless-shell" not in lowered
+            assert "agent-browser" not in lowered
+            assert "ms-playwright" not in lowered

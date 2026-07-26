@@ -485,6 +485,124 @@ def _get_cdp_override() -> str:
     return ""
 
 
+# OTTO: memoized CDP endpoints for sessions driving an enrolled browser profile.
+# Memoization is load-bearing, not an optimization: browser_session_manager's
+# acquire() runs daemon hygiene (``close --all``), so calling it per tool
+# invocation would tear the browser down between navigate and click.
+_session_cdp_lock = threading.Lock()
+_session_cdp_urls: Dict[str, str] = {}
+
+
+def _reset_session_cdp_cache() -> None:
+    """Drop every memoized enrolled CDP endpoint. Test helper."""
+    with _session_cdp_lock:
+        _session_cdp_urls.clear()
+
+
+def _forget_session_cdp_url(session_key: str) -> None:
+    """Drop one session's memoized endpoint; called when its session is reaped."""
+    with _session_cdp_lock:
+        _session_cdp_urls.pop(str(session_key), None)
+
+
+def _session_browser_profile(session_key: Optional[str]):
+    """OTTO: return the ``BrowserProfile`` this session drives, or None.
+
+    PURE — resolves config only and launches nothing, so guards may consult it
+    without starting a browser. Resolution matches ``session_trusts_url``: an
+    explicit ``bind()`` wins, otherwise ``browser.default_profile`` applies, so
+    an explicitly ephemeral session never inherits the enrolled browser.
+    """
+    if not session_key:
+        return None
+    try:
+        from tools import browser_session_registry
+        from tools.browser_profiles import get_profile
+
+        name = (
+            browser_session_registry.profile_for(session_key)
+            or browser_session_registry.default_profile_name()
+        )
+        return get_profile(name) if name else None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("browser profile lookup failed for %s: %s", session_key, exc)
+        return None
+
+
+def _session_uses_enrolled_browser(session_key: Optional[str]) -> bool:
+    """OTTO: True when this session drives an enrolled (real, installed) browser.
+
+    Such a session attaches over CDP to the user's own Chrome/Edge, so it needs
+    no bundled Chromium on disk. Pure — see ``_session_browser_profile``.
+    """
+    profile = _session_browser_profile(session_key)
+    return bool(profile is not None and profile.is_enrolled)
+
+
+def _default_profile_launchable() -> bool:
+    """OTTO: True when browser.default_profile names a launchable enrolled browser.
+
+    Delegates so the footprint in this heavily-churned upstream file stays a
+    thin helper. Fails CLOSED.
+    """
+    try:
+        from tools.browser_session_registry import default_profile_launchable
+
+        return default_profile_launchable()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _session_cdp_url(session_key: Optional[str]) -> str:
+    """OTTO: return the CDP endpoint this session must drive.
+
+    An ``enrolled`` profile means the user's REAL installed browser: it holds
+    the corporate certificates and SSO that agent-browser's bundled Chrome for
+    Testing does not, so the session is launched (or reattached) through
+    ``browser_session_manager.acquire()`` and driven over its CDP URL. Every
+    other session keeps today's behaviour exactly — ``_get_cdp_override()``,
+    meaning ``BROWSER_CDP_URL`` then ``browser.cdp_url`` — so ``/browser
+    connect`` and a statically configured endpoint are unaffected.
+
+    ``acquire()`` also exports ``BROWSER_CDP_URL`` (``_attach_cdp``), which is
+    what keeps the unswapped predicates — ``_is_local_mode``,
+    ``_is_local_backend``, ``_ensure_cdp_supervisor`` — in agreement without
+    further edits to this heavily-churned file.
+
+    Raises whatever ``acquire()`` raises (``ProfileError`` for an unresolvable
+    enrolled browser). That propagation is deliberate: falling back to the
+    unmanaged bundled browser would be refused by internal sites and read as a
+    broken connection rather than a misconfigured profile. Failures are NOT
+    cached, so a transient launch failure can recover on the next call.
+
+    See docs/plans/2026-07-26-consolidated-browser-automation-design.md §2.
+    """
+    if not session_key:
+        return _get_cdp_override()
+
+    key = str(session_key)
+    with _session_cdp_lock:
+        cached = _session_cdp_urls.get(key)
+    if cached:
+        return cached
+
+    profile = _session_browser_profile(key)
+    if profile is None or not profile.is_enrolled:
+        return _get_cdp_override()
+
+    from tools.browser_session_manager import ProfileError, acquire
+
+    session = acquire(profile.name, session_key=key)
+    cdp_url = _resolve_cdp_override(str(session.cdp_url or ""))
+    if not cdp_url:
+        raise ProfileError(
+            f"browser profile {profile.name!r} exposed no CDP endpoint"
+        )
+    with _session_cdp_lock:
+        _session_cdp_urls[key] = cdp_url
+    return cdp_url
+
+
 def _get_dialog_policy_config() -> Tuple[str, float]:
     """Read ``browser.dialog_policy`` + ``browser.dialog_timeout_s`` from config.
 
@@ -2078,8 +2196,14 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     # the bare task_id key.
     force_local = _is_local_sidecar_key(task_id)
 
-    # Create session outside the lock (network call in cloud mode)
-    cdp_override = _get_cdp_override()
+    # Create session outside the lock (network call in cloud mode).
+    # OTTO: _session_cdp_url is the launch decision — for a session driving an
+    # enrolled profile it launches (or reattaches to) the user's real installed
+    # browser and returns its CDP endpoint; for every other session it is
+    # _get_cdp_override() unchanged. Skipped for hybrid-routing sidecars, which
+    # own a deliberately local Chromium (matching the previous code, where this
+    # value was ignored whenever force_local was set).
+    cdp_override = "" if force_local else _session_cdp_url(task_id)
     if cdp_override and not force_local:
         session_info = _create_cdp_session(task_id, cdp_override)
     elif force_local:
@@ -2339,8 +2463,13 @@ def _run_browser_command(
     # Local mode with no Chromium on disk: fail fast with an actionable
     # message instead of hanging for _command_timeout seconds per call.
     # Skip when engine=lightpanda — LP doesn't need Chromium for navigation.
+    # OTTO: also skip for a session driving an enrolled profile — it attaches to
+    # the user's real installed browser over CDP and never uses the bundled
+    # Chromium. The check is the PURE predicate, so closing a session cannot
+    # launch a browser; the acquire happens in _get_session_info below.
     if (
         _is_local_mode()
+        and not _session_uses_enrolled_browser(task_id)
         and not _chromium_installed()
         and _get_browser_engine() != "lightpanda"
         and not _maybe_autoinstall_chromium()
@@ -4567,6 +4696,12 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     else:
         logger.debug("No active session found for task_id: %s", task_id)
 
+    # OTTO: drop this session's memoized enrolled CDP endpoint — the browser
+    # behind it may be gone, so a later session must acquire rather than reuse a
+    # stale URL. Outside the branch above: an acquire that succeeded before
+    # session registration failed leaves a memo with no _active_sessions entry.
+    _forget_session_cdp_url(task_id)
+
 
 def cleanup_all_browsers() -> None:
     """
@@ -4808,6 +4943,17 @@ def check_browser_requirements() -> bool:
     # CDP override mode can connect to an existing remote/local browser endpoint
     # without requiring the local agent-browser binary on PATH.
     if _get_cdp_override():
+        return True
+
+    # OTTO: an enrolled default profile drives the user's REAL installed browser
+    # over CDP (see _session_cdp_url), so it needs no bundled Chromium — without
+    # this, a machine that never downloaded agent-browser's Chromium has every
+    # browser tool silently withheld even though the enrolled path would never
+    # have used it. Scoped to "would actually work": the toggle must be on AND
+    # the executable must resolve, so we never advertise a tool that fails on
+    # first use. Toggle off means the throwaway browser, which genuinely does
+    # need Chromium, and the checks below still apply.
+    if _default_profile_launchable():
         return True
 
     # The agent-browser CLI is required for local launch and cloud-provider flows.

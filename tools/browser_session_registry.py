@@ -81,6 +81,33 @@ def default_profile_name() -> Optional[str]:
     return name or None
 
 
+def default_profile_launchable() -> bool:
+    """Return True when ``browser.default_profile`` names an ENROLLED profile
+    whose browser executable actually resolves on this machine.
+
+    Gates the browser tools' availability check: such a session drives the
+    user's real installed browser over CDP and needs no bundled Chromium, so
+    withholding every browser tool for a missing Chromium would be wrong.
+
+    Requires the executable to resolve, not merely the toggle to be on, so we
+    never advertise a tool that would hang until the command timeout on first
+    use — the same reasoning the Termux branch applies. Fails CLOSED.
+    """
+    name = default_profile_name()
+    if not name:
+        return False
+    try:
+        from tools.browser_profiles import get_profile, resolve_executable
+
+        profile = get_profile(name)
+        if profile is None or not profile.is_enrolled:
+            return False
+        return bool(resolve_executable(profile))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("default_profile_launchable: reporting unavailable after error: %s", exc)
+        return False
+
+
 def session_trusts_url(session_key: str, url: str) -> bool:
     """Return True when ``session_key``'s profile explicitly trusts ``url``.
 
