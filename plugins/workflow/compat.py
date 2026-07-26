@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from typing import TYPE_CHECKING, AbstractSet, Literal, Mapping
+from typing import TYPE_CHECKING, AbstractSet, Iterable, Literal, Mapping, Protocol
 
 from plugins.workflow.models import (
     CompatibilityFinding,
     CompatibilityLevel,
     WorkflowPackage,
+)
+from plugins.workflow.language import (
+    WORKFLOW_LANGUAGE_FINDINGS_PER_NODE_MAX,
+    WORKFLOW_LANGUAGE_PACKAGE_FINDINGS_MAX,
+)
+from plugins.workflow.projection_limits import (
+    WORKFLOW_DEFINITION_MAX_BYTES,
+    WORKFLOW_DEFINITION_MAX_CONTAINER_ITEMS,
+    WORKFLOW_DEFINITION_MAX_NODES,
 )
 
 if TYPE_CHECKING:
@@ -24,6 +33,28 @@ class CompatibilityReport:
     @property
     def blocking_findings(self) -> tuple[CompatibilityFinding, ...]:
         return tuple(finding for finding in self.findings if finding.blocking)
+
+
+class _CompatibilityStateFinding(Protocol):
+    level: CompatibilityLevel | str
+    blocking: bool
+
+
+def derive_compatibility_report_state(
+    findings: Iterable[_CompatibilityStateFinding],
+) -> tuple[CompatibilityLevel, bool]:
+    """Derive the authoritative report level and runnable bit from findings."""
+    materialized = tuple(findings)
+    blocking = any(finding.blocking for finding in materialized)
+    if blocking or any(
+        finding.level == CompatibilityLevel.UNSUPPORTED for finding in materialized
+    ):
+        level = CompatibilityLevel.UNSUPPORTED
+    elif materialized:
+        level = CompatibilityLevel.MAPPED
+    else:
+        level = CompatibilityLevel.PORTABLE
+    return level, not blocking
 
 
 @dataclass(frozen=True)
@@ -137,6 +168,52 @@ _PROVIDER_FIELDS = {
     "betas": "betas",
     "sandbox": "sandbox",
 }
+
+# A detail response is admitted only after the complete definition projection
+# succeeds. These ceilings therefore bound every compatibility producer loop:
+# two tool lists can each emit one finding per projected list member, hook
+# findings are one per supported event, and all remaining fields are singular.
+# The byte ceiling safely bounds legacy unknown top-level keys because each
+# issue requires a distinct key represented in that same complete projection.
+_SINGULAR_COMMAND_FINDING_FIELDS = frozenset({
+    "persist_session",
+    "skills",
+    "mcp",
+    "agents",
+    "provider",
+    "model",
+    "effort",
+    "thinking",
+    "maxBudgetUsd",
+    "fallbackModel",
+    "betas",
+    "sandbox",
+    "systemPrompt",
+})
+WORKFLOW_COMPATIBILITY_FINDINGS_PER_NODE_MAX = (
+    WORKFLOW_LANGUAGE_FINDINGS_PER_NODE_MAX
+    + 1  # context
+    + len(_AI_ONLY_FIELDS)
+    + 2 * WORKFLOW_DEFINITION_MAX_CONTAINER_ITEMS  # allowed_tools + denied_tools
+    + len(_SINGULAR_COMMAND_FINDING_FIELDS)
+    + len(MAPPED_HOOK_EVENTS | UNSUPPORTED_HOOK_EVENTS)
+)
+WORKFLOW_COMPATIBILITY_PACKAGE_FINDINGS_MAX = (
+    WORKFLOW_DEFINITION_MAX_BYTES  # non-fatal unknown top-level issues
+    + WORKFLOW_LANGUAGE_PACKAGE_FINDINGS_MAX
+    + 2  # provider + model
+    + 1  # persist_sessions
+    + 2  # interactive + tags
+    + WORKFLOW_DEFINITION_MAX_CONTAINER_ITEMS  # requires
+    + 1  # worktree
+    + len(_PROVIDER_FIELDS)
+    + 1  # execution-environment finding added by the runner binding
+)
+WORKFLOW_COMPATIBILITY_FINDINGS_MAX = (
+    WORKFLOW_DEFINITION_MAX_NODES
+    * WORKFLOW_COMPATIBILITY_FINDINGS_PER_NODE_MAX
+    + WORKFLOW_COMPATIBILITY_PACKAGE_FINDINGS_MAX
+)
 
 
 def _finding(
@@ -461,15 +538,7 @@ def assess_compatibility(
         )
         for finding in findings
     ]
-    blocking = any(finding.blocking for finding in findings)
-    if blocking or any(
-        finding.level is CompatibilityLevel.UNSUPPORTED for finding in findings
-    ):
-        level = CompatibilityLevel.UNSUPPORTED
-    elif findings:
-        level = CompatibilityLevel.MAPPED
-    else:
-        level = CompatibilityLevel.PORTABLE
+    level, runnable = derive_compatibility_report_state(findings)
     return CompatibilityReport(
-        level=level, findings=tuple(findings), runnable=not blocking
+        level=level, findings=tuple(findings), runnable=runnable
     )

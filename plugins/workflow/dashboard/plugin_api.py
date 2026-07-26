@@ -30,6 +30,10 @@ from pydantic import (
 
 from hermes_constants import get_hermes_home
 from plugins.workflow.actions import MUTATION_ACTIONS, mutation_is_valid
+from plugins.workflow.compat import (
+    WORKFLOW_COMPATIBILITY_FINDINGS_MAX,
+    derive_compatibility_report_state,
+)
 from plugins.workflow.evidence import EVIDENCE_KINDS, EvidenceReader
 from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.runtime import (
@@ -46,7 +50,6 @@ _CURSOR_SECRET = secrets.token_bytes(32)
 _RUNTIME: WorkflowApiRuntime | None = None
 _RUNTIME_LOCK = threading.Lock()
 _WORKFLOW_RESPONSE_TEXT_MAX = 16_384
-_WORKFLOW_COMPATIBILITY_FINDINGS_MAX = 200
 
 
 def _runtime() -> WorkflowApiRuntime:
@@ -290,30 +293,28 @@ class WorkflowCompatibilitySummary(BaseModel):
 class WorkflowCompatibilityFinding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    path: str = Field(..., max_length=_WORKFLOW_RESPONSE_TEXT_MAX)
+    path: str = Field(..., min_length=1, max_length=_WORKFLOW_RESPONSE_TEXT_MAX)
     level: WorkflowCompatibilityLevel
-    message: str = Field(..., max_length=_WORKFLOW_RESPONSE_TEXT_MAX)
+    message: str = Field(..., min_length=1, max_length=_WORKFLOW_RESPONSE_TEXT_MAX)
     blocking: StrictBool
     code: str = Field(..., min_length=1, max_length=_WORKFLOW_RESPONSE_TEXT_MAX)
-    severity: Literal["info", "warning", "error"] | None = Field(
-        None, exclude_if=lambda value: value is None
-    )
-    effective_profile: WorkflowLanguageProfile | None = Field(
-        None, exclude_if=lambda value: value is None
-    )
-    migration: str | None = Field(
-        None,
-        max_length=_WORKFLOW_RESPONSE_TEXT_MAX,
-        exclude_if=lambda value: value is None,
-    )
 
 
 class WorkflowCompatibilityFull(WorkflowCompatibilitySummary):
     model_config = ConfigDict(extra="forbid")
 
     findings: list[WorkflowCompatibilityFinding] = Field(
-        ..., max_length=_WORKFLOW_COMPATIBILITY_FINDINGS_MAX
+        ..., max_length=WORKFLOW_COMPATIBILITY_FINDINGS_MAX
     )
+
+    @model_validator(mode="after")
+    def require_authoritative_report_state(self):
+        expected_level, expected_runnable = derive_compatibility_report_state(
+            self.findings
+        )
+        if self.level != expected_level or self.runnable != expected_runnable:
+            raise ValueError("compatibility level and runnable must match findings")
+        return self
 
 
 class WorkflowCatalogEntry(BaseModel):
@@ -509,6 +510,18 @@ def workflow_detail(
     # build_workflow_detail already supplies the shared semantically redacted,
     # byte-bounded definition; generic list limits must not silently clip it.
     sanitized["definition"] = detail["definition"]
+    # Preserve the complete producer report instead of applying the generic
+    # sanitizer's unrelated 200-item list limit. Sanitize each closed finding
+    # independently so path/text redaction remains in force.
+    compatibility = detail["compatibility"]
+    assert isinstance(compatibility, dict)
+    findings = compatibility["findings"]
+    assert isinstance(findings, list)
+    sanitized["compatibility"] = {
+        "level": compatibility["level"],
+        "runnable": compatibility["runnable"],
+        "findings": [sanitize_projection(finding) for finding in findings],
+    }
     return sanitized
 
 

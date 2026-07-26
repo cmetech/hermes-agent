@@ -348,9 +348,6 @@ def test_workflow_compatibility_response_models_are_exact_bounded_and_strict() -
         "message": "timeout semantics are unavailable",
         "blocking": True,
         "code": "archon_timeout_semantics_unavailable",
-        "severity": "error",
-        "effective_profile": "archon-2026-07",
-        "migration": "Remove timeout.",
     }
     full = {"level": "unsupported", "runnable": False, "findings": [finding]}
 
@@ -365,14 +362,24 @@ def test_workflow_compatibility_response_models_are_exact_bounded_and_strict() -
     ]
     invalid_full = [
         {**full, "unknown": True},
-        {**full, "findings": [finding] * 201},
+        {
+            **full,
+            "findings": [finding]
+            * (module.WORKFLOW_COMPATIBILITY_FINDINGS_MAX + 1),
+        },
+        {**full, "findings": [{**finding, "path": ""}]},
+        {**full, "findings": [{**finding, "message": ""}]},
+        {**full, "findings": [{**finding, "code": ""}]},
         {**full, "findings": [{**finding, "path": "p" * 16_385}]},
         {**full, "findings": [{**finding, "message": "m" * 16_385}]},
         {**full, "findings": [{**finding, "code": "c" * 16_385}]},
-        {**full, "findings": [{**finding, "migration": "m" * 16_385}]},
         {**full, "findings": [{**finding, "blocking": 1}]},
-        {**full, "findings": [{**finding, "severity": "fatal"}]},
-        {**full, "findings": [{**finding, "effective_profile": "future"}]},
+        {**full, "findings": [{**finding, "severity": "error"}]},
+        {
+            **full,
+            "findings": [{**finding, "effective_profile": "archon-2026-07"}],
+        },
+        {**full, "findings": [{**finding, "migration": "Remove timeout."}]},
         {**full, "findings": [{**finding, "extra": "escape"}]},
     ]
 
@@ -380,6 +387,57 @@ def test_workflow_compatibility_response_models_are_exact_bounded_and_strict() -
         with pytest.raises(ValidationError):
             module.WorkflowCompatibilitySummary.model_validate(payload)
     for payload in invalid_full:
+        with pytest.raises(ValidationError):
+            module.WorkflowCompatibilityFull.model_validate(payload)
+
+
+def test_workflow_compatibility_full_enforces_authoritative_report_state() -> None:
+    module = _module()
+    mapped = {
+        "path": "nodes[0].model",
+        "level": "mapped",
+        "message": "model resolves through Hermes provider profiles",
+        "blocking": False,
+        "code": "provider_profile_resolution",
+    }
+    blocking = {
+        "path": "nodes[0].timeout",
+        "level": "unsupported",
+        "message": "timeout semantics are unavailable",
+        "blocking": True,
+        "code": "archon_timeout_semantics_unavailable",
+    }
+    nonblocking_unsupported = {
+        "path": "legacy_extension",
+        "level": "unsupported",
+        "message": "unknown top-level field",
+        "blocking": False,
+        "code": "unknown_top_level_field",
+    }
+
+    valid = [
+        {"level": "portable", "runnable": True, "findings": []},
+        {"level": "mapped", "runnable": True, "findings": [mapped]},
+        {"level": "unsupported", "runnable": False, "findings": [blocking]},
+        {
+            "level": "unsupported",
+            "runnable": True,
+            "findings": [nonblocking_unsupported],
+        },
+    ]
+    invalid = [
+        {"level": "unsupported", "runnable": True, "findings": []},
+        {"level": "portable", "runnable": False, "findings": [blocking]},
+        {"level": "portable", "runnable": True, "findings": [mapped]},
+        {"level": "mapped", "runnable": True, "findings": []},
+        {"level": "mapped", "runnable": False, "findings": [mapped]},
+        {"level": "mapped", "runnable": True, "findings": [nonblocking_unsupported]},
+        {"level": "unsupported", "runnable": True, "findings": [blocking]},
+    ]
+
+    for payload in valid:
+        module.WorkflowCompatibilityFull.model_validate(payload)
+    for payload in invalid:
         with pytest.raises(ValidationError):
             module.WorkflowCompatibilityFull.model_validate(payload)
 
@@ -400,7 +458,7 @@ def test_workflow_catalog_response_model_enforces_source_projection_and_old_opti
         "language": {"effective_profile": "hermes-legacy", "legacy": True},
     }
     summary = {"level": "mapped", "runnable": True}
-    full = {"level": "mapped", "runnable": True, "findings": []}
+    full = {"level": "portable", "runnable": True, "findings": []}
 
     assert module.WorkflowCatalogEntry.model_validate({**base, "compatibility": summary})
     assert module.WorkflowCatalogEntry.model_validate(base).compatibility is None
@@ -439,6 +497,23 @@ def test_workflow_catalog_openapi_closes_language_and_compatibility_objects() ->
         assert schema["type"] == "object"
         assert schema.get("additionalProperties") != {}
         assert schema.get("additionalProperties") is not True
+
+    finding = schemas["WorkflowCompatibilityFinding"]
+    assert set(finding["properties"]) == {
+        "path",
+        "level",
+        "message",
+        "blocking",
+        "code",
+    }
+    assert set(finding["required"]) == set(finding["properties"])
+    assert finding["properties"]["path"]["minLength"] == 1
+    assert finding["properties"]["message"]["minLength"] == 1
+    assert finding["properties"]["code"]["minLength"] == 1
+    assert (
+        schemas["WorkflowCompatibilityFull"]["properties"]["findings"]["maxItems"]
+        == module.WORKFLOW_COMPATIBILITY_FINDINGS_MAX
+    )
 
 
 def test_workflow_catalog_keeps_isolation_incompatibility_scenario_local(

@@ -20,13 +20,15 @@ from hermes_cli.dashboard_auth.base import TokenPrincipal
 import yaml
 
 from plugins.workflow.cli import register_cli
-from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.compat import CompatibilityLevel, assess_compatibility
+from plugins.workflow.catalog_api import build_workflow_detail
 import plugins.workflow.coordinator_store as coordinator_store_module
 from plugins.workflow.coordinator_store import (
     CoordinatorIdentity,
     CoordinatorStore,
     install_coordinator_schema,
 )
+from plugins.workflow.projection_limits import WORKFLOW_DEFINITION_MAX_NODES
 from plugins.workflow.schema import load_workflow
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.topology import sanitize_topology_label
@@ -254,6 +256,113 @@ def test_catalog_and_detail_models_accept_all_authoritative_source_projections(
         )
         assert response.status_code == 200
         module.WorkflowDetailResponse.model_validate(response.json())
+
+
+def test_workflow_detail_model_accepts_real_maximum_node_compatibility_report(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    path = workflow_writer(
+        home / "workflows",
+        name="maximum-language-shape",
+        filename="maximum-language-shape.yaml",
+        nodes=[
+            {
+                "id": f"node-{index:03d}",
+                "bash": "true",
+                "timeout": 1,
+                "retry": {"max_attempts": 1},
+                "output_format": {"type": "object"},
+                "output_type": "text",
+                "maxBudgetUsd": 1,
+                "sandbox": {"enabled": True},
+            }
+            for index in range(WORKFLOW_DEFINITION_MAX_NODES)
+        ],
+    )
+    path.with_name("maximum-language-shape.hermes.yaml").write_text(
+        yaml.safe_dump({"language_compatibility": "archon-2026-07"}),
+        encoding="utf-8",
+    )
+    module = _module()
+
+    detail = build_workflow_detail(
+        "maximum-language-shape",
+        hermes_home=home,
+        workdir=tmp_path,
+        catalog_source="profile",
+    )
+    findings = detail["compatibility"]["findings"]
+
+    assert len(findings) > 200
+    assert len(findings) <= module.WORKFLOW_COMPATIBILITY_FINDINGS_MAX
+    module.WorkflowDetailResponse.model_validate(detail)
+
+    response = _detail_get(
+        module.router,
+        "maximum-language-shape",
+        token=_reader(),
+        catalog_source="profile",
+    )
+    assert response.status_code == 200
+    assert len(response.json()["compatibility"]["findings"]) == len(findings)
+
+
+def test_workflow_compatibility_models_accept_real_producer_state_variants(
+    tmp_path, workflow_writer
+) -> None:
+    module = _module()
+    cases = [
+        (
+            "portable",
+            {"language_compatibility": "archon-2026-07"},
+            {},
+            CompatibilityLevel.PORTABLE,
+            True,
+        ),
+        ("mapped", None, {}, CompatibilityLevel.MAPPED, True),
+        (
+            "blocking",
+            {"language_compatibility": "archon-2026-07"},
+            {"nodes": [{"id": "start", "bash": "true", "timeout": 1}]},
+            CompatibilityLevel.UNSUPPORTED,
+            False,
+        ),
+        (
+            "nonblocking-unsupported",
+            None,
+            {"legacy_extension": True},
+            CompatibilityLevel.UNSUPPORTED,
+            True,
+        ),
+    ]
+
+    for name, sidecar, options, expected_level, expected_runnable in cases:
+        path = workflow_writer(tmp_path / name, name=name, **options)
+        if sidecar is not None:
+            path.with_name(f"{path.stem}.hermes.yaml").write_text(
+                yaml.safe_dump(sidecar), encoding="utf-8"
+            )
+        report = assess_compatibility(load_workflow(path))
+        projection = {
+            "level": report.level.value,
+            "runnable": report.runnable,
+            "findings": [
+                {
+                    "path": finding.path,
+                    "level": finding.level.value,
+                    "message": finding.message,
+                    "blocking": finding.blocking,
+                    "code": finding.code,
+                }
+                for finding in report.findings
+            ],
+        }
+
+        assert report.level is expected_level
+        assert report.runnable is expected_runnable
+        module.WorkflowCompatibilityFull.model_validate(projection)
 
 
 def test_workflow_detail_omitted_or_wrong_source_never_falls_through_to_showcase(

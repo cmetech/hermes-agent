@@ -60,6 +60,12 @@ from plugins.workflow.machine_contract import (
     success_envelope,
 )
 from plugins.workflow.provenance import TriggerProvenance
+from plugins.workflow.projection_limits import (
+    WORKFLOW_DEFINITION_MAX_BYTES,
+    WORKFLOW_DEFINITION_MAX_CONTAINER_ITEMS,
+    WORKFLOW_DEFINITION_MAX_EDGES,
+    WORKFLOW_DEFINITION_MAX_NODES,
+)
 from plugins.workflow.schema import load_workflow, validate_package
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.sanitize import (
@@ -87,10 +93,6 @@ from tools.managed_process import ProcessResourceLimits
 _MACHINE_COMMAND: ContextVar[str] = ContextVar(
     "workflow_machine_command", default="workflow"
 )
-_DEFINITION_MAX_NODES = 512
-_DEFINITION_MAX_EDGES = 4_096
-_DEFINITION_MAX_BYTES = 512 * 1024
-_DEFINITION_MAX_CONTAINER_ITEMS = 512
 _BENIGN_POLICY_FIELDS = frozenset({"modelReasoningEffort"})
 
 
@@ -288,7 +290,7 @@ def _complete_projection(
     if projection_key_is_secret(key):
         return "[REDACTED]"
     if isinstance(value, Mapping):
-        if len(value) > _DEFINITION_MAX_CONTAINER_ITEMS:
+        if len(value) > WORKFLOW_DEFINITION_MAX_CONTAINER_ITEMS:
             raise WorkflowDefinitionProjectionCapacityError(
                 "workflow definition mapping limit exceeded"
             )
@@ -303,7 +305,7 @@ def _complete_projection(
             not in {"operator_scope_digest", "idempotency_key_digest"}
         }
     if isinstance(value, (list, tuple)):
-        if len(value) > _DEFINITION_MAX_CONTAINER_ITEMS:
+        if len(value) > WORKFLOW_DEFINITION_MAX_CONTAINER_ITEMS:
             raise WorkflowDefinitionProjectionCapacityError(
                 "workflow definition sequence limit exceeded"
             )
@@ -390,12 +392,12 @@ def _options_projection(options: Mapping[str, object]) -> dict[str, object]:
 def _definition_projection(package: WorkflowPackage) -> dict[str, object]:
     """Return the bounded, body-free normalized definition used by show APIs."""
     definition = package.definition
-    if len(definition.nodes) > _DEFINITION_MAX_NODES:
+    if len(definition.nodes) > WORKFLOW_DEFINITION_MAX_NODES:
         raise WorkflowDefinitionProjectionCapacityError(
             "workflow definition node limit exceeded"
         )
     edge_count = sum(len(node.depends_on) for node in definition.nodes)
-    if edge_count > _DEFINITION_MAX_EDGES:
+    if edge_count > WORKFLOW_DEFINITION_MAX_EDGES:
         raise WorkflowDefinitionProjectionCapacityError(
             "workflow definition edge limit exceeded"
         )
@@ -475,7 +477,7 @@ def _definition_projection(package: WorkflowPackage) -> dict[str, object]:
     encoded = json.dumps(
         projection, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
-    if len(encoded) > _DEFINITION_MAX_BYTES:
+    if len(encoded) > WORKFLOW_DEFINITION_MAX_BYTES:
         raise WorkflowDefinitionProjectionCapacityError(
             "workflow definition byte limit exceeded"
         )

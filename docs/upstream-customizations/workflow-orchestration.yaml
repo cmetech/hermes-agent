@@ -3367,6 +3367,10 @@ upstream_changes:
   change_class: workflow-compatibility
   owner: workflow-orchestration
   files:
+  - plugins/workflow/projection_limits.py
+  - plugins/workflow/cli.py
+  - plugins/workflow/compat.py
+  - plugins/workflow/language.py
   - plugins/workflow/catalog_api.py
   - plugins/workflow/dashboard/plugin_api.py
   - tests/plugins/workflow/test_catalog_api.py
@@ -3385,6 +3389,18 @@ upstream_changes:
   - apps/desktop/src/i18n/zh.ts
   - apps/desktop/src/i18n/zh-hant.ts
   owned_symbols:
+  - WORKFLOW_DEFINITION_MAX_NODES
+  - WORKFLOW_DEFINITION_MAX_EDGES
+  - WORKFLOW_DEFINITION_MAX_BYTES
+  - WORKFLOW_DEFINITION_MAX_CONTAINER_ITEMS
+  - LEGACY_LANGUAGE_FINDING_FIELDS
+  - ARCHON_LANGUAGE_FINDING_FIELDS
+  - WORKFLOW_LANGUAGE_FINDINGS_PER_NODE_MAX
+  - WORKFLOW_LANGUAGE_PACKAGE_FINDINGS_MAX
+  - derive_compatibility_report_state
+  - WORKFLOW_COMPATIBILITY_FINDINGS_PER_NODE_MAX
+  - WORKFLOW_COMPATIBILITY_PACKAGE_FINDINGS_MAX
+  - WORKFLOW_COMPATIBILITY_FINDINGS_MAX
   - _catalog_language_projection
   - _compatibility_summary
   - _compatibility_projection
@@ -3393,6 +3409,7 @@ upstream_changes:
   - WorkflowCompatibilitySummary
   - WorkflowCompatibilityFinding
   - WorkflowCompatibilityFull
+  - WorkflowCompatibilityFull.require_authoritative_report_state
   - WorkflowCatalogEntry.require_source_compatibility_projection
   - WorkflowDetailResponse.language
   - WorkflowDetailResponse.compatibility
@@ -3418,10 +3435,16 @@ upstream_changes:
   merge_guidance: >-
     Preserve backend authority for profile resolution, normalization,
     compatibility findings, and Run eligibility. Keep catalog language status
-    and user compatibility summaries bounded, retain the existing verified
-    showcase compatibility payload, and expose expanded metadata and findings
-    only in detail. Desktop language data must remain optional for old-backend
-    skew and strictly presentational: badges, one read-only detail alert, and
+    and user compatibility summaries bounded, derive the full-report finding
+    ceiling from the complete definition projection's node, byte, and
+    container limits plus producer field inventories, retain the existing
+    verified showcase compatibility payload, and expose expanded metadata and findings
+    only in detail without generic sanitizer truncation. Full compatibility
+    responses must contain only the five projected finding fields and their
+    level/runnable pair must be derived from the complete finding set using the
+    same authority rule as CompatibilityReport. Desktop language data must
+    remain optional for old-backend skew and strictly presentational: badges,
+    one read-only detail alert, and
     the trust/risk preflight review must never parse YAML, recompute language
     profiles, inspect findings to gate Run, issue mutation requests, or change
     focus and navigation behavior. Preserve all-locale parity and the intended

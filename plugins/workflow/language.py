@@ -24,6 +24,25 @@ from plugins.workflow.models import (
 
 WORKFLOW_NORMALIZER_VERSION = 1
 SUPPORTED_NORMALIZER_VERSIONS = frozenset({1})
+LEGACY_LANGUAGE_FINDING_FIELDS = frozenset({
+    "timeout",
+    "retry.max_attempts",
+    "output_format",
+    "output_type",
+})
+ARCHON_LANGUAGE_FINDING_FIELDS = frozenset({
+    "timeout",
+    "retry",
+    "output_format",
+    "output_type",
+    "maxBudgetUsd",
+    "sandbox",
+})
+WORKFLOW_LANGUAGE_FINDINGS_PER_NODE_MAX = max(
+    len(LEGACY_LANGUAGE_FINDING_FIELDS),
+    len(ARCHON_LANGUAGE_FINDING_FIELDS),
+)
+WORKFLOW_LANGUAGE_PACKAGE_FINDINGS_MAX = 1
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
