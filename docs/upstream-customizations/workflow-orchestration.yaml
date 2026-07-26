@@ -3568,3 +3568,26 @@ upstream_changes:
     in an equivalent executor-owned mutable namespace without weakening sealed
     workflow tree verification.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-installed-distribution-nix-build-fixture
+  change_class: workflow-testing
+  owner: workflow-orchestration
+  files:
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  owned_symbols:
+  - installed workflow distribution E2E authorized Nix build marker
+  - wheel and sdist production build guard preservation
+  tests:
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/test_packaging_build_guard.py
+  expected_commit_subject: 'fix(workflow): authorize installed fixture build'
+  upstream_candidate: true
+  merge_guidance: >-
+    Set HERMES_NIX_BUILD only on the installed-filesystem test fixture's build
+    subprocess. Preserve the production wheel and sdist guard, never export the
+    marker globally, and continue using the extracted wheel only as a test
+    fixture for the Nix-authorized installed layout.
+  removal_condition: >-
+    Remove when upstream provides an equivalent installed-filesystem workflow
+    regression fixture that exercises its supported distribution mechanism
+    without weakening the artifact build guard.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

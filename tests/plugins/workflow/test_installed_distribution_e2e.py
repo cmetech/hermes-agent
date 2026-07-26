@@ -19,10 +19,12 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     tmp_path: Path,
 ) -> None:
-    """Exercise the installed-filesystem path used by pip and release updates."""
+    """Exercise installed-filesystem layout through the authorized Nix build path."""
     artifacts = tmp_path / "artifacts"
     generated_paths = (REPO_ROOT / "build", REPO_ROOT / "hermes_agent.egg-info")
     preexisting = {path for path in generated_paths if path.exists()}
+    build_env = os.environ.copy()
+    build_env["HERMES_NIX_BUILD"] = "1"
     try:
         build = subprocess.run(
             [
@@ -35,6 +37,7 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
                 ".",
             ],
             cwd=REPO_ROOT,
+            env=build_env,
             capture_output=True,
             text=True,
             timeout=600,
