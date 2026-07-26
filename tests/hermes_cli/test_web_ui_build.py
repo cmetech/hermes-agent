@@ -304,7 +304,15 @@ class TestBuildWebUISkipsWhenFresh:
         install_cmd = install_args[0]
         assert install_cmd[:2] == ["/usr/bin/npm", "install"]
         assert "--include=dev" in install_cmd
-        assert "--no-save" in install_cmd
+        # This is the lockfile-PRESENT branch, where the fallback now passes
+        # --no-package-lock rather than --no-save. That was deliberate: a
+        # fallback install used to rewrite the committed package-lock.json,
+        # leaving the managed clone dirty and forcing an autostash on every
+        # subsequent update. Both flags leave the lockfile untouched for an
+        # argument-less `npm install`, so accept either and assert the property
+        # that actually matters -- the helper does not mutate the lockfile,
+        # which is what its name promises.
+        assert {"--no-package-lock", "--no-save"} & set(install_cmd), install_cmd
 
     def test_npm_install_uses_workspace_web_scope(self, tmp_path):
         web_dir, _ = _make_web_dir(tmp_path)

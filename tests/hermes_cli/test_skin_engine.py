@@ -1,6 +1,35 @@
 """Tests for hermes_cli.skin_engine — the data-driven skin/theme system."""
 
+import inspect
+import re
+
 import pytest
+
+from hermes_cli import skin_engine as _skin_engine
+
+
+def _brand_default_skin() -> str:
+    """The skin ``init_skin_from_config`` falls back to on this branch.
+
+    Generator-owned and therefore branch-dependent: the neutral ``base`` branch
+    carries upstream's ``"default"``, while a stamped brand branch carries
+    ``"otto"`` / ``"loop24"``. Hardcoding either one makes this file pass on
+    exactly one branch -- it previously asserted ``"otto"`` literally, which is
+    why three tests here failed on ``base`` and were documented as "otto-only".
+    That documented exception is what this removes.
+
+    Read out of the function's own source rather than from
+    ``_active_skin_name``: the autouse fixture below rewrites that global
+    before every test, so its value says nothing about what the generator
+    stamped. The fallback literal is the actual contract.
+    """
+    source = inspect.getsource(_skin_engine.init_skin_from_config)
+    match = re.search(r'display\.get\("skin",\s*"([^"]+)"\)', source)
+    assert match, "init_skin_from_config no longer has a literal skin fallback"
+    return match.group(1)
+
+
+BRAND_DEFAULT_SKIN = _brand_default_skin()
 
 
 @pytest.fixture(autouse=True)
@@ -161,28 +190,28 @@ class TestSkinManagement:
         assert get_active_skin_name() == "ares"
 
     def test_init_skin_from_empty_config(self):
-        # OTTO branding: the default active skin is "otto".
+        # Falls back to the brand default, whatever the generator stamped.
         from hermes_cli.skin_engine import init_skin_from_config, get_active_skin_name
         init_skin_from_config({})
-        assert get_active_skin_name() == "otto"
+        assert get_active_skin_name() == BRAND_DEFAULT_SKIN
 
     def test_init_skin_from_null_display(self):
         """display: null should fall back to the default skin, not crash."""
         from hermes_cli.skin_engine import init_skin_from_config, get_active_skin_name
         init_skin_from_config({"display": None})
-        assert get_active_skin_name() == "otto"
+        assert get_active_skin_name() == BRAND_DEFAULT_SKIN
 
     def test_init_skin_from_non_dict_display(self):
         """display: <non-dict> should fall back to the default skin."""
         from hermes_cli.skin_engine import init_skin_from_config, get_active_skin_name
         init_skin_from_config({"display": "invalid"})
-        assert get_active_skin_name() == "otto"
+        assert get_active_skin_name() == BRAND_DEFAULT_SKIN
 
         init_skin_from_config({"display": 42})
-        assert get_active_skin_name() == "otto"
+        assert get_active_skin_name() == BRAND_DEFAULT_SKIN
 
         init_skin_from_config({"display": []})
-        assert get_active_skin_name() == "otto"
+        assert get_active_skin_name() == BRAND_DEFAULT_SKIN
 
 
 class TestUserSkins:

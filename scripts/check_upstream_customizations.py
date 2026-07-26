@@ -33,6 +33,32 @@ def _git(repo: Path, *args: str, check: bool = True) -> str:
     return proc.stdout
 
 
+def _is_shallow_clone(repo: Path) -> bool:
+    """True when this clone lacks the history the commit assertions need.
+
+    ``actions/checkout`` fetches depth 1 by default, so neither
+    ``coverage.base_commit`` nor any entry's ``last_verified_upstream`` exists
+    locally in CI. Those assertions then fail for a reason that has nothing to
+    do with the ledger being wrong -- the first CI run on this fork's
+    development branch reported "coverage base is not a local commit" and took
+    the whole merge gate down with it.
+
+    Deepening the checkout was the alternative and was rejected: the pack is
+    ~400 MiB and eight parallel test slices would each pay a full-history fetch
+    to validate two pinned commits. Skipping only the history-dependent
+    assertions keeps every schema, path, and field check running everywhere,
+    and the skipped ones still run on any full clone -- a developer's checkout
+    and the merge skill, which are the contexts that actually gate a merge.
+    """
+    proc = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout.strip() == "true"
+
+
 def _contained(repo: Path, raw: str) -> Path:
     path = (repo / raw).resolve()
     try:
@@ -51,6 +77,15 @@ def load_and_validate_manifest(
     data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("schema_version") != 1:
         raise ValueError("manifest schema_version must be 1")
+    # Resolved once: the commit-existence and ancestry assertions below are
+    # unevaluable without full history. See _is_shallow_clone.
+    shallow = check_git and _is_shallow_clone(repo)
+    if shallow:
+        print(
+            f"note: {manifest_path.name}: shallow clone -- skipping commit-history "
+            "assertions (schema, paths and fields are still enforced)",
+            file=sys.stderr,
+        )
     entries = data.get("upstream_changes")
     if not isinstance(entries, list) or not entries:
         raise ValueError("manifest upstream_changes must be a non-empty list")
@@ -77,7 +112,7 @@ def load_and_validate_manifest(
             if not isinstance(reason, str) or not reason.strip():
                 raise ValueError(f"excluded commit {sha} must have a non-empty reason")
             excluded_shas.add(sha)
-        if check_git:
+        if check_git and not shallow:
             _validate_coverage_commits(coverage, repo, "HEAD")
     ids: set[str] = set()
     for entry in entries:
@@ -111,7 +146,7 @@ def load_and_validate_manifest(
         for field in ("expected_commit_subject", "merge_guidance", "removal_condition"):
             if not isinstance(entry.get(field), str) or not entry[field].strip():
                 raise ValueError(f"{entry_id}.{field} must be non-empty")
-        if check_git:
+        if check_git and not shallow:
             if not _git(repo, "cat-file", "-e", f"{baseline}^{{commit}}", check=False):
                 # cat-file is quiet on success and failure, so inspect status separately.
                 proc = subprocess.run(

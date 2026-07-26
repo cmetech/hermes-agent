@@ -78,9 +78,44 @@ fi
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.
 echo "▶ running per-file parallel test suite via run_tests_parallel.py"
-echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
+echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0, .pyc redirected out of tree; clean env)"
 
 cd "$REPO_ROOT"
+
+# ── Keep bytecode OUT of the source tree ────────────────────────────────────
+# `git ls-files '*.py'` below matches every tracked .py, which includes the
+# scripts inside workflow showcase bundles
+# (plugins/workflow/showcases/packages/*/scripts/*.py). Writing __pycache__
+# next to those puts a non-UTF-8 file INSIDE a bundle whose safety contract
+# rejects binary resources, so the whole bundle fails to load:
+#
+#   ShowcaseCatalogError: showcase safety contract rejects binary resource
+#   UnicodeDecodeError: 'utf-8' codec can't decode byte 0xa7   (the .pyc magic)
+#
+# That single side effect accounted for ~101 failures across all 8 CI slices
+# the first time CI ran on this fork's development branch, and made a focused
+# `run_tests.sh tests/plugins/workflow/` run unreproducible locally unless you
+# manually deleted __pycache__ between runs.
+#
+# PYTHONPYCACHEPREFIX (3.8+) redirects every .pyc into a mirrored tree outside
+# the repo, so we keep the caching AND stop the pollution. Deliberately not
+# PYTHONDONTWRITEBYTECODE: that would fix the pollution by making each of the
+# ~2000 subprocesses recompile from source, which is exactly the cost the
+# pre-compile step below exists to avoid. The prefix is absolute and stable so
+# the cache stays warm across runs; cache_from_source mirrors the absolute
+# source path underneath it, so separate checkouts and worktrees cannot collide.
+PYCACHE_PREFIX="${HERMES_TEST_PYCACHE_DIR:-${TMPDIR:-/tmp}/hermes-test-pycache}"
+export PYTHONPYCACHEPREFIX="$PYCACHE_PREFIX"
+
+# Self-heal a checkout polluted by an earlier run (or by anyone invoking
+# compileall / pytest by hand). The redirect above only prevents NEW writes, so
+# without this an existing tree keeps failing exactly as before and the fix
+# looks like it did nothing. Scoped to the showcase bundles: they are the trees
+# under a byte-level safety contract, and they contain no bytecode we want.
+if [ -d "$REPO_ROOT/plugins/workflow/showcases" ]; then
+  find "$REPO_ROOT/plugins/workflow/showcases" -name '__pycache__' -type d \
+    -exec rm -rf {} + 2>/dev/null || true
+fi
 
 # ── Pre-compile .pyc bytecode cache ─────────────────────────────────────────
 # Each test file runs in its own subprocess via run_tests_parallel.py.
@@ -98,6 +133,7 @@ exec env -i \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
+  PYTHONPYCACHEPREFIX="$PYCACHE_PREFIX" \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \

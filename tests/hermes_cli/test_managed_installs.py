@@ -16,7 +16,15 @@ def test_recommended_update_command_defaults_to_hermes_update(monkeypatch):
     # detect_install_method().
     with patch("hermes_cli.config.get_managed_update_command", return_value=None), \
          patch("hermes_cli.config.detect_install_method", return_value="git"):
-        assert recommended_update_command() == "hermes update"
+        # Derived, not hardcoded: this fork rebrands the source-install
+        # update command (recommended_update_command_for_method returns
+        # "<brand> update", not "hermes update"), so a literal here asserts
+        # upstream's branding and fails on every brand branch. The behaviour
+        # under test is that a git install falls through to the source-install
+        # command at all -- not what that command is called.
+        from hermes_cli.config import recommended_update_command_for_method
+
+        assert recommended_update_command() == recommended_update_command_for_method("git")
 
 
 def test_optional_skill_source_honors_env_override(monkeypatch, tmp_path):
