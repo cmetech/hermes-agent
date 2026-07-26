@@ -5,11 +5,14 @@ from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
+import shutil
+import sqlite3
 import threading
 
 import pytest
 import yaml
 
+import plugins.workflow.scheduler as scheduler_module
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
@@ -29,6 +32,62 @@ LEGACY_STORE_FIXTURE = (
     / "store"
     / "pre-production-amendment-v2.0.9"
 )
+
+
+def _copy_v209_store(tmp_path: Path) -> RunStore:
+    manifest = json.loads(
+        (LEGACY_STORE_FIXTURE / "fixture-manifest.json").read_text(encoding="utf-8")
+    )
+    home = tmp_path / "v209-home"
+    workflows = home / "workflows"
+    workflows.mkdir(parents=True)
+    shutil.copy2(
+        LEGACY_STORE_FIXTURE / "admission.db",
+        workflows / "admission.sqlite3",
+    )
+    shutil.copytree(LEGACY_STORE_FIXTURE / "runs", workflows / "runs")
+    database = workflows / "admission.sqlite3"
+    with sqlite3.connect(database) as connection:
+        legacy_directory = connection.execute(
+            "SELECT run_directory FROM runs WHERE run_id='migration-run'"
+        ).fetchone()[0]
+        legacy_prefix = str(manifest["legacy_run_directory_prefix"])
+        relocated = str(workflows) + legacy_directory[len(legacy_prefix) :]
+        connection.execute(
+            "UPDATE runs SET run_directory=? WHERE run_id='migration-run'",
+            (relocated,),
+        )
+    return RunStore(home)
+
+
+def _legacy_transitive_package(workflow_writer, root: Path):
+    (root / "scripts").mkdir(parents=True)
+    (root / "scripts" / "helper.py").write_text(
+        "print('sealed script')\n", encoding="utf-8"
+    )
+    (root / "mcp").mkdir()
+    (root / "mcp" / "echo.yaml").write_text(
+        "command: python\nargs: [servers/echo.py]\n", encoding="utf-8"
+    )
+    (root / "servers").mkdir()
+    (root / "servers" / "echo.py").write_text(
+        "print('sealed server')\n", encoding="utf-8"
+    )
+    path = workflow_writer(
+        root / "workflows",
+        name="legacy-transitive",
+        filename="legacy-transitive.yaml",
+        nodes=[
+            {"id": "script", "script": "helper", "runtime": "uv"},
+            {
+                "id": "mcp",
+                "prompt": "Use MCP",
+                "mcp": "mcp/echo.yaml",
+                "depends_on": ["script"],
+            },
+        ],
+    )
+    return load_workflow(path)
 
 
 def _profile_package(workflow_writer, root: Path, *, profile: str):
@@ -625,6 +684,291 @@ def test_pre_language_snapshot_with_reconstructible_package_digest_still_loads(
     )
 
     assert loaded.language.effective_profile.value == "hermes-legacy"
+
+
+def test_unverifiable_pre_language_snapshot_never_reaches_workflow_parser(
+    tmp_path, workflow_writer, monkeypatch
+):
+    package = _profile_package(workflow_writer, tmp_path, profile="hermes-legacy")
+    store = RunStore(tmp_path / "home")
+    prepared = replace(
+        _prepare_pre_language_snapshot(store, package),
+        definition_digest="0" * 64,
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="legacy-parser-order",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    parse_calls = 0
+
+    def forbidden_parser(*_args, **_kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        raise AssertionError("unverified workflow bytes reached the YAML parser")
+
+    monkeypatch.setattr(scheduler_module, "load_workflow_snapshot", forbidden_parser)
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        _load_with_scheduler(
+            store, admitted.run_id, historical_projection=True
+        )
+
+    assert exc.value.code == "workflow_legacy_snapshot_unverifiable"
+    assert parse_calls == 0
+
+
+def test_reconstructible_pre_language_snapshot_is_verified_before_parser(
+    tmp_path, workflow_writer, monkeypatch
+):
+    name = "legacy-parser-order-valid"
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package", name=name, filename=f"{name}.yaml"
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = _prepare_pre_language_snapshot(store, package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="legacy-parser-order-valid",
+            concurrency_key=name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    events: list[str] = []
+    original_digest = RunScheduler._legacy_package_digest_for_identity
+    original_parser = scheduler_module.load_workflow_snapshot
+
+    def recording_digest(*args, **kwargs):
+        digest = original_digest(*args, **kwargs)
+        if digest == prepared.definition_digest:
+            events.append("verified")
+        return digest
+
+    def recording_parser(*args, **kwargs):
+        events.append("parsed")
+        return original_parser(*args, **kwargs)
+
+    monkeypatch.setattr(
+        RunScheduler,
+        "_legacy_package_digest_for_identity",
+        staticmethod(recording_digest),
+    )
+    monkeypatch.setattr(
+        scheduler_module, "load_workflow_snapshot", recording_parser
+    )
+
+    loaded = _load_with_scheduler(
+        store, admitted.run_id, historical_projection=True
+    )
+
+    assert loaded.definition.name == name
+    assert events.index("verified") < events.index("parsed")
+
+
+def test_pre_language_file_replacement_cannot_authenticate_different_parser_bytes(
+    tmp_path, workflow_writer, monkeypatch
+):
+    name = "legacy-parser-byte-binding"
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package", name=name, filename=f"{name}.yaml"
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = _prepare_pre_language_snapshot(store, package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="legacy-parser-byte-binding",
+            concurrency_key=name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    definition = store.run_directory(admitted.run_id) / "definition.yaml"
+    authenticated_bytes = definition.read_bytes()
+    document = yaml.safe_load(authenticated_bytes)
+    document["nodes"][0]["bash"] = "printf forged"
+    definition.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    original_inventory = RunScheduler._legacy_raw_package_paths
+    original_parser = scheduler_module.load_workflow_snapshot
+    parse_calls = 0
+
+    def restore_after_initial_read(run_directory):
+        paths = original_inventory(run_directory)
+        definition.write_bytes(authenticated_bytes)
+        return paths
+
+    def recording_parser(*args, **kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        return original_parser(*args, **kwargs)
+
+    monkeypatch.setattr(
+        RunScheduler,
+        "_legacy_raw_package_paths",
+        staticmethod(restore_after_initial_read),
+    )
+    monkeypatch.setattr(
+        scheduler_module, "load_workflow_snapshot", recording_parser
+    )
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        _load_with_scheduler(
+            store, admitted.run_id, historical_projection=True
+        )
+
+    assert exc.value.code == "workflow_snapshot_integrity_mismatch"
+    assert parse_calls == 0
+
+
+def test_checked_in_v209_snapshot_loads_through_full_scheduler_path(
+    tmp_path, monkeypatch
+):
+    store = _copy_v209_store(tmp_path)
+    expected_digest = str(store.load_run("migration-run")["definition_digest"])
+    events: list[str] = []
+    original_digest = RunScheduler._legacy_package_digest_for_identity
+    original_parser = scheduler_module.load_workflow_snapshot
+
+    def recording_digest(*args, **kwargs):
+        digest = original_digest(*args, **kwargs)
+        if digest == expected_digest:
+            events.append("verified")
+        return digest
+
+    def recording_parser(*args, **kwargs):
+        events.append("parsed")
+        return original_parser(*args, **kwargs)
+
+    monkeypatch.setattr(
+        RunScheduler,
+        "_legacy_package_digest_for_identity",
+        staticmethod(recording_digest),
+    )
+    monkeypatch.setattr(
+        scheduler_module, "load_workflow_snapshot", recording_parser
+    )
+    scheduler = RunScheduler(store)
+    try:
+        package = scheduler._load_run_package("migration-run")
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert package.definition.name == "migration-fixture"
+    assert package.sidecar["outward_action_nodes"] == ("start",)
+    assert events.index("verified") < events.index("parsed")
+
+
+def test_pre_language_raw_authentication_covers_transitive_package_resources(
+    tmp_path, workflow_writer
+):
+    package = _legacy_transitive_package(workflow_writer, tmp_path / "package")
+    store = RunStore(tmp_path / "home")
+    prepared = _prepare_pre_language_snapshot(store, package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="legacy-transitive-valid",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    scheduler = RunScheduler(store)
+    original_load_run = store.load_run
+    projection = json.loads(json.dumps(original_load_run(admitted.run_id)))
+    projection.pop("snapshot_format_version", None)
+    store.load_run = lambda _run_id: json.loads(json.dumps(projection))  # type: ignore[method-assign]
+    try:
+        loaded, sealed_paths = scheduler._load_verified_run_package(admitted.run_id)
+    finally:
+        store.load_run = original_load_run  # type: ignore[method-assign]
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert loaded.definition.name == "legacy-transitive"
+    assert sealed_paths == frozenset(
+        {
+            "definition.yaml",
+            "mcp/echo.yaml",
+            "scripts/helper.py",
+            "servers/echo.py",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["omit-script", "omit-mcp-transitive", "inject-package-resource"],
+)
+def test_changed_pre_language_transitive_closure_is_rejected_before_parser(
+    tmp_path, workflow_writer, monkeypatch, mutation
+):
+    package = _legacy_transitive_package(workflow_writer, tmp_path / "package")
+    store = RunStore(tmp_path / "home")
+    prepared = _prepare_pre_language_snapshot(store, package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=f"legacy-transitive-{mutation}",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    run_directory = store.run_directory(admitted.run_id)
+    if mutation == "omit-script":
+        (run_directory / "scripts" / "helper.py").unlink()
+    elif mutation == "omit-mcp-transitive":
+        (run_directory / "servers" / "echo.py").unlink()
+    else:
+        (run_directory / "scripts" / "injected.py").write_text(
+            "print('injected')\n", encoding="utf-8"
+        )
+    parse_calls = 0
+
+    def forbidden_parser(*_args, **_kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        raise AssertionError("changed package closure reached the YAML parser")
+
+    monkeypatch.setattr(scheduler_module, "load_workflow_snapshot", forbidden_parser)
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        _load_with_scheduler(
+            store, admitted.run_id, historical_projection=True
+        )
+
+    assert exc.value.code == "workflow_legacy_snapshot_unverifiable"
+    assert parse_calls == 0
 
 
 def test_checked_in_v209_snapshot_package_identity_is_reconstructible():

@@ -59,6 +59,21 @@ _CLAUSE = re.compile(
     re.UNICODE,
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_LEGACY_PACKAGE_PATHS = 4096
+_LEGACY_PACKAGE_PATH_CHARS = 512
+_LEGACY_NON_PACKAGE_FILES = frozenset(
+    {
+        ".lock",
+        ".snapshot-owner.json",
+        "events.jsonl",
+        "inputs.json",
+        "resources.json",
+        "run.json",
+    }
+)
+_LEGACY_NON_PACKAGE_ROOTS = frozenset(
+    {"artifacts", "inputs", "node-agent-skills", "node-skills", "nodes"}
+)
 
 
 class ConditionEvaluationError(ValueError):
@@ -611,17 +626,50 @@ class RunScheduler:
             )
 
         legacy_snapshot_verified = False
-        legacy_definition_verified = False
+        legacy_direct_paths: frozenset[str] = frozenset()
+        legacy_preparsed_paths: frozenset[str] | None = None
+        legacy_preparsed_bytes: Mapping[str, bytes] | None = None
+        legacy_workflow_identity: str | None = None
+        expected_package_digest = projection.get("definition_digest")
+        if (
+            not isinstance(expected_package_digest, str)
+            or _SHA256.fullmatch(expected_package_digest) is None
+        ):
+            raise integrity_error("trusted workflow package identity is missing")
         if snapshot is None:
             (
                 legacy_snapshot_verified,
-                legacy_definition_verified,
+                legacy_direct_paths,
             ) = self._verify_legacy_journaled_seals(
                 projection,
                 run_directory=run_directory,
                 definition_bytes=definition_bytes,
                 policy_bytes=policy_bytes,
                 resources_bytes=resources_bytes,
+                policy_present=policy.is_file(),
+            )
+            legacy_preparsed_paths = self._legacy_raw_package_paths(run_directory)
+            legacy_preparsed_bytes = self._legacy_raw_package_bytes(
+                run_directory, legacy_preparsed_paths
+            )
+            if (
+                legacy_preparsed_bytes.get("definition.yaml") != definition_bytes
+                or (
+                    policy.is_file()
+                    and legacy_preparsed_bytes.get("policy.yaml") != policy_bytes
+                )
+            ):
+                raise integrity_error(
+                    "pre-language workflow package changed during authentication"
+                )
+            legacy_workflow_identity = self._verify_legacy_preparse_identity(
+                projection,
+                run_directory=run_directory,
+                expected_package_digest=expected_package_digest,
+                package_paths=legacy_preparsed_paths,
+                package_bytes=legacy_preparsed_bytes,
+                snapshot_verified=legacy_snapshot_verified,
+                directly_verified_paths=legacy_direct_paths,
             )
 
         package = load_workflow_snapshot(
@@ -634,12 +682,6 @@ class RunScheduler:
                 else WORKFLOW_NORMALIZER_VERSION
             ),
         )
-        expected_package_digest = projection.get("definition_digest")
-        if (
-            not isinstance(expected_package_digest, str)
-            or _SHA256.fullmatch(expected_package_digest) is None
-        ):
-            raise integrity_error("trusted workflow package identity is missing")
         if snapshot is None and (
             package.language.effective_profile
             is not WorkflowLanguageProfile.HERMES_LEGACY
@@ -655,17 +697,23 @@ class RunScheduler:
                 snapshot,
             )
         else:
+            package = replace(
+                package,
+                root=run_directory,
+                workflow_path=definition,
+                sidecar_path=policy if policy.is_file() else None,
+            )
             verified_sealed_paths = self._legacy_resource_paths(
                 package, run_directory=run_directory
             )
-            self._verify_legacy_admission_identity(
+            self._verify_legacy_postparse_identity(
                 package,
                 projection=projection,
                 run_directory=run_directory,
                 expected_package_digest=expected_package_digest,
                 sealed_paths=verified_sealed_paths,
-                snapshot_verified=legacy_snapshot_verified,
-                definition_verified=legacy_definition_verified,
+                preparsed_paths=legacy_preparsed_paths,
+                workflow_identity=legacy_workflow_identity,
             )
         if verified_sealed_paths is None:
             raise integrity_error("verified workflow resource identity is missing")
@@ -737,6 +785,129 @@ class RunScheduler:
         )
 
     @staticmethod
+    def _legacy_raw_package_paths(run_directory: Path) -> frozenset[str]:
+        """Inventory the bounded historical package closure without parsing YAML."""
+        paths: set[str] = set()
+        pending = [run_directory]
+        while pending:
+            directory = pending.pop()
+            try:
+                children = tuple(os.scandir(directory))
+            except OSError as exc:
+                raise WorkflowLanguageCompatibilityError(
+                    "workflow_snapshot_integrity_mismatch",
+                    "pre-language workflow package is unreadable",
+                ) from exc
+            for entry in children:
+                path = Path(entry.path)
+                relative = path.relative_to(run_directory).as_posix()
+                relative_path = PurePosixPath(relative)
+                first_part = relative_path.parts[0]
+                try:
+                    if entry.is_symlink():
+                        raise WorkflowLanguageCompatibilityError(
+                            "workflow_snapshot_integrity_mismatch",
+                            "pre-language workflow package contains a symlink",
+                        )
+                    if entry.is_dir(follow_symlinks=False):
+                        if first_part not in _LEGACY_NON_PACKAGE_ROOTS:
+                            pending.append(path)
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        raise WorkflowLanguageCompatibilityError(
+                            "workflow_snapshot_integrity_mismatch",
+                            "pre-language workflow package contains a special file",
+                        )
+                except OSError as exc:
+                    raise WorkflowLanguageCompatibilityError(
+                        "workflow_snapshot_integrity_mismatch",
+                        "pre-language workflow package is unreadable",
+                    ) from exc
+                if (
+                    relative in _LEGACY_NON_PACKAGE_FILES
+                    or first_part in _LEGACY_NON_PACKAGE_ROOTS
+                ):
+                    continue
+                if (
+                    len(relative) > _LEGACY_PACKAGE_PATH_CHARS
+                    or relative_path.is_absolute()
+                    or relative_path.as_posix() != relative
+                    or any(part in {"", ".", ".."} for part in relative_path.parts)
+                ):
+                    raise WorkflowLanguageCompatibilityError(
+                        "workflow_snapshot_integrity_mismatch",
+                        "pre-language workflow package path is invalid",
+                    )
+                paths.add(relative)
+                if len(paths) > _LEGACY_PACKAGE_PATHS:
+                    raise WorkflowLanguageCompatibilityError(
+                        "workflow_snapshot_integrity_mismatch",
+                        "pre-language workflow package has too many resources",
+                    )
+        if "definition.yaml" not in paths:
+            raise WorkflowLanguageCompatibilityError(
+                "workflow_snapshot_integrity_mismatch",
+                "pre-language workflow definition is missing",
+            )
+        for relative in paths:
+            candidate = PurePosixPath(relative)
+            if (
+                candidate.parts[0] == "scripts"
+                and candidate.suffix in {".js", ".py", ".ts"}
+                and candidate.with_suffix("").as_posix() in paths
+            ) or (
+                candidate.parts[0] == "mcp"
+                and candidate.suffix == ".yaml"
+                and candidate.with_suffix("").as_posix() in paths
+            ):
+                raise WorkflowLanguageCompatibilityError(
+                    "workflow_snapshot_integrity_mismatch",
+                    "pre-language workflow has ambiguous executable resources",
+                )
+        return frozenset(paths)
+
+    @staticmethod
+    def _legacy_raw_package_bytes(
+        run_directory: Path, package_paths: frozenset[str]
+    ) -> Mapping[str, bytes]:
+        """Read one stable in-memory byte set for pre-parse authentication."""
+        package_bytes: dict[str, bytes] = {}
+        for relative in sorted(package_paths):
+            path = run_directory / relative
+            try:
+                before = path.stat()
+                if path.is_symlink() or not path.is_file():
+                    raise OSError("package resource is not a regular file")
+                data = path.read_bytes()
+                after = path.stat()
+            except OSError as exc:
+                raise WorkflowLanguageCompatibilityError(
+                    "workflow_snapshot_integrity_mismatch",
+                    "pre-language workflow package is unreadable",
+                ) from exc
+            if (
+                (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                )
+                != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                )
+                or len(data) != before.st_size
+            ):
+                raise WorkflowLanguageCompatibilityError(
+                    "workflow_snapshot_integrity_mismatch",
+                    "pre-language workflow package changed during authentication",
+                )
+            package_bytes[relative] = data
+        return package_bytes
+
+    @staticmethod
     def _verify_legacy_journaled_seals(
         projection: Mapping[str, object],
         *,
@@ -744,17 +915,18 @@ class RunScheduler:
         definition_bytes: bytes,
         policy_bytes: bytes,
         resources_bytes: bytes,
-    ) -> tuple[bool, bool]:
+        policy_present: bool,
+    ) -> tuple[bool, frozenset[str]]:
         """Verify every journaled pre-language byte seal before parsing YAML."""
         metadata = projection.get("run_metadata")
         if not isinstance(metadata, Mapping):
-            return False, False
+            return False, frozenset()
 
-        definition_verified = False
-        for name, data in (
-            ("sealed_definition_digest", definition_bytes),
-            ("sealed_policy_digest", policy_bytes),
-            ("sealed_input_digest", resources_bytes),
+        verified_paths: set[str] = set()
+        for name, relative, data in (
+            ("sealed_definition_digest", "definition.yaml", definition_bytes),
+            ("sealed_policy_digest", "policy.yaml", policy_bytes),
+            ("sealed_input_digest", "resources.json", resources_bytes),
         ):
             admitted_digest = metadata.get(name)
             if admitted_digest is None:
@@ -768,13 +940,12 @@ class RunScheduler:
                     "workflow_snapshot_integrity_mismatch",
                     f"pre-language workflow {name} differs from admitted bytes",
                 )
-            definition_verified = (
-                definition_verified or name == "sealed_definition_digest"
-            )
+            if relative != "policy.yaml" or policy_present:
+                verified_paths.add(relative)
 
         admitted_snapshot_digest = metadata.get("sealed_snapshot_digest")
         if admitted_snapshot_digest is None:
-            return False, definition_verified
+            return False, frozenset(verified_paths)
         if (
             not isinstance(admitted_snapshot_digest, str)
             or _SHA256.fullmatch(admitted_snapshot_digest) is None
@@ -800,45 +971,18 @@ class RunScheduler:
                 "workflow_snapshot_integrity_mismatch",
                 "pre-language workflow snapshot differs from admitted bytes",
             )
-        return True, definition_verified
+        return True, frozenset(verified_paths)
 
     @staticmethod
-    def _verify_legacy_admission_identity(
-        package: WorkflowPackage,
-        *,
+    def _legacy_identity_candidates(
         projection: Mapping[str, object],
-        run_directory: Path,
-        expected_package_digest: str,
-        sealed_paths: frozenset[str],
-        snapshot_verified: bool,
-        definition_verified: bool,
-    ) -> None:
-        """Authenticate the remaining legacy executable closure or fail closed."""
-        if snapshot_verified:
-            return
-        if definition_verified and sealed_paths.issubset(
-            {"definition.yaml", "policy.yaml"}
-        ):
-            return
-
-        from plugins.workflow.trust import compute_package_digest
-
-        sealed_package = replace(package, root=run_directory)
-        if (
-            compute_package_digest(sealed_package).sha256
-            == expected_package_digest
-        ):
-            return
+    ) -> tuple[str, ...]:
+        """Return only bounded path identities carried by the admission journal."""
+        identity_candidates: set[str] = set()
         projected_workflow = projection.get("workflow")
         workflow_name = (
             projected_workflow if isinstance(projected_workflow, str) else ""
         )
-        if package.definition.name != workflow_name:
-            raise WorkflowLanguageCompatibilityError(
-                "workflow_snapshot_integrity_mismatch",
-                "pre-language workflow name differs from admitted identity",
-            )
-        identity_candidates: set[str] = set()
         if (
             workflow_name
             and "/" not in workflow_name
@@ -856,16 +1000,35 @@ class RunScheduler:
             workflow_relative = metadata.get("workflow_path")
             if isinstance(workflow_relative, str):
                 identity_candidates.add(workflow_relative)
-        matches = 0
-        for identity in sorted(identity_candidates)[:8]:
+        return tuple(sorted(identity_candidates)[:8])
+
+    @staticmethod
+    def _verify_legacy_preparse_identity(
+        projection: Mapping[str, object],
+        *,
+        run_directory: Path,
+        expected_package_digest: str,
+        package_paths: frozenset[str],
+        package_bytes: Mapping[str, bytes],
+        snapshot_verified: bool,
+        directly_verified_paths: frozenset[str],
+    ) -> str | None:
+        """Authenticate every executable byte before allowing a YAML parse."""
+        if snapshot_verified or package_paths.issubset(directly_verified_paths):
+            return None
+        matches = tuple(
+            identity
+            for identity in RunScheduler._legacy_identity_candidates(projection)
             if RunScheduler._legacy_package_digest_for_identity(
                 run_directory,
-                sealed_paths=sealed_paths,
+                sealed_paths=package_paths,
                 workflow_identity=identity,
-            ) == expected_package_digest:
-                matches += 1
-        if matches == 1:
-            return
+                resource_bytes=package_bytes,
+            )
+            == expected_package_digest
+        )
+        if len(matches) == 1:
+            return matches[0]
         raise WorkflowLanguageCompatibilityError(
             "workflow_legacy_snapshot_unverifiable",
             "pre-language workflow snapshot cannot be authenticated from its "
@@ -873,11 +1036,49 @@ class RunScheduler:
         )
 
     @staticmethod
+    def _verify_legacy_postparse_identity(
+        package: WorkflowPackage,
+        *,
+        projection: Mapping[str, object],
+        run_directory: Path,
+        expected_package_digest: str,
+        sealed_paths: frozenset[str],
+        preparsed_paths: frozenset[str] | None,
+        workflow_identity: str | None,
+    ) -> None:
+        """Require parsed closure equality and repeat raw authentication for races."""
+        if preparsed_paths is None or sealed_paths != preparsed_paths:
+            raise WorkflowLanguageCompatibilityError(
+                "workflow_snapshot_integrity_mismatch",
+                "pre-language workflow parsed resource closure differs from sealed bytes",
+            )
+        projected_workflow = projection.get("workflow")
+        workflow_name = (
+            projected_workflow if isinstance(projected_workflow, str) else ""
+        )
+        if package.definition.name != workflow_name:
+            raise WorkflowLanguageCompatibilityError(
+                "workflow_snapshot_integrity_mismatch",
+                "pre-language workflow name differs from admitted identity",
+            )
+        if workflow_identity is not None:
+            if RunScheduler._legacy_package_digest_for_identity(
+                run_directory,
+                sealed_paths=sealed_paths,
+                workflow_identity=workflow_identity,
+            ) != expected_package_digest:
+                raise WorkflowLanguageCompatibilityError(
+                    "workflow_snapshot_integrity_mismatch",
+                    "pre-language workflow package changed during verification",
+                )
+
+    @staticmethod
     def _legacy_package_digest_for_identity(
         run_directory: Path,
         *,
         sealed_paths: frozenset[str],
         workflow_identity: str,
+        resource_bytes: Mapping[str, bytes] | None = None,
     ) -> str | None:
         """Recompute the historical package hash for one bounded path identity."""
         if (
@@ -895,6 +1096,8 @@ class RunScheduler:
             or identity_path.suffix not in {".yaml", ".yml"}
         ):
             return None
+        if resource_bytes is not None and frozenset(resource_bytes) != sealed_paths:
+            return None
         sidecar_identity = identity_path.with_name(
             f"{identity_path.stem}.hermes.yaml"
         ).as_posix()
@@ -909,27 +1112,36 @@ class RunScheduler:
             )
             if identity in resources:
                 return None
-            path = run_directory / relative
-            try:
-                before = path.stat()
-                if path.is_symlink() or not path.is_file():
+            if resource_bytes is None:
+                path = run_directory / relative
+                try:
+                    before = path.stat()
+                    if path.is_symlink() or not path.is_file():
+                        return None
+                    data = path.read_bytes()
+                    after = path.stat()
+                except OSError:
                     return None
-                data = path.read_bytes()
-                after = path.stat()
-            except OSError:
-                return None
-            if (
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-            ) != (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-            ) or len(data) != before.st_size:
-                return None
+                if (
+                    (
+                        before.st_dev,
+                        before.st_ino,
+                        before.st_size,
+                        before.st_mtime_ns,
+                    )
+                    != (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_size,
+                        after.st_mtime_ns,
+                    )
+                    or len(data) != before.st_size
+                ):
+                    return None
+            else:
+                data = resource_bytes.get(relative)
+                if not isinstance(data, bytes):
+                    return None
             resources[identity] = data
         digest = hashlib.sha256()
         for identity in sorted(resources):

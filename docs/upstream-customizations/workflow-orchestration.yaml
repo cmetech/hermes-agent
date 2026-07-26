@@ -3240,7 +3240,11 @@ upstream_changes:
   - RunScheduler._load_verified_run_package atomic verification result
   - RunScheduler._load_run_package sealed language verification
   - RunScheduler._verify_legacy_journaled_seals
-  - RunScheduler._verify_legacy_admission_identity
+  - RunScheduler._legacy_raw_package_paths
+  - RunScheduler._legacy_raw_package_bytes
+  - RunScheduler._legacy_identity_candidates
+  - RunScheduler._verify_legacy_preparse_identity
+  - RunScheduler._verify_legacy_postparse_identity
   - RunScheduler._legacy_package_digest_for_identity
   - read_sealed_snapshot_paths
   - sealed_snapshot_digest admitted-path verification
@@ -3285,23 +3289,36 @@ upstream_changes:
     fields. Stamp every new durable projection with snapshot_format_version so
     removing language or tree fields cannot make a current admission look
     historical. Preserve the pre-language fallback only for marker-free
-    snapshots whose policy resolves to hermes-legacy and whose executable
-    closure is authenticated by the old package digest, an exact bounded
-    historical path-identity reconstruction, or journaled direct/whole-tree
-    seals. Derive at most eight reconstruction candidates from authenticated
-    workflow identity and stored catalog/workflow paths, require one exact old
-    package-digest match, and fail closed on zero or multiple matches. Verify
-    this against the checked-in v2.0.9 migration fixture. Verify every available journaled definition,
-    policy, resources, and immutable-tree seal before parsing executable YAML;
-    legacy tree verification excludes only the code-owned mutable nodes/ and
-    artifacts/ roots. Reject ambiguous legacy script/MCP precedence candidates
-    and bind the surviving legacy resource set for execution. A historical row
-    whose sealed rename lost the original package-relative path and which has
-    no direct or whole-tree seal is cryptographically unverifiable: fail with
-    workflow_legacy_snapshot_unverifiable and instruct the operator to re-trust
-    the installed workflow and start a new run. Never infer trust for those
-    bytes. Declared Archon and new-format snapshots without language metadata
-    remain invalid.
+    snapshots whose policy resolves to hermes-legacy and whose complete raw
+    executable closure is authenticated before any workflow YAML parse. Build a
+    bounded canonical inventory from every non-runtime file in the sealed run
+    tree, including scripts, MCP definitions, and their transitive resources;
+    exclude only journal-authenticated input/skill manifests and the code-owned
+    mutable nodes/ and artifacts/ roots. Read one stable in-memory byte set,
+    reject symlink/replacement races, and parse exactly those authenticated
+    definition and policy bytes. Derive at most eight historical path candidates
+    from authenticated workflow identity and stored catalog/workflow paths, map
+    raw definition.yaml and policy.yaml bytes back to the original workflow and
+    companion identities, preserve every other resource-relative identity, and
+    require exactly one old package-digest match unless direct seals cover the
+    complete executable set or a whole-tree seal authenticates it. After parsing,
+    require the derived resource closure to equal the preauthenticated path set
+    exactly and repeat the winning raw digest comparison before execution.
+    Verify the full scheduler load, not only a digest helper, against the
+    checked-in v2.0.9 migration fixture whose sealed companion is policy.yaml.
+    Fail before parser entry for omitted scripts, omitted MCP-transitive files,
+    injected resources, ambiguous identities, and unverifiable or changed bytes.
+    Verify every available journaled definition, policy, resources, and
+    immutable-tree seal before parsing executable YAML; legacy tree verification
+    excludes only the code-owned mutable nodes/ and artifacts/ roots. Reject
+    ambiguous legacy script/MCP precedence candidates and bind the surviving
+    legacy resource set for execution. A historical row whose sealed rename lost
+    the original package-relative path and which has no applicable direct,
+    whole-tree, or unique raw-package proof is cryptographically unverifiable:
+    fail with workflow_legacy_snapshot_unverifiable and instruct the operator to
+    re-trust the installed workflow and start a new run. Never infer trust for
+    those bytes. Declared Archon and new-format snapshots without language
+    metadata remain invalid.
     Scheduled revalidation must compare projection and resources language plus
     sealed-tree identities, while not-due coordinator polling stays bounded and
     does not reopen installed workflow definitions.
