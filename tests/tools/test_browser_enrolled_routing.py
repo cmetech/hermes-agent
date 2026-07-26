@@ -406,3 +406,42 @@ class TestBareTaskIdStripsEnrolledSuffix:
             browser_tool._active_sessions.pop("t::enrolled", None)
             browser_tool._last_active_session_key.pop("t", None)
             browser_tool._reset_session_cdp_cache()
+
+
+class TestRedirectParity:
+    @pytest.fixture(autouse=True)
+    def _nav(self, monkeypatch, _default_enrolled):
+        monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
+        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+        monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(browser_tool, "_is_safe_url", lambda u: "corp.example" not in u)
+        monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda u: "169.254" in u)
+        monkeypatch.setattr(browser_tool, "check_website_access", lambda u: None)
+        monkeypatch.setattr(
+            browser_tool, "_get_session_info",
+            lambda k: {"session_name": "s", "bb_session_id": None, "cdp_url": None,
+                       "features": {}, "_first_nav": False},
+        )
+
+    def _navigate_landing_on(self, monkeypatch, final_url):
+        monkeypatch.setattr(
+            browser_tool, "_run_browser_command",
+            lambda *a, **kw: {"success": True, "data": {"title": "T", "url": final_url}},
+        )
+        return browser_tool.browser_navigate(TRUSTED, task_id="t")
+
+    def test_redirect_to_a_trusted_origin_is_permitted(self, monkeypatch):
+        out = self._navigate_landing_on(monkeypatch, "https://wiki.corp.example/home")
+        # The redirect-block error text is "private/internal address" (see
+        # test_browser_ssrf_local.py:271, a protected suite this task must not
+        # edit) -- distinct from the pre-nav guard's "private or internal
+        # address" wording. Assert against the real production string.
+        assert "private/internal address" not in out
+
+    def test_redirect_to_an_unlisted_private_origin_is_blocked(self, monkeypatch):
+        out = self._navigate_landing_on(monkeypatch, "https://other.corp.example/x")
+        assert "private/internal address" in out
+
+    def test_redirect_to_cloud_metadata_is_blocked(self, monkeypatch):
+        out = self._navigate_landing_on(monkeypatch, "http://169.254.169.254/latest")
+        assert "cloud metadata endpoint" in out

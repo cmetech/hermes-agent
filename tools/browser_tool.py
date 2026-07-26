@@ -3170,6 +3170,12 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             and not auto_local_this_nav
             and not _allow_private_urls()
             and final_url and final_url != url and not _is_safe_url(final_url)
+            # OTTO: mirror the pre-navigation guard -- an origin this session's
+            # profile explicitly trusts is a legitimate redirect target (SSO and
+            # CF Access land here). Denies for ephemeral keys, which trust
+            # nothing. The metadata floor above is checked first and never
+            # trusted (review finding EBL-008).
+            and not _session_trusts_url(nav_session_key, final_url)
         ):
             # Navigate away to a blank page to prevent snapshot leaks
             _run_browser_command(nav_session_key, "open", ["about:blank"], timeout=10)
