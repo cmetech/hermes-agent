@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -18,7 +19,11 @@ from agent.plugin_agent import (
     PluginAgentRunResult,
     PluginAgentRunner,
 )
-from plugins.workflow.resources import ResourceResolver
+from agent.plugin_agent_worker import _finalize_authenticated_mcp_config
+from plugins.workflow.resources import (
+    AuthenticatedExecutionMaterializer,
+    ResourceResolver,
+)
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from tools.registry import registry
 from tests.plugins.workflow.test_ai_executor import FakeAgentRunner, _context, _node
@@ -219,11 +224,16 @@ def test_node_executor_resolves_only_scheduler_verified_mcp_resource(tmp_path):
     assert runner.requests[0].mcp_servers["echo"]["command"] == "sealed"
 
 
-def test_node_executor_rejects_post_authentication_mcp_substitution(tmp_path):
+@pytest.mark.parametrize("mutation", ["delete", "rename", "replace"])
+def test_node_executor_uses_authenticated_mcp_bytes_without_reopening_source(
+    tmp_path, mutation
+):
     run = tmp_path / "run"
     (run / "mcp").mkdir(parents=True)
     definition = run / "mcp" / "echo.yaml"
-    authenticated = b"command: sealed\nargs: [servers/echo.py]\n"
+    authenticated = (
+        f"command: {json.dumps(sys.executable)}\nargs: [servers/echo.py]\n"
+    ).encode()
     definition.write_bytes(authenticated)
     (run / "servers").mkdir()
     server = run / "servers" / "echo.py"
@@ -239,13 +249,19 @@ def test_node_executor_rejects_post_authentication_mcp_substitution(tmp_path):
             "servers/echo.py": server_bytes,
         },
     )
-    definition.write_text("command: forged\nargs: [servers/echo.py]\n", encoding="utf-8")
+    if mutation == "delete":
+        definition.unlink()
+    elif mutation == "rename":
+        definition.rename(definition.with_suffix(".gone"))
+    else:
+        definition.write_text(
+            "command: forged\nargs: [servers/echo.py]\n", encoding="utf-8"
+        )
 
     result = AgentNodeExecutor(runner).execute(context)
 
-    assert result.status == "failed"
-    assert result.error_code == "validation"
-    assert not runner.requests
+    assert result.status == "succeeded"
+    assert runner.requests[0].mcp_servers["echo"]["command"] == sys.executable
 
 
 def test_mcp_child_opens_materialized_authenticated_server_after_original_race(
@@ -276,13 +292,11 @@ def test_mcp_child_opens_materialized_authenticated_server_after_original_race(
             self.materialized_paths: list[Path] = []
 
         def run(self, request, **_kwargs):
-            config = dict(request.mcp_servers["echo"])
+            config = _finalize_authenticated_mcp_config(
+                {"echo": dict(request.mcp_servers["echo"])}
+            )["echo"]
             args = [str(item) for item in config.get("args", ())]
-            self.materialized_paths = [
-                Path(item)
-                for item in args
-                if Path(item).is_absolute() and Path(item).exists()
-            ]
+            self.materialized_paths = [Path(config["__hermes_private_mcp_cwd"])]
             server.write_bytes(forged_server)
             child = subprocess.run(
                 [str(config["command"]), *args],
@@ -290,7 +304,7 @@ def test_mcp_child_opens_materialized_authenticated_server_after_original_race(
                 text=True,
                 capture_output=True,
                 check=True,
-                cwd=run,
+                cwd=config["__hermes_private_mcp_cwd"],
             )
             return PluginAgentRunResult(
                 final_response=child.stdout.strip(),
@@ -324,6 +338,159 @@ def test_mcp_child_opens_materialized_authenticated_server_after_original_race(
     assert all(not path.exists() for path in runner.materialized_paths)
 
 
+def test_real_mcp_worker_uses_complete_private_runtime_closure_after_ipc(
+    tmp_path,
+):
+    provider, base_url = _start_mock_provider()
+    _write_provider_config(base_url, api_mode="chat_completions")
+    run = tmp_path / "run"
+    for directory in ("mcp", "servers", "config", "data"):
+        (run / directory).mkdir(parents=True, exist_ok=True)
+    definition_bytes = (
+        "mcp_servers:\n"
+        "  node_echo:\n"
+        f"    command: {json.dumps(sys.executable)}\n"
+        "    args: [servers/echo.py, --config=config/settings.json]\n"
+        "    runtime_files: [servers/helper.py, data/value.txt]\n"
+        "    env: {}\n    connect_timeout: 10\n"
+    ).encode()
+    server_bytes = f"""\
+from pathlib import Path
+import sys
+from mcp.server.fastmcp import FastMCP
+from helper import VALUE
+
+ORIGINAL_ROOT = Path({str(run)!r})
+
+config_path = next(value.split('=', 1)[1] for value in sys.argv[1:] if value.startswith('--config='))
+config = Path(config_path).read_text(encoding='utf-8').strip()
+data = Path('data/value.txt').read_text(encoding='utf-8').strip()
+try:
+    import injected
+except ImportError:
+    injected_value = 'isolated'
+else:
+    injected_value = injected.VALUE
+server = FastMCP('authority-echo')
+
+@server.tool()
+def echo(text: str) -> str:
+    private = (
+        'hermes-workflow-authority-' in Path.cwd().as_posix()
+        and Path(__file__).resolve().is_relative_to(Path.cwd().resolve())
+        and all(str(ORIGINAL_ROOT) not in item for item in sys.path)
+    )
+    return '|'.join((VALUE, config, data, injected_value, text, str(private)))
+
+if __name__ == '__main__':
+    server.run(transport='stdio')
+""".encode()
+    authenticated = {
+        "mcp/echo.yaml": definition_bytes,
+        "servers/echo.py": server_bytes,
+        "servers/helper.py": b"VALUE = 'authenticated-helper'\n",
+        "config/settings.json": b"authenticated-config\n",
+        "data/value.txt": b"authenticated-data\n",
+    }
+    for relative, data in authenticated.items():
+        path = run / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+    class MutatingRealRunner:
+        starts_request_mcp = True
+
+        def run(self, request, **kwargs):
+            (run / "servers" / "helper.py").write_text(
+                "VALUE = 'forged-helper'\n", encoding="utf-8"
+            )
+            (run / "config" / "settings.json").write_text(
+                "forged-config\n", encoding="utf-8"
+            )
+            (run / "data" / "value.txt").write_text(
+                "forged-data\n", encoding="utf-8"
+            )
+            (run / "injected.py").write_text(
+                "VALUE = 'forged-injected'\n", encoding="utf-8"
+            )
+            return PluginAgentRunner("workflow/test").run(
+                replace(request, provider=None, model=None), **kwargs
+            )
+
+    context = _context(
+        tmp_path,
+        _node(
+            "mcp-node",
+            "Call the echo tool once and then finish.",
+            mcp="echo",
+            allowed_tools=["mcp__node_echo__echo"],
+        ),
+        sealed_resource_paths=frozenset(authenticated),
+        sealed_resource_bytes=authenticated,
+    )
+    try:
+        result = AgentNodeExecutor(MutatingRealRunner()).execute(context)
+    finally:
+        provider.shutdown()
+        provider.server_close()
+
+    assert result.status == "succeeded", (result.error_message, result.metadata)
+    provider_request = json.dumps(_MockProviderHandler.requests)
+    for expected in (
+        "authenticated-helper",
+        "authenticated-config",
+        "authenticated-data",
+        "isolated",
+        "hello",
+        "True",
+    ):
+        assert expected in provider_request, provider_request
+    assert "forged-helper" not in provider_request
+    assert "forged-config" not in provider_request
+    assert "forged-data" not in provider_request
+    assert "forged-injected" not in provider_request
+
+
+def test_mcp_authority_materialization_is_idempotent_for_duplicate_entry(
+    tmp_path,
+):
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        first = materializer.materialize("servers/echo.py", b"print('sealed')\n")
+        second = materializer.materialize("servers/echo.py", b"print('sealed')\n")
+    finally:
+        materializer.cleanup()
+
+    assert first == second
+    assert first.name == "echo.py"
+    assert first.parent.name == "servers"
+
+
+def test_mcp_authority_cleanup_retries_portable_sharing_failure(
+    monkeypatch,
+):
+    import plugins.workflow.resources as resources_module
+
+    materializer = AuthenticatedExecutionMaterializer()
+    materializer.materialize("servers/echo.py", b"print('sealed')\n")
+    real_rmtree = resources_module.shutil.rmtree
+    calls = 0
+
+    def sharing_then_remove(path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PermissionError("simulated Windows sharing violation")
+        return real_rmtree(path)
+
+    monkeypatch.setattr(resources_module.shutil, "rmtree", sharing_then_remove)
+
+    materializer.cleanup()
+
+    assert calls == 2
+    assert not materializer.root.exists()
+
+
 @pytest.mark.parametrize("outcome", ["failure", "cancelled"])
 def test_mcp_materialized_authority_is_cleaned_after_terminal_outcome(
     tmp_path, outcome
@@ -344,12 +511,14 @@ def test_mcp_materialized_authority_is_cleaned_after_terminal_outcome(
             self.materialized_paths: list[Path] = []
 
         def run(self, request, **_kwargs):
-            args = request.mcp_servers["echo"]["args"]
-            self.materialized_paths = [
-                Path(str(item))
-                for item in args
-                if Path(str(item)).is_absolute() and Path(str(item)).exists()
+            authority = request.mcp_servers["echo"][
+                "__hermes_authenticated_local_mcp"
             ]
+            root = Path(str(authority["root"]))
+            self.materialized_paths = [
+                root / relative for relative in authority["files"]
+            ]
+            assert all(path.exists() for path in self.materialized_paths)
             if outcome == "failure":
                 raise RuntimeError("runner failed")
             return PluginAgentRunResult(

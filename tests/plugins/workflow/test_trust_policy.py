@@ -28,11 +28,18 @@ def _package(workflow_writer, root):
     (root / "scripts" / "helper.py").write_text("print('ok')\n", encoding="utf-8")
     (root / "mcp").mkdir()
     (root / "mcp" / "echo.yaml").write_text(
-        "command: python\nargs: [servers/echo.py]\nenv: {TOKEN: '${TOKEN}'}\n",
+        "command: python\n"
+        "args: [servers/echo.py, --config=config/settings.json]\n"
+        "runtime_files: [data/value.txt]\n"
+        "env: {TOKEN: '${TOKEN}'}\n",
         encoding="utf-8",
     )
     (root / "servers").mkdir()
     (root / "servers" / "echo.py").write_text("print('echo')\n", encoding="utf-8")
+    (root / "config").mkdir()
+    (root / "config" / "settings.json").write_text("{}\n", encoding="utf-8")
+    (root / "data").mkdir()
+    (root / "data" / "value.txt").write_text("sealed\n", encoding="utf-8")
     path = workflow_writer(
         root / "workflows",
         name="risky",
@@ -73,6 +80,8 @@ def test_digest_covers_yaml_sidecar_and_executable_resources(workflow_writer, tm
 
     assert original.covered_relative_paths == (
         "commands/audit.md",
+        "config/settings.json",
+        "data/value.txt",
         "mcp/echo.yaml",
         "scripts/helper.py",
         "servers/echo.py",

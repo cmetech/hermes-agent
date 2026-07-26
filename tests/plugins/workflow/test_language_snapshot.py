@@ -24,7 +24,10 @@ from plugins.workflow.language import (
     make_language_snapshot,
     read_language_snapshot,
 )
-from plugins.workflow.resources import ResourceResolver
+from plugins.workflow.resources import (
+    AuthenticatedExecutionMaterializer,
+    ResourceResolver,
+)
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.scheduled_revalidation import sealed_snapshot_digest
@@ -1153,12 +1156,20 @@ def test_historical_mcp_consumers_rebind_same_size_bytes_for_every_seal_mode(
     assert len(forged) == len(original)
     target.write_bytes(forged)
 
-    with pytest.raises(ValueError, match="changed after authentication"):
-        ResourceResolver(
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        servers = ResourceResolver(
             run,
             sealed_paths=sealed_paths,
             sealed_bytes=sealed_bytes,
-        ).mcp_servers("mcp/echo.yaml")
+        ).mcp_servers("mcp/echo.yaml", materializer=materializer)
+        authority = next(iter(servers.values()))[
+            "__hermes_authenticated_local_mcp"
+        ]
+        private_target = Path(authority["root"]) / target.relative_to(run)
+        assert private_target.read_bytes() == original
+    finally:
+        materializer.cleanup()
 
 
 @pytest.mark.parametrize("invalid_name", [r"node\\skill", "node\0skill"])
@@ -1311,6 +1322,44 @@ def _authority_budget() -> WorkflowResourceReadBudget:
         max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
         max_files=CATALOG_MAX_RESOURCE_FILES,
     )
+
+
+@pytest.mark.parametrize("mutation", ["delete", "rename", "replace"])
+def test_scheduler_input_variables_use_authenticated_bytes_without_reopening_source(
+    tmp_path, mutation
+):
+    run = tmp_path / "run"
+    inputs = run / "inputs"
+    inputs.mkdir(parents=True)
+    manifest = b'{"arguments":{"relative_path":"inputs/arguments.txt"}}'
+    arguments = b"authenticated input"
+    manifest_path = run / "inputs.json"
+    argument_path = inputs / "arguments.txt"
+    manifest_path.write_bytes(manifest)
+    argument_path.write_bytes(arguments)
+    if mutation == "delete":
+        argument_path.unlink()
+    elif mutation == "rename":
+        argument_path.rename(argument_path.with_suffix(".gone"))
+    else:
+        argument_path.write_text("forged input", encoding="utf-8")
+    scheduler = RunScheduler(RunStore(tmp_path / "home"))
+    try:
+        variables = scheduler._variables(
+            {"run_id": "authority-input", "artifacts": []},
+            run,
+            sealed_resource_paths=frozenset(
+                {"inputs.json", "inputs/arguments.txt"}
+            ),
+            sealed_resource_bytes={
+                "inputs.json": manifest,
+                "inputs/arguments.txt": arguments,
+            },
+        )
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert variables.arguments == "authenticated input"
 
 
 @pytest.mark.parametrize("boundary", ["files", "file-bytes", "total-bytes"])

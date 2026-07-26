@@ -126,7 +126,10 @@ def test_script_executor_resolves_only_scheduler_verified_resources(
     assert argv[-1] == str(sealed.resolve())
 
 
-def test_script_executor_rejects_post_authentication_substitution(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mutation", ["delete", "rename", "replace"])
+def test_script_executor_uses_authenticated_bytes_without_reopening_source(
+    tmp_path: Path, mutation: str
+) -> None:
     scripts = tmp_path / "run" / "scripts"
     scripts.mkdir(parents=True)
     script = scripts / "diagnose.py"
@@ -137,10 +140,17 @@ def test_script_executor_rejects_post_authentication_substitution(tmp_path: Path
         sealed_resource_paths=frozenset({"scripts/diagnose.py"}),
         sealed_resource_bytes={"scripts/diagnose.py": authenticated},
     )
-    script.write_text("print('forged')\n", encoding="utf-8")
+    if mutation == "delete":
+        script.unlink()
+    elif mutation == "rename":
+        script.rename(script.with_suffix(".gone"))
+    else:
+        script.write_text("print('forged')\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="changed after authentication"):
-        ScriptExecutor()._argv(context, "/fake/uv")
+    argv, _warnings, source = ScriptExecutor()._execution_plan(context, "/fake/uv")
+
+    assert argv[-2:] == ["python", "-"]
+    assert source == authenticated
 
 
 @pytest.mark.parametrize(

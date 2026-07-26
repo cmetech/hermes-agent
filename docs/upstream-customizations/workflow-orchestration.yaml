@@ -3219,6 +3219,9 @@ upstream_changes:
   - plugins/workflow/trust.py
   - plugins/workflow/catalog_api.py
   - plugins/workflow/resources.py
+  - agent/plugin_agent.py
+  - agent/plugin_agent_worker.py
+  - tools/mcp_tool.py
   - plugins/workflow/executors/base.py
   - plugins/workflow/executors/script.py
   - plugins/workflow/executors/ai.py
@@ -3229,6 +3232,7 @@ upstream_changes:
   - tests/plugins/workflow/test_ai_executor.py
   - tests/plugins/workflow/test_node_agents.py
   - tests/plugins/workflow/test_resources.py
+  - tests/plugins/workflow/test_trust_policy.py
   owned_symbols:
   - WorkflowLanguageSnapshot
   - make_language_snapshot
@@ -3259,12 +3263,18 @@ upstream_changes:
   - NodeExecutionContext positional constructor compatibility
   - ResourceResolver sealed-path candidate authorization
   - ResourceResolver authenticated-byte rebinding
+  - ResourceResolver sealed-byte-exclusive resource reads
   - WorkflowResourceReadBudget.from_authenticated
   - WorkflowResourceReadBudget canonical shared-run accounting
   - authoritative workflow resource capacity limits
   - AuthenticatedExecutionMaterializer
+  - AuthenticatedExecutionMaterializer canonical closure materialization
   - ScriptExecutor authenticated stdin execution plan
   - ResourceResolver authenticated local Python MCP loader
+  - PluginAgentRunner same-source worker bootstrap
+  - plugin-agent worker authenticated MCP authority validation
+  - MCPServerTask authenticated private working directory
+  - compute_package_digest exact and compound MCP closure discovery
   tests:
   - tests/plugins/workflow/test_language_snapshot.py
   - tests/plugins/workflow/test_schedule_revalidation.py
@@ -3275,6 +3285,7 @@ upstream_changes:
   - tests/plugins/workflow/test_ai_executor.py
   - tests/plugins/workflow/test_node_agents.py
   - tests/plugins/workflow/test_resources.py
+  - tests/plugins/workflow/test_trust_policy.py
   expected_commit_subject: 'feat(workflow): pin workflow semantics at admission'
   upstream_candidate: true
   merge_guidance: >-
@@ -3352,12 +3363,20 @@ upstream_changes:
     bytes immediately around use; same-size post-authentication disk substitution
     must never become prompt or executable content. Execute authenticated named
     uv and Bun scripts from inherited anonymous byte streams, never their
-    reopened package path. For authenticated local Python MCP servers, create a
-    private disposable authority outside the run tree, replace the path launch
-    with a Python loader that reads once, verifies SHA-256, and executes those
-    bytes in memory without consuming MCP protocol stdin; clean the authority
-    after success, failure, or cancellation and fail closed for local executable
-    shapes that cannot preserve the byte authority.
+    reopened package path. For authenticated local Python MCP servers,
+    materialize the complete sealed byte closure at canonical relative paths in
+    one private disposable authority outside the run tree. Carry only its
+    bounded digest manifest through JSON IPC; after environment interpolation
+    the worker must validate the exact private tree, rewrite exact and compound
+    local path arguments, and launch Python isolated from the mutable run cwd
+    with private cwd, sys.path, and __file__ semantics while preserving MCP
+    protocol stdin. The worker must load from the same source tree as its parent.
+    Clean the authority after success, failure, or cancellation with retry-and-
+    surface behavior, make duplicate relpath-plus-digest materialization
+    idempotent, and fail closed with stable migration guidance for local
+    executable shapes whose complete closure cannot be proven. Installed
+    commands, npx servers, inline Python without sealed dependencies, and remote
+    servers retain their existing launch behavior.
     Scheduled revalidation must compare projection and resources language plus
     sealed-tree identities, while not-due coordinator polling stays bounded and
     does not reopen installed workflow definitions.

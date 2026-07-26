@@ -410,12 +410,16 @@ def compute_package_digest(
                     "invalid_mcp",
                     f"invalid MCP definition: {reference}: {exc}",
                 ) from exc
-            for candidate in _walk_strings(mcp_document):
-                if not candidate or candidate.startswith(("$", "-")):
-                    continue
-                resource = package.root / candidate
-                if resource.exists() or resource.is_symlink():
-                    add(resource)
+            for raw_candidate in _walk_strings(mcp_document):
+                candidates = [raw_candidate]
+                if raw_candidate.startswith("-") and "=" in raw_candidate:
+                    candidates.append(raw_candidate.split("=", 1)[1])
+                for candidate in candidates:
+                    if not candidate or candidate.startswith(("$", "-")):
+                        continue
+                    resource = package.root / candidate
+                    if resource.exists() or resource.is_symlink():
+                        add(resource)
 
     digest = hashlib.sha256()
     for relative in sorted(resources):
