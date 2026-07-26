@@ -675,6 +675,7 @@ def test_workflow_catalog_projects_showcase_from_authenticated_snapshot(
     target = copied / "packages/ai-extensions/commands/inspect-evidence.md"
     original_loader = showcase_module.load_verified_showcase_packages
     original_open = Path.open
+    original_stat = Path.stat
     projection_started = False
     authenticated_digest = ""
     projected_digests: list[str] = []
@@ -691,6 +692,11 @@ def test_workflow_catalog_projects_showcase_from_authenticated_snapshot(
         if projection_started and self == target:
             pytest.fail("catalog projection reopened authenticated showcase source")
         return original_open(self, *args, **kwargs)
+
+    def forbid_restat(self, *args, **kwargs):
+        if projection_started and self == target:
+            pytest.fail("catalog projection restatted authenticated showcase source")
+        return original_stat(self, *args, **kwargs)
 
     original_assess = catalog_api.assess_package_execution
 
@@ -710,6 +716,7 @@ def test_workflow_catalog_projects_showcase_from_authenticated_snapshot(
         mutate_after_authentication,
     )
     monkeypatch.setattr(Path, "open", forbid_reopen)
+    monkeypatch.setattr(Path, "stat", forbid_restat)
     monkeypatch.setattr(catalog_api, "assess_package_execution", capture_assessment)
 
     items, truncated = catalog_api.build_workflow_catalog(
@@ -1743,8 +1750,10 @@ def test_workflow_catalog_rejects_oversized_resource_without_reading_it_all(
             return self._wrapped.read(size)
 
     def recording_open(path, *args, **kwargs):
+        if Path(path) == resource:
+            raise AssertionError("oversized resource was opened")
         opened = original_open(path, *args, **kwargs)
-        return RecordingReader(opened) if Path(path) == resource else opened
+        return opened
 
     monkeypatch.setattr(Path, "open", recording_open)
 
@@ -1754,8 +1763,7 @@ def test_workflow_catalog_rejects_oversized_resource_without_reading_it_all(
     assert _user_items(response) == [
         {"name": "oversized-resource", "error": "catalog_capacity"}
     ]
-    assert read_sizes
-    assert all(0 < size <= 1024 * 1024 + 1 for size in read_sizes)
+    assert read_sizes == []
 
 
 def test_workflow_catalog_enforces_aggregate_resource_budget(

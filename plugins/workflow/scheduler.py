@@ -1026,7 +1026,7 @@ class RunScheduler:
         for relative in sorted(paths):
             path = run_directory / relative
             try:
-                data = budget.read(path)
+                data = budget.read(path, verify_cached_identity=True)
             except WorkflowResourceCapacityError as exc:
                 if legacy_capacity:
                     raise WorkflowLanguageCompatibilityError(

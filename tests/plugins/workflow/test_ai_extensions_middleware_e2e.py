@@ -54,6 +54,19 @@ EXPECTED_MCP_SERVERS = {
 }
 
 
+def _assert_authenticated_mcp_servers(servers) -> None:
+    assert set(servers) == {"echo"}
+    server = servers["echo"]
+    assert server["command"] == "python"
+    assert server["env"] == {}
+    assert server["args"][0] == "-c"
+    assert "hashlib.sha256" in server["args"][1]
+    authority_path = Path(server["args"][2])
+    assert authority_path.is_absolute()
+    assert "hermes-workflow-authority-" in authority_path.as_posix()
+    assert "mcp/echo-server.py" in server["args"]
+
+
 class CapabilityDeclaringRecordingRunner:
     """Record sealed requests without claiming to start their MCP servers."""
 
@@ -62,7 +75,7 @@ class CapabilityDeclaringRecordingRunner:
 
     def run(self, request, *, is_cancelled=None) -> PluginAgentRunResult:
         assert is_cancelled is None or not is_cancelled()
-        assert request.mcp_servers == EXPECTED_MCP_SERVERS
+        _assert_authenticated_mcp_servers(request.mcp_servers)
         assert request.allowed_tools is None
         self.requests.append(request)
         return PluginAgentRunResult(
@@ -493,10 +506,9 @@ def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
             "shared",
         ]
         assert len(recording_runner.requests) == 2
-        assert all(
-            request.mcp_servers == EXPECTED_MCP_SERVERS
-            for request in recording_runner.requests
-        )
+        for request in recording_runner.requests:
+            _assert_authenticated_mcp_servers(request.mcp_servers)
+            assert not Path(request.mcp_servers["echo"]["args"][2]).exists()
         assert trust_store.path.read_bytes() == trust_before
         assert _persisted_start_digest(store, run_id) == (
             RunStore._start_digest_from_projection(store.get_run_status(run_id))

@@ -206,7 +206,7 @@ def sealed_snapshot_digest(
         try:
             before = path.stat()
             data = (
-                read_budget.read(path)
+                read_budget.read(path, verify_cached_identity=True)
                 if read_budget is not None
                 else path.read_bytes()
             )
@@ -312,11 +312,13 @@ def verify_sealed_snapshot(
         max_files=_RESOURCE_FILES,
     )
     try:
-        definition_bytes = budget.read(definition)
+        definition_bytes = budget.read(definition, verify_cached_identity=True)
         policy_bytes = (
-            budget.read(policy) if policy.is_file() or policy.is_symlink() else b"{}\n"
+            budget.read(policy, verify_cached_identity=True)
+            if policy.is_file() or policy.is_symlink()
+            else b"{}\n"
         )
-        resources_bytes = budget.read(resources)
+        resources_bytes = budget.read(resources, verify_cached_identity=True)
     except (OSError, WorkflowResourceCapacityError) as exc:
         raise ScheduledRunRevalidationError("sealed snapshot is unreadable") from exc
     expected = (

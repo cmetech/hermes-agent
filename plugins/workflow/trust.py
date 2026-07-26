@@ -68,14 +68,14 @@ class WorkflowResourceReadBudget:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
 
-    def read(self, path: Path) -> bytes:
+    def read(self, path: Path, *, verify_cached_identity: bool = False) -> bytes:
         if self._sealed:
             return self.read_cached(path)
         canonical = self._logical_key(path)
         cached = self._contents.get(canonical)
         if cached is not None:
             identity = self._identities.get(canonical)
-            if identity is not None:
+            if verify_cached_identity and identity is not None:
                 current = path.stat()
                 if path.is_symlink() or not path.is_file() or identity != (
                     current.st_dev,
@@ -155,6 +155,11 @@ class WorkflowResourceReadBudget:
                 "sealed package resource is unavailable"
             ) from exc
 
+    def has_cached(self, logical_path: Path) -> bool:
+        key = self._logical_key(logical_path)
+        canonical = self._aliases.get(key, key)
+        return canonical in self._contents
+
     @classmethod
     def from_authenticated(
         cls,
@@ -232,6 +237,16 @@ def _contained_resource(
     *,
     read_budget: WorkflowResourceReadBudget | None = None,
 ) -> tuple[str, bytes]:
+    if read_budget is not None and read_budget.has_cached(path):
+        try:
+            relative = path.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise _validation_error(
+                str(path),
+                "resource_escape",
+                f"workflow resource escapes package root: {path}",
+            ) from exc
+        return relative, read_budget.read(path)
     try:
         if path.is_symlink():
             raise _validation_error(
@@ -270,7 +285,12 @@ def _contained_resource(
     return resolved.relative_to(root).as_posix(), data
 
 
-def _named_script_path(package: WorkflowPackage, name: str, runtime: str) -> Path:
+def _named_script_path(
+    package: WorkflowPackage,
+    name: str,
+    runtime: str,
+    read_budget: WorkflowResourceReadBudget | None = None,
+) -> Path:
     extension = ".py" if runtime == "uv" else ".ts"
     base = package.root / "scripts" / name
     candidates = (
@@ -279,25 +299,37 @@ def _named_script_path(package: WorkflowPackage, name: str, runtime: str) -> Pat
         else (base, base.with_suffix(extension))
     )
     for candidate in candidates:
-        if candidate.exists() or candidate.is_symlink():
+        if (read_budget is not None and read_budget.has_cached(candidate)) or (
+            candidate.exists() or candidate.is_symlink()
+        ):
             return candidate
     raise _validation_error(
         name, "missing_script", f"named script resource is missing: {name}"
     )
 
 
-def _command_path(package: WorkflowPackage, name: str) -> Path:
+def _command_path(
+    package: WorkflowPackage,
+    name: str,
+    read_budget: WorkflowResourceReadBudget | None = None,
+) -> Path:
     base = package.root / "commands" / name
     candidates = (base, base.with_suffix(".md"))
     for candidate in candidates:
-        if candidate.exists() or candidate.is_symlink():
+        if (read_budget is not None and read_budget.has_cached(candidate)) or (
+            candidate.exists() or candidate.is_symlink()
+        ):
             return candidate
     raise _validation_error(
         name, "missing_command", f"command resource is missing: {name}"
     )
 
 
-def _mcp_path(package: WorkflowPackage, reference: str) -> Path:
+def _mcp_path(
+    package: WorkflowPackage,
+    reference: str,
+    read_budget: WorkflowResourceReadBudget | None = None,
+) -> Path:
     direct = package.root / reference
     candidates = (
         direct,
@@ -305,7 +337,9 @@ def _mcp_path(package: WorkflowPackage, reference: str) -> Path:
         (package.root / "mcp" / reference).with_suffix(".yaml"),
     )
     for candidate in candidates:
-        if candidate.exists() or candidate.is_symlink():
+        if (read_budget is not None and read_budget.has_cached(candidate)) or (
+            candidate.exists() or candidate.is_symlink()
+        ):
             return candidate
     raise _validation_error(
         reference, "missing_mcp", f"MCP definition is missing: {reference}"
@@ -345,12 +379,15 @@ def compute_package_digest(
         add(package.sidecar_path or expected_sidecar)
     for node in package.definition.nodes:
         if node.node_type == "command":
-            add(_command_path(package, str(node.value)))
+            add(_command_path(package, str(node.value), read_budget))
         elif node.node_type == "script" and isinstance(node.value, str):
             if not is_inline_script(node.value):
                 add(
                     _named_script_path(
-                        package, node.value, str(node.options["runtime"])
+                        package,
+                        node.value,
+                        str(node.options["runtime"]),
+                        read_budget,
                     )
                 )
         mcp_value = node.options.get("mcp")
@@ -364,7 +401,7 @@ def compute_package_digest(
         for reference in references:
             if not isinstance(reference, str):
                 continue
-            _, mcp_bytes = add(_mcp_path(package, reference))
+            _, mcp_bytes = add(_mcp_path(package, reference, read_budget))
             try:
                 mcp_document = yaml.safe_load(mcp_bytes) or {}
             except yaml.YAMLError as exc:
