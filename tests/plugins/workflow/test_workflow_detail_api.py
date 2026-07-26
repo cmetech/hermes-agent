@@ -17,6 +17,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from hermes_cli.dashboard_auth.base import TokenPrincipal
+import pytest
 import yaml
 
 from plugins.workflow.cli import register_cli
@@ -363,6 +364,69 @@ def test_workflow_compatibility_models_accept_real_producer_state_variants(
         assert report.level is expected_level
         assert report.runnable is expected_runnable
         module.WorkflowCompatibilityFull.model_validate(projection)
+
+
+@pytest.mark.parametrize(
+    ("case_name", "unsafe_key"),
+    (
+        ("empty", ""),
+        ("root", "/"),
+        ("dot", "."),
+        ("ansi-only", "\x1b[31m"),
+    ),
+)
+def test_workflow_detail_normalizes_sanitizer_empty_compatibility_paths(
+    tmp_path, monkeypatch, case_name, unsafe_key
+) -> None:
+    home = tmp_path / "home"
+    workflow_root = home / "workflows"
+    workflow_root.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    path = workflow_root / f"unsafe-path-{case_name}.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "name": f"unsafe-path-{case_name}",
+                "description": "Compatibility path sanitizer regression",
+                "nodes": [{"id": "start", "bash": "true"}],
+                unsafe_key: True,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    module = _module()
+
+    response = _detail_get(
+        module.router,
+        f"unsafe-path-{case_name}",
+        token=_reader(),
+        catalog_source="profile",
+        raise_server_exceptions=False,
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    finding = next(
+        item
+        for item in payload["compatibility"]["findings"]
+        if item["code"] == "unknown_top_level_field"
+    )
+    assert finding == {
+        "path": module.WORKFLOW_COMPATIBILITY_UNKNOWN_PATH,
+        "level": "unsupported",
+        "message": (
+            "unknown top-level field: "
+            f"{module.WORKFLOW_COMPATIBILITY_UNKNOWN_PATH}"
+        ),
+        "blocking": False,
+        "code": "unknown_top_level_field",
+    }
+    if unsafe_key:
+        assert unsafe_key not in finding["path"]
+        assert unsafe_key not in finding["message"]
+    assert len(response.content) < 65_536
+    module.WorkflowDetailResponse.model_validate(payload)
 
 
 def test_workflow_detail_omitted_or_wrong_source_never_falls_through_to_showcase(

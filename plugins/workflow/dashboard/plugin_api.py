@@ -50,6 +50,7 @@ _CURSOR_SECRET = secrets.token_bytes(32)
 _RUNTIME: WorkflowApiRuntime | None = None
 _RUNTIME_LOCK = threading.Lock()
 _WORKFLOW_RESPONSE_TEXT_MAX = 16_384
+WORKFLOW_COMPATIBILITY_UNKNOWN_PATH = "<unknown-path>"
 
 
 def _runtime() -> WorkflowApiRuntime:
@@ -317,6 +318,31 @@ class WorkflowCompatibilityFull(WorkflowCompatibilitySummary):
         return self
 
 
+def _sanitize_compatibility_finding_projection(
+    finding: Mapping[str, object],
+) -> dict[str, object]:
+    """Sanitize one closed finding while preserving its nonempty API path."""
+    raw_path = finding.get("path")
+    candidate = dict(finding)
+    if isinstance(raw_path, str):
+        sanitized_path = sanitize_projection(raw_path, key="path")
+        if sanitized_path == "":
+            raw_message = candidate.get("message")
+            if isinstance(raw_message, str):
+                if raw_path:
+                    candidate["message"] = raw_message.replace(
+                        raw_path, WORKFLOW_COMPATIBILITY_UNKNOWN_PATH
+                    )
+                elif raw_message.endswith(": "):
+                    candidate["message"] = (
+                        raw_message + WORKFLOW_COMPATIBILITY_UNKNOWN_PATH
+                    )
+            candidate["path"] = WORKFLOW_COMPATIBILITY_UNKNOWN_PATH
+    projected = sanitize_projection(candidate)
+    assert isinstance(projected, dict)
+    return projected
+
+
 class WorkflowCatalogEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -520,7 +546,10 @@ def workflow_detail(
     sanitized["compatibility"] = {
         "level": compatibility["level"],
         "runnable": compatibility["runnable"],
-        "findings": [sanitize_projection(finding) for finding in findings],
+        "findings": [
+            _sanitize_compatibility_finding_projection(finding)
+            for finding in findings
+        ],
     }
     return sanitized
 

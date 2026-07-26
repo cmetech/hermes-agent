@@ -3401,6 +3401,8 @@ upstream_changes:
   - WORKFLOW_COMPATIBILITY_FINDINGS_PER_NODE_MAX
   - WORKFLOW_COMPATIBILITY_PACKAGE_FINDINGS_MAX
   - WORKFLOW_COMPATIBILITY_FINDINGS_MAX
+  - WORKFLOW_COMPATIBILITY_UNKNOWN_PATH
+  - _sanitize_compatibility_finding_projection
   - _catalog_language_projection
   - _compatibility_summary
   - _compatibility_projection
@@ -3438,14 +3440,16 @@ upstream_changes:
     and user compatibility summaries bounded, derive the full-report finding
     ceiling from the complete definition projection's node, byte, and
     container limits plus producer field inventories, retain the existing
-    verified showcase compatibility payload, and expose expanded metadata and findings
-    only in detail without generic sanitizer truncation. Full compatibility
+    verified showcase compatibility payload, and expose expanded metadata and
+    findings only in detail without generic sanitizer truncation. Full compatibility
     responses must contain only the five projected finding fields and their
     level/runnable pair must be derived from the complete finding set using the
-    same authority rule as CompatibilityReport. Desktop language data must
-    remain optional for old-backend skew and strictly presentational: badges,
-    one read-only detail alert, and
-    the trust/risk preflight review must never parse YAML, recompute language
+    same authority rule as CompatibilityReport. Preserve API-specific finding
+    sanitization, including the stable nonempty unknown-path marker when ANSI
+    and filesystem-path redaction leave no diagnostic path. Desktop language
+    data must remain optional for old-backend skew and strictly presentational:
+    badges, one read-only detail alert, and the trust/risk preflight review must
+    never parse YAML, recompute language
     profiles, inspect findings to gate Run, issue mutation requests, or change
     focus and navigation behavior. Preserve all-locale parity and the intended
     new-backend fail-closed behavior for older clients through the existing

@@ -442,6 +442,51 @@ def test_workflow_compatibility_full_enforces_authoritative_report_state() -> No
             module.WorkflowCompatibilityFull.model_validate(payload)
 
 
+def test_workflow_compatibility_finding_api_projection_normalizes_only_empty_paths() -> None:
+    module = _module()
+    base = {
+        "level": "unsupported",
+        "message": "unknown top-level field: raw",
+        "blocking": False,
+        "code": "unknown_top_level_field",
+    }
+
+    legitimate = module._sanitize_compatibility_finding_projection(
+        {**base, "path": "nodes[0].timeout"}
+    )
+    assert legitimate["path"] == "nodes[0].timeout"
+    module.WorkflowCompatibilityFinding.model_validate(legitimate)
+
+    absolute = module._sanitize_compatibility_finding_projection(
+        {**base, "path": "/private/tmp/operator-secret.yaml"}
+    )
+    ansi_prefixed = module._sanitize_compatibility_finding_projection(
+        {**base, "path": "\x1b[31mnodes[0].timeout"}
+    )
+    assert absolute["path"] == "operator-secret.yaml"
+    assert ansi_prefixed["path"] == "nodes[0].timeout"
+    module.WorkflowCompatibilityFinding.model_validate(absolute)
+    module.WorkflowCompatibilityFinding.model_validate(ansi_prefixed)
+
+    for raw_path in ("", "/", ".", "\x1b[31m"):
+        projected = module._sanitize_compatibility_finding_projection(
+            {
+                **base,
+                "path": raw_path,
+                "message": f"unknown top-level field: {raw_path}",
+            }
+        )
+        assert projected == {
+            **base,
+            "path": module.WORKFLOW_COMPATIBILITY_UNKNOWN_PATH,
+            "message": (
+                "unknown top-level field: "
+                f"{module.WORKFLOW_COMPATIBILITY_UNKNOWN_PATH}"
+            ),
+        }
+        module.WorkflowCompatibilityFinding.model_validate(projected)
+
+
 def test_workflow_catalog_response_model_enforces_source_projection_and_old_optional_compatibility() -> None:
     module = _module()
     base = {
