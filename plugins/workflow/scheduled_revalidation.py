@@ -23,6 +23,7 @@ from plugins.workflow.trust import (
     WORKFLOW_RESOURCE_MAX_FILE_BYTES,
     WORKFLOW_RESOURCE_MAX_FILES,
     WORKFLOW_RESOURCE_MAX_TOTAL_BYTES,
+    WorkflowResourceCapacityError,
     WorkflowResourceReadBudget,
     WorkflowTrustStore,
     compute_package_digest,
@@ -104,6 +105,7 @@ def sealed_snapshot_digest(
     root: str | Path,
     *,
     relative_paths: Iterable[str] | None = None,
+    read_budget: WorkflowResourceReadBudget | None = None,
 ) -> str:
     """Digest the immutable files sealed at admission, or a legacy run tree."""
     snapshot_root = Path(root)
@@ -203,7 +205,11 @@ def sealed_snapshot_digest(
     for relative, path in sorted(entries):
         try:
             before = path.stat()
-            data = path.read_bytes()
+            data = (
+                read_budget.read(path)
+                if read_budget is not None
+                else path.read_bytes()
+            )
             after = path.stat()
         except OSError as exc:
             raise ScheduledRunRevalidationError(
@@ -300,11 +306,18 @@ def verify_sealed_snapshot(
     definition = run_directory / "definition.yaml"
     policy = run_directory / "policy.yaml"
     resources = run_directory / "resources.json"
+    budget = WorkflowResourceReadBudget(
+        max_file_bytes=_RESOURCE_FILE_BYTES,
+        max_total_bytes=_RESOURCE_TOTAL_BYTES,
+        max_files=_RESOURCE_FILES,
+    )
     try:
-        definition_bytes = definition.read_bytes()
-        policy_bytes = policy.read_bytes() if policy.is_file() else b"{}\n"
-        resources_bytes = resources.read_bytes()
-    except Exception as exc:
+        definition_bytes = budget.read(definition)
+        policy_bytes = (
+            budget.read(policy) if policy.is_file() or policy.is_symlink() else b"{}\n"
+        )
+        resources_bytes = budget.read(resources)
+    except (OSError, WorkflowResourceCapacityError) as exc:
         raise ScheduledRunRevalidationError("sealed snapshot is unreadable") from exc
     expected = (
         _required_digest(run["run_metadata"], "sealed_definition_digest"),
@@ -347,7 +360,11 @@ def verify_sealed_snapshot(
         else None
     )
     if (
-        sealed_snapshot_digest(run_directory, relative_paths=sealed_paths)
+        sealed_snapshot_digest(
+            run_directory,
+            relative_paths=sealed_paths,
+            read_budget=budget,
+        )
         != expected_snapshot_digest
     ):
         raise ScheduledRunRevalidationError("sealed snapshot identity changed")

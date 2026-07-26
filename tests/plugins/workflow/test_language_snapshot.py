@@ -29,6 +29,7 @@ from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.scheduled_revalidation import sealed_snapshot_digest
 from plugins.workflow.store import RunStore
+from plugins.workflow.trust import WorkflowResourceReadBudget
 
 
 LEGACY_STORE_FIXTURE = (
@@ -1302,6 +1303,197 @@ def test_legacy_raw_package_bytes_rejects_authoritative_capacity_overflow(
     assert exc.value.code == "workflow_legacy_snapshot_unverifiable"
     assert "re-trust" in str(exc.value)
     assert "new run" in str(exc.value)
+
+
+def _authority_budget() -> WorkflowResourceReadBudget:
+    return WorkflowResourceReadBudget(
+        max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
+        max_total_bytes=CATALOG_MAX_RESOURCE_TOTAL_BYTES,
+        max_files=CATALOG_MAX_RESOURCE_FILES,
+    )
+
+
+@pytest.mark.parametrize("boundary", ["files", "file-bytes", "total-bytes"])
+def test_modern_snapshot_authority_accepts_exact_shared_budget_boundaries(
+    tmp_path, boundary
+):
+    run = tmp_path / "run"
+    run.mkdir()
+    if boundary == "files":
+        paths = []
+        for index in range(CATALOG_MAX_RESOURCE_FILES):
+            path = run / f"resource-{index:03}.bin"
+            path.write_bytes(b"")
+            paths.append(path.name)
+    elif boundary == "file-bytes":
+        path = run / "resource.bin"
+        path.write_bytes(b"x" * CATALOG_MAX_RESOURCE_FILE_BYTES)
+        paths = [path.name]
+    else:
+        paths = []
+        for index in range(
+            CATALOG_MAX_RESOURCE_TOTAL_BYTES // CATALOG_MAX_RESOURCE_FILE_BYTES
+        ):
+            path = run / f"resource-{index}.bin"
+            path.write_bytes(bytes([index]) * CATALOG_MAX_RESOURCE_FILE_BYTES)
+            paths.append(path.name)
+
+    authenticated = RunScheduler._stable_snapshot_bytes(
+        run,
+        paths,
+        read_budget=_authority_budget(),
+    )
+
+    assert len(authenticated) == len(paths)
+    assert sum(map(len, authenticated.values())) <= CATALOG_MAX_RESOURCE_TOTAL_BYTES
+
+
+def test_historical_package_and_auxiliary_reads_share_one_total_budget(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    package_paths = []
+    for index in range(4):
+        path = run / f"package-{index}.bin"
+        path.write_bytes(b"p" * CATALOG_MAX_RESOURCE_FILE_BYTES)
+        package_paths.append(path.name)
+    (run / "inputs.json").write_bytes(b"{}")
+    skill_digests = {}
+    for index in range(4):
+        relative = f"node-skills/node-{index}.md"
+        path = run / relative
+        path.parent.mkdir(exist_ok=True)
+        data = b"s" * CATALOG_MAX_RESOURCE_FILE_BYTES
+        path.write_bytes(data)
+        skill_digests[f"node-{index}"] = sha256(data).hexdigest()
+    resources = {
+        "inputs_sha256": sha256(b"{}").hexdigest(),
+        "node_skills": skill_digests,
+        "node_agent_skills": {},
+    }
+    budget = _authority_budget()
+
+    RunScheduler._legacy_raw_package_bytes(
+        run,
+        frozenset(package_paths),
+        read_budget=budget,
+    )
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        RunScheduler._legacy_auxiliary_bytes(
+            run,
+            resources,
+            b"resources",
+            read_budget=budget,
+        )
+
+    assert exc.value.code == "workflow_legacy_snapshot_unverifiable"
+    assert "re-trust" in str(exc.value)
+
+
+def test_shared_snapshot_budget_deduplicates_same_canonical_file(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    path = run / "definition.yaml"
+    path.write_bytes(b"x" * CATALOG_MAX_RESOURCE_FILE_BYTES)
+    budget = WorkflowResourceReadBudget(
+        max_file_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
+        max_total_bytes=CATALOG_MAX_RESOURCE_FILE_BYTES,
+        max_files=1,
+    )
+
+    first = RunScheduler._stable_snapshot_bytes(
+        run, (path.name,), read_budget=budget
+    )
+    second = RunScheduler._legacy_raw_package_bytes(
+        run, frozenset({path.name}), read_budget=budget
+    )
+
+    assert first[path.name] == second[path.name]
+    assert budget.files_read == 1
+    assert budget.bytes_read == CATALOG_MAX_RESOURCE_FILE_BYTES
+
+
+def test_modern_oversized_file_is_rejected_before_open(tmp_path, monkeypatch):
+    run = tmp_path / "run"
+    run.mkdir()
+    oversized = run / "oversized.bin"
+    oversized.write_bytes(b"")
+    with oversized.open("r+b") as stream:
+        stream.truncate(CATALOG_MAX_RESOURCE_FILE_BYTES + 1)
+
+    def forbidden_open(*_args, **_kwargs):
+        raise AssertionError("oversized snapshot file was opened")
+
+    monkeypatch.setattr(Path, "open", forbidden_open)
+
+    with pytest.raises(WorkflowLanguageCompatibilityError, match="resource limit"):
+        RunScheduler._stable_snapshot_bytes(
+            run,
+            (oversized.name,),
+            read_budget=_authority_budget(),
+        )
+
+
+@pytest.mark.parametrize("overflow", ["files", "total-bytes"])
+def test_modern_snapshot_authority_rejects_shared_budget_overflow(
+    tmp_path, overflow
+):
+    run = tmp_path / "run"
+    run.mkdir()
+    paths = []
+    if overflow == "files":
+        for index in range(CATALOG_MAX_RESOURCE_FILES + 1):
+            path = run / f"resource-{index:03}.bin"
+            path.write_bytes(b"")
+            paths.append(path.name)
+    else:
+        for index in range(
+            CATALOG_MAX_RESOURCE_TOTAL_BYTES // CATALOG_MAX_RESOURCE_FILE_BYTES
+        ):
+            path = run / f"resource-{index}.bin"
+            path.write_bytes(b"x" * CATALOG_MAX_RESOURCE_FILE_BYTES)
+            paths.append(path.name)
+        overflow_path = run / "overflow.bin"
+        overflow_path.write_bytes(b"x")
+        paths.append(overflow_path.name)
+
+    with pytest.raises(WorkflowLanguageCompatibilityError, match="resource limit"):
+        RunScheduler._stable_snapshot_bytes(
+            run,
+            paths,
+            read_budget=_authority_budget(),
+        )
+
+
+def test_historical_package_and_inputs_share_one_file_count_budget(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    package_paths = []
+    for index in range(CATALOG_MAX_RESOURCE_FILES):
+        path = run / f"package-{index:03}.bin"
+        path.write_bytes(b"")
+        package_paths.append(path.name)
+    (run / "inputs.json").write_bytes(b"{}")
+    resources = {
+        "inputs_sha256": sha256(b"{}").hexdigest(),
+        "node_skills": {},
+        "node_agent_skills": {},
+    }
+    budget = _authority_budget()
+    RunScheduler._legacy_raw_package_bytes(
+        run,
+        frozenset(package_paths),
+        read_budget=budget,
+    )
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        RunScheduler._legacy_auxiliary_bytes(
+            run,
+            resources,
+            b"resources",
+            read_budget=budget,
+        )
+
+    assert exc.value.code == "workflow_legacy_snapshot_unverifiable"
 
 
 @pytest.mark.parametrize(

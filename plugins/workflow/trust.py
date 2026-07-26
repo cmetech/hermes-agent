@@ -56,6 +56,9 @@ class WorkflowResourceReadBudget:
     bytes_read: int = 0
     files_read: int = 0
     _contents: dict[Path, bytes] = field(default_factory=dict, init=False, repr=False)
+    _identities: dict[Path, tuple[int, int, int, int]] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _aliases: dict[Path, Path] = field(default_factory=dict, init=False, repr=False)
     _sealed: bool = field(default=False, init=False, repr=False)
 
@@ -68,22 +71,62 @@ class WorkflowResourceReadBudget:
     def read(self, path: Path) -> bytes:
         if self._sealed:
             return self.read_cached(path)
-        cached = self._contents.get(path)
+        canonical = self._logical_key(path)
+        cached = self._contents.get(canonical)
         if cached is not None:
+            identity = self._identities.get(canonical)
+            if identity is not None:
+                current = path.stat()
+                if path.is_symlink() or not path.is_file() or identity != (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_size,
+                    current.st_mtime_ns,
+                ):
+                    raise OSError("package resource changed after shared read")
             return cached
         if self.files_read >= self.max_files:
             raise WorkflowResourceCapacityError("package resource file limit exceeded")
+        before = path.stat()
+        if path.is_symlink() or not path.is_file():
+            raise OSError("package resource is not a regular file")
+        if before.st_size > self.max_file_bytes:
+            raise WorkflowResourceCapacityError(
+                "package resource per-file limit exceeded"
+            )
         remaining = self.max_total_bytes - self.bytes_read
-        if remaining <= 0:
+        if before.st_size > remaining:
             raise WorkflowResourceCapacityError("package resource byte limit exceeded")
-        read_limit = min(self.max_file_bytes, remaining)
         with path.open("rb") as stream:
-            data = stream.read(read_limit + 1)
+            data = stream.read(before.st_size + 1)
+        after = path.stat()
+        if (
+            (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            )
+            or len(data) != before.st_size
+        ):
+            raise OSError("package resource changed during read")
+        if len(data) > self.max_file_bytes or len(data) > remaining:
+            raise WorkflowResourceCapacityError("package resource byte limit exceeded")
         self.files_read += 1
         self.bytes_read += len(data)
-        if len(data) > read_limit:
-            raise WorkflowResourceCapacityError("package resource byte limit exceeded")
-        self._contents[path] = data
+        self._contents[canonical] = data
+        self._identities[canonical] = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
         return data
 
     @staticmethod
@@ -139,8 +182,9 @@ class WorkflowResourceReadBudget:
             ):
                 raise ValueError("authenticated resource path or bytes are invalid")
             logical = canonical_root / relative
-            authority._contents[logical] = bytes(data)
-            authority._aliases[authority._logical_key(logical)] = logical
+            canonical = authority._logical_key(logical)
+            authority._contents[canonical] = bytes(data)
+            authority._aliases[canonical] = canonical
         authority.bytes_read = total
         authority.files_read = len(contents)
         authority.seal()

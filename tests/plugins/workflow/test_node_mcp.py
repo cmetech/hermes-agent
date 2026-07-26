@@ -13,7 +13,11 @@ import psutil
 import pytest
 import yaml
 
-from agent.plugin_agent import PluginAgentRunRequest, PluginAgentRunner
+from agent.plugin_agent import (
+    PluginAgentRunRequest,
+    PluginAgentRunResult,
+    PluginAgentRunner,
+)
 from plugins.workflow.resources import ResourceResolver
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from tools.registry import registry
@@ -242,6 +246,139 @@ def test_node_executor_rejects_post_authentication_mcp_substitution(tmp_path):
     assert result.status == "failed"
     assert result.error_code == "validation"
     assert not runner.requests
+
+
+def test_mcp_child_opens_materialized_authenticated_server_after_original_race(
+    tmp_path,
+):
+    run = tmp_path / "run"
+    (run / "mcp").mkdir(parents=True)
+    (run / "servers").mkdir()
+    definition = run / "mcp" / "echo.yaml"
+    definition_bytes = (
+        f"command: {json.dumps(sys.executable)}\n"
+        "args: [servers/echo.py]\n"
+    ).encode()
+    definition.write_bytes(definition_bytes)
+    server = run / "servers" / "echo.py"
+    authenticated_server = (
+        b"import sys\n"
+        b"print('authenticated:' + sys.stdin.readline().strip(), flush=True)\n"
+    )
+    forged_server = (
+        b"import sys\n"
+        b"print('forged:' + sys.stdin.readline().strip(), flush=True)\n"
+    )
+    server.write_bytes(authenticated_server)
+
+    class RacingRunner:
+        def __init__(self) -> None:
+            self.materialized_paths: list[Path] = []
+
+        def run(self, request, **_kwargs):
+            config = dict(request.mcp_servers["echo"])
+            args = [str(item) for item in config.get("args", ())]
+            self.materialized_paths = [
+                Path(item)
+                for item in args
+                if Path(item).is_absolute() and Path(item).exists()
+            ]
+            server.write_bytes(forged_server)
+            child = subprocess.run(
+                [str(config["command"]), *args],
+                input="protocol-line\n",
+                text=True,
+                capture_output=True,
+                check=True,
+                cwd=run,
+            )
+            return PluginAgentRunResult(
+                final_response=child.stdout.strip(),
+                session_id="race-session",
+                provider="fake",
+                model="fake",
+                status="completed",
+                pending_interaction=None,
+                usage={"input_tokens": 1, "output_tokens": 1},
+                audit={},
+            )
+
+    runner = RacingRunner()
+    context = _context(
+        tmp_path,
+        _node("mcp-node", "work", mcp="echo"),
+        sealed_resource_paths=frozenset({"mcp/echo.yaml", "servers/echo.py"}),
+        sealed_resource_bytes={
+            "mcp/echo.yaml": definition_bytes,
+            "servers/echo.py": authenticated_server,
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert server.read_bytes() == forged_server
+    assert result.status == "succeeded"
+    output = run / result.artifacts[0].relative_path
+    assert output.read_text() == "authenticated:protocol-line"
+    assert runner.materialized_paths
+    assert all(not path.exists() for path in runner.materialized_paths)
+
+
+@pytest.mark.parametrize("outcome", ["failure", "cancelled"])
+def test_mcp_materialized_authority_is_cleaned_after_terminal_outcome(
+    tmp_path, outcome
+):
+    run = tmp_path / "run"
+    (run / "mcp").mkdir(parents=True)
+    (run / "servers").mkdir()
+    definition = run / "mcp" / "echo.yaml"
+    definition_bytes = (
+        f"command: {json.dumps(sys.executable)}\nargs: [servers/echo.py]\n"
+    ).encode()
+    definition.write_bytes(definition_bytes)
+    server_bytes = b"print('authenticated')\n"
+    (run / "servers" / "echo.py").write_bytes(server_bytes)
+
+    class TerminalRunner:
+        def __init__(self) -> None:
+            self.materialized_paths: list[Path] = []
+
+        def run(self, request, **_kwargs):
+            args = request.mcp_servers["echo"]["args"]
+            self.materialized_paths = [
+                Path(str(item))
+                for item in args
+                if Path(str(item)).is_absolute() and Path(str(item)).exists()
+            ]
+            if outcome == "failure":
+                raise RuntimeError("runner failed")
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="cancel-session",
+                provider="fake",
+                model="fake",
+                status="cancelled",
+                pending_interaction=None,
+                usage={},
+                audit={},
+            )
+
+    runner = TerminalRunner()
+    context = _context(
+        tmp_path,
+        _node("mcp-node", "work", mcp="echo"),
+        sealed_resource_paths=frozenset({"mcp/echo.yaml", "servers/echo.py"}),
+        sealed_resource_bytes={
+            "mcp/echo.yaml": definition_bytes,
+            "servers/echo.py": server_bytes,
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == ("failed" if outcome == "failure" else "cancelled")
+    assert runner.materialized_paths
+    assert all(not path.exists() for path in runner.materialized_paths)
 
 
 def test_node_executor_passes_only_its_snapshotted_mcp_mapping(tmp_path):

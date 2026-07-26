@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import re
 import shlex
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Mapping
@@ -65,6 +68,47 @@ class CommandResource:
 class ScriptResource:
     path: Path
     runtime: str
+    authenticated_bytes: bytes | None = None
+
+
+class AuthenticatedExecutionMaterializer:
+    """Private, disposable files whose consumers verify bytes before execution."""
+
+    def __init__(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="hermes-workflow-authority-"))
+        try:
+            self.root.chmod(0o700)
+        except OSError:
+            pass
+        self._closed = False
+
+    def materialize(self, relative: str, data: bytes) -> Path:
+        suffix = PurePosixPath(relative).suffix
+        name = hashlib.sha256(relative.encode("utf-8") + b"\0" + data).hexdigest()
+        path = self.root / f"{name}{suffix}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags, 0o400)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        return path
+
+    def cleanup(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.root.chmod(0o700)
+        except OSError:
+            pass
+        shutil.rmtree(self.root, ignore_errors=True)
 
 
 class ResourceResolver:
@@ -238,11 +282,22 @@ class ResourceResolver:
                     or not self._is_sealed(resolved)
                 ):
                     continue
-                self._authenticated_bytes(resolved)
-                return ScriptResource(path=resolved, runtime=runtime)
+                authenticated = self._authenticated_bytes(resolved)
+                return ScriptResource(
+                    path=resolved,
+                    runtime=runtime,
+                    authenticated_bytes=(
+                        authenticated if self.sealed_bytes is not None else None
+                    ),
+                )
         raise FileNotFoundError(f"script resource is missing: {name}")
 
-    def mcp_servers(self, reference: str) -> dict[str, dict[str, object]]:
+    def mcp_servers(
+        self,
+        reference: str,
+        *,
+        materializer: AuthenticatedExecutionMaterializer | None = None,
+    ) -> dict[str, dict[str, object]]:
         """Load one contained, snapshotted MCP definition without interpolation."""
         normalized = reference.replace("\\", "/")
         relative = PurePosixPath(normalized)
@@ -293,6 +348,7 @@ class ResourceResolver:
                 raise ValueError(f"MCP server {name} must be a mapping")
             servers[name] = dict(raw)
         if self.sealed_bytes is not None:
+            local_references: dict[str, tuple[Path, bytes]] = {}
             for value in self._walk_strings(document):
                 candidate = self.package_root / value
                 try:
@@ -300,7 +356,69 @@ class ResourceResolver:
                 except ValueError:
                     continue
                 if relative in self.sealed_bytes:
-                    self._authenticated_bytes(candidate)
+                    local_references[value] = (
+                        candidate,
+                        self._authenticated_bytes(candidate),
+                    )
+            if local_references:
+                if materializer is None:
+                    raise ValueError(
+                        "authenticated local MCP resources require private execution materialization"
+                    )
+                consumed: set[str] = set()
+                for name, server in servers.items():
+                    command = server.get("command")
+                    args = server.get("args", [])
+                    if not isinstance(command, str) or not isinstance(args, list):
+                        continue
+                    referenced = [
+                        (index, value, local_references[value])
+                        for index, value in enumerate(args)
+                        if isinstance(value, str) and value in local_references
+                    ]
+                    if not referenced:
+                        continue
+                    executable = Path(command).name.lower()
+                    python_command = executable in {
+                        "python", "python3", "python.exe", "python3.exe"
+                    }
+                    if len(referenced) != 1 or not python_command:
+                        raise ValueError(
+                            f"MCP server {name} uses an unsupported authenticated local "
+                            "executable; use a Python stdio server or an installed command"
+                        )
+                    index, _value, (source, source_bytes) = referenced[0]
+                    consumed.add(_value)
+                    if source.suffix.lower() != ".py":
+                        raise ValueError(
+                            f"MCP server {name} authenticated local executable must be Python"
+                        )
+                    relative = source.relative_to(self.package_root).as_posix()
+                    materialized = materializer.materialize(relative, source_bytes)
+                    digest = hashlib.sha256(source_bytes).hexdigest()
+                    loader = (
+                        "import hashlib,sys;"
+                        "p,d,n=sys.argv[1:4];b=open(p,'rb').read();"
+                        "hashlib.sha256(b).hexdigest()==d or sys.exit(86);"
+                        "sys.argv=[n,*sys.argv[4:]];"
+                        "g={'__name__':'__main__','__file__':n};"
+                        "exec(compile(b,n,'exec'),g,g)"
+                    )
+                    server["args"] = [
+                        *args[:index],
+                        "-c",
+                        loader,
+                        str(materialized),
+                        digest,
+                        relative,
+                        *args[index + 1 :],
+                    ]
+                # Every local reference must either have been replaced above or
+                # fail closed: generic MCP consumers reopen path arguments later.
+                if set(local_references) != consumed:
+                    raise ValueError(
+                        "authenticated local MCP resource cannot be passed through by path"
+                    )
         return servers
 
     @staticmethod

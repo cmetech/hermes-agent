@@ -144,6 +144,65 @@ def test_script_executor_rejects_post_authentication_substitution(tmp_path: Path
 
 
 @pytest.mark.parametrize(
+    ("runtime", "authenticated_source", "forged_source"),
+    [
+        ("uv", b"print('authenticated-child')\n", b"print('forged-child')\n"),
+        (
+            "bun",
+            b"console.log('authenticated-child')\n",
+            b"console.log('forged-child')\n",
+        ),
+    ],
+)
+def test_named_script_child_reads_authenticated_bytes_not_raced_original(
+    tmp_path: Path,
+    runtime: str,
+    authenticated_source: bytes,
+    forged_source: bytes,
+) -> None:
+    real_runtime = shutil.which(runtime)
+    if real_runtime is None:
+        pytest.skip(f"{runtime} is not installed")
+    suffix = ".py" if runtime == "uv" else ".js"
+    script = tmp_path / "run" / "scripts" / f"race{suffix}"
+    script.parent.mkdir(parents=True)
+    script.write_bytes(authenticated_source)
+    wrapper = tmp_path / f"race-{runtime}-wrapper.py"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib,subprocess,sys\n"
+        "source=sys.stdin.buffer.read()\n"
+        f"target=pathlib.Path({str(script)!r})\n"
+        f"target.write_bytes({forged_source!r})\n"
+        "if not source: source=target.read_bytes()\n"
+        + (
+            "exec(compile(source, str(target), 'exec'))\n"
+            if runtime == "uv"
+            else (
+                f"raise SystemExit(subprocess.run([{real_runtime!r}, "
+                "'--no-env-file', 'run', '-'], input=source).returncode)\n"
+            )
+        ),
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    context = replace(
+        _context(tmp_path, runtime=runtime, script=f"race{suffix}"),
+        sealed_resource_paths=frozenset({f"scripts/race{suffix}"}),
+        sealed_resource_bytes={f"scripts/race{suffix}": authenticated_source},
+    )
+
+    result = ScriptExecutor(
+        runtime_locator=lambda _runtime: str(wrapper)
+    ).execute(context)
+
+    assert script.read_bytes() == forged_source
+    assert result.status == "succeeded"
+    output = context.run_directory / result.artifacts[0].relative_path
+    assert output.read_text() == "authenticated-child"
+
+
+@pytest.mark.parametrize(
     ("name", "runtime", "message"),
     [
         ("../escape", "uv", "contained script name"),

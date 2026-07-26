@@ -19,7 +19,11 @@ from plugins.workflow.executors.base import (
     conservative_provider_retry_count,
     validated_provider_retry_count,
 )
-from plugins.workflow.resources import ResourceResolver, VariableContext
+from plugins.workflow.resources import (
+    AuthenticatedExecutionMaterializer,
+    ResourceResolver,
+    VariableContext,
+)
 from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
 from plugins.workflow.store import ArtifactRef
 
@@ -151,6 +155,7 @@ class AgentNodeExecutor:
         node = context.node
         if node.node_type not in {"command", "prompt"}:
             return self._failure("unsupported_ai_node", node.node_type)
+        materializer: AuthenticatedExecutionMaterializer | None = None
         try:
             agent_runner = entitled_agent_runner(
                 context.ai_entitlement,
@@ -271,13 +276,16 @@ class AgentNodeExecutor:
                 for event, entries in node.options.get("hooks", {}).items()
                 for entry in entries
             )
+            if "mcp" in node.options and context.sealed_resource_bytes is not None:
+                materializer = AuthenticatedExecutionMaterializer()
             mcp_servers = (
                 ResourceResolver(
                     context.run_directory,
                     sealed_paths=context.sealed_resource_paths,
                     sealed_bytes=context.sealed_resource_bytes,
                 ).mcp_servers(
-                    str(node.options["mcp"])
+                    str(node.options["mcp"]),
+                    materializer=materializer,
                 )
                 if "mcp" in node.options
                 else None
@@ -417,6 +425,9 @@ class AgentNodeExecutor:
                     )
                 },
             )
+        finally:
+            if materializer is not None:
+                materializer.cleanup()
 
         metadata: dict[str, object] = {
             "session_id": result.session_id,

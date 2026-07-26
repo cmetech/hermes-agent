@@ -54,6 +54,8 @@ from plugins.workflow.trust import (
     WORKFLOW_RESOURCE_MAX_FILE_BYTES,
     WORKFLOW_RESOURCE_MAX_FILES,
     WORKFLOW_RESOURCE_MAX_TOTAL_BYTES,
+    WorkflowResourceCapacityError,
+    WorkflowResourceReadBudget,
 )
 from tools.managed_process import ProcessResourceLimits, TerminationPolicy
 
@@ -579,6 +581,11 @@ class RunScheduler:
         policy = run_directory / "policy.yaml"
         projection = self.store.load_run(run_id)
         resources_path = run_directory / "resources.json"
+        read_budget = WorkflowResourceReadBudget(
+            max_file_bytes=WORKFLOW_RESOURCE_MAX_FILE_BYTES,
+            max_total_bytes=WORKFLOW_RESOURCE_MAX_TOTAL_BYTES,
+            max_files=WORKFLOW_RESOURCE_MAX_FILES,
+        )
 
         def integrity_error(message: str) -> WorkflowLanguageCompatibilityError:
             return WorkflowLanguageCompatibilityError(
@@ -586,12 +593,18 @@ class RunScheduler:
                 message,
             )
 
-        try:
-            definition_bytes = definition.read_bytes()
-            policy_bytes = policy.read_bytes() if policy.is_file() else b"{}\n"
-            resources_bytes = resources_path.read_bytes()
-        except OSError as exc:
-            raise integrity_error("sealed workflow snapshot is unreadable") from exc
+        initial_paths = ["definition.yaml", "resources.json"]
+        if policy.is_file() or policy.is_symlink():
+            initial_paths.append("policy.yaml")
+        initial_bytes = self._stable_snapshot_bytes(
+            run_directory,
+            initial_paths,
+            read_budget=read_budget,
+            legacy_capacity=projection.get("snapshot_format_version") is None,
+        )
+        definition_bytes = initial_bytes["definition.yaml"]
+        policy_bytes = initial_bytes.get("policy.yaml", b"{}\n")
+        resources_bytes = initial_bytes["resources.json"]
 
         expected_policy_digest = projection.get("policy_digest")
         expected_resources_digest = projection.get("input_manifest_digest")
@@ -640,11 +653,17 @@ class RunScheduler:
                 )
                 # Validate the exact tree shape (including mutable-root symlinks and
                 # unsealed precedence shadows) before binding the authoritative bytes.
-                sealed_snapshot_digest(run_directory, relative_paths=sealed_paths)
-                verified_sealed_bytes = self._stable_snapshot_bytes(
-                    run_directory, sealed_paths
+                sealed_snapshot_digest(
+                    run_directory,
+                    relative_paths=sealed_paths,
+                    read_budget=read_budget,
                 )
-            except ScheduledRunRevalidationError as exc:
+                verified_sealed_bytes = self._stable_snapshot_bytes(
+                    run_directory,
+                    sealed_paths,
+                    read_budget=read_budget,
+                )
+            except (ScheduledRunRevalidationError, WorkflowResourceCapacityError) as exc:
                 raise integrity_error("sealed workflow tree is unreadable") from exc
             actual_snapshot_digest = self._snapshot_digest_from_bytes(
                 verified_sealed_bytes
@@ -698,10 +717,15 @@ class RunScheduler:
             )
             legacy_preparsed_paths = self._legacy_raw_package_paths(run_directory)
             legacy_preparsed_bytes = self._legacy_raw_package_bytes(
-                run_directory, legacy_preparsed_paths
+                run_directory,
+                legacy_preparsed_paths,
+                read_budget=read_budget,
             )
             legacy_auxiliary_bytes = self._legacy_auxiliary_bytes(
-                run_directory, resources, resources_bytes
+                run_directory,
+                resources,
+                resources_bytes,
+                read_budget=read_budget,
             )
             verified_sealed_bytes = {
                 **legacy_preparsed_bytes,
@@ -958,69 +982,18 @@ class RunScheduler:
 
     @staticmethod
     def _legacy_raw_package_bytes(
-        run_directory: Path, package_paths: frozenset[str]
+        run_directory: Path,
+        package_paths: frozenset[str],
+        *,
+        read_budget: WorkflowResourceReadBudget | None = None,
     ) -> Mapping[str, bytes]:
         """Read one admission-bounded byte set for pre-parse authentication."""
-        if len(package_paths) > WORKFLOW_RESOURCE_MAX_FILES:
-            raise WorkflowLanguageCompatibilityError(
-                "workflow_legacy_snapshot_unverifiable",
-                "pre-language workflow exceeds the authenticated resource file "
-                "limit; re-trust the installed workflow and start a new run",
-            )
-        package_bytes: dict[str, bytes] = {}
-        total_bytes = 0
-        for relative in sorted(package_paths):
-            path = run_directory / relative
-            try:
-                before = path.stat()
-                if path.is_symlink() or not path.is_file():
-                    raise OSError("package resource is not a regular file")
-                if before.st_size > WORKFLOW_RESOURCE_MAX_FILE_BYTES:
-                    raise WorkflowLanguageCompatibilityError(
-                        "workflow_legacy_snapshot_unverifiable",
-                        "pre-language workflow exceeds the authenticated per-file "
-                        "resource limit; re-trust the installed workflow and start "
-                        "a new run",
-                    )
-                if total_bytes + before.st_size > WORKFLOW_RESOURCE_MAX_TOTAL_BYTES:
-                    raise WorkflowLanguageCompatibilityError(
-                        "workflow_legacy_snapshot_unverifiable",
-                        "pre-language workflow exceeds the authenticated total "
-                        "resource limit; re-trust the installed workflow and start "
-                        "a new run",
-                    )
-                with path.open("rb") as stream:
-                    data = stream.read(WORKFLOW_RESOURCE_MAX_FILE_BYTES + 1)
-                after = path.stat()
-            except WorkflowLanguageCompatibilityError:
-                raise
-            except OSError as exc:
-                raise WorkflowLanguageCompatibilityError(
-                    "workflow_snapshot_integrity_mismatch",
-                    "pre-language workflow package is unreadable",
-                ) from exc
-            if (
-                (
-                    before.st_dev,
-                    before.st_ino,
-                    before.st_size,
-                    before.st_mtime_ns,
-                )
-                != (
-                    after.st_dev,
-                    after.st_ino,
-                    after.st_size,
-                    after.st_mtime_ns,
-                )
-                or len(data) != before.st_size
-            ):
-                raise WorkflowLanguageCompatibilityError(
-                    "workflow_snapshot_integrity_mismatch",
-                    "pre-language workflow package changed during authentication",
-                )
-            package_bytes[relative] = data
-            total_bytes += len(data)
-        return package_bytes
+        return RunScheduler._stable_snapshot_bytes(
+            run_directory,
+            package_paths,
+            read_budget=read_budget,
+            legacy_capacity=True,
+        )
 
     @staticmethod
     def _snapshot_digest_from_bytes(resources: Mapping[str, bytes]) -> str:
@@ -1039,41 +1012,37 @@ class RunScheduler:
     def _stable_snapshot_bytes(
         run_directory: Path,
         paths: Iterable[str],
+        *,
+        read_budget: WorkflowResourceReadBudget | None = None,
+        legacy_capacity: bool = False,
     ) -> dict[str, bytes]:
         """Read the exact sealed path set with per-file race detection."""
+        budget = read_budget or WorkflowResourceReadBudget(
+            max_file_bytes=WORKFLOW_RESOURCE_MAX_FILE_BYTES,
+            max_total_bytes=WORKFLOW_RESOURCE_MAX_TOTAL_BYTES,
+            max_files=WORKFLOW_RESOURCE_MAX_FILES,
+        )
         result: dict[str, bytes] = {}
         for relative in sorted(paths):
             path = run_directory / relative
             try:
-                before = path.stat()
-                if path.is_symlink() or not path.is_file():
-                    raise OSError("sealed resource is not a regular file")
-                data = path.read_bytes()
-                after = path.stat()
+                data = budget.read(path)
+            except WorkflowResourceCapacityError as exc:
+                if legacy_capacity:
+                    raise WorkflowLanguageCompatibilityError(
+                        "workflow_legacy_snapshot_unverifiable",
+                        "pre-language workflow exceeds the authenticated resource "
+                        "limit; re-trust the installed workflow and start a new run",
+                    ) from exc
+                raise WorkflowLanguageCompatibilityError(
+                    "workflow_snapshot_integrity_mismatch",
+                    "sealed workflow snapshot exceeds the authenticated resource limit",
+                ) from exc
             except OSError as exc:
                 raise WorkflowLanguageCompatibilityError(
                     "workflow_snapshot_integrity_mismatch",
                     "sealed workflow snapshot is unreadable",
                 ) from exc
-            if (
-                (
-                    before.st_dev,
-                    before.st_ino,
-                    before.st_size,
-                    before.st_mtime_ns,
-                )
-                != (
-                    after.st_dev,
-                    after.st_ino,
-                    after.st_size,
-                    after.st_mtime_ns,
-                )
-                or len(data) != before.st_size
-            ):
-                raise WorkflowLanguageCompatibilityError(
-                    "workflow_snapshot_integrity_mismatch",
-                    "sealed workflow snapshot changed during authentication",
-                )
             result[relative] = data
         return result
 
@@ -1082,6 +1051,8 @@ class RunScheduler:
         run_directory: Path,
         resources: Mapping[str, object],
         resources_bytes: bytes,
+        *,
+        read_budget: WorkflowResourceReadBudget | None = None,
     ) -> dict[str, bytes]:
         """Authenticate exact inputs and generated skills from resources.json."""
         malformed = WorkflowLanguageCompatibilityError(
@@ -1126,7 +1097,10 @@ class RunScheduler:
         if not isinstance(inputs_digest, str) or _SHA256.fullmatch(inputs_digest) is None:
             raise malformed
         inputs_map = RunScheduler._stable_snapshot_bytes(
-            run_directory, ("inputs.json",)
+            run_directory,
+            ("inputs.json",),
+            read_budget=read_budget,
+            legacy_capacity=True,
         )
         inputs_bytes = inputs_map["inputs.json"]
         if not hmac.compare_digest(hashlib.sha256(inputs_bytes).hexdigest(), inputs_digest):
@@ -1199,7 +1173,9 @@ class RunScheduler:
             )
         authenticated = dict(
             RunScheduler._legacy_raw_package_bytes(
-                run_directory, frozenset(expected)
+                run_directory,
+                frozenset(expected),
+                read_budget=read_budget,
             )
         )
         for relative, expected_digest in expected.items():
@@ -1261,23 +1237,10 @@ class RunScheduler:
                 "workflow_snapshot_integrity_mismatch",
                 "pre-language workflow snapshot identity is malformed",
             )
-        from plugins.workflow.scheduled_revalidation import (
-            ScheduledRunRevalidationError,
-            sealed_snapshot_digest,
-        )
-
-        try:
-            actual_snapshot_digest = sealed_snapshot_digest(run_directory)
-        except ScheduledRunRevalidationError as exc:
-            raise WorkflowLanguageCompatibilityError(
-                "workflow_snapshot_integrity_mismatch",
-                "pre-language workflow snapshot is unreadable",
-            ) from exc
-        if actual_snapshot_digest != admitted_snapshot_digest:
-            raise WorkflowLanguageCompatibilityError(
-                "workflow_snapshot_integrity_mismatch",
-                "pre-language workflow snapshot differs from admitted bytes",
-            )
+        # The caller compares this seal with the complete shared-budget byte map
+        # before treating this provisional proof as authorization. Reopening the
+        # tree here would create a second, independently unbounded read budget.
+        del run_directory
         return True, frozenset(verified_paths)
 
     @staticmethod

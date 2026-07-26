@@ -3260,7 +3260,11 @@ upstream_changes:
   - ResourceResolver sealed-path candidate authorization
   - ResourceResolver authenticated-byte rebinding
   - WorkflowResourceReadBudget.from_authenticated
+  - WorkflowResourceReadBudget canonical shared-run accounting
   - authoritative workflow resource capacity limits
+  - AuthenticatedExecutionMaterializer
+  - ScriptExecutor authenticated stdin execution plan
+  - ResourceResolver authenticated local Python MCP loader
   tests:
   - tests/plugins/workflow/test_language_snapshot.py
   - tests/plugins/workflow/test_schedule_revalidation.py
@@ -3337,12 +3341,23 @@ upstream_changes:
     and bytes against the digest maps inside journal-authenticated resources.json,
     rejecting missing, extra, changed, symlinked, backslash, NUL, and replacement
     cases. Apply the shared 512-file, 1 MiB-per-file, and 8 MiB-total package
-    resource bounds before allocating historical package bytes. Every later
+    resource bounds as one canonical-deduplicated authority across definition,
+    policy, resources, package resources, inputs, and skills for both current
+    and historical runs; reject over-limit files from metadata before opening
+    them and detect replacement even when a canonical read is deduplicated.
+    Every later
     command, named script, MCP definition and transitive local server, prompt
     skill, inline-agent skill, and input/template consumer must either read the
     immutable authenticated byte authority or rebind its reopened file to those
     bytes immediately around use; same-size post-authentication disk substitution
-    must never become prompt or executable content.
+    must never become prompt or executable content. Execute authenticated named
+    uv and Bun scripts from inherited anonymous byte streams, never their
+    reopened package path. For authenticated local Python MCP servers, create a
+    private disposable authority outside the run tree, replace the path launch
+    with a Python loader that reads once, verifies SHA-256, and executes those
+    bytes in memory without consuming MCP protocol stdin; clean the authority
+    after success, failure, or cancellation and fail closed for local executable
+    shapes that cannot preserve the byte authority.
     Scheduled revalidation must compare projection and resources language plus
     sealed-tree identities, while not-due coordinator polling stays bounded and
     does not reopen installed workflow definitions.
