@@ -127,6 +127,14 @@ def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compa
         for item in payload["items"]
     }
     assert ("profile", "ordinary-user-workflow") in rows
+    assert rows[("profile", "ordinary-user-workflow")]["language"] == {
+        "effective_profile": "hermes-legacy",
+        "legacy": True,
+    }
+    assert rows[("profile", "ordinary-user-workflow")]["compatibility"] == {
+        "level": "mapped",
+        "runnable": True,
+    }
     showcase_rows = {
         name: row for (source, name), row in rows.items() if source == "showcase"
     }
@@ -138,6 +146,10 @@ def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compa
         "scheduling",
     }
     approval = showcase_rows["approval-gate"]
+    assert approval["language"] == {
+        "effective_profile": "hermes-legacy",
+        "legacy": True,
+    }
     assert approval["trust_state"] == "verified_bundled"
     assert approval["supported_inputs"] == {
         "supported": True,
@@ -791,12 +803,25 @@ def test_workflow_catalog_returns_stable_redacted_server_classification(
         ],
         "supported_inputs": {"supported": True, "reason": "flat_inputs"},
         "run_support": {"supported": True, "reason": "supported"},
+        "language": {
+            "effective_profile": "hermes-legacy",
+            "legacy": True,
+        },
+        "compatibility": {"level": "mapped", "runnable": True},
     }
     assert user_items[1]["trust_state"] == "untrusted"
     assert user_items[1]["inputs"] == []
     assert user_items[1]["supported_inputs"] == {
         "supported": True,
         "reason": "parameterless",
+    }
+    assert user_items[1]["language"] == {
+        "effective_profile": "hermes-legacy",
+        "legacy": True,
+    }
+    assert user_items[1]["compatibility"] == {
+        "level": "mapped",
+        "runnable": True,
     }
     assert user_items[1]["run_support"] == {
         "supported": True,
@@ -805,6 +830,45 @@ def test_workflow_catalog_returns_stable_redacted_server_classification(
     assert b"SECRET_NUMERIC_DEFAULT" not in response.content
     assert b"SECRET_TITLE_DEFAULT" not in response.content
     assert beta.is_file()
+
+
+def test_workflow_catalog_projects_archon_language_and_bounded_compatibility(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.chdir(workdir)
+    path = workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="archon-deferred",
+        filename="archon-deferred.yaml",
+        nodes=[{"id": "start", "bash": "true", "timeout": 5}],
+    )
+    path.with_name("archon-deferred.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    row = next(
+        item
+        for item in response.json()["items"]
+        if item.get("source") == "project" and item.get("name") == "archon-deferred"
+    )
+    assert row["language"] == {
+        "effective_profile": "archon-2026-07",
+        "legacy": False,
+    }
+    assert row["compatibility"] == {
+        "level": "unsupported",
+        "runnable": False,
+    }
+    assert set(row["language"]) == {"effective_profile", "legacy"}
+    assert set(row["compatibility"]) == {"level", "runnable"}
 
 
 def test_workflow_catalog_projects_declared_text_bounds_and_support_modes(
@@ -1210,6 +1274,11 @@ def test_workflow_catalog_degrades_unrepresentable_workflow_name_per_entry(
                 "reason": "parameterless",
             },
             "run_support": {"supported": True, "reason": "supported"},
+            "language": {
+                "effective_profile": "hermes-legacy",
+                "legacy": True,
+            },
+            "compatibility": {"level": "mapped", "runnable": True},
         },
         {"name": "x" * 128, "error": "invalid_definition"},
     ]
@@ -1254,6 +1323,11 @@ def test_workflow_catalog_isolates_invalid_definition(
                 "reason": "parameterless",
             },
             "run_support": {"supported": True, "reason": "supported"},
+            "language": {
+                "effective_profile": "hermes-legacy",
+                "legacy": True,
+            },
+            "compatibility": {"level": "mapped", "runnable": True},
         },
     ]
     assert response.json()["truncated"] is False
@@ -1669,6 +1743,11 @@ def test_workflow_catalog_project_definition_overrides_profile(
                 "reason": "parameterless",
             },
             "run_support": {"supported": True, "reason": "supported"},
+            "language": {
+                "effective_profile": "hermes-legacy",
+                "legacy": True,
+            },
+            "compatibility": {"level": "mapped", "runnable": True},
         }
     ]
 

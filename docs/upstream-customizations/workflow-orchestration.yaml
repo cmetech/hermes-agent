@@ -3363,3 +3363,58 @@ upstream_changes:
     profile-specific compatibility annotations, and a side-effect-free CLI
     projection whose local profile selector is not consumed globally.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-language-desktop-status
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/catalog_api.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  - tests/plugins/workflow/test_workflow_language_desktop_e2e.py
+  - apps/desktop/src/types/hermes.ts
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  owned_symbols:
+  - bounded catalog language projection
+  - project and profile compatibility summary
+  - WorkflowLanguageStatus optional backend-skew contract
+  - read-only workflow language badges and detail alert
+  - authoritative compatibility.runnable Run gating
+  - all-locale workflow language copy
+  tests:
+  - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_detail_api.py
+  - tests/plugins/workflow/test_workflow_language_desktop_e2e.py
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/workflow-operations.e2e.test.tsx
+  expected_commit_subject: 'feat(desktop): surface workflow language status'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve backend authority for profile resolution, normalization,
+    compatibility findings, and Run eligibility. Keep catalog language status
+    and user compatibility summaries bounded, retain the existing verified
+    showcase compatibility payload, and expose expanded metadata and findings
+    only in detail. Desktop language data must remain optional for old-backend
+    skew and strictly presentational: badges, one read-only detail alert, and
+    the trust/risk preflight review must never parse YAML, recompute language
+    profiles, inspect findings to gate Run, issue mutation requests, or change
+    focus and navigation behavior. Preserve all-locale parity and the intended
+    new-backend fail-closed behavior for older clients through the existing
+    compatibility.runnable field.
+  removal_condition: >-
+    Remove when upstream provides an equivalent bounded authoritative workflow
+    language projection with skew-safe read-only Desktop presentation and
+    backend-owned compatibility and Run gating.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

@@ -243,6 +243,7 @@ class WorkflowCatalogEntry(BaseModel):
     inputs: list[WorkflowCatalogInput] = Field(..., max_length=64)
     supported_inputs: WorkflowCatalogInputSupport
     run_support: WorkflowCatalogRunSupport
+    language: dict[str, object]
     compatibility: dict[str, object] | None = None
 
 
@@ -292,6 +293,7 @@ class WorkflowDetailResponse(BaseModel):
     inputs: list[WorkflowCatalogInput] = Field(..., max_length=64)
     supported_inputs: WorkflowCatalogInputSupport
     run_support: WorkflowCatalogRunSupport
+    language: dict[str, object]
     risk_summary: dict[str, object]
     compatibility: dict[str, object]
     coordinator: WorkflowCoordinatorResponse

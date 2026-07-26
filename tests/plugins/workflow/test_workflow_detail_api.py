@@ -685,6 +685,14 @@ def test_workflow_detail_is_full_read_only_preflight_with_coordinator_down(
     assert payload["risk_summary"]["risk_digest"]
     assert payload["compatibility"]["level"]
     assert isinstance(payload["compatibility"]["findings"], list)
+    assert payload["language"] == {
+        "declared_profile": None,
+        "effective_profile": "hermes-legacy",
+        "legacy": True,
+        "normalizer_version": 1,
+        "normalized_definition_digest": load_workflow(path).language.normalized_definition_digest,
+    }
+    assert "semantic_fingerprint" not in payload["language"]
     assert payload["coordinator"]["healthy"] is False
     assert payload["coordinator"]["reason"] == "coordinator_missing"
     assert payload["topology"] == {

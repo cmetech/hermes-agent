@@ -22,6 +22,7 @@ from plugins.workflow.input_contract import (
     WorkflowInputContractError,
     workflow_input_declarations,
 )
+from plugins.workflow.language import language_projection
 from plugins.workflow.models import WorkflowPackage, WorkflowValidationError
 from plugins.workflow.runner_binding import (
     ExecutionCapabilityContext,
@@ -111,6 +112,7 @@ class CatalogEntry(TypedDict):
     inputs: list[CatalogInput]
     supported_inputs: SupportedInputs
     run_support: CatalogRunSupport
+    language: dict[str, object]
     compatibility: NotRequired[dict[str, object]]
 
 
@@ -516,6 +518,28 @@ def _compatibility_projection(compatibility) -> dict[str, object]:
     }
 
 
+def _compatibility_summary(compatibility) -> dict[str, object]:
+    return {
+        "level": compatibility.level.value,
+        "runnable": compatibility.runnable,
+    }
+
+
+def _catalog_language_projection(
+    package: WorkflowPackage, *, detail: bool = False
+) -> dict[str, object]:
+    language = package.language
+    status: dict[str, object] = {
+        "effective_profile": language.effective_profile.value,
+        "legacy": language.effective_profile.value == "hermes-legacy",
+    }
+    if detail:
+        expanded = language_projection(language)
+        expanded["legacy"] = status["legacy"]
+        return expanded
+    return status
+
+
 def qualify_workflow_catalog_package(
     package: WorkflowPackage, *, compatibility
 ) -> dict[str, object]:
@@ -635,9 +659,12 @@ def _catalog_entry(
             showcase_scenario=showcase_scenario,
             input_support=supported_inputs,
         ),
+        "language": _catalog_language_projection(package),
     }
     if verified_showcase is not None:
         entry["compatibility"] = _compatibility_projection(compatibility)
+    else:
+        entry["compatibility"] = _compatibility_summary(compatibility)
     return entry
 
 
@@ -968,6 +995,7 @@ def build_workflow_detail(
             showcase_scenario=showcase_scenario,
             input_support=supported_inputs,
         ),
+        "language": _catalog_language_projection(package, detail=True),
         "risk_summary": risk.to_dict(),
         "compatibility": _compatibility_projection(compatibility),
         "coordinator": _coordinator_projection(home),

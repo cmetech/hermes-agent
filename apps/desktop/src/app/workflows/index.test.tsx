@@ -241,6 +241,38 @@ describe('WorkflowsView', () => {
     expect(onRunWorkflow).toHaveBeenCalledWith(item)
   })
 
+  it('shows backend language badges while preserving old-backend source rows', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowDefinitions.mockResolvedValue({
+      items: [
+        definition({
+          language: { effective_profile: 'archon-2026-07', legacy: false },
+          name: 'Archon workflow',
+          source: 'project'
+        }),
+        definition({
+          language: { effective_profile: 'hermes-legacy', legacy: true },
+          name: 'Legacy workflow'
+        }),
+        definition({ name: 'Older backend workflow' })
+      ],
+      truncated: false
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    const rows = within(await screen.findByRole('table', { name: 'Workflow catalog' }))
+      .getAllByRole('row')
+      .slice(1)
+
+    expect(within(rows[0]!).getByText('Archon 2026-07')).toBeTruthy()
+    expect(within(rows[1]!).getByText('Legacy semantics')).toBeTruthy()
+    expect(within(rows[2]!).getByText('Profile')).toBeTruthy()
+    expect(within(rows[2]!).queryByText('Archon 2026-07')).toBeNull()
+    expect(within(rows[2]!).queryByText('Legacy semantics')).toBeNull()
+  })
+
   it('shows authenticated AI metadata as information without changing Run policy', async () => {
     $workflowSelectedRunId.set(null)
     listWorkflowDefinitions.mockResolvedValue({

@@ -2,6 +2,8 @@ import { lazy, Suspense, useId, useMemo, useState } from 'react'
 
 import { RichBoundary } from '@/components/assistant-ui/embeds/rich-boundary'
 import { CodeCard, CodeCardBody, CodeCardHeader, CodeCardTitle } from '@/components/chat/code-card'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
@@ -147,6 +149,31 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
         ) : null}
         {detail.data ? (
           <div className="grid min-h-0 min-w-0 gap-3 overflow-x-hidden">
+            {detail.data.language ? (
+              <Alert variant={detail.data.language.legacy ? 'warning' : 'default'}>
+                <AlertDescription>
+                  <Badge variant={detail.data.language.legacy ? 'muted' : 'default'}>
+                    {detail.data.language.legacy
+                      ? copy.workflowLanguageLegacy
+                      : copy.workflowLanguageArchon}
+                  </Badge>
+                  {detail.data.language.legacy ? <p>{copy.workflowLanguageLegacyDescription}</p> : null}
+                  {detail.data.language.normalizer_version !== undefined ? (
+                    <p>
+                      {copy.workflowLanguageNormalizer} {detail.data.language.normalizer_version}
+                    </p>
+                  ) : null}
+                  {detail.data.language.normalized_definition_digest ? (
+                    <p className="flex flex-wrap gap-1">
+                      <span>{copy.workflowLanguageDigest}</span>
+                      <span className="font-mono" title={detail.data.language.normalized_definition_digest}>
+                        {detail.data.language.normalized_definition_digest.slice(0, 12)}…
+                      </span>
+                    </p>
+                  ) : null}
+                </AlertDescription>
+              </Alert>
+            ) : null}
             <SegmentedControl onChange={setMode} options={modes} value={mode} />
             {mode === 'diagram' ? (
               detail.data.topology.mermaid ? (
