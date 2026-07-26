@@ -1,11 +1,43 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 
 import { group, split } from '@/components/pane-shell/tree/model'
-import type { SessionTile } from '@/store/session-states'
-import { orderTilesByTree, selectionHomesToWorkspace } from '@/store/session-states'
+import { $selectedStoredSessionId } from '@/store/session'
+import {
+  $sessionTiles,
+  focusOpenSession,
+  orderTilesByTree,
+  selectionHomesToWorkspace,
+  type SessionTile
+} from '@/store/session-states'
 
 const tile = (storedSessionId: string): SessionTile => ({ storedSessionId })
 const tilePane = (id: string) => `session-tile:${id}`
+
+beforeEach(() => {
+  $selectedStoredSessionId.set(null)
+  $sessionTiles.set([])
+})
+
+describe('focusOpenSession', () => {
+  it('leaves a primary session unresolved when a page hides the workspace chat', () => {
+    $selectedStoredSessionId.set('primary')
+
+    expect(focusOpenSession('primary', false)).toBe(false)
+  })
+
+  it('focuses a primary session when its workspace chat is visible', () => {
+    $selectedStoredSessionId.set('primary')
+
+    expect(focusOpenSession('primary', true)).toBe(true)
+  })
+
+  it('focuses an open session tile even when a page hides the primary workspace chat', () => {
+    $selectedStoredSessionId.set('primary')
+    $sessionTiles.set([tile('secondary')])
+
+    expect(focusOpenSession('secondary', false)).toBe(true)
+  })
+})
 
 describe('orderTilesByTree', () => {
   it('no-ops (null) without a tree or below two tiles', () => {

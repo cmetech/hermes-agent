@@ -801,9 +801,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onRemoveAttachment: id => void composer.removeAttachment(id),
     onRestoreToMessage: restoreToMessage,
     // Already on screen (open tile, or the main session)? Jump to its tab;
-    // otherwise load it into main.
+    // otherwise load it into main. A cached primary is only on screen while
+    // its session route is active — full-page routes reuse the workspace pane.
     onResumeSession: sessionId => {
-      if (!focusOpenSession(sessionId)) {
+      if (!focusOpenSession(sessionId, routedSessionId === sessionId)) {
         navigate(sessionRoute(sessionId))
       }
     },

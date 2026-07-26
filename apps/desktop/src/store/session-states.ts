@@ -571,12 +571,12 @@ export function nextSessionTileForWorkspace(): null | string {
   return null
 }
 
-/** If a session is already ON SCREEN — an open tile OR the one loaded in main —
+/** If a session is already ON SCREEN — an open tile OR the visible one loaded in main —
  *  front its tab (and focus its zone) and return true. A sidebar click on an
  *  already-open chat JUMPS to its tab instead of reloading it; `false` means the
  *  caller must load it into main. Covers the two dead clicks: an open tile, and
  *  the main session while focus sits on a tile (route unchanged → no reload). */
-export function focusOpenSession(storedSessionId: string): boolean {
+export function focusOpenSession(storedSessionId: string, primaryVisible: boolean): boolean {
   if ($sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
     const paneId = `${TILE_PANE_PREFIX}${storedSessionId}`
     revealTreePane(paneId) // un-dismiss + adopt + front in its group
@@ -592,7 +592,7 @@ export function focusOpenSession(storedSessionId: string): boolean {
 
   // Already the main session: front the workspace tab and drop tile focus so
   // the readouts + sidebar highlight come home (a no-op when main is focused).
-  if (storedSessionId === $selectedStoredSessionId.get()) {
+  if (primaryVisible && storedSessionId === $selectedStoredSessionId.get()) {
     revealTreePane('workspace')
     noteActiveTreeGroup(null)
 
