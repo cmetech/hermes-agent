@@ -3722,3 +3722,27 @@ upstream_changes:
     cannot inherit orchestration-only interpreter or pytest controls and still
     retains the selected virtualenv and ordinary required environment.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-evidence-repository-file-path-bounds
+  change_class: workflow-testing
+  owner: workflow-orchestration
+  files:
+  - docs/upstream-customizations/merge-evidence.schema.json
+  - tests/scripts/test_workflow_upstream_merge.py
+  - tests/scripts/test_check_upstream_customizations.py
+  owned_symbols:
+  - evidence entry file paths aligned with manifest repository path bounds
+  - normalized existing file path regression above the safe-text limit
+  - exact 4096-character acceptance and 4097-character rejection coverage
+  tests:
+  - tests/scripts/test_workflow_upstream_merge.py
+  - tests/scripts/test_check_upstream_customizations.py
+  expected_commit_subject: 'fix(workflow): align evidence repository path bounds'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve exact normalized repository file paths in merge evidence through
+    the same 4096-character boundary enforced by the customization manifest.
+    Do not route repository paths through the shorter free-text evidence type.
+  removal_condition: >-
+    Remove when upstream provides one shared schema contract for manifest and
+    evidence repository paths with equivalent normalization and length bounds.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

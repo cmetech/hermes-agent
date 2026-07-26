@@ -9,6 +9,7 @@ import subprocess
 import pytest
 import yaml
 
+import scripts.check_upstream_customizations as customization_checker
 from scripts.check_upstream_customizations import (
     classify_upstream_overlap,
     load_and_validate_manifest,
@@ -71,6 +72,7 @@ def test_manifest_rejects_non_hex_and_paths_outside_repository(tmp_path: Path) -
 
 def test_manifest_bounds_evidence_identity_and_exact_repository_paths(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = _repo(tmp_path)
     baseline = _git(repo, "rev-parse", "HEAD")
@@ -83,6 +85,15 @@ def test_manifest_bounds_evidence_identity_and_exact_repository_paths(
         load_and_validate_manifest(manifest, repo, check_git=False)
 
     data["upstream_changes"][0]["id"] = "owned"
+    monkeypatch.setattr(
+        customization_checker,
+        "_contained",
+        lambda _repo, _raw: repo / "test_core.py",
+    )
+    data["upstream_changes"][0]["tests"] = ["t" * 4096]
+    manifest.write_text(yaml.safe_dump(data))
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
     data["upstream_changes"][0]["tests"] = ["t" * 4097]
     manifest.write_text(yaml.safe_dump(data))
     with pytest.raises(ValueError, match="path must be at most 4096"):

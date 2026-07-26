@@ -133,7 +133,7 @@
         "files": {
           "type": "array",
           "minItems": 1,
-          "items": {"$ref": "#/$defs/safeText"}
+          "items": {"$ref": "#/$defs/repositoryPath"}
         },
         "patch_sha256": {"$ref": "#/$defs/digest"},
         "overlap_class": {

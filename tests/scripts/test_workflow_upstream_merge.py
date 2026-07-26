@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 import pytest
+from jsonschema import ValidationError, validate
 
 from scripts.check_upstream_customizations import classify_upstream_overlap
 from tests.scripts.test_check_upstream_customizations import _git, _manifest, _repo
@@ -349,6 +350,43 @@ def test_rehearsal_emits_single_oversized_invariant_as_bounded_exact_evidence(
     assert invariant_evidence["path"] == test_path
     assert invariant_evidence["result"] == "passed"
     assert len(invariant_evidence["name"]) <= 512
+
+
+def test_rehearsal_preserves_existing_file_path_over_safe_text_limit(
+    tmp_path: Path,
+) -> None:
+    repo = _synthetic_rehearsal_repo(tmp_path, "none")
+    manifest = repo / "docs/upstream-customizations/workflow-orchestration.yaml"
+    data = __import__("yaml").safe_load(manifest.read_text())
+    segments = [f"owned-{index:02d}-{'f' * 70}" for index in range(7)]
+    file_path = "/".join(["owned", *segments, "contract.py"])
+    owned_file = repo / file_path
+    owned_file.parent.mkdir(parents=True)
+    owned_file.write_text("class OwnedBoundary:\n    pass\n")
+    assert 512 < len(file_path) < 4096
+    data["upstream_changes"][0]["files"] = [file_path]
+    data["upstream_changes"][0]["owned_symbols"] = ["OwnedBoundary"]
+    manifest.write_text(__import__("yaml").safe_dump(data, sort_keys=False))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "install long owned file path")
+
+    report = tmp_path / "report-long-owned-file"
+    result = _run_synthetic(repo, report)
+
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads((report / "merge-evidence.json").read_text())
+    assert evidence["entries"][0]["files"] == [file_path]
+
+
+def test_evidence_repository_path_accepts_4096_and_rejects_4097() -> None:
+    schema = json.loads(
+        (ROOT / "docs/upstream-customizations/merge-evidence.schema.json").read_text()
+    )
+    repository_path = schema["$defs"]["repositoryPath"]
+
+    validate("p" * 4096, repository_path)
+    with pytest.raises(ValidationError, match="too long"):
+        validate("p" * 4097, repository_path)
 
 
 @pytest.mark.parametrize("overlap", ["owned-symbol", "upstream-equivalent"])
