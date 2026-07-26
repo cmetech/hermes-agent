@@ -3614,3 +3614,24 @@ upstream_changes:
     baseline advancement and refuses to rehearse a ledger with mixed verified
     upstream commits.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-rehearsal-structured-entry-tests
+  change_class: workflow-testing
+  owner: workflow-orchestration
+  files:
+  - scripts/test_workflow_upstream_merge.sh
+  - tests/scripts/test_workflow_upstream_merge.py
+  owned_symbols:
+  - bounded per-entry invariant evidence records
+  - stable entry ID and individual test-path evidence names
+  tests:
+  - tests/scripts/test_workflow_upstream_merge.py
+  expected_commit_subject: 'fix(workflow): bound rehearsal evidence labels'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve one schema-bounded evidence command record per declared invariant
+    test. Include the stable ledger entry ID and exact individual test path in
+    every name; never concatenate an unbounded entry test list into one field.
+  removal_condition: >-
+    Remove when upstream emits equivalent schema-validated structured evidence
+    that remains bounded while retaining each entry's exact invariant tests.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

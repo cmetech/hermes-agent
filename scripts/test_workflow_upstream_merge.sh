@@ -285,7 +285,13 @@ for entry in manifest["upstream_changes"]:
         "conflict_files": [],
         "retained_commit_subjects": retained,
         "removed_commit_subjects": removed,
-        "tests": [{**base_gate, "name": "entry invariants: " + ", ".join(entry["tests"])}],
+        "tests": [
+            {
+                **base_gate,
+                "name": f"entry invariant {entry['id']}: {test_path}",
+            }
+            for test_path in entry["tests"]
+        ],
     })
 
 brands = []

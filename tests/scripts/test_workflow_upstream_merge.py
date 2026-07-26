@@ -235,6 +235,33 @@ def test_rehearsal_auto_merges_safe_overlap_and_emits_valid_evidence(
     assert "apps/desktop/package.json" in (report / "otto-merge.log").read_text()
 
 
+def test_rehearsal_emits_long_entry_test_lists_as_bounded_structured_evidence(
+    tmp_path: Path,
+) -> None:
+    repo = _synthetic_rehearsal_repo(tmp_path, "none")
+    manifest = repo / "docs/upstream-customizations/workflow-orchestration.yaml"
+    data = __import__("yaml").safe_load(manifest.read_text())
+    test_paths = [
+        f"entry-invariant-{index:02d}-{'contract-' * 6}test.txt"
+        for index in range(12)
+    ]
+    for test_path in test_paths:
+        (repo / test_path).write_text("invariant\n")
+    data["upstream_changes"][0]["tests"] = test_paths
+    manifest.write_text(__import__("yaml").safe_dump(data, sort_keys=False))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "expand entry invariant coverage")
+
+    report = tmp_path / "report-long-entry-tests"
+    result = _run_synthetic(repo, report)
+
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads((report / "merge-evidence.json").read_text())
+    names = [item["name"] for item in evidence["entries"][0]["tests"]]
+    assert names == [f"entry invariant owned-core: {path}" for path in test_paths]
+    assert all(len(name) <= 512 for name in names)
+
+
 @pytest.mark.parametrize("overlap", ["owned-symbol", "upstream-equivalent"])
 def test_rehearsal_requires_explicit_decision_for_owned_or_equivalent_overlap(
     tmp_path: Path, overlap: str
