@@ -11,7 +11,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable, Literal, Mapping
 
 import yaml
@@ -31,6 +31,9 @@ _ISOLATION_CAPABILITIES = (
     "workdir_containment",
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+WORKFLOW_RESOURCE_MAX_FILE_BYTES = 1024 * 1024
+WORKFLOW_RESOURCE_MAX_TOTAL_BYTES = 8 * 1024 * 1024
+WORKFLOW_RESOURCE_MAX_FILES = 512
 
 
 class WorkflowTrustError(RuntimeError):
@@ -89,6 +92,8 @@ class WorkflowResourceReadBudget:
 
     def remember_alias(self, logical_path: Path, canonical_path: Path) -> None:
         if self._sealed:
+            if self._aliases.get(self._logical_key(logical_path)) == canonical_path:
+                return
             raise WorkflowResourceCacheMissError(
                 "package resource cache aliases are sealed"
             )
@@ -106,6 +111,40 @@ class WorkflowResourceReadBudget:
             raise WorkflowResourceCacheMissError(
                 "sealed package resource is unavailable"
             ) from exc
+
+    @classmethod
+    def from_authenticated(
+        cls,
+        root: Path,
+        contents: Mapping[str, bytes],
+    ) -> WorkflowResourceReadBudget:
+        """Build a sealed read authority from already authenticated package bytes."""
+        total = sum(len(data) for data in contents.values())
+        authority = cls(
+            max_file_bytes=max((len(data) for data in contents.values()), default=1),
+            max_total_bytes=max(total, 1),
+            max_files=max(len(contents), 1),
+        )
+        canonical_root = root.resolve(strict=True)
+        for relative, data in contents.items():
+            logical_relative = PurePosixPath(relative)
+            if (
+                not relative
+                or "\\" in relative
+                or "\0" in relative
+                or logical_relative.is_absolute()
+                or logical_relative.as_posix() != relative
+                or any(part in {"", ".", ".."} for part in logical_relative.parts)
+                or not isinstance(data, bytes)
+            ):
+                raise ValueError("authenticated resource path or bytes are invalid")
+            logical = canonical_root / relative
+            authority._contents[logical] = bytes(data)
+            authority._aliases[authority._logical_key(logical)] = logical
+        authority.bytes_read = total
+        authority.files_read = len(contents)
+        authority.seal()
+        return authority
 
 
 @dataclass(frozen=True)

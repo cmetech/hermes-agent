@@ -14,6 +14,11 @@ import yaml
 
 import plugins.workflow.scheduler as scheduler_module
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.catalog_api import (
+    CATALOG_MAX_RESOURCE_FILE_BYTES,
+    CATALOG_MAX_RESOURCE_FILES,
+    CATALOG_MAX_RESOURCE_TOTAL_BYTES,
+)
 from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
     make_language_snapshot,
@@ -155,6 +160,34 @@ def _pre_language_seals(prepared) -> dict[str, str]:
         ).hexdigest(),
         "sealed_snapshot_digest": sealed_snapshot_digest(staging),
     }
+
+
+def _legacy_skill_package(workflow_writer, root: Path, monkeypatch):
+    monkeypatch.setattr(
+        "agent.skill_commands.build_preloaded_skills_prompt",
+        lambda names, task_id=None: (f"SEALED:{','.join(names)}", names, []),
+    )
+    return load_workflow(
+        workflow_writer(
+            root,
+            name="legacy-skill-auth",
+            filename="legacy-skill-auth.yaml",
+            nodes=[
+                {
+                    "id": "analyze",
+                    "prompt": "Analyze",
+                    "skills": ["reports"],
+                    "agents": {
+                        "reviewer": {
+                            "description": "review",
+                            "prompt": "inspect",
+                            "skills": ["reviewing"],
+                        }
+                    },
+                }
+            ],
+        )
+    )
 def _rewrite_resources(store: RunStore, run_id: str, mutate) -> None:
     resources_path = store.run_directory(run_id) / "resources.json"
     resources = json.loads(resources_path.read_bytes())
@@ -905,7 +938,9 @@ def test_pre_language_raw_authentication_covers_transitive_package_resources(
     projection.pop("snapshot_format_version", None)
     store.load_run = lambda _run_id: json.loads(json.dumps(projection))  # type: ignore[method-assign]
     try:
-        loaded, sealed_paths = scheduler._load_verified_run_package(admitted.run_id)
+        loaded, sealed_paths, sealed_bytes = scheduler._load_verified_run_package(
+            admitted.run_id
+        )
     finally:
         store.load_run = original_load_run  # type: ignore[method-assign]
         scheduler.shutdown(deadline_seconds=2)
@@ -917,8 +952,356 @@ def test_pre_language_raw_authentication_covers_transitive_package_resources(
             "mcp/echo.yaml",
             "scripts/helper.py",
             "servers/echo.py",
+            "inputs.json",
+            "resources.json",
         }
     )
+    assert frozenset(sealed_bytes) == sealed_paths | {
+        "inputs.json",
+        "resources.json",
+    }
+
+
+@pytest.mark.parametrize(
+    ("relative", "mutation"),
+    [
+        ("node-skills/analyze.md", "changed"),
+        ("node-skills/analyze.md", "missing"),
+        ("node-skills/extra.md", "extra"),
+        ("node-agent-skills/analyze/reviewer.md", "changed"),
+        ("node-agent-skills/analyze/reviewer.md", "symlink"),
+    ],
+)
+def test_pre_language_snapshot_authenticates_exact_skill_bytes_before_parse(
+    tmp_path, workflow_writer, monkeypatch, relative, mutation
+):
+    package = _legacy_skill_package(workflow_writer, tmp_path / "package", monkeypatch)
+    store = RunStore(tmp_path / "home")
+    prepared = _prepare_pre_language_snapshot(store, package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=f"legacy-skill-{mutation}-{relative}",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    target = store.run_directory(admitted.run_id) / relative
+    if mutation == "changed":
+        target.write_text("FORGED", encoding="utf-8")
+    elif mutation == "missing":
+        target.unlink()
+    elif mutation == "extra":
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("INJECTED", encoding="utf-8")
+    else:
+        original = target.read_bytes()
+        external = tmp_path / "external-skill.md"
+        external.write_bytes(original)
+        target.unlink()
+        try:
+            target.symlink_to(external)
+        except OSError:
+            pytest.skip("symlinks unavailable")
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        _load_with_scheduler(store, admitted.run_id, historical_projection=True)
+
+    assert exc.value.code == "workflow_snapshot_integrity_mismatch"
+
+
+def test_pre_language_snapshot_returns_authenticated_skill_bytes(
+    tmp_path, workflow_writer, monkeypatch
+):
+    package = _legacy_skill_package(workflow_writer, tmp_path / "package", monkeypatch)
+    store = RunStore(tmp_path / "home")
+    prepared = _prepare_pre_language_snapshot(store, package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="legacy-skill-byte-authority",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    scheduler = RunScheduler(store)
+    original_load_run = store.load_run
+    projection = json.loads(json.dumps(original_load_run(admitted.run_id)))
+    projection.pop("snapshot_format_version", None)
+    store.load_run = lambda _run_id: json.loads(json.dumps(projection))  # type: ignore[method-assign]
+    try:
+        _loaded, sealed_paths, sealed_bytes = scheduler._load_verified_run_package(
+            admitted.run_id
+        )
+    finally:
+        store.load_run = original_load_run  # type: ignore[method-assign]
+        scheduler.shutdown(deadline_seconds=2)
+
+    expected = {
+        "node-skills/analyze.md",
+        "node-agent-skills/analyze/reviewer.md",
+    }
+    assert expected.issubset(sealed_paths)
+    assert sealed_bytes["node-skills/analyze.md"] == b"SEALED:reports"
+    assert sealed_bytes["node-agent-skills/analyze/reviewer.md"] == b"SEALED:reviewing"
+
+
+@pytest.mark.parametrize("seal_mode", ["raw", "direct", "whole"])
+def test_pre_language_same_size_skill_substitution_fails_for_every_seal_mode(
+    tmp_path, workflow_writer, monkeypatch, seal_mode
+):
+    package = _legacy_skill_package(workflow_writer, tmp_path / "package", monkeypatch)
+    store = RunStore(tmp_path / "home")
+    prepared = _prepare_pre_language_snapshot(store, package)
+    metadata = None
+    if seal_mode == "direct":
+        metadata = {
+            key: value
+            for key, value in _pre_language_seals(prepared).items()
+            if key != "sealed_snapshot_digest"
+        }
+    elif seal_mode == "whole":
+        metadata = _pre_language_seals(prepared)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=f"legacy-same-size-skill-{seal_mode}",
+            concurrency_key=package.definition.name,
+            run_metadata=metadata,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    skill = store.run_directory(admitted.run_id) / "node-skills" / "analyze.md"
+    assert len(skill.read_bytes()) == len(b"FORGED:reports")
+    skill.write_bytes(b"FORGED:reports")
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        _load_with_scheduler(store, admitted.run_id, historical_projection=True)
+
+    assert exc.value.code == "workflow_snapshot_integrity_mismatch"
+
+
+@pytest.mark.parametrize("seal_mode", ["raw", "direct", "whole"])
+@pytest.mark.parametrize("target_kind", ["mcp", "server"])
+def test_historical_mcp_consumers_rebind_same_size_bytes_for_every_seal_mode(
+    tmp_path, workflow_writer, seal_mode, target_kind
+):
+    package = _legacy_transitive_package(workflow_writer, tmp_path / "package")
+    store = RunStore(tmp_path / "home")
+    prepared = _prepare_pre_language_snapshot(store, package)
+    metadata = None
+    if seal_mode == "direct":
+        metadata = {
+            key: value
+            for key, value in _pre_language_seals(prepared).items()
+            if key != "sealed_snapshot_digest"
+        }
+    elif seal_mode == "whole":
+        metadata = _pre_language_seals(prepared)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=f"legacy-mcp-rebind-{seal_mode}-{target_kind}",
+            concurrency_key=package.definition.name,
+            run_metadata=metadata,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    scheduler = RunScheduler(store)
+    original_load_run = store.load_run
+    projection = json.loads(json.dumps(original_load_run(admitted.run_id)))
+    projection.pop("snapshot_format_version", None)
+    store.load_run = lambda _run_id: json.loads(json.dumps(projection))  # type: ignore[method-assign]
+    try:
+        _loaded, sealed_paths, sealed_bytes = scheduler._load_verified_run_package(
+            admitted.run_id
+        )
+    finally:
+        store.load_run = original_load_run  # type: ignore[method-assign]
+        scheduler.shutdown(deadline_seconds=2)
+    run = store.run_directory(admitted.run_id)
+    if target_kind == "mcp":
+        target = run / "mcp" / "echo.yaml"
+        original = target.read_bytes()
+        forged = original.replace(b"python", b"pyth0n")
+    else:
+        target = run / "servers" / "echo.py"
+        original = target.read_bytes()
+        forged = original.replace(b"sealed", b"forged")
+    assert forged != original
+    assert len(forged) == len(original)
+    target.write_bytes(forged)
+
+    with pytest.raises(ValueError, match="changed after authentication"):
+        ResourceResolver(
+            run,
+            sealed_paths=sealed_paths,
+            sealed_bytes=sealed_bytes,
+        ).mcp_servers("mcp/echo.yaml")
+
+
+@pytest.mark.parametrize("invalid_name", [r"node\\skill", "node\0skill"])
+def test_pre_language_skill_digest_map_rejects_noncanonical_names(
+    tmp_path, invalid_name
+):
+    run = tmp_path / "run"
+    run.mkdir()
+    inputs = b"{}"
+    (run / "inputs.json").write_bytes(inputs)
+    resources = {
+        "inputs_sha256": sha256(inputs).hexdigest(),
+        "node_skills": {invalid_name: "0" * 64},
+        "node_agent_skills": {},
+    }
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        RunScheduler._legacy_auxiliary_bytes(run, resources, b"resources")
+
+    assert exc.value.code == "workflow_snapshot_integrity_mismatch"
+
+
+@pytest.mark.parametrize("mutation", ["changed", "missing", "extra", "symlink"])
+def test_pre_language_snapshot_authenticates_exact_input_bytes(
+    tmp_path, workflow_writer, mutation
+):
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="legacy-input-auth",
+            filename="legacy-input-auth.yaml",
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package, values={"arguments": "sealed"})
+    resources_path = prepared.staging_directory / "resources.json"
+    resources = json.loads(resources_path.read_bytes())
+    resources.pop("language")
+    resources.pop("sealed_paths")
+    encoded = json.dumps(resources, sort_keys=True, separators=(",", ":")).encode()
+    resources_path.write_bytes(encoded)
+    prepared = replace(
+        prepared,
+        input_manifest_digest=sha256(encoded).hexdigest(),
+        language=None,
+        sealed_snapshot_digest=None,
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=f"legacy-input-{mutation}",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    run = store.run_directory(admitted.run_id)
+    target = run / "inputs" / "arguments.txt"
+    if mutation == "changed":
+        target.write_text("forged", encoding="utf-8")
+    elif mutation == "missing":
+        target.unlink()
+    elif mutation == "extra":
+        (run / "inputs" / "injected.txt").write_text("forged", encoding="utf-8")
+    else:
+        external = tmp_path / "external-input.txt"
+        external.write_bytes(target.read_bytes())
+        target.unlink()
+        try:
+            target.symlink_to(external)
+        except OSError:
+            pytest.skip("symlinks unavailable")
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        _load_with_scheduler(store, admitted.run_id, historical_projection=True)
+
+    assert exc.value.code == "workflow_snapshot_integrity_mismatch"
+
+
+def test_legacy_raw_package_bytes_accepts_exact_authoritative_boundaries(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    count_paths = []
+    for index in range(CATALOG_MAX_RESOURCE_FILES):
+        path = run / f"count-{index:03}.bin"
+        path.write_bytes(b"")
+        count_paths.append(path.name)
+    assert len(
+        RunScheduler._legacy_raw_package_bytes(run, frozenset(count_paths))
+    ) == CATALOG_MAX_RESOURCE_FILES
+
+    boundary = run / "boundary.bin"
+    boundary.write_bytes(b"x" * CATALOG_MAX_RESOURCE_FILE_BYTES)
+    assert RunScheduler._legacy_raw_package_bytes(
+        run, frozenset({boundary.name})
+    )[boundary.name] == b"x" * CATALOG_MAX_RESOURCE_FILE_BYTES
+
+    total_paths = []
+    chunk_size = CATALOG_MAX_RESOURCE_FILE_BYTES
+    for index in range(CATALOG_MAX_RESOURCE_TOTAL_BYTES // chunk_size):
+        path = run / f"total-{index}.bin"
+        path.write_bytes(bytes([index]) * chunk_size)
+        total_paths.append(path.name)
+    result = RunScheduler._legacy_raw_package_bytes(run, frozenset(total_paths))
+    assert sum(map(len, result.values())) == CATALOG_MAX_RESOURCE_TOTAL_BYTES
+
+
+@pytest.mark.parametrize("overflow", ["files", "file-bytes", "total-bytes"])
+def test_legacy_raw_package_bytes_rejects_authoritative_capacity_overflow(
+    tmp_path, overflow
+):
+    run = tmp_path / "run"
+    run.mkdir()
+    paths = []
+    if overflow == "files":
+        for index in range(CATALOG_MAX_RESOURCE_FILES + 1):
+            path = run / f"resource-{index:03}.bin"
+            path.write_bytes(b"")
+            paths.append(path.name)
+    elif overflow == "file-bytes":
+        path = run / "oversized.bin"
+        path.write_bytes(b"x" * (CATALOG_MAX_RESOURCE_FILE_BYTES + 1))
+        paths.append(path.name)
+    else:
+        for index in range(
+            CATALOG_MAX_RESOURCE_TOTAL_BYTES // CATALOG_MAX_RESOURCE_FILE_BYTES
+        ):
+            path = run / f"resource-{index}.bin"
+            path.write_bytes(b"x" * CATALOG_MAX_RESOURCE_FILE_BYTES)
+            paths.append(path.name)
+        path = run / "overflow.bin"
+        path.write_bytes(b"x")
+        paths.append(path.name)
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        RunScheduler._legacy_raw_package_bytes(run, frozenset(paths))
+
+    assert exc.value.code == "workflow_legacy_snapshot_unverifiable"
+    assert "re-trust" in str(exc.value)
+    assert "new run" in str(exc.value)
 
 
 @pytest.mark.parametrize(

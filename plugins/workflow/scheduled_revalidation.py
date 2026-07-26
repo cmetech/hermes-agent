@@ -20,6 +20,9 @@ from plugins.workflow.runner_binding import (
     assess_package_execution,
 )
 from plugins.workflow.trust import (
+    WORKFLOW_RESOURCE_MAX_FILE_BYTES,
+    WORKFLOW_RESOURCE_MAX_FILES,
+    WORKFLOW_RESOURCE_MAX_TOTAL_BYTES,
     WorkflowResourceReadBudget,
     WorkflowTrustStore,
     compute_package_digest,
@@ -27,9 +30,9 @@ from plugins.workflow.trust import (
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_RESOURCE_FILE_BYTES = 1024 * 1024
-_RESOURCE_TOTAL_BYTES = 8 * 1024 * 1024
-_RESOURCE_FILES = 512
+_RESOURCE_FILE_BYTES = WORKFLOW_RESOURCE_MAX_FILE_BYTES
+_RESOURCE_TOTAL_BYTES = WORKFLOW_RESOURCE_MAX_TOTAL_BYTES
+_RESOURCE_FILES = WORKFLOW_RESOURCE_MAX_FILES
 _SOURCE_IDENTITY_CHARS = 512
 _SEALED_SNAPSHOT_FILES = 4096
 _SEALED_SNAPSHOT_PATH_CHARS = 512

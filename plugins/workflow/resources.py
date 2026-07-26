@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import shlex
@@ -75,6 +76,7 @@ class ResourceResolver:
         *,
         global_root: str | Path | None = None,
         sealed_paths: Iterable[str] | None = None,
+        sealed_bytes: Mapping[str, bytes] | None = None,
     ):
         self.package_root = Path(package_root).resolve()
         self.global_root = (
@@ -83,6 +85,17 @@ class ResourceResolver:
         self.sealed_paths = (
             frozenset(sealed_paths) if sealed_paths is not None else None
         )
+        self.sealed_bytes = (
+            {str(path): bytes(data) for path, data in sealed_bytes.items()}
+            if sealed_bytes is not None
+            else None
+        )
+        if (
+            self.sealed_bytes is not None
+            and self.sealed_paths is not None
+            and frozenset(self.sealed_bytes) != self.sealed_paths
+        ):
+            raise ValueError("authenticated resource bytes must match sealed paths")
 
     def _is_sealed(self, path: Path) -> bool:
         if self.sealed_paths is None:
@@ -92,6 +105,72 @@ class ResourceResolver:
         except ValueError:
             return False
         return relative in self.sealed_paths
+
+    def _relative(self, path: Path) -> str:
+        try:
+            return path.relative_to(self.package_root).as_posix()
+        except ValueError as exc:
+            raise ValueError("resource escapes authenticated package") from exc
+
+    def _authenticated_bytes(self, path: Path) -> bytes:
+        """Read a resource once and rebind it to the scheduler's byte authority."""
+        relative = self._relative(path)
+        if self.sealed_bytes is None:
+            return path.read_bytes()
+        expected = self.sealed_bytes.get(relative)
+        if expected is None:
+            raise ValueError(f"resource is not authenticated: {relative}")
+        try:
+            before = path.stat()
+            if path.is_symlink() or not path.is_file():
+                raise OSError("resource is not a regular file")
+            actual = path.read_bytes()
+            after = path.stat()
+        except OSError as exc:
+            raise ValueError(f"authenticated resource is unreadable: {relative}") from exc
+        if (
+            (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            )
+            or len(actual) != before.st_size
+            or not hmac.compare_digest(actual, expected)
+        ):
+            raise ValueError(f"resource changed after authentication: {relative}")
+        return expected
+
+    def read_bytes(self, relative: str) -> bytes:
+        """Load one contained resource through the scheduler's byte authority."""
+        normalized = relative.replace("\\", "/")
+        logical = PurePosixPath(normalized)
+        if (
+            not relative
+            or logical.is_absolute()
+            or logical.as_posix() != normalized
+            or any(part in {"", ".", ".."} for part in logical.parts)
+        ):
+            raise ValueError("resource must be a contained relative path")
+        candidate = self.package_root / normalized
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(self.package_root)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise FileNotFoundError(f"resource is missing: {relative}") from exc
+        if candidate.is_symlink() or not resolved.is_file() or not self._is_sealed(resolved):
+            raise FileNotFoundError(f"resource is missing: {relative}")
+        return self._authenticated_bytes(resolved)
+
+    def text(self, relative: str) -> str:
+        """Load one contained UTF-8 resource through the byte authority."""
+        return self.read_bytes(relative).decode("utf-8")
 
     def command(self, name: str) -> CommandResource:
         if not isinstance(name, str) or not _COMMAND_NAME.fullmatch(name):
@@ -113,7 +192,10 @@ class ResourceResolver:
                 or not self._is_sealed(resolved)
             ):
                 continue
-            return self._parse_command(resolved)
+            return self._parse_command(
+                resolved,
+                text=self._authenticated_bytes(resolved).decode("utf-8"),
+            )
         raise FileNotFoundError(f"command resource is missing: {name}")
 
     def script(self, name: str, *, runtime: str) -> ScriptResource:
@@ -156,6 +238,7 @@ class ResourceResolver:
                     or not self._is_sealed(resolved)
                 ):
                     continue
+                self._authenticated_bytes(resolved)
                 return ScriptResource(path=resolved, runtime=runtime)
         raise FileNotFoundError(f"script resource is missing: {name}")
 
@@ -191,9 +274,10 @@ class ResourceResolver:
                 break
         if path is None:
             raise FileNotFoundError(f"MCP definition is missing: {reference}")
-        if path.stat().st_size > 256_000:
+        encoded = self._authenticated_bytes(path)
+        if len(encoded) > 256_000:
             raise ValueError("MCP definition exceeds 256000 bytes")
-        document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        document = yaml.safe_load(encoded.decode("utf-8")) or {}
         if not isinstance(document, dict):
             raise ValueError("MCP definition must be a mapping")
         raw_servers = document.get("mcp_servers", document)
@@ -208,11 +292,32 @@ class ResourceResolver:
             if not isinstance(raw, dict):
                 raise ValueError(f"MCP server {name} must be a mapping")
             servers[name] = dict(raw)
+        if self.sealed_bytes is not None:
+            for value in self._walk_strings(document):
+                candidate = self.package_root / value
+                try:
+                    relative = candidate.relative_to(self.package_root).as_posix()
+                except ValueError:
+                    continue
+                if relative in self.sealed_bytes:
+                    self._authenticated_bytes(candidate)
         return servers
 
     @staticmethod
-    def _parse_command(path: Path) -> CommandResource:
-        text = path.read_text(encoding="utf-8")
+    def _walk_strings(value: object) -> Iterable[str]:
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, Mapping):
+            for item in value.values():
+                yield from ResourceResolver._walk_strings(item)
+        elif isinstance(value, list | tuple):
+            for item in value:
+                yield from ResourceResolver._walk_strings(item)
+
+    @staticmethod
+    def _parse_command(path: Path, *, text: str | None = None) -> CommandResource:
+        if text is None:
+            text = path.read_text(encoding="utf-8")
         metadata: dict[str, object] = {}
         body = text
         if text.startswith("---\n"):

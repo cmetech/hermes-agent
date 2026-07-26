@@ -3216,6 +3216,8 @@ upstream_changes:
   - plugins/workflow/store.py
   - plugins/workflow/scheduler.py
   - plugins/workflow/scheduled_revalidation.py
+  - plugins/workflow/trust.py
+  - plugins/workflow/catalog_api.py
   - plugins/workflow/resources.py
   - plugins/workflow/executors/base.py
   - plugins/workflow/executors/script.py
@@ -3224,6 +3226,9 @@ upstream_changes:
   - tests/plugins/workflow/test_schedule_revalidation.py
   - tests/plugins/workflow/test_script_executor.py
   - tests/plugins/workflow/test_node_mcp.py
+  - tests/plugins/workflow/test_ai_executor.py
+  - tests/plugins/workflow/test_node_agents.py
+  - tests/plugins/workflow/test_resources.py
   owned_symbols:
   - WorkflowLanguageSnapshot
   - make_language_snapshot
@@ -3250,8 +3255,12 @@ upstream_changes:
   - sealed_snapshot_digest admitted-path verification
   - verify_sealed_snapshot language identity verification
   - NodeExecutionContext.sealed_resource_paths
+  - NodeExecutionContext.sealed_resource_bytes
   - NodeExecutionContext positional constructor compatibility
   - ResourceResolver sealed-path candidate authorization
+  - ResourceResolver authenticated-byte rebinding
+  - WorkflowResourceReadBudget.from_authenticated
+  - authoritative workflow resource capacity limits
   tests:
   - tests/plugins/workflow/test_language_snapshot.py
   - tests/plugins/workflow/test_schedule_revalidation.py
@@ -3259,6 +3268,9 @@ upstream_changes:
   - tests/plugins/workflow/test_performance_bounds.py
   - tests/plugins/workflow/test_script_executor.py
   - tests/plugins/workflow/test_node_mcp.py
+  - tests/plugins/workflow/test_ai_executor.py
+  - tests/plugins/workflow/test_node_agents.py
+  - tests/plugins/workflow/test_resources.py
   expected_commit_subject: 'feat(workflow): pin workflow semantics at admission'
   upstream_candidate: true
   merge_guidance: >-
@@ -3277,7 +3289,8 @@ upstream_changes:
     and MCP resolution to the journal-corroborated sealed path set so
     higher-precedence additions and resolver-visible mutable outputs cannot
     become executable resources. Return the verified package and its sealed
-    resource paths atomically from one internal load; never hand authorization
+    resource paths and an immutable per-run authenticated byte authority
+    atomically from one internal load; never hand authorization
     through scheduler-global mutable state or permit a missing path set to
     become unrestricted resolution under concurrent same-run preparation.
     Select the pinned supported normalizer and fail closed with typed invalid,
@@ -3286,7 +3299,8 @@ upstream_changes:
     PreparedRunSnapshot compatibility by appending defaulted fields. Preserve
     NodeExecutionContext's preexisting positional monotonic and
     termination_policy order by appending sealed_resource_paths after both
-    fields. Stamp every new durable projection with snapshot_format_version so
+    fields and sealed_resource_bytes after sealed_resource_paths. Stamp every
+    new durable projection with snapshot_format_version so
     removing language or tree fields cannot make a current admission look
     historical. Preserve the pre-language fallback only for marker-free
     snapshots whose policy resolves to hermes-legacy and whose complete raw
@@ -3319,6 +3333,16 @@ upstream_changes:
     re-trust the installed workflow and start a new run. Never infer trust for
     those bytes. Declared Archon and new-format snapshots without language
     metadata remain invalid.
+    Authenticate the exact inputs, node-skills, and node-agent-skills inventories
+    and bytes against the digest maps inside journal-authenticated resources.json,
+    rejecting missing, extra, changed, symlinked, backslash, NUL, and replacement
+    cases. Apply the shared 512-file, 1 MiB-per-file, and 8 MiB-total package
+    resource bounds before allocating historical package bytes. Every later
+    command, named script, MCP definition and transitive local server, prompt
+    skill, inline-agent skill, and input/template consumer must either read the
+    immutable authenticated byte authority or rebind its reopened file to those
+    bytes immediately around use; same-size post-authentication disk substitution
+    must never become prompt or executable content.
     Scheduled revalidation must compare projection and resources language plus
     sealed-tree identities, while not-due coordinator polling stays bounded and
     does not reopen installed workflow definitions.

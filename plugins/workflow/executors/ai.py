@@ -94,6 +94,7 @@ class AgentNodeExecutor:
                 ResourceResolver(
                     context.run_directory,
                     sealed_paths=context.sealed_resource_paths,
+                    sealed_bytes=context.sealed_resource_bytes,
                 ).command(str(node.value)).body
             )
         else:
@@ -102,11 +103,12 @@ class AgentNodeExecutor:
         if not isinstance(variables, VariableContext):
             variables = VariableContext(workflow_id=context.run_id)
         prompt = variables.render_prompt(template)
-        skill_path = context.run_directory / "node-skills" / f"{node.id}.md"
         if node.options.get("skills"):
-            if not skill_path.is_file():
-                raise ValueError(f"snapshotted skills are missing for node {node.id}")
-            skill_text = skill_path.read_text(encoding="utf-8")
+            skill_text = ResourceResolver(
+                context.run_directory,
+                sealed_paths=context.sealed_resource_paths,
+                sealed_bytes=context.sealed_resource_bytes,
+            ).text(f"node-skills/{node.id}.md")
             prompt = f"{skill_text}\n\n{prompt}"
         return prompt
 
@@ -127,17 +129,13 @@ class AgentNodeExecutor:
                     denied.append(forbidden)
             instructions = ""
             if raw.get("skills"):
-                path = (
-                    context.run_directory
-                    / "node-agent-skills"
-                    / context.node.id
-                    / f"{agent_id}.md"
+                instructions = ResourceResolver(
+                    context.run_directory,
+                    sealed_paths=context.sealed_resource_paths,
+                    sealed_bytes=context.sealed_resource_bytes,
+                ).text(
+                    f"node-agent-skills/{context.node.id}/{agent_id}.md"
                 )
-                if not path.is_file():
-                    raise ValueError(
-                        f"snapshotted inline-agent skills are missing for {agent_id}"
-                    )
-                instructions = path.read_text(encoding="utf-8")
             definitions[str(agent_id)] = {
                 "description": str(raw["description"]),
                 "prompt": str(raw["prompt"]),
@@ -277,6 +275,7 @@ class AgentNodeExecutor:
                 ResourceResolver(
                     context.run_directory,
                     sealed_paths=context.sealed_resource_paths,
+                    sealed_bytes=context.sealed_resource_bytes,
                 ).mcp_servers(
                     str(node.options["mcp"])
                 )

@@ -215,6 +215,35 @@ def test_node_executor_resolves_only_scheduler_verified_mcp_resource(tmp_path):
     assert runner.requests[0].mcp_servers["echo"]["command"] == "sealed"
 
 
+def test_node_executor_rejects_post_authentication_mcp_substitution(tmp_path):
+    run = tmp_path / "run"
+    (run / "mcp").mkdir(parents=True)
+    definition = run / "mcp" / "echo.yaml"
+    authenticated = b"command: sealed\nargs: [servers/echo.py]\n"
+    definition.write_bytes(authenticated)
+    (run / "servers").mkdir()
+    server = run / "servers" / "echo.py"
+    server_bytes = b"print('sealed')\n"
+    server.write_bytes(server_bytes)
+    runner = FakeAgentRunner("unused")
+    context = _context(
+        tmp_path,
+        _node("mcp-node", "work", mcp="echo"),
+        sealed_resource_paths=frozenset({"mcp/echo.yaml", "servers/echo.py"}),
+        sealed_resource_bytes={
+            "mcp/echo.yaml": authenticated,
+            "servers/echo.py": server_bytes,
+        },
+    )
+    definition.write_text("command: forged\nargs: [servers/echo.py]\n", encoding="utf-8")
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "validation"
+    assert not runner.requests
+
+
 def test_node_executor_passes_only_its_snapshotted_mcp_mapping(tmp_path):
     run = tmp_path / "run"
     (run / "mcp").mkdir(parents=True)

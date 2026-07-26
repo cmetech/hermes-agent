@@ -73,6 +73,7 @@ def test_node_execution_context_preserves_pre_sealed_resource_positional_order(
     assert context.monotonic is monotonic
     assert context.termination_policy is termination_policy
     assert context.sealed_resource_paths is None
+    assert context.sealed_resource_bytes is None
 
 
 def test_named_script_prefers_exact_package_resource_before_runtime_suffix(
@@ -123,6 +124,23 @@ def test_script_executor_resolves_only_scheduler_verified_resources(
     argv, _warnings = ScriptExecutor()._argv(context, "/fake/uv")
 
     assert argv[-1] == str(sealed.resolve())
+
+
+def test_script_executor_rejects_post_authentication_substitution(tmp_path: Path) -> None:
+    scripts = tmp_path / "run" / "scripts"
+    scripts.mkdir(parents=True)
+    script = scripts / "diagnose.py"
+    authenticated = b"print('authenticated')\n"
+    script.write_bytes(authenticated)
+    context = replace(
+        _context(tmp_path, runtime="uv", script="diagnose"),
+        sealed_resource_paths=frozenset({"scripts/diagnose.py"}),
+        sealed_resource_bytes={"scripts/diagnose.py": authenticated},
+    )
+    script.write_text("print('forged')\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="changed after authentication"):
+        ScriptExecutor()._argv(context, "/fake/uv")
 
 
 @pytest.mark.parametrize(

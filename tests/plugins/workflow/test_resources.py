@@ -28,6 +28,23 @@ def test_local_command_precedes_global_and_preserves_frontmatter(tmp_path: Path)
     assert command.path == (local / "commands" / "investigate.md").resolve()
 
 
+def test_command_rejects_post_authentication_substitution(tmp_path: Path):
+    root = tmp_path / "run"
+    command = root / "commands" / "investigate.md"
+    command.parent.mkdir(parents=True)
+    authenticated = b"authenticated instructions\n"
+    command.write_bytes(authenticated)
+    resolver = ResourceResolver(
+        root,
+        sealed_paths={"commands/investigate.md"},
+        sealed_bytes={"commands/investigate.md": authenticated},
+    )
+    command.write_text("forged instructions\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="changed after authentication"):
+        resolver.command("investigate")
+
+
 @pytest.mark.parametrize(
     "name", ("../secret", "nested/secret", "/tmp/secret", "~/.secret")
 )

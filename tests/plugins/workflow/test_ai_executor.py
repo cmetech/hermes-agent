@@ -97,6 +97,28 @@ def test_fresh_prompt_uses_host_runner_and_validates_structured_output(tmp_path)
     assert output.read_text() == '{"answer":"ok","count":2}'
 
 
+def test_snapshotted_skill_rejects_post_authentication_substitution(tmp_path):
+    runner = FakeAgentRunner("unused")
+    node = _node("analyze", "Analyze", skills=["reports"])
+    skill = tmp_path / "run" / "node-skills" / "analyze.md"
+    skill.parent.mkdir(parents=True)
+    authenticated = b"AUTHENTICATED SKILL"
+    skill.write_bytes(authenticated)
+    context = _context(
+        tmp_path,
+        node,
+        sealed_resource_paths=frozenset({"node-skills/analyze.md"}),
+        sealed_resource_bytes={"node-skills/analyze.md": authenticated},
+    )
+    skill.write_text("FORGED SKILL", encoding="utf-8")
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "validation"
+    assert not runner.requests
+
+
 def test_invalid_structured_output_fails_without_repairing_prose(tmp_path):
     runner = FakeAgentRunner('Result: {"answer":"ok"}')
     node = _node(

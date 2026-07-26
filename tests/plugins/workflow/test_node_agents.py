@@ -49,6 +49,39 @@ def test_declared_agents_are_scoped_and_aliases_resolve_without_delegate(tmp_pat
     assert "delegate_task" in runner.requests[0].denied_tools
 
 
+def test_inline_agent_skill_rejects_post_authentication_substitution(tmp_path):
+    runner = FakeAgentRunner("unused")
+    node = _node(
+        "parent",
+        "coordinate",
+        agents={
+            "reviewer": {
+                "description": "Review evidence",
+                "prompt": "Review it",
+                "skills": ["reviewing"],
+            }
+        },
+    )
+    relative = "node-agent-skills/parent/reviewer.md"
+    skill = tmp_path / "run" / relative
+    skill.parent.mkdir(parents=True)
+    authenticated = b"AUTHENTICATED CHILD SKILL"
+    skill.write_bytes(authenticated)
+    context = _context(
+        tmp_path,
+        node,
+        sealed_resource_paths=frozenset({relative}),
+        sealed_resource_bytes={relative: authenticated},
+    )
+    skill.write_text("FORGED CHILD SKILL", encoding="utf-8")
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "validation"
+    assert not runner.requests
+
+
 class ChildRunner:
     def __init__(self, result):
         self.result = result

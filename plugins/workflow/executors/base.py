@@ -62,6 +62,7 @@ class NodeExecutionContext:
         )
     )
     sealed_resource_paths: frozenset[str] | None = None
+    sealed_resource_bytes: Mapping[str, bytes] | None = None
 
 
 @dataclass(frozen=True)

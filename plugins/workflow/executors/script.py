@@ -84,6 +84,7 @@ class ScriptExecutor:
             resource = ResourceResolver(
                 context.run_directory,
                 sealed_paths=context.sealed_resource_paths,
+                sealed_bytes=context.sealed_resource_bytes,
             ).script(
                 str(node.value), runtime=runtime
             )
@@ -97,6 +98,7 @@ class ScriptExecutor:
             resource = ResourceResolver(
                 context.run_directory,
                 sealed_paths=context.sealed_resource_paths,
+                sealed_bytes=context.sealed_resource_bytes,
             ).script(
                 str(node.value), runtime=runtime
             )

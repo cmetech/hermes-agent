@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -17,6 +18,7 @@ import re
 import threading
 import time
 import uuid
+from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
 
 from plugins.workflow.entitlement import AIEntitlementResolution, derive_ai_entitlement
@@ -44,10 +46,15 @@ from plugins.workflow.models import (
     WorkflowPackage,
     WorkflowRuntimeConfig,
 )
-from plugins.workflow.resources import VariableContext
+from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.schema import is_inline_script, load_workflow_snapshot
 from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.store import NodeClaim, RunStore, StorageQuotaError
+from plugins.workflow.trust import (
+    WORKFLOW_RESOURCE_MAX_FILE_BYTES,
+    WORKFLOW_RESOURCE_MAX_FILES,
+    WORKFLOW_RESOURCE_MAX_TOTAL_BYTES,
+)
 from tools.managed_process import ProcessResourceLimits, TerminationPolicy
 
 
@@ -452,14 +459,37 @@ class RunScheduler:
                 continue
         return outputs
 
-    def _variables(self, projection: dict[str, object], run_directory: Path):
+    def _variables(
+        self,
+        projection: dict[str, object],
+        run_directory: Path,
+        *,
+        sealed_resource_paths: frozenset[str] | None = None,
+        sealed_resource_bytes: Mapping[str, bytes] | None = None,
+    ):
         arguments = ""
-        manifest_path = run_directory / "inputs.json"
-        if manifest_path.is_file():
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if sealed_resource_bytes is not None:
+            resolver = ResourceResolver(
+                run_directory,
+                sealed_paths=sealed_resource_paths,
+                sealed_bytes=sealed_resource_bytes,
+            )
+            manifest = json.loads(resolver.text("inputs.json"))
             entry = manifest.get("arguments")
             if isinstance(entry, dict):
-                arguments = self._read_text(run_directory / entry["relative_path"])
+                data = resolver.read_bytes(str(entry["relative_path"]))
+                if len(data) > 500_000:
+                    raise ValueError("workflow argument value exceeds 500000 bytes")
+                arguments = data.decode("utf-8")
+        else:
+            manifest_path = run_directory / "inputs.json"
+            if manifest_path.is_file():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                entry = manifest.get("arguments")
+                if isinstance(entry, dict):
+                    arguments = self._read_text(
+                        run_directory / entry["relative_path"]
+                    )
         outputs = {
             node: value if isinstance(value, str) else json.dumps(value, sort_keys=True)
             for node, value in self._output_values(projection, run_directory).items()
@@ -543,7 +573,7 @@ class RunScheduler:
 
     def _load_verified_run_package(
         self, run_id: str
-    ) -> tuple[WorkflowPackage, frozenset[str]]:
+    ) -> tuple[WorkflowPackage, frozenset[str], Mapping[str, bytes]]:
         run_directory = self.store.run_directory(run_id)
         definition = run_directory / "definition.yaml"
         policy = run_directory / "policy.yaml"
@@ -591,6 +621,7 @@ class RunScheduler:
 
         projected_snapshot_digest = projection.get("sealed_snapshot_digest")
         verified_sealed_paths: frozenset[str] | None = None
+        verified_sealed_bytes: dict[str, bytes] | None = None
         if snapshot is not None:
             if (
                 not isinstance(projected_snapshot_digest, str)
@@ -607,14 +638,31 @@ class RunScheduler:
                 sealed_paths = read_sealed_snapshot_paths(
                     resources.get("sealed_paths")
                 )
-                actual_snapshot_digest = sealed_snapshot_digest(
-                    run_directory, relative_paths=sealed_paths
+                # Validate the exact tree shape (including mutable-root symlinks and
+                # unsealed precedence shadows) before binding the authoritative bytes.
+                sealed_snapshot_digest(run_directory, relative_paths=sealed_paths)
+                verified_sealed_bytes = self._stable_snapshot_bytes(
+                    run_directory, sealed_paths
                 )
             except ScheduledRunRevalidationError as exc:
                 raise integrity_error("sealed workflow tree is unreadable") from exc
+            actual_snapshot_digest = self._snapshot_digest_from_bytes(
+                verified_sealed_bytes
+            )
             if actual_snapshot_digest != projected_snapshot_digest:
                 raise integrity_error("sealed workflow tree identity changed")
             verified_sealed_paths = frozenset(sealed_paths)
+            if (
+                verified_sealed_bytes.get("definition.yaml") != definition_bytes
+                or verified_sealed_bytes.get("resources.json") != resources_bytes
+                or (
+                    policy.is_file()
+                    and verified_sealed_bytes.get("policy.yaml") != policy_bytes
+                )
+            ):
+                raise integrity_error(
+                    "sealed workflow snapshot changed during authentication"
+                )
         elif (
             projected_snapshot_digest is not None
             or projection.get("snapshot_format_version") is not None
@@ -652,6 +700,13 @@ class RunScheduler:
             legacy_preparsed_bytes = self._legacy_raw_package_bytes(
                 run_directory, legacy_preparsed_paths
             )
+            legacy_auxiliary_bytes = self._legacy_auxiliary_bytes(
+                run_directory, resources, resources_bytes
+            )
+            verified_sealed_bytes = {
+                **legacy_preparsed_bytes,
+                **legacy_auxiliary_bytes,
+            }
             if (
                 legacy_preparsed_bytes.get("definition.yaml") != definition_bytes
                 or (
@@ -661,6 +716,20 @@ class RunScheduler:
             ):
                 raise integrity_error(
                     "pre-language workflow package changed during authentication"
+                )
+            metadata = projection.get("run_metadata")
+            admitted_whole_digest = (
+                metadata.get("sealed_snapshot_digest")
+                if isinstance(metadata, Mapping)
+                else None
+            )
+            if (
+                admitted_whole_digest is not None
+                and self._snapshot_digest_from_bytes(verified_sealed_bytes)
+                != admitted_whole_digest
+            ):
+                raise integrity_error(
+                    "pre-language workflow snapshot changed during authentication"
                 )
             legacy_workflow_identity = self._verify_legacy_preparse_identity(
                 projection,
@@ -704,7 +773,9 @@ class RunScheduler:
                 sidecar_path=policy if policy.is_file() else None,
             )
             verified_sealed_paths = self._legacy_resource_paths(
-                package, run_directory=run_directory
+                package,
+                run_directory=run_directory,
+                authenticated_bytes=legacy_preparsed_bytes,
             )
             self._verify_legacy_postparse_identity(
                 package,
@@ -714,19 +785,30 @@ class RunScheduler:
                 sealed_paths=verified_sealed_paths,
                 preparsed_paths=legacy_preparsed_paths,
                 workflow_identity=legacy_workflow_identity,
+                authenticated_bytes=legacy_preparsed_bytes,
             )
+            verified_sealed_paths = frozenset(verified_sealed_bytes)
         if verified_sealed_paths is None:
             raise integrity_error("verified workflow resource identity is missing")
-        return package, verified_sealed_paths
+        if verified_sealed_bytes is None:
+            raise integrity_error("verified workflow resource bytes are missing")
+        return (
+            package,
+            verified_sealed_paths,
+            MappingProxyType(dict(verified_sealed_bytes)),
+        )
 
     def _load_run_package(self, run_id: str) -> WorkflowPackage:
         """Compatibility wrapper returning only the verified workflow package."""
-        package, _sealed_paths = self._load_verified_run_package(run_id)
+        package, _sealed_paths, _sealed_bytes = self._load_verified_run_package(run_id)
         return package
 
     @staticmethod
     def _legacy_resource_paths(
-        package: WorkflowPackage, *, run_directory: Path
+        package: WorkflowPackage,
+        *,
+        run_directory: Path,
+        authenticated_bytes: Mapping[str, bytes],
     ) -> frozenset[str]:
         """Bind legacy resolution while rejecting ambiguous shadow candidates."""
         sealed_package = replace(package, root=run_directory)
@@ -778,10 +860,18 @@ class RunScheduler:
                     "MCP",
                 )
 
-        from plugins.workflow.trust import compute_package_digest
+        from plugins.workflow.trust import (
+            WorkflowResourceReadBudget,
+            compute_package_digest,
+        )
 
         return frozenset(
-            compute_package_digest(sealed_package).covered_relative_paths
+            compute_package_digest(
+                sealed_package,
+                read_budget=WorkflowResourceReadBudget.from_authenticated(
+                    run_directory, authenticated_bytes
+                ),
+            ).covered_relative_paths
         )
 
     @staticmethod
@@ -870,16 +960,40 @@ class RunScheduler:
     def _legacy_raw_package_bytes(
         run_directory: Path, package_paths: frozenset[str]
     ) -> Mapping[str, bytes]:
-        """Read one stable in-memory byte set for pre-parse authentication."""
+        """Read one admission-bounded byte set for pre-parse authentication."""
+        if len(package_paths) > WORKFLOW_RESOURCE_MAX_FILES:
+            raise WorkflowLanguageCompatibilityError(
+                "workflow_legacy_snapshot_unverifiable",
+                "pre-language workflow exceeds the authenticated resource file "
+                "limit; re-trust the installed workflow and start a new run",
+            )
         package_bytes: dict[str, bytes] = {}
+        total_bytes = 0
         for relative in sorted(package_paths):
             path = run_directory / relative
             try:
                 before = path.stat()
                 if path.is_symlink() or not path.is_file():
                     raise OSError("package resource is not a regular file")
-                data = path.read_bytes()
+                if before.st_size > WORKFLOW_RESOURCE_MAX_FILE_BYTES:
+                    raise WorkflowLanguageCompatibilityError(
+                        "workflow_legacy_snapshot_unverifiable",
+                        "pre-language workflow exceeds the authenticated per-file "
+                        "resource limit; re-trust the installed workflow and start "
+                        "a new run",
+                    )
+                if total_bytes + before.st_size > WORKFLOW_RESOURCE_MAX_TOTAL_BYTES:
+                    raise WorkflowLanguageCompatibilityError(
+                        "workflow_legacy_snapshot_unverifiable",
+                        "pre-language workflow exceeds the authenticated total "
+                        "resource limit; re-trust the installed workflow and start "
+                        "a new run",
+                    )
+                with path.open("rb") as stream:
+                    data = stream.read(WORKFLOW_RESOURCE_MAX_FILE_BYTES + 1)
                 after = path.stat()
+            except WorkflowLanguageCompatibilityError:
+                raise
             except OSError as exc:
                 raise WorkflowLanguageCompatibilityError(
                     "workflow_snapshot_integrity_mismatch",
@@ -905,7 +1019,200 @@ class RunScheduler:
                     "pre-language workflow package changed during authentication",
                 )
             package_bytes[relative] = data
+            total_bytes += len(data)
         return package_bytes
+
+    @staticmethod
+    def _snapshot_digest_from_bytes(resources: Mapping[str, bytes]) -> str:
+        digest = hashlib.sha256()
+        for relative in sorted(resources):
+            data = resources[relative]
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(len(data)).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(data)
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _stable_snapshot_bytes(
+        run_directory: Path,
+        paths: Iterable[str],
+    ) -> dict[str, bytes]:
+        """Read the exact sealed path set with per-file race detection."""
+        result: dict[str, bytes] = {}
+        for relative in sorted(paths):
+            path = run_directory / relative
+            try:
+                before = path.stat()
+                if path.is_symlink() or not path.is_file():
+                    raise OSError("sealed resource is not a regular file")
+                data = path.read_bytes()
+                after = path.stat()
+            except OSError as exc:
+                raise WorkflowLanguageCompatibilityError(
+                    "workflow_snapshot_integrity_mismatch",
+                    "sealed workflow snapshot is unreadable",
+                ) from exc
+            if (
+                (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                )
+                != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                )
+                or len(data) != before.st_size
+            ):
+                raise WorkflowLanguageCompatibilityError(
+                    "workflow_snapshot_integrity_mismatch",
+                    "sealed workflow snapshot changed during authentication",
+                )
+            result[relative] = data
+        return result
+
+    @staticmethod
+    def _legacy_auxiliary_bytes(
+        run_directory: Path,
+        resources: Mapping[str, object],
+        resources_bytes: bytes,
+    ) -> dict[str, bytes]:
+        """Authenticate exact inputs and generated skills from resources.json."""
+        malformed = WorkflowLanguageCompatibilityError(
+            "workflow_snapshot_integrity_mismatch",
+            "pre-language workflow auxiliary resource identity is malformed",
+        )
+
+        def digest_map(value: object, prefix: str, *, nested: bool) -> dict[str, str]:
+            if not isinstance(value, Mapping):
+                raise malformed
+            expected: dict[str, str] = {}
+            for name, digest in value.items():
+                if (
+                    not isinstance(name, str)
+                    or not isinstance(digest, str)
+                    or _SHA256.fullmatch(digest) is None
+                    or "\\" in name
+                    or "\0" in name
+                ):
+                    raise malformed
+                parts = PurePosixPath(name).parts
+                expected_parts = 2 if nested else 1
+                if (
+                    len(parts) != expected_parts
+                    or any(part in {"", ".", ".."} for part in parts)
+                    or PurePosixPath(name).as_posix() != name
+                ):
+                    raise malformed
+                expected[f"{prefix}/{name}.md"] = digest
+            return expected
+
+        expected: dict[str, str] = {}
+        expected.update(digest_map(resources.get("node_skills"), "node-skills", nested=False))
+        expected.update(
+            digest_map(
+                resources.get("node_agent_skills"),
+                "node-agent-skills",
+                nested=True,
+            )
+        )
+        inputs_digest = resources.get("inputs_sha256")
+        if not isinstance(inputs_digest, str) or _SHA256.fullmatch(inputs_digest) is None:
+            raise malformed
+        inputs_map = RunScheduler._stable_snapshot_bytes(
+            run_directory, ("inputs.json",)
+        )
+        inputs_bytes = inputs_map["inputs.json"]
+        if not hmac.compare_digest(hashlib.sha256(inputs_bytes).hexdigest(), inputs_digest):
+            raise WorkflowLanguageCompatibilityError(
+                "workflow_snapshot_integrity_mismatch",
+                "pre-language workflow inputs manifest differs from admitted bytes",
+            )
+        try:
+            inputs = json.loads(inputs_bytes)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise malformed from exc
+        if not isinstance(inputs, Mapping):
+            raise malformed
+        for record in inputs.values():
+            if not isinstance(record, Mapping):
+                raise malformed
+            relative = record.get("relative_path")
+            digest = record.get("sha256")
+            if (
+                not isinstance(relative, str)
+                or not relative.startswith("inputs/")
+                or not isinstance(digest, str)
+                or _SHA256.fullmatch(digest) is None
+            ):
+                raise malformed
+            path = PurePosixPath(relative)
+            if (
+                path.is_absolute()
+                or path.as_posix() != relative
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or relative in expected
+            ):
+                raise malformed
+            expected[relative] = digest
+
+        actual: set[str] = set()
+        for root_name in ("inputs", "node-skills", "node-agent-skills"):
+            root = run_directory / root_name
+            if not root.exists():
+                continue
+            if root.is_symlink() or not root.is_dir():
+                raise malformed
+            pending = [root]
+            while pending:
+                directory = pending.pop()
+                try:
+                    children = tuple(os.scandir(directory))
+                except OSError as exc:
+                    raise malformed from exc
+                for entry in children:
+                    path = Path(entry.path)
+                    relative = path.relative_to(run_directory).as_posix()
+                    try:
+                        if entry.is_symlink():
+                            raise malformed
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(path)
+                        elif entry.is_file(follow_symlinks=False):
+                            actual.add(relative)
+                        else:
+                            raise malformed
+                    except OSError as exc:
+                        raise malformed from exc
+                    if len(actual) > _LEGACY_PACKAGE_PATHS:
+                        raise malformed
+        if actual != set(expected):
+            raise WorkflowLanguageCompatibilityError(
+                "workflow_snapshot_integrity_mismatch",
+                "pre-language workflow auxiliary resources differ from admitted paths",
+            )
+        authenticated = dict(
+            RunScheduler._legacy_raw_package_bytes(
+                run_directory, frozenset(expected)
+            )
+        )
+        for relative, expected_digest in expected.items():
+            if not hmac.compare_digest(
+                hashlib.sha256(authenticated[relative]).hexdigest(), expected_digest
+            ):
+                raise WorkflowLanguageCompatibilityError(
+                    "workflow_snapshot_integrity_mismatch",
+                    "pre-language workflow auxiliary resource differs from admitted bytes",
+                )
+        authenticated["inputs.json"] = inputs_bytes
+        authenticated["resources.json"] = resources_bytes
+        return authenticated
 
     @staticmethod
     def _verify_legacy_journaled_seals(
@@ -1045,6 +1352,7 @@ class RunScheduler:
         sealed_paths: frozenset[str],
         preparsed_paths: frozenset[str] | None,
         workflow_identity: str | None,
+        authenticated_bytes: Mapping[str, bytes],
     ) -> None:
         """Require parsed closure equality and repeat raw authentication for races."""
         if preparsed_paths is None or sealed_paths != preparsed_paths:
@@ -1066,6 +1374,7 @@ class RunScheduler:
                 run_directory,
                 sealed_paths=sealed_paths,
                 workflow_identity=workflow_identity,
+                resource_bytes=authenticated_bytes,
             ) != expected_package_digest:
                 raise WorkflowLanguageCompatibilityError(
                     "workflow_snapshot_integrity_mismatch",
@@ -1172,8 +1481,13 @@ class RunScheduler:
 
     def _prepare_run_package(self, run_id: str, schedule_revalidation):
         try:
-            package, sealed_paths = self._load_verified_run_package(run_id)
-            return package, self._run_execution_limits(package), sealed_paths
+            package, sealed_paths, sealed_bytes = self._load_verified_run_package(run_id)
+            return (
+                package,
+                self._run_execution_limits(package),
+                sealed_paths,
+                sealed_bytes,
+            )
         except Exception:
             if schedule_revalidation is None:
                 raise
@@ -1304,6 +1618,7 @@ class RunScheduler:
         projection: dict[str, object],
         execution_limits: RunExecutionLimits,
         sealed_resource_paths: frozenset[str] | None,
+        sealed_resource_bytes: Mapping[str, bytes] | None,
     ) -> None:
         with self._activity:
             self._active_executions += 1
@@ -1403,7 +1718,10 @@ class RunScheduler:
                         ),
                     )
                     variables = self._variables(
-                        projection, self.store.run_directory(run_id)
+                        projection,
+                        self.store.run_directory(run_id),
+                        sealed_resource_paths=sealed_resource_paths,
+                        sealed_resource_bytes=sealed_resource_bytes,
                     )
                     loop_input = projection["nodes"][node.id].get(
                         "loop_user_input_artifact"
@@ -1496,6 +1814,7 @@ class RunScheduler:
                                 )
                             ),
                             sealed_resource_paths=sealed_resource_paths,
+                            sealed_resource_bytes=sealed_resource_bytes,
                             monotonic=self._monotonic,
                             termination_policy=TerminationPolicy(
                                 cooperative_grace_seconds=(
@@ -1638,7 +1957,12 @@ class RunScheduler:
         prepared_package = self._prepare_run_package(run_id, authorization)
         if prepared_package is None:
             return self.store.load_run(run_id)
-        package, execution_limits, sealed_resource_paths = prepared_package
+        (
+            package,
+            execution_limits,
+            sealed_resource_paths,
+            sealed_resource_bytes,
+        ) = prepared_package
         by_id = {node.id: node for node in package.definition.nodes}
         foreground_owner_id, foreground_owner_epoch = self._foreground_claim_token(
             self.store.load_run(run_id)
@@ -1747,6 +2071,7 @@ class RunScheduler:
                             snapshot,
                             execution_limits,
                             sealed_resource_paths,
+                            sealed_resource_bytes,
                         )
                         for claim, node, snapshot in claims
                     ]
@@ -1807,6 +2132,7 @@ class RunScheduler:
         packages = {}
         execution_limits = {}
         sealed_resource_paths = {}
+        sealed_resource_bytes = {}
         prepared_run_ids = []
         for run_id in run_ids:
             prepared_package = self._prepare_run_package(
@@ -1815,10 +2141,11 @@ class RunScheduler:
             )
             if prepared_package is None:
                 continue
-            package, limits, paths = prepared_package
+            package, limits, paths, resource_bytes = prepared_package
             packages[run_id] = package
             execution_limits[run_id] = limits
             sealed_resource_paths[run_id] = paths
+            sealed_resource_bytes[run_id] = resource_bytes
             prepared_run_ids.append(run_id)
         run_ids = prepared_run_ids
         foreground_tokens = {
@@ -1964,6 +2291,7 @@ class RunScheduler:
                             snapshots[run_id],
                             execution_limits[run_id],
                             sealed_resource_paths[run_id],
+                            sealed_resource_bytes[run_id],
                         ))
                         fair_cursor = (active.index(run_id) + 1) % len(active)
                         claimed_this_round = True
@@ -1980,6 +2308,7 @@ class RunScheduler:
                         _snapshot,
                         _limits,
                         _sealed_paths,
+                        _sealed_bytes,
                     ) in claims:
                         self.store.release_claim_before_execution(claim)
                     break
