@@ -13,6 +13,7 @@ ROOT = Path(__file__).parents[2]
 GATE = ROOT / "scripts/test_workflow_merge_gate.sh"
 CI = ROOT / ".github/workflows/ci.yml"
 MANIFEST = ROOT / "docs/upstream-customizations/workflow-orchestration.yaml"
+CUSTOMIZATION_CHECKER = ROOT / "scripts/check_upstream_customizations.py"
 PHASE_1_LANGUAGE_BACKEND_SUITES = (
     "tests/plugins/workflow/test_language.py",
     "tests/plugins/workflow/test_language_snapshot.py",
@@ -80,6 +81,25 @@ EXPECTED_SHOWCASE_IDS = {
     "resilience",
     "scheduling",
 }
+
+
+def test_live_customization_ledger_has_one_rehearsable_upstream_baseline() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CUSTOMIZATION_CHECKER),
+            "--manifest",
+            str(MANIFEST),
+            "--print-verified-upstream",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert re.fullmatch(r"[0-9a-f]{40}\n", result.stdout)
 
 
 def test_merge_gate_references_only_existing_invariant_tests() -> None:

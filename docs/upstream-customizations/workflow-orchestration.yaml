@@ -521,7 +521,7 @@ upstream_changes:
   removal_condition: >-
     Remove together with kanban-mutation-preconditions, or when upstream
     provides an equivalent conflict type whose callers it maintains itself.
-  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: kanban-desktop-rest
   change_class: kanban-rest-adapter
   owner: workflow-orchestration
@@ -623,7 +623,7 @@ upstream_changes:
     is easy to misread as an infrastructure problem rather than drift.
   removal_condition: Remove when Hermes upstream provides equivalent native
     Workflow and Kanban operations pages over the same generic APIs.
-  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: desktop-workflow-stale-recovery
   change_class: desktop-composition-generic
   owner: workflow-orchestration
@@ -3590,4 +3590,27 @@ upstream_changes:
     Remove when upstream provides an equivalent installed-filesystem workflow
     regression fixture that exercises its supported distribution mechanism
     without weakening the artifact build guard.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-ledger-shared-upstream-baseline
+  change_class: workflow-testing
+  owner: workflow-orchestration
+  files:
+  - docs/upstream-customizations/workflow-orchestration.yaml
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - shared last_verified_upstream baseline for the workflow ledger
+  - live-ledger rehearsal print-verified-upstream preflight
+  tests:
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'fix(workflow): restore rehearsal baseline'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve one shared last_verified_upstream commit across every workflow
+    ledger entry and keep the live-ledger rehearsal preflight in the base gate.
+    Advance that baseline only as one atomic ledger-wide operation after every
+    entry has been reviewed against the candidate upstream commit.
+  removal_condition: >-
+    Remove when an upstream customization system provides equivalent atomic
+    baseline advancement and refuses to rehearse a ledger with mixed verified
+    upstream commits.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
