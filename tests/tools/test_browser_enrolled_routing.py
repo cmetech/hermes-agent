@@ -295,3 +295,69 @@ class TestAcquireLifecycle:
 
         monkeypatch.setattr(browser_session_registry, "default_profile_name", lambda: None)
         assert not browser_session_registry.session_trusts_url("t::enrolled", TRUSTED)
+
+
+class TestCleanupReapsEnrolledSidecar:
+    """Fix round 1, Important finding: cleanup_browser() must expand a bare
+    task id to its ``::enrolled`` sidecar the same way it already does for
+    ``::local``. Without this, the PRIMARY end-of-task path
+    (agent/run_agent.py -> cleanup_browser(bare_task_id)) never calls
+    _cleanup_single_browser_session on the enrolled key at all, so the
+    registry binding, the CDP memo, AND the BrowserSession handle all survive
+    normal task completion -- exactly the residual internal-origin trust this
+    task exists to eliminate.
+    """
+
+    def test_bare_cleanup_reaps_the_enrolled_binding(self, monkeypatch, _default_enrolled):
+        # Isolate from module-level state left by sibling tests in this file
+        # (run_tests.sh isolates per-file, not per-test).
+        browser_tool._reset_session_cdp_cache()
+        browser_tool._active_sessions.pop("t::enrolled", None)
+        try:
+            monkeypatch.setattr(browser_tool, "_resolve_cdp_override", lambda u: u)
+            monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+            monkeypatch.setattr(browser_tool, "_stop_cdp_supervisor", lambda t: None)
+            monkeypatch.setattr(browser_tool, "_maybe_stop_recording", lambda t: None)
+            monkeypatch.setattr(
+                browser_tool, "_run_browser_command",
+                lambda *a, **k: {"success": True},
+            )
+            monkeypatch.setattr(browser_tool.os.path, "exists", lambda p: False)
+
+            def _binding_acquire(profile, headless=None, session_key=None, attach_global=True):
+                browser_session_registry.bind(session_key, profile)
+                return browser_session_manager.BrowserSession(
+                    session_key=session_key, profile=ENROLLED, cdp_url="http://127.0.0.1:9222"
+                )
+
+            monkeypatch.setattr(browser_session_manager, "acquire", _binding_acquire)
+
+            browser_tool._session_cdp_url("t::enrolled")
+            # Mirror the real navigation path (_get_session_info): a navigation
+            # routed to the enrolled key also registers an agent-browser
+            # session under that same key. This is what a real task looks
+            # like right before end-of-task cleanup runs.
+            browser_tool._active_sessions["t::enrolled"] = {
+                "session_name": "", "bb_session_id": None, "cdp_url": "http://127.0.0.1:9222",
+            }
+
+            assert browser_session_registry.profile_for("t::enrolled") == "corp"
+            assert "t::enrolled" in browser_tool._session_cdp_urls
+            assert "t::enrolled" in browser_tool._session_handles
+
+            # This is the exact call agent/run_agent.py makes at task
+            # completion: the BARE task id, never the enrolled key itself.
+            browser_tool.cleanup_browser("t")
+
+            assert browser_session_registry.profile_for("t::enrolled") is None, \
+                "registry binding leaked past end-of-task cleanup (EBL-005 regression)"
+            assert "t::enrolled" not in browser_tool._session_cdp_urls, \
+                "CDP endpoint memo leaked past end-of-task cleanup"
+            assert "t::enrolled" not in browser_tool._session_handles, \
+                "BrowserSession handle leaked past end-of-task cleanup"
+
+            monkeypatch.setattr(browser_session_registry, "default_profile_name", lambda: None)
+            assert not browser_session_registry.session_trusts_url("t::enrolled", TRUSTED)
+        finally:
+            browser_tool._active_sessions.pop("t::enrolled", None)
+            browser_tool._reset_session_cdp_cache()

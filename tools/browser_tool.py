@@ -4661,11 +4661,15 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     Called automatically when a task completes or when inactivity timeout is reached.
     Closes both the agent-browser/Browserbase session and Camofox sessions.
 
-    When ``task_id`` is a bare task identifier (no ``::local`` suffix), reaps
-    BOTH the cloud/primary session AND any hybrid-routing local sidecar that
-    may have been spawned for LAN/localhost URLs in the same task.  When
-    ``task_id`` already carries a ``::local`` suffix (called from the inactivity
-    cleanup loop against a specific session key), reaps only that one.
+    When ``task_id`` is a bare task identifier (no ``::local``/``::enrolled``
+    suffix), reaps the cloud/primary session PLUS any hybrid-routing local
+    sidecar AND any enrolled-browser sidecar that may have been spawned for
+    this task (review finding EBL-005 fix-round-1: the primary end-of-task
+    path calls this with the bare id, so without this expansion the enrolled
+    session's registry binding/CDP memo/handle never got released here at
+    all). When ``task_id`` already carries a ``::local`` or ``::enrolled``
+    suffix (an explicit session key, e.g. from the inactivity cleanup loop),
+    reaps only that one key -- symmetric with the existing ``::local`` handling.
 
     Args:
         task_id: Task identifier (or explicit session key)
@@ -4673,27 +4677,35 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     if task_id is None:
         task_id = "default"
 
-    # Expand to the full set of session keys to reap. For a bare task_id
-    # that includes the cloud/primary key + the local sidecar if one exists.
+    # Expand to the full set of session keys to reap. For a bare task_id that
+    # includes the cloud/primary key + the local sidecar and/or the enrolled
+    # sidecar, whichever exist.
     if _is_local_sidecar_key(task_id):
         session_keys = [task_id]
         bare_task_id = task_id[: -len(_LOCAL_SUFFIX)]
+    elif _is_enrolled_session_key(task_id):
+        session_keys = [task_id]
+        bare_task_id = task_id[: -len(_ENROLLED_SUFFIX)]
     else:
         session_keys = [task_id]
         sidecar_key = f"{task_id}{_LOCAL_SUFFIX}"
+        enrolled_key = f"{task_id}{_ENROLLED_SUFFIX}"
         with _cleanup_lock:
             if sidecar_key in _active_sessions:
                 session_keys.append(sidecar_key)
+            if enrolled_key in _active_sessions:
+                session_keys.append(enrolled_key)
         bare_task_id = task_id
 
     for session_key in session_keys:
         _cleanup_single_browser_session(session_key)
 
     # Drop stale last-active ownership. Cleaning a bare task drops its binding;
-    # cleaning a sidecar drops the binding only if that sidecar was still the
-    # recorded owner. This prevents a later click/snapshot from resurrecting a
-    # cleaned sidecar on about:blank while preserving a primary-session binding.
-    if _is_local_sidecar_key(task_id):
+    # cleaning a sidecar (local or enrolled) drops the binding only if that
+    # sidecar was still the recorded owner. This prevents a later click/
+    # snapshot from resurrecting a cleaned sidecar on about:blank while
+    # preserving a primary-session binding.
+    if _is_local_sidecar_key(task_id) or _is_enrolled_session_key(task_id):
         if _last_active_session_key.get(bare_task_id) == task_id:
             _last_active_session_key.pop(bare_task_id, None)
     else:
