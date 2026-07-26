@@ -45,9 +45,10 @@ export function releaseUpdatePending(
   marker: { pinnedCommit?: string | null } | null,
   isPackaged: boolean
 ): boolean {
-  if (!isReleaseInstall(stamp, isPackaged)) return false
+  if (!isReleaseInstall(stamp, isPackaged)) {return false}
   const stampCommit = stamp && stamp.commit
   const markerCommit = marker && marker.pinnedCommit
+
   return Boolean(stampCommit && markerCommit && stampCommit !== markerCommit)
 }
 
@@ -63,18 +64,23 @@ export function compareSemver(a: string, b: string): -1 | 0 | 1 {
   const pa = normalize(a)
   const pb = normalize(b)
   const len = Math.max(pa.length, pb.length)
+
   for (let i = 0; i < len; i++) {
     const da = pa[i] ?? 0
     const db = pb[i] ?? 0
-    if (da > db) return 1
-    if (da < db) return -1
+
+    if (da > db) {return 1}
+
+    if (da < db) {return -1}
   }
+
   return 0
 }
 
 export function assetPattern(platform: string, arch: string): RegExp {
   const os = platform === 'win32' ? 'win' : platform === 'darwin' ? 'mac' : 'linux'
   const ext = platform === 'win32' ? 'exe' : platform === 'darwin' ? 'dmg' : 'AppImage'
+
   // Any brand prefix (OTTO-, LOOP24-, …); anchor the exact os-arch.ext suffix
   // so `.exe.blockmap` sidecars and other-arch assets don't match.
   return new RegExp(`-${os}-${arch}\\.${ext}$`)
@@ -84,13 +90,16 @@ export function assetPattern(platform: string, arch: string): RegExp {
 export function installerFileName(assetUrl: string): string {
   const clean = assetUrl.split('?')[0].split('#')[0]
   const base = clean.substring(clean.lastIndexOf('/') + 1)
+
   return base || 'installer'
 }
 
 /** Platform-appropriate way to launch a downloaded installer. */
 export function installerLaunch(filePath: string, platform: string): { cmd: string; args: string[] } {
-  if (platform === 'darwin') return { cmd: 'open', args: [filePath] }
-  if (platform === 'win32') return { cmd: filePath, args: [] }
+  if (platform === 'darwin') {return { cmd: 'open', args: [filePath] }}
+
+  if (platform === 'win32') {return { cmd: filePath, args: [] }}
+
   // linux AppImage: marking it executable is the caller's job; run it directly.
   return { cmd: filePath, args: [] }
 }
@@ -106,6 +115,7 @@ export function parseLatestRelease(releases: unknown, platform: string, arch: st
   }
 
   const rel = releases.find(r => r && typeof r.tag_name === 'string') || null
+
   if (!rel) {
     return null
   }

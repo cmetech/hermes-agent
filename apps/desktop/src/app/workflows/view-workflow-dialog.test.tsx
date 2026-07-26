@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { openModalOwnsKeyboard } from '@/app/hooks/use-keybinds'
 import { setApiRequestProfile } from '@/hermes'
+import type * as ProfileStore from '@/store/profile'
 import type { WorkflowDefinition, WorkflowDetail } from '@/types/hermes'
 
 import { workflowDetailQueryKey, workflowDetailQueryOptions } from './detail-query'
@@ -34,7 +35,7 @@ vi.mock('@/components/assistant-ui/embeds/mermaid-embed', () => ({
 // an export the code under test imports (v0.19.0 added normalizeProfileKey and
 // $activeGatewayProfile, which is what broke this suite); spreading self-heals.
 vi.mock('@/store/profile', async importOriginal => ({
-  ...(await importOriginal<typeof import('@/store/profile')>()),
+  ...(await importOriginal<typeof ProfileStore>()),
   $newChatProfile: { set: vi.fn() },
   cycleProfile: vi.fn(),
   ensureGatewayProfile: profileRouting.ensureGatewayProfile,

@@ -74,7 +74,7 @@ def _read_cache_posix() -> str | None:
         directory_stat = os.fstat(directory_fd)
         if not stat.S_ISDIR(directory_stat.st_mode):
             raise OSError("cache parent is not a directory")
-        if directory_stat.st_uid != os.geteuid():
+        if directory_stat.st_uid != os.geteuid():  # windows-footgun: ok — POSIX-only path (see os.name guards above)
             raise OSError("cache parent is not owned by the current user")
         os.fchmod(directory_fd, 0o700)
         if stat.S_IMODE(os.fstat(directory_fd).st_mode) != 0o700:
@@ -87,7 +87,7 @@ def _read_cache_posix() -> str | None:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise OSError("cache destination is not a regular file")
-        if opened.st_uid != os.geteuid():
+        if opened.st_uid != os.geteuid():  # windows-footgun: ok — POSIX-only path (see os.name guards above)
             raise OSError("cache destination is not owned by the current user")
         os.fchmod(descriptor, 0o600)
         if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
@@ -140,7 +140,7 @@ def _persist_posix(serialized: bytes) -> None:
         directory_stat = os.fstat(directory_fd)
         if not stat.S_ISDIR(directory_stat.st_mode):
             raise OSError("cache parent is not a directory")
-        if directory_stat.st_uid != os.geteuid():
+        if directory_stat.st_uid != os.geteuid():  # windows-footgun: ok — POSIX-only path (see os.name guards above)
             raise OSError("cache parent is not owned by the current user")
         os.fchmod(directory_fd, 0o700)
         if stat.S_IMODE(os.fstat(directory_fd).st_mode) != 0o700:
@@ -178,7 +178,7 @@ def _persist_posix(serialized: bytes) -> None:
         temporary_stat = os.fstat(temporary_fd)
         if not stat.S_ISREG(temporary_stat.st_mode):
             raise OSError("cache temporary is not a regular file")
-        if temporary_stat.st_uid != os.geteuid():
+        if temporary_stat.st_uid != os.geteuid():  # windows-footgun: ok — POSIX-only path (see os.name guards above)
             raise OSError("cache temporary is not owned by the current user")
         if stat.S_IMODE(temporary_stat.st_mode) != 0o600:
             raise OSError("cache temporary permissions are not private")

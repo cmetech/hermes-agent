@@ -1,9 +1,10 @@
 schema_version: 1
 feature: desktop-test-infra
-# Test-infrastructure repairs to upstream desktop test config. Both entries fix
-# upstream defects rather than adding downstream behaviour, so both are strong
-# upstream_candidates — but until upstream takes them, a merge that rewrites
-# either file silently restores the defect.
+# Test-infrastructure repairs to upstream desktop test config, plus the product
+# defects that only surface as a red desktop check. Most entries fix upstream
+# defects rather than adding downstream behaviour, so they are strong
+# upstream_candidates — but until upstream takes them, a merge that rewrites any
+# of these files silently restores the defect.
 coverage:
   base_commit: c38874511d67d9fd42da9fd7f65df146bf7ceeb0
   excluded_commits: []
@@ -75,4 +76,74 @@ upstream_changes:
   removal_condition: >-
     Remove if the dark first-run default is ever reverted to upstream's light,
     or moved out of context.tsx into brand-scoped configuration.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+- id: packaged-artifact-name-derivation
+  change_class: test-infrastructure
+  owner: downstream-test-reliability
+  files:
+  - apps/desktop/scripts/test-desktop.mjs
+  owned_symbols:
+  - readPackageJson
+  - productFilename
+  - linuxExecutable
+  - resolveApp
+  - refreshPackageMetadata
+  tests:
+  - apps/desktop/scripts/test-desktop.mjs
+  expected_commit_subject: 'fix(desktop): derive packaged artifact names instead of hardcoding Hermes'
+  upstream_candidate: true
+  merge_guidance: >-
+    Upstream hardcoded 'Hermes' for every packaged-artifact path (Hermes.app,
+    Hermes.exe, linux-unpacked/Hermes, Hermes-<version>-<arch>.dmg) and captured
+    package.json through a module-level `import ... with { type: 'json' }`. Both
+    halves are wrong here. (1) On Linux electron-builder names the executable
+    appInfo.sanitizedName.toLowerCase() -- package.json `name`, not productName
+    -- so `Hermes` never exists on that platform even unbranded; this is what
+    failed check:test:desktop:all in CI, which runs on ubuntu. (2) The desktop
+    `build` script runs scripts/brand/generate.mjs --write as its FIRST step, so
+    `npm run pack` rewrites name/productName in place mid-run for the brand in
+    brand/active (`otto` even on base); a copy imported at module load is stale
+    by the time electron-builder names its output, and the validator then looks
+    for Hermes.app while OTTO.app was just written. The fix reads package.json
+    from DISK and re-reads it after every build step (refreshPackageMetadata,
+    called from ensurePackagedApp / ensureDmg / ensureNsis), deriving names with
+    electron-builder's own rules. On merge: UNION. Never reintroduce a literal
+    product name here and never restore the static import -- either regression
+    fails the whole job with a "Missing packaged app binary" that looks like a
+    packaging bug rather than a naming bug. The two HERMES_HOME literals lower
+    in this file are home-emitter anchors and must stay byte-exact.
+  removal_condition: >-
+    Remove if upstream derives these paths itself, or if the desktop build stops
+    invoking the brand generator so package.json is stable across a build.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+- id: native-notification-dispatch-rejection-guard
+  change_class: desktop-composition-generic
+  owner: downstream-test-reliability
+  files:
+  - apps/desktop/src/store/native-notifications.ts
+  owned_symbols:
+  - dispatchNativeNotification
+  tests:
+  - apps/desktop/src/store/native-notifications.test.ts
+  expected_commit_subject: 'fix(desktop): stop fire-and-forget notifications rejecting unhandled'
+  upstream_candidate: true
+  merge_guidance: >-
+    dispatchNativeNotification is fire-and-forget (`void
+    projectNativeNotification(input)`), but projectNativeNotification throws
+    'Electron notification bridge unavailable' when window.hermesDesktop.notify
+    is absent. Outside Electron -- the browser/dev-server build, and every
+    jsdom test -- that produced an unhandled rejection nobody awaited. Vitest
+    fails a whole run on one unhandled rejection, so check:test:ui exited 1
+    with 258/258 files and 0 failing tests, which reads as a config problem
+    rather than a defect. The fix attaches .catch() at the dispatch site only.
+    On merge: UNION, and keep the throwing contract of
+    projectNativeNotification intact -- deliverWorkflowNotificationsOnce
+    (workflow-notifications.ts) awaits it and routes the rejection to
+    failWorkflowNotification, so swallowing the error there instead would
+    silently drop durable notification failures. Removing the .catch() breaks
+    no build and fails no assertion; it just turns the UI job red again with a
+    green test list.
+  removal_condition: >-
+    Remove if upstream makes projectNativeNotification resolve rather than throw
+    when the bridge is unavailable, or adds its own guard at the dispatch site.
   last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6

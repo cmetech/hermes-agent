@@ -8,6 +8,7 @@ import { useKeybinds } from '@/app/hooks/use-keybinds'
 import { setApiRequestProfile } from '@/hermes'
 import { IS_MAC } from '@/lib/keybinds/combo'
 import { $notifications, clearNotifications } from '@/store/notifications'
+import type * as ProfileStore from '@/store/profile'
 import type { WorkflowDefinition, WorkflowDetail, WorkflowRunSnapshot } from '@/types/hermes'
 
 import { $workflowSelectedRunId } from './store'
@@ -23,7 +24,7 @@ const profileRouting = vi.hoisted(() => ({ ensureGatewayProfile: vi.fn() }))
 // an export the code under test imports (v0.19.0 added normalizeProfileKey and
 // $activeGatewayProfile, which is what broke this suite); spreading self-heals.
 vi.mock('@/store/profile', async importOriginal => ({
-  ...(await importOriginal<typeof import('@/store/profile')>()),
+  ...(await importOriginal<typeof ProfileStore>()),
   $newChatProfile: { set: vi.fn() },
   cycleProfile: vi.fn(),
   ensureGatewayProfile: profileRouting.ensureGatewayProfile,
@@ -129,7 +130,12 @@ function renderView() {
 }
 
 function KeybindRouteHarness() {
-  useKeybinds({ startFreshSession: vi.fn(), toggleCommandCenter: vi.fn(), toggleSelectedPin: vi.fn() })
+  useKeybinds({
+    openNewSessionTab: vi.fn(),
+    startFreshSession: vi.fn(),
+    toggleCommandCenter: vi.fn(),
+    toggleSelectedPin: vi.fn()
+  })
 
   return (
     <Routes>
@@ -306,6 +312,7 @@ describe('Review & Run workflow dialog', () => {
     if (value) {
       fireEvent.change(picker, { target: { value } })
     }
+
     fireEvent.click(within(dialog).getByRole('button', { name: 'Run later' }))
 
     expect((await within(dialog).findByRole('alert')).textContent).toContain(message)
@@ -780,12 +787,15 @@ describe('Review & Run workflow dialog', () => {
       if (request.path.startsWith('/api/plugins/workflow/runs?')) {
         return { next_cursor: null, runs: [runSnapshot('run-existing')], schema_version: 1 }
       }
+
       if (request.path === '/api/plugins/workflow/attention') {
         return { items: [], next_cursor: null, schema_version: 1 }
       }
+
       if (request.path === '/api/plugins/workflow/runs/run-existing') {
         return runSnapshot('run-existing')
       }
+
       throw new Error(`unexpected legacy request: ${request.path}`)
     })
     renderView()
