@@ -3297,6 +3297,7 @@ upstream_changes:
   files:
   - hermes_cli/main.py
   - plugins/workflow/language_schema.py
+  - plugins/workflow/schema_cli.py
   - plugins/workflow/schema.py
   - plugins/workflow/cli.py
   - tests/hermes_cli/test_apply_profile_override.py
@@ -3317,6 +3318,8 @@ upstream_changes:
   - compatibility_code_catalog
   - workflow_authoring_contract
   - workflow schema CLI command
+  - configure_schema_parser
+  - emit_schema
   - exact top-level workflow schema action resolution
   - workflow schema local and global profile option routing
   - workflow schema read-only startup bypass
@@ -3334,16 +3337,21 @@ upstream_changes:
     and every deferred annotation aligned with the runtime's stable finding
     code, blocking status, and enforcement phase. Derive nested structural
     requirements from immutable inventory metadata, including script runtime,
-    interactive-loop gate, event-bound hook output, retry, approval, and
-    inline-agent shapes; keep graph references, resource paths, provider
+    interactive-loop gate (including a nonempty conditional message),
+    event-bound hook output (including loader-valid explicit null), retry,
+    approval, and inline-agent shapes; keep graph references, resource paths, provider
     capabilities, and runtime compatibility with the loader rather than
     encoding false JSON constraints. The bounded schema command must bypass
     logging, brand/capability startup, workflow/plugin discovery, and all
     filesystem mutation, model, MCP, or network calls while emitting
-    deterministic compact JSON. Resolve the exact top-level workflow/schema
-    action so positional values cannot steal profile ownership; preserve
-    historical global profile placement while leaving only that action's long
-    language-profile option local.
+    deterministic compact JSON. Compose the bounded early parser from Hermes'
+    top-level argparse authority and the same schema-child argument registrar
+    and emitter used by plugin dispatch. Success, help, and every parse error
+    must complete before startup exactly once with normal argparse semantics.
+    Resolve the exact top-level workflow/schema action so positional values
+    cannot steal profile ownership or unknown pre-command flags invoke schema;
+    preserve historical global profile placement while leaving only that
+    action's long language-profile option local.
   removal_condition: >-
     Remove when upstream provides an equivalent bounded versioned workflow
     authoring contract driven by the loader's field authority, truthful

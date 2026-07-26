@@ -45,6 +45,7 @@ class StructuralRequirement:
     when_field: str
     equals: object
     required_field: str
+    required_shape: str
 
 
 def _compatibility(
@@ -345,7 +346,7 @@ _HOOK_ENTRY_FIELDS = (
 _HOOK_RESPONSE_FIELDS = tuple(
     _field("hook_response", name, json_type, shape)
     for name, json_type, shape in (
-        ("hookSpecificOutput", "object", "hook_specific"),
+        ("hookSpecificOutput", "object or null", "nullable_hook_specific"),
         ("systemMessage", "string", "nonempty_string"),
         ("continue", "boolean", "boolean"),
         ("decision", "string", "hook_decision"),
@@ -426,6 +427,7 @@ STRUCTURAL_REQUIREMENTS = (
         when_field="interactive",
         equals=True,
         required_field="gate_message",
+        required_shape="nonempty_string",
     ),
 )
 
@@ -603,6 +605,13 @@ def _schema_for_shape(
         return _object_schema("hook_response", profile, hook_event=hook_event)
     if shape == "hook_specific":
         return _object_schema("hook_specific", profile, hook_event=hook_event)
+    if shape == "nullable_hook_specific":
+        return {
+            "oneOf": [
+                {"type": "null"},
+                _object_schema("hook_specific", profile, hook_event=hook_event),
+            ]
+        }
     if shape == "agents":
         return {
             "type": "object",
@@ -669,7 +678,14 @@ def _object_schema(
                     },
                     "required": [item.when_field],
                 },
-                "then": {"required": [item.required_field]},
+                "then": {
+                    "required": [item.required_field],
+                    "properties": {
+                        item.required_field: _schema_for_shape(
+                            item.required_shape, profile
+                        )
+                    },
+                },
             }
             for item in conditions
         ]

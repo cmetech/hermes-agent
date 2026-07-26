@@ -543,7 +543,8 @@ def _workflow_schema_action_index(argv: list[str]) -> int | None:
             i += 1
             continue
         if arg.startswith("-"):
-            return None
+            i += 1
+            continue
         return i if arg == "schema" else None
     return None
 
@@ -14524,47 +14525,23 @@ def cmd_claw(args):
 
 def _try_workflow_schema_readonly() -> bool:
     """Serve exact schema introspection before any mutating CLI startup seam."""
-    action_index = _workflow_schema_action_index(sys.argv[1:])
-    if action_index is None:
+    if _workflow_schema_action_index(sys.argv[1:]) is None:
         return False
 
-    arguments = sys.argv[1:][action_index + 1 :]
-    selected_profile = "archon-2026-07"
-    json_mode = False
-    i = 0
-    while i < len(arguments):
-        argument = arguments[i]
-        if argument == "--json":
-            json_mode = True
-            i += 1
-            continue
-        if argument == "--profile" and i + 1 < len(arguments):
-            selected_profile = arguments[i + 1]
-            i += 2
-            continue
-        if argument.startswith("--profile="):
-            selected_profile = argument.split("=", 1)[1]
-            i += 1
-            continue
-        return False
+    from hermes_cli._parser import build_top_level_parser
+    from plugins.workflow.schema_cli import configure_schema_parser, emit_schema
 
-    from plugins.workflow.language_schema import workflow_authoring_contract
-    from plugins.workflow.models import WorkflowLanguageProfile
-
-    try:
-        profile = WorkflowLanguageProfile(selected_profile)
-    except ValueError:
-        return False
-    contract = workflow_authoring_contract(profile)
-    if json_mode:
-        print(json.dumps(
-            contract,
-            sort_keys=True,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ))
-    else:
-        print(json.dumps(contract, sort_keys=True, ensure_ascii=False, indent=2))
+    parser, subparsers, _chat_parser = build_top_level_parser()
+    workflow_parser = subparsers.add_parser("workflow")
+    workflow_parser.add_argument("--workdir", help=argparse.SUPPRESS)
+    workflow_parser.add_argument("--hermes-home", help=argparse.SUPPRESS)
+    actions = workflow_parser.add_subparsers(dest="workflow_action")
+    schema_parser = actions.add_parser(
+        "schema", help="Print the workflow authoring contract"
+    )
+    configure_schema_parser(schema_parser)
+    args = parser.parse_args(sys.argv[1:])
+    emit_schema(args)
     return True
 
 

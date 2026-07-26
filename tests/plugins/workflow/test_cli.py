@@ -60,6 +60,50 @@ def _tree_snapshot(root: Path) -> tuple[tuple[str, str, bytes | None], ...]:
     return tuple(entries)
 
 
+def _run_packaged_schema(tmp_path: Path, arguments: list[str]):
+    home = tmp_path / "fresh-home"
+    hermes_home = tmp_path / "fresh-hermes-home"
+    guard_dir = tmp_path / "process-guards"
+    guard_dir.mkdir()
+    (guard_dir / "sitecustomize.py").write_text(
+        """
+import socket
+import sys
+
+class _ForbiddenRuntimeImports:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in {"run_agent", "model_tools", "tools.mcp_tool"}:
+            raise RuntimeError(f"forbidden runtime import: {fullname}")
+        return None
+
+def _forbid_network(*args, **kwargs):
+    raise RuntimeError("network access is forbidden during schema introspection")
+
+sys.meta_path.insert(0, _ForbiddenRuntimeImports())
+socket.create_connection = _forbid_network
+socket.socket.connect = _forbid_network
+""".lstrip(),
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "HERMES_HOME": str(hermes_home),
+        "PYTHONPATH": os.pathsep.join([str(guard_dir), str(Path(__file__).parents[3])]),
+    }
+    before = (_tree_snapshot(home), _tree_snapshot(hermes_home))
+    completed = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", *arguments],
+        cwd=Path(__file__).parents[3],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    after = (_tree_snapshot(home), _tree_snapshot(hermes_home))
+    return completed, before, after, home, hermes_home
+
+
 def test_success_envelope_sanitizes_every_machine_payload_and_preserves_cleanup_capability():
     ordinary = machine_contract.success_envelope(
         "workflow list",
@@ -232,56 +276,17 @@ def test_packaged_schema_command_is_read_only_before_normal_startup(
     tmp_path, json_mode
 ):
     """The exact packaged introspection path must not initialize Hermes."""
-    home = tmp_path / "fresh-home"
-    hermes_home = tmp_path / "fresh-hermes-home"
-    guard_dir = tmp_path / "process-guards"
-    guard_dir.mkdir()
-    (guard_dir / "sitecustomize.py").write_text(
-        """
-import socket
-import sys
-
-class _ForbiddenRuntimeImports:
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname in {"run_agent", "model_tools", "tools.mcp_tool"}:
-            raise RuntimeError(f"forbidden runtime import: {fullname}")
-        return None
-
-def _forbid_network(*args, **kwargs):
-    raise RuntimeError("network access is forbidden during schema introspection")
-
-sys.meta_path.insert(0, _ForbiddenRuntimeImports())
-socket.create_connection = _forbid_network
-socket.socket.connect = _forbid_network
-""".lstrip(),
-        encoding="utf-8",
-    )
-    env = {
-        **os.environ,
-        "HOME": str(home),
-        "HERMES_HOME": str(hermes_home),
-        "PYTHONPATH": os.pathsep.join([str(guard_dir), str(Path(__file__).parents[3])]),
-    }
-    command = [
-        sys.executable,
-        "-m",
-        "hermes_cli.main",
+    arguments = [
         "workflow",
         "schema",
         "--profile",
         "archon-2026-07",
     ]
     if json_mode:
-        command.append("--json")
+        arguments.append("--json")
 
-    before = (_tree_snapshot(home), _tree_snapshot(hermes_home))
-    completed = subprocess.run(
-        command,
-        cwd=Path(__file__).parents[3],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
+    completed, before, after, home, hermes_home = _run_packaged_schema(
+        tmp_path, arguments
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -293,7 +298,140 @@ socket.socket.connect = _forbid_network
     else:
         assert '\n  "compatibility_codes"' in completed.stdout
     assert before == ((), ())
-    assert (_tree_snapshot(home), _tree_snapshot(hermes_home)) == before
+    assert after == before
+    assert not home.exists()
+    assert not hermes_home.exists()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--definitely-unknown", "workflow", "schema", "--json"],
+        ["workflow", "--definitely-unknown", "schema", "--json"],
+    ],
+    ids=["global", "workflow-root"],
+)
+def test_packaged_schema_rejects_unknown_precommand_once_without_startup(
+    tmp_path, arguments
+):
+    completed, before, after, home, hermes_home = _run_packaged_schema(
+        tmp_path, arguments
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr.count("usage: hermes") == 1
+    assert completed.stderr.count("error:") == 1
+    assert "unrecognized arguments: --definitely-unknown" in completed.stderr
+    assert '"schema_version"' not in completed.stderr
+    assert before == after == ((), ())
+    assert not home.exists()
+    assert not hermes_home.exists()
+
+
+def test_packaged_schema_help_is_read_only_argparse_output(tmp_path):
+    completed, before, after, home, hermes_home = _run_packaged_schema(
+        tmp_path, ["workflow", "schema", "--help"]
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    assert completed.stdout.count("usage: hermes workflow schema") == 1
+    assert "--profile {hermes-legacy,archon-2026-07}" in completed.stdout
+    assert "--json" in completed.stdout
+    assert before == after == ((), ())
+    assert not home.exists()
+    assert not hermes_home.exists()
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (
+            ["workflow", "schema", "--profile", "future-profile"],
+            "invalid choice: 'future-profile'",
+        ),
+        (
+            ["workflow", "schema", "--profile"],
+            "argument --profile: expected one argument",
+        ),
+        (
+            ["workflow", "schema", "--definitely-child", "--json"],
+            "unrecognized arguments: --definitely-child",
+        ),
+    ],
+    ids=["invalid-profile", "missing-profile", "unknown-child"],
+)
+def test_packaged_schema_parse_errors_are_single_and_read_only(
+    tmp_path, arguments, message
+):
+    completed, before, after, home, hermes_home = _run_packaged_schema(
+        tmp_path, arguments
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr.count("usage: hermes") == 1
+    assert completed.stderr.count("error:") == 1
+    assert message in completed.stderr
+    assert before == after == ((), ())
+    assert not home.exists()
+    assert not hermes_home.exists()
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_profile"),
+    [
+        (
+            [
+                "--profile",
+                "default",
+                "workflow",
+                "schema",
+                "--profile",
+                "hermes-legacy",
+                "--json",
+            ],
+            "hermes-legacy",
+        ),
+        (
+            [
+                "workflow",
+                "--profile",
+                "default",
+                "schema",
+                "--profile",
+                "archon-2026-07",
+                "--json",
+            ],
+            "archon-2026-07",
+        ),
+        (
+            [
+                "workflow",
+                "schema",
+                "--profile",
+                "hermes-legacy",
+                "--json",
+                "-p",
+                "default",
+            ],
+            "hermes-legacy",
+        ),
+    ],
+    ids=["global-before-command", "global-before-action", "global-after-child"],
+)
+def test_packaged_schema_keeps_global_and_child_profiles_distinct(
+    tmp_path, arguments, expected_profile
+):
+    completed, before, after, home, hermes_home = _run_packaged_schema(
+        tmp_path, arguments
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout)["profile"] == expected_profile
+    assert before == after == ((), ())
     assert not home.exists()
     assert not hermes_home.exists()
 

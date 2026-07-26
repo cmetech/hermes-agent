@@ -23,7 +23,6 @@ import yaml
 
 from hermes_constants import get_hermes_home
 from plugins.workflow.language import language_projection
-from plugins.workflow.language_schema import workflow_authoring_contract
 from plugins.workflow.compat import (
     ARCHON_TOOL_ALIASES,
     CompatibilityFinding,
@@ -67,6 +66,7 @@ from plugins.workflow.sanitize import (
     projection_key_is_secret,
     sanitize_projection,
 )
+from plugins.workflow.schema_cli import configure_schema_parser, emit_schema
 from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.store import (
     ForegroundExecutionConflict,
@@ -604,12 +604,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     schema_parser = actions.add_parser(
         "schema", help="Print the workflow authoring contract"
     )
-    schema_parser.add_argument(
-        "--profile",
-        choices=("hermes-legacy", "archon-2026-07"),
-        default="archon-2026-07",
-    )
-    _json_flag(schema_parser)
+    configure_schema_parser(schema_parser)
 
     list_parser = actions.add_parser(
         "list", aliases=["ls"], help="List discovered workflows"
@@ -863,19 +858,7 @@ def _emit(payload: object, *, as_json: bool) -> None:
 
 
 def _cmd_schema(args: argparse.Namespace) -> int:
-    contract = workflow_authoring_contract(WorkflowLanguageProfile(args.profile))
-    if args.json:
-        print(
-            json.dumps(
-                contract,
-                sort_keys=True,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
-    else:
-        print(json.dumps(contract, sort_keys=True, ensure_ascii=False, indent=2))
-    return 0
+    return emit_schema(args)
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
