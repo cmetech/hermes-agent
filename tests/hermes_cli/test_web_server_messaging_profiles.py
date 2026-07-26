@@ -253,6 +253,25 @@ class TestMultiplexPortBindingGuard:
         # multiplex flag under test comes from the default profile's config.
         monkeypatch.delenv("GATEWAY_MULTIPLEX_PROFILES", raising=False)
 
+    @pytest.fixture(autouse=True)
+    def _neutral_brand_channel_curation(self, monkeypatch):
+        """Exempt this class from the brand messaging-channel allowlist.
+
+        The test asserts a 409 for EVERY member of
+        PORT_BINDING_PLATFORM_VALUES. Platforms outside the brand allowlist
+        (bluebubbles, for one) are filtered out of the messaging surface
+        upstream of the port-binding guard, so the PUT is rejected as unknown
+        and never reaches the 409 -- the guard under test is simply not
+        exercised for them.
+
+        Scoped to this class ON PURPOSE: the allowlist's own tests live in this
+        same directory (test_brand_channels.py, test_channel_filter.py), so a
+        module- or directory-wide neutralization would blunt the feature's real
+        coverage. Pointing at a non-existent brand uses the production
+        fail-open path rather than patching internals.
+        """
+        monkeypatch.setenv("OTTO_BRAND", "_neutral-for-tests")
+
     def test_rejects_every_port_binding_platform_on_secondary(
         self, client, isolated_profiles
     ):

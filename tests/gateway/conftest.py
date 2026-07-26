@@ -39,6 +39,32 @@ from unittest.mock import MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _neutral_brand_channel_curation(monkeypatch):
+    """Insulate gateway tests from the brand messaging-channel allowlist.
+
+    This fork can hide non-allowlisted messaging channels via a brand
+    descriptor's ``curation.channels.allow``, applied inside
+    ``get_connected_platforms``. The active-brand marker resolves to a real
+    brand even on the neutral ``base`` branch, so that allowlist (11 channels)
+    applies here and platforms outside it -- dingtalk, feishu, weixin, relay,
+    a registered test plugin -- vanish from every result. Six upstream tests
+    then failed asserting things like ``Platform.DINGTALK in []``.
+
+    Those tests are about platform DETECTION (is dingtalk recognised from env
+    vars / extras?), a strictly lower layer than brand curation. Curation keeps
+    its own coverage in tests/hermes_cli/test_brand_channels.py and
+    test_channel_filter.py, which this does not touch -- deliberately scoped to
+    tests/gateway/ for that reason.
+
+    Points ``OTTO_BRAND`` at a slug that does not exist rather than patching
+    internals: resolution is fail-OPEN by design, so an unknown brand yields no
+    allowlist and every platform stays visible. That exercises the real
+    production path and survives any rename of the private filter helpers.
+    """
+    monkeypatch.setenv("OTTO_BRAND", "_neutral-for-tests")
+
+
 def make_async_session_db(sync_mock=None):
     """Wrap a sync mock SessionDB in AsyncSessionDB so gateway code that awaits
     the facade works in tests. Returns (facade, sync_mock); configure return

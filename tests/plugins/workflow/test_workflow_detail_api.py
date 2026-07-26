@@ -367,10 +367,20 @@ def test_workflow_detail_first_reads_closed_wal_database_without_sidecars_or_mut
         anchor.close()
     wal = database.with_name(database.name + "-wal")
     shm = database.with_name(database.name + "-shm")
-    assert wal.stat().st_size == 0
-    assert shm.is_file()
-    wal.unlink()
-    shm.unlink()
+    # Closing the LAST connection to a WAL database makes SQLite checkpoint and
+    # REMOVE both sidecars, so whether they still exist here depends on whether
+    # any other connection (CoordinatorStore's) happens to be alive -- which is
+    # refcount/GC timing, not behaviour under test. Asserting they exist made
+    # this fail with FileNotFoundError on macOS and Linux CI alike.
+    #
+    # The state this test needs is simply "no sidecars before the request", and
+    # SQLite having already produced it is a pass, not a failure. When a -wal
+    # does survive, the truncating checkpoint above must still have emptied it.
+    if wal.exists():
+        assert wal.stat().st_size == 0
+        wal.unlink()
+    if shm.exists():
+        shm.unlink()
     assert not wal.exists()
     assert not shm.exists()
     before_request = _tree_snapshot(home)
