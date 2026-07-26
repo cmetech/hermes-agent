@@ -81,6 +81,28 @@ def default_profile_name() -> Optional[str]:
     return name or None
 
 
+def default_profile_trusts_url(url: str) -> bool:
+    """Return True when ``browser.default_profile`` is an enrolled profile that
+    explicitly trusts ``url``'s origin.
+
+    This is the ROUTING question -- "should this navigation use the real
+    installed browser?" -- and is deliberately separate from
+    ``session_trusts_url``, which answers the GUARD question for an existing
+    session. Both consult the same ``is_origin_trusted`` matcher, so routing and
+    trust can never disagree about an origin. Fails CLOSED.
+    """
+    name = default_profile_name()
+    if not name:
+        return False
+    try:
+        from tools.browser_profiles import get_profile, is_origin_trusted
+
+        return is_origin_trusted(get_profile(name), url)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("default_profile_trusts_url: denying after error: %s", exc)
+        return False
+
+
 def default_profile_launchable() -> bool:
     """Return True when ``browser.default_profile`` names an ENROLLED profile
     whose browser executable actually resolves on this machine.

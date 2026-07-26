@@ -1423,17 +1423,25 @@ def _url_is_private(url: str) -> bool:
 def _navigation_session_key(task_id: str, url: str) -> str:
     """Pick the session key that should handle ``url`` for ``task_id``.
 
-    Returns the bare task_id unless ALL of these are true:
-      1. A cloud provider is configured (``_get_cloud_provider()`` is not None).
-      2. Auto-local routing is enabled (``browser.auto_local_for_private_urls``,
-         default True).
-      3. The URL resolves to a private/LAN/loopback address.
-      4. A CDP override is not active (that path owns the whole session).
-      5. Camofox mode is not active (Camofox is already local-only).
+    Checked in order:
+      1. A CDP override is active (``/browser connect`` owns the whole
+         session) -- bare task_id.
+      2. Camofox mode is active (already local-only) -- bare task_id.
+      3. OTTO: ``url``'s origin is explicitly trusted by
+         ``browser.default_profile`` -- ``f"{task_id}::enrolled"``, so the
+         user's real installed browser drives it. Checked before the
+         cloud/hybrid split below so an explicitly trusted origin outranks a
+         local sidecar.
+      4. Otherwise, returns the bare task_id unless ALL of these are true:
+         a. A cloud provider is configured (``_get_cloud_provider()`` is not
+            None).
+         b. Auto-local routing is enabled
+            (``browser.auto_local_for_private_urls``, default True).
+         c. The URL resolves to a private/LAN/loopback address.
 
-    When all are true, returns ``f"{task_id}::local"`` so the hybrid-routing
-    path spawns a local Chromium sidecar while the cloud session (if any)
-    continues to serve public URLs.
+         When all are true, returns ``f"{task_id}::local"`` so the
+         hybrid-routing path spawns a local Chromium sidecar while the cloud
+         session (if any) continues to serve public URLs.
     """
     if task_id is None:
         task_id = "default"
@@ -1441,6 +1449,24 @@ def _navigation_session_key(task_id: str, url: str) -> str:
         return task_id
     if _is_camofox_mode():
         return task_id
+    # OTTO: an origin the enrolled profile explicitly trusts is driven by the
+    # user's REAL installed browser on its own session key. Everything else --
+    # public pages, untrusted private addresses -- stays on the bare key and
+    # the throwaway browser, so untrusted content never touches corporate SSO
+    # cookies or client certificates. Ordered after the CDP-override and
+    # Camofox checks (those backends own their session) and before the
+    # cloud/hybrid split (an explicitly trusted origin outranks a local
+    # sidecar).
+    # No filesystem probe here: an unresolvable executable surfaces at acquire
+    # time as ProfileError, never as a silent downgrade to the bundled
+    # browser.
+    try:
+        from tools.browser_session_registry import default_profile_trusts_url
+
+        if default_profile_trusts_url(url):
+            return f"{task_id}{_ENROLLED_SUFFIX}"
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("enrolled routing check failed for %s: %s", task_id, exc)
     if _get_cloud_provider() is None:
         return task_id
     if not _auto_local_for_private_urls():

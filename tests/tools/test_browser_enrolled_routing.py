@@ -94,3 +94,51 @@ class TestOnlyEnrolledKeysDrive:
 
     def test_local_sidecar_never_drives_enrolled(self, _default_enrolled):
         assert browser_tool._session_uses_enrolled_browser("task-1::local") is False
+
+
+TRUSTED = "https://wiki.corp.example/display/TEAM/Onboarding"
+UNTRUSTED_PRIVATE = "https://intranet.other.example/secret"
+PUBLIC = "https://example.com/page"
+
+
+class TestNavigationRouting:
+    @pytest.fixture(autouse=True)
+    def _plain_local(self, monkeypatch, _default_enrolled):
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: None)
+
+    def test_trusted_origin_routes_to_enrolled(self):
+        assert browser_tool._navigation_session_key("t", TRUSTED) == "t::enrolled"
+
+    def test_public_origin_stays_on_the_bare_key(self):
+        assert browser_tool._navigation_session_key("t", PUBLIC) == "t"
+
+    def test_untrusted_private_origin_stays_on_the_bare_key(self):
+        assert browser_tool._navigation_session_key("t", UNTRUSTED_PRIVATE) == "t"
+
+    def test_cdp_override_suppresses_enrolled_routing(self, monkeypatch):
+        """/browser connect owns the whole session."""
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "ws://x")
+        assert browser_tool._navigation_session_key("t", TRUSTED) == "t"
+
+    def test_camofox_suppresses_enrolled_routing(self, monkeypatch):
+        monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: True)
+        assert browser_tool._navigation_session_key("t", TRUSTED) == "t"
+
+    def test_enrolled_outranks_the_local_sidecar(self, monkeypatch):
+        """A trusted origin under a cloud provider gets the corporate browser."""
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: object())
+        monkeypatch.setattr(browser_tool, "_auto_local_for_private_urls", lambda: True)
+        monkeypatch.setattr(browser_tool, "_url_is_private", lambda u: True)
+        assert browser_tool._navigation_session_key("t", TRUSTED) == "t::enrolled"
+
+    def test_untrusted_private_still_gets_the_local_sidecar(self, monkeypatch):
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: object())
+        monkeypatch.setattr(browser_tool, "_auto_local_for_private_urls", lambda: True)
+        monkeypatch.setattr(browser_tool, "_url_is_private", lambda u: True)
+        assert browser_tool._navigation_session_key("t", UNTRUSTED_PRIVATE) == "t::local"
+
+    def test_no_default_profile_never_routes_enrolled(self, monkeypatch):
+        monkeypatch.setattr(browser_session_registry, "default_profile_name", lambda: None)
+        assert browser_tool._navigation_session_key("t", TRUSTED) == "t"
