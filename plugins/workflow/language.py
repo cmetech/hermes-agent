@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
+from datetime import date, datetime
 from hashlib import sha256
 import json
 from typing import Any, Mapping
@@ -139,15 +141,28 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, tuple | list):
         return [_json_safe(item) for item in value]
     if isinstance(value, frozenset | set):
-        return sorted(_json_safe(item) for item in value)
+        return sorted((_json_safe(item) for item in value), key=_canonical_json)
+    if isinstance(value, datetime):
+        return {"__yaml_scalar__": "timestamp", "value": value.isoformat()}
+    if isinstance(value, date):
+        return {"__yaml_scalar__": "date", "value": value.isoformat()}
+    if isinstance(value, bytes):
+        return {
+            "__yaml_scalar__": "binary",
+            "base64": base64.b64encode(value).decode("ascii"),
+        }
     return value
 
 
 def _sha256_json(document: Mapping[str, Any]) -> str:
-    canonical = json.dumps(
-        document,
+    return sha256(_canonical_json(document).encode("utf-8")).hexdigest()
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
+        allow_nan=False,
     )
-    return sha256(canonical.encode("utf-8")).hexdigest()

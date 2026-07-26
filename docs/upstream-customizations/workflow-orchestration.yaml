@@ -3127,6 +3127,8 @@ upstream_changes:
   - normalize_workflow
   - bind_semantic_fingerprint
   - language_projection
+  - YAML-native scalar canonicalization
+  - strict non-finite JSON float rejection
   tests:
   - tests/plugins/workflow/test_language.py
   expected_commit_subject: 'feat(workflow): define language profile contracts'
@@ -3135,7 +3137,9 @@ upstream_changes:
     Preserve the dependency-neutral immutable language contracts and the
     deterministic, versioned normalization boundary. Keep unversioned
     workflows on hermes-legacy, exclude source locations from semantic
-    identity, and fail closed for unsupported profiles or normalizer versions.
+    identity, encode every safe-load YAML scalar deterministically, reject
+    non-finite JSON floats, and fail closed for unsupported profiles or
+    normalizer versions.
   removal_condition: >-
     Remove when upstream provides an equivalent dependency-neutral immutable,
     versioned workflow normalization boundary with deterministic semantic

@@ -18,6 +18,7 @@ from plugins.workflow.models import (
     WorkflowNode,
     freeze_value,
 )
+from plugins.workflow.schema import load_workflow
 
 
 @pytest.fixture
@@ -133,3 +134,71 @@ def test_normalized_digest_excludes_source_location_and_diagnostics(definition):
     ).metadata.normalized_definition_digest
 
     assert left_digest == right_digest
+
+
+def test_legacy_yaml_native_scalars_normalize_deterministically_across_paths(tmp_path):
+    workflow = """\
+name: legacy-scalars
+description: Legacy YAML scalar contract
+nodes:
+  - id: start
+    bash: \"true\"
+ignored_null: null
+ignored_boolean: true
+ignored_integer: 42
+ignored_float: 1.25
+ignored_string: plain text
+ignored_date: 2026-07-25
+ignored_timestamp: 2026-07-25T12:34:56+00:00
+ignored_binary: !!binary |
+  AAEC
+"""
+    installed_path = tmp_path / "installed" / "legacy.yaml"
+    sealed_path = tmp_path / "sealed" / "definition.yaml"
+    installed_path.parent.mkdir()
+    sealed_path.parent.mkdir()
+    installed_path.write_text(workflow, encoding="utf-8")
+    sealed_path.write_text(workflow, encoding="utf-8")
+
+    installed = load_workflow(installed_path)
+    sealed = load_workflow(sealed_path)
+    selection = resolve_language_profile({})
+
+    installed_normalized = normalize_workflow(
+        installed.definition,
+        selection=selection,
+        normalizer_version=1,
+    )
+    sealed_normalized = normalize_workflow(
+        sealed.definition,
+        selection=selection,
+        normalizer_version=1,
+    )
+
+    assert (
+        installed_normalized.metadata.normalized_definition_digest
+        == sealed_normalized.metadata.normalized_definition_digest
+    )
+
+
+def test_nonfinite_yaml_float_is_rejected_by_strict_json_normalization(tmp_path):
+    path = tmp_path / "nonfinite.yaml"
+    path.write_text(
+        """\
+name: nonfinite
+description: Non-finite scalar fixture
+nodes:
+  - id: start
+    bash: \"true\"
+ignored_float: .nan
+""",
+        encoding="utf-8",
+    )
+    package = load_workflow(path)
+
+    with pytest.raises(ValueError, match="Out of range float values are not JSON compliant"):
+        normalize_workflow(
+            package.definition,
+            selection=resolve_language_profile({}),
+            normalizer_version=1,
+        )
