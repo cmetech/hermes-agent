@@ -23,6 +23,14 @@ from plugins.workflow.scheduled_revalidation import sealed_snapshot_digest
 from plugins.workflow.store import RunStore
 
 
+LEGACY_STORE_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "store"
+    / "pre-production-amendment-v2.0.9"
+)
+
+
 def _profile_package(workflow_writer, root: Path, *, profile: str):
     path = workflow_writer(root / "package", name=f"{profile}-snapshot")
     if profile == "archon-2026-07":
@@ -72,6 +80,22 @@ def _prepare_pre_language_snapshot(store: RunStore, package):
     )
 
 
+def _pre_language_seals(prepared) -> dict[str, str]:
+    staging = prepared.staging_directory
+    return {
+        "sealed_definition_digest": sha256(
+            (staging / "definition.yaml").read_bytes()
+        ).hexdigest(),
+        "sealed_policy_digest": sha256(
+            (staging / "policy.yaml").read_bytes()
+            if (staging / "policy.yaml").is_file()
+            else b"{}\n"
+        ).hexdigest(),
+        "sealed_input_digest": sha256(
+            (staging / "resources.json").read_bytes()
+        ).hexdigest(),
+        "sealed_snapshot_digest": sealed_snapshot_digest(staging),
+    }
 def _rewrite_resources(store: RunStore, run_id: str, mutate) -> None:
     resources_path = store.run_directory(run_id) / "resources.json"
     resources = json.loads(resources_path.read_bytes())
@@ -99,11 +123,25 @@ def _rewrite_language_for_sealed_package(store: RunStore, run_id: str) -> None:
     )
 
 
-def _load_with_scheduler(store: RunStore, run_id: str):
+def _load_with_scheduler(
+    store: RunStore, run_id: str, *, historical_projection: bool = False
+):
     scheduler = RunScheduler(store)
+    original_load_run = store.load_run
+    if historical_projection:
+        projection = json.loads(json.dumps(original_load_run(run_id)))
+        projection.pop("snapshot_format_version", None)
+
+        def load_historical(candidate: str):
+            if candidate == run_id:
+                return json.loads(json.dumps(projection))
+            return original_load_run(candidate)
+
+        store.load_run = load_historical  # type: ignore[method-assign]
     try:
         return scheduler._load_run_package(run_id)
     finally:
+        store.load_run = original_load_run  # type: ignore[method-assign]
         scheduler.shutdown(deadline_seconds=2)
 
 
@@ -557,10 +595,15 @@ def test_resume_rejects_changed_language_digest(
     assert exc.value.code == "workflow_snapshot_integrity_mismatch"
 
 
-def test_legacy_snapshot_without_language_metadata_still_loads(
+def test_pre_language_snapshot_with_reconstructible_package_digest_still_loads(
     tmp_path, workflow_writer
 ):
-    package = _profile_package(workflow_writer, tmp_path, profile="hermes-legacy")
+    name = "reconstructible-legacy"
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package", name=name, filename=f"{name}.yaml"
+        )
+    )
     store = RunStore(tmp_path / "home")
     prepared = _prepare_pre_language_snapshot(store, package)
     admitted = store.start_run(
@@ -577,9 +620,260 @@ def test_legacy_snapshot_without_language_metadata_still_loads(
     )
     assert admitted.run_id is not None
 
-    loaded = _load_with_scheduler(store, admitted.run_id)
+    loaded = _load_with_scheduler(
+        store, admitted.run_id, historical_projection=True
+    )
 
     assert loaded.language.effective_profile.value == "hermes-legacy"
+
+
+def test_checked_in_v209_snapshot_package_identity_is_reconstructible():
+    run_directory = (
+        LEGACY_STORE_FIXTURE
+        / "runs"
+        / "migration-fixture"
+        / "migration-run"
+    )
+    projection = json.loads((run_directory / "run.json").read_bytes())
+
+    digest = RunScheduler._legacy_package_digest_for_identity(
+        run_directory,
+        sealed_paths=frozenset({"definition.yaml", "policy.yaml"}),
+        workflow_identity="migration-fixture.yaml",
+    )
+
+    assert digest == projection["definition_digest"]
+
+
+@pytest.mark.parametrize(
+    "identity",
+    ["wrong-name.yaml", "../migration-fixture.yaml", "/migration-fixture.yaml"],
+)
+def test_v209_snapshot_rejects_wrong_or_escaping_path_identity(identity):
+    run_directory = (
+        LEGACY_STORE_FIXTURE
+        / "runs"
+        / "migration-fixture"
+        / "migration-run"
+    )
+    projection = json.loads((run_directory / "run.json").read_bytes())
+
+    digest = RunScheduler._legacy_package_digest_for_identity(
+        run_directory,
+        sealed_paths=frozenset({"definition.yaml", "policy.yaml"}),
+        workflow_identity=identity,
+    )
+
+    assert digest != projection["definition_digest"]
+
+
+def test_v209_snapshot_reconstruction_rejects_altered_definition(tmp_path):
+    source = (
+        LEGACY_STORE_FIXTURE
+        / "runs"
+        / "migration-fixture"
+        / "migration-run"
+    )
+    run_directory = tmp_path / "migration-run"
+    run_directory.mkdir()
+    for relative in ("definition.yaml", "policy.yaml", "run.json"):
+        (run_directory / relative).write_bytes((source / relative).read_bytes())
+    projection = json.loads((run_directory / "run.json").read_bytes())
+    (run_directory / "definition.yaml").write_text(
+        "name: migration-fixture\nnodes: [{id: start, bash: forged}]\n",
+        encoding="utf-8",
+    )
+
+    digest = RunScheduler._legacy_package_digest_for_identity(
+        run_directory,
+        sealed_paths=frozenset({"definition.yaml", "policy.yaml"}),
+        workflow_identity="migration-fixture.yaml",
+    )
+
+    assert digest != projection["definition_digest"]
+
+
+def test_verifiable_pre_language_scheduled_snapshot_still_loads(
+    tmp_path, workflow_writer
+):
+    package = _profile_package(workflow_writer, tmp_path, profile="hermes-legacy")
+    store = RunStore(tmp_path / "home")
+    prepared = _prepare_pre_language_snapshot(store, package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cron",
+            idempotency_key="legacy-scheduled-v0",
+            concurrency_key=package.definition.name,
+            run_metadata=_pre_language_seals(prepared),
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    output = store.run_directory(admitted.run_id) / "nodes" / "start" / "stdout.txt"
+    output.parent.mkdir(parents=True)
+    output.write_text("legitimate mutable output\n", encoding="utf-8")
+
+    loaded = _load_with_scheduler(
+        store, admitted.run_id, historical_projection=True
+    )
+
+    assert loaded.language.effective_profile.value == "hermes-legacy"
+
+
+def test_pre_language_snapshot_rejects_altered_definition(
+    tmp_path, workflow_writer
+):
+    name = "legacy-definition-integrity"
+    path = workflow_writer(tmp_path / "package", name=name, filename=f"{name}.yaml")
+    package = load_workflow(path)
+    store = RunStore(tmp_path / "home")
+    prepared = _prepare_pre_language_snapshot(store, package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="legacy-definition-integrity",
+            concurrency_key=name,
+            run_metadata=_pre_language_seals(prepared),
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    definition_path = store.run_directory(admitted.run_id) / "definition.yaml"
+    definition = yaml.safe_load(definition_path.read_text(encoding="utf-8"))
+    definition["nodes"][0]["bash"] = "printf forged"
+    definition_path.write_text(
+        yaml.safe_dump(definition, sort_keys=False), encoding="utf-8"
+    )
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        _load_with_scheduler(
+            store, admitted.run_id, historical_projection=True
+        )
+
+    assert exc.value.code == "workflow_snapshot_integrity_mismatch"
+
+
+def test_pre_language_snapshot_rejects_altered_package_resource(
+    tmp_path, workflow_writer
+):
+    name = "legacy-resource-integrity"
+    root = tmp_path / "package"
+    command = root / "commands" / "inspect.md"
+    command.parent.mkdir(parents=True)
+    command.write_text("Inspect admitted bytes.\n", encoding="utf-8")
+    package = load_workflow(
+        workflow_writer(
+            root,
+            name=name,
+            filename=f"{name}.yaml",
+            nodes=[{"id": "inspect", "command": "inspect"}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = _prepare_pre_language_snapshot(store, package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="legacy-resource-integrity",
+            concurrency_key=name,
+            run_metadata=_pre_language_seals(prepared),
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    sealed_command = store.run_directory(admitted.run_id) / "commands" / "inspect.md"
+    sealed_command.write_text("Execute forged instructions.\n", encoding="utf-8")
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        _load_with_scheduler(
+            store, admitted.run_id, historical_projection=True
+        )
+
+    assert exc.value.code == "workflow_snapshot_integrity_mismatch"
+
+
+def test_unverifiable_pre_language_snapshot_requires_readmission(
+    tmp_path, workflow_writer
+):
+    package = _profile_package(workflow_writer, tmp_path, profile="hermes-legacy")
+    store = RunStore(tmp_path / "home")
+    prepared = replace(
+        _prepare_pre_language_snapshot(store, package),
+        definition_digest="0" * 64,
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="legacy-unverifiable",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    assert store.load_run(admitted.run_id)["snapshot_format_version"] == 1
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        _load_with_scheduler(
+            store, admitted.run_id, historical_projection=True
+        )
+
+    assert exc.value.code == "workflow_legacy_snapshot_unverifiable"
+    assert "re-trust" in str(exc.value)
+    assert "new run" in str(exc.value)
+
+
+def test_pre_language_snapshot_rejects_ambiguous_reconstructed_identities(
+    tmp_path, workflow_writer, monkeypatch
+):
+    name = "ambiguous-legacy"
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package", name=name, filename=f"{name}.yaml"
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = _prepare_pre_language_snapshot(store, package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="ambiguous-legacy",
+            concurrency_key=name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    monkeypatch.setattr(
+        RunScheduler,
+        "_legacy_package_digest_for_identity",
+        staticmethod(lambda *_args, **_kwargs: prepared.definition_digest),
+    )
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        _load_with_scheduler(
+            store, admitted.run_id, historical_projection=True
+        )
+
+    assert exc.value.code == "workflow_legacy_snapshot_unverifiable"
 
 
 def test_pre_language_legacy_snapshot_rejects_executable_shadow(
@@ -616,7 +910,9 @@ def test_pre_language_legacy_snapshot_rejects_executable_shadow(
     )
 
     with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
-        _load_with_scheduler(store, admitted.run_id)
+        _load_with_scheduler(
+            store, admitted.run_id, historical_projection=True
+        )
 
     assert exc.value.code == "workflow_snapshot_integrity_mismatch"
 
@@ -649,6 +945,44 @@ def test_new_legacy_snapshot_without_language_metadata_fails_closed(
             input_manifest_digest=prepared.input_manifest_digest,
             trigger_source="cli",
             idempotency_key="new-legacy-without-language",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    assert store.load_run(admitted.run_id)["snapshot_format_version"] == 1
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        _load_with_scheduler(store, admitted.run_id)
+
+    assert exc.value.code == "workflow_language_snapshot_missing"
+
+
+def test_current_snapshot_cannot_downgrade_into_pre_language_fallback(
+    tmp_path, workflow_writer
+):
+    package = _profile_package(workflow_writer, tmp_path, profile="hermes-legacy")
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    resources_path = prepared.staging_directory / "resources.json"
+    resources = json.loads(resources_path.read_bytes())
+    resources.pop("language")
+    encoded = json.dumps(resources, sort_keys=True, separators=(",", ":")).encode()
+    resources_path.write_bytes(encoded)
+    prepared = replace(
+        prepared,
+        input_manifest_digest=sha256(encoded).hexdigest(),
+        language=None,
+        sealed_snapshot_digest=None,
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="current-format-downgrade",
             concurrency_key=package.definition.name,
         ),
         immutable_snapshot=prepared,

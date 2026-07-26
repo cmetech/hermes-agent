@@ -173,15 +173,18 @@ def sealed_snapshot_digest(
                 ) from exc
             for entry in children:
                 path = Path(entry.path)
+                relative = path.relative_to(snapshot_root).as_posix()
+                first_part = PurePosixPath(relative).parts[0]
                 try:
                     if entry.is_symlink():
                         raise ScheduledRunRevalidationError(
                             "sealed snapshot contains a symlink"
                         )
                     if entry.is_dir(follow_symlinks=False):
+                        if first_part in _MUTABLE_RUN_ROOTS:
+                            continue
                         pending.append(path)
                     elif entry.is_file(follow_symlinks=False):
-                        relative = path.relative_to(snapshot_root).as_posix()
                         if relative not in _MUTABLE_RUN_FILES:
                             entries.append((relative, path))
                     else:

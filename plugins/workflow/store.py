@@ -3811,6 +3811,7 @@ class RunStore:
             "run_id": run_id,
             "workflow": request.workflow_name,
             "workflow_version": snapshot.workflow_version,
+            "snapshot_format_version": 1,
             "definition_digest": request.definition_digest,
             "policy_digest": request.policy_digest,
             "input_manifest_digest": request.input_manifest_digest,

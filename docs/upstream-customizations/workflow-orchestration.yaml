@@ -3231,6 +3231,7 @@ upstream_changes:
   - verify_language_snapshot
   - PreparedRunSnapshot.language
   - PreparedRunSnapshot.sealed_snapshot_digest
+  - run projection snapshot_format_version
   - resources.json language metadata
   - resources.json sealed_paths metadata
   - run projection language metadata
@@ -3238,6 +3239,9 @@ upstream_changes:
   - load_workflow_snapshot normalizer_version pin
   - RunScheduler._load_verified_run_package atomic verification result
   - RunScheduler._load_run_package sealed language verification
+  - RunScheduler._verify_legacy_journaled_seals
+  - RunScheduler._verify_legacy_admission_identity
+  - RunScheduler._legacy_package_digest_for_identity
   - read_sealed_snapshot_paths
   - sealed_snapshot_digest admitted-path verification
   - verify_sealed_snapshot language identity verification
@@ -3274,12 +3278,27 @@ upstream_changes:
     Select the pinned supported normalizer and fail closed with typed invalid,
     unsupported-profile, unsupported-version, missing, mismatch, or snapshot
     integrity errors before node execution. Preserve positional
-    PreparedRunSnapshot compatibility by appending defaulted fields. Preserve
-    the pre-language fallback only for snapshots with neither language nor
-    sealed-tree projection whose policy resolves to hermes-legacy; reject
-    ambiguous legacy script/MCP precedence candidates and bind the surviving
-    legacy resource set for execution. Declared Archon and new-format snapshots
-    without language metadata remain invalid.
+    PreparedRunSnapshot compatibility by appending defaulted fields. Stamp
+    every new durable projection with snapshot_format_version so
+    removing language or tree fields cannot make a current admission look
+    historical. Preserve the pre-language fallback only for marker-free
+    snapshots whose policy resolves to hermes-legacy and whose executable
+    closure is authenticated by the old package digest, an exact bounded
+    historical path-identity reconstruction, or journaled direct/whole-tree
+    seals. Derive at most eight reconstruction candidates from authenticated
+    workflow identity and stored catalog/workflow paths, require one exact old
+    package-digest match, and fail closed on zero or multiple matches. Verify
+    this against the checked-in v2.0.9 migration fixture. Verify every available journaled definition,
+    policy, resources, and immutable-tree seal before parsing executable YAML;
+    legacy tree verification excludes only the code-owned mutable nodes/ and
+    artifacts/ roots. Reject ambiguous legacy script/MCP precedence candidates
+    and bind the surviving legacy resource set for execution. A historical row
+    whose sealed rename lost the original package-relative path and which has
+    no direct or whole-tree seal is cryptographically unverifiable: fail with
+    workflow_legacy_snapshot_unverifiable and instruct the operator to re-trust
+    the installed workflow and start a new run. Never infer trust for those
+    bytes. Declared Archon and new-format snapshots without language metadata
+    remain invalid.
     Scheduled revalidation must compare projection and resources language plus
     sealed-tree identities, while not-due coordinator polling stays bounded and
     does not reopen installed workflow definitions.
