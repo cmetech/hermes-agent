@@ -18,7 +18,15 @@ from pathlib import Path
 from typing import Iterator, Literal, Mapping
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from hermes_constants import get_hermes_home
 from plugins.workflow.actions import MUTATION_ACTIONS, mutation_is_valid
@@ -37,6 +45,8 @@ from plugins.workflow.store import JournalRecoveryError, RunStore
 _CURSOR_SECRET = secrets.token_bytes(32)
 _RUNTIME: WorkflowApiRuntime | None = None
 _RUNTIME_LOCK = threading.Lock()
+_WORKFLOW_RESPONSE_TEXT_MAX = 16_384
+_WORKFLOW_COMPATIBILITY_FINDINGS_MAX = 200
 
 
 def _runtime() -> WorkflowApiRuntime:
@@ -230,6 +240,82 @@ class WorkflowCatalogRunSupport(BaseModel):
     ]
 
 
+WorkflowLanguageProfile = Literal["hermes-legacy", "archon-2026-07"]
+WorkflowCompatibilityLevel = Literal["portable", "mapped", "unsupported"]
+
+
+class WorkflowCatalogLanguageStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    effective_profile: WorkflowLanguageProfile
+    legacy: StrictBool
+
+    @model_validator(mode="after")
+    def require_consistent_legacy_status(self):
+        if self.legacy != (self.effective_profile == "hermes-legacy"):
+            raise ValueError("legacy must match effective_profile")
+        return self
+
+
+class WorkflowDetailLanguageStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    declared_profile: WorkflowLanguageProfile | None
+    effective_profile: WorkflowLanguageProfile
+    legacy: StrictBool
+    normalizer_version: StrictInt = Field(..., ge=1, le=1)
+    normalized_definition_digest: str = Field(
+        ..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+
+    @model_validator(mode="after")
+    def require_consistent_profile_status(self):
+        if self.legacy != (self.effective_profile == "hermes-legacy"):
+            raise ValueError("legacy must match effective_profile")
+        if self.declared_profile is None:
+            if self.effective_profile != "hermes-legacy":
+                raise ValueError("an undeclared profile must resolve to hermes-legacy")
+        elif self.declared_profile != self.effective_profile:
+            raise ValueError("declared_profile must match effective_profile")
+        return self
+
+
+class WorkflowCompatibilitySummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    level: WorkflowCompatibilityLevel
+    runnable: StrictBool
+
+
+class WorkflowCompatibilityFinding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(..., max_length=_WORKFLOW_RESPONSE_TEXT_MAX)
+    level: WorkflowCompatibilityLevel
+    message: str = Field(..., max_length=_WORKFLOW_RESPONSE_TEXT_MAX)
+    blocking: StrictBool
+    code: str = Field(..., min_length=1, max_length=_WORKFLOW_RESPONSE_TEXT_MAX)
+    severity: Literal["info", "warning", "error"] | None = Field(
+        None, exclude_if=lambda value: value is None
+    )
+    effective_profile: WorkflowLanguageProfile | None = Field(
+        None, exclude_if=lambda value: value is None
+    )
+    migration: str | None = Field(
+        None,
+        max_length=_WORKFLOW_RESPONSE_TEXT_MAX,
+        exclude_if=lambda value: value is None,
+    )
+
+
+class WorkflowCompatibilityFull(WorkflowCompatibilitySummary):
+    model_config = ConfigDict(extra="forbid")
+
+    findings: list[WorkflowCompatibilityFinding] = Field(
+        ..., max_length=_WORKFLOW_COMPATIBILITY_FINDINGS_MAX
+    )
+
+
 class WorkflowCatalogEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -243,8 +329,21 @@ class WorkflowCatalogEntry(BaseModel):
     inputs: list[WorkflowCatalogInput] = Field(..., max_length=64)
     supported_inputs: WorkflowCatalogInputSupport
     run_support: WorkflowCatalogRunSupport
-    language: dict[str, object]
-    compatibility: dict[str, object] | None = None
+    language: WorkflowCatalogLanguageStatus
+    compatibility: WorkflowCompatibilitySummary | WorkflowCompatibilityFull | None = (
+        None
+    )
+
+    @model_validator(mode="after")
+    def require_source_compatibility_projection(self):
+        if self.compatibility is None:
+            return self
+        if self.source == "showcase":
+            if not isinstance(self.compatibility, WorkflowCompatibilityFull):
+                raise ValueError("showcase compatibility must include findings")
+        elif isinstance(self.compatibility, WorkflowCompatibilityFull):
+            raise ValueError("project and profile compatibility must be summary-only")
+        return self
 
 
 class WorkflowCatalogErrorEntry(BaseModel):
@@ -293,9 +392,9 @@ class WorkflowDetailResponse(BaseModel):
     inputs: list[WorkflowCatalogInput] = Field(..., max_length=64)
     supported_inputs: WorkflowCatalogInputSupport
     run_support: WorkflowCatalogRunSupport
-    language: dict[str, object]
+    language: WorkflowDetailLanguageStatus
     risk_summary: dict[str, object]
-    compatibility: dict[str, object]
+    compatibility: WorkflowCompatibilityFull
     coordinator: WorkflowCoordinatorResponse
     topology: WorkflowTopologyResponse
     definition: dict[str, object]

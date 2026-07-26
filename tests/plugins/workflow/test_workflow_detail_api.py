@@ -209,6 +209,53 @@ def test_workflow_detail_source_disambiguates_user_and_verified_showcase(
     }
 
 
+def test_catalog_and_detail_models_accept_all_authoritative_source_projections(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.chdir(workdir)
+    workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="project-model",
+        filename="project-model.yaml",
+    )
+    workflow_writer(
+        home / "workflows",
+        name="profile-model",
+        filename="profile-model.yaml",
+    )
+    showcase_module._clear_verified_showcase_cache_for_tests()
+    module = _module()
+    router = module.router
+
+    catalog = TestClient(_app(router, token=_reader())).get(
+        "/api/plugins/workflow/workflows"
+    )
+
+    assert catalog.status_code == 200
+    rows = [item for item in catalog.json()["items"] if "source" in item]
+    assert {item["source"] for item in rows} == {"project", "profile", "showcase"}
+    for row in rows:
+        module.WorkflowCatalogEntry.model_validate(row)
+
+    for name, source in (
+        ("project-model", "project"),
+        ("profile-model", "profile"),
+        ("approval-gate", "showcase"),
+    ):
+        response = _detail_get(
+            router,
+            name,
+            token=_reader(),
+            catalog_source=source,
+        )
+        assert response.status_code == 200
+        module.WorkflowDetailResponse.model_validate(response.json())
+
+
 def test_workflow_detail_omitted_or_wrong_source_never_falls_through_to_showcase(
     tmp_path, monkeypatch
 ) -> None:

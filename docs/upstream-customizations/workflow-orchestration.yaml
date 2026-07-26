@@ -3385,12 +3385,26 @@ upstream_changes:
   - apps/desktop/src/i18n/zh.ts
   - apps/desktop/src/i18n/zh-hant.ts
   owned_symbols:
-  - bounded catalog language projection
-  - project and profile compatibility summary
-  - WorkflowLanguageStatus optional backend-skew contract
-  - read-only workflow language badges and detail alert
-  - authoritative compatibility.runnable Run gating
-  - all-locale workflow language copy
+  - _catalog_language_projection
+  - _compatibility_summary
+  - _compatibility_projection
+  - WorkflowCatalogLanguageStatus
+  - WorkflowDetailLanguageStatus
+  - WorkflowCompatibilitySummary
+  - WorkflowCompatibilityFinding
+  - WorkflowCompatibilityFull
+  - WorkflowCatalogEntry.require_source_compatibility_projection
+  - WorkflowDetailResponse.language
+  - WorkflowDetailResponse.compatibility
+  - WorkflowLanguageStatus
+  - CatalogRow
+  - ViewWorkflowDialog
+  - ReviewRunDialog
+  - workflowLanguageArchon
+  - workflowLanguageLegacy
+  - workflowLanguageLegacyDescription
+  - workflowLanguageNormalizer
+  - workflowLanguageDigest
   tests:
   - tests/plugins/workflow/test_catalog_api.py
   - tests/plugins/workflow/test_workflow_detail_api.py

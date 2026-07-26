@@ -295,6 +295,152 @@ def test_workflow_detail_and_response_model_require_generic_requires_ai(
         )
 
 
+def test_workflow_language_response_models_reject_non_contract_shapes() -> None:
+    module = _module()
+    list_status = {
+        "effective_profile": "hermes-legacy",
+        "legacy": True,
+    }
+    detail_status = {
+        "declared_profile": "archon-2026-07",
+        "effective_profile": "archon-2026-07",
+        "legacy": False,
+        "normalizer_version": 1,
+        "normalized_definition_digest": "a" * 64,
+    }
+
+    assert module.WorkflowCatalogLanguageStatus.model_validate(list_status)
+    assert module.WorkflowDetailLanguageStatus.model_validate(detail_status)
+
+    invalid_list = [
+        {**list_status, "declared_profile": None},
+        {"legacy": True},
+        {**list_status, "effective_profile": "future-profile"},
+        {**list_status, "legacy": 1},
+        {**list_status, "legacy": False},
+    ]
+    invalid_detail = [
+        {**detail_status, "extra": "escape"},
+        {key: value for key, value in detail_status.items() if key != "declared_profile"},
+        {**detail_status, "declared_profile": "future-profile"},
+        {**detail_status, "effective_profile": "hermes-legacy"},
+        {**detail_status, "legacy": 0},
+        {**detail_status, "normalizer_version": True},
+        {**detail_status, "normalizer_version": 2},
+        {**detail_status, "normalized_definition_digest": "A" * 64},
+        {**detail_status, "normalized_definition_digest": "a" * 63},
+    ]
+
+    for payload in invalid_list:
+        with pytest.raises(ValidationError):
+            module.WorkflowCatalogLanguageStatus.model_validate(payload)
+    for payload in invalid_detail:
+        with pytest.raises(ValidationError):
+            module.WorkflowDetailLanguageStatus.model_validate(payload)
+
+
+def test_workflow_compatibility_response_models_are_exact_bounded_and_strict() -> None:
+    module = _module()
+    summary = {"level": "mapped", "runnable": True}
+    finding = {
+        "path": "nodes[0].timeout",
+        "level": "unsupported",
+        "message": "timeout semantics are unavailable",
+        "blocking": True,
+        "code": "archon_timeout_semantics_unavailable",
+        "severity": "error",
+        "effective_profile": "archon-2026-07",
+        "migration": "Remove timeout.",
+    }
+    full = {"level": "unsupported", "runnable": False, "findings": [finding]}
+
+    assert module.WorkflowCompatibilitySummary.model_validate(summary)
+    assert module.WorkflowCompatibilityFull.model_validate(full)
+
+    invalid_summaries = [
+        {**summary, "findings": []},
+        {"level": "mapped"},
+        {**summary, "level": "future"},
+        {**summary, "runnable": 1},
+    ]
+    invalid_full = [
+        {**full, "unknown": True},
+        {**full, "findings": [finding] * 201},
+        {**full, "findings": [{**finding, "path": "p" * 16_385}]},
+        {**full, "findings": [{**finding, "message": "m" * 16_385}]},
+        {**full, "findings": [{**finding, "code": "c" * 16_385}]},
+        {**full, "findings": [{**finding, "migration": "m" * 16_385}]},
+        {**full, "findings": [{**finding, "blocking": 1}]},
+        {**full, "findings": [{**finding, "severity": "fatal"}]},
+        {**full, "findings": [{**finding, "effective_profile": "future"}]},
+        {**full, "findings": [{**finding, "extra": "escape"}]},
+    ]
+
+    for payload in invalid_summaries:
+        with pytest.raises(ValidationError):
+            module.WorkflowCompatibilitySummary.model_validate(payload)
+    for payload in invalid_full:
+        with pytest.raises(ValidationError):
+            module.WorkflowCompatibilityFull.model_validate(payload)
+
+
+def test_workflow_catalog_response_model_enforces_source_projection_and_old_optional_compatibility() -> None:
+    module = _module()
+    base = {
+        "name": "response-model",
+        "version": "1",
+        "description": "Response model fixture",
+        "requires_ai": False,
+        "source": "profile",
+        "precedence": 2,
+        "trust_state": "untrusted",
+        "inputs": [],
+        "supported_inputs": {"supported": True, "reason": "parameterless"},
+        "run_support": {"supported": True, "reason": "supported"},
+        "language": {"effective_profile": "hermes-legacy", "legacy": True},
+    }
+    summary = {"level": "mapped", "runnable": True}
+    full = {"level": "mapped", "runnable": True, "findings": []}
+
+    assert module.WorkflowCatalogEntry.model_validate({**base, "compatibility": summary})
+    assert module.WorkflowCatalogEntry.model_validate(base).compatibility is None
+    with pytest.raises(ValidationError):
+        module.WorkflowCatalogEntry.model_validate({**base, "compatibility": full})
+
+    showcase = {
+        **base,
+        "source": "showcase",
+        "precedence": 3,
+        "trust_state": "verified_bundled",
+    }
+    assert module.WorkflowCatalogEntry.model_validate(
+        {**showcase, "compatibility": full}
+    )
+    with pytest.raises(ValidationError):
+        module.WorkflowCatalogEntry.model_validate(
+            {**showcase, "compatibility": summary}
+        )
+
+
+def test_workflow_catalog_openapi_closes_language_and_compatibility_objects() -> None:
+    module = _module()
+    schemas = _app(module.router, token=_reader()).openapi()["components"]["schemas"]
+    nested_names = {
+        "WorkflowCatalogLanguageStatus",
+        "WorkflowDetailLanguageStatus",
+        "WorkflowCompatibilitySummary",
+        "WorkflowCompatibilityFull",
+        "WorkflowCompatibilityFinding",
+    }
+
+    for name in nested_names:
+        schema = schemas[name]
+        assert schema["additionalProperties"] is False
+        assert schema["type"] == "object"
+        assert schema.get("additionalProperties") != {}
+        assert schema.get("additionalProperties") is not True
+
+
 def test_workflow_catalog_keeps_isolation_incompatibility_scenario_local(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
