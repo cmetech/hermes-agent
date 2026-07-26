@@ -51,6 +51,12 @@ def _stub_env(monkeypatch):
     )
     monkeypatch.setattr(browser_session_manager.os, "makedirs", lambda *a, **kw: None)
     monkeypatch.setattr(browser_session_manager.time, "sleep", lambda s: None)
+    # Default the pre-launch reuse gate to "nothing is listening" so tests
+    # never hit the real network (127.0.0.1:9222 is Chrome's conventional
+    # remote-debugging port -- exactly what this feature encourages a
+    # developer to have running locally). Tests that specifically exercise
+    # the reuse path override this explicitly.
+    monkeypatch.setattr(browser_session_manager, "_cdp_browser_identity", lambda url: None)
     return calls
 
 
