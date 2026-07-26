@@ -74,25 +74,27 @@ def normalize_workflow(
             f"workflow normalizer version {normalizer_version!r} is unsupported",
         )
 
-    normalized_document = {
-        "profile": selection.effective_profile.value,
-        "normalizer_version": normalizer_version,
-        "definition": {
-            "name": source_definition.name,
-            "description": source_definition.description,
-            "nodes": [
-                {
-                    "id": node.id,
-                    "node_type": node.node_type,
-                    "value": _json_safe(node.value),
-                    "depends_on": list(node.depends_on),
-                    "options": _json_safe(node.options),
-                }
-                for node in source_definition.nodes
-            ],
-            "options": _json_safe(source_definition.options),
-        },
-    }
+    normalized_document = _json_safe(
+        {
+            "profile": selection.effective_profile.value,
+            "normalizer_version": normalizer_version,
+            "definition": {
+                "name": source_definition.name,
+                "description": source_definition.description,
+                "nodes": [
+                    {
+                        "id": node.id,
+                        "node_type": node.node_type,
+                        "value": node.value,
+                        "depends_on": list(node.depends_on),
+                        "options": node.options,
+                    }
+                    for node in source_definition.nodes
+                ],
+                "options": source_definition.options,
+            },
+        }
+    )
     metadata = WorkflowLanguageMetadata(
         declared_profile=selection.declared_profile,
         effective_profile=selection.effective_profile,
@@ -136,29 +138,46 @@ def language_projection(
 
 
 def _json_safe(value: Any) -> Any:
-    """Convert frozen workflow values into canonical JSON-compatible values."""
+    """Encode the complete workflow value graph with collision-proof types."""
     if isinstance(value, Mapping):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, tuple | list):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, frozenset | set):
-        return sorted((_json_safe(item) for item in value), key=_canonical_json)
-    if isinstance(value, float) and not math.isfinite(value):
         return {
-            "__yaml_scalar__": "nonfinite-float",
+            "type": "mapping",
+            "entries": [
+                [_json_safe(str(key)), _json_safe(item)]
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            ],
+        }
+    if isinstance(value, tuple | list):
+        return {"type": "sequence", "items": [_json_safe(item) for item in value]}
+    if isinstance(value, frozenset | set):
+        items = sorted((_json_safe(item) for item in value), key=_canonical_json)
+        return {"type": "set", "items": items}
+    if isinstance(value, datetime):
+        return {"type": "timestamp", "value": value.isoformat()}
+    if isinstance(value, date):
+        return {"type": "date", "value": value.isoformat()}
+    if isinstance(value, bytes):
+        return {
+            "type": "binary",
+            "base64": base64.b64encode(value).decode("ascii"),
+        }
+    if value is None:
+        return {"type": "null"}
+    if isinstance(value, bool):
+        return {"type": "boolean", "value": value}
+    if isinstance(value, int):
+        return {"type": "integer", "value": value}
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return {"type": "float", "value": value}
+        return {
+            "type": "float",
             "kind": "nan" if math.isnan(value) else "infinity",
             "sign": "negative" if math.copysign(1.0, value) < 0 else "positive",
         }
-    if isinstance(value, datetime):
-        return {"__yaml_scalar__": "timestamp", "value": value.isoformat()}
-    if isinstance(value, date):
-        return {"__yaml_scalar__": "date", "value": value.isoformat()}
-    if isinstance(value, bytes):
-        return {
-            "__yaml_scalar__": "binary",
-            "base64": base64.b64encode(value).decode("ascii"),
-        }
-    return value
+    if isinstance(value, str):
+        return {"type": "string", "value": value}
+    raise TypeError(f"unsupported workflow value type: {type(value).__name__}")
 
 
 def _sha256_json(document: Mapping[str, Any]) -> str:

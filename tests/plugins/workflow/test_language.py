@@ -218,3 +218,53 @@ ignored_float: {scalar}
         digests[label] = installed.metadata.normalized_definition_digest
 
     assert len(set(digests.values())) == 3
+
+
+def test_legacy_mapping_cannot_impersonate_a_nonfinite_scalar_marker(tmp_path):
+    mapping_workflow = """\
+name: marker-collision
+description: Typed value graph fixture
+nodes:
+  - id: start
+    bash: \"true\"
+ignored_value:
+  __yaml_scalar__: nonfinite-float
+  kind: nan
+  sign: positive
+"""
+    nan_workflow = """\
+name: marker-collision
+description: Typed value graph fixture
+nodes:
+  - id: start
+    bash: \"true\"
+ignored_value: .nan
+"""
+    installed_path = tmp_path / "installed" / "mapping.yaml"
+    sealed_path = tmp_path / "sealed" / "definition.yaml"
+    nan_path = tmp_path / "nan.yaml"
+    installed_path.parent.mkdir()
+    sealed_path.parent.mkdir()
+    installed_path.write_text(mapping_workflow, encoding="utf-8")
+    sealed_path.write_text(mapping_workflow, encoding="utf-8")
+    nan_path.write_text(nan_workflow, encoding="utf-8")
+    selection = resolve_language_profile({})
+
+    installed_digest = normalize_workflow(
+        load_workflow(installed_path).definition,
+        selection=selection,
+        normalizer_version=1,
+    ).metadata.normalized_definition_digest
+    sealed_digest = normalize_workflow(
+        load_workflow(sealed_path).definition,
+        selection=selection,
+        normalizer_version=1,
+    ).metadata.normalized_definition_digest
+    nan_digest = normalize_workflow(
+        load_workflow(nan_path).definition,
+        selection=selection,
+        normalizer_version=1,
+    ).metadata.normalized_definition_digest
+
+    assert installed_digest == sealed_digest
+    assert installed_digest != nan_digest
