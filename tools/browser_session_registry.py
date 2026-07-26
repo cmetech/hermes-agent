@@ -16,6 +16,7 @@ Design: docs/plans/2026-07-20-persistent-enrolled-browser-session-design.md
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Any, Dict, Optional
 
@@ -105,15 +106,18 @@ def default_profile_trusts_url(url: str) -> bool:
 
 def default_profile_launchable() -> bool:
     """Return True when ``browser.default_profile`` names an ENROLLED profile
-    whose browser executable actually resolves on this machine.
+    whose browser executable actually resolves on this machine, AND whose
+    ``user_data_dir``/``cdp_port`` are usable.
 
     Gates the browser tools' availability check: such a session drives the
     user's real installed browser over CDP and needs no bundled Chromium, so
     withholding every browser tool for a missing Chromium would be wrong.
 
-    Requires the executable to resolve, not merely the toggle to be on, so we
-    never advertise a tool that would hang until the command timeout on first
-    use — the same reasoning the Termux branch applies. Fails CLOSED.
+    Validates the whole launch chain, not merely the toggle, so we never
+    advertise a tool that would fail (PermissionError on a non-executable
+    file, or hang until the command timeout) on first use — the same
+    reasoning the Termux branch applies (review finding EBL-006). Fails
+    CLOSED.
     """
     name = default_profile_name()
     if not name:
@@ -124,7 +128,16 @@ def default_profile_launchable() -> bool:
         profile = get_profile(name)
         if profile is None or not profile.is_enrolled:
             return False
-        return bool(resolve_executable(profile))
+        if not resolve_executable(profile):
+            return False
+        # A launch that cannot create its user-data-dir, or whose port is out of
+        # range, fails on every acquire -- do not advertise the tools for it.
+        data_dir = os.path.expandvars(profile.user_data_dir or "")
+        if not data_dir:
+            return False
+        if not (1 <= int(profile.cdp_port) <= 65535):
+            return False
+        return True
     except Exception as exc:  # noqa: BLE001
         logger.debug("default_profile_launchable: reporting unavailable after error: %s", exc)
         return False

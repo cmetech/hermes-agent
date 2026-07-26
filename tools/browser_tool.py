@@ -5042,17 +5042,6 @@ def check_browser_requirements() -> bool:
     if _get_cdp_override():
         return True
 
-    # OTTO: an enrolled default profile drives the user's REAL installed browser
-    # over CDP (see _session_cdp_url), so it needs no bundled Chromium — without
-    # this, a machine that never downloaded agent-browser's Chromium has every
-    # browser tool silently withheld even though the enrolled path would never
-    # have used it. Scoped to "would actually work": the toggle must be on AND
-    # the executable must resolve, so we never advertise a tool that fails on
-    # first use. Toggle off means the throwaway browser, which genuinely does
-    # need Chromium, and the checks below still apply.
-    if _default_profile_launchable():
-        return True
-
     # The agent-browser CLI is required for local launch and cloud-provider flows.
     # Tool-schema assembly runs during Desktop startup; do not execute
     # ``agent-browser --version`` here, because Windows .cmd shims route through
@@ -5069,6 +5058,13 @@ def check_browser_requirements() -> bool:
     # first use.
     if _requires_real_termux_browser_install(browser_cmd):
         return False
+
+    # OTTO: an enrolled default profile drives the user's REAL installed browser
+    # over CDP, so it needs no bundled Chromium -- but it still drives that
+    # browser THROUGH agent-browser (`--cdp <url>`), so the CLI check above
+    # still applies and this return sits after it (review finding EBL-006).
+    if _default_profile_launchable():
+        return True
 
     # In cloud mode, also require provider credentials. Cloud browsers
     # don't need a local Chromium binary.

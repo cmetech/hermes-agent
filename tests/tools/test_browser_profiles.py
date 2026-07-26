@@ -199,6 +199,7 @@ class TestResolveExecutable:
     def test_explicit_path_is_used_when_it_exists(self, monkeypatch, tmp_path):
         exe = tmp_path / "msedge"
         exe.write_text("")
+        exe.chmod(0o755)
         p = browser_profiles.BrowserProfile(
             name="enrolled", kind=browser_profiles.KIND_ENROLLED, executable=str(exe)
         )
@@ -215,6 +216,7 @@ class TestResolveExecutable:
     def test_auto_probes_platform_candidates(self, monkeypatch, tmp_path):
         found = tmp_path / "Microsoft Edge"
         found.write_text("")
+        found.chmod(0o755)
         monkeypatch.setattr(
             browser_profiles, "_enrolled_candidates", lambda: [str(tmp_path / "nope"), str(found)]
         )

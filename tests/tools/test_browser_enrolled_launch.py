@@ -33,6 +33,9 @@ ENROLLED = browser_profiles.BrowserProfile(
     kind=browser_profiles.KIND_ENROLLED,
     trusted_origins=("https://wiki.corp.example",),
     headed=True,
+    # A launchable profile needs a real user_data_dir -- see EBL-006's
+    # default_profile_launchable() chain validation in TestAvailabilityGate.
+    user_data_dir="/tmp/otto-enrolled-profile",
 )
 EPHEMERAL = browser_profiles.BrowserProfile(name="default")
 
@@ -330,3 +333,35 @@ class TestAvailabilityGate:
             browser_session_registry, "default_profile_name", lambda: "default"
         )
         assert browser_tool.check_browser_requirements() is False
+
+    def test_unavailable_without_the_agent_browser_cli(self, monkeypatch, tmp_path):
+        """The enrolled path still drives the browser THROUGH agent-browser."""
+        exe = tmp_path / "chrome"
+        exe.write_text("")
+        exe.chmod(0o755)
+        monkeypatch.setattr(browser_profiles, "get_profile", lambda n: ENROLLED)
+        monkeypatch.setattr(browser_profiles, "resolve_executable", lambda p: str(exe))
+        monkeypatch.setattr(
+            browser_session_registry, "default_profile_name", lambda: "enrolled"
+        )
+
+        def _missing(**kw):
+            raise FileNotFoundError("agent-browser CLI not found")
+
+        monkeypatch.setattr(browser_tool, "_find_agent_browser", _missing)
+        assert browser_tool.check_browser_requirements() is False
+
+    def test_non_executable_file_does_not_resolve(self, tmp_path):
+        exe = tmp_path / "chrome"
+        exe.write_text("")
+        exe.chmod(0o644)
+        profile = browser_profiles.BrowserProfile(
+            name="enrolled", kind=browser_profiles.KIND_ENROLLED, executable=str(exe)
+        )
+        assert browser_profiles.resolve_executable(profile) is None
+
+    def test_directory_does_not_resolve(self, tmp_path):
+        profile = browser_profiles.BrowserProfile(
+            name="enrolled", kind=browser_profiles.KIND_ENROLLED, executable=str(tmp_path)
+        )
+        assert browser_profiles.resolve_executable(profile) is None

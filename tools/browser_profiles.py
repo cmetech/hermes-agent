@@ -265,6 +265,21 @@ def _enrolled_candidates() -> List[str]:
     ]
 
 
+def _is_runnable(path: str) -> bool:
+    """True when ``path`` is a regular file we could actually execute.
+
+    ``os.path.exists`` alone accepts a directory or a mode-0644 file, which then
+    passes the availability gate and fails at first launch with PermissionError
+    (review finding EBL-006). Windows has no execute bit, so the X_OK check is
+    POSIX-only.
+    """
+    if not os.path.isfile(path):
+        return False
+    if sys.platform == "win32":
+        return True
+    return os.access(path, os.X_OK)
+
+
 def resolve_executable(profile: BrowserProfile) -> Optional[str]:
     """Return the enrolled browser executable for ``profile``, or None.
 
@@ -276,9 +291,9 @@ def resolve_executable(profile: BrowserProfile) -> Optional[str]:
 
     configured = (profile.executable or "auto").strip()
     if configured and configured.lower() != "auto":
-        return configured if os.path.exists(configured) else None
+        return configured if _is_runnable(configured) else None
 
     for candidate in _enrolled_candidates():
-        if os.path.exists(candidate):
+        if _is_runnable(candidate):
             return candidate
     return None
