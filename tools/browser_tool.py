@@ -570,10 +570,10 @@ def _session_cdp_url(session_key: Optional[str]) -> str:
     meaning ``BROWSER_CDP_URL`` then ``browser.cdp_url`` — so ``/browser
     connect`` and a statically configured endpoint are unaffected.
 
-    ``acquire()`` also exports ``BROWSER_CDP_URL`` (``_attach_cdp``), which is
-    what keeps the unswapped predicates — ``_is_local_mode``,
-    ``_is_local_backend``, ``_ensure_cdp_supervisor`` — in agreement without
-    further edits to this heavily-churned file.
+    The endpoint is returned to the caller and stored in the session's own
+    record; it is NOT exported to ``os.environ``. A process-global endpoint
+    cannot model concurrent per-task state — see review finding EBL-001 and
+    ``docs/plans/2026-07-26-per-navigation-browser-profile-design.md``.
 
     Raises whatever ``acquire()`` raises (``ProfileError`` for an unresolvable
     enrolled browser). That propagation is deliberate: falling back to the
@@ -598,7 +598,7 @@ def _session_cdp_url(session_key: Optional[str]) -> str:
 
     from tools.browser_session_manager import ProfileError, acquire
 
-    session = acquire(profile.name, session_key=key)
+    session = acquire(profile.name, session_key=key, attach_global=False)
     cdp_url = _resolve_cdp_override(str(session.cdp_url or ""))
     if not cdp_url:
         raise ProfileError(

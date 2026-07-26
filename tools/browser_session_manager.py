@@ -252,12 +252,20 @@ class BrowserSession:
 
 def acquire(profile: str = browser_profiles.DEFAULT_PROFILE_NAME,
             headless: Optional[bool] = None,
-            session_key: Optional[str] = None) -> BrowserSession:
+            session_key: Optional[str] = None,
+            attach_global: bool = True) -> BrowserSession:
     """Acquire a session for ``profile``.
 
     ``headless`` defaults to the inverse of the profile's ``headed`` flag.
     ``session_key`` lets a caller bind the session under its own key — the agent
     passes its ``task_id`` so the trust seam in ``browser_tool`` matches.
+
+    ``attach_global`` controls whether the resolved endpoint is exported to the
+    process-global ``BROWSER_CDP_URL``. Scripted callers default to True and rely
+    on it. The AGENT passes False: a process-global endpoint cannot model
+    concurrent per-task state, and an explicitly ephemeral task would otherwise
+    read it back through ``_get_cdp_override()`` and drive the corporate browser
+    (review finding EBL-001).
 
     Raises ``ProfileError`` for an unknown profile, an unresolvable enrolled
     browser, or a browser that never exposes CDP. Never silently falls back to
@@ -275,7 +283,8 @@ def acquire(profile: str = browser_profiles.DEFAULT_PROFILE_NAME,
     cdp_url: Optional[str] = None
     if prof.is_enrolled:
         cdp_url = _ensure_enrolled_cdp(prof, effective_headless)
-        _attach_cdp(cdp_url)
+        if attach_global:
+            _attach_cdp(cdp_url)
 
     browser_session_registry.bind(key, prof.name)
     return BrowserSession(session_key=key, profile=prof, cdp_url=cdp_url)

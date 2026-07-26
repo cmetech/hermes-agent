@@ -57,7 +57,7 @@ class _AcquireSpy:
         self._cdp_url = cdp_url
         self._error = error
 
-    def __call__(self, profile, headless=None, session_key=None):
+    def __call__(self, profile, headless=None, session_key=None, attach_global=True):
         self.calls.append((profile, session_key))
         if self._error is not None:
             raise self._error
