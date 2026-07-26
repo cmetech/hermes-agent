@@ -3141,6 +3141,7 @@ class RunStore:
         )
         remaining_required = 0
         terminal_found = terminal_attempt_id is None
+        regrown: list[tuple[str, int, int]] = []
         for row in rows:
             reserve_bytes = int(row["terminal_reserve_bytes"])
             consumed_bytes = int(row["consumed_bytes"])
@@ -3152,18 +3153,57 @@ class RunStore:
                         "terminal_journal_reserve exhausted before durable completion"
                     )
                 remaining -= frame_bytes
-            else:
-                if projection_bytes > int(row["projection_limit_bytes"]):
-                    raise StorageQuotaError(
-                        "event_journal_quota protected terminal projection reserve"
-                    )
+            elif projection_bytes > int(row["projection_limit_bytes"]):
+                # A concurrently live sibling reserved against the projection as
+                # it stood when that sibling claimed. Ordinary progress -- every
+                # other sibling in the same fan-out completing and appending its
+                # results -- grows the projection past that snapshot, and the
+                # snapshot is never revised. Refusing here would fail a healthy
+                # run with executor_crash purely because a sibling started
+                # earlier, which is what a five-wide fan-out measured at only
+                # ~9% headroom before tipping over on a CI runner.
+                #
+                # Re-reserve that sibling at the CURRENT projection size instead.
+                # It still owes the same guarantee -- durable capacity for its
+                # own terminal and recovery frames -- so grow the reserve to
+                # match and let the journal-capacity check below decide whether
+                # the quota can actually fund it. That way the error we raise
+                # means "out of durable space", never "an older sibling's
+                # snapshot went stale".
+                grown = TerminalJournalReserve.for_projection(projection_bytes)
+                if grown.terminal_reserve_bytes > reserve_bytes:
+                    regrown.append((
+                        str(row["attempt_id"]),
+                        grown.projection_limit_bytes,
+                        grown.terminal_reserve_bytes,
+                    ))
+                    remaining = max(0, grown.terminal_reserve_bytes - consumed_bytes)
             remaining_required += remaining
         if not terminal_found:
             raise StorageQuotaError("terminal_journal_reserve is missing")
         if journal_bytes + frame_bytes + remaining_required > self.max_journal_bytes:
+            # Honest exhaustion: even after re-reserving, the journal cannot hold
+            # every live attempt's terminal evidence.
             raise StorageQuotaError(
                 "event_journal_quota protected terminal recovery capacity"
             )
+        if regrown:
+            # Only persisted once the capacity check above has passed, so a
+            # rejected write never leaves a widened reserve behind.
+            with (
+                nullcontext(connection)
+                if connection is not None
+                else self._connect()
+            ) as regrow_connection:
+                regrow_connection.executemany(
+                    "UPDATE attempt_journal_reserves "
+                    "SET projection_limit_bytes=?, terminal_reserve_bytes=? "
+                    "WHERE attempt_id=? AND terminal_reserve_bytes<?",
+                    [
+                        (limit, reserve, attempt_id, reserve)
+                        for attempt_id, limit, reserve in regrown
+                    ],
+                )
 
     def _consume_journal_reserve(
         self,
