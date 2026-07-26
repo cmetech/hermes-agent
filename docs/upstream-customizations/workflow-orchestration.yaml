@@ -3507,6 +3507,8 @@ upstream_changes:
   owned_symbols:
   - Phase 1 language base merge-gate suite selection
   - Phase 1 language native portability matrix suite selection
+  - relative PYTHON_BIN canonicalization before repository switching
+  - canonical per-file test isolation in the base merge gate
   - tests/plugins/workflow/test_language.py gate membership
   - tests/plugins/workflow/test_language_snapshot.py gate membership
   - tests/plugins/workflow/test_language_schema.py gate membership
@@ -3529,7 +3531,11 @@ upstream_changes:
     E2E suite. Keep the existing Desktop index and workflow-detail suites in
     the base gate's existing Vitest invocation. Retain the existing base and CI
     jobs, dependency installation, and process model rather than duplicating a
-    workflow, service, or install path.
+    workflow, service, or install path. Canonicalize an explicit relative
+    PYTHON_BIN before switching to rehearsal repositories, share that exact
+    environment into temporary worktrees, and run Python suites through the
+    canonical per-file runner so module globals and background runtime state
+    cannot cross test-file boundaries.
   removal_condition: >-
     Remove when upstream's base and native portability release gates select
     equivalent language contracts, admission pinning, schema, middleware, and

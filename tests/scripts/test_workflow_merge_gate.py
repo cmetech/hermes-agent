@@ -4,6 +4,7 @@ from pathlib import Path
 import os
 import re
 import subprocess
+import sys
 
 import yaml
 
@@ -358,6 +359,13 @@ def test_merge_gate_shares_workspace_root_dependencies_with_temp_worktrees() -> 
     assert '[[ -d node_modules ]]' in source
 
 
+def test_base_gate_uses_the_canonical_per_file_test_runner() -> None:
+    source = GATE.read_text()
+
+    assert source.count('"$ROOT/scripts/run_tests.sh"') == 2
+    assert '"$PYTHON_BIN" -m pytest' not in source
+
+
 def test_merge_gate_rejects_invalid_phase_and_unknown_brand() -> None:
     invalid = subprocess.run([GATE, "--phase", "invalid"], cwd=ROOT, text=True, capture_output=True)
     assert invalid.returncode == 2
@@ -474,3 +482,22 @@ def test_base_gate_propagates_customization_checker_failure(tmp_path: Path) -> N
     )
 
     assert result.returncode == 9
+
+
+def test_gate_resolves_relative_python_before_switching_repositories(
+    tmp_path: Path,
+) -> None:
+    repo, _base = _brand_repo(tmp_path)
+    env = os.environ.copy()
+    env["WORKFLOW_MERGE_GATE_FAST"] = "1"
+    env["PYTHON_BIN"] = os.path.relpath(sys.executable, ROOT)
+
+    result = subprocess.run(
+        [GATE, "--repo", repo, "--phase", "base"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
