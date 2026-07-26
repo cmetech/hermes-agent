@@ -5,7 +5,9 @@ from dataclasses import FrozenInstanceError
 import json
 from pathlib import Path
 
+from jsonschema import Draft202012Validator
 import pytest
+import yaml
 
 from plugins.workflow.language_schema import (
     FIELD_INVENTORY,
@@ -17,7 +19,13 @@ from plugins.workflow.language_schema import (
     workflow_authoring_contract,
 )
 from plugins.workflow.models import WorkflowLanguageProfile
-from plugins.workflow.schema import COMMON_NODE_FIELDS, SIDECAR_FIELDS, TOP_LEVEL_FIELDS
+from plugins.workflow.models import WorkflowValidationError
+from plugins.workflow.schema import (
+    COMMON_NODE_FIELDS,
+    SIDECAR_FIELDS,
+    TOP_LEVEL_FIELDS,
+    load_workflow_snapshot,
+)
 
 
 def _node_property(schema: dict[str, object], node_type: str, field: str) -> dict:
@@ -67,7 +75,6 @@ def test_node_payload_inventory_declares_truthful_json_types():
             "cancel",
         }
     }
-
     assert {name: spec.json_type for name, spec in payloads.items()} == {
         "command": "string",
         "prompt": "string",
@@ -77,6 +84,242 @@ def test_node_payload_inventory_declares_truthful_json_types():
         "approval": "object",
         "cancel": "string",
     }
+
+
+def test_structural_requirements_are_inventory_metadata():
+    required = {
+        (spec.scope, spec.yaml_name, tuple(sorted(spec.required_node_types)))
+        for spec in FIELD_INVENTORY
+        if spec.required or spec.required_node_types
+    }
+
+    assert ("definition", "nodes", ()) in required
+    assert ("node", "runtime", ("script",)) in required
+    assert ("loop", "gate_message", ()) not in required
+    assert ("hook_entry", "response", ()) in required
+    assert ("hook_specific", "hookEventName", ()) in required
+
+
+def _structural_outcomes(document: dict[str, object]) -> tuple[bool, bool]:
+    schema = definition_json_schema(WorkflowLanguageProfile.HERMES_LEGACY)
+    schema_valid = not list(Draft202012Validator(schema).iter_errors(document))
+    try:
+        load_workflow_snapshot(
+            "structural-parity.yaml",
+            workflow_bytes=yaml.safe_dump(document, sort_keys=False).encode(),
+            sidecar_bytes=None,
+        )
+    except WorkflowValidationError:
+        loader_valid = False
+    else:
+        loader_valid = True
+    return schema_valid, loader_valid
+
+
+def _workflow(node: dict[str, object]) -> dict[str, object]:
+    return {
+        "name": "structural-parity",
+        "description": "schema and loader agree",
+        "nodes": [node],
+    }
+
+
+@pytest.mark.parametrize(
+    ("node", "expected"),
+    [
+        pytest.param({"id": "n", "command": "build"}, True, id="command-valid"),
+        pytest.param({"id": "n", "command": 1}, False, id="command-invalid"),
+        pytest.param({"id": "n", "prompt": "do it"}, True, id="prompt-valid"),
+        pytest.param({"id": "n", "prompt": []}, False, id="prompt-invalid"),
+        pytest.param({"id": "n", "bash": "true"}, True, id="bash-valid"),
+        pytest.param({"id": "n", "bash": {}}, False, id="bash-invalid"),
+        pytest.param(
+            {"id": "n", "script": "print('ok')", "runtime": "bun"},
+            True,
+            id="script-valid",
+        ),
+        pytest.param(
+            {"id": "n", "script": "print('no runtime')"},
+            False,
+            id="script-runtime-required",
+        ),
+        pytest.param(
+            {
+                "id": "n",
+                "loop": {"prompt": "again", "until": "done", "max_iterations": 2},
+            },
+            True,
+            id="loop-valid",
+        ),
+        pytest.param(
+            {"id": "n", "loop": {"prompt": "again", "max_iterations": 2}},
+            False,
+            id="loop-invalid",
+        ),
+        pytest.param(
+            {"id": "n", "approval": {"message": "continue?"}},
+            True,
+            id="approval-valid",
+        ),
+        pytest.param(
+            {"id": "n", "approval": {"capture_response": True}},
+            False,
+            id="approval-invalid",
+        ),
+        pytest.param({"id": "n", "cancel": "stop"}, True, id="cancel-valid"),
+        pytest.param({"id": "n", "cancel": None}, False, id="cancel-invalid"),
+    ],
+)
+def test_every_node_kind_has_schema_loader_structural_parity(node, expected):
+    assert _structural_outcomes(_workflow(node)) == (expected, expected)
+
+
+@pytest.mark.parametrize(
+    ("node", "expected"),
+    [
+        pytest.param(
+            {
+                "id": "n",
+                "loop": {
+                    "prompt": "again",
+                    "until": "done",
+                    "max_iterations": 2,
+                    "interactive": True,
+                    "gate_message": "approve next iteration",
+                },
+            },
+            True,
+            id="interactive-loop-valid",
+        ),
+        pytest.param(
+            {
+                "id": "n",
+                "loop": {
+                    "prompt": "again",
+                    "until": "done",
+                    "max_iterations": 2,
+                    "interactive": True,
+                },
+            },
+            False,
+            id="interactive-loop-requires-gate-message",
+        ),
+        pytest.param(
+            {
+                "id": "n",
+                "bash": "false",
+                "retry": {"max_attempts": 2, "delay_ms": 1000, "on_error": "all"},
+            },
+            True,
+            id="retry-valid",
+        ),
+        pytest.param(
+            {"id": "n", "bash": "false", "retry": {"max_attempts": 0}},
+            False,
+            id="retry-invalid",
+        ),
+        pytest.param(
+            {
+                "id": "n",
+                "approval": {
+                    "message": "continue?",
+                    "capture_response": {"loader": "accepts-untyped-value"},
+                    "on_reject": {"prompt": "try again", "max_attempts": 2},
+                },
+            },
+            True,
+            id="approval-reject-valid",
+        ),
+        pytest.param(
+            {
+                "id": "n",
+                "approval": {"message": "continue?", "on_reject": {"max_attempts": 2}},
+            },
+            False,
+            id="approval-reject-invalid",
+        ),
+        pytest.param(
+            {
+                "id": "n",
+                "prompt": "delegate",
+                "agents": {"reviewer": {"description": "review", "prompt": "check"}},
+            },
+            True,
+            id="agent-valid",
+        ),
+        pytest.param(
+            {
+                "id": "n",
+                "prompt": "delegate",
+                "agents": {"reviewer": {"description": "review"}},
+            },
+            False,
+            id="agent-invalid",
+        ),
+        pytest.param(
+            {
+                "id": "n",
+                "prompt": "hook",
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": 7,
+                            "response": {
+                                "hookSpecificOutput": {
+                                    "hookEventName": "PreToolUse",
+                                    "permissionDecision": "allow",
+                                }
+                            },
+                        }
+                    ]
+                },
+            },
+            True,
+            id="hook-valid-integer-matcher",
+        ),
+        pytest.param(
+            {
+                "id": "n",
+                "prompt": "hook",
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "response": {
+                                "hookSpecificOutput": {"hookEventName": "PostToolUse"}
+                            }
+                        }
+                    ]
+                },
+            },
+            False,
+            id="hook-event-mismatch",
+        ),
+        pytest.param(
+            {
+                "id": "n",
+                "prompt": "hook",
+                "hooks": {
+                    "PreToolUse": [
+                        {"response": {"hookSpecificOutput": {"content": "missing"}}}
+                    ]
+                },
+            },
+            False,
+            id="hook-event-name-required",
+        ),
+        pytest.param(
+            {
+                "id": "n",
+                "prompt": "hook",
+                "hooks": {"PreToolUse": [{"matcher": "tool"}]},
+            },
+            False,
+            id="hook-response-required",
+        ),
+    ],
+)
+def test_nested_shapes_have_schema_loader_structural_parity(node, expected):
+    assert _structural_outcomes(_workflow(node)) == (expected, expected)
 
 
 @pytest.mark.parametrize(

@@ -495,6 +495,59 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # The flag is stripped from sys.argv so argparse never sees it.
 # Falls back to ~/.hermes/active_profile for sticky default.
 # ---------------------------------------------------------------------------
+_PROFILE_VALUE_FLAGS = frozenset({
+    "-z", "--oneshot", "-m", "--model", "--provider", "-t", "--toolsets",
+    "-r", "--resume", "-s", "--skills", "--usage-file",
+})
+_PROFILE_OPTIONAL_VALUE_FLAGS = frozenset({"-c", "--continue"})
+_WORKFLOW_ROOT_VALUE_FLAGS = frozenset({"--workdir", "--hermes-home"})
+
+
+def _workflow_schema_action_index(argv: list[str]) -> int | None:
+    """Resolve the exact top-level ``workflow schema`` action dependency-free."""
+    command_index = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            return None
+        if arg in {"--profile", "-p"} or arg in _PROFILE_VALUE_FLAGS:
+            i += 2
+            continue
+        if arg.startswith("--profile=") or (arg.startswith("--") and "=" in arg):
+            i += 1
+            continue
+        if arg in _PROFILE_OPTIONAL_VALUE_FLAGS:
+            i += 1
+            if i < len(argv) and not argv[i].startswith("-"):
+                i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        command_index = i
+        break
+    if command_index is None or argv[command_index] != "workflow":
+        return None
+
+    i = command_index + 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg in _WORKFLOW_ROOT_VALUE_FLAGS or arg in {"--profile", "-p"}:
+            i += 2
+            continue
+        if any(arg.startswith(f"{flag}=") for flag in _WORKFLOW_ROOT_VALUE_FLAGS):
+            i += 1
+            continue
+        if arg.startswith("--profile="):
+            i += 1
+            continue
+        if arg.startswith("-"):
+            return None
+        return i if arg == "schema" else None
+    return None
+
+
 def _apply_profile_override() -> None:
     """Pre-parse --profile/-p and set HERMES_HOME before imports."""
     argv = sys.argv[1:]
@@ -512,20 +565,6 @@ def _apply_profile_override() -> None:
         try:
             mcp_index = argv.index("mcp", 0, index)
             argv.index("add", mcp_index + 1, index)
-        except ValueError:
-            return False
-        return True
-
-    def _inside_workflow_schema_args(index: int) -> bool:
-        """Return true for the workflow schema command's language profile.
-
-        This early parser cannot load plugin argparse trees without defeating
-        its dependency-free purpose. Keep the exception at the narrow nested
-        command boundary that owns a distinct ``--profile`` option.
-        """
-        try:
-            workflow_index = argv.index("workflow", 0, index)
-            argv.index("schema", workflow_index + 1, index)
         except ValueError:
             return False
         return True
@@ -564,16 +603,7 @@ def _apply_profile_override() -> None:
     # 1. Check for explicit -p / --profile flag. Historically this worked even
     # after the subcommand (`hermes chat -p coder`), so keep scanning broadly.
     # The exception is command-argv passthrough regions such as `mcp add --args`.
-    value_flags = {
-        "-z", "--oneshot",
-        "-m", "--model",
-        "--provider",
-        "-t", "--toolsets",
-        "-r", "--resume",
-        "-s", "--skills",
-        "--usage-file",
-    }
-    optional_value_flags = {"-c", "--continue"}
+    workflow_schema_index = _workflow_schema_action_index(argv)
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -581,10 +611,18 @@ def _apply_profile_override() -> None:
             break
         if arg == "--args" and _inside_mcp_add_args(i):
             break
-        if arg == "--profile" and _inside_workflow_schema_args(i):
+        if (
+            arg == "--profile"
+            and workflow_schema_index is not None
+            and i > workflow_schema_index
+        ):
             i += 2
             continue
-        if arg.startswith("--profile=") and _inside_workflow_schema_args(i):
+        if (
+            arg.startswith("--profile=")
+            and workflow_schema_index is not None
+            and i > workflow_schema_index
+        ):
             i += 1
             continue
         if arg in {"--profile", "-p"} and i + 1 < len(argv):
@@ -597,11 +635,11 @@ def _apply_profile_override() -> None:
             consume = 1
             profile_index = i
             break
-        if "=" not in arg and arg in value_flags and i + 1 < len(argv):
+        if "=" not in arg and arg in _PROFILE_VALUE_FLAGS and i + 1 < len(argv):
             i += 2
         elif (
             "=" not in arg
-            and arg in optional_value_flags
+            and arg in _PROFILE_OPTIONAL_VALUE_FLAGS
             and i + 1 < len(argv)
             and not argv[i + 1].startswith("-")
         ):
@@ -689,6 +727,9 @@ def _apply_profile_override() -> None:
 
 
 _apply_profile_override()
+_WORKFLOW_SCHEMA_READONLY_STARTUP = (
+    _workflow_schema_action_index(sys.argv[1:]) is not None
+)
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -744,19 +785,20 @@ except Exception:
 # (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
 # during GUI testing, including pre-dispatch startup failures.
-try:
-    from hermes_logging import setup_logging as _setup_logging
+if not _WORKFLOW_SCHEMA_READONLY_STARTUP:
+    try:
+        from hermes_logging import setup_logging as _setup_logging
 
-    _setup_logging(
-        mode=(
-            "gui"
-            if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
-            in {"dashboard", "serve", "gui", "desktop"}
-            else "cli"
+        _setup_logging(
+            mode=(
+                "gui"
+                if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
+                in {"dashboard", "serve", "gui", "desktop"}
+                else "cli"
+            )
         )
-    )
-except Exception:
-    pass  # best-effort — don't crash the CLI if logging setup fails
+    except Exception:
+        pass  # best-effort — don't crash the CLI if logging setup fails
 
 # Apply IPv4 preference early, before any HTTP clients are created.
 # We already determined whether to force IPv4 from the raw yaml read above —
@@ -14480,8 +14522,57 @@ def cmd_claw(args):
     claw_command(args)
 
 
+def _try_workflow_schema_readonly() -> bool:
+    """Serve exact schema introspection before any mutating CLI startup seam."""
+    action_index = _workflow_schema_action_index(sys.argv[1:])
+    if action_index is None:
+        return False
+
+    arguments = sys.argv[1:][action_index + 1 :]
+    selected_profile = "archon-2026-07"
+    json_mode = False
+    i = 0
+    while i < len(arguments):
+        argument = arguments[i]
+        if argument == "--json":
+            json_mode = True
+            i += 1
+            continue
+        if argument == "--profile" and i + 1 < len(arguments):
+            selected_profile = arguments[i + 1]
+            i += 2
+            continue
+        if argument.startswith("--profile="):
+            selected_profile = argument.split("=", 1)[1]
+            i += 1
+            continue
+        return False
+
+    from plugins.workflow.language_schema import workflow_authoring_contract
+    from plugins.workflow.models import WorkflowLanguageProfile
+
+    try:
+        profile = WorkflowLanguageProfile(selected_profile)
+    except ValueError:
+        return False
+    contract = workflow_authoring_contract(profile)
+    if json_mode:
+        print(json.dumps(
+            contract,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ))
+    else:
+        print(json.dumps(contract, sort_keys=True, ensure_ascii=False, indent=2))
+    return True
+
+
 def main():
     """Main entry point for hermes CLI."""
+    if _try_workflow_schema_readonly():
+        return
+
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()

@@ -4,7 +4,10 @@ import argparse
 import ast
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -41,6 +44,20 @@ def _json_envelope(capsys):
     output = capsys.readouterr()
     assert output.err == ""
     return json.loads(output.out)
+
+
+def _tree_snapshot(root: Path) -> tuple[tuple[str, str, bytes | None], ...]:
+    if not root.exists():
+        return ()
+    entries = []
+    for path in sorted(root.rglob("*")):
+        kind = "directory" if path.is_dir() else "file"
+        entries.append((
+            path.relative_to(root).as_posix(),
+            kind,
+            None if path.is_dir() else path.read_bytes(),
+        ))
+    return tuple(entries)
 
 
 def test_success_envelope_sanitizes_every_machine_payload_and_preserves_cleanup_capability():
@@ -207,7 +224,78 @@ def test_schema_text_is_indented_json(capsys):
     output = capsys.readouterr()
     assert output.err == ""
     assert json.loads(output.out)["profile"] == "hermes-legacy"
-    assert "\n  \"compatibility_codes\"" in output.out
+    assert '\n  "compatibility_codes"' in output.out
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_packaged_schema_command_is_read_only_before_normal_startup(
+    tmp_path, json_mode
+):
+    """The exact packaged introspection path must not initialize Hermes."""
+    home = tmp_path / "fresh-home"
+    hermes_home = tmp_path / "fresh-hermes-home"
+    guard_dir = tmp_path / "process-guards"
+    guard_dir.mkdir()
+    (guard_dir / "sitecustomize.py").write_text(
+        """
+import socket
+import sys
+
+class _ForbiddenRuntimeImports:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in {"run_agent", "model_tools", "tools.mcp_tool"}:
+            raise RuntimeError(f"forbidden runtime import: {fullname}")
+        return None
+
+def _forbid_network(*args, **kwargs):
+    raise RuntimeError("network access is forbidden during schema introspection")
+
+sys.meta_path.insert(0, _ForbiddenRuntimeImports())
+socket.create_connection = _forbid_network
+socket.socket.connect = _forbid_network
+""".lstrip(),
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "HERMES_HOME": str(hermes_home),
+        "PYTHONPATH": os.pathsep.join([str(guard_dir), str(Path(__file__).parents[3])]),
+    }
+    command = [
+        sys.executable,
+        "-m",
+        "hermes_cli.main",
+        "workflow",
+        "schema",
+        "--profile",
+        "archon-2026-07",
+    ]
+    if json_mode:
+        command.append("--json")
+
+    before = (_tree_snapshot(home), _tree_snapshot(hermes_home))
+    completed = subprocess.run(
+        command,
+        cwd=Path(__file__).parents[3],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout)["profile"] == "archon-2026-07"
+    if json_mode:
+        assert completed.stdout.count("\n") == 1
+        assert ": " not in completed.stdout
+    else:
+        assert '\n  "compatibility_codes"' in completed.stdout
+    assert before == ((), ())
+    assert (_tree_snapshot(home), _tree_snapshot(hermes_home)) == before
+    assert not home.exists()
+    assert not hermes_home.exists()
 
 
 def test_list_and_show_json_are_stable_and_redacted(workflow_writer, tmp_path, capsys):
@@ -287,9 +375,7 @@ def test_cleanup_cli_is_preview_only_until_exact_token_is_executed(
     workflow_writer, tmp_path, capsys
 ) -> None:
     profile = tmp_path / "profile"
-    package = load_workflow(
-        workflow_writer(tmp_path / "package", name="cleanup-cli")
-    )
+    package = load_workflow(workflow_writer(tmp_path / "package", name="cleanup-cli"))
     store = RunStore(profile)
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -567,9 +653,9 @@ def test_foreground_cli_releases_at_gate_and_claims_new_epoch_for_continue(
     assert start_args.func(start_args) == 0
     paused = _json_result(capsys)
     assert paused["status"] == "paused"
-    assert datetime.fromisoformat(paused["foreground_lease_expires_at"]) <= datetime.now(
-        timezone.utc
-    )
+    assert datetime.fromisoformat(
+        paused["foreground_lease_expires_at"]
+    ) <= datetime.now(timezone.utc)
 
     approve_args = parser.parse_args([
         *common,
@@ -687,17 +773,15 @@ def test_run_refuses_trusted_package_that_requires_an_isolated_backend(
     WorkflowTrustStore(profile).trust(
         digest.sha256, actor="test", risk_digest=risk.risk_digest
     )
-    args = _parser().parse_args(
-        [
-            "--workdir",
-            str(workdir),
-            "--hermes-home",
-            str(profile),
-            "run",
-            "sample",
-            "--json",
-        ]
-    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(profile),
+        "run",
+        "sample",
+        "--json",
+    ])
 
     assert args.func(args) == machine_contract.EXIT_AUTHORIZATION
     assert _json_envelope(capsys)["error"]["code"] == "trust_required"
@@ -735,7 +819,14 @@ def test_json_failures_use_stable_envelopes_and_exit_categories(
     assert envelope["command"] == "workflow status"
     assert envelope["error"]["code"] == "not_found"
 
-    invalid = parser.parse_args([*common, "events", "missing-run", "--tail", "0", "--json"])
+    invalid = parser.parse_args([
+        *common,
+        "events",
+        "missing-run",
+        "--tail",
+        "0",
+        "--json",
+    ])
     assert invalid.func(invalid) == 2
     assert _json_envelope(capsys)["error"]["code"] == "invalid_request"
 
@@ -793,15 +884,13 @@ def test_os_error_is_sanitized(tmp_path, capsys, monkeypatch) -> None:
         "plugins.workflow.cli._cmd_status",
         lambda _args: (_ for _ in ()).throw(OSError(private_path)),
     )
-    args = _parser().parse_args(
-        [
-            "--hermes-home",
-            str(tmp_path / "profile"),
-            "status",
-            "run",
-            "--json",
-        ]
-    )
+    args = _parser().parse_args([
+        "--hermes-home",
+        str(tmp_path / "profile"),
+        "status",
+        "run",
+        "--json",
+    ])
 
     assert args.func(args) == machine_contract.EXIT_ACTION_FAILED
     output = capsys.readouterr()
@@ -820,9 +909,7 @@ def test_runs_json_reports_sanitized_keyset_truncation(
     tmp_path, capsys, workflow_writer
 ) -> None:
     profile = tmp_path / "profile"
-    package = load_workflow(
-        workflow_writer(tmp_path / "package", name="runs-page")
-    )
+    package = load_workflow(workflow_writer(tmp_path / "package", name="runs-page"))
     store = RunStore(
         profile,
         max_executing_runs=10,

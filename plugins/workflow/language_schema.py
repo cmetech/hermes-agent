@@ -33,6 +33,18 @@ class WorkflowFieldSpec:
     applicable_node_types: frozenset[str]
     enforcement_phase: int
     compatibility: tuple[FieldCompatibility, ...]
+    required: bool
+    required_node_types: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class StructuralRequirement:
+    """A JSON-Schema requirement derived from loader structure."""
+
+    scope: str
+    when_field: str
+    equals: object
+    required_field: str
 
 
 def _compatibility(
@@ -63,6 +75,8 @@ def _field(
     shape: str,
     *,
     node_types: tuple[str, ...] = (),
+    required: bool = False,
+    required_node_types: tuple[str, ...] = (),
     phase: int = 1,
     legacy_status: str = "supported",
     legacy_code: str | None = None,
@@ -82,6 +96,8 @@ def _field(
             archon_status=archon_status,
             archon_code=archon_code,
         ),
+        required=required,
+        required_node_types=frozenset(required_node_types),
     )
 
 
@@ -91,9 +107,9 @@ _NON_LOOP_NODE_TYPES = tuple(item for item in NODE_TYPES if item != "loop")
 
 
 _DEFINITION_FIELDS = (
-    _field("definition", "name", "string", "nonempty_string"),
-    _field("definition", "description", "string", "nonempty_string"),
-    _field("definition", "nodes", "array", "nodes"),
+    _field("definition", "name", "string", "nonempty_string", required=True),
+    _field("definition", "description", "string", "nonempty_string", required=True),
+    _field("definition", "nodes", "array", "nodes", required=True),
     _field("definition", "provider", "string", "nonempty_string"),
     _field("definition", "model", "string", "nonempty_string"),
     _field("definition", "modelReasoningEffort", "string", "nonempty_string"),
@@ -120,7 +136,14 @@ _DEFINITION_FIELDS = (
 
 
 _NODE_FIELDS = (
-    _field("node", "id", "string", "nonempty_string", node_types=NODE_TYPES),
+    _field(
+        "node",
+        "id",
+        "string",
+        "nonempty_string",
+        node_types=NODE_TYPES,
+        required_node_types=NODE_TYPES,
+    ),
     *(
         _field(
             "node",
@@ -128,6 +151,7 @@ _NODE_FIELDS = (
             "object" if node_type in {"loop", "approval"} else "string",
             f"{node_type}_payload",
             node_types=(node_type,),
+            required_node_types=(node_type,),
         )
         for node_type in NODE_TYPES
     ),
@@ -211,7 +235,14 @@ _NODE_FIELDS = (
         archon_status="blocking",
         archon_code="archon_sandbox_enforcement_unavailable",
     ),
-    _field("node", "runtime", "string", "runtime", node_types=("script",)),
+    _field(
+        "node",
+        "runtime",
+        "string",
+        "runtime",
+        node_types=("script",),
+        required_node_types=("script",),
+    ),
     _field("node", "deps", "array", "string_list", node_types=("script",)),
     _field(
         "node",
@@ -241,32 +272,32 @@ _RETRY_FIELDS = (
     _field("retry", "on_error", "string", "retry_error"),
     _field("retry", "delay_ms", "integer", "retry_delay"),
 )
-_LOOP_FIELDS = tuple(
-    _field("loop", name, json_type, shape)
-    for name, json_type, shape in (
-        ("prompt", "string", "nonempty_string"),
-        ("until", "string", "nonempty_string"),
-        ("max_iterations", "integer", "loop_iterations"),
-        ("fresh_context", "boolean", "boolean"),
-        ("until_bash", "string", "nonempty_string"),
-        ("interactive", "boolean", "boolean"),
-        ("gate_message", "string", "nonempty_string"),
-    )
+_LOOP_FIELDS = (
+    _field("loop", "prompt", "string", "nonempty_string", required=True),
+    _field("loop", "until", "string", "nonempty_string", required=True),
+    _field("loop", "max_iterations", "integer", "loop_iterations", required=True),
+    _field("loop", "fresh_context", "any", "any"),
+    _field("loop", "until_bash", "any", "any"),
+    _field("loop", "interactive", "any", "any"),
+    _field("loop", "gate_message", "any", "any"),
 )
-_APPROVAL_FIELDS = tuple(
-    _field("approval", name, json_type, shape)
-    for name, json_type, shape in (
-        ("message", "string", "nonempty_string"),
-        ("capture_response", "boolean", "boolean"),
-        ("on_reject", "object", "approval_reject"),
-    )
+_APPROVAL_FIELDS = (
+    _field("approval", "message", "string", "nonempty_string", required=True),
+    _field("approval", "capture_response", "any", "any"),
+    _field("approval", "on_reject", "object", "approval_reject"),
 )
 _APPROVAL_REJECT_FIELDS = (
-    _field("approval_reject", "prompt", "string", "nonempty_string"),
+    _field("approval_reject", "prompt", "string", "nonempty_string", required=True),
     _field("approval_reject", "max_attempts", "integer", "approval_attempts"),
 )
 _AGENT_FIELDS = tuple(
-    _field("agent", name, json_type, shape)
+    _field(
+        "agent",
+        name,
+        json_type,
+        shape,
+        required=name in {"description", "prompt"},
+    )
     for name, json_type, shape in (
         ("description", "string", "nonempty_string"),
         ("prompt", "string", "nonempty_string"),
@@ -307,8 +338,8 @@ _HOOK_EVENT_FIELDS = tuple(
     for event in _HOOK_EVENT_NAMES
 )
 _HOOK_ENTRY_FIELDS = (
-    _field("hook_entry", "matcher", "string", "string"),
-    _field("hook_entry", "response", "object", "hook_response"),
+    _field("hook_entry", "matcher", "any", "any"),
+    _field("hook_entry", "response", "object", "hook_response", required=True),
     _field("hook_entry", "timeout", "number", "positive_number"),
 )
 _HOOK_RESPONSE_FIELDS = tuple(
@@ -323,7 +354,13 @@ _HOOK_RESPONSE_FIELDS = tuple(
     )
 )
 _HOOK_SPECIFIC_FIELDS = tuple(
-    _field("hook_specific", name, json_type, shape)
+    _field(
+        "hook_specific",
+        name,
+        json_type,
+        shape,
+        required=name == "hookEventName",
+    )
     for name, json_type, shape in (
         ("hookEventName", "string", "hook_event_name"),
         ("permissionDecision", "string", "permission_decision"),
@@ -381,6 +418,15 @@ FIELD_INVENTORY = (
     *_HOOK_RESPONSE_FIELDS,
     *_HOOK_SPECIFIC_FIELDS,
     *_SIDECAR_FIELDS,
+)
+
+STRUCTURAL_REQUIREMENTS = (
+    StructuralRequirement(
+        scope="loop",
+        when_field="interactive",
+        equals=True,
+        required_field="gate_message",
+    ),
 )
 
 
@@ -452,7 +498,12 @@ def _field_status(
     return next(item for item in spec.compatibility if item.profile is profile)
 
 
-def _schema_for_shape(shape: str, profile: WorkflowLanguageProfile) -> dict[str, Any]:
+def _schema_for_shape(
+    shape: str,
+    profile: WorkflowLanguageProfile,
+    *,
+    hook_event: str | None = None,
+) -> dict[str, Any]:
     if shape == "any":
         return {}
     if shape == "string":
@@ -524,6 +575,8 @@ def _schema_for_shape(shape: str, profile: WorkflowLanguageProfile) -> dict[str,
     if shape == "hook_action":
         return {"type": "string", "enum": ["accept", "decline", "cancel"]}
     if shape == "hook_event_name":
+        if hook_event is not None:
+            return {"const": hook_event}
         return {"type": "string", "enum": list(_HOOK_EVENT_NAMES)}
     if shape == "language_profile":
         return {"type": "string", "enum": [item.value for item in _PROFILES]}
@@ -544,39 +597,38 @@ def _schema_for_shape(shape: str, profile: WorkflowLanguageProfile) -> dict[str,
         return {
             "type": "array",
             "minItems": 1,
-            "items": _object_schema("hook_entry", profile, required=("response",)),
+            "items": _object_schema("hook_entry", profile, hook_event=hook_event),
         }
     if shape == "hook_response":
-        return _object_schema("hook_response", profile)
+        return _object_schema("hook_response", profile, hook_event=hook_event)
     if shape == "hook_specific":
-        return _object_schema("hook_specific", profile)
+        return _object_schema("hook_specific", profile, hook_event=hook_event)
     if shape == "agents":
         return {
             "type": "object",
             "propertyNames": {"pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
-            "additionalProperties": _object_schema(
-                "agent", profile, required=("description", "prompt")
-            ),
+            "additionalProperties": _object_schema("agent", profile),
         }
     if shape == "nodes":
         return _nodes_schema(profile)
     if shape == "loop_payload":
-        return _object_schema(
-            "loop", profile, required=("prompt", "until", "max_iterations")
-        )
+        return _object_schema("loop", profile)
     if shape == "approval_payload":
-        return _object_schema("approval", profile, required=("message",))
+        return _object_schema("approval", profile)
     if shape == "approval_reject":
-        return _object_schema("approval_reject", profile, required=("prompt",))
+        return _object_schema("approval_reject", profile)
     if shape.endswith("_payload"):
         return {"type": "string", "minLength": 1}
     raise ValueError(f"unknown workflow field shape: {shape}")
 
 
 def _field_schema(
-    spec: WorkflowFieldSpec, profile: WorkflowLanguageProfile
+    spec: WorkflowFieldSpec,
+    profile: WorkflowLanguageProfile,
+    *,
+    hook_event: str | None = None,
 ) -> dict[str, Any]:
-    result = _schema_for_shape(spec.shape, profile)
+    result = _schema_for_shape(spec.shape, profile, hook_event=hook_event)
     status = _field_status(spec, profile)
     if status.status != "supported":
         result["x-hermes-status"] = status.status
@@ -589,17 +641,38 @@ def _object_schema(
     scope: str,
     profile: WorkflowLanguageProfile,
     *,
-    required: tuple[str, ...] = (),
+    hook_event: str | None = None,
 ) -> dict[str, Any]:
+    specs = _specs(scope)
     result: dict[str, Any] = {
         "type": "object",
         "properties": {
-            spec.yaml_name: _field_schema(spec, profile) for spec in _specs(scope)
+            spec.yaml_name: _field_schema(
+                spec,
+                profile,
+                hook_event=(spec.yaml_name if scope == "hook_event" else hook_event),
+            )
+            for spec in specs
         },
         "additionalProperties": False,
     }
+    required = tuple(spec.yaml_name for spec in specs if spec.required)
     if required:
         result["required"] = list(required)
+    conditions = tuple(item for item in STRUCTURAL_REQUIREMENTS if item.scope == scope)
+    if conditions:
+        result["allOf"] = [
+            {
+                "if": {
+                    "properties": {
+                        item.when_field: {"const": item.equals},
+                    },
+                    "required": [item.when_field],
+                },
+                "then": {"required": [item.required_field]},
+            }
+            for item in conditions
+        ]
     return result
 
 
@@ -616,7 +689,11 @@ def _nodes_schema(profile: WorkflowLanguageProfile) -> dict[str, Any]:
         variants.append({
             "type": "object",
             "properties": properties,
-            "required": ["id", node_type],
+            "required": [
+                spec.yaml_name
+                for spec in specs
+                if node_type in spec.required_node_types
+            ],
             "additionalProperties": False,
         })
     return {
@@ -640,12 +717,17 @@ def definition_json_schema(
         "$schema": _DRAFT_2020_12,
         "$id": f"https://hermes.local/workflow/{selected.value}/definition.schema.json",
         "title": f"Hermes workflow definition ({selected.value})",
+        "description": (
+            "Structural authoring schema. The workflow loader remains authoritative "
+            "for graph references, resource paths, provider capabilities, and runtime "
+            "compatibility checks that are not structural JSON constraints."
+        ),
         "type": "object",
         "properties": {
             spec.yaml_name: _field_schema(spec, selected)
             for spec in _specs("definition")
         },
-        "required": ["name", "description", "nodes"],
+        "required": [spec.yaml_name for spec in _specs("definition") if spec.required],
         "additionalProperties": (selected is WorkflowLanguageProfile.HERMES_LEGACY),
     }
 
