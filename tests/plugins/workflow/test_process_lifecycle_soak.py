@@ -51,7 +51,15 @@ def test_hundred_fast_cycles_release_every_claim_and_scheduler_thread(
         max_nonterminal_runs=120,
         max_start_requests_per_minute=120,
     )
-    scheduler = RunScheduler(store, heartbeat_seconds=0.1, lease_seconds=1)
+    # lease_seconds=15, not 1. What this test actually asserts is leak freedom
+    # over 100 cycles -- every worker_claim released, no scheduler threads left,
+    # empty quarantine -- and the lease length is incidental to that. But each
+    # cycle does a package directory copy plus fsync'd writes, which on Windows
+    # can exceed a 1-second lease; release_or_expire_claim then expires the
+    # claim mid-advance and the run lands 'interrupted' instead of 'succeeded'.
+    # That failed roughly half of Windows CI runs. heartbeat_seconds stays at
+    # 0.1 so the heartbeat path is still exercised ~150x per lease.
+    scheduler = RunScheduler(store, heartbeat_seconds=0.1, lease_seconds=15)
 
     class FastExecutor:
         def execute(self, _context):
