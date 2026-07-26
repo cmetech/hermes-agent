@@ -20,6 +20,12 @@ branches relative to literal `main` merely because a developer used the
 shorthand "main." When branch intent matters, resolve ambiguous references in
 favor of `base` and verify the relevant refs before mutating Git state.
 
+**Release checkout end state:** after completing or aborting any release build
+or publication workflow, always switch the working checkout back to `base` and
+verify that `git branch --show-current` reports `base`. A release is not fully
+handed off while the checkout remains on `otto`, `loop24`, or another brand
+branch, even after its workflows and artifacts have been verified.
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a

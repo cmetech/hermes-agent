@@ -15,3 +15,8 @@ changes from the Hermes fork and merge those upstream updates into `base`.
 Never develop, commit, start feature branches, target pull requests, build
 releases, or merge feature work on literal `main`. When wording is ambiguous,
 prefer `base` and verify the relevant refs before changing Git state.
+
+After any release build or publication workflow—successful or aborted—always
+switch the working checkout back to `base` and verify the current branch before
+ending the task. Release completion includes this checkout reset; do not leave
+the repository on `otto`, `loop24`, or another brand branch.
