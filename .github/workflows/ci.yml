@@ -24,11 +24,20 @@ on:
     # cycle and how the kanban expected_run_id contract drifted away from its
     # callers unnoticed.
     #
-    # NOT yet a required check: the first runs are advisory on purpose. Roughly
-    # 15 suite failures are still undiagnosed and may be macOS-only artifacts
-    # of the dev box rather than real -- this run is what classifies them. Add
-    # branch protection once it is green, not before; an always-red check
-    # teaches everyone to ignore it.
+    # ADVISORY BY CHOICE, not "not green yet". The suite reached green on
+    # 2026-07-26 (run 30190623502): Python 8/8, all four Windows portability
+    # slices, and every JS/TS check. The undiagnosed failures this comment used
+    # to warn about were classified and fixed -- most were tests measuring the
+    # macOS dev box rather than behaviour, but two were real Windows product
+    # bugs (quarantine could not rename an open SQLite file; a showcase's
+    # max_descendants was POSIX-shaped and killed a healthy node).
+    #
+    # `All required checks pass` is deliberately NOT wired into branch
+    # protection. Required checks are evaluated against the branch tip and CI
+    # runs after a push, so requiring it would force every change through a PR.
+    # This fork pushes directly to base by design, so the gate stays
+    # informational: it reports on every push and blocks nothing. Revisit only
+    # if the team adopts a PR workflow -- do not enable it as "tidying up".
     #
     # Brand branches (otto, loop24) are deliberately excluded for now: they are
     # generated overlays of base, so base covers the shared code. Add them if a
