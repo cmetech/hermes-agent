@@ -3166,8 +3166,10 @@ upstream_changes:
   - WorkflowPackage.compatibility_findings
   - language_compatibility_findings
   - profile-aware unknown top-level field policy
+  - explicit language declaration type enforcement
   - companion-aware discovery cache signature
   - stable compatibility finding codes
+  - compatibility finding effective-profile invariant
   - validate and doctor language projections
   tests:
   - tests/plugins/workflow/test_schema.py
@@ -3179,12 +3181,15 @@ upstream_changes:
   upstream_candidate: true
   merge_guidance: >-
     Resolve and validate the companion language profile before applying
-    profile-dependent workflow field policy, call the versioned normalizer
+    profile-dependent workflow field policy. Only an absent key defaults to
+    legacy; an explicit null or other non-string declaration fails with the
+    stable unsupported-profile code. Call the versioned normalizer
     exactly once per load, retain the immutable source definition alongside the
     normalized execution definition, and include companion create, edit, and
     delete identity in discovery caching. Preserve one dependency-neutral
-    compatibility finding runtime type, backend-issued stable codes and profile
-    metadata, and identical validate and doctor language projections. Workflows
+    compatibility finding runtime type, backend-issued stable codes, package
+    effective-profile metadata on every compatibility and doctor finding, and
+    identical validate and doctor language projections. Workflows
     without a declaration and explicit hermes-legacy workflows must remain
     permissive with actionable warnings; declared archon-2026-07 workflows must
     fail closed only for invalid or currently unenforceable semantics.

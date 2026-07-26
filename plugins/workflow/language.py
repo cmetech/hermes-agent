@@ -40,11 +40,16 @@ class NormalizedWorkflow:
 
 def resolve_language_profile(sidecar: Mapping[str, object]) -> WorkflowLanguageSelection:
     """Resolve the sidecar's declared language profile, defaulting to legacy."""
-    declared = sidecar.get("language_compatibility")
-    if declared is None:
+    if "language_compatibility" not in sidecar:
         return WorkflowLanguageSelection(
             declared_profile=None,
             effective_profile=WorkflowLanguageProfile.HERMES_LEGACY,
+        )
+    declared = sidecar["language_compatibility"]
+    if not isinstance(declared, str):
+        raise WorkflowLanguageCompatibilityError(
+            "workflow_language_profile_unsupported",
+            "language_compatibility must be hermes-legacy or archon-2026-07",
         )
     try:
         profile = WorkflowLanguageProfile(declared)

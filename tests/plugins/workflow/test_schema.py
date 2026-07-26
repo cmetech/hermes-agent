@@ -158,10 +158,22 @@ def test_companion_selects_archon_profile(workflow_writer, tmp_path):
     assert package.source_definition == package.definition
 
 
-def test_invalid_companion_profile_is_rejected(workflow_writer, tmp_path):
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "language_compatibility: archon-latest\n",
+        "language_compatibility: null\n",
+        "language_compatibility: true\n",
+        "language_compatibility:\n  profile: archon-2026-07\n",
+        "language_compatibility:\n  - archon-2026-07\n",
+    ],
+)
+def test_invalid_companion_profile_is_rejected(
+    workflow_writer, tmp_path, declaration
+):
     path = workflow_writer(tmp_path)
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
-        "language_compatibility: archon-latest\n", encoding="utf-8"
+        declaration, encoding="utf-8"
     )
 
     with pytest.raises(WorkflowValidationError) as exc:

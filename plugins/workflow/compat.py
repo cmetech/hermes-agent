@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, AbstractSet, Literal, Mapping
 
 from plugins.workflow.models import (
@@ -454,6 +454,13 @@ def assess_compatibility(
                     blocking=True,
                 )
 
+    findings = [
+        replace(
+            finding,
+            effective_profile=package.language.effective_profile,
+        )
+        for finding in findings
+    ]
     blocking = any(finding.blocking for finding in findings)
     if blocking or any(
         finding.level is CompatibilityLevel.UNSUPPORTED for finding in findings

@@ -13,7 +13,7 @@ import shutil
 import sys
 import time
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MethodType
@@ -1362,7 +1362,15 @@ def doctor_package(
         )
     )
 
-    findings = list({(finding.code, finding.path): finding for finding in findings}.values())
+    findings = [
+        replace(
+            finding,
+            effective_profile=package.language.effective_profile,
+        )
+        for finding in {
+            (finding.code, finding.path): finding for finding in findings
+        }.values()
+    ]
     trust_state = WorkflowTrustStore(hermes_home).check(
         package_digest.sha256, risk_digest=risk.risk_digest
     )
@@ -1423,6 +1431,7 @@ def _doctor_payload(
         ),
     }
     mode_findings = []
+    effective_profile = package.language.effective_profile.value
     if (
         mode == "foreground"
         and payload["risk_summary"]["execution_environment"]
@@ -1434,6 +1443,7 @@ def _doctor_payload(
             "message": "foreground mode cannot satisfy isolated backend containment",
             "blocking": True,
             "code": "foreground_isolation_unavailable",
+            "effective_profile": effective_profile,
         })
     if mode == "background" and coordinator.status != "healthy":
         mode_findings.append({
@@ -1442,6 +1452,7 @@ def _doctor_payload(
             "message": "background mode requires a healthy workflow coordinator",
             "blocking": True,
             "code": "coordinator_unavailable",
+            "effective_profile": effective_profile,
         })
     if mode_findings:
         payload["findings"] = [*payload.get("findings", []), *mode_findings]

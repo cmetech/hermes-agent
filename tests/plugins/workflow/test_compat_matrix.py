@@ -163,6 +163,7 @@ def test_unknown_top_level_fields_are_explicit_compatibility_findings(
     assert finding.level is CompatibilityLevel.UNSUPPORTED
     assert finding.code == "unknown_top_level_field"
     assert finding.blocking is False
+    assert finding.effective_profile is package.language.effective_profile
     assert report.runnable is True
 
 
@@ -334,6 +335,21 @@ def test_doctor_preserves_finding_codes_instead_of_deriving_them_from_prose(
         finding.code == "stable_contract_code" for finding in report.findings
     )
     assert not any(finding.code == "unknown_tool_alias" for finding in report.findings)
+
+
+def test_doctor_dynamic_findings_carry_the_package_effective_profile(
+    workflow_writer, tmp_path
+):
+    package = load_workflow(workflow_writer(tmp_path))
+
+    report = doctor_package(package, hermes_home=tmp_path / "profile")
+    finding = next(
+        item
+        for item in report.findings
+        if item.code == "effective_admission_capacity"
+    )
+
+    assert finding.effective_profile is package.language.effective_profile
 
 
 def test_default_finding_severity_tracks_blocking_state():
