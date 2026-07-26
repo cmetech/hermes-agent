@@ -78,7 +78,18 @@ Manifests are located exactly as `_inject_capability_env_vars` does
 (`config.py:9448-9452`): `<repo root>/capabilities/*.json`, fail-safe, skipping
 anything unparseable.
 
-`browser.default_profile` is deliberately absent.
+`browser.default_profile` is seeded as an **empty string** — present, but not
+activated.
+
+Both halves matter, and v4.2.0 shipped only one of them. Not `"enrolled"`,
+because that would route every unbound agent browsing session through the
+corporate profile. But not *omitted* either: `sectionFieldEntries` renders a key
+only when the served schema declares it or the config already holds a value, and
+this key is in neither (it is absent from `DEFAULT_CONFIG`, hence from
+`CONFIG_SCHEMA`). Omitting it meant the activation switch never rendered, leaving
+the feature enable-able only by the hand-editing it existed to remove.
+
+Empty keeps it inert: `default_profile_name()` returns `name or None`.
 
 ### 2. The seeding — `seed_brand_defaults`
 
@@ -146,7 +157,9 @@ Python, extending `tests/hermes_cli/test_brand_defaults_seed.py`:
 - A fresh home gets the profile and both origins seeded, with
   `trusted_origins` a genuine **list** — the exact failure the runbook warns
   about.
-- `browser.default_profile` is **not** written.
+- `browser.default_profile` IS written, as an empty string, so the Settings
+  switch renders in the off position. Asserted as present-and-empty, never as
+  absent — absence is the v4.2.0 defect.
 - A user value already present is never overwritten.
 - A value the user deleted after seeding is not restored (the marker is honoured).
 - A malformed or missing manifest seeds nothing and does not raise.
