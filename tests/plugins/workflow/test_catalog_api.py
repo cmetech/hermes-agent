@@ -730,7 +730,7 @@ def test_workflow_catalog_projects_showcase_from_authenticated_snapshot(
     assert ai_row["trust_state"] == "verified_bundled"
 
 
-def test_workflow_catalog_omits_showcases_when_resource_disappears_after_authentication(
+def test_workflow_catalog_projects_cached_showcase_when_source_disappears_after_authentication(
     tmp_path, monkeypatch, workflow_writer, caplog
 ) -> None:
     import plugins.workflow.catalog_api as catalog_api
@@ -766,7 +766,12 @@ def test_workflow_catalog_omits_showcases_when_resource_disappears_after_authent
     )
 
     assert truncated is False
-    assert not any(item.get("source") == "showcase" for item in items)
+    ai_row = next(
+        item
+        for item in items
+        if item.get("source") == "showcase" and item.get("name") == "ai-extensions"
+    )
+    assert ai_row["trust_state"] == "verified_bundled"
     assert any(
         item.get("source") == "profile"
         and item.get("name") == "ordinary-user-workflow"
@@ -777,10 +782,7 @@ def test_workflow_catalog_omits_showcases_when_resource_disappears_after_authent
         for record in caplog.records
         if record.name == "plugins.workflow.catalog_api"
         and record.levelno == logging.WARNING
-    ] == [
-        "workflow showcase catalog projection verification failed: "
-        "WorkflowValidationError"
-    ]
+    ] == []
 
 
 def test_workflow_catalog_rejects_verified_provenance_on_digest_mismatch(
