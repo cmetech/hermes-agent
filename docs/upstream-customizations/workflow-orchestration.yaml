@@ -3246,6 +3246,7 @@ upstream_changes:
   - sealed_snapshot_digest admitted-path verification
   - verify_sealed_snapshot language identity verification
   - NodeExecutionContext.sealed_resource_paths
+  - NodeExecutionContext positional constructor compatibility
   - ResourceResolver sealed-path candidate authorization
   tests:
   - tests/plugins/workflow/test_language_snapshot.py
@@ -3278,8 +3279,10 @@ upstream_changes:
     Select the pinned supported normalizer and fail closed with typed invalid,
     unsupported-profile, unsupported-version, missing, mismatch, or snapshot
     integrity errors before node execution. Preserve positional
-    PreparedRunSnapshot compatibility by appending defaulted fields. Stamp
-    every new durable projection with snapshot_format_version so
+    PreparedRunSnapshot compatibility by appending defaulted fields. Preserve
+    NodeExecutionContext's preexisting positional monotonic and
+    termination_policy order by appending sealed_resource_paths after both
+    fields. Stamp every new durable projection with snapshot_format_version so
     removing language or tree fields cannot make a current admission look
     historical. Preserve the pre-language fallback only for marker-free
     snapshots whose policy resolves to hermes-legacy and whose executable

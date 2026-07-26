@@ -9,6 +9,7 @@ import time
 import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.models import WorkflowNode, freeze_value
@@ -16,7 +17,62 @@ from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
-from tools.managed_process import TerminationPolicy
+from tools.managed_process import ProcessResourceLimits, TerminationPolicy
+
+
+def test_node_execution_context_preserves_pre_sealed_resource_positional_order(
+    tmp_path: Path,
+) -> None:
+    node = WorkflowNode(
+        id="script",
+        node_type="script",
+        value="print('ok')\n",
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({"runtime": "uv", "deps": ()}),
+    )
+    monotonic = lambda: 17.0
+    termination_policy = TerminationPolicy(
+        cooperative_grace_seconds=1,
+        term_grace_seconds=2,
+        kill_grace_seconds=3,
+        wait_timeout_seconds=4,
+    )
+
+    context = NodeExecutionContext(
+        "run-1",
+        tmp_path,
+        node,
+        "attempt-1",
+        10.0,
+        1024,
+        2048,
+        None,
+        "workflow",
+        {},
+        None,
+        {},
+        {},
+        "local",
+        AIEntitlementResolution("real"),
+        None,
+        ProcessResourceLimits(),
+        None,
+        5,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        monotonic,
+        termination_policy,
+    )
+
+    assert context.monotonic is monotonic
+    assert context.termination_policy is termination_policy
+    assert context.sealed_resource_paths is None
 
 
 def test_named_script_prefers_exact_package_resource_before_runtime_suffix(
