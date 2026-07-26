@@ -27,12 +27,19 @@ from plugins.workflow.executors.cancel import CancelExecutor
 from plugins.workflow.executors.loop import LoopExecutor
 from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.locks import WorkflowLockTimeout
+from plugins.workflow.language import (
+    WORKFLOW_NORMALIZER_VERSION,
+    WorkflowLanguageCompatibilityError,
+    read_language_snapshot,
+    verify_language_snapshot,
+)
 from plugins.workflow.models import (
     DeadlineBudget,
     ExecutionFence,
     RetryPolicy,
     RunExecutionLimits,
     WorkflowNode,
+    WorkflowLanguageProfile,
     WorkflowPackage,
     WorkflowRuntimeConfig,
 )
@@ -521,11 +528,39 @@ class RunScheduler:
         run_directory = self.store.run_directory(run_id)
         definition = run_directory / "definition.yaml"
         policy = run_directory / "policy.yaml"
-        return load_workflow_snapshot(
+        projection = self.store.load_run(run_id)
+        resources = json.loads((run_directory / "resources.json").read_bytes())
+        if not isinstance(resources, Mapping):
+            raise WorkflowLanguageCompatibilityError(
+                "workflow_language_snapshot_invalid",
+                "workflow resources snapshot must be a mapping",
+            )
+        snapshot = read_language_snapshot(resources.get("language"))
+        package = load_workflow_snapshot(
             definition,
             workflow_bytes=definition.read_bytes(),
             sidecar_bytes=policy.read_bytes() if policy.is_file() else None,
+            normalizer_version=(
+                snapshot.normalizer_version
+                if snapshot is not None
+                else WORKFLOW_NORMALIZER_VERSION
+            ),
         )
+        if snapshot is None and (
+            package.language.effective_profile
+            is not WorkflowLanguageProfile.HERMES_LEGACY
+        ):
+            raise WorkflowLanguageCompatibilityError(
+                "workflow_language_snapshot_missing",
+                "declared Archon workflow is missing admitted language metadata",
+            )
+        if snapshot is not None:
+            verify_language_snapshot(
+                package,
+                str(projection["definition_digest"]),
+                snapshot,
+            )
+        return package
 
     def _run_execution_limits(self, package: WorkflowPackage) -> RunExecutionLimits:
         limits = package.sidecar.get("limits", {})

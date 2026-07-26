@@ -3206,3 +3206,54 @@ upstream_changes:
     stable coded compatibility findings, and CLI language projections while
     preserving legacy behavior and Archon fail-closed semantics.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-language-admission-pinning
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/language.py
+  - plugins/workflow/admission.py
+  - plugins/workflow/schema.py
+  - plugins/workflow/store.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/scheduled_revalidation.py
+  - tests/plugins/workflow/test_language_snapshot.py
+  - tests/plugins/workflow/test_schedule_revalidation.py
+  owned_symbols:
+  - WorkflowLanguageSnapshot
+  - make_language_snapshot
+  - read_language_snapshot
+  - verify_language_snapshot
+  - PreparedRunSnapshot.language
+  - resources.json language metadata
+  - run projection language metadata
+  - load_workflow_snapshot normalizer_version pin
+  - RunScheduler._load_run_package sealed language verification
+  - verify_sealed_snapshot language identity verification
+  tests:
+  - tests/plugins/workflow/test_language_snapshot.py
+  - tests/plugins/workflow/test_schedule_revalidation.py
+  - tests/plugins/workflow/test_fault_injection.py
+  - tests/plugins/workflow/test_performance_bounds.py
+  expected_commit_subject: 'feat(workflow): pin workflow semantics at admission'
+  upstream_candidate: true
+  merge_guidance: >-
+    Seal effective_profile, normalizer_version, normalized_definition_digest,
+    and the package-bound semantic_fingerprint into the existing bounded
+    resources.json snapshot and mirror that exact object into the durable run
+    projection without adding SQLite columns. Resume must parse only the sealed
+    definition, policy, and resources bytes, select the pinned supported
+    normalizer, and fail closed with typed invalid, unsupported-profile,
+    unsupported-version, missing, or mismatch errors before node execution.
+    Preserve positional PreparedRunSnapshot compatibility by keeping language
+    as the final defaulted field. Preserve the pre-language fallback only when
+    sealed policy resolution is hermes-legacy; declared Archon snapshots without
+    language metadata remain invalid. Scheduled revalidation must compare the
+    projected language object with resources.json after whole-file digest
+    verification, while not-due coordinator polling stays bounded and does not
+    reopen installed workflow definitions.
+  removal_condition: >-
+    Remove when upstream provides equivalent package-bound semantic admission
+    pinning, sealed-byte-only resume, typed fail-closed verification, scheduled
+    language identity revalidation, and pre-language legacy compatibility
+    without a database migration.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

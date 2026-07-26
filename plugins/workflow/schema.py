@@ -946,6 +946,7 @@ def _load_workflow_bytes(
     sidecar_bytes: bytes | None | object,
     source: str,
     precedence: int,
+    normalizer_version: int = WORKFLOW_NORMALIZER_VERSION,
 ) -> WorkflowPackage:
     if len(data) > _MAX_YAML_BYTES:
         _fail(
@@ -1051,7 +1052,7 @@ def _load_workflow_bytes(
     normalized = normalize_workflow(
         definition,
         selection=selection,
-        normalizer_version=WORKFLOW_NORMALIZER_VERSION,
+        normalizer_version=normalizer_version,
     )
     return WorkflowPackage(
         source_definition=definition,
@@ -1096,6 +1097,7 @@ def load_workflow_snapshot(
     sidecar_bytes: bytes | None,
     source: str = "explicit",
     precedence: int = 0,
+    normalizer_version: int = WORKFLOW_NORMALIZER_VERSION,
 ) -> WorkflowPackage:
     """Parse caller-authenticated bytes without reopening definition files."""
     workflow_path = Path(path).expanduser().absolute()
@@ -1107,6 +1109,7 @@ def load_workflow_snapshot(
         sidecar_bytes=sidecar_bytes,
         source=source,
         precedence=precedence,
+        normalizer_version=normalizer_version,
     )
 
 

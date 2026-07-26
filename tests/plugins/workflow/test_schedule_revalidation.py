@@ -541,6 +541,84 @@ def test_real_coordinator_revalidates_revoked_user_trust_before_any_claim(
         )
 
 
+def test_sealed_snapshot_revalidation_includes_language_identity(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, _package, run_id, _due, _coordinator, _identity, _epoch, _context = (
+        _admit_scheduled_user(
+            home,
+            workflow_writer,
+            name="scheduled-language-identity",
+            binding=binding,
+        )
+    )
+    run = store.load_run(run_id)
+    resources = json.loads(
+        (store.run_directory(run_id) / "resources.json").read_bytes()
+    )
+    assert run["language"] == resources["language"]
+    changed = dict(run)
+    changed["language"] = {
+        **run["language"],
+        "semantic_fingerprint": "0" * 64,
+    }
+
+    with pytest.raises(
+        scheduled_revalidation_module.ScheduledRunRevalidationError,
+        match="language identity changed",
+    ):
+        scheduled_revalidation_module.verify_sealed_snapshot(
+            changed,
+            run_directory=store.run_directory(run_id),
+        )
+
+
+def test_coordinator_poll_before_fire_does_not_reopen_installed_workflow(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, package, run_id, due, coordinator, identity, epoch, _context = (
+        _admit_scheduled_user(
+            home,
+            workflow_writer,
+            name="scheduled-poll-sealed-only",
+            binding=binding,
+        )
+    )
+    package.workflow_path.unlink()
+    observed = due - timedelta(seconds=1)
+    scheduler = RunScheduler(
+        store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=lambda: observed,
+    )
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(
+            host_kind="web",
+            host_instance_id="schedule-revalidation-test",
+        ),
+        hermes_home=home,
+        utcnow=lambda: observed,
+        runner_binding=binding,
+    )
+    try:
+        service._sweep_once(store, coordinator, identity, epoch, scheduler)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert store.load_run(run_id)["status"] == "queued"
+
+
 @pytest.mark.parametrize("trust_change", ["revoked", "risk-changed"])
 def test_restarted_coordinator_requires_current_exact_user_trust(
     tmp_path: Path,

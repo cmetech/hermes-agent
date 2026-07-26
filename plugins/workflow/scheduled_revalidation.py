@@ -219,6 +219,16 @@ def verify_sealed_snapshot(
         run["run_metadata"], "sealed_snapshot_digest"
     ):
         raise ScheduledRunRevalidationError("sealed snapshot identity changed")
+    try:
+        resources_document = json.loads(resources_bytes)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ScheduledRunRevalidationError("sealed snapshot is unreadable") from exc
+    if not isinstance(resources_document, Mapping) or run.get(
+        "language"
+    ) != resources_document.get("language"):
+        raise ScheduledRunRevalidationError(
+            "sealed snapshot language identity changed"
+        )
 
 
 def _load_exact_catalog_package(

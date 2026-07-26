@@ -31,6 +31,7 @@ from plugins.workflow.admission import (
     RunAdmissionResult,
 )
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
+from plugins.workflow.language import make_language_snapshot
 from plugins.workflow.input_contract import (
     WorkflowInputContractError,
     workflow_input_declarations,
@@ -2843,6 +2844,7 @@ class RunStore:
             package_digest = trusted_package_digest or compute_package_digest(
                 package, read_budget=resource_read_budget
             )
+            language = make_language_snapshot(package, package_digest.sha256).to_dict()
 
             def read_package_file(path: Path) -> bytes:
                 if resource_read_budget is None:
@@ -3041,6 +3043,7 @@ class RunStore:
                     "inputs_sha256": _sha256(manifest_data),
                     "node_skills": node_skill_digests,
                     "node_agent_skills": node_agent_skill_digests,
+                    "language": language,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -3076,6 +3079,7 @@ class RunStore:
                     str(node_id)
                     for node_id in package.sidecar.get("outward_action_nodes", ())
                 ),
+                language=language,
             )
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
@@ -3278,6 +3282,7 @@ class RunStore:
             snapshot.nodes,
             dict(snapshot.input_digests),
             snapshot.outward_action_nodes,
+            dict(snapshot.language) if snapshot.language is not None else None,
         )
 
     @staticmethod
@@ -3764,6 +3769,9 @@ class RunStore:
             "foreground_heartbeat_monotonic": foreground_heartbeat_monotonic,
             "foreground_lease_seconds": foreground_lease_seconds,
             "outward_action_nodes": list(snapshot.outward_action_nodes),
+            "language": (
+                dict(snapshot.language) if snapshot.language is not None else None
+            ),
             "admission_disposition": disposition,
             "queue_position": queue_position,
             "queue_sequence": queue_sequence,

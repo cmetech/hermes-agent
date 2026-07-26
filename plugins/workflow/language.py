@@ -8,6 +8,7 @@ from datetime import date, datetime
 from hashlib import sha256
 import json
 import math
+import re
 from typing import Any, Mapping
 
 from plugins.workflow.models import (
@@ -17,11 +18,13 @@ from plugins.workflow.models import (
     WorkflowLanguageMetadata,
     WorkflowLanguageProfile,
     WorkflowLanguageSelection,
+    WorkflowPackage,
 )
 
 
 WORKFLOW_NORMALIZER_VERSION = 1
 SUPPORTED_NORMALIZER_VERSIONS = frozenset({1})
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class WorkflowLanguageCompatibilityError(ValueError):
@@ -36,6 +39,22 @@ class WorkflowLanguageCompatibilityError(ValueError):
 class NormalizedWorkflow:
     definition: WorkflowDefinition
     metadata: WorkflowLanguageMetadata
+
+
+@dataclass(frozen=True)
+class WorkflowLanguageSnapshot:
+    effective_profile: WorkflowLanguageProfile
+    normalizer_version: int
+    normalized_definition_digest: str
+    semantic_fingerprint: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "effective_profile": self.effective_profile.value,
+            "normalizer_version": self.normalizer_version,
+            "normalized_definition_digest": self.normalized_definition_digest,
+            "semantic_fingerprint": self.semantic_fingerprint,
+        }
 
 
 def resolve_language_profile(sidecar: Mapping[str, object]) -> WorkflowLanguageSelection:
@@ -269,6 +288,97 @@ def bind_semantic_fingerprint(
             "normalized_definition_digest": metadata.normalized_definition_digest,
         }
     )
+
+
+def make_language_snapshot(
+    package: WorkflowPackage, package_digest: str
+) -> WorkflowLanguageSnapshot:
+    """Bind a loaded package's normalized semantics to its trusted digest."""
+    return WorkflowLanguageSnapshot(
+        effective_profile=package.language.effective_profile,
+        normalizer_version=package.language.normalizer_version,
+        normalized_definition_digest=package.language.normalized_definition_digest,
+        semantic_fingerprint=bind_semantic_fingerprint(
+            package_digest, package.language
+        ),
+    )
+
+
+def read_language_snapshot(
+    value: object | None,
+) -> WorkflowLanguageSnapshot | None:
+    """Parse untrusted sealed language metadata using the exact v1 shape."""
+    if value is None:
+        return None
+    expected_keys = {
+        "effective_profile",
+        "normalizer_version",
+        "normalized_definition_digest",
+        "semantic_fingerprint",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected_keys:
+        raise WorkflowLanguageCompatibilityError(
+            "workflow_language_snapshot_invalid",
+            "workflow language snapshot must contain the exact supported fields",
+        )
+
+    profile_value = value["effective_profile"]
+    if not isinstance(profile_value, str):
+        raise WorkflowLanguageCompatibilityError(
+            "workflow_language_profile_unsupported",
+            "workflow language snapshot profile is unsupported",
+        )
+    try:
+        profile = WorkflowLanguageProfile(profile_value)
+    except ValueError as exc:
+        raise WorkflowLanguageCompatibilityError(
+            "workflow_language_profile_unsupported",
+            "workflow language snapshot profile is unsupported",
+        ) from exc
+
+    normalizer_version = value["normalizer_version"]
+    if (
+        isinstance(normalizer_version, bool)
+        or not isinstance(normalizer_version, int)
+        or normalizer_version not in SUPPORTED_NORMALIZER_VERSIONS
+    ):
+        raise WorkflowLanguageCompatibilityError(
+            "workflow_normalizer_version_unsupported",
+            f"workflow normalizer version {normalizer_version!r} is unsupported",
+        )
+
+    normalized_digest = value["normalized_definition_digest"]
+    fingerprint = value["semantic_fingerprint"]
+    if (
+        not isinstance(normalized_digest, str)
+        or _SHA256.fullmatch(normalized_digest) is None
+        or not isinstance(fingerprint, str)
+        or _SHA256.fullmatch(fingerprint) is None
+    ):
+        raise WorkflowLanguageCompatibilityError(
+            "workflow_language_snapshot_invalid",
+            "workflow language snapshot digests must be lowercase SHA-256 values",
+        )
+    return WorkflowLanguageSnapshot(
+        effective_profile=profile,
+        normalizer_version=normalizer_version,
+        normalized_definition_digest=normalized_digest,
+        semantic_fingerprint=fingerprint,
+    )
+
+
+def verify_language_snapshot(
+    package: WorkflowPackage,
+    package_digest: str,
+    snapshot: WorkflowLanguageSnapshot,
+) -> None:
+    """Fail closed unless sealed and freshly normalized semantics are identical."""
+    expected = make_language_snapshot(package, package_digest)
+    if snapshot != expected:
+        raise WorkflowLanguageCompatibilityError(
+            "workflow_language_snapshot_mismatch",
+            "workflow language snapshot does not match sealed package semantics",
+        )
 
 
 def language_projection(
