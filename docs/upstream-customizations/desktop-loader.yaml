@@ -60,8 +60,15 @@ upstream_changes:
     The GPU was never on the critical path — acceleration helps rasterization,
     while the cost here was CPU-side and on the main thread (241 curve
     evaluations, a ~241-segment path string, 314 setAttribute calls per frame).
-    The gap between machines is single-thread CPU performance plus the number of
-    concurrently mounted loaders, each running its own rAF loop.
+    Nor is it raw single-thread speed: the affected laptop (i5-1145G7) and the
+    unaffected machine (Ryzen 7 5700U) are broadly comparable per core. The
+    mechanism is that the frame budget is a CLIFF -- ~12ms fits inside 16.7ms and
+    feels normal, ~20ms means rAF re-queues immediately and the thread never
+    idles -- so a ~1.6x difference is enough. Contributors on the laptop: half
+    the threads (4C/8T vs 8C/16T) against the same process load, a 15W sustained
+    envelope, and each concurrently mounted Loader adding another rAF loop. Do
+    not go looking for a large hardware disparity; there isn't one, and the
+    faster machine is plausibly also near the limit.
 
     The footprint is deliberately lopsided. loader-native.tsx and
     loader.test.tsx are absent upstream and cannot conflict. loader.tsx keeps

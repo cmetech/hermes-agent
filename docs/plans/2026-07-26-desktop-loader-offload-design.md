@@ -97,17 +97,34 @@ path string, and 314 `setAttribute` calls per frame. The paused call stack
 contained only JavaScript. The diagnosis never depended on the GPU theory; only
 the explanation for the *size* of the gap between the two machines did.
 
-What remains:
+**Not raw single-thread speed either.** The affected laptop is an Intel
+i5-1145G7; the unaffected machine an AMD Ryzen 7 5700U. Tiger Lake's per-core
+IPC is strong, so on single-thread these are broadly comparable — the laptop is
+not several times slower, and an early draft of this document was wrong to imply
+it.
 
-- **Single-thread CPU performance.** A throttled laptop core against a desktop
-  one is comfortably 2-4×. If a frame is already marginal on the fast machine,
-  that multiple pushes it past the budget, and past the budget is qualitatively
-  different: rAF re-queues immediately and the thread never idles.
+What the hardware difference actually offers:
+
+- **4 cores / 8 threads against 8 cores / 16 threads.** The machine is never
+  running one thing: Chromium's renderer, GPU and utility processes, the Python
+  backend (two of them — see the duplicate-start anomaly), the gateway, the tray,
+  and a managed image's EDR. With half the threads, the renderer's main thread is
+  materially more likely to wait for a scheduling slot.
+- **A 15 W sustained power envelope.** The i5-1145G7's turbo is short-lived, and
+  a corporate power plan or thermal ceiling holds it far below its peak under
+  sustained load — which a continuously animating spinner is.
 - **Concurrent loaders.** Each mounted `Loader` runs its own independent rAF
-  loop, so the cost is multiplied by however many are on screen. Slower frames
-  keep the spinner alive longer, which lets more accumulate — the same feedback
-  loop that makes the failure self-perpetuating.
-- **Display scaling**, if the panel is high-DPI.
+  loop, so cost multiplies by however many are on screen. Slower frames keep the
+  spinner alive longer, letting more accumulate — the feedback loop that makes
+  the failure self-perpetuating.
+
+The mechanism that matters is not the size of any of these. **The frame budget is
+a cliff, not a slope.** A frame taking ~12 ms fits inside 16.7 ms and the app
+feels normal; the same frame at ~20 ms means rAF re-queues immediately and the
+thread never idles. A ~1.6× difference is sufficient to produce freeze-versus-
+normal, which is why hunting for a large hardware disparity was the wrong
+instinct — and why the faster machine is plausibly also near the limit, with the
+difference read as "normal".
 
 ## Goals
 
