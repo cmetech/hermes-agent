@@ -182,30 +182,40 @@ class TestNoGlobalEndpointLeak:
     ):
         """The exact EBL-001 reproduction. This test must fail if the global returns.
 
-        An enrolled task acquires; an explicitly ephemeral task must then still
-        resolve to its own override, not to the corporate endpoint -- before AND
-        after the enrolled task is cleaned up.
+        An enrolled task acquires through the REAL ``acquire()``/``attach_global``
+        path -- only its browser-launch internals (``_ensure_enrolled_cdp``,
+        ``_run_daemon_hygiene``) are mocked, exactly like
+        ``test_scripted_callers_keep_the_global`` below. ``_get_cdp_override`` is
+        deliberately left UNMOCKED: stubbing it to ``""`` would make the "not the
+        corporate endpoint" assertions vacuously true regardless of whether
+        ``_attach_cdp`` ever ran, which is what let this test through review
+        without ever exercising ``attach_global``. An explicitly ephemeral task
+        must then still resolve to its own (real) override, not to the corporate
+        endpoint -- before AND after the enrolled task is cleaned up.
         """
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
         monkeypatch.setattr(browser_tool, "_resolve_cdp_override", lambda u: u)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
         monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
         monkeypatch.setattr(browser_tool, "_stop_cdp_supervisor", lambda t: None)
+        monkeypatch.setattr(
+            browser_session_manager, "_ensure_enrolled_cdp",
+            lambda p, h: "http://127.0.0.1:9222/corporate",
+        )
+        monkeypatch.setattr(browser_session_manager, "_run_daemon_hygiene", lambda: None)
         browser_tool._reset_session_cdp_cache()
 
-        def _acq(profile, headless=None, session_key=None, attach_global=True):
-            return browser_session_manager.BrowserSession(
-                session_key=session_key, profile=ENROLLED,
-                cdp_url="http://127.0.0.1:9222/corporate",
-            )
-
-        monkeypatch.setattr(browser_session_manager, "acquire", _acq)
         browser_session_registry.bind("external", "default")
 
         assert browser_tool._session_cdp_url("corp-task::enrolled") == \
             "http://127.0.0.1:9222/corporate"
+        # The real _attach_cdp path just ran (or didn't): assert directly on the
+        # process-global, not through a session key whose resolution never
+        # depended on it.
+        assert os.environ.get("BROWSER_CDP_URL") is None
         assert browser_tool._session_cdp_url("external") == ""
 
         browser_tool._cleanup_single_browser_session("corp-task::enrolled")
+        assert os.environ.get("BROWSER_CDP_URL") is None
         assert browser_tool._session_cdp_url("external") == ""
 
     def test_scripted_callers_keep_the_global(self, monkeypatch):
