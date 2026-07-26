@@ -79,6 +79,25 @@ describe('settings helpers', () => {
     ).toBe('string')
   })
 
+  it('shows the activation toggle on a seeded install, where it is not yet set', () => {
+    // The shipped state after first-run seeding: the profile exists, and
+    // browser.default_profile deliberately does NOT -- the capability ships
+    // inert. But sectionFieldEntries omits a key that is absent from BOTH the
+    // served schema and the config, and default_profile is in neither, so the
+    // switch that turns the feature on never rendered. Seeding it empty is what
+    // makes it appear, in the off position.
+    const config = {
+      browser: {
+        default_profile: '',
+        profiles: { enrolled: { trusted_origins: ['https://*.ericsson.com'] } }
+      }
+    } as unknown as HermesConfigRecord
+
+    const entries = sectionFieldEntries({}, config).get('safety') ?? []
+
+    expect(entries.find(([key]) => key === 'browser.default_profile')).toBeDefined()
+  })
+
   it('hides the enrolled keys until the profile exists in config', () => {
     // sectionFieldEntries omits absent keys, so an untouched config must not show
     // a dead origins field for a profile the user has not created.

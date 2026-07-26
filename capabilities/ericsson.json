@@ -26,6 +26,7 @@
   "personas": [],
   "configDefaults": {
     "browser": {
+      "default_profile": "",
       "profiles": {
         "enrolled": {
           "kind": "enrolled",

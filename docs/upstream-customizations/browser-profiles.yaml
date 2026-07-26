@@ -163,12 +163,23 @@ upstream_changes:
     seed_baked_capabilities, which re-applies managed content on a version bump
     -- right for MCP definitions, wrong for a security list.
 
-    (2) browser.default_profile is NOT seeded. Seeding it would route every
-    unbound agent browsing session through the corporate profile, so arbitrary
-    external pages would share a browser identity with live SSO cookies.
-    Activation is the user's decision, via the Settings switch. A test asserts
-    the key is absent after seeding; if that test is ever "fixed" by adding the
-    key, the isolation is gone.
+    (2) browser.default_profile is seeded EMPTY -- present, but not activated.
+    The distinction is load-bearing in both directions and v4.2.0 got it wrong.
+
+    It must not be seeded to "enrolled": that would route every unbound agent
+    browsing session through the corporate profile, so arbitrary external pages
+    would share a browser identity with live SSO cookies. Empty is what keeps it
+    inert -- default_profile_name() returns `name or None`.
+
+    But it must not be OMITTED either, which is what v4.2.0 shipped.
+    sectionFieldEntries renders a key only when the served schema declares it OR
+    the config already holds a value, and browser.default_profile is in neither:
+    it is absent from DEFAULT_CONFIG, so absent from CONFIG_SCHEMA. Omitting it
+    meant the activation switch never rendered at all, leaving the feature
+    enable-able only by the hand-editing it existed to remove.
+
+    So the invariant is "present and empty", not "absent". Two tests pin it --
+    one on the seeder, one on sectionFieldEntries -- and both must survive.
 
     The toggle cannot be a plain `type: 'boolean'` schema entry:
     browser.default_profile holds a profile NAME, so the generic Switch branch
