@@ -84,27 +84,38 @@ Every one is a declarative animation expressed imperatively.
 ### Why the machines differ
 
 The per-frame work is identical on both. What differs is how long a frame takes.
-Contributing factors, largest first:
 
-- **Software rasterization.** Corporate images commonly disable or blacklist GPU
-  acceleration, and Chromium then rasterizes on the CPU. Re-rastering an
-  animated SVG path every frame in software is far more expensive than on the
-  GPU — plausibly an order of magnitude, not the 2-3× a CPU difference alone
-  would give. Unconfirmed; tracked separately.
-- **CPU and display.** A throttled laptop core, possibly driving a high-DPI
-  panel at scaling.
+**Not GPU acceleration.** That was the initial hypothesis — corporate images
+often disable or blacklist it, and Chromium then rasterizes in software. It was
+checked on the affected machine and **disproved**: acceleration is enabled, and
+Task Manager shows the process using a GPU engine while the UI is driven.
+
+That is consistent rather than surprising, because the GPU was never on the
+critical path. Acceleration helps *rasterization*; the expensive work here is
+CPU-side and on the main thread — 241 curve evaluations, building a ~241-segment
+path string, and 314 `setAttribute` calls per frame. The paused call stack
+contained only JavaScript. The diagnosis never depended on the GPU theory; only
+the explanation for the *size* of the gap between the two machines did.
+
+What remains:
+
+- **Single-thread CPU performance.** A throttled laptop core against a desktop
+  one is comfortably 2-4×. If a frame is already marginal on the fast machine,
+  that multiple pushes it past the budget, and past the budget is qualitatively
+  different: rAF re-queues immediately and the thread never idles.
 - **Concurrent loaders.** Each mounted `Loader` runs its own independent rAF
-  loop. On a fast machine loads finish before many accumulate.
-
-The GPU question is tracked as its own task and does not block this work.
+  loop, so the cost is multiplied by however many are on screen. Slower frames
+  keep the spinner alive longer, which lets more accumulate — the same feedback
+  loop that makes the failure self-perpetuating.
+- **Display scaling**, if the panel is high-DPI.
 
 ## Goals
 
 - Zero per-frame JavaScript in the loader.
 - A loader that **cannot** block the main thread, on any machine, under any
   rendering path. Declarative animations have no JS loop to starve the thread,
-  so under software rendering the worst case degrades to visible jank rather
-  than a frozen application.
+  so the worst case — a slow CPU, or software rendering on some other machine —
+  degrades to visible jank rather than a frozen application.
 - Honour `prefers-reduced-motion`.
 - Survive upstream merges, detectably.
 
@@ -113,7 +124,7 @@ The GPU question is tracked as its own task and does not block this work.
 - Preserving the breathing morph. Explicitly sacrificed (see below).
 - Optimising `configurable_toolsets` (1.27s). Noted, not addressed here.
 - Changing the 21 curve definitions or the three call sites' props.
-- Diagnosing GPU acceleration or the duplicate backend start.
+- The duplicate backend start (two `HERMES_BACKEND_READY` ports in one launch).
 
 ## Design
 

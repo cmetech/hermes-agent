@@ -51,9 +51,17 @@ upstream_changes:
     rotation, path shape, particle position -- are declarative animations that
     upstream expresses imperatively. The fix describes them once and lets
     Chromium run them, so nothing executes per frame and there is no JS loop that
-    can starve the main thread. On a slow or software-rasterized renderer this
-    degrades to visible jank instead of a freeze, which is a stronger guarantee
-    than any "detect we are falling behind and downgrade" heuristic.
+    can starve the main thread. On a slow renderer this degrades to visible jank
+    instead of a freeze, which is a stronger guarantee than any "detect we are
+    falling behind and downgrade" heuristic.
+
+    Note for anyone re-diagnosing this: GPU acceleration was checked on the
+    affected machine and is ENABLED, so software rasterization is not the cause.
+    The GPU was never on the critical path — acceleration helps rasterization,
+    while the cost here was CPU-side and on the main thread (241 curve
+    evaluations, a ~241-segment path string, 314 setAttribute calls per frame).
+    The gap between machines is single-thread CPU performance plus the number of
+    concurrently mounted loaders, each running its own rAF loop.
 
     The footprint is deliberately lopsided. loader-native.tsx and
     loader.test.tsx are absent upstream and cannot conflict. loader.tsx keeps
