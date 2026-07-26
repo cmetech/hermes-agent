@@ -1533,6 +1533,8 @@ def _bare_task_id_for_session_key(session_key: str) -> str:
     """Return the owning bare task id for an opaque browser session key."""
     if _is_local_sidecar_key(session_key):
         return session_key[: -len(_LOCAL_SUFFIX)]
+    if _is_enrolled_session_key(session_key):
+        return session_key[: -len(_ENROLLED_SUFFIX)]
     return session_key
 
 

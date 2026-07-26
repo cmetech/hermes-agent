@@ -361,3 +361,48 @@ class TestCleanupReapsEnrolledSidecar:
         finally:
             browser_tool._active_sessions.pop("t::enrolled", None)
             browser_tool._reset_session_cdp_cache()
+
+
+class TestBareTaskIdStripsEnrolledSuffix:
+    """Fix round 2, Important finding: _bare_task_id_for_session_key stripped
+    _LOCAL_SUFFIX but not _ENROLLED_SUFFIX, so an enrolled session's recorded
+    owner_task_id was "<task>::enrolled" instead of "<task>". A later
+    non-navigation call (browser_click/type/snapshot -> _last_session_key)
+    then saw owner_task_id != the caller's bare task id, treated the binding
+    as stale, and fell back to the ephemeral throwaway browser instead of the
+    enrolled one the page is actually open in -- silently breaking every
+    non-navigation tool call after an enrolled navigate.
+    """
+
+    def test_non_nav_call_resolves_to_the_enrolled_session_key(self):
+        # Isolate from module-level state left by sibling tests in this file
+        # (run_tests.sh isolates per-file, not per-test).
+        browser_tool._reset_session_cdp_cache()
+        browser_tool._active_sessions.pop("t::enrolled", None)
+        browser_tool._last_active_session_key.pop("t", None)
+        try:
+            session_key = "t::enrolled"
+            # Built the same way _get_session_info (tools/browser_tool.py
+            # ~line 2334-2337) builds a session record: session_key is the
+            # full routing key, owner_task_id is derived by the function
+            # under test rather than hand-computed here.
+            session_info: dict = {"session_name": "sess-enrolled", "bb_session_id": None}
+            session_info.setdefault("session_key", session_key)
+            session_info.setdefault(
+                "owner_task_id", browser_tool._bare_task_id_for_session_key(session_key)
+            )
+            browser_tool._active_sessions[session_key] = session_info
+            # Mirrors what browser_navigate records after a successful
+            # enrolled navigation made under the bare task id "t".
+            browser_tool._last_active_session_key["t"] = session_key
+
+            resolved = browser_tool._last_session_key("t")
+
+            assert resolved == session_key, (
+                f"non-navigation call resolved to {resolved!r} instead of "
+                f"{session_key!r} -- it would act on the wrong browser"
+            )
+        finally:
+            browser_tool._active_sessions.pop("t::enrolled", None)
+            browser_tool._last_active_session_key.pop("t", None)
+            browser_tool._reset_session_cdp_cache()
