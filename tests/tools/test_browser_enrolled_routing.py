@@ -467,5 +467,93 @@ class TestDeadEndpointRecovery:
         assert len(calls) == 2
         assert first != second
 
+
+class TestDeadEndpointHookIntegration:
+    """Fix round 1, Important finding #3: the two TestDeadEndpointRecovery
+    tests above call _evict_dead_enrolled_session directly, bypassing both
+    the marker matching and the `if not result.get("success")` gate inside
+    _run_browser_command -- deleting the 8-line hook there fails nothing in
+    that class. These drive _run_browser_command itself with a mocked
+    subprocess pipeline, so the hook's actual wiring is under test.
+
+    Also covers Important finding #1's required regression test: a benign
+    error that merely CONTAINS the substring "websocket" must not evict.
+    """
+
+    @staticmethod
+    def _seed_session_state():
+        browser_tool._reset_session_cdp_cache()
+        browser_tool._active_sessions.pop("t::enrolled", None)
+        browser_tool._session_cdp_urls["t::enrolled"] = "http://127.0.0.1:9222"
+        browser_tool._session_handles["t::enrolled"] = object()
+        browser_tool._active_sessions["t::enrolled"] = {
+            "session_name": "sess", "bb_session_id": None,
+            "cdp_url": "http://127.0.0.1:9222",
+        }
+
+    @staticmethod
+    def _drive_run_browser_command(monkeypatch, error_text):
+        import json as _json
+        from unittest.mock import MagicMock
+        import tools.interrupt as interrupt_mod
+
+        # engine="auto" (not "lightpanda") keeps this test clear of the
+        # Lightpanda-fallback branch entirely -- that branch is exercised
+        # separately in test_browser_lightpanda.py and by the Important #2
+        # fix's own reasoning, not here.
+        monkeypatch.setattr(browser_tool, "_get_browser_engine", lambda: "auto")
+        monkeypatch.setattr(browser_tool, "_is_local_mode", lambda: False)
+        monkeypatch.setattr(browser_tool, "_find_agent_browser", lambda: "/usr/bin/agent-browser")
+        monkeypatch.setattr(
+            browser_tool, "_get_session_info",
+            lambda task_id: {"session_name": "sess", "cdp_url": "http://127.0.0.1:9222"},
+        )
+        monkeypatch.setattr(browser_tool, "_write_owner_pid", lambda *a, **k: None)
+        monkeypatch.setattr(interrupt_mod, "is_interrupted", lambda: False)
+
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 0
+        monkeypatch.setattr("subprocess.Popen", lambda *a, **k: mock_proc)
+        monkeypatch.setattr("os.open", lambda *a, **k: 99)
+        monkeypatch.setattr("os.close", lambda *a, **k: None)
+        monkeypatch.setattr("os.unlink", lambda *a, **k: None)
+        monkeypatch.setattr("os.makedirs", lambda *a, **k: None)
+
+        stdout_text = _json.dumps({"success": False, "error": error_text})
+        monkeypatch.setattr(
+            "builtins.open",
+            MagicMock(return_value=MagicMock(
+                __enter__=MagicMock(return_value=MagicMock(read=MagicMock(return_value=stdout_text))),
+                __exit__=MagicMock(return_value=False),
+            )),
+        )
+
+        return browser_tool._run_browser_command("t::enrolled", "click", ["e1"])
+
+    def test_genuine_dead_endpoint_error_is_evicted_and_result_unchanged(self, monkeypatch):
+        self._seed_session_state()
+        error_text = "WebSocket connection closed unexpectedly"
+
+        result = self._drive_run_browser_command(monkeypatch, error_text)
+
+        # The hook must never turn a failure into a success or alter the payload.
+        assert result == {"success": False, "error": error_text}
+        assert "t::enrolled" not in browser_tool._session_cdp_urls
+        assert "t::enrolled" not in browser_tool._session_handles
+        assert "t::enrolled" not in browser_tool._active_sessions
+
+    def test_benign_websocket_mention_does_not_evict(self, monkeypatch):
+        """IMPORTANT #1 regression test: bare "websocket" must not evict."""
+        self._seed_session_state()
+        error_text = "Failed to open a websocket devtools inspector stream; retrying navigation"
+
+        result = self._drive_run_browser_command(monkeypatch, error_text)
+
+        assert result == {"success": False, "error": error_text}
+        assert browser_tool._session_cdp_urls.get("t::enrolled") == "http://127.0.0.1:9222"
+        assert "t::enrolled" in browser_tool._session_handles
+        assert "t::enrolled" in browser_tool._active_sessions
+
     def test_eviction_is_a_noop_for_a_bare_key(self, _default_enrolled):
         browser_tool._evict_dead_enrolled_session("t")  # must not raise

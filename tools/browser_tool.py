@@ -532,8 +532,18 @@ def _release_session_handle(session_key: str) -> None:
 
 
 _DEAD_CDP_MARKERS = (
-    "econnrefused", "connection refused", "websocket", "target closed",
-    "browser has disconnected", "connect econn",
+    "econnrefused", "connection refused",
+    # OTTO (fix round 1, EBL-009 Important #1): bare "websocket" is too broad
+    # -- _format_browser_timeout_error embeds up to 1500 raw chars of daemon
+    # stdout/stderr on a timeout, and the non-JSON path embeds up to 2000,
+    # both plausible carriers of ordinary CDP chatter that merely mentions
+    # "websocket" without the browser actually being gone. A false match
+    # here isn't just a harmless relaunch: the next acquire()'s daemon
+    # hygiene runs `close --all` unconditionally, tearing down every
+    # concurrent agent-browser session, not just this one. Narrowed to
+    # phrases that only appear when the transport itself has failed.
+    "websocket connection closed", "websocket error",
+    "target closed", "browser has disconnected", "connect econn",
 )
 
 
@@ -2844,7 +2854,19 @@ def _run_browser_command(
     # --- Lightpanda automatic Chrome fallback ---
     # If engine is lightpanda and the result looks broken, retry with Chrome.
     # This runs for ALL exit paths (timeout, empty, non-JSON, nonzero rc, parsed).
-    fallback_reason = _lightpanda_fallback_reason(engine, command, result)
+    # OTTO (fix round 1, EBL-009 Important #2): `engine` is the GLOBALLY
+    # configured browser.engine, not proof this specific command actually ran
+    # on Lightpanda -- a CDP-attached session (session_info["cdp_url"] set)
+    # never gets `--engine` appended (see the injection guard above), so it
+    # never runs Lightpanda regardless of what `engine` resolves to. Without
+    # this guard, an operator running an enrolled profile alongside a global
+    # `browser.engine: lightpanda` setting would have every genuine dead-CDP
+    # failure on the enrolled key silently swallowed by this branch's early
+    # `return`, skipping the eviction hook below entirely.
+    fallback_reason = (
+        None if session_info.get("cdp_url")
+        else _lightpanda_fallback_reason(engine, command, result)
+    )
     if fallback_reason:
         logger.info(
             "Lightpanda fallback: retrying '%s' with Chrome (task=%s): %s",
