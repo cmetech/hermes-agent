@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from enum import StrEnum
 import math
 from pathlib import Path
 from types import MappingProxyType
@@ -110,6 +111,25 @@ class WorkflowDefinition:
     nodes: tuple[WorkflowNode, ...]
     options: Mapping[str, Any]
     source_path: Path
+
+
+class WorkflowLanguageProfile(StrEnum):
+    HERMES_LEGACY = "hermes-legacy"
+    ARCHON_2026_07 = "archon-2026-07"
+
+
+@dataclass(frozen=True)
+class WorkflowLanguageSelection:
+    declared_profile: WorkflowLanguageProfile | None
+    effective_profile: WorkflowLanguageProfile
+
+
+@dataclass(frozen=True)
+class WorkflowLanguageMetadata:
+    declared_profile: WorkflowLanguageProfile | None
+    effective_profile: WorkflowLanguageProfile
+    normalizer_version: int
+    normalized_definition_digest: str
 
 
 @dataclass(frozen=True)

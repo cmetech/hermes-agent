@@ -3111,3 +3111,33 @@ upstream_changes:
     ceiling becomes run-scoped and is revised as the projection grows, making a
     per-attempt refresh redundant.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-language-contracts
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/language.py
+  - plugins/workflow/models.py
+  - tests/plugins/workflow/test_language.py
+  owned_symbols:
+  - WorkflowLanguageProfile
+  - WorkflowLanguageSelection
+  - WorkflowLanguageMetadata
+  - WorkflowLanguageCompatibilityError
+  - resolve_language_profile
+  - normalize_workflow
+  - bind_semantic_fingerprint
+  - language_projection
+  tests:
+  - tests/plugins/workflow/test_language.py
+  expected_commit_subject: 'feat(workflow): define language profile contracts'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve the dependency-neutral immutable language contracts and the
+    deterministic, versioned normalization boundary. Keep unversioned
+    workflows on hermes-legacy, exclude source locations from semantic
+    identity, and fail closed for unsupported profiles or normalizer versions.
+  removal_condition: >-
+    Remove when upstream provides an equivalent dependency-neutral immutable,
+    versioned workflow normalization boundary with deterministic semantic
+    fingerprints.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
