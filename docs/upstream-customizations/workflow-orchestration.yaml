@@ -3541,3 +3541,30 @@ upstream_changes:
     equivalent language contracts, admission pinning, schema, middleware, and
     Desktop compatibility coverage.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-language-sealed-showcase-retry-marker
+  change_class: workflow-security
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/showcases/digests.json
+  - plugins/workflow/showcases/packages/resilience/scripts/fail-once.py
+  - tests/plugins/workflow/test_showcase_resilience_e2e.py
+  owned_symbols:
+  - resilience fail-once marker placement in ARTIFACTS_DIR
+  - absence of unsealed resilience retry state at the run root
+  - digest-restamped resilience showcase package
+  tests:
+  - tests/plugins/workflow/test_showcase_resilience_e2e.py
+  - tests/plugins/workflow/test_portable_compatibility_e2e.py
+  expected_commit_subject: 'fix(workflow): preserve sealed resilience retries'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve retry state for the resilience showcase inside the executor-owned
+    mutable artifacts namespace using ARTIFACTS_DIR. Never restore the marker
+    at the sealed run root or weaken sealed-snapshot default-deny to allow a
+    showcase-specific unsealed file. Restamp the authenticated package digest
+    whenever the bundled script changes.
+  removal_condition: >-
+    Remove when upstream's resilience retry fixture stores its runtime marker
+    in an equivalent executor-owned mutable namespace without weakening sealed
+    workflow tree verification.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

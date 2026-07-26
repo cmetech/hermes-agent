@@ -5,13 +5,12 @@ import os
 from pathlib import Path
 
 
-run_dir = Path(os.environ["HERMES_WORKFLOW_RUN_DIR"])
 node_id = os.environ["HERMES_WORKFLOW_NODE_ID"]
 mode = os.environ.get("ARGUMENTS", "retry").strip() or "retry"
 if node_id == "select-mode":
     print(json.dumps({"mode": mode}))
 elif node_id == "retry":
-    marker = run_dir / ".showcase-failed-once"
+    marker = Path(os.environ["ARTIFACTS_DIR"]) / ".showcase-failed-once"
     if not marker.exists():
         marker.write_text("owned\n", encoding="utf-8")
         raise SystemExit(17)
