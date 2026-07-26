@@ -328,7 +328,6 @@ class RunScheduler:
         self._active_runs: set[str] = set()
         self._submitted_runs: set[str] = set()
         self._active_executions = 0
-        self._verified_sealed_paths: dict[str, frozenset[str] | None] = {}
         self._submission_pool = ThreadPoolExecutor(
             max_workers=self.max_parallel_nodes,
             thread_name_prefix="workflow-run",
@@ -527,9 +526,9 @@ class RunScheduler:
                 return
             self.store.transition_pending_nodes(run_id, transitions)
 
-    def _load_run_package(self, run_id: str) -> WorkflowPackage:
-        with self._activity:
-            self._verified_sealed_paths.pop(run_id, None)
+    def _load_verified_run_package(
+        self, run_id: str
+    ) -> tuple[WorkflowPackage, frozenset[str]]:
         run_directory = self.store.run_directory(run_id)
         definition = run_directory / "definition.yaml"
         policy = run_directory / "policy.yaml"
@@ -641,8 +640,13 @@ class RunScheduler:
             verified_sealed_paths = self._legacy_resource_paths(
                 package, run_directory=run_directory
             )
-        with self._activity:
-            self._verified_sealed_paths[run_id] = verified_sealed_paths
+        if verified_sealed_paths is None:
+            raise integrity_error("verified workflow resource identity is missing")
+        return package, verified_sealed_paths
+
+    def _load_run_package(self, run_id: str) -> WorkflowPackage:
+        """Compatibility wrapper returning only the verified workflow package."""
+        package, _sealed_paths = self._load_verified_run_package(run_id)
         return package
 
     @staticmethod
@@ -723,9 +727,7 @@ class RunScheduler:
 
     def _prepare_run_package(self, run_id: str, schedule_revalidation):
         try:
-            package = self._load_run_package(run_id)
-            with self._activity:
-                sealed_paths = self._verified_sealed_paths.pop(run_id, None)
+            package, sealed_paths = self._load_verified_run_package(run_id)
             return package, self._run_execution_limits(package), sealed_paths
         except Exception:
             if schedule_revalidation is None:

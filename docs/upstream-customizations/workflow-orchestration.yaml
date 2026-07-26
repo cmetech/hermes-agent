@@ -3236,6 +3236,7 @@ upstream_changes:
   - run projection language metadata
   - run projection sealed_snapshot_digest
   - load_workflow_snapshot normalizer_version pin
+  - RunScheduler._load_verified_run_package atomic verification result
   - RunScheduler._load_run_package sealed language verification
   - read_sealed_snapshot_paths
   - sealed_snapshot_digest admitted-path verification
@@ -3266,7 +3267,10 @@ upstream_changes:
     are mutable exceptions; symlinks remain forbidden. Bind command, script,
     and MCP resolution to the journal-corroborated sealed path set so
     higher-precedence additions and resolver-visible mutable outputs cannot
-    become executable resources.
+    become executable resources. Return the verified package and its sealed
+    resource paths atomically from one internal load; never hand authorization
+    through scheduler-global mutable state or permit a missing path set to
+    become unrestricted resolution under concurrent same-run preparation.
     Select the pinned supported normalizer and fail closed with typed invalid,
     unsupported-profile, unsupported-version, missing, mismatch, or snapshot
     integrity errors before node execution. Preserve positional
@@ -3283,7 +3287,7 @@ upstream_changes:
     Remove when upstream provides equivalent package-bound semantic admission
     pinning, journal-backed admitted-tree identity, sealed-byte-only resume,
     typed fail-closed verification, default-deny current-tree validation,
-    resolver-bound admitted resources, scheduled language and tree identity
-    revalidation, and pre-language legacy compatibility without a database
-    migration.
+    atomically returned resolver-bound admitted resources, scheduled language
+    and tree identity revalidation, and pre-language legacy compatibility
+    without a database migration.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

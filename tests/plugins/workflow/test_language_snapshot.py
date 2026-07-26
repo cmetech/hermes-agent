@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
+import threading
 
 import pytest
 import yaml
@@ -14,6 +16,7 @@ from plugins.workflow.language import (
     make_language_snapshot,
     read_language_snapshot,
 )
+from plugins.workflow.resources import ResourceResolver
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.scheduled_revalidation import sealed_snapshot_digest
@@ -278,6 +281,66 @@ def test_resume_rejects_unsealed_resource_precedence_shadow(
         _load_with_scheduler(store, admitted.run_id)
 
     assert exc.value.code == "workflow_snapshot_integrity_mismatch"
+
+
+def test_concurrent_same_run_preparation_returns_independent_sealed_paths(
+    tmp_path, workflow_writer, monkeypatch
+):
+    root = tmp_path / "concurrent-prepare"
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True)
+    sealed = scripts / "helper.py"
+    sealed.write_text("print('sealed')\n", encoding="utf-8")
+    package = load_workflow(
+        workflow_writer(
+            root,
+            name="concurrent-prepare",
+            nodes=[{"id": "use", "script": "helper", "runtime": "uv"}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    _prepared, admitted = _start(store, package, key="concurrent-prepare")
+    scheduler = RunScheduler(store)
+    barrier = threading.Barrier(2)
+    original_load = scheduler._load_verified_run_package
+
+    def synchronized_load(run_id: str):
+        loaded = original_load(run_id)
+        barrier.wait(timeout=5)
+        return loaded
+
+    monkeypatch.setattr(
+        scheduler, "_load_verified_run_package", synchronized_load
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = tuple(
+                future.result(timeout=10)
+                for future in (
+                    pool.submit(
+                        scheduler._prepare_run_package, admitted.run_id, None
+                    ),
+                    pool.submit(
+                        scheduler._prepare_run_package, admitted.run_id, None
+                    ),
+                )
+            )
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    sealed_path_sets = tuple(result[2] for result in results)
+    assert sealed_path_sets[0] is not None
+    assert sealed_path_sets[0] == sealed_path_sets[1]
+    run_directory = store.run_directory(admitted.run_id)
+    (run_directory / "scripts" / "helper").write_text(
+        "print('shadow')\n", encoding="utf-8"
+    )
+    assert {
+        ResourceResolver(
+            run_directory, sealed_paths=paths
+        ).script("helper", runtime="uv").path.name
+        for paths in sealed_path_sets
+    } == {"helper.py"}
 
 
 def test_resume_rejects_unjournaled_unknown_normalizer_rewrite(

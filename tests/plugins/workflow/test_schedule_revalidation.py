@@ -1378,7 +1378,7 @@ def test_live_trust_change_after_package_load_fails_at_atomic_promotion(
         execution_fence=ExecutionFence(identity.owner_id, epoch),
         utcnow=lambda: due,
     )
-    original_load = scheduler._load_run_package
+    original_load = scheduler._load_verified_run_package
     mutated = False
 
     def load_then_revoke(loaded_run_id: str):
@@ -1391,7 +1391,9 @@ def test_live_trust_change_after_package_load_fails_at_atomic_promotion(
             )
         return sealed
 
-    monkeypatch.setattr(scheduler, "_load_run_package", load_then_revoke)
+    monkeypatch.setattr(
+        scheduler, "_load_verified_run_package", load_then_revoke
+    )
     try:
         if batch:
             result = scheduler.advance_all([run_id])[run_id]
@@ -1632,7 +1634,7 @@ def test_package_preparation_error_without_server_authorization_propagates(
     def fail_load(_run_id: str):
         raise RuntimeError("ordinary package load failure")
 
-    monkeypatch.setattr(scheduler, "_load_run_package", fail_load)
+    monkeypatch.setattr(scheduler, "_load_verified_run_package", fail_load)
     try:
         with pytest.raises(RuntimeError, match="ordinary package load failure"):
             scheduler._prepare_run_package("ordinary-or-legacy", None)
