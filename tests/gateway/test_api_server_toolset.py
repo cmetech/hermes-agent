@@ -175,4 +175,18 @@ class TestApiServerAdapterToolset:
             mock_agent_cls.assert_called_once()
             call_kwargs = mock_agent_cls.call_args
             toolsets = call_kwargs.kwargs.get("enabled_toolsets")
-            assert sorted(toolsets) == ["terminal", "web"]
+            # Plugin toolsets are enabled-by-DEFAULT (opt-out, not opt-in --
+            # see the "Plugin toolsets" branch in _get_platform_tools), so they
+            # ride along regardless of platform_toolsets. This fork vendors
+            # Ericsson plugins, which is why ``ericsson-jira`` started showing
+            # up here and broke a bare equality assertion.
+            #
+            # The behaviour under test is that the CONFIG OVERRIDE is honoured,
+            # so compare only the non-plugin toolsets. Subtracting the plugin
+            # keys rather than naming Ericsson keeps this correct for any
+            # future vendored plugin, while still failing if the override leaks
+            # an unrequested first-party toolset.
+            from hermes_cli.tools_config import _get_plugin_toolset_keys
+
+            plugin_keys = _get_plugin_toolset_keys()
+            assert sorted(ts for ts in toolsets if ts not in plugin_keys) == ["terminal", "web"]
