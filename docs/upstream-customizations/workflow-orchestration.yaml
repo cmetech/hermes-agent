@@ -830,9 +830,24 @@ upstream_changes:
   - tests/plugins/workflow/test_process_lifecycle_soak.py
   expected_commit_subject: 'test(workflow): enforce production and merge gates'
   upstream_candidate: true
-  merge_guidance: Preserve the credential-free Linux, macOS, and Windows matrix
-    and its installed-showcase and process-lifecycle assertions while reconciling
-    upstream CI orchestration changes.
+  merge_guidance: >-
+    Preserve the credential-free Linux, macOS, and Windows matrix and its
+    installed-showcase and process-lifecycle assertions while reconciling
+    upstream CI orchestration changes. The job is now SLICED (os x slice, four
+    slices) and the file list lives in the matrix rather than inline in the run
+    step, so a merge that restores a single inline list silently reintroduces
+    the failure this fixed: the job last passed on 2026-07-21 in 18 minutes with
+    19 files, then grew to 28 and took 40m40s on Windows against a 30-minute
+    budget, so it was killed at ~64% on every run and the aggregate gate could
+    never go green. Windows is roughly 14x slower than macOS on these
+    admission/backlog tests (a directory copy plus an fsync'd SQLite write per
+    admission), so slices are balanced on measured WINDOWS seconds --
+    1155/659/548/74 -- not on test count. Keep test_scheduled_runs.py alone in
+    slice 1: at 1155s it is 47% of the job, so it bounds the critical path and
+    pairing it with anything makes that slice the new timeout risk. On merge:
+    UNION, keep `os` as the three-entry list (tests assert it literally), keep
+    the step name "Run portable workflow and installed-showcase gates", and
+    re-balance from fresh Windows timings rather than assuming these hold.
   removal_condition: Remove when upstream CI provides equivalent native
     all-platform portable-workflow and installed-showcase coverage.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
@@ -3051,4 +3066,48 @@ upstream_changes:
     files are non-normative and must not be interpreted as widening Revision 7.
   removal_condition: Remove after equivalent v3.0.3 verification evidence and
     deferred-work dispositions are carried in the upstream release record.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-journal-reserve-refresh
+  change_class: workflow-runtime
+  owner: workflow-orchestration
+  files:
+  - plugins/workflow/store.py
+  owned_symbols:
+  - _check_journal_reserve
+  tests:
+  - tests/plugins/workflow/test_journal_reserve_fanout.py
+  - tests/plugins/workflow/test_fault_injection.py
+  - tests/plugins/workflow/test_provider_failures.py
+  expected_commit_subject: 'fix(workflow): re-reserve journal capacity when a fan-out outgrows a sibling snapshot'
+  upstream_candidate: false
+  merge_guidance: >-
+    Each attempt reserves durable journal capacity sized by
+    TerminalJournalReserve.for_projection from the projection as it stood when
+    that attempt claimed (limit = P + max(8KB, P)); the row lives until the
+    attempt's worker_claims row is deleted, which cascades it away. In a
+    parallel fan-out every sibling claims while the projection is smallest, so
+    the OLDEST live sibling's snapshot bound every later sibling's terminal
+    write, and ordinary progress -- each sibling completing and appending its
+    results -- grew the projection past it. The run then died with
+    executor_crash and last_error "event_journal_quota protected terminal
+    projection reserve" for no capacity reason at all. Measured on the five-wide
+    laptop-diagnostic showcase: peak projection 12034 against a 13258 ceiling,
+    1224 bytes (~9%) of headroom, ~1280 bytes consumed per completing sibling.
+    It tipped over on macos-latest in CI. The fix re-derives that sibling's
+    reserve at the CURRENT projection size and persists the wider values, but
+    ONLY after the existing max_journal_bytes check passes, so a refused write
+    never leaves a widened reserve behind and re-reserving can never be used to
+    exceed the quota. On merge: UNION, and preserve three properties or the
+    guarantee silently weakens -- (1) the widening UPDATE must stay AFTER the
+    journal-capacity check, (2) remaining_required must be recomputed from the
+    grown reserve so the capacity check accounts for what it just promised, and
+    (3) the terminal attempt keeps going through frame consumption
+    (_consume_journal_reserve), never through re-reserve. After this change
+    "event_journal_quota" always means genuinely out of durable space; if a
+    stale-snapshot refusal ever reappears, the fan-out regression test is the
+    canary.
+  removal_condition: >-
+    Remove if reserves stop being per-attempt snapshots -- e.g. if the projection
+    ceiling becomes run-scoped and is revised as the projection grows, making a
+    per-attempt refresh redundant.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

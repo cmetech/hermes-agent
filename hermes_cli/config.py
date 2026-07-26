@@ -154,7 +154,14 @@ def _warn_config_parse_failure(
     except Exception:
         pass
 
-_IS_WINDOWS = platform.system() == "Windows"
+# os.name, not platform.system(): on Windows the latter routes through
+# platform.uname() -> win32_ver() -> _syscmd_ver(), which SPAWNS `cmd /c ver`.
+# This constant is evaluated at import, so every process that imports
+# hermes_cli.config paid for a subprocess on Windows -- measurable CLI startup
+# cost, and a hard failure anywhere subprocess creation is restricted. It also
+# broke test_bedrock_classification_is_pure_in_a_fresh_process, which forbids
+# subprocess during runtime classification and caught this import-time spawn.
+_IS_WINDOWS = os.name == "nt"
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Env var names that influence how the next subprocess executes —

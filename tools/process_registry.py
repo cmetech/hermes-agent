@@ -40,7 +40,9 @@ import threading
 import time
 import uuid
 
-_IS_WINDOWS = platform.system() == "Windows"
+# os.name, not platform.system(): the latter spawns `cmd /c ver` on Windows
+# and this runs at import time. See the note in hermes_cli/config.py.
+_IS_WINDOWS = os.name == "nt"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field

@@ -149,6 +149,29 @@ describe('dispatchNativeNotification throttle', () => {
   })
 })
 
+describe('dispatchNativeNotification without the Electron bridge', () => {
+  // Fire-and-forget projection must degrade quietly outside Electron. An
+  // unhandled rejection here fails the entire vitest run (and is a real defect
+  // in the browser/dev-server build), so assert the promise is settled.
+  it('swallows the missing-bridge rejection instead of leaving it unhandled', async () => {
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined)
+    delete desktopWindow.hermesDesktop
+    setWindowState({ focused: false, hidden: true })
+
+    expect(() => {
+      dispatchNativeNotification({ kind: 'approval', sessionId: freshSession(), title: 'no bridge' })
+    }).not.toThrow()
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(debug).toHaveBeenCalledWith(
+      '[native-notifications] projection failed',
+      expect.objectContaining({ message: 'Electron notification bridge unavailable' })
+    )
+    debug.mockRestore()
+  })
+})
+
 describe('sendTestNativeNotification', () => {
   it('fires regardless of focus or active session', () => {
     setWindowState({ focused: true, hidden: false })

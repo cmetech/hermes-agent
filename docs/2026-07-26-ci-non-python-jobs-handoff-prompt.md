@@ -14,14 +14,27 @@ CI now runs on `base` (added 2026-07-25) and its **Python suite is fully green**
 `All required checks pass` is still RED because of five non-Python jobs, none of
 which was ever in the Python failure set.
 
-- Branch `base`, HEAD **`55fd2d99a`**, pushed, clean.
+- **Start from `base` at HEAD `a7ac8a1cf` (v4.0.5).** Pull before starting —
+  this moved after the handoff was first written. Two commits landed on top of
+  the original `b8d37a756`:
+  `824019f65 fix(desktop): restore sessions from full-page routes`, then
+  `a7ac8a1cf chore(release): v4.0.5`.
 - `base` has branch protection: force-push and deletion blocked,
   `enforce_admins: true`, **no** required status checks, **no** required PR
   reviews. Direct pushes still work. To force-push you must temporarily
   `gh api -X DELETE repos/cmetech/hermes-agent/branches/base/protection`.
-- Latest CI run: **30180814521**. Failing job IDs are listed per section below.
-- OTTO/LOOP24 **v4.0.4** are released (otto `25ac86346`, loop24 `d08a5d389`).
-  None of this work is in a release; it is all test/lint infrastructure.
+- OTTO/LOOP24 **v4.0.5** are released (otto `1f257a21d`, loop24 `515a56ef3`).
+  None of the work in THIS handoff is in a release; it is all test/lint
+  infrastructure and needs no version bump.
+- CI runs referenced below: job IDs in §3-§6 come from run **30180814521**
+  (at `55fd2d99a`). Run **30182346371** is the v4.0.5 run; its job IDs differ,
+  but the same five jobs fail. Re-resolve IDs for the current run with the
+  command in §9 rather than reusing the old ones.
+
+**Re-verified at `a7ac8a1cf`:** the same five jobs fail, and the `check:test:ui`
+diagnosis below still reproduces exactly (0 failing tests, exit 1). The desktop
+fix added 3 tests — 2258 pass now vs 2255 — but changed nothing about these
+failures.
 
 **Goal:** get these five green, then the required-status-check decision becomes
 available (it is deliberately still advisory — see §7).
@@ -35,6 +48,13 @@ available (it is deliberately still advisory — see §7).
 
 If either fails: `rm -rf .venv && uv sync --locked --python 3.11 --extra all --extra dev --python-preference managed`.
 
+- **Run the desktop checks on `base`, never on a brand branch.** CI runs on
+  `base`. On `otto`/`loop24` the desktop i18n strings are branded, so
+  `npm run test:ui` reports ~13 real-looking failures that are pure brand
+  artifacts (`expected 'LOOP24 Desktop is ready' to be 'Hermes Desktop is
+  ready'`). They are NOT the CI failure and chasing them wastes an hour.
+  Check `git branch --show-current` first; this repo is often left on a brand
+  branch after a release.
 - **Never use bare `pytest` for a verdict** — use `scripts/run_tests.sh`
   (CI parity: subprocess-per-file, `TZ=UTC`, scrubbed env).
 - `node scripts/brand/generate.mjs <brand> --check` **fails on `base` by
@@ -87,7 +107,7 @@ passes. Confirm with Corey before editing vendored files in place.
 cd apps/desktop && npm run test:ui    # EXIT=1
 ```
 
-The trap: **every test passes.** `258 files, 2255 passed, 1 skipped, 0 failed` —
+The trap: **every test passes.** `258 files, 2258 passed, 1 skipped, 0 failed` —
 and it still exits 1, because vitest fails a run on an unhandled rejection:
 
 ```

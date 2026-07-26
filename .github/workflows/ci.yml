@@ -24,11 +24,20 @@ on:
     # cycle and how the kanban expected_run_id contract drifted away from its
     # callers unnoticed.
     #
-    # NOT yet a required check: the first runs are advisory on purpose. Roughly
-    # 15 suite failures are still undiagnosed and may be macOS-only artifacts
-    # of the dev box rather than real -- this run is what classifies them. Add
-    # branch protection once it is green, not before; an always-red check
-    # teaches everyone to ignore it.
+    # ADVISORY BY CHOICE, not "not green yet". The suite reached green on
+    # 2026-07-26 (run 30190623502): Python 8/8, all four Windows portability
+    # slices, and every JS/TS check. The undiagnosed failures this comment used
+    # to warn about were classified and fixed -- most were tests measuring the
+    # macOS dev box rather than behaviour, but two were real Windows product
+    # bugs (quarantine could not rename an open SQLite file; a showcase's
+    # max_descendants was POSIX-shaped and killed a healthy node).
+    #
+    # `All required checks pass` is deliberately NOT wired into branch
+    # protection. Required checks are evaluated against the branch tip and CI
+    # runs after a push, so requiring it would force every change through a PR.
+    # This fork pushes directly to base by design, so the gate stays
+    # informational: it reports on every push and blocks nothing. Revisit only
+    # if the team adopts a PR workflow -- do not enable it as "tidying up".
     #
     # Brand branches (otto, loop24) are deliberately excluded for now: they are
     # generated overlays of base, so base covers the shared code. Add them if a
@@ -177,16 +186,74 @@ jobs:
     name: OSV scan
     uses: ./.github/workflows/osv-scanner.yml
 
+  # Sliced because this job outgrew a single runner. It last passed on
+  # 2026-07-21 in 18 minutes with 19 test files; nine more were added after
+  # that (including test_scheduled_runs.py and test_schedule_store_identity.py,
+  # neither of which existed then), which took the Windows run to 40m40s
+  # against a 30-minute budget. It was killed at ~64% on every run afterwards.
+  # That looked like a hang but never was: these are admission/backlog tests
+  # that copy a package directory and fsync a SQLite write per admission, and
+  # Windows is ~14x slower at exactly that (one test measures 8.7s here and
+  # >120s there).
+  #
+  # Slices are balanced on MEASURED WINDOWS seconds — Linux and macOS finish in
+  # a fraction of the time, so Windows sets the shape. Totals per slice:
+  # 1155s / 659s / 548s / 74s, i.e. a ~19-minute critical path instead of 41.
+  #
+  # NOTE slice 1 is one file. test_scheduled_runs.py alone is 1155s (47% of the
+  # job), so file-level slicing cannot go below it — if this job creeps toward
+  # the limit again, split that FILE rather than adding a fifth slice.
   workflow-portability:
-    name: Workflow portability (${{ matrix.os }})
+    name: Workflow portability (${{ matrix.os }}, slice ${{ matrix.slice.index }}/4)
     needs: detect
     if: needs.detect.outputs.python == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        slice:
+          # ~1155s on Windows
+          - index: 1
+            files: >-
+              tests/plugins/workflow/test_scheduled_runs.py
+          # ~659s on Windows
+          - index: 2
+            files: >-
+              tests/plugins/workflow/test_coordinator.py
+              tests/plugins/workflow/test_process_lifecycle_soak.py
+              tests/plugins/workflow/test_schedule_store_identity.py
+              tests/plugins/workflow/test_schedule_revalidation.py
+          # ~548s on Windows
+          - index: 3
+            files: >-
+              tests/plugins/workflow/test_desktop_api.py
+              tests/plugins/workflow/test_node_mcp.py
+              tests/plugins/workflow/test_retention.py
+              tests/plugins/workflow/test_notifications.py
+              tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py
+              tests/plugins/workflow/test_showcase_resilience_e2e.py
+              tests/plugins/workflow/test_fault_injection.py
+          # ~74s on Windows
+          - index: 4
+            files: >-
+              tests/plugins/workflow/test_ai_extensions_middleware_e2e.py
+              tests/plugins/workflow/test_scheduling_middleware_e2e.py
+              tests/plugins/workflow/test_showcase_catalog.py
+              tests/plugins/workflow/test_coordinator_multiprocess.py
+              tests/plugins/workflow/test_idempotency_multiprocess.py
+              tests/plugins/workflow/test_notification_delivery.py
+              tests/plugins/workflow/test_runner_binding.py
+              tests/plugins/workflow/test_portable_compatibility_e2e.py
+              tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
+              tests/plugins/workflow/test_shutdown_recovery.py
+              tests/plugins/workflow/test_schema_migrations.py
+              tests/plugins/workflow/test_evidence_api.py
+              tests/plugins/workflow/test_showcase_distribution_e2e.py
+              tests/plugins/workflow/test_security_boundaries.py
+              tests/tools/test_managed_process.py
+              tests/hermes_cli/test_execution_runtime_capabilities.py
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -213,35 +280,7 @@ jobs:
           NOUS_API_KEY: ""
           PYTHONUTF8: "1"
         run: |
-          uv run --no-sync python -m pytest -q \
-            tests/tools/test_managed_process.py \
-            tests/hermes_cli/test_execution_runtime_capabilities.py \
-            tests/plugins/workflow/test_evidence_api.py \
-            tests/plugins/workflow/test_idempotency_multiprocess.py \
-            tests/plugins/workflow/test_coordinator.py \
-            tests/plugins/workflow/test_coordinator_multiprocess.py \
-            tests/plugins/workflow/test_runner_binding.py \
-            tests/plugins/workflow/test_schedule_store_identity.py \
-            tests/plugins/workflow/test_scheduled_runs.py \
-            tests/plugins/workflow/test_schedule_revalidation.py \
-            tests/plugins/workflow/test_desktop_api.py \
-            tests/plugins/workflow/test_node_mcp.py \
-            tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py \
-            tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py \
-            tests/plugins/workflow/test_ai_extensions_middleware_e2e.py \
-            tests/plugins/workflow/test_scheduling_middleware_e2e.py \
-            tests/plugins/workflow/test_schema_migrations.py \
-            tests/plugins/workflow/test_notification_delivery.py \
-            tests/plugins/workflow/test_notifications.py \
-            tests/plugins/workflow/test_shutdown_recovery.py \
-            tests/plugins/workflow/test_retention.py \
-            tests/plugins/workflow/test_portable_compatibility_e2e.py \
-            tests/plugins/workflow/test_showcase_catalog.py \
-            tests/plugins/workflow/test_showcase_distribution_e2e.py \
-            tests/plugins/workflow/test_showcase_resilience_e2e.py \
-            tests/plugins/workflow/test_fault_injection.py \
-            tests/plugins/workflow/test_security_boundaries.py \
-            tests/plugins/workflow/test_process_lifecycle_soak.py
+          uv run --no-sync python -m pytest -q ${{ matrix.slice.files }}
 
   # ─────────────────────────────────────────────────────────────────────
   # Live-updating PR review comment.

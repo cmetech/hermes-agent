@@ -182,7 +182,13 @@ def test_scheduler_sidecar_caps_normal_ai_request_fields_exactly(
     assert result["status"] == "succeeded"
     request = runner.requests[0]
     assert request.idle_timeout_seconds == 10
-    assert request.wall_timeout_seconds == 20
+    # DeadlineBudget stores an absolute deadline (now + requested) and reports
+    # remaining_wall() as (deadline - now). That round-trip is inexact whenever
+    # now + requested crosses a binary exponent boundary -- ~7% of freshly
+    # booted CI clocks for requested=20, 0% at a long-uptime dev box, which is
+    # why this only ever failed on macos-latest. The value is correct; exact
+    # float equality is the wrong assertion.
+    assert request.wall_timeout_seconds == pytest.approx(20, abs=1e-9)
     assert request.provider_request_timeout_seconds == 8
     assert request.max_api_attempts == 3
     assert request.max_process_tree_rss_bytes == 64 * 1024 * 1024

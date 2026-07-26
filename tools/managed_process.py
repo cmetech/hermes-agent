@@ -13,7 +13,6 @@ from dataclasses import dataclass
 import logging
 import math
 import os
-import platform
 import signal
 import subprocess
 import threading
@@ -26,7 +25,9 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 
 
 logger = logging.getLogger(__name__)
-_IS_WINDOWS = platform.system() == "Windows"
+# os.name, not platform.system(): the latter spawns `cmd /c ver` on Windows
+# and this runs at import time. See the note in hermes_cli/config.py.
+_IS_WINDOWS = os.name == "nt"
 _JOB_OBJECT_QUERY = 0x0004
 _JOB_OBJECT_TERMINATE = 0x0008
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
