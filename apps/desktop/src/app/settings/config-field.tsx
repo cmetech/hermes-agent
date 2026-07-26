@@ -10,6 +10,7 @@ import { cn } from '@/lib/utils'
 import type { ConfigFieldSchema } from '@/types/hermes'
 
 import { CONTROL_TEXT, EMPTY_SELECT_VALUE, FIELD_DESCRIPTIONS, FIELD_LABELS, FREE_INPUT_KEYS } from './constants'
+import { EnrolledProfileField } from './enrolled-profile-field'
 import { FallbackModelsField } from './fallback-models-field'
 import { fieldCopyForSchemaKey } from './field-copy'
 import { ListRow } from './primitives'
@@ -81,6 +82,14 @@ export function ConfigField({
   // dedicated structured editor instead.
   if (schemaKey === 'fallback_providers') {
     return row(<FallbackModelsField onChange={onChange} value={value} />, true)
+  }
+
+  // OTTO: `browser.default_profile` holds a profile NAME, so it cannot be
+  // declared `type: 'boolean'` — the generic Switch below would write `true` and
+  // the backend would look up a profile called "True". Users still need a
+  // switch rather than a text box, so the mapping is explicit.
+  if (schemaKey === 'browser.default_profile') {
+    return row(<EnrolledProfileField onChange={onChange} value={value} />)
   }
 
   if (schema.type === 'boolean') {

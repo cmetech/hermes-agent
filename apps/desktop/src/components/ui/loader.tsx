@@ -1,6 +1,6 @@
-import { type ComponentProps, useEffect, useRef } from 'react'
+import { type ComponentProps } from 'react'
 
-import { cn } from '@/lib/utils'
+import { NativeLoader } from './loader-native'
 
 export const LOADER_TYPES = [
   'original-thinking',
@@ -45,7 +45,7 @@ interface LoaderCurve {
   trailSpan: number
 }
 
-interface LoaderProps extends Omit<ComponentProps<'div'>, 'children'> {
+export interface LoaderProps extends Omit<ComponentProps<'div'>, 'children'> {
   label?: string
   pathSteps?: number
   strokeScale?: number
@@ -63,7 +63,7 @@ interface BaseCurveOptions extends Pick<
 
 const TWO_PI = Math.PI * 2
 
-const LOADER_CURVES: Record<LoaderType, LoaderCurve> = {
+export const LOADER_CURVES: Record<LoaderType, LoaderCurve> = {
   'original-thinking': thinkingCurve('Original Thinking', 7, {
     durationMs: 4600,
     particleCount: 64,
@@ -315,85 +315,26 @@ const LOADER_CURVES: Record<LoaderType, LoaderCurve> = {
   }
 }
 
-export function Loader({
-  className,
-  label = 'Loading',
-  pathSteps = 240,
-  role = 'status',
-  strokeScale = 1,
-  type = 'rose-curve',
-  ...props
-}: LoaderProps) {
-  const config = LOADER_CURVES[type]
-  const groupRef = useRef<SVGGElement | null>(null)
-  const particleRefs = useRef<Array<SVGCircleElement | null>>([])
-  const pathRef = useRef<SVGPathElement | null>(null)
-
-  useEffect(() => {
-    let animationFrame = 0
-    const startedAt = performance.now()
-    const phaseOffset = Math.random()
-    particleRefs.current.length = config.particleCount
-
-    const render = (now: number) => {
-      const time = now - startedAt
-      const progress = ((time + phaseOffset * config.durationMs) % config.durationMs) / config.durationMs
-      const detailScale = detailScaleFor(time, config, phaseOffset)
-      const rotation = rotationFor(time, config, phaseOffset)
-
-      groupRef.current?.setAttribute('transform', `rotate(${rotation} 50 50)`)
-      pathRef.current?.setAttribute('d', buildPath(config, detailScale, pathSteps))
-
-      particleRefs.current.forEach((node, index) => {
-        if (!node) {
-          return
-        }
-
-        const particle = particleFor(config, index, progress, detailScale, strokeScale)
-        node.setAttribute('cx', particle.x.toFixed(2))
-        node.setAttribute('cy', particle.y.toFixed(2))
-        node.setAttribute('r', particle.radius.toFixed(2))
-        node.setAttribute('opacity', particle.opacity.toFixed(3))
-      })
-
-      animationFrame = window.requestAnimationFrame(render)
-    }
-
-    render(performance.now())
-
-    return () => window.cancelAnimationFrame(animationFrame)
-  }, [config, pathSteps, strokeScale])
-
-  return (
-    <div
-      {...props}
-      aria-label={props['aria-label'] ?? label}
-      className={cn('inline-grid size-10 place-items-center text-primary', className)}
-      role={role}
-    >
-      <svg aria-hidden="true" className="size-full overflow-visible" fill="none" viewBox="0 0 100 100">
-        <g ref={groupRef}>
-          <path
-            opacity="0.1"
-            ref={pathRef}
-            stroke="currentColor"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            strokeWidth={config.strokeWidth * strokeScale}
-          />
-          {Array.from({ length: config.particleCount }, (_, index) => (
-            <circle
-              fill="currentColor"
-              key={`${type}-${index}`}
-              ref={node => {
-                particleRefs.current[index] = node
-              }}
-            />
-          ))}
-        </g>
-      </svg>
-    </div>
-  )
+// OTTO: delegates to the declarative implementation in loader-native.tsx.
+//
+// This function used to run a requestAnimationFrame loop that rebuilt the path
+// and rewrote every particle attribute on every frame. On a renderer that could
+// not finish that inside a frame budget it saturated the main thread, and the
+// desktop app froze with `webContents became unresponsive` -- while a spinner
+// was on screen, so the loading indicator was what blocked the load.
+//
+// Everything above this line (the curve table and the geometry helpers) is
+// upstream and still used: loader-native imports LOADER_CURVES, buildPath and
+// particleFor from here. Only the per-frame driving is gone.
+//
+// MERGE: keep this delegation. An upstream rewrite of this file can drop it with
+// no conflict, no build error and no type error -- the app would compile, look
+// identical, and freeze again on slow machines. loader.test.tsx is the guard:
+// it renders every LOADER_TYPE and asserts no animation frame is ever scheduled.
+//
+// Design: docs/plans/2026-07-26-desktop-loader-offload-design.md
+export function Loader(props: LoaderProps) {
+  return <NativeLoader {...props} />
 }
 
 function baseCurve(name: string, options: BaseCurveOptions): LoaderCurve {
@@ -513,7 +454,7 @@ function cardioidCurve(
   }
 }
 
-function buildPath(config: LoaderCurve, detailScale: number, steps: number) {
+export function buildPath(config: LoaderCurve, detailScale: number, steps: number) {
   return Array.from({ length: steps + 1 }, (_, index) => {
     const point = config.point(index / steps, detailScale)
 
@@ -534,7 +475,13 @@ function normalizeProgress(progress: number) {
   return ((progress % 1) + 1) % 1
 }
 
-function particleFor(config: LoaderCurve, index: number, progress: number, detailScale: number, strokeScale: number) {
+export function particleFor(
+  config: LoaderCurve,
+  index: number,
+  progress: number,
+  detailScale: number,
+  strokeScale: number
+) {
   const tailOffset = index / (config.particleCount - 1)
   const point = config.point(normalizeProgress(progress - tailOffset * config.trailSpan), detailScale)
   const fade = (1 - tailOffset) ** 0.56
