@@ -3158,6 +3158,8 @@ upstream_changes:
   - plugins/workflow/discovery.py
   - plugins/workflow/compat.py
   - plugins/workflow/cli.py
+  - plugins/workflow/runner_binding.py
+  - plugins/workflow/showcase.py
   owned_symbols:
   - CompatibilityLevel
   - CompatibilityFinding
@@ -3170,6 +3172,8 @@ upstream_changes:
   - companion-aware discovery cache signature
   - stable compatibility finding codes
   - compatibility finding effective-profile invariant
+  - assess_package_execution environment compatibility finding
+  - _verified_distribution_assessment environment compatibility finding
   - validate and doctor language projections
   tests:
   - tests/plugins/workflow/test_schema.py
@@ -3177,6 +3181,8 @@ upstream_changes:
   - tests/plugins/workflow/test_compat_matrix.py
   - tests/plugins/workflow/test_cli.py
   - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_runner_binding.py
+  - tests/plugins/workflow/test_showcase_catalog.py
   expected_commit_subject: 'feat(workflow): normalize declared language profiles'
   upstream_candidate: true
   merge_guidance: >-
@@ -3188,8 +3194,9 @@ upstream_changes:
     normalized execution definition, and include companion create, edit, and
     delete identity in discovery caching. Preserve one dependency-neutral
     compatibility finding runtime type, backend-issued stable codes, package
-    effective-profile metadata on every compatibility and doctor finding, and
-    identical validate and doctor language projections. Workflows
+    effective-profile metadata on every compatibility and doctor finding,
+    including findings appended by runner-binding and showcase environment
+    wrappers, and identical validate and doctor language projections. Workflows
     without a declaration and explicit hermes-legacy workflows must remain
     permissive with actionable warnings; declared archon-2026-07 workflows must
     fail closed only for invalid or currently unenforceable semantics.

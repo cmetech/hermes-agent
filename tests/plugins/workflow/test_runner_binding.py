@@ -303,6 +303,35 @@ def _binding(*, runtime_managed: bool, runner_capable: bool = True):
     )
 
 
+def test_execution_environment_finding_carries_effective_language_profile(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    workflow = workflow_writer(tmp_path)
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n"
+        "execution_environment: isolated_backend_required\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    context = _binding(runtime_managed=True).execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+
+    compatibility, _risk = runner_binding_module.assess_package_execution(
+        package,
+        context,
+    )
+
+    finding = next(
+        item
+        for item in compatibility.findings
+        if item.code == "execution_environment_unavailable"
+    )
+    assert finding.effective_profile is package.language.effective_profile
+
+
 def _healthy_coordinator(store: RunStore) -> None:
     lease = CoordinatorStore(store.database).try_acquire(
         CoordinatorIdentity(
