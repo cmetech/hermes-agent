@@ -65,7 +65,32 @@ def test_manifest_rejects_non_hex_and_paths_outside_repository(tmp_path: Path) -
     data["upstream_changes"][0]["last_verified_upstream"] = "a" * 40
     data["upstream_changes"][0]["files"] = ["../escape.py"]
     manifest.write_text(yaml.safe_dump(data))
-    with pytest.raises(ValueError, match="contained"):
+    with pytest.raises(ValueError, match="normalized repository-relative POSIX"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_manifest_bounds_evidence_identity_and_exact_repository_paths(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    data = yaml.safe_load(manifest.read_text())
+
+    data["upstream_changes"][0]["id"] = "i" * 513
+    manifest.write_text(yaml.safe_dump(data))
+    with pytest.raises(ValueError, match="id must be at most 512"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+    data["upstream_changes"][0]["id"] = "owned"
+    data["upstream_changes"][0]["tests"] = ["t" * 4097]
+    manifest.write_text(yaml.safe_dump(data))
+    with pytest.raises(ValueError, match="path must be at most 4096"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+    data["upstream_changes"][0]["tests"] = ["./test_core.py"]
+    manifest.write_text(yaml.safe_dump(data))
+    with pytest.raises(ValueError, match="normalized repository-relative POSIX"):
         load_and_validate_manifest(manifest, repo, check_git=False)
 
 
