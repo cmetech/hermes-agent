@@ -3497,3 +3497,41 @@ upstream_changes:
     mixed-version backend guidance, deferred-field choice gates, and explicit
     OTTO V1 incompatibility.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-language-regression-gates
+  change_class: workflow-testing
+  owner: workflow-orchestration
+  files:
+  - scripts/test_workflow_merge_gate.sh
+  - tests/scripts/test_workflow_merge_gate.py
+  - .github/workflows/ci.yml
+  owned_symbols:
+  - Phase 1 language base merge-gate suite selection
+  - Phase 1 language native portability matrix suite selection
+  - tests/plugins/workflow/test_language.py gate membership
+  - tests/plugins/workflow/test_language_snapshot.py gate membership
+  - tests/plugins/workflow/test_language_schema.py gate membership
+  - tests/plugins/workflow/test_workflow_language_desktop_e2e.py gate membership
+  - src/app/workflows/index.test.tsx gate membership
+  - src/app/workflows/view-workflow-dialog.test.tsx gate membership
+  tests:
+  - tests/plugins/workflow/test_language.py
+  - tests/plugins/workflow/test_language_snapshot.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_workflow_language_desktop_e2e.py
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'test(workflow): gate language compatibility foundation'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve exactly one base-gate and native portability selection for the
+    three Phase 1 language unit suites and the backend-to-Desktop middleware
+    E2E suite. Keep the existing Desktop index and workflow-detail suites in
+    the base gate's existing Vitest invocation. Retain the existing base and CI
+    jobs, dependency installation, and process model rather than duplicating a
+    workflow, service, or install path.
+  removal_condition: >-
+    Remove when upstream's base and native portability release gates select
+    equivalent language contracts, admission pinning, schema, middleware, and
+    Desktop compatibility coverage.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

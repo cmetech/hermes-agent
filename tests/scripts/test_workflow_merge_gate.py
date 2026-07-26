@@ -11,6 +11,25 @@ import yaml
 ROOT = Path(__file__).parents[2]
 GATE = ROOT / "scripts/test_workflow_merge_gate.sh"
 CI = ROOT / ".github/workflows/ci.yml"
+MANIFEST = ROOT / "docs/upstream-customizations/workflow-orchestration.yaml"
+PHASE_1_LANGUAGE_BACKEND_SUITES = (
+    "tests/plugins/workflow/test_language.py",
+    "tests/plugins/workflow/test_language_snapshot.py",
+    "tests/plugins/workflow/test_language_schema.py",
+    "tests/plugins/workflow/test_workflow_language_desktop_e2e.py",
+)
+PHASE_1_LANGUAGE_DESKTOP_SUITES = (
+    "src/app/workflows/index.test.tsx",
+    "src/app/workflows/view-workflow-dialog.test.tsx",
+)
+PHASE_1_LANGUAGE_CUSTOMIZATION_IDS = {
+    "workflow-language-contracts",
+    "workflow-language-profile-normalization",
+    "workflow-language-admission-pinning",
+    "workflow-language-schema-cli",
+    "workflow-language-desktop-status",
+    "workflow-language-authoring-reference",
+}
 WORKFLOW_GATE_OPTOUTS = {
     path: "covered by the standard Python suite; outside the focused release gates"
     for path in (
@@ -266,6 +285,31 @@ def test_merge_gate_pins_desktop_review_run_contract() -> None:
     assert "src/app/workflows/review-run-dialog.test.tsx" in source
     assert "src/app/workflows/view-workflow-dialog.test.tsx" in source
     assert "src/components/assistant-ui/embeds/workflow-topology.test.tsx" in source
+
+
+def test_phase_1_language_contracts_are_pinned_in_base_gate() -> None:
+    source = GATE.read_text()
+
+    for path in PHASE_1_LANGUAGE_BACKEND_SUITES + PHASE_1_LANGUAGE_DESKTOP_SUITES:
+        assert source.count(path) == 1
+
+
+def test_phase_1_language_contracts_are_pinned_in_native_matrix() -> None:
+    source = CI.read_text()
+    portable_files = _portability_files()
+
+    for path in PHASE_1_LANGUAGE_BACKEND_SUITES:
+        assert source.count(path) == 1
+        assert portable_files.count(path) == 1
+
+
+def test_phase_1_language_customizations_and_regression_gate_are_tracked() -> None:
+    customization_ids = {
+        entry["id"] for entry in yaml.safe_load(MANIFEST.read_text())["upstream_changes"]
+    }
+
+    assert PHASE_1_LANGUAGE_CUSTOMIZATION_IDS <= customization_ids
+    assert "workflow-language-regression-gates" in customization_ids
 
 
 def test_native_workflow_matrix_covers_every_release_gate() -> None:
