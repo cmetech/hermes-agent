@@ -1765,8 +1765,16 @@ setup_path() {
     command_link_display_dir="$(get_command_link_display_dir)"
 
     # Create a user-facing shim for the hermes command.
-    # We intentionally clear PYTHONPATH/PYTHONHOME here so inherited env vars
-    # can't make this launcher import modules from another checkout.
+    #
+    # We intentionally clear the inherited Python environment here so it can't
+    # make this launcher import modules from another checkout -- or, worse,
+    # another stdlib. PYTHONPATH is prepended AHEAD of the interpreter's own Lib
+    # and PYTHONHOME replaces it outright, so either one pointed at a different
+    # minor version kills the process in site.py with "SRE module mismatch"
+    # before any hermes_cli code runs. The list mirrors the top-of-file scrub,
+    # INHERITED_PYTHON_ENV_VARS (apps/desktop/electron/backend-env.ts) and
+    # $InheritedPythonEnvVars (install.ps1's Install-CommandShims), which writes
+    # the Windows equivalent of this file.
     mkdir -p "$command_link_dir"
     # Older installs created this path as a symlink to $HERMES_BIN. Without
     # the rm, `cat >` follows the symlink and overwrites the venv pip entry
@@ -1774,8 +1782,12 @@ setup_path() {
     rm -f "$command_link_dir/hermes"
     cat > "$command_link_dir/hermes" <<EOF
 #!/usr/bin/env bash
-unset PYTHONPATH
 unset PYTHONHOME
+unset PYTHONPATH
+unset PYTHONSTARTUP
+unset PYTHONEXECUTABLE
+unset PYTHONUSERBASE
+export PYTHONNOUSERSITE=1
 exec "$HERMES_BIN" "\$@"
 EOF
     chmod +x "$command_link_dir/hermes"

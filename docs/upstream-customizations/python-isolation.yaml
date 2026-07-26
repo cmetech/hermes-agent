@@ -18,10 +18,18 @@ feature: python-isolation
 # (A) alone is insufficient: a managed 3.11 under PYTHONHOME=...Python310 fails
 # identically.
 #
-# The user's shell is NOT a fix surface. The Electron app spawns the install and
-# inherits Machine/User-scope environment directly, which is why clearing these
-# in a PowerShell session did not help and the fix must live in the installer
-# and the app's spawn environment.
+# The user's shell is not a fix surface FOR THE INSTALL. The Electron app spawns
+# the install and inherits Machine/User-scope environment directly, which is why
+# clearing these in a PowerShell session did not help and that fix must live in
+# the installer and the app's spawn environment.
+#
+# It IS the surface for the command a user types, and that is a third defect,
+# found on 2026-07-26 and fixed by cli-launcher-env-isolation below: `loop24
+# config edit` died with the same SRE mismatch on a laptop whose PYTHONPATH --
+# not PYTHONHOME, which was unset -- named a complete 3.10 stdlib. pip's console
+# script starts the venv interpreter with the shell's environment intact, and
+# PYTHONPATH is prepended ahead of the venv's own Lib. Nothing in-process can
+# defend against it: site.py has already failed.
 #
 # Why this manifest exists: the workspace-level surface table and the
 # otto-upstream-merge grep list live OUTSIDE any git repository, so they do not
@@ -150,4 +158,64 @@ upstream_changes:
     Remove when uv defaults to managed-only interpreter selection (making the
     --managed-python wrappers redundant) AND the desktop no longer spawns
     installs from a process that inherits machine-scope environment.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+- id: cli-launcher-env-isolation
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - scripts/install.ps1
+  - scripts/install.sh
+  - tests/test_install_python_isolation.py
+  owned_symbols:
+  - InheritedPythonEnvVars
+  - Get-ConsoleScriptNames
+  - Install-CommandShims
+  - Set-PathVariable
+  tests:
+  - tests/test_install_python_isolation.py
+  expected_commit_subject: 'fix(install): scrub the inherited Python env in the command launchers'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. The command a user types is its own fix surface, separate
+    from the install and from the desktop backend spawn. install.sh has always
+    written a launcher that unsets the inherited Python vars before exec'ing the
+    venv entry point; install.ps1 had no equivalent and put venv\Scripts on PATH
+    raw, so `loop24 config edit` ran pip's console script with a corporate
+    PYTHONPATH still set and died in site.py.
+
+    Two details are load-bearing and neither produces a test failure elsewhere
+    if lost. (1) The launchers must NOT be written into venv\Scripts: within one
+    directory PATHEXT resolves .EXE ahead of .CMD, so pip's exe would keep
+    winning. They go in $HermesHome\bin and Set-PathVariable puts that directory
+    on PATH AHEAD of venv\Scripts -- across directories the first entry holding
+    any match wins, and that ordering IS the mechanism. (2) Set-PathVariable
+    re-seats both directories instead of skipping when either is already
+    present. An install predating this fix has venv\Scripts on PATH alone;
+    appending the shim dir after it would leave pip's exe resolving first and
+    the upgrade would silently fix nothing.
+
+    Get-ConsoleScriptNames reads [project.scripts] from pyproject.toml rather
+    than hardcoding names. That table is what the brand generator stamps, so a
+    brand branch's own entry points are covered with no per-brand edit -- do not
+    replace it with a literal list. It shims only names whose .exe was actually
+    built, so a declared-but-unbuilt entry point gets no launcher.
+
+    $InheritedPythonEnvVars is hoisted specifically so the install-time scrub and
+    the generated launchers cannot drift apart; keep them reading one list.
+    install.ps1 must stay pure ASCII (test_install_ps1_ascii_only.py).
+
+    Accepted trade-off: a .cmd wrapper is a resident process, so Ctrl+C can
+    raise cmd.exe's "Terminate batch job (Y/N)?" prompt. install.sh avoids this
+    with exec, which cmd has no equivalent for. Without the launcher the command
+    does not start at all, so correctness wins.
+
+    Not covered, and deliberately so: install.sh exposes only `hermes` in the
+    command link dir and never puts venv/bin on PATH, so the branded POSIX
+    commands do not exist there at all. That is a missing-feature gap, not an
+    env-poisoning one, and is out of scope for this entry.
+  removal_condition: >-
+    Remove when the entry points are no longer pip console scripts that inherit
+    the invoking shell's environment -- e.g. a native launcher that starts the
+    interpreter with a curated environment, or a CPython that ignores PYTHONPATH
+    for a venv it did not build.
   last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
