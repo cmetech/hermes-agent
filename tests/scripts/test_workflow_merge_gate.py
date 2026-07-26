@@ -200,6 +200,25 @@ def test_portability_slices_cover_every_pinned_file_exactly_once() -> None:
     assert not missing, f"portability slices name files that do not exist: {missing}"
 
 
+def test_portability_job_uses_uv_with_the_cross_platform_isolated_runner() -> None:
+    job = yaml.safe_load(CI.read_text())["jobs"]["workflow-portability"]
+    step = next(
+        item
+        for item in job["steps"]
+        if item.get("name") == "Run portable workflow and installed-showcase gates"
+    )
+
+    assert step["shell"] == "bash"
+    assert step["run"].strip() == (
+        "uv run --no-sync bash scripts/run_tests.sh "
+        "${{ matrix.slice.files }} -q"
+    )
+    assert "python -m pytest" not in step["run"]
+    runner = (ROOT / "scripts/run_tests.sh").read_text()
+    assert 'PYTHONUTF8="${PYTHONUTF8:-1}"' in runner
+    assert "Scripts/python.exe" in runner
+
+
 def test_laptop_diagnostic_middleware_e2e_is_exactly_pinned_in_release_gates() -> None:
     path = "tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py"
 

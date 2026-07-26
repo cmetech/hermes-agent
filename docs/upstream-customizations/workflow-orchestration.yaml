@@ -3635,3 +3635,65 @@ upstream_changes:
     Remove when upstream emits equivalent schema-validated structured evidence
     that remains bounded while retaining each entry's exact invariant tests.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-portability-isolated-matrix
+  change_class: workflow-testing
+  owner: workflow-orchestration
+  files:
+  - .github/workflows/ci.yml
+  - scripts/run_tests.sh
+  - plugins/workflow/store.py
+  - tests/plugins/workflow/test_admission.py
+  - tests/scripts/test_workflow_merge_gate.py
+  owned_symbols:
+  - per-file workflow portability matrix execution through uv and Bash
+  - native Windows virtualenv interpreter discovery and UTF-8 propagation
+  - pre-language resource-digest compatibility for genuine legacy retries
+  - fail-closed current-format and tampered retry coverage
+  tests:
+  - tests/scripts/test_workflow_merge_gate.py
+  - tests/plugins/workflow/test_schema_migrations.py
+  - tests/plugins/workflow/test_admission.py
+  expected_commit_subject: 'fix(workflow): isolate portability matrix tests'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve uv's locked environment while routing every portability slice
+    through the canonical per-file subprocess runner on Linux, macOS, and
+    Windows. Preserve legacy retry identity only by reconstructing the exact
+    pre-language resource serialization; current or tampered snapshots must
+    continue to fail closed on idempotency conflict.
+  removal_condition: >-
+    Remove when upstream provides equivalent native portability isolation and
+    migration-safe language metadata without accepting changed current-format
+    retry identity.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-rehearsal-executed-invariant-evidence
+  change_class: workflow-testing
+  owner: workflow-orchestration
+  files:
+  - scripts/test_workflow_upstream_merge.sh
+  - scripts/run_workflow_ledger_invariants.py
+  - scripts/check_upstream_customizations.py
+  - docs/upstream-customizations/merge-evidence.schema.json
+  - tests/scripts/test_workflow_upstream_merge.py
+  - tests/scripts/test_check_upstream_customizations.py
+  owned_symbols:
+  - isolated execution and actual duration for every executable ledger test
+  - reference-only evidence type without pass or duration fields
+  - digest-bounded evidence names with separate exact repository paths
+  - manifest ID and repository-path construction bounds
+  tests:
+  - tests/scripts/test_workflow_upstream_merge.py
+  - tests/scripts/test_check_upstream_customizations.py
+  expected_commit_subject: 'fix(workflow): execute ledger evidence invariants'
+  upstream_candidate: true
+  merge_guidance: >-
+    Execute every executable ledger invariant in its own subprocess and record
+    its actual result and duration. Keep fixtures and runner paths visibly
+    reference-only so they cannot satisfy execution requirements. Preserve
+    exact test paths in a dedicated bounded field and use stable digests for
+    evidence labels.
+  removal_condition: >-
+    Remove when upstream emits equivalent schema-validated evidence that
+    distinguishes actual execution from references, records real outcomes,
+    and retains exact bounded paths without unbounded labels.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9

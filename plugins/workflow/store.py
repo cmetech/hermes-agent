@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from contextlib import ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
@@ -3419,6 +3419,38 @@ class RunStore:
         ).encode()
         return _sha256(material)
 
+    @staticmethod
+    def _pre_language_input_manifest_digest(
+        snapshot: PreparedRunSnapshot,
+    ) -> str | None:
+        """Reconstruct the pre-language resources digest for legacy retries.
+
+        ``input_manifest_digest`` historically covered the complete
+        ``resources.json`` object.  Language pinning and sealed-path metadata
+        extended that object without changing legacy workflow semantics.  A
+        retry of a pre-language idempotency key must therefore compare against
+        the exact old serialization, while all new admissions continue to use
+        the complete current digest.
+        """
+        try:
+            resources = json.loads(
+                (snapshot.staging_directory / "resources.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(resources, dict):
+            return None
+        legacy_keys = ("inputs_sha256", "node_skills", "node_agent_skills")
+        if any(key not in resources for key in legacy_keys):
+            return None
+        legacy_resources = {key: resources[key] for key in legacy_keys}
+        material = json.dumps(
+            legacy_resources, sort_keys=True, separators=(",", ":")
+        ).encode()
+        return _sha256(material)
+
     def close_admission(self) -> None:
         """Atomically prevent this coordinator from publishing another run."""
         with self._admission_gate:
@@ -3511,9 +3543,18 @@ class RunStore:
             ).fetchone()
             if existing:
                 connection.commit()
+                legacy_inputs = self._pre_language_input_manifest_digest(
+                    immutable_snapshot
+                )
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
                 if existing["start_digest"] == start_digest:
                     return RunAdmissionResult(existing["run_id"], "existing")
+                if legacy_inputs is not None:
+                    legacy_request = replace(
+                        request, input_manifest_digest=legacy_inputs
+                    )
+                    if existing["start_digest"] == self._start_digest(legacy_request):
+                        return RunAdmissionResult(existing["run_id"], "existing")
                 return RunAdmissionResult(None, "rejected", "idempotency_conflict")
             if request.execution_mode not in {"foreground", "background"}:
                 raise ValueError("execution_mode must be foreground or background")

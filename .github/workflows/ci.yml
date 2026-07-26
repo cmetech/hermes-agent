@@ -284,7 +284,7 @@ jobs:
           NOUS_API_KEY: ""
           PYTHONUTF8: "1"
         run: |
-          uv run --no-sync python -m pytest -q ${{ matrix.slice.files }}
+          uv run --no-sync bash scripts/run_tests.sh ${{ matrix.slice.files }} -q
 
   # ─────────────────────────────────────────────────────────────────────
   # Live-updating PR review comment.
