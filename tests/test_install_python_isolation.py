@@ -423,8 +423,8 @@ def test_command_shims_clear_every_inherited_python_var(tmp_path: Path) -> None:
 @pytest.mark.skipif(not INSTALL_SH.exists(), reason="install.sh missing")
 def test_install_sh_launcher_clears_the_whole_inherited_family() -> None:
     """The POSIX shim predates this fix but only cleared two of the five vars."""
-    setup_path = _extract_shell_function(INSTALL_SH.read_text(), "setup_path")
+    writer = _extract_shell_function(INSTALL_SH.read_text(), "write_command_launchers")
 
     for name in INHERITED_PYTHON_ENV_VARS:
-        assert f"unset {name}" in setup_path, f"the hermes launcher does not clear {name}"
-    assert "export PYTHONNOUSERSITE=1" in setup_path
+        assert f"unset {name}" in writer, f"the launcher does not clear {name}"
+    assert "export PYTHONNOUSERSITE=1" in writer

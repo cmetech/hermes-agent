@@ -96,25 +96,114 @@ def remove_path_from_shell_configs():
     return removed_from
 
 
+# Written into every launcher by scripts/install.sh (write_command_launchers).
+_LAUNCHER_MARKER = "hermes-agent command launcher"
+
+
+def _installed_command_names() -> "list[str]":
+    """Names the POSIX installer may have placed on PATH.
+
+    ``scripts/install.sh`` links one launcher per ``[project.scripts]`` entry, so
+    a branded install owns ``loop24``/``loop24-agent``/``loop24-acp`` as well as
+    the ``hermes`` family. Read that table when the checkout is still present --
+    it is the same source of truth the installer used -- and otherwise derive the
+    brand's names, because uninstall may run after the tree is gone.
+    """
+    names = ["hermes", "hermes-agent", "hermes-acp"]
+
+    agent_root = Path(__file__).resolve().parent.parent
+    pyproject = agent_root / "pyproject.toml"
+    try:
+        in_scripts = False
+        for line in pyproject.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("["):
+                in_scripts = stripped == "[project.scripts]"
+                continue
+            if not in_scripts or stripped.startswith("#") or "=" not in stripped:
+                continue
+            name = stripped.split("=", 1)[0].strip()
+            if name and name not in names:
+                names.append(name)
+    except Exception:
+        pass
+
+    try:
+        from hermes_cli.brand_config import resolve_active_brand
+
+        slug = resolve_active_brand()
+    except Exception:
+        slug = ""
+    if slug:
+        for name in (slug, f"{slug}-agent", f"{slug}-acp"):
+            if name not in names:
+                names.append(name)
+
+    return names
+
+
 def remove_wrapper_script():
-    """Remove the hermes wrapper script if it exists."""
-    wrapper_paths = [
-        Path.home() / ".local" / "bin" / "hermes",
-        Path("/usr/local/bin/hermes"),
-    ]
-    
-    removed = []
-    for wrapper in wrapper_paths:
-        if wrapper.exists():
-            try:
-                # Check if it's our wrapper (contains hermes_cli reference)
-                content = wrapper.read_text()
-                if 'hermes_cli' in content or 'hermes-agent' in content:
-                    wrapper.unlink()
-                    removed.append(wrapper)
-            except Exception as e:
-                log_warn(f"Could not remove {wrapper}: {e}")
-    
+    """Remove the command launchers the installer placed on PATH.
+
+    Two passes, because neither alone is both complete and safe:
+
+    * Marker scan -- remove any small text file in the candidate directories
+      carrying ``_LAUNCHER_MARKER``. Only our generator writes that string, and
+      this is the only pass that catches a launcher whose name we cannot derive
+      (uninstalling a LOOP24 install from a checkout whose active brand has
+      since changed, say).
+    * Name pass -- for the names we CAN derive, also accept the two legacy
+      substrings, so installs predating the marker are still removable.
+
+    Deliberately not done: deleting anything in the directory that merely
+    mentions Hermes. That would take a user's own script with it.
+    """
+    # Same directories the node symlinks go to, plus /usr/local/bin
+    # unconditionally: the previous implementation checked it on every platform,
+    # and dropping that on macOS would strand an older install's launcher.
+    candidate_dirs = list(_node_symlink_candidate_dirs())
+    if Path("/usr/local/bin") not in candidate_dirs:
+        candidate_dirs.append(Path("/usr/local/bin"))
+
+    removed: list = []
+
+    def _drop(wrapper: Path) -> None:
+        try:
+            wrapper.unlink()
+            removed.append(wrapper)
+        except Exception as e:
+            log_warn(f"Could not remove {wrapper}: {e}")
+
+    def _read_small_text(path: Path) -> str:
+        # A launcher is a few hundred bytes; the cap keeps this from slurping
+        # real binaries that share a directory with us.
+        try:
+            if path.is_dir() or path.stat().st_size > 4096:
+                return ""
+            return path.read_text(errors="ignore")
+        except Exception:
+            return ""
+
+    for bin_dir in candidate_dirs:
+        seen: set = set()
+
+        try:
+            entries = sorted(bin_dir.iterdir()) if bin_dir.is_dir() else []
+        except Exception:
+            entries = []
+        for entry in entries:
+            if _LAUNCHER_MARKER in _read_small_text(entry):
+                seen.add(entry.name)
+                _drop(entry)
+
+        for name in _installed_command_names():
+            wrapper = bin_dir / name
+            if name in seen or not wrapper.exists():
+                continue
+            content = _read_small_text(wrapper)
+            if 'hermes_cli' in content or 'hermes-agent' in content:
+                _drop(wrapper)
+
     return removed
 
 
