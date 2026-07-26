@@ -153,8 +153,15 @@ export interface NativeNotificationInput {
   actions?: NativeNotificationAction[]
 }
 
+// Fire-and-forget wrapper. Projection is best-effort: outside Electron the
+// bridge is absent and `projectNativeNotification` rejects, so an uncaught
+// rejection here would surface as a hard error in the browser/dev-server build
+// (and fails a whole vitest run). Callers that need the outcome await
+// `projectNativeNotification` directly and handle the rejection themselves.
 export function dispatchNativeNotification(input: NativeNotificationInput): void {
-  void projectNativeNotification(input)
+  void projectNativeNotification(input).catch(error => {
+    console.debug('[native-notifications] projection failed', error)
+  })
 }
 
 export async function projectNativeNotification(input: NativeNotificationInput): Promise<'projected' | 'suppressed'> {

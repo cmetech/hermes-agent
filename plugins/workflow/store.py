@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import hmac
 import json
@@ -300,14 +301,40 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def _replace_with_retry(source: str | Path, target: str | Path) -> None:
-    for attempt in range(5):
+    """Rename across the quarantine boundary, tolerating Windows file locking.
+
+    POSIX renames an open file happily. Windows refuses with WinError 32 while
+    ANY handle is open, which makes this the fragile step in damaged-index
+    quarantine (`_preserve_damaged_index`) -- precisely the path taken when a
+    store is already unhealthy, so failing here turns a recoverable corrupt
+    index into an unhandled PermissionError.
+
+    Two things keep a handle alive past the point the code "closed" it:
+
+    * A connection still referenced by a live traceback. Any caller holding an
+      exception -- pytest.raises, or production code that captured the error to
+      report it -- keeps the raising frame, its locals, and therefore the
+      sqlite3 connection alive until collected. gc.collect() reaps those.
+    * Delayed handle release by the OS or an antivirus scanner mid-scan, which
+      is common on Windows CI and on corporate laptops with real-time scanning.
+      Only waiting fixes that, and the original ~0.15s total was far too short.
+
+    The retry budget below is ~6.4s, which is cheap relative to losing the
+    index, and is never paid on the healthy path.
+    """
+    attempts = 8
+    for attempt in range(attempts):
         try:
             os.replace(source, target)
             return
         except PermissionError:
-            if attempt == 4:
+            if attempt == attempts - 1:
                 raise
-            time.sleep(0.01 * (2**attempt))
+            if attempt == 0:
+                # Cheapest cause first: drop connections that are unreachable
+                # except through a retained traceback.
+                gc.collect()
+            time.sleep(0.05 * (2**attempt))
 
 
 def _durable_replace(source: str | Path, target: str | Path) -> None:
@@ -3141,6 +3168,7 @@ class RunStore:
         )
         remaining_required = 0
         terminal_found = terminal_attempt_id is None
+        regrown: list[tuple[str, int, int]] = []
         for row in rows:
             reserve_bytes = int(row["terminal_reserve_bytes"])
             consumed_bytes = int(row["consumed_bytes"])
@@ -3152,18 +3180,57 @@ class RunStore:
                         "terminal_journal_reserve exhausted before durable completion"
                     )
                 remaining -= frame_bytes
-            else:
-                if projection_bytes > int(row["projection_limit_bytes"]):
-                    raise StorageQuotaError(
-                        "event_journal_quota protected terminal projection reserve"
-                    )
+            elif projection_bytes > int(row["projection_limit_bytes"]):
+                # A concurrently live sibling reserved against the projection as
+                # it stood when that sibling claimed. Ordinary progress -- every
+                # other sibling in the same fan-out completing and appending its
+                # results -- grows the projection past that snapshot, and the
+                # snapshot is never revised. Refusing here would fail a healthy
+                # run with executor_crash purely because a sibling started
+                # earlier, which is what a five-wide fan-out measured at only
+                # ~9% headroom before tipping over on a CI runner.
+                #
+                # Re-reserve that sibling at the CURRENT projection size instead.
+                # It still owes the same guarantee -- durable capacity for its
+                # own terminal and recovery frames -- so grow the reserve to
+                # match and let the journal-capacity check below decide whether
+                # the quota can actually fund it. That way the error we raise
+                # means "out of durable space", never "an older sibling's
+                # snapshot went stale".
+                grown = TerminalJournalReserve.for_projection(projection_bytes)
+                if grown.terminal_reserve_bytes > reserve_bytes:
+                    regrown.append((
+                        str(row["attempt_id"]),
+                        grown.projection_limit_bytes,
+                        grown.terminal_reserve_bytes,
+                    ))
+                    remaining = max(0, grown.terminal_reserve_bytes - consumed_bytes)
             remaining_required += remaining
         if not terminal_found:
             raise StorageQuotaError("terminal_journal_reserve is missing")
         if journal_bytes + frame_bytes + remaining_required > self.max_journal_bytes:
+            # Honest exhaustion: even after re-reserving, the journal cannot hold
+            # every live attempt's terminal evidence.
             raise StorageQuotaError(
                 "event_journal_quota protected terminal recovery capacity"
             )
+        if regrown:
+            # Only persisted once the capacity check above has passed, so a
+            # rejected write never leaves a widened reserve behind.
+            with (
+                nullcontext(connection)
+                if connection is not None
+                else self._connect()
+            ) as regrow_connection:
+                regrow_connection.executemany(
+                    "UPDATE attempt_journal_reserves "
+                    "SET projection_limit_bytes=?, terminal_reserve_bytes=? "
+                    "WHERE attempt_id=? AND terminal_reserve_bytes<?",
+                    [
+                        (limit, reserve, attempt_id, reserve)
+                        for attempt_id, limit, reserve in regrown
+                    ],
+                )
 
     def _consume_journal_reserve(
         self,

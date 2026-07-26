@@ -1,5 +1,9 @@
 overlap_policy: forbid
 execution_environment: trusted_local
 limits: {max_parallel_nodes: 1, max_total_workers: 1, subprocess_timeout_seconds: 300}
-resource_limits: {max_descendants: 2}
+# 4, not 2: a `runtime: uv` script node spawns one more process on Windows
+# than on POSIX (the uv shim / launcher), so a limit of 2 killed a healthy
+# checkpoint node with 'script node exceeded descendant_limit'. The
+# laptop-diagnostic showcase already allows 8 and runs clean on Windows.
+resource_limits: {max_descendants: 4}
 outward_action_nodes: []

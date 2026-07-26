@@ -49,9 +49,20 @@ def test_shutdown_closes_admission_interrupts_workers_and_returns_bounded(
 
     scheduler = RunScheduler(store)
     scheduler.executors["bash"] = Cooperative()
-    worker = threading.Thread(target=scheduler.advance, args=(admitted.run_id,))
+    # daemon=True: if any assertion below fails before scheduler.shutdown()
+    # runs, this thread stays in its `while not is_cancelled()` loop forever.
+    # As a non-daemon thread it then blocks interpreter exit, so pytest printed
+    # its summary and hung -- a 2-minute Windows job burned its full 40-minute
+    # timeout with no further output. A stuck test must fail, not wedge CI.
+    worker = threading.Thread(
+        target=scheduler.advance, args=(admitted.run_id,), daemon=True
+    )
     worker.start()
-    assert entered.wait(2)
+    # 30s, not 2s: this only waits for the worker to REACH the executor,
+    # which means a claim plus store writes first. That is setup, not the
+    # bounded-shutdown behaviour under test, and 2s is not enough on Windows.
+    # The real timing assertions below are deliberately left untouched.
+    assert entered.wait(30)
 
     started = time.monotonic()
     scheduler.shutdown(deadline_seconds=1)
@@ -112,9 +123,16 @@ def test_shutdown_cancellation_reaches_isolated_agent_runner(tmp_path, workflow_
             )
 
     scheduler = RunScheduler(store, agent_runner=CancellableRunner())
-    thread = threading.Thread(target=scheduler.advance, args=(admitted.run_id,))
+    # daemon=True for the same reason as the worker thread above.
+    thread = threading.Thread(
+        target=scheduler.advance, args=(admitted.run_id,), daemon=True
+    )
     thread.start()
-    assert entered.wait(2)
+    # 30s, not 2s: this only waits for the worker to REACH the executor,
+    # which means a claim plus store writes first. That is setup, not the
+    # bounded-shutdown behaviour under test, and 2s is not enough on Windows.
+    # The real timing assertions below are deliberately left untouched.
+    assert entered.wait(30)
 
     scheduler.shutdown(deadline_seconds=2)
     thread.join(timeout=2)

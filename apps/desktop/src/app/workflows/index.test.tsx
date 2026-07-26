@@ -368,6 +368,7 @@ describe('WorkflowsView', () => {
         'Run this bundled showcase from the CLI.'
       )
     }
+
     expect((within(rows[4]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
   })
 
@@ -602,10 +603,14 @@ describe('WorkflowsView', () => {
     // keyboard focus for the focused element only — same technique as
     // upstream's own tooltip.test.tsx, which stubs `matches`.
     const originalMatches = HTMLElement.prototype.matches
-    HTMLElement.prototype.matches = function (selector: string) {
-      if (selector === ':focus-visible') return this === document.activeElement
+    // `Element['matches']` is an overload set whose tag-name overloads are type
+    // predicates, which a plain function expression can never satisfy. The stub
+    // is behaviourally a boolean predicate, so cast it back onto the slot.
+    HTMLElement.prototype.matches = function (this: HTMLElement, selector: string): boolean {
+      if (selector === ':focus-visible') {return this === document.activeElement}
+
       return originalMatches.call(this, selector)
-    }
+    } as typeof HTMLElement.prototype.matches
 
     try {
       keyboardStops[0]!.focus()
@@ -618,6 +623,7 @@ describe('WorkflowsView', () => {
     } finally {
       HTMLElement.prototype.matches = originalMatches
     }
+
     const untrustedView = within(rows[2]!).getByRole('button', { name: 'View' }) as HTMLButtonElement
     const untrustedRun = within(rows[2]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement
     expect(untrustedView.disabled).toBe(false)

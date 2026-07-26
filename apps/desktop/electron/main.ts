@@ -130,6 +130,14 @@ import { runNativeLogin } from './native-oauth-login'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { createKeepAwake } from './power-save'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
+import {
+  buildReleaseUpdateStatus,
+  installerFileName,
+  installerLaunch,
+  isReleaseInstall,
+  parseLatestRelease,
+  releaseUpdatePending
+} from './release-update'
 import * as remoteLifecycle from './remote-lifecycle'
 import { RemoteLivenessTracker, RemoteRevalidationCoordinator, revalidateRemoteConnection } from './remote-liveness'
 import {
@@ -164,14 +172,6 @@ import {
   sandboxFallbackFromEnv,
   sandboxPreflight
 } from './update-relaunch'
-import {
-  buildReleaseUpdateStatus,
-  installerFileName,
-  installerLaunch,
-  isReleaseInstall,
-  parseLatestRelease,
-  releaseUpdatePending
-} from './release-update'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { spawnUpdaterProcess } from './updater-process'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
@@ -2315,6 +2315,7 @@ function fetchLatestReleases(): Promise<any[]> {
         })
       }
     )
+
     req.on('error', () => resolve([]))
     req.setTimeout(10_000, () => {
       req.destroy()
@@ -2328,30 +2329,40 @@ function fetchLatestReleases(): Promise<any[]> {
 // with (receivedBytes, totalBytes|null). Rejects on non-2xx / network error.
 function downloadFile(url, destPath, onProgress, redirects = 0) {
   return new Promise((resolve, reject) => {
-    if (redirects > 5) return reject(new Error('too many redirects'))
+    if (redirects > 5) {return reject(new Error('too many redirects'))}
+
     const req = https.get(url, { headers: { 'User-Agent': 'Hermes-Desktop' } }, res => {
       const status = res.statusCode || 0
+
       if (status >= 300 && status < 400 && res.headers.location) {
         res.resume()
+
         return resolve(downloadFile(res.headers.location, destPath, onProgress, redirects + 1))
       }
+
       if (status !== 200) {
         res.resume()
+
         return reject(new Error(`download failed: HTTP ${status}`))
       }
+
       const total = Number(res.headers['content-length']) || null
       let received = 0
       const out = fs.createWriteStream(destPath)
+
       const fail = (err) => {
-        try { out.destroy() } catch {}
-        try { fs.unlink(destPath, () => {}) } catch {}
+        try { out.destroy() } catch { /* already destroyed */ }
+
+        try { fs.unlink(destPath, () => {}) } catch { /* partial file may not exist */ }
         reject(err)
       }
+
       res.on('data', chunk => {
         received += chunk.length
+
         try {
           onProgress(received, total)
-        } catch {}
+        } catch { /* progress reporting is best-effort */ }
       })
       res.pipe(out)
       out.on('finish', () => out.close(() => {
@@ -2359,14 +2370,18 @@ function downloadFile(url, destPath, onProgress, redirects = 0) {
         // against a truncated or corrupt-but-complete download before we ever
         // hand the file to spawn(). An installer is tens of MB, never a few KB.
         let size = 0
-        try { size = fs.statSync(destPath).size } catch {}
-        if (total != null && size !== total) return fail(new Error(`incomplete download: ${size}/${total}`))
-        if (size < 1_000_000) return fail(new Error(`download too small: ${size} bytes`))
+
+        try { size = fs.statSync(destPath).size } catch { /* treated as size 0 below */ }
+
+        if (total != null && size !== total) {return fail(new Error(`incomplete download: ${size}/${total}`))}
+
+        if (size < 1_000_000) {return fail(new Error(`download too small: ${size} bytes`))}
         resolve(destPath)
       }))
       out.on('error', fail)
       res.on('error', fail)
     })
+
     req.on('error', reject)
     req.setTimeout(60000, () => req.destroy(new Error('download timed out')))
   })
@@ -2802,7 +2817,8 @@ async function applyUpdates(opts = {}) {
       let lastPct = -1
       await downloadFile(assetUrl, dest, (recv, total) => {
         const pct = total ? Math.round((recv / total) * 100) : null
-        if (pct === lastPct) return
+
+        if (pct === lastPct) {return}
         lastPct = pct
         emitUpdateProgress({
           stage: 'update',
@@ -2817,7 +2833,7 @@ async function applyUpdates(opts = {}) {
       if (process.platform === 'linux') {
         try {
           fs.chmodSync(dest, 0o755)
-        } catch {}
+        } catch { /* spawn below reports the real failure */ }
       }
 
       const child = spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: false })
@@ -2827,8 +2843,9 @@ async function applyUpdates(opts = {}) {
       // handler the app would already be mid quit-handoff with no fallback and
       // the unhandled event could throw. Fall back to the release page.
       child.on('error', (e) => {
-        try { rememberLog(`[update] installer launch failed: ${e?.message || e}`) } catch {}
-        try { shell.openExternal(fallbackUrl) } catch {}
+        try { rememberLog(`[update] installer launch failed: ${e?.message || e}`) } catch { /* logging is best-effort */ }
+
+        try { shell.openExternal(fallbackUrl) } catch { /* nothing left to fall back to */ }
       })
 
       child.unref()
@@ -2844,6 +2861,7 @@ async function applyUpdates(opts = {}) {
         } catch {
           /* fall through to force-exit */
         }
+
         setTimeout(() => {
           try {
             app.exit(0)
@@ -3815,6 +3833,7 @@ function resolveHermesBackend(backendArgs) {
   //     backend at the previous release (the abe1103 freeze bug).
   if (releaseUpdatePending(INSTALL_STAMP, readBootstrapMarker(), IS_PACKAGED)) {
     rememberLog('[updates] release update pending; routing to bootstrap to fast-forward the backend')
+
     return makeBootstrapNeeded(backendArgs)
   }
 

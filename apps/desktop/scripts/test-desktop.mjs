@@ -5,24 +5,50 @@ import { spawn, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { listPackage } from '@electron/asar'
 
-import PACKAGE_JSON from '../package.json' with { type: 'json' }
-
 const MODE = process.argv[2] || 'help'
 const ARCH = process.arch === 'arm64' ? 'arm64' : 'x64'
 const DESKTOP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const RELEASE_ROOT = path.join(DESKTOP_ROOT, 'release')
 const PLATFORM = process.platform
+const PACKAGE_JSON_PATH = path.join(DESKTOP_ROOT, 'package.json')
+
+// package.json is read from DISK, not `import`ed, and re-read after every build
+// step. `npm run build` runs the brand generator (`scripts/brand/generate.mjs
+// --write`) as its first step, which rewrites name/productName/build in place
+// for the active brand -- so a copy captured at module load is stale by the
+// time electron-builder names its output. That staleness is what made this
+// validator look for `Hermes` while the packager had just emitted `OTTO`.
+function readPackageJson() {
+  return JSON.parse(fs.readFileSync(PACKAGE_JSON_PATH, 'utf8'))
+}
+
+// Packaged artifact names, derived the way electron-builder derives them --
+// never hardcoded, because the brand generator rewrites productName per brand
+// (Hermes / OTTO / LOOP24). electron-builder's own rules (app-builder-lib):
+//   - macOS/Windows bundle + executable  -> appInfo.productFilename, i.e.
+//     `build.executableName` if set, else productName.
+//   - Linux executable                   -> `build.linux.executableName` if
+//     set, else `build.executableName`, else package.json `name` LOWERCASED
+//     (linuxPackager.ts). That last rule is a second trap: even unbranded, the
+//     Linux binary is `hermes`, never `Hermes`.
+function productFilename(pkg) {
+  return pkg.build?.executableName || pkg.productName || pkg.name
+}
+
+function linuxExecutable(pkg) {
+  return pkg.build?.linux?.executableName || pkg.build?.executableName || pkg.name.toLowerCase()
+}
 
 // Platform-specific packaged-app layout. The thin installer ships an Electron
 // app shell plus extraResources (install-stamp.json + native-deps/) -- it
 // no longer bundles the Hermes Agent Python payload (that's fetched at first
 // launch via install.ps1 / install.sh, per the Phase 1 thin-installer flow).
-const APP = (() => {
+function resolveApp(pkg) {
   if (PLATFORM === 'darwin') {
-    const appPath = path.join(RELEASE_ROOT, `mac-${ARCH}`, 'Hermes.app')
+    const appPath = path.join(RELEASE_ROOT, `mac-${ARCH}`, `${productFilename(pkg)}.app`)
     return {
       appPath,
-      binary: path.join(appPath, 'Contents', 'MacOS', 'Hermes'),
+      binary: path.join(appPath, 'Contents', 'MacOS', productFilename(pkg)),
       resourcesPath: path.join(appPath, 'Contents', 'Resources'),
       asarPath: path.join(appPath, 'Contents', 'Resources', 'app.asar'),
       unpackedDistIndex: path.join(appPath, 'Contents', 'Resources', 'app.asar.unpacked', 'dist', 'index.html')
@@ -32,7 +58,7 @@ const APP = (() => {
     const unpacked = path.join(RELEASE_ROOT, 'win-unpacked')
     return {
       appPath: unpacked,
-      binary: path.join(unpacked, 'Hermes.exe'),
+      binary: path.join(unpacked, `${productFilename(pkg)}.exe`),
       resourcesPath: path.join(unpacked, 'resources'),
       asarPath: path.join(unpacked, 'resources', 'app.asar'),
       unpackedDistIndex: path.join(unpacked, 'resources', 'app.asar.unpacked', 'dist', 'index.html')
@@ -42,12 +68,21 @@ const APP = (() => {
   const unpacked = path.join(RELEASE_ROOT, 'linux-unpacked')
   return {
     appPath: unpacked,
-    binary: path.join(unpacked, 'Hermes'),
+    binary: path.join(unpacked, linuxExecutable(pkg)),
     resourcesPath: path.join(unpacked, 'resources'),
     asarPath: path.join(unpacked, 'resources', 'app.asar'),
     unpackedDistIndex: path.join(unpacked, 'resources', 'app.asar.unpacked', 'dist', 'index.html')
   }
-})()
+}
+
+let PACKAGE_JSON = readPackageJson()
+let APP = resolveApp(PACKAGE_JSON)
+
+// Call after anything that may have re-stamped package.json (i.e. any build).
+function refreshPackageMetadata() {
+  PACKAGE_JSON = readPackageJson()
+  APP = resolveApp(PACKAGE_JSON)
+}
 
 // Default HERMES_HOME for non-sandboxed runs -- matches main.ts's
 // resolveHermesHome(). On Windows it's %LOCALAPPDATA%\hermes; elsewhere
@@ -120,14 +155,15 @@ function ensurePackagedApp() {
   }
 
   run('npm', ['run', 'pack'])
+  refreshPackageMetadata()
 }
 
 function resolveDmgPath() {
   if (!exists(RELEASE_ROOT)) {
-    return path.join(RELEASE_ROOT, `Hermes-${PACKAGE_JSON.version}-${ARCH}.dmg`)
+    return path.join(RELEASE_ROOT, `${productFilename(PACKAGE_JSON)}-${PACKAGE_JSON.version}-${ARCH}.dmg`)
   }
 
-  const prefix = `Hermes-${PACKAGE_JSON.version}`
+  const prefix = `${productFilename(PACKAGE_JSON)}-${PACKAGE_JSON.version}`
   const candidates = fs
     .readdirSync(RELEASE_ROOT)
     .filter(name => name.endsWith('.dmg'))
@@ -141,11 +177,11 @@ function resolveDmgPath() {
 
   return candidates.length > 0
     ? path.join(RELEASE_ROOT, candidates[0])
-    : path.join(RELEASE_ROOT, `Hermes-${PACKAGE_JSON.version}-${ARCH}.dmg`)
+    : path.join(RELEASE_ROOT, `${productFilename(PACKAGE_JSON)}-${PACKAGE_JSON.version}-${ARCH}.dmg`)
 }
 
 function resolveNsisPath() {
-  // electron-builder NSIS artifactName template is 'Hermes-${version}-${os}-${arch}.${ext}'
+  // electron-builder NSIS artifactName template is '<productName>-${version}-${os}-${arch}.${ext}'
   if (!exists(RELEASE_ROOT)) return null
   const candidates = fs
     .readdirSync(RELEASE_ROOT)
@@ -166,6 +202,7 @@ function ensureDmg() {
     return
   }
   run('npm', ['run', 'dist:mac:dmg'])
+  refreshPackageMetadata()
 }
 
 function ensureNsis() {
@@ -176,6 +213,7 @@ function ensureNsis() {
     return
   }
   run('npm', ['run', 'dist:win:nsis'])
+  refreshPackageMetadata()
 }
 
 function openApp() {

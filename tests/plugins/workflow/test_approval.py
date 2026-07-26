@@ -311,7 +311,11 @@ def test_scheduler_uses_ai_deadline_for_approval_rework(
 
     request = runner.requests[0]
     assert request.idle_timeout_seconds == 11
-    assert request.wall_timeout_seconds == 37
+    # Seeded from the real clock (line 299), so remaining_wall()'s
+    # (now + 37) - now round-trip is inexact on ~13% of freshly booted CI
+    # clocks. See the same guard in test_ai_e2e.py. The fixed-clock cases
+    # elsewhere in this file stay exact and are deliberately left alone.
+    assert request.wall_timeout_seconds == pytest.approx(37, abs=1e-9)
     assert request.provider_request_timeout_seconds == 7
 
 

@@ -1467,13 +1467,23 @@ def test_scheduled_due_pages_advance_past_a_stably_lane_blocked_first_page(
     tmp_path, workflow_writer
 ) -> None:
     now = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
+    # Freeze the lease clock, exactly as the sibling test below does. Without it
+    # the service runs on a frozen clock while the STORE still judges lease
+    # freshness against the real monotonic clock (lease_is_fresh compares
+    # sample.monotonic_now - lease.heartbeat_monotonic against lease_seconds).
+    # The 101 admissions between try_acquire and the first sweep take well over
+    # 30 real seconds on Windows, so the lease genuinely expired and the sweep
+    # died with "stale coordinator execution fence". The product was right; the
+    # test was measuring wall-clock I/O speed rather than page advancement.
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "scheduled-page"))
     store = RunStore(
         tmp_path,
         max_queued_runs=102,
         max_nonterminal_runs=102,
         max_start_requests_per_minute=200,
+        lease_clock=clock,
     )
-    coordinator = CoordinatorStore(store.database)
+    coordinator = CoordinatorStore(store.database, clock=clock)
     identity = _identity("scheduled-page")
     leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
     package = load_workflow(workflow_writer(tmp_path / "package", name="scheduled-page"))
