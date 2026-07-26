@@ -509,9 +509,13 @@ def _session_browser_profile(session_key: Optional[str]):
     """OTTO: return the ``BrowserProfile`` this session drives, or None.
 
     PURE — resolves config only and launches nothing, so guards may consult it
-    without starting a browser. Resolution matches ``session_trusts_url``: an
-    explicit ``bind()`` wins, otherwise ``browser.default_profile`` applies, so
-    an explicitly ephemeral session never inherits the enrolled browser.
+    without starting a browser.
+
+    An explicit ``bind()`` always wins, so scripted callers keep driving the
+    profile they bound. ``browser.default_profile`` applies ONLY to an
+    enrolled-suffixed key, which routing creates for an origin the profile
+    explicitly trusts. The bare task key is therefore always ephemeral: an
+    untrusted page can never be loaded by the corporate browser.
     """
     if not session_key:
         return None
@@ -519,10 +523,12 @@ def _session_browser_profile(session_key: Optional[str]):
         from tools import browser_session_registry
         from tools.browser_profiles import get_profile
 
-        name = (
-            browser_session_registry.profile_for(session_key)
-            or browser_session_registry.default_profile_name()
-        )
+        bound = browser_session_registry.profile_for(session_key)
+        if bound:
+            return get_profile(bound)
+        if not _is_enrolled_session_key(session_key):
+            return None
+        name = browser_session_registry.default_profile_name()
         return get_profile(name) if name else None
     except Exception as exc:  # noqa: BLE001
         logger.debug("browser profile lookup failed for %s: %s", session_key, exc)

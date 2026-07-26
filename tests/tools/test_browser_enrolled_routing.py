@@ -52,3 +52,45 @@ class TestGuardForcedOnForEnrolled:
         """The operator's blunt global switch keeps its meaning."""
         monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: True)
         assert browser_tool._eval_ssrf_guard_active("task-1::enrolled") is False
+
+
+ENROLLED = browser_profiles.BrowserProfile(
+    name="corp",
+    kind=browser_profiles.KIND_ENROLLED,
+    trusted_origins=("https://wiki.corp.example",),
+)
+
+
+@pytest.fixture()
+def _default_enrolled(monkeypatch):
+    monkeypatch.setattr(
+        browser_profiles, "get_profile",
+        lambda n: ENROLLED if n == "corp" else (
+            browser_profiles.BrowserProfile(name="default") if n == "default" else None
+        ),
+    )
+    monkeypatch.setattr(browser_session_registry, "default_profile_name", lambda: "corp")
+
+
+class TestOnlyEnrolledKeysDrive:
+    def test_bare_key_never_drives_enrolled(self, _default_enrolled):
+        """EBL-002: an unbound session must not get the corporate browser."""
+        assert browser_tool._session_browser_profile("task-1") is None
+        assert browser_tool._session_uses_enrolled_browser("task-1") is False
+
+    def test_enrolled_key_drives_enrolled(self, _default_enrolled):
+        profile = browser_tool._session_browser_profile("task-1::enrolled")
+        assert profile is not None and profile.is_enrolled
+        assert browser_tool._session_uses_enrolled_browser("task-1::enrolled") is True
+
+    def test_explicit_bind_still_drives(self, _default_enrolled):
+        """Scripted callers (confluence CLI, workflow script nodes) bind their key."""
+        browser_session_registry.bind("scripted", "corp")
+        assert browser_tool._session_uses_enrolled_browser("scripted") is True
+
+    def test_explicit_ephemeral_bind_never_drives_enrolled(self, _default_enrolled):
+        browser_session_registry.bind("task-1::enrolled", "default")
+        assert browser_tool._session_uses_enrolled_browser("task-1::enrolled") is False
+
+    def test_local_sidecar_never_drives_enrolled(self, _default_enrolled):
+        assert browser_tool._session_uses_enrolled_browser("task-1::local") is False
