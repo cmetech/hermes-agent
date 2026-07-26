@@ -936,6 +936,59 @@ class TestAgentBrowserRunnable:
         assert agent_browser_runnable(None) is False
         assert agent_browser_runnable("") is False
 
+    def test_repeat_calls_do_not_respawn_the_probe(self, tmp_path, monkeypatch):
+        """The probe execs a process; callers hit it a dozen-plus times a request.
+
+        get_nous_subscription_features calls _has_agent_browser twice, and the
+        /api/tools/toolsets handler calls that function once per toolset
+        directly plus once more inside _visible_providers -- roughly 24 process
+        spawns to render a list of toolset names. On a managed Windows machine
+        each spawn is scanned by EDR the first time, which pushed the request
+        past the desktop's 15s abort so the page rendered nothing.
+
+        Validating by exec is deliberate (issue #48521, a dangling symlink
+        passes `which` but fails on exec), so the fix is to remember the answer,
+        not to stop checking.
+        """
+        import subprocess
+
+        exe = self._stub(tmp_path, "agent-browser", "#!/bin/sh\nexit 0\n")
+        calls = []
+        real_run = subprocess.run
+
+        def counting_run(*a, **kw):
+            calls.append(a[0])
+            return real_run(*a, **kw)
+
+        monkeypatch.setattr(subprocess, "run", counting_run)
+        hermes_constants.reset_agent_browser_runnable_cache()
+
+        assert agent_browser_runnable(str(exe)) is True
+        assert agent_browser_runnable(str(exe)) is True
+        assert agent_browser_runnable(str(exe)) is True
+
+        assert len(calls) == 1, f"probe re-spawned {len(calls)} times"
+
+    def test_cache_is_keyed_per_path(self, tmp_path, monkeypatch):
+        """A cached answer for one binary must not decide another's fate."""
+        import subprocess
+
+        good = self._stub(tmp_path, "agent-browser", "#!/bin/sh\nexit 0\n")
+        bad = self._stub(tmp_path, "agent-browser-broken", "#!/bin/sh\nexit 127\n")
+        calls = []
+        real_run = subprocess.run
+
+        def counting_run(*a, **kw):
+            calls.append(a[0])
+            return real_run(*a, **kw)
+
+        monkeypatch.setattr(subprocess, "run", counting_run)
+        hermes_constants.reset_agent_browser_runnable_cache()
+
+        assert agent_browser_runnable(str(good)) is True
+        assert agent_browser_runnable(str(bad)) is False
+        assert len(calls) == 2
+
     def test_dangling_symlink_rejected(self, tmp_path):
         link = tmp_path / "agent-browser"
         link.symlink_to(tmp_path / "does-not-exist")
