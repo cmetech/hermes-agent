@@ -18,10 +18,18 @@ feature: python-isolation
 # (A) alone is insufficient: a managed 3.11 under PYTHONHOME=...Python310 fails
 # identically.
 #
-# The user's shell is NOT a fix surface. The Electron app spawns the install and
-# inherits Machine/User-scope environment directly, which is why clearing these
-# in a PowerShell session did not help and the fix must live in the installer
-# and the app's spawn environment.
+# The user's shell is not a fix surface FOR THE INSTALL. The Electron app spawns
+# the install and inherits Machine/User-scope environment directly, which is why
+# clearing these in a PowerShell session did not help and that fix must live in
+# the installer and the app's spawn environment.
+#
+# It IS the surface for the command a user types, and that is a third defect,
+# found on 2026-07-26 and fixed by cli-launcher-env-isolation below: `loop24
+# config edit` died with the same SRE mismatch on a laptop whose PYTHONPATH --
+# not PYTHONHOME, which was unset -- named a complete 3.10 stdlib. pip's console
+# script starts the venv interpreter with the shell's environment intact, and
+# PYTHONPATH is prepended ahead of the venv's own Lib. Nothing in-process can
+# defend against it: site.py has already failed.
 #
 # Why this manifest exists: the workspace-level surface table and the
 # otto-upstream-merge grep list live OUTSIDE any git repository, so they do not
@@ -150,4 +158,132 @@ upstream_changes:
     Remove when uv defaults to managed-only interpreter selection (making the
     --managed-python wrappers redundant) AND the desktop no longer spawns
     installs from a process that inherits machine-scope environment.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+- id: cli-launcher-env-isolation
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - scripts/install.ps1
+  - scripts/install.sh
+  - tests/test_install_python_isolation.py
+  owned_symbols:
+  - InheritedPythonEnvVars
+  - Get-ConsoleScriptNames
+  - Install-CommandShims
+  - Set-PathVariable
+  tests:
+  - tests/test_install_python_isolation.py
+  expected_commit_subject: 'fix(install): scrub the inherited Python env in the command launchers'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. The command a user types is its own fix surface, separate
+    from the install and from the desktop backend spawn. install.sh has always
+    written a launcher that unsets the inherited Python vars before exec'ing the
+    venv entry point; install.ps1 had no equivalent and put venv\Scripts on PATH
+    raw, so `loop24 config edit` ran pip's console script with a corporate
+    PYTHONPATH still set and died in site.py.
+
+    Two details are load-bearing and neither produces a test failure elsewhere
+    if lost. (1) The launchers must NOT be written into venv\Scripts: within one
+    directory PATHEXT resolves .EXE ahead of .CMD, so pip's exe would keep
+    winning. They go in $HermesHome\bin and Set-PathVariable puts that directory
+    on PATH AHEAD of venv\Scripts -- across directories the first entry holding
+    any match wins, and that ordering IS the mechanism. (2) Set-PathVariable
+    re-seats both directories instead of skipping when either is already
+    present. An install predating this fix has venv\Scripts on PATH alone;
+    appending the shim dir after it would leave pip's exe resolving first and
+    the upgrade would silently fix nothing.
+
+    Get-ConsoleScriptNames reads [project.scripts] from pyproject.toml rather
+    than hardcoding names. That table is what the brand generator stamps, so a
+    brand branch's own entry points are covered with no per-brand edit -- do not
+    replace it with a literal list. It shims only names whose .exe was actually
+    built, so a declared-but-unbuilt entry point gets no launcher.
+
+    $InheritedPythonEnvVars is hoisted specifically so the install-time scrub and
+    the generated launchers cannot drift apart; keep them reading one list.
+    install.ps1 must stay pure ASCII (test_install_ps1_ascii_only.py).
+
+    Accepted trade-off: a .cmd wrapper is a resident process, so Ctrl+C can
+    raise cmd.exe's "Terminate batch job (Y/N)?" prompt. install.sh avoids this
+    with exec, which cmd has no equivalent for. Without the launcher the command
+    does not start at all, so correctness wins.
+
+    The POSIX side of the launcher surface -- one launcher per console script,
+    and the matching uninstall cleanup -- is a separate entry below
+    (posix-command-launcher-coverage), because it is a coverage gap rather than
+    an env-poisoning one. Both entries own scripts/install.sh; resolve them
+    together.
+  removal_condition: >-
+    Remove when the entry points are no longer pip console scripts that inherit
+    the invoking shell's environment -- e.g. a native launcher that starts the
+    interpreter with a curated environment, or a CPython that ignores PYTHONPATH
+    for a venv it did not build.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+- id: posix-command-launcher-coverage
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - scripts/install.sh
+  - hermes_cli/uninstall.py
+  - tests/test_posix_command_launchers.py
+  - tests/test_install_sh_symlink_stomp.py
+  - tests/test_install_sh_pythonpath_sanitization.py
+  owned_symbols:
+  - console_script_names
+  - write_command_launchers
+  - _installed_command_names
+  - _LAUNCHER_MARKER
+  - remove_wrapper_script
+  tests:
+  - tests/test_posix_command_launchers.py
+  expected_commit_subject: 'fix(install): expose every console script on POSIX, not just hermes'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. setup_path linked exactly ONE launcher, $command_link_dir/
+    hermes, and install.sh never puts venv/bin on PATH. The brand branches
+    declare their own entry points in [project.scripts], so pip builds
+    venv/bin/loop24 and nothing ever made it reachable -- the branded command
+    did not exist on Linux or macOS at all. If a merge collapses
+    write_command_launchers back to a single hardcoded `hermes`, every brand
+    silently loses its command with no test failure outside this entry's tests.
+
+    console_script_names parses [project.scripts] for the same reason
+    Get-ConsoleScriptNames does on Windows: that table is what the brand
+    generator stamps. Keep them reading the same source. setup_path falls back
+    to a literal "hermes" when the parse yields nothing, so a malformed
+    pyproject degrades to the old behaviour rather than to no command at all.
+
+    Three details are load-bearing. (1) The `rm -f "$link_dir/$name"` must stay
+    BEFORE the heredoc -- older installs left symlinks to the pip entry point,
+    and `cat >` follows a symlink and overwrites it, which is #21454. It now
+    applies per launcher. (2) The self-shim guard (link_dir resolving to the
+    same directory as bin_dir returns early) protects --no-venv installs, where
+    HERMES_BIN comes from `which hermes` and can already resolve inside the link
+    dir; without it the launcher exec's itself forever. (3) Each launcher must
+    exec ITS OWN entry point ($bin_dir/$name), not HERMES_BIN -- otherwise every
+    branded command runs `hermes`.
+
+    uninstall's remove_wrapper_script runs two passes and needs both. The marker
+    scan (_LAUNCHER_MARKER, written into every generated launcher) is the only
+    pass that catches a launcher whose name cannot be derived -- uninstalling a
+    LOOP24 install from a checkout whose active brand differs. The name pass
+    accepts the two legacy substrings so pre-marker installs stay removable.
+    Do NOT "simplify" this to deleting anything in the directory mentioning
+    Hermes: that takes a user's own scripts with it. The 4096-byte read cap
+    keeps the scan off real binaries sharing /usr/local/bin. /usr/local/bin is
+    appended unconditionally rather than taken from
+    _node_symlink_candidate_dirs (which adds it on Linux only), because the
+    previous implementation checked it on every platform and dropping that would
+    strand an older macOS install's launcher.
+
+    The tests for #21454 (test_install_sh_symlink_stomp.py) and for the env
+    scrub (test_install_sh_pythonpath_sanitization.py) were retargeted from
+    setup_path to write_command_launchers when the block moved. They assert the
+    same guarantees; if a merge moves the block again, retarget rather than
+    delete.
+  removal_condition: >-
+    Remove when the POSIX installer puts the venv's bin directory on PATH
+    directly (making per-script launchers unnecessary) AND the entry points no
+    longer need an environment scrub to start.
   last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6

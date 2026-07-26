@@ -24,7 +24,9 @@ def test_hermes_launcher_wrapper_clears_python_env_before_exec() -> None:
     text = INSTALL_SH.read_text()
 
     # Wrapper should clear env and forward args untouched to the venv entrypoint.
-    assert 'cat > "$command_link_dir/hermes" <<EOF' in text
+    # One launcher per console script since POSIX installs stopped exposing
+    # only `hermes`; the heredoc is now parameterised by name.
+    assert 'cat > "$link_dir/$name" <<EOF' in text
     assert 'unset PYTHONPATH' in text
     assert 'unset PYTHONHOME' in text
-    assert 'exec "$HERMES_BIN" "\\$@"' in text
+    assert 'exec "$bin_dir/$name" "\\$@"' in text

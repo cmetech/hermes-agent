@@ -64,6 +64,15 @@ def _extract_shell_function(text: str, name: str) -> str:
     return match.group(0)
 
 
+def _extract_ps_function(text: str, name: str) -> str:
+    """Return one top-level ``function Name { ... }`` block from install.ps1."""
+    match = re.search(
+        rf"^function {re.escape(name)} \{{$.*?^\}}$", text, re.MULTILINE | re.DOTALL
+    )
+    assert match, f"function {name} not found in install.ps1"
+    return match.group(0)
+
+
 def _write_stub_interpreter(path: Path, version_line: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"#!/bin/sh\necho '{version_line}'\n")
@@ -295,3 +304,127 @@ def test_get_managed_python_path_never_returns_a_discovered_interpreter(tmp_path
     # A system interpreter is discoverable here and must NOT be returned; the
     # caller degrades explicitly and warns instead of being handed one silently.
     assert _probe(managed_available=False) == ""
+
+
+# ---------------------------------------------------------------------------
+# Launcher shims: the entry point a user TYPES must scrub too
+# ---------------------------------------------------------------------------
+# The install-time scrub and the desktop backend spawn were not the whole
+# surface. A branded CLI invoked from a shell -- `loop24 config edit` -- runs
+# pip's console script, which starts the venv interpreter with whatever Python
+# environment that shell carries. A corporate PYTHONPATH naming a complete 3.10
+# stdlib is prepended AHEAD of the venv's own Lib, and the process dies in
+# sre_compile.py with "AssertionError: SRE module mismatch" inside site.py --
+# before any hermes_cli code exists to defend itself.
+
+
+@pytest.mark.skipif(not INSTALL_PS1.exists(), reason="install.ps1 missing")
+def test_install_ps1_installs_env_scrubbing_command_shims() -> None:
+    text = INSTALL_PS1.read_text()
+
+    assert "function Get-ConsoleScriptNames" in text
+    assert "function Install-CommandShims" in text
+
+    set_path = _extract_ps_function(text, "Set-PathVariable")
+    assert "Install-CommandShims" in set_path, "Set-PathVariable must write the launchers"
+
+    # The shims are useless unless their directory is searched BEFORE
+    # venv\Scripts: within one directory PATHEXT resolves .EXE ahead of .CMD, so
+    # pip's exe would keep winning. Across directories the first PATH entry
+    # holding a match wins, which is the only reason this works.
+    assert "@($shimDir, $hermesBin)" in set_path, (
+        "shim dir must be ordered ahead of the venv Scripts dir"
+    )
+
+
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None or not INSTALL_PS1.exists(),
+    reason="PowerShell unavailable; source-level assertions cover this case",
+)
+def test_command_shims_clear_every_inherited_python_var(tmp_path: Path) -> None:
+    """Behavioural: run the real shim writer and read what it produced.
+
+    Asserting that install.ps1 mentions PYTHONPATH proves nothing about the file
+    the user's shell actually executes, so generate the launchers and inspect
+    them.
+    """
+    text = INSTALL_PS1.read_text()
+
+    decl = re.search(r"^\$InheritedPythonEnvVars = @\([^)]*\)$", text, re.MULTILINE)
+    assert decl, "$InheritedPythonEnvVars must be a hoisted list shared with the scrub block"
+
+    fn_file = tmp_path / "fn.ps1"
+    fn_file.write_text(
+        decl.group(0)
+        + "\n"
+        + _extract_ps_function(text, "Get-ConsoleScriptNames")
+        + "\n"
+        + _extract_ps_function(text, "Install-CommandShims")
+        + "\n"
+    )
+
+    scripts_dir = tmp_path / "venv" / "Scripts"
+    scripts_dir.mkdir(parents=True)
+    # A brand branch adds its own scripts to [project.scripts]; the writer must
+    # pick them up from there rather than from a hardcoded brand list.
+    for name in ("hermes", "loop24", "loop24-acp"):
+        (scripts_dir / f"{name}.exe").write_text("stub")
+
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        textwrap.dedent(
+            """\
+            [project]
+            name = "hermes-agent"
+
+            [project.scripts]
+            hermes = "hermes_cli.main:main"
+            loop24 = "hermes_cli.main:main"
+            loop24-acp = "acp_adapter.entry:main"
+            never-built = "nope:main"
+
+            [tool.setuptools]
+            packages = ["hermes_cli"]
+            """
+        )
+    )
+
+    shim_dir = tmp_path / "bin"
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            f'. "{fn_file}"; '
+            f'$names = Get-ConsoleScriptNames "{pyproject}"; '
+            f'Install-CommandShims -ShimDir "{shim_dir}" -ScriptsDir "{scripts_dir}" -Names $names',
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    for name in ("hermes", "loop24", "loop24-acp"):
+        shim = shim_dir / f"{name}.cmd"
+        assert shim.exists(), f"no launcher written for {name}"
+        body = shim.read_text()
+        for var in INHERITED_PYTHON_ENV_VARS:
+            assert f'set "{var}="' in body, f"{name}.cmd does not clear {var}"
+        assert 'set "PYTHONNOUSERSITE=1"' in body
+        # Quoted, so a HERMES_HOME containing a space still launches.
+        assert f'"{scripts_dir / (name + ".exe")}" %*' in body
+
+    # A declared script with no built .exe must not get a launcher that would
+    # shadow nothing and fail confusingly.
+    assert not (shim_dir / "never-built.cmd").exists()
+
+
+@pytest.mark.skipif(not INSTALL_SH.exists(), reason="install.sh missing")
+def test_install_sh_launcher_clears_the_whole_inherited_family() -> None:
+    """The POSIX shim predates this fix but only cleared two of the five vars."""
+    writer = _extract_shell_function(INSTALL_SH.read_text(), "write_command_launchers")
+
+    for name in INHERITED_PYTHON_ENV_VARS:
+        assert f"unset {name}" in writer, f"the launcher does not clear {name}"
+    assert "export PYTHONNOUSERSITE=1" in writer

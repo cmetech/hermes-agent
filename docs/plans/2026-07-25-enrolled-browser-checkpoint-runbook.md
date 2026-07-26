@@ -93,11 +93,23 @@ this uses `config edit`.)
 Settings → Advanced → **Safety**.
 
 **Expected:** *Browser Profile For Internal Sites* (text, `enrolled`) and
-*Trusted Internal Origins* (an **add/remove list**, showing your two entries).
+*Trusted Internal Origins* (a single text input showing your entries joined with
+commas: `https://eteamspace.internal.ericsson.com, https://*.internal.ericsson.com`).
 *Allow Private URLs* should be **off**.
 
+A comma-joined textbox **is** the list widget — that is what `type: 'list'`
+renders (`config-field.tsx`: `value.join(', ')` for display, `split(',')` back to
+an array on edit). Editing it stores an array, so commas here are safe. There is
+no add/remove chip UI.
+
 The origins field only appears because the profile now exists in config — that is
-intended, not a bug.
+intended, not a bug. Its *type* is inferred from the stored value, so the field is
+also a type check: `inferFieldSchema` returns `list` only for an array. If Step 2
+had left a string behind, you would still see a textbox here and could not tell
+the difference — which is why Step 2 verifies with `config get --json` rather than
+by eye. A string value would trust nothing (`browser_profiles.py` fails closed and
+logs a warning), and Steps 4-6 would fail with `Blocked: URL targets a private or
+internal address`.
 
 ## Step 4 — First sign-in ⭐ THE CRITICAL STEP
 

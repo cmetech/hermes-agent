@@ -8,9 +8,13 @@ the existing symlink and overwrote the pip entry point with the shim. The
 shim's ``exec "$HERMES_BIN" "$@"`` then self-recursed and ``hermes`` hung on
 every invocation.
 
-These tests pin the fix: ``setup_path()`` must remove ``$command_link_dir/hermes``
-before writing through the redirect, so the shim is created as a regular file
-in ``command_link_dir`` and the venv entry point is left intact.
+These tests pin the fix: the launcher writer must remove the link path before
+writing through the redirect, so the shim is created as a regular file in
+``command_link_dir`` and the venv entry point is left intact.
+
+The block moved out of ``setup_path()`` into ``write_command_launchers()`` when
+POSIX installs started exposing every ``[project.scripts]`` entry point instead
+of only ``hermes``; the stomp hazard is unchanged and now applies per launcher.
 """
 
 from __future__ import annotations
@@ -27,26 +31,24 @@ INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 
 
 def _extract_setup_path_shim_block() -> str:
-    """Return the install.sh shim-write block used by setup_path()."""
+    """Return install.sh's launcher writer, which owns the shim-write block."""
     text = INSTALL_SH.read_text()
     match = re.search(
-        r"(?P<block>mkdir -p \"\$command_link_dir\".*?chmod \+x \"\$command_link_dir/hermes\")",
-        text,
-        re.DOTALL,
+        r"^write_command_launchers\(\) \{$.*?^\}$", text, re.MULTILINE | re.DOTALL
     )
     assert match is not None, (
-        "Could not locate the setup_path shim-write block in scripts/install.sh"
+        "Could not locate write_command_launchers() in scripts/install.sh"
     )
-    return match["block"]
+    return match.group(0)
 
 
 def test_setup_path_shim_block_removes_old_link_before_writing() -> None:
     """Static guard: the rm must precede the cat heredoc, not follow it."""
     block = _extract_setup_path_shim_block()
-    rm_idx = block.find('rm -f "$command_link_dir/hermes"')
-    cat_idx = block.find('cat > "$command_link_dir/hermes" <<EOF')
+    rm_idx = block.find('rm -f "$link_dir/$name"')
+    cat_idx = block.find('cat > "$link_dir/$name" <<EOF')
     assert rm_idx != -1, (
-        "setup_path() must `rm -f` $command_link_dir/hermes before the "
+        "the launcher writer must `rm -f` $link_dir/$name before the "
         "`cat >` heredoc, otherwise an existing symlink (left by older "
         "installs) will be followed and the pip entry point overwritten. "
         "See #21454."
@@ -89,8 +91,12 @@ def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -
     assert shim_path.is_symlink()
 
     block = _extract_setup_path_shim_block()
-    # Drive the block with the real env vars setup_path() sets.
-    script = f'set -e\nHERMES_BIN={pip_entry!s}\ncommand_link_dir={command_link_dir!s}\n{block}\n'
+    # Drive the writer the way setup_path() does: link dir, entry-point dir,
+    # then the console-script names.
+    script = (
+        f"set -e\n{block}\n"
+        f'write_command_launchers "{command_link_dir}" "{venv_bin}" hermes\n'
+    )
     result = subprocess.run(
         ["bash", "-c", script],
         capture_output=True,

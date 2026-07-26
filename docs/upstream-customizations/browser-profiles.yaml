@@ -123,3 +123,72 @@ upstream_changes:
     profiles panel replaces these Advanced keys (planned follow-up, deferred until
     the enrolled launcher is verified on a managed corporate machine).
   last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+- id: enrolled-profile-seeding-and-toggle
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  files:
+  - capabilities/ericsson.json
+  - hermes_cli/capability_staging.py
+  - apps/desktop/src/app/settings/enrolled-profile-field.tsx
+  - apps/desktop/src/app/settings/enrolled-profile-field.test.tsx
+  - apps/desktop/src/app/settings/config-field.tsx
+  - apps/desktop/src/app/settings/constants.ts
+  - tests/hermes_cli/test_brand_defaults_seed.py
+  owned_symbols:
+  - _capability_config_defaults
+  - _flatten_defaults
+  - _read_nested
+  - _write_nested
+  - seed_brand_defaults
+  - EnrolledProfileField
+  - ENROLLED_PROFILE_NAME
+  tests:
+  - tests/hermes_cli/test_brand_defaults_seed.py
+  - apps/desktop/src/app/settings/enrolled-profile-field.test.tsx
+  expected_commit_subject: 'feat(browser): seed the enrolled profile and make activating it one click'
+  upstream_candidate: false
+  merge_guidance: >-
+    UNION on merge. Removes the runbook's manual YAML step: the enrolled profile
+    and its trusted_origins are seeded into config.yaml on first run, from
+    capabilities/ericsson.json `configDefaults`.
+
+    Two properties are load-bearing and neither is enforced by the type system.
+
+    (1) SEED-ONCE, NEVER OVERWRITE. seed_brand_defaults records seeded leaf paths
+    in the .brand-defaults-seeded.json marker (the `config` key, additive --
+    its absence reads as "nothing seeded yet", so BRAND_DEFAULTS_SCHEMA_VERSION
+    stays 1) and skips any path already present in the config. trusted_origins
+    governs private-network access: a user who deliberately trims it must not
+    have entries restored on the next launch. Do NOT move this into
+    seed_baked_capabilities, which re-applies managed content on a version bump
+    -- right for MCP definitions, wrong for a security list.
+
+    (2) browser.default_profile is NOT seeded. Seeding it would route every
+    unbound agent browsing session through the corporate profile, so arbitrary
+    external pages would share a browser identity with live SSO cookies.
+    Activation is the user's decision, via the Settings switch. A test asserts
+    the key is absent after seeding; if that test is ever "fixed" by adding the
+    key, the isolation is gone.
+
+    The toggle cannot be a plain `type: 'boolean'` schema entry:
+    browser.default_profile holds a profile NAME, so the generic Switch branch
+    would write `true` and default_profile_name() would look up a profile called
+    "True" -- failing closed, but silently and for the wrong reason. Hence
+    EnrolledProfileField, dispatched from config-field.tsx by schemaKey exactly
+    as fallback_providers already is. Off writes an empty string, which is what
+    `name or None` reads as no profile; writing `false` or deleting nothing would
+    leave the profile active.
+
+    A test reads the SHIPPED capabilities/ericsson.json rather than a fixture, so
+    a typo there cannot leave every install unseeded while the suite stays green.
+    Two origins, not three: the matcher treats *.ericsson.com as any strict
+    subdomain, so *.internal.ericsson.com would be redundant.
+
+    Known scope limit, accepted: the manifest is vendored on `base`, so a future
+    NON-Ericsson brand built from base would also be seeded these origins. The
+    gate for that is the descriptor's existing capabilitySets field.
+  removal_condition: >-
+    Remove when the enrolled browser profile is configured through a dedicated
+    Settings panel that writes the profile directly, making first-run seeding of
+    config.yaml unnecessary.
+  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6

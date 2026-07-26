@@ -802,6 +802,78 @@ BRAND_DEFAULTS_MARKER = ".brand-defaults-seeded.json"
 BRAND_DEFAULTS_SCHEMA_VERSION = 1
 
 
+def _capability_config_defaults(root: Path | None = None) -> dict:
+    """Merge every vendored capability manifest's ``configDefaults`` block.
+
+    Manifest-driven for the same reason ``_inject_capability_env_vars`` is
+    (config.py): adding a default later is a manifest edit, not a code edit.
+    Located the same way — ``<repo root>/capabilities/*.json`` — and equally
+    fail-safe, since a malformed manifest must never break startup.
+    """
+    base = Path(root) if root is not None else Path(__file__).resolve().parents[1]
+    cap_dir = base / "capabilities"
+    merged: dict = {}
+    if not cap_dir.is_dir():
+        return merged
+
+    for manifest_path in sorted(cap_dir.glob("*.json")):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(manifest, dict):
+            continue
+        defaults = manifest.get("configDefaults")
+        if isinstance(defaults, dict):
+            _deep_merge_defaults(merged, defaults)
+    return merged
+
+
+def _deep_merge_defaults(target: dict, source: dict) -> None:
+    """Merge ``source`` into ``target``; the first manifest to claim a leaf wins."""
+    for key, value in source.items():
+        if isinstance(value, dict):
+            child = target.setdefault(key, {})
+            if isinstance(child, dict):
+                _deep_merge_defaults(child, value)
+        elif key not in target:
+            target[key] = value
+
+
+def _flatten_defaults(defaults: dict, prefix: str = "") -> "list[tuple[list[str], object]]":
+    """Flatten to (path, value) leaves. A list IS a leaf — ``trusted_origins``
+    must be seeded whole, never merged element-wise."""
+    leaves: list[tuple[list[str], object]] = []
+    for key, value in defaults.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            leaves.extend(_flatten_defaults(value, path))
+        else:
+            leaves.append((path.split("."), value))
+    return leaves
+
+
+def _read_nested(cfg: dict, path: "list[str]") -> "tuple[bool, object]":
+    """Return (present, value) for a dotted path already in the config."""
+    cursor: object = cfg
+    for part in path:
+        if not isinstance(cursor, dict) or part not in cursor:
+            return False, None
+        cursor = cursor[part]
+    return True, cursor
+
+
+def _write_nested(cfg: dict, path: "list[str]", value: object) -> None:
+    cursor = cfg
+    for part in path[:-1]:
+        nxt = cursor.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cursor[part] = nxt
+        cursor = nxt
+    cursor[path[-1]] = value
+
+
 def seed_brand_defaults(home: Path | str, root: Path | None = None) -> None:
     """Seed the active brand's curation.*.disabledByDefault into config.yaml ONCE.
 
@@ -831,7 +903,18 @@ def seed_brand_defaults(home: Path | str, root: Path | None = None) -> None:
             str(x) for x in ((curation.get("tools") or {}).get("disabledByDefault") or [])
             if isinstance(x, str)
         ]
-        if not skills_dbd and not tools_dbd:
+        # Vendored capability manifests contribute config defaults alongside the
+        # descriptor's curation lists — same seed-once semantics, because a
+        # seeded value (browser trusted_origins, say) is one a user may
+        # deliberately trim and must not have restored on the next launch.
+        try:
+            config_defaults = _capability_config_defaults(root)
+        except Exception:
+            log.debug("seed_brand_defaults: could not read capability configDefaults", exc_info=True)
+            config_defaults = {}
+        default_leaves = _flatten_defaults(config_defaults) if isinstance(config_defaults, dict) else []
+
+        if not skills_dbd and not tools_dbd and not default_leaves:
             return  # nothing to seed — the no-op path
 
         home = Path(home)
@@ -842,10 +925,17 @@ def seed_brand_defaults(home: Path | str, root: Path | None = None) -> None:
             marker = {}
         seeded_skills = set(marker.get("skills") or [])
         seeded_tools = set(marker.get("toolsets") or [])
+        seeded_config = set(marker.get("config") or [])
+
+        # Absent from the marker AND absent from the config: never seeded, and
+        # not something the user has set. Anything else is left alone.
+        pending_leaves = [
+            (path, value) for path, value in default_leaves if ".".join(path) not in seeded_config
+        ]
 
         new_skills = [s for s in skills_dbd if s not in seeded_skills]
         new_tools = [t for t in tools_dbd if t not in seeded_tools]
-        if not new_skills and not new_tools:
+        if not new_skills and not new_tools and not pending_leaves:
             return  # already seeded once — respect the user's toggles
 
         # config IO must target the SAME home being seeded (see stage_bundle note).
@@ -868,6 +958,14 @@ def seed_brand_defaults(home: Path | str, root: Path | None = None) -> None:
                 if merged != cfg.get("disabled_toolsets"):
                     cfg["disabled_toolsets"] = merged
                     changed = True
+            for path, value in pending_leaves:
+                # Present already means the user (or an earlier hand-edit) owns
+                # it. Seeding is additive only — it never overwrites.
+                present, _existing = _read_nested(cfg, path)
+                if present:
+                    continue
+                _write_nested(cfg, path, value)
+                changed = True
             if changed:
                 config_mod.save_config(cfg)
         finally:
@@ -876,6 +974,7 @@ def seed_brand_defaults(home: Path | str, root: Path | None = None) -> None:
         # Record ALL descriptor defaults as seeded (only reached once the config
         # round-trip above completed) so they are never reconsidered.
         marker_out = {
+            "config": sorted(seeded_config | {".".join(path) for path, _ in default_leaves}),
             "schemaVersion": BRAND_DEFAULTS_SCHEMA_VERSION,
             "skills": sorted(seeded_skills | set(skills_dbd)),
             "toolsets": sorted(seeded_tools | set(tools_dbd)),
