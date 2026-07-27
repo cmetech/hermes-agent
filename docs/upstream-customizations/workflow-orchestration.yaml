@@ -798,7 +798,7 @@ upstream_changes:
   owned_symbols:
   - _EPHEMERAL_COVERAGE_PATHS
   - validate_diff_coverage
-  - _range_base
+  - _resolved_diff_endpoints
   - _existed_at
   tests:
   - tests/scripts/test_check_upstream_customizations.py
