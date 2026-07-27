@@ -80,9 +80,16 @@ upstream_changes:
     vision comparison back to `not _is_safe_url(_current_url)`, the enrolled
     profile silently loses the ability to READ internal pages while still being
     able to navigate to them, which looks like a flaky page rather than a
-    regression. browser.default_profile (browser_session_registry.default_profile_name)
-    is what lets the AGENT's bare task_id inherit the profile; without it only
-    scripted acquire() callers get enrolled access.
+    regression. browser.default_profile
+    (browser_session_registry.default_profile_name) is what makes the profile
+    reachable from the AGENT at all -- but it must NEVER be re-wired so a bare
+    task_id inherits it. That inheritance was EBL-002 and was removed: an
+    unbound bare key would route every page, including arbitrary external ones,
+    through the corporate browser and its live SSO cookies. The correct wiring
+    is per-navigation: _navigation_session_key sends an origin the profile
+    explicitly trusts to f"{task_id}::enrolled", and _session_browser_profile
+    applies default_profile ONLY to that suffixed key. Scripted acquire()
+    callers still bind their own key explicitly.
   removal_condition: >-
     Remove when upstream provides a first-class per-profile or per-origin trust
     model for private-network browser access (for example an allowlist attached
@@ -96,9 +103,17 @@ upstream_changes:
   - tools/browser_profiles.py
   - tools/browser_session_registry.py
   - tools/browser_session_manager.py
+  - hermes_cli/browser_connect.py
+  - hermes_cli/cli_commands_mixin.py
+  - tui_gateway/server.py
+  - agent/chat_completion_helpers.py
+  - capabilities/ericsson.json
+  - skills/ericsson/confluence-research/scripts/backends.py
   - tests/tools/test_browser_enrolled_launch.py
   - tests/tools/test_browser_profiles.py
   - tests/tools/test_browser_enrolled_routing.py
+  - tests/tools/test_browser_enrolled_port_guard.py
+  - tests/tools/test_browser_headed_mode.py
   owned_symbols:
   - _ENROLLED_SUFFIX
   - _is_enrolled_session_key
@@ -124,22 +139,41 @@ upstream_changes:
   - _bare_task_id_for_session_key
   - check_browser_requirements
   - _eval_ssrf_guard_active
+  # Five of the six guard-forcing disjuncts live in these functions, not in a
+  # shared helper. Without them here an upstream rewrite of any of them
+  # classifies as the weakest `same_file` signal instead of an owned-symbol hit.
+  - browser_navigate
+  - browser_snapshot
+  - browser_vision
+  - _last_session_key
+  - _should_inject_engine
+  - _session_is_cdp_attached
   - default_profile_trusts_url
   - default_profile_launchable
   - session_trusts_url
   - _enrolled_candidates
   - _is_runnable
   - resolve_executable
+  - resolve_user_data_dir
+  - enrolled_cdp_ports
   - load_profiles
   - acquire
   - _cdp_browser_identity
+  - _cdp_version_payload
+  - _devtools_active_target
+  - _endpoint_is_profile_browser
+  - _run_daemon_hygiene
+  - _live_browser_session_keys
   - _ensure_enrolled_cdp
+  - enrolled_port_refusal
   tests:
   - tests/tools/test_browser_enrolled_launch.py
   - tests/tools/test_browser_enrolled_routing.py
+  - tests/tools/test_browser_enrolled_port_guard.py
   - tests/tools/test_browser_profiles.py
   - tests/tools/test_browser_default_profile.py
   - tests/tools/test_browser_session_manager.py
+  - tests/tools/test_browser_headed_mode.py
   - tests/tools/test_browser_hybrid_routing.py
   - tests/tools/test_browser_cdp_override.py
   - tests/tools/test_browser_chromium_check.py
@@ -290,10 +324,18 @@ upstream_changes:
     _run_browser_command when a failed enrolled-session command's error text
     matches _DEAD_CDP_MARKERS, so the NEXT call relaunches rather than being
     driven at a stale endpoint forever (it deliberately does not retry the
-    failed command itself, since that command may not be idempotent). The
-    Lightpanda-fallback branch in _run_browser_command is gated off
-    session_info.get("cdp_url") so a CDP-attached (including enrolled) session
-    is never misdiagnosed as a Lightpanda failure needing a Chrome retry.
+    failed command itself, since that command may not be idempotent).
+
+    There are TWO Lightpanda fallback sites and BOTH must stay gated. The one in
+    _run_browser_command is gated off session_info.get("cdp_url"). The one in
+    browser_vision (the screenshot pre-route) is gated off the pure
+    _session_is_cdp_attached, because _should_inject_engine is session-blind:
+    with a global browser.engine: lightpanda it would call
+    _chrome_fallback_screenshot on an ENROLLED key, which reads the internal URL
+    off the enrolled session and then opens it in the BUNDLED browser -- a
+    silent fallback to the throwaway browser for a trusted origin, and an
+    internal URL loaded in an unmanaged profile. Site two went ungated until
+    2026-07-26 (review finding M-1); if a merge reshapes either, re-gate both.
 
     The Chromium fast-fail gate in _run_browser_command consults the PURE
     predicate _session_uses_enrolled_browser, never _session_cdp_url. That
@@ -329,14 +371,71 @@ upstream_changes:
     that reuses an already-claimed cdp_port (fail-open: first claim wins, a
     warning is logged, the loser is dropped from the profile map) -- two
     profiles sharing one port would let one profile's trust apply to whatever
-    browser actually answers on it. _cdp_browser_identity (in
-    browser_session_manager.py) closes that same hole at connect time: before
-    reusing a listener on the profile's port, it reads /json/version and
-    requires a non-empty "Browser" string, failing CLOSED (launch our own
-    browser) on any connection error, timeout, non-JSON body, or missing key --
-    so an unrelated process squatting on the port is never mistaken for the
-    enrolled browser. _cdp_alive (unchanged) is liveness-only and still serves
-    the POST-launch readiness poll, where identity is already established.
+    browser actually answers on it.
+
+    PORT SEPARATION AND ENDPOINT IDENTITY (2026-07-26, review findings BP-1 and
+    H-1). Two related invariants; neither is enforced by types.
+
+    (i) browser_profiles.DEFAULT_CDP_PORT is 9333 and must NOT be moved to 9222.
+    9222 is hermes_cli.browser_connect.DEFAULT_BROWSER_CDP_PORT -- the port
+    `/browser connect` defaults to, discovers, and auto-launches a throwaway
+    debug Chrome on. `/browser connect` publishes a PROCESS-GLOBAL
+    BROWSER_CDP_URL, after which _navigation_session_key returns the bare key
+    for every URL and _session_cdp_url falls through to the override, so every
+    navigation -- including attacker-controlled public pages -- runs in whatever
+    is on that port. An enrolled profile sharing 9222 therefore reopens the
+    original CRITICAL on the shipped default config. The seeded value lives in
+    capabilities/ericsson.json; the confluence-research skill's
+    CONFLUENCE_CDP_PORT default matches it deliberately. Paired with it,
+    hermes_cli.browser_connect.enrolled_port_refusal() REFUSES a connect to any
+    port in browser_profiles.enrolled_cdp_ports() (every configured enrolled
+    profile's cdp_port plus the reserved default) and is wired into BOTH connect
+    surfaces -- the CLI /browser command and the browser.manage RPC in
+    tui_gateway/server.py -- plus find_free_debug_port, so a squatted port
+    cannot push a throwaway browser onto the enrolled one. Losing either half
+    leaves the hole. It fails OPEN on a config read error by design: a broken
+    config must not make /browser connect unusable.
+
+    (ii) _cdp_browser_identity is LIVENESS ONLY and proves nothing about
+    identity -- every CDP endpoint returns a non-empty "Browser" string, so
+    Chrome for Testing, /browser connect's throwaway Chrome in
+    $HERMES_HOME/chrome-debug, and the confluence skill's Edge are all
+    indistinguishable from the enrolled browser by that measure. Do not let a
+    comment claim otherwise. The actual proof is
+    _endpoint_is_profile_browser(profile, cdp_url), anchored on the profile's
+    OWN user_data_dir, which only the enrolled browser ever uses: Chromium
+    writes DevToolsActivePort there (line 1 port, line 2
+    /devtools/browser/<uuid>) when its DevTools server starts, and the live
+    endpoint reports the same target in webSocketDebuggerUrl. Matching them
+    proves the listener on this port is the browser holding this profile
+    directory, and it survives process restarts, so the attach-or-launch reuse
+    this module is built on still works. It is checked on BOTH the reuse gate
+    and the POST-launch readiness poll: without the second, a foreign listener
+    holding the port (our launch cannot bind it) would be reported ready by
+    _cdp_alive and returned as the enrolled browser. Fails CLOSED everywhere; a
+    false negative costs a relaunch, a false positive costs the corporate
+    session. _cdp_alive itself is unchanged and remains liveness-only.
+
+    PATH RESOLUTION (M-3). browser_profiles.resolve_user_data_dir() expands
+    ${HERMES_HOME} through hermes_constants.get_hermes_home(), NOT
+    os.path.expandvars. HERMES_HOME is only exported into os.environ on the
+    --profile override path, so on the CLI and `hermes serve` expandvars returns
+    the literal and os.makedirs creates the profile dir RELATIVE TO THE CWD.
+    Reverting to expandvars produces no error -- just a persistent SSO profile
+    that silently moves with the working directory.
+
+    LIFECYCLE (H-2). cleanup_browser takes keep_enrolled, and ONLY the per-turn
+    hook (agent.chat_completion_helpers.cleanup_task_resources) passes True. Its
+    headed-mode skip reads the GLOBAL browser.headed, which a profile-level
+    `headed: true` never sets, so without the flag every turn dropped a live
+    enrolled session's memo/handle/binding and the next trusted navigation
+    re-acquired. run_agent's end-of-task call passes nothing and must keep
+    reaping the sidecar. Relatedly, _run_daemon_hygiene() skips `close --all`
+    whenever this process has live browser sessions: the call cannot be scoped
+    to the session being acquired (it does not exist yet, and agent-browser
+    session names are fresh UUIDs), so the only available scoping is refusing to
+    run it when it could tear down another task's in-flight browser. Do not
+    "restore" the unconditional close.
 
     (f) check_browser_requirements() gains an early return for a launchable
     enrolled default profile (_default_profile_launchable, which validates the
