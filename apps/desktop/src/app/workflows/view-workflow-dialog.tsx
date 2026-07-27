@@ -104,7 +104,7 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
     ? copy.workflowViewRunError
     : !detail.data
       ? copy.workflowViewRunLoading
-      : desktopWorkflowRunDisabledReason(detail.data, copy)
+      : desktopWorkflowRunDisabledReason(detail.data, copy, 'detail')
 
   const errorDescription =
     detail.error instanceof WorkflowApiError && detail.error.code === 'workflow_not_found'

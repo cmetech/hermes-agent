@@ -3785,6 +3785,8 @@ upstream_changes:
   - desktopWorkflowLanguageLabel
   - workflowLanguage
   - fail-closed unknown and incoherent Desktop run-support handling
+  - explicit catalog-versus-detail Desktop Run policy shape
+  - null-safe absent, undefined, and null workflow readiness projections
   - future workflow-language profile presentation
   tests:
   - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
@@ -3800,11 +3802,16 @@ upstream_changes:
     compatibility, trust, and coordinator gates are considered. Preserve the
     established supported:false schedule_required projection as the one known
     scheduling-capability exception, with immediate and scheduled button gates
-    remaining separate. Treat language profiles as additive server-authored
-    values: known profiles retain localized labels, future nonempty strings are
-    shown verbatim, and malformed or empty values use localized generic workflow
-    language copy instead of being relabeled as the current Archon version.
-    Desktop remains read-only and backend admission remains mutation authority.
+    remaining separate. Require callers to identify catalog versus detail
+    explicitly rather than inferring the shape from coordinator presence.
+    Compatibility must report runnable:true on both shapes; detail and review
+    must additionally report coordinator healthy:true. Missing, undefined, or
+    null readiness projections fail closed and review alerts remain null-safe.
+    Treat language profiles as additive server-authored values: known profiles
+    retain localized labels, future nonblank strings are shown byte-for-byte,
+    and malformed or blank values use localized generic workflow language copy
+    instead of being relabeled as the current Archon version. Desktop remains
+    read-only and backend admission remains mutation authority.
   removal_condition: >-
     Remove when upstream Desktop provides an equivalent centralized,
     locale-complete, fail-closed capability-skew policy across all workflow Run

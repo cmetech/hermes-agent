@@ -51,6 +51,7 @@ let startHandler: (request: StructuredRequest) => Promise<unknown>
 
 function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
   return {
+    compatibility: { level: 'supported', runnable: true },
     description: 'Checks a release before deployment.',
     inputs: [],
     name: WORKFLOW_NAME,
@@ -62,6 +63,22 @@ function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefini
     version: '1.0.0',
     ...overrides
   }
+}
+
+function detailWithoutProjection(
+  projection: 'compatibility' | 'coordinator',
+  representation: 'absent' | 'null' | 'undefined',
+  overrides: Partial<WorkflowDetail> = {}
+): WorkflowDetail {
+  const payload = detail(overrides) as unknown as Record<string, unknown>
+
+  if (representation === 'absent') {
+    Reflect.deleteProperty(payload, projection)
+  } else {
+    payload[projection] = representation === 'null' ? null : undefined
+  }
+
+  return payload as unknown as WorkflowDetail
 }
 
 function detail(overrides: Partial<WorkflowDetail> = {}): WorkflowDetail {
@@ -875,6 +892,58 @@ describe('Review & Run workflow dialog', () => {
     ).toBeTruthy()
     expect(within(dialog).getByText("The background coordinator isn't running — try again shortly.")).toBeTruthy()
     expect(within(dialog).queryByRole('combobox', { name: 'mode' })).toBeNull()
+    expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it.each(['absent', 'undefined', 'null'] as const)(
+    'fails closed without throwing or posting when review compatibility is %s',
+    async representation => {
+      preflightHandler = async () => ({
+        ok: true,
+        value: detailWithoutProjection('compatibility', representation)
+      })
+      renderView()
+
+      const dialog = await openReviewDialog()
+      expect(
+        within(dialog).getByText('This workflow is not compatible with the current Hermes runtime and cannot start.')
+      ).toBeTruthy()
+      expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+      expect(
+        apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')
+      ).toHaveLength(0)
+    }
+  )
+
+  it.each(['absent', 'undefined', 'null'] as const)(
+    'fails closed without throwing or posting when review coordinator is %s',
+    async representation => {
+      preflightHandler = async () => ({
+        ok: true,
+        value: detailWithoutProjection('coordinator', representation)
+      })
+      renderView()
+
+      const dialog = await openReviewDialog()
+      expect(within(dialog).getByText("The background coordinator isn't running — try again shortly.")).toBeTruthy()
+      expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+      expect(
+        apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')
+      ).toHaveLength(0)
+    }
+  )
+
+  it('keeps compatibility failure ahead of missing trust in review skew', async () => {
+    preflightHandler = async () => ({
+      ok: true,
+      value: detailWithoutProjection('compatibility', 'absent', { trust_state: undefined as never })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(
+      within(dialog).getByText('This workflow is not compatible with the current Hermes runtime and cannot start.')
+    ).toBeTruthy()
     expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
   })
 

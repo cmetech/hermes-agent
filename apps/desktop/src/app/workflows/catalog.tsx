@@ -63,7 +63,7 @@ function CatalogRow({
   const { t } = useI18n()
   const runReasonId = useId()
 
-  const runDisabledReason = desktopWorkflowRunDisabledReason(item, t.operations)
+  const runDisabledReason = desktopWorkflowRunDisabledReason(item, t.operations, 'catalog')
 
   const inputCount = item.inputs.length
 

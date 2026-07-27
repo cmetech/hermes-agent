@@ -575,7 +575,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
 
   const runSupport = detail?.run_support
 
-  const runDisabledReason = detail ? desktopWorkflowRunDisabledReason(detail, copy) : null
+  const runDisabledReason = detail ? desktopWorkflowRunDisabledReason(detail, copy, 'detail') : null
 
   const runSupportMessage =
     runDisabledReason === copy.workflowRunSupportUnavailable ||
@@ -730,18 +730,18 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
                 <AlertDescription>{runSupportMessage}</AlertDescription>
               </Alert>
             ) : null}
-            {!detail.coordinator.healthy ? (
+            {detail.coordinator?.healthy !== true ? (
               <Alert variant="warning">
                 <AlertDescription>{copy.workflowRunCoordinatorUnavailable}</AlertDescription>
               </Alert>
             ) : null}
-            {detail.compatibility.runnable !== true ? (
+            {detail.compatibility?.runnable !== true ? (
               <Alert variant="warning">
                 <AlertDescription>
                   <p>{copy.workflowRunIncompatible}</p>
-                  {(detail.compatibility.findings ?? []).some(finding => finding.blocking) ? (
+                  {(detail.compatibility?.findings ?? []).some(finding => finding.blocking) ? (
                     <ul className="list-disc pl-4">
-                      {(detail.compatibility.findings ?? [])
+                      {(detail.compatibility?.findings ?? [])
                         .filter(finding => finding.blocking)
                         .map(finding => (
                           <li key={`${finding.path}:${finding.code}`}>{finding.message}</li>

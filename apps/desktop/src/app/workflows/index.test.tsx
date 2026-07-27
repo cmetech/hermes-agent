@@ -73,6 +73,7 @@ function run(overrides: Partial<WorkflowRunSnapshot> = {}): WorkflowRunSnapshot 
 
 function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
   return {
+    compatibility: { level: 'supported', runnable: true },
     description: 'Checks a laptop and produces a diagnostic report.',
     inputs: [],
     name: 'Laptop diagnostic',
@@ -84,6 +85,18 @@ function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefini
     version: '1.2.0',
     ...overrides
   }
+}
+
+function catalogWithoutCompatibility(representation: 'absent' | 'null' | 'undefined'): WorkflowDefinition {
+  const item = definition() as unknown as Record<string, unknown>
+
+  if (representation === 'absent') {
+    Reflect.deleteProperty(item, 'compatibility')
+  } else {
+    item.compatibility = representation === 'null' ? null : undefined
+  }
+
+  return item as unknown as WorkflowDefinition
 }
 
 function detail(overrides: Partial<WorkflowDetail> = {}): WorkflowDetail {
@@ -290,6 +303,30 @@ describe('WorkflowsView', () => {
     const row = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row')[1]!
     expect(within(row).getByText('future-workflow-language')).toBeTruthy()
     expect(within(row).queryByText('Archon 2026-07')).toBeNull()
+  })
+
+  it('preserves a whitespace-padded markup-shaped future profile as inert server text', async () => {
+    const futureProfile = '  <strong>future-workflow-language</strong>  '
+    $workflowSelectedRunId.set(null)
+    listWorkflowDefinitions.mockResolvedValue({
+      items: [
+        definition({
+          language: { effective_profile: futureProfile as never, legacy: false }
+        })
+      ],
+      truncated: false
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    const row = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row')[1]!
+    const languageBadge = Array.from(row.querySelectorAll('[data-slot="badge"]')).find(badge =>
+      badge.textContent?.includes('future-workflow-language')
+    )
+
+    expect(languageBadge?.textContent).toBe(futureProfile)
+    expect(languageBadge?.querySelector('strong')).toBeNull()
   })
 
   it('renders generic localized language copy when the backend profile has no safe label', async () => {
@@ -558,6 +595,27 @@ describe('WorkflowsView', () => {
       'Run is unavailable until the Hermes backend supports this workflow catalog version.'
     )
   })
+
+  it.each(['absent', 'undefined', 'null'] as const)(
+    'fails closed without requiring a coordinator when catalog compatibility is %s',
+    async representation => {
+      $workflowSelectedRunId.set(null)
+      listWorkflowDefinitions.mockResolvedValue({
+        items: [catalogWithoutCompatibility(representation)],
+        truncated: false
+      })
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+      await renderView(client, 'workflows')
+
+      const row = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row')[1]!
+      const run = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
+      expect(run.disabled).toBe(true)
+      expect(document.getElementById(run.getAttribute('aria-describedby')!)?.textContent).toBe(
+        'This workflow is not compatible with the current Hermes runtime and cannot start.'
+      )
+    }
+  )
 
   it('keeps Run disabled for an unknown backend run-support reason', async () => {
     $workflowSelectedRunId.set(null)

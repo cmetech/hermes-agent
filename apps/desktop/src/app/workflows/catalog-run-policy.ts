@@ -59,7 +59,8 @@ function workflowRunSupportDisabledReason(
 
 export function desktopWorkflowRunDisabledReason(
   workflow: WorkflowDefinition | WorkflowDetail,
-  copy: DesktopWorkflowRunCopy
+  copy: DesktopWorkflowRunCopy,
+  shape: 'catalog' | 'detail'
 ): string | null {
   const supportReason = workflowRunSupportDisabledReason(workflow.run_support, copy)
 
@@ -67,7 +68,7 @@ export function desktopWorkflowRunDisabledReason(
     return supportReason
   }
 
-  if (workflow.compatibility && workflow.compatibility.runnable !== true) {
+  if (workflow.compatibility?.runnable !== true) {
     return copy.workflowRunIncompatible
   }
 
@@ -75,7 +76,7 @@ export function desktopWorkflowRunDisabledReason(
     return copy.workflowRunUntrusted
   }
 
-  if ('coordinator' in workflow && !workflow.coordinator.healthy) {
+  if (shape === 'detail' && (workflow as WorkflowDetail).coordinator?.healthy !== true) {
     return copy.workflowRunCoordinatorUnavailable
   }
 
@@ -95,7 +96,7 @@ export function desktopWorkflowLanguageLabel(
   }
 
   const effectiveProfile: unknown = language.effective_profile
-  const serverProfile = typeof effectiveProfile === 'string' ? effectiveProfile.trim() : ''
+  const serverProfile = typeof effectiveProfile === 'string' && effectiveProfile.trim() ? effectiveProfile : ''
 
   return serverProfile || copy.workflowLanguage
 }

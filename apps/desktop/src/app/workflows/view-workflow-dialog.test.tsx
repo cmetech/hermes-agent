@@ -58,6 +58,7 @@ interface StructuredRequest {
 
 function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
   return {
+    compatibility: { level: 'supported', runnable: true },
     description: 'Checks a release before deployment.',
     inputs: [],
     name: WORKFLOW_NAME,
@@ -69,6 +70,22 @@ function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefini
     version: '1.0.0',
     ...overrides
   }
+}
+
+function detailWithoutProjection(
+  projection: 'compatibility' | 'coordinator',
+  representation: 'absent' | 'null' | 'undefined',
+  overrides: Partial<WorkflowDetail> = {}
+): WorkflowDetail {
+  const payload = detail(overrides) as unknown as Record<string, unknown>
+
+  if (representation === 'absent') {
+    Reflect.deleteProperty(payload, projection)
+  } else {
+    payload[projection] = representation === 'null' ? null : undefined
+  }
+
+  return payload as unknown as WorkflowDetail
 }
 
 function detail(overrides: Partial<WorkflowDetail> = {}): WorkflowDetail {
@@ -383,6 +400,42 @@ describe('workflow View dialog', () => {
 
     await within(dialog).findByTestId('shared-mermaid-renderer')
     expectDisabledRunReason(dialog, reason)
+  })
+
+  it.each(['absent', 'undefined', 'null'] as const)(
+    'fails closed without throwing when detail compatibility is %s',
+    async representation => {
+      currentDetail = detailWithoutProjection('compatibility', representation)
+      renderView()
+      const dialog = await openView()
+
+      await within(dialog).findByTestId('shared-mermaid-renderer')
+      expectDisabledRunReason(
+        dialog,
+        'This workflow is not compatible with the current Hermes runtime and cannot start.'
+      )
+    }
+  )
+
+  it.each(['absent', 'undefined', 'null'] as const)(
+    'fails closed without throwing when detail coordinator is %s',
+    async representation => {
+      currentDetail = detailWithoutProjection('coordinator', representation)
+      renderView()
+      const dialog = await openView()
+
+      await within(dialog).findByTestId('shared-mermaid-renderer')
+      expectDisabledRunReason(dialog, "The background coordinator isn't running — try again shortly.")
+    }
+  )
+
+  it('keeps compatibility failure ahead of missing trust in detail skew', async () => {
+    currentDetail = detailWithoutProjection('compatibility', 'absent', { trust_state: undefined as never })
+    renderView()
+    const dialog = await openView()
+
+    await within(dialog).findByTestId('shared-mermaid-renderer')
+    expectDisabledRunReason(dialog, 'This workflow is not compatible with the current Hermes runtime and cannot start.')
   })
 
   it('enables Run when fetched detail is runnable despite a stale untrusted catalog row', async () => {
