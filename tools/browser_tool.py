@@ -50,6 +50,7 @@ Usage:
 """
 
 import atexit
+import contextlib
 import functools
 import json
 import logging
@@ -457,6 +458,69 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     return raw
 
 
+_ENROLLED_OVERRIDE_WARNED: set = set()
+
+
+def _reject_enrolled_override(raw: str, source: str) -> bool:
+    """OTTO: True when ``raw`` names a LOCAL enrolled browser and must be dropped.
+
+    THE SECOND DOOR (review finding CRIT-001). ``BROWSER_CDP_URL`` and
+    ``browser.cdp_url`` are process-global: once either is set,
+    ``_navigation_session_key`` returns the BARE task key for every URL and
+    ``_session_cdp_url`` falls through to the override. Pointed at the enrolled
+    browser that means an attacker-controlled public page is driven by the
+    browser holding live SSO cookies and the machine client certificate -- with
+    all six enrolled guard-forcing disjuncts inactive, because the key is not
+    ``::enrolled``. That is exactly the process-global leak per-navigation
+    routing was built to remove, reached through a different input.
+
+    "Nothing seeds it" was not true: the OpenClaw migration copies
+    ``browser.cdpUrl`` straight into ``browser.cdp_url``
+    (``optional-skills/migration/openclaw-migration/scripts/openclaw_to_hermes.py``).
+    And deliberate operator configuration is not an authority boundary -- a user
+    cannot be expected to infer that this global field defeats per-origin trust.
+
+    Dropping the override is deliberately BETTER than hard-failing: with no
+    override, normal routing resumes, so an origin the profile explicitly trusts
+    still reaches the real corporate browser on a guarded ``::enrolled`` key,
+    while everything else gets the throwaway browser. The user's intent survives;
+    the blanket authority does not.
+
+    Checked on the RAW value, BEFORE ``_resolve_cdp_override`` -- that helper
+    makes a discovery request, which we must not send to the corporate browser.
+    """
+    if not raw:
+        return False
+    try:
+        from tools.browser_profiles import enrolled_endpoint_owner
+
+        owner = enrolled_endpoint_owner(raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("enrolled override check skipped: %s", exc)
+        return False
+    if owner is None:
+        return False
+    # Once per (source, endpoint): this runs on every navigation. Capped so a
+    # process that somehow sees many distinct endpoints cannot grow it without
+    # bound; past the cap we simply warn again rather than stay silent.
+    marker = f"{source}:{raw}"
+    if marker not in _ENROLLED_OVERRIDE_WARNED:
+        if len(_ENROLLED_OVERRIDE_WARNED) < 64:
+            _ENROLLED_OVERRIDE_WARNED.add(marker)
+        logger.warning(
+            "Ignoring %s=%s: it points at %s. A process-global CDP endpoint "
+            "would make every page -- including untrusted public sites -- run in "
+            "the browser holding your live SSO session and client certificate. "
+            "Trusted origins still reach that browser through per-navigation "
+            "routing; remove this setting to silence this warning.",
+            source,
+            _sanitize_url_for_logs(raw),
+            f"the enrolled browser profile {owner!r}" if owner
+            else "the reserved enrolled-browser port",
+        )
+    return True
+
+
 def _get_cdp_override() -> str:
     """Return a normalized CDP URL override, or empty string.
 
@@ -467,9 +531,15 @@ def _get_cdp_override() -> str:
     When either is set, we skip both Browserbase and the local headless
     launcher and connect directly to the supplied Chrome DevTools Protocol
     endpoint.
+
+    OTTO: an override naming a LOCAL enrolled browser is DROPPED rather than
+    honoured -- see ``_reject_enrolled_override``. Ordinary throwaway and remote
+    CDP endpoints are unaffected, and env-over-config precedence is unchanged.
     """
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     if env_override:
+        if _reject_enrolled_override(env_override, "BROWSER_CDP_URL"):
+            return ""
         return _resolve_cdp_override(env_override)
 
     try:
@@ -478,7 +548,10 @@ def _get_cdp_override() -> str:
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
+            raw = str(browser_cfg.get("cdp_url", "") or "").strip()
+            if _reject_enrolled_override(raw, "browser.cdp_url"):
+                return ""
+            return _resolve_cdp_override(raw)
     except Exception as e:
         logger.debug("Could not read browser.cdp_url from config: %s", e)
 
@@ -496,24 +569,75 @@ _session_cdp_urls: Dict[str, str] = {}
 # The dict lock alone is not enough: acquire() runs `close --all` hygiene, so a
 # second concurrent acquire tears down the first session mid-navigation (EBL-003).
 #
-# DELIBERATELY UNPRUNED -- do NOT "fix" this by popping a key on cleanup. The
-# naive `_session_cdp_keylocks.pop(key)` reintroduces the very race the locks
-# exist to prevent: thread B can be BLOCKED on the lock while cleanup removes
-# it, then the next acquire for that key calls setdefault() and gets a FRESH,
-# unheld lock -- so B and the new thread both enter acquire() and one's
-# `close --all` tears down the other's session. `lock.locked()` cannot make the
-# pop safe either; it is racy by construction (true the instant after you read
-# it as false). The dict is bounded by the number of distinct session keys the
-# process ever sees, and each entry is a bare threading.Lock, so the leak is a
-# few dozen bytes per task -- cheaper than the race.
-_session_cdp_keylocks: Dict[str, threading.Lock] = {}
+# REF-COUNTED, never popped by key. Do NOT "fix" this with a bare
+# `_session_cdp_keylocks.pop(key)` on cleanup: that reintroduces the very race
+# the locks exist to prevent -- thread B can be BLOCKED on the lock while
+# cleanup removes it, then the next acquire for that key calls setdefault() and
+# gets a FRESH, unheld lock, so B and the new thread both enter acquire() and
+# one's `close --all` tears down the other's session. `lock.locked()` cannot
+# make the pop safe either; it is racy by construction (true the instant after
+# you read it as false).
+#
+# The safe form is a refcount that covers the OWNER PLUS EVERY WAITER, taken
+# under _session_cdp_lock before blocking and dropped after release, with the
+# entry removed only at zero. A waiter therefore always holds a reference to the
+# same entry it is blocked on, so it cannot be swapped underneath. That keeps
+# the table bounded by CONCURRENT keys rather than by every key the process has
+# ever seen -- task ids grow without limit in a long-running `hermes serve`
+# (review finding LOW-009).
+_session_cdp_keylocks: Dict[str, "_KeyLockEntry"] = {}
+
+
+class _KeyLockEntry:
+    """A per-key lock plus the number of threads holding or awaiting it."""
+
+    __slots__ = ("lock", "refs")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.refs = 0
 # Live BrowserSession handles, so cleanup can release() exactly once (EBL-005).
 _session_handles: Dict[str, Any] = {}
 
+# Cleanup generation per session key. Bumped every time a key is reaped, so an
+# acquire that was ALREADY IN FLIGHT when its task ended can tell that its
+# result is obsolete and release it instead of publishing enrolled authority
+# after the reaper ran (review finding HIGH-004).
+_session_generations: Dict[str, int] = {}
 
-def _session_cdp_keylock(session_key: str) -> threading.Lock:
+
+@contextlib.contextmanager
+def _session_cdp_keylock(session_key: str):
+    """Hold this session key's acquire lock; drop the entry when nobody wants it.
+
+    The refcount is taken BEFORE blocking on the lock, so a waiter pins the exact
+    entry it will acquire and the table can be pruned without reopening the
+    single-flight race (see the note on ``_session_cdp_keylocks``).
+    """
+    key = str(session_key)
     with _session_cdp_lock:
-        return _session_cdp_keylocks.setdefault(session_key, threading.Lock())
+        entry = _session_cdp_keylocks.get(key)
+        if entry is None:
+            entry = _KeyLockEntry()
+            _session_cdp_keylocks[key] = entry
+        entry.refs += 1
+    try:
+        with entry.lock:
+            yield
+    finally:
+        with _session_cdp_lock:
+            entry.refs -= 1
+            # Identity check: a prior entry could already have been replaced.
+            if entry.refs <= 0 and _session_cdp_keylocks.get(key) is entry:
+                _session_cdp_keylocks.pop(key, None)
+
+
+def _bump_session_generation(session_key: str) -> None:
+    """Mark ``session_key`` as reaped; invalidates any acquire now in flight."""
+    with _session_cdp_lock:
+        _session_generations[str(session_key)] = (
+            _session_generations.get(str(session_key), 0) + 1
+        )
 
 
 def _reset_session_cdp_cache() -> None:
@@ -522,6 +646,7 @@ def _reset_session_cdp_cache() -> None:
         _session_cdp_urls.clear()
         _session_cdp_keylocks.clear()
         _session_handles.clear()
+        _session_generations.clear()
 
 
 def _forget_session_cdp_url(session_key: str) -> None:
@@ -700,8 +825,11 @@ def _session_cdp_url(session_key: Optional[str]) -> str:
         # Re-check under the key lock: another thread may have published while
         # we waited. Without this the loser acquires a second browser and its
         # `close --all` hygiene tears down the winner's session.
+        # The generation is read HERE, before acquire, so a cleanup that runs
+        # while we are launching is detectable when we come back (HIGH-004).
         with _session_cdp_lock:
             cached = _session_cdp_urls.get(key)
+            generation = _session_generations.get(key, 0)
         if cached:
             return cached
 
@@ -718,8 +846,20 @@ def _session_cdp_url(session_key: Optional[str]) -> str:
                 f"browser profile {profile.name!r} exposed no CDP endpoint"
             )
         with _session_cdp_lock:
-            _session_cdp_urls[key] = cdp_url
-            _session_handles[key] = session
+            stale = _session_generations.get(key, 0) != generation
+            if not stale:
+                _session_cdp_urls[key] = cdp_url
+                _session_handles[key] = session
+        if stale:
+            # The owning task was cleaned up while this acquire was in flight.
+            # Publishing now would resurrect enrolled authority AFTER its
+            # reaper ran, so release instead and fail loudly -- the caller's
+            # navigation belongs to a task that has ended.
+            session.release()
+            raise ProfileError(
+                f"browser session {key!r} was cleaned up while its browser was "
+                "being acquired; not resurrecting it"
+            )
         return cdp_url
 
 
@@ -4825,7 +4965,20 @@ def cleanup_browser(task_id: Optional[str] = None, *, keep_enrolled: bool = Fals
         with _cleanup_lock:
             if sidecar_key in _active_sessions:
                 session_keys.append(sidecar_key)
-            if enrolled_key in _active_sessions and not keep_enrolled:
+        if not keep_enrolled:
+            # TOMBSTONE FIRST, unconditionally. An acquire that is in flight
+            # right now has published NOTHING -- no active record, no memo, no
+            # handle, no binding -- so there is nothing to detect it by; the
+            # generation bump is what makes it release instead of publishing
+            # enrolled authority after its task's reaper ran (HIGH-004).
+            _bump_session_generation(enrolled_key)
+            # Then reap, gated on any state existing. _session_cdp_url publishes
+            # the memo/handle/binding BEFORE _get_session_info publishes the
+            # active record, so gating on _active_sessions alone (the first
+            # remediation) missed a real window. Gating on nothing at all would
+            # fire per-key teardown (notably Camofox close) for a sidecar that
+            # never existed.
+            if _enrolled_sidecar_has_state(enrolled_key):
                 session_keys.append(enrolled_key)
         bare_task_id = task_id
 
@@ -4849,8 +5002,37 @@ def cleanup_browser(task_id: Optional[str] = None, *, keep_enrolled: bool = Fals
         _last_active_session_key.pop(bare_task_id, None)
 
 
+def _enrolled_sidecar_has_state(enrolled_key: str) -> bool:
+    """OTTO: True when anything about ``enrolled_key`` still needs reaping.
+
+    Four independent records can exist, and they are NOT published together:
+    ``_session_cdp_url`` writes the memo + handle and ``acquire()`` binds the
+    registry, all BEFORE ``_get_session_info`` writes ``_active_sessions``.
+    Checking only the last one leaves enrolled origin trust bound after the
+    owning task has ended (review finding HIGH-004).
+    """
+    with _cleanup_lock:
+        if enrolled_key in _active_sessions:
+            return True
+    with _session_cdp_lock:
+        if enrolled_key in _session_cdp_urls or enrolled_key in _session_handles:
+            return True
+    try:
+        from tools.browser_session_registry import profile_for
+
+        return profile_for(enrolled_key) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _cleanup_single_browser_session(task_id: str) -> None:
     """Internal: reap a single browser session by its exact session key."""
+    # Tombstone FIRST, before any teardown: an acquire that is in flight right
+    # now must observe the bump when it finishes and release rather than
+    # publish. Doing this after the teardown would leave the same race
+    # (review finding HIGH-004).
+    _bump_session_generation(task_id)
+
     # Stop the CDP supervisor for this task FIRST so we close our WebSocket
     # before the backend tears down the underlying CDP endpoint.
     _stop_cdp_supervisor(task_id)

@@ -34,6 +34,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
@@ -49,6 +50,22 @@ CDP_PROBE_TIMEOUT_S = 2
 # Readiness polling after a launch: 30 x 0.5s ≈ 15s, matching the proven skill.
 READY_POLL_ATTEMPTS = 30
 READY_POLL_INTERVAL_S = 0.5
+
+# ...but the ITERATION count alone is not a time bound. Each iteration also does
+# a liveness probe and an identity probe, each of which can approach
+# CDP_PROBE_TIMEOUT_S against a slow or stateful listener, so 30 iterations could
+# run ~135s -- and the whole acquire happens under browser_tool's per-key lock,
+# so a same-key caller waited all of it before its own 30s browser command even
+# started (review finding MED-007). A wall-clock deadline caps the pathological
+# case without shortening the intended ~15s of polling.
+ENROLLED_READY_DEADLINE_S = 30
+
+# The documented worst case for one acquisition, for operators and for the
+# regression that keeps it honest: hygiene + the pre-launch identity probe pair
+# + the readiness deadline.
+ACQUIRE_WORST_CASE_S = (
+    HYGIENE_TIMEOUT_S + (2 * CDP_PROBE_TIMEOUT_S) + ENROLLED_READY_DEADLINE_S
+)
 
 
 class ProfileError(RuntimeError):
@@ -79,6 +96,36 @@ def _live_browser_session_keys() -> List[str]:
         return list(_active_sessions)
 
 
+# Acquisitions that have passed hygiene but have not yet bound their session.
+# A process-global `close --all` must not run while one of these is launching a
+# browser (review finding HIGH-003).
+_inflight_lock = threading.Lock()
+_inflight_acquires: Dict[str, int] = {}
+
+
+def _reserve_acquire(session_key: str) -> List[str]:
+    """Register an in-flight acquire; return the OTHER keys already in flight.
+
+    Registering happens under the same lock that reads the others, so two
+    concurrent acquires can never both observe an empty table and both decide
+    to run process-global hygiene.
+    """
+    with _inflight_lock:
+        others = [k for k in _inflight_acquires if k != session_key]
+        _inflight_acquires[session_key] = _inflight_acquires.get(session_key, 0) + 1
+        return others
+
+
+def _release_acquire(session_key: str) -> None:
+    """Drop one in-flight reservation. Idempotent-safe for the failure path."""
+    with _inflight_lock:
+        remaining = _inflight_acquires.get(session_key, 0) - 1
+        if remaining > 0:
+            _inflight_acquires[session_key] = remaining
+        else:
+            _inflight_acquires.pop(session_key, None)
+
+
 def _run_daemon_hygiene() -> None:
     """Close every agent-browser session so a wedged daemon can't poison us.
 
@@ -89,13 +136,24 @@ def _run_daemon_hygiene() -> None:
     What CAN be scoped is WHEN it runs: if this process already has live browser
     sessions, ``close --all`` would tear down other tasks' in-flight browsers,
     which is strictly worse than skipping the hygiene (review finding H-2). With
-    no live sessions, the only thing ``close --all`` can reach is an orphaned or
+    nothing live, the only thing ``close --all`` can reach is an orphaned or
     wedged daemon -- exactly what it is for.
 
-    Residual: a daemon that wedges WHILE another session is live is no longer
-    cleared here. That surfaces as a bounded command failure on this acquire
-    rather than as a silent teardown of someone else's session, which is the
-    trade we want. Errors reading the session table fail toward SKIPPING.
+    "Live" is THREE things, not one (review finding HIGH-003 -- the first
+    remediation only checked the first, which left two windows open):
+
+    1. ``browser_tool._active_sessions`` -- sessions the tool has published.
+    2. ``browser_session_registry`` bindings -- a session that has ACQUIRED but
+       whose caller has not published it yet. ``acquire()`` binds before
+       returning and ``release()`` unbinds, so this covers the whole lifetime.
+    3. Other in-flight acquires -- checked by ``acquire()`` BEFORE it calls
+       this, because only it knows its own key. Nothing else can see those: the
+       browser exists but no record of it does.
+
+    Residual: a daemon that wedges WHILE another session is live is not cleared
+    here. That surfaces as a bounded command failure on this acquire rather than
+    as a silent teardown of someone else's session, which is the trade we want.
+    Errors reading any table fail toward SKIPPING.
     """
     try:
         live = _live_browser_session_keys()
@@ -106,6 +164,17 @@ def _run_daemon_hygiene() -> None:
         logger.debug(
             "daemon hygiene skipped: %d live browser session(s) would be torn "
             "down by `close --all` (%s)", len(live), live,
+        )
+        return
+    try:
+        bound = browser_session_registry.bound_session_keys()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("daemon hygiene skipped (registry unreadable): %s", exc)
+        return
+    if bound:
+        logger.debug(
+            "daemon hygiene skipped: %d acquired session(s) still bound (%s)",
+            len(bound), bound,
         )
         return
     try:
@@ -316,7 +385,12 @@ def _ensure_enrolled_cdp(profile: browser_profiles.BrowserProfile, headless: boo
     )
     _spawn_browser(executable, args)
 
+    # Bounded by BOTH the attempt count and a wall-clock deadline: slow probes
+    # make the attempt count a poor proxy for elapsed time (MED-007).
+    deadline = time.monotonic() + ENROLLED_READY_DEADLINE_S
     for _ in range(READY_POLL_ATTEMPTS):
+        if time.monotonic() >= deadline:
+            break
         time.sleep(READY_POLL_INTERVAL_S)
         # Identity is checked here too, not just on the reuse path: if a foreign
         # listener holds the port, our launch cannot bind it, yet _cdp_alive
@@ -326,9 +400,9 @@ def _ensure_enrolled_cdp(profile: browser_profiles.BrowserProfile, headless: boo
             return cdp_url
 
     raise ProfileError(
-        f"browser for profile {profile.name!r} did not expose CDP on {cdp_url} in time "
-        "(if something else is listening on that port, give the profile its own "
-        "cdp_port)"
+        f"browser for profile {profile.name!r} did not expose CDP on {cdp_url} within "
+        f"{ENROLLED_READY_DEADLINE_S}s (if something else is listening on that port, "
+        "give the profile its own cdp_port)"
     )
 
 
@@ -452,13 +526,29 @@ def acquire(profile: str = browser_profiles.DEFAULT_PROFILE_NAME,
     key = session_key or f"profile::{prof.name}"
     effective_headless = (not prof.headed) if headless is None else bool(headless)
 
-    _run_daemon_hygiene()
+    # Reserve BEFORE hygiene, and hold the reservation until the session is
+    # bound: between those two points the browser may exist while no record of
+    # it does, and another key's `close --all` would tear it down (HIGH-003).
+    others_in_flight = _reserve_acquire(key)
+    try:
+        if others_in_flight:
+            # Another acquire may be launching a browser right now, and
+            # `close --all` is process-global. Skipping is strictly safer than
+            # tearing down a browser nothing has recorded yet (HIGH-003).
+            logger.debug(
+                "daemon hygiene skipped: %d acquire(s) in flight (%s)",
+                len(others_in_flight), others_in_flight,
+            )
+        else:
+            _run_daemon_hygiene()
 
-    cdp_url: Optional[str] = None
-    if prof.is_enrolled:
-        cdp_url = _ensure_enrolled_cdp(prof, effective_headless)
-        if attach_global:
-            _attach_cdp(cdp_url)
+        cdp_url: Optional[str] = None
+        if prof.is_enrolled:
+            cdp_url = _ensure_enrolled_cdp(prof, effective_headless)
+            if attach_global:
+                _attach_cdp(cdp_url)
 
-    browser_session_registry.bind(key, prof.name)
+        browser_session_registry.bind(key, prof.name)
+    finally:
+        _release_acquire(key)
     return BrowserSession(session_key=key, profile=prof, cdp_url=cdp_url)

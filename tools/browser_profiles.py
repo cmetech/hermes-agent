@@ -21,6 +21,7 @@ Design: docs/plans/2026-07-20-persistent-enrolled-browser-session-design.md
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import sys
@@ -214,6 +215,106 @@ def enrolled_cdp_ports() -> Dict[int, str]:
     return ports
 
 
+_LOCAL_HOST_LITERALS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0", "::"})
+
+
+@functools.lru_cache(maxsize=256)
+def _resolves_to_loopback(hostname: str) -> bool:
+    """Cached DNS check. Only reached for a non-literal host on a RESERVED port.
+
+    ``enrolled_endpoint_owner`` checks the port first, so this is rare -- but
+    when it does apply it sits on the per-navigation path, where an uncached
+    blocking ``getaddrinfo`` would cost every browser action. A hosts-file edit
+    therefore needs a process restart to be seen, which is an acceptable trade
+    for a check whose literal-loopback cases never reach here at all.
+    """
+    import socket
+
+    try:
+        addr_info = socket.getaddrinfo(
+            hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
+        )
+    except OSError:
+        return False
+
+    import ipaddress
+
+    for *_, sockaddr in addr_info:
+        try:
+            if ipaddress.ip_address(sockaddr[0]).is_loopback:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def is_local_host(host: Optional[str]) -> bool:
+    """Return True when ``host`` names a listener on THIS machine.
+
+    ``None``/empty means the caller could not determine a host (e.g. the
+    free-port search, which is always about a local bind), so it reads as LOCAL
+    -- the fail-closed direction for the enrolled-port refusal.
+
+    A non-literal hostname is resolved, because ``corp-browser.internal`` in
+    ``/etc/hosts`` pointing at ``127.0.0.1`` is still the local enrolled
+    listener. DNS failure reads as NOT local: a remote CDP endpoint whose name
+    does not resolve here must fail with its own connection error, not with a
+    confusing enrolled-port refusal (review finding MED-006).
+    """
+    if host is None:
+        return True
+    normalized = host.strip().lower().strip("[]")
+    if not normalized:
+        return True
+    if normalized in _LOCAL_HOST_LITERALS or normalized.endswith(".localhost"):
+        return True
+
+    import ipaddress
+
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        pass  # a real hostname — resolve it below
+
+    return _resolves_to_loopback(normalized)
+
+
+def enrolled_endpoint_owner(url: str) -> Optional[str]:
+    """Return the enrolled profile owning the LOCAL CDP listener ``url`` names.
+
+    Returns the profile name (``""`` for the reserved default port, which is
+    owned by construction even with no profile configured), or ``None`` when
+    ``url`` cannot be the local enrolled browser.
+
+    This is the ONE classifier for "does this endpoint reach the corporate
+    browser?". Every surface that can point the agent at a CDP endpoint --
+    ``/browser connect``, the ``browser.manage`` RPC, ``BROWSER_CDP_URL``, and
+    ``browser.cdp_url`` -- must consult it, or the authority boundary has a
+    second door (review findings CRIT-001, MED-006).
+
+    Fails CLOSED for a malformed URL on a reserved port; fails OPEN (``None``)
+    only when the URL names no port we reserve.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url.strip() if "://" in url else f"http://{url.strip()}")
+    except (ValueError, AttributeError):
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is None:
+        port = 443 if parts.scheme in {"https", "wss"} else 80
+    owners = enrolled_cdp_ports()
+    if port not in owners:
+        return None
+    if not is_local_host(parts.hostname):
+        return None
+    return owners[port]
+
+
 def _normalize_origin(url: str) -> Optional[Tuple[str, str, Optional[int]]]:
     """Return ``(scheme, hostname, port)`` for a URL, or None when unparseable.
 
@@ -295,6 +396,13 @@ def resolve_user_data_dir(profile: BrowserProfile) -> str:
     An empty ``user_data_dir`` falls back to ``<home>/browser-profiles/<name>``
     so a hand-written profile without one still gets a persistent directory
     instead of failing in ``os.makedirs("")``.
+
+    A configured RELATIVE path is anchored under the Hermes home, not the CWD.
+    ``os.path.abspath`` made such a value syntactically absolute while still
+    resolving differently under the classic CLI, ``hermes serve``, Desktop, and
+    any launcher with a different working directory -- so the persistent SSO
+    profile this feature exists for would silently split into several
+    directories (review finding MED-005). Absolute values are untouched.
     """
     from hermes_constants import get_hermes_home
 
@@ -304,7 +412,45 @@ def resolve_user_data_dir(profile: BrowserProfile) -> str:
         return os.path.abspath(os.path.join(home, "browser-profiles", profile.name))
     for token in _HERMES_HOME_TOKENS:
         raw = raw.replace(token, home)
-    return os.path.abspath(os.path.expandvars(os.path.expanduser(raw)))
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(home, expanded)
+    return os.path.abspath(expanded)
+
+
+def data_dir_problem(path: str) -> Optional[str]:
+    """Return why ``path`` cannot serve as a profile directory, or None.
+
+    Proving the string is absolute says nothing about whether ``os.makedirs``
+    can succeed: a path under a REGULAR FILE, or an existing target that is a
+    file, passes that test and then fails deterministically at first acquire
+    with ``NotADirectoryError`` (review finding MED-005). We check what the
+    filesystem actually says, walking up to the nearest existing ancestor.
+
+    The filesystem can still change between this check and the launch, so
+    acquire must stay loud; this only stops us ADVERTISING a profile that
+    cannot work.
+    """
+    if not path or not os.path.isabs(path):
+        return "is not an absolute path"
+    if os.path.exists(path):
+        if not os.path.isdir(path):
+            return "exists but is not a directory"
+        if not os.access(path, os.W_OK | os.X_OK):
+            return "is not writable"
+        return None
+    ancestor = os.path.dirname(path)
+    seen = set()
+    while ancestor and ancestor not in seen and not os.path.exists(ancestor):
+        seen.add(ancestor)
+        ancestor = os.path.dirname(ancestor)
+    if not ancestor or not os.path.exists(ancestor):
+        return "has no existing parent directory"
+    if not os.path.isdir(ancestor):
+        return f"cannot be created: {ancestor} is not a directory"
+    if not os.access(ancestor, os.W_OK | os.X_OK):
+        return f"cannot be created: {ancestor} is not writable"
+    return None
 
 
 def _enrolled_candidates() -> List[str]:

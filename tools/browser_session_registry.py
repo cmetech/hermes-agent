@@ -44,6 +44,20 @@ def profile_for(session_key: str) -> Optional[str]:
         return _session_profiles.get(str(session_key))
 
 
+def bound_session_keys() -> list:
+    """Return every session key currently bound to a profile.
+
+    Daemon hygiene consults this. ``acquire()`` binds here BEFORE its caller
+    publishes into ``browser_tool._active_sessions``, and ``release()`` unbinds,
+    so a binding covers the whole life of a session -- including the window
+    where a browser has launched but nothing has been published yet, which is
+    where a second acquire's process-global ``close --all`` used to tear it down
+    (review finding HIGH-003).
+    """
+    with _lock:
+        return list(_session_profiles)
+
+
 def clear() -> None:
     """Drop all bindings. Test helper; also usable on interpreter teardown."""
     with _lock:
@@ -124,6 +138,7 @@ def default_profile_launchable() -> bool:
         return False
     try:
         from tools.browser_profiles import (
+            data_dir_problem,
             get_profile,
             resolve_executable,
             resolve_user_data_dir,
@@ -140,8 +155,16 @@ def default_profile_launchable() -> bool:
         # and `hermes serve` paths, where expandvars leaves the literal
         # "${HERMES_HOME}/..." in place -- non-empty, so this check passed while
         # the directory it described was CWD-relative (review finding M-3).
+        # data_dir_problem, not os.path.isabs: an absolute string can still be a
+        # path under a regular file, which passes an isabs check and then fails
+        # at first acquire with NotADirectoryError (review finding MED-005).
         data_dir = resolve_user_data_dir(profile)
-        if not data_dir or not os.path.isabs(data_dir):
+        problem = data_dir_problem(data_dir)
+        if problem:
+            logger.debug(
+                "browser profile %r is not launchable: user_data_dir %s %s",
+                name, data_dir, problem,
+            )
             return False
         if not (1 <= int(profile.cdp_port) <= 65535):
             return False

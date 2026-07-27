@@ -1862,7 +1862,7 @@ class CLICommandsMixin:
             # browser. /browser connect publishes a process-global endpoint, so
             # connecting there would route every untrusted page through the
             # browser holding live SSO cookies and the machine client cert.
-            _refusal = enrolled_port_refusal(_port)
+            _refusal = enrolled_port_refusal(_port, parsed_cdp.hostname)
             if _refusal:
                 print()
                 print(f"   ⚠ {_refusal}")
@@ -1906,7 +1906,15 @@ class CLICommandsMixin:
             elif _is_default:
                 _launch_port = _port
                 if local_port_in_use(_port):
-                    _launch_port = find_free_debug_port(_port)
+                    try:
+                        _launch_port = find_free_debug_port(_port)
+                    except RuntimeError as _exc:
+                        # Every nearby port is taken or enrolled-reserved. Say
+                        # so instead of launching onto a reserved port.
+                        print()
+                        print(f"   ⚠ {_exc}")
+                        print()
+                        return
                     print(
                         f"   ⚠ Port {_port} is occupied by another application that isn't a CDP browser"
                     )
