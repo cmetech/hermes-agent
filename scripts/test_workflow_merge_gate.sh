@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+INVOCATION_ROOT="$(pwd -P)"
 ROOT="$(git rev-parse --show-toplevel)"
 PHASE="base"
 BRAND=""
@@ -45,13 +46,25 @@ elif [[ -x "$ROOT/venv/bin/python" ]]; then
 else
   PYTHON_BIN="python3"
 fi
+case "$PYTHON_BIN" in
+  /*) ;;
+  */*) PYTHON_BIN="$INVOCATION_ROOT/$PYTHON_BIN" ;;
+  *) PYTHON_BIN="$(command -v "$PYTHON_BIN")" ;;
+esac
+[[ -x "$PYTHON_BIN" ]] || { echo "python interpreter is not executable: $PYTHON_BIN" >&2; exit 1; }
 
 cd "$ROOT"
 "$PYTHON_BIN" "$CHECKER" --manifest "$MANIFEST"
 
 if [[ "$PHASE" == "base" ]]; then
   if [[ "${WORKFLOW_MERGE_GATE_FAST:-0}" != "1" ]]; then
-    "$PYTHON_BIN" -m pytest -q \
+    if [[ ! -e "$ROOT/.venv" ]]; then
+      SHARED_VENV="$(cd "$(dirname "$PYTHON_BIN")/.." && pwd -P)"
+      if [[ -f "$SHARED_VENV/bin/activate" ]]; then
+        ln -s "$SHARED_VENV" "$ROOT/.venv"
+      fi
+    fi
+    HERMES_PYTHON="$PYTHON_BIN" "$ROOT/scripts/run_tests.sh" \
       tests/tools/test_managed_process.py tests/tools/test_process_registry.py \
       tests/agent/test_plugin_agent.py tests/tools/test_registry.py \
       tests/hermes_cli/test_execution_runtime_capabilities.py \
@@ -64,6 +77,9 @@ if [[ "$PHASE" == "base" ]]; then
       tests/gateway/test_plugin_delivery.py \
       tests/hermes_cli/test_plugin_provider_hot_reload.py \
       tests/scripts/test_workflow_merge_gate.py \
+      tests/plugins/workflow/test_language.py \
+      tests/plugins/workflow/test_language_snapshot.py \
+      tests/plugins/workflow/test_language_schema.py \
       tests/plugins/workflow/test_admission.py \
       tests/plugins/workflow/test_schedule_store_identity.py \
       tests/plugins/workflow/test_scheduled_runs.py \
@@ -75,6 +91,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_catalog_api.py \
       tests/plugins/workflow/test_workflow_detail_api.py \
       tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py \
+      tests/plugins/workflow/test_workflow_language_desktop_e2e.py \
       tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py \
       tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py \
       tests/plugins/workflow/test_ai_extensions_middleware_e2e.py \
@@ -89,9 +106,9 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_quarantine_replace_retry.py \
       tests/hermes_cli/test_capability_staging.py \
       tests/hermes_cli/test_baked_seed.py \
-      tests/test_packaging_metadata.py
-    "$PYTHON_BIN" -m pytest -q -m integration \
-      tests/plugins/workflow/test_installed_distribution_e2e.py
+      tests/test_packaging_metadata.py -q
+    HERMES_PYTHON="$PYTHON_BIN" "$ROOT/scripts/run_tests.sh" \
+      tests/plugins/workflow/test_installed_distribution_e2e.py -q -m integration
     SHARED_GIT_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
     SHARED_ROOT="$(dirname "$SHARED_GIT_DIR")"
     if [[ ! -d node_modules && -d "$SHARED_ROOT/node_modules" ]]; then

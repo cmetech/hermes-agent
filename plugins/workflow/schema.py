@@ -11,17 +11,39 @@ from typing import Any
 
 import yaml
 
+from plugins.workflow.language import (
+    WORKFLOW_NORMALIZER_VERSION,
+    WorkflowLanguageCompatibilityError,
+    language_compatibility_findings,
+    normalize_workflow,
+    resolve_language_profile,
+)
+from plugins.workflow.language_schema import (
+    NODE_TYPES,
+    agent_field_names,
+    approval_field_names,
+    approval_reject_field_names,
+    common_node_field_names,
+    definition_field_names,
+    hook_entry_field_names,
+    hook_event_names,
+    hook_response_field_names,
+    hook_specific_field_names,
+    loop_field_names,
+    retry_field_names,
+    sidecar_field_names,
+)
 from plugins.workflow.models import (
     ValidationIssue,
     WorkflowDefinition,
     WorkflowNode,
     WorkflowPackage,
+    WorkflowLanguageProfile,
     WorkflowRuntimeConfig,
     WorkflowValidationError,
     freeze_value,
 )
 
-NODE_TYPES = ("command", "prompt", "bash", "script", "loop", "approval", "cancel")
 TRIGGER_RULES = (
     "all_success",
     "one_success",
@@ -30,99 +52,18 @@ TRIGGER_RULES = (
 )
 CONTEXT_VALUES = ("fresh", "shared")
 SCRIPT_RUNTIMES = ("bun", "uv")
-TOP_LEVEL_FIELDS = frozenset({
-    "name",
-    "description",
-    "nodes",
-    "provider",
-    "model",
-    "modelReasoningEffort",
-    "webSearchMode",
-    "interactive",
-    "requires",
-    "worktree",
-    "tags",
-    "persist_sessions",
-    "effort",
-    "thinking",
-    "fallbackModel",
-    "betas",
-    "sandbox",
-})
-COMMON_NODE_FIELDS = frozenset({
-    "id",
-    *NODE_TYPES,
-    "depends_on",
-    "when",
-    "trigger_rule",
-    "context",
-    "idle_timeout",
-    "retry",
-    "always_run",
-    "output_type",
-    "persist_session",
-    "provider",
-    "model",
-    "output_format",
-    "allowed_tools",
-    "denied_tools",
-    "hooks",
-    "mcp",
-    "skills",
-    "agents",
-    "effort",
-    "thinking",
-    "maxBudgetUsd",
-    "systemPrompt",
-    "fallbackModel",
-    "betas",
-    "sandbox",
-    "runtime",
-    "deps",
-    "timeout",
-})
-HOOK_EVENTS = frozenset({
-    "PreToolUse",
-    "PostToolUse",
-    "PostToolUseFailure",
-    "Notification",
-    "Stop",
-    "SubagentStart",
-    "SubagentStop",
-    "PreCompact",
-    "SessionStart",
-    "SessionEnd",
-    "UserPromptSubmit",
-    "PermissionRequest",
-    "Setup",
-    "TeammateIdle",
-    "TaskCompleted",
-    "Elicitation",
-    "ElicitationResult",
-    "InstructionsLoaded",
-    "ConfigChange",
-    "WorktreeCreate",
-    "WorktreeRemove",
-})
-HOOK_RESPONSE_FIELDS = frozenset({
-    "hookSpecificOutput",
-    "systemMessage",
-    "continue",
-    "decision",
-    "stopReason",
-    "suppressOutput",
-})
-HOOK_SPECIFIC_FIELDS = frozenset({
-    "hookEventName",
-    "permissionDecision",
-    "permissionDecisionReason",
-    "updatedInput",
-    "additionalContext",
-    "updatedMCPToolOutput",
-    "action",
-    "content",
-})
-RETRY_FIELDS = frozenset({"max_attempts", "on_error", "delay_ms"})
+TOP_LEVEL_FIELDS = definition_field_names()
+COMMON_NODE_FIELDS = common_node_field_names()
+HOOK_EVENTS = hook_event_names()
+HOOK_ENTRY_FIELDS = hook_entry_field_names()
+HOOK_RESPONSE_FIELDS = hook_response_field_names()
+HOOK_SPECIFIC_FIELDS = hook_specific_field_names()
+RETRY_FIELDS = retry_field_names()
+LOOP_FIELDS = loop_field_names()
+APPROVAL_FIELDS = approval_field_names()
+APPROVAL_REJECT_FIELDS = approval_reject_field_names()
+AGENT_FIELDS = agent_field_names()
+SIDECAR_FIELDS = sidecar_field_names()
 _CONTROL_OR_ANSI = re.compile(r"[\x00-\x1f\x7f-\x9f]|\x1b\[")
 _SAFE_NAME = re.compile(r"^[^\s/\\]+$")
 _WHEN_REFERENCE = re.compile(r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*", re.UNICODE)
@@ -137,22 +78,6 @@ _WHEN_EXPRESSION = re.compile(
 )
 _INLINE_SCRIPT_METACHAR = re.compile(r"[\s;(){}&|<>$`\"']")
 _MAX_YAML_BYTES = 2 * 1024 * 1024
-_SIDECAR_FIELDS = frozenset({
-    "delivery_defaults",
-    "required_services",
-    "retention",
-    "tags",
-    "outward_action_nodes",
-    "outward_action_policy",
-    "execution_environment",
-    "overlap_policy",
-    "pause_lane_policy",
-    "concurrency_key",
-    "limits",
-    "resource_limits",
-    "required_secrets",
-    "scheduling",
-})
 
 
 def _issue(
@@ -324,7 +249,7 @@ def _validate_hook_fields(hooks_value: Any, path: str) -> None:
         for index, entry_value in enumerate(entries_value):
             entry_path = f"{path}.{event}[{index}]"
             entry = _mapping(entry_value, entry_path)
-            unknown_entry = sorted(set(entry) - {"matcher", "response", "timeout"})
+            unknown_entry = sorted(set(entry) - HOOK_ENTRY_FIELDS)
             if unknown_entry:
                 _fail(
                     entry_path,
@@ -426,16 +351,7 @@ def _validate_agents(value: Any, path: str) -> None:
             )
         agent = _mapping(raw_agent, agent_path)
         unknown = sorted(
-            set(agent)
-            - {
-                "description",
-                "prompt",
-                "model",
-                "tools",
-                "disallowedTools",
-                "skills",
-                "maxTurns",
-            }
+            set(agent) - AGENT_FIELDS
         )
         if unknown:
             _fail(
@@ -531,16 +447,7 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
     if node_type == "loop":
         loop = _mapping(value, f"{path}.loop")
         unknown = sorted(
-            set(loop)
-            - {
-                "prompt",
-                "until",
-                "max_iterations",
-                "fresh_context",
-                "until_bash",
-                "interactive",
-                "gate_message",
-            }
+            set(loop) - LOOP_FIELDS
         )
         if unknown:
             _fail(
@@ -569,7 +476,7 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
             )
     if node_type == "approval":
         approval = _mapping(value, f"{path}.approval")
-        unknown = sorted(set(approval) - {"message", "capture_response", "on_reject"})
+        unknown = sorted(set(approval) - APPROVAL_FIELDS)
         if unknown:
             _fail(
                 f"{path}.approval",
@@ -579,7 +486,7 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
         _string(approval.get("message"), f"{path}.approval.message")
         if "on_reject" in approval:
             on_reject = _mapping(approval["on_reject"], f"{path}.approval.on_reject")
-            if set(on_reject) - {"prompt", "max_attempts"}:
+            if set(on_reject) - APPROVAL_REJECT_FIELDS:
                 _fail(
                     f"{path}.approval.on_reject",
                     "unknown_approval_field",
@@ -774,7 +681,6 @@ def _validate_graph(nodes: tuple[WorkflowNode, ...]) -> None:
 
 def _parse_sidecar(
     sidecar_path: Path,
-    node_ids: frozenset[str],
     data: bytes,
 ) -> tuple[Path, Mapping[str, Any]]:
     try:
@@ -794,7 +700,7 @@ def _parse_sidecar(
             "sidecar_authority",
             f"workflow sidecar cannot set trust or graph topology: {sorted(forbidden)[0]}",
         )
-    unknown = sorted(set(sidecar) - _SIDECAR_FIELDS)
+    unknown = sorted(set(sidecar) - SIDECAR_FIELDS)
     if unknown:
         _fail(
             "sidecar",
@@ -825,13 +731,6 @@ def _parse_sidecar(
             "invalid_sidecar",
             "outward_action_nodes must be a list of node identifiers",
         )
-    for node_id in outward:
-        if node_id not in node_ids:
-            _fail(
-                "sidecar.outward_action_nodes",
-                "unknown_sidecar_node",
-                f"outward_action_nodes references unknown node: {node_id}",
-            )
     if "required_secrets" in sidecar:
         secrets = sidecar["required_secrets"]
         if not isinstance(secrets, list) or any(
@@ -870,9 +769,19 @@ def _parse_sidecar(
     return sidecar_path, freeze_value(sidecar)
 
 
-def _load_sidecar(
-    path: Path, node_ids: frozenset[str]
-) -> tuple[Path | None, Mapping[str, Any]]:
+def _validate_sidecar_node_references(
+    sidecar: Mapping[str, Any], node_ids: frozenset[str]
+) -> None:
+    for node_id in sidecar.get("outward_action_nodes", ()):
+        if node_id not in node_ids:
+            _fail(
+                "sidecar.outward_action_nodes",
+                "unknown_sidecar_node",
+                f"outward_action_nodes references unknown node: {node_id}",
+            )
+
+
+def _load_sidecar(path: Path) -> tuple[Path | None, Mapping[str, Any]]:
     sidecar_path = path.with_name(f"{path.stem}.hermes.yaml")
     if not sidecar_path.is_file():
         return None, freeze_value({})
@@ -880,7 +789,7 @@ def _load_sidecar(
         data = sidecar_path.read_bytes()
     except OSError as exc:
         _fail("sidecar", "invalid_sidecar", f"invalid workflow sidecar: {exc}")
-    return _parse_sidecar(sidecar_path, node_ids, data)
+    return _parse_sidecar(sidecar_path, data)
 
 
 def _package_root(path: Path) -> Path:
@@ -935,6 +844,7 @@ def _load_workflow_bytes(
     sidecar_bytes: bytes | None | object,
     source: str,
     precedence: int,
+    normalizer_version: int = WORKFLOW_NORMALIZER_VERSION,
 ) -> WorkflowPackage:
     if len(data) > _MAX_YAML_BYTES:
         _fail(
@@ -963,7 +873,36 @@ def _load_workflow_bytes(
             "self_trust",
             "workflow package cannot declare trust",
         )
+    if sidecar_bytes is _READ_SIDECAR_FROM_DISK:
+        sidecar_path, sidecar = _load_sidecar(workflow_path)
+    elif sidecar_bytes is None:
+        sidecar_path, sidecar = None, freeze_value({})
+    else:
+        assert isinstance(sidecar_bytes, bytes)
+        sidecar_path, sidecar = _parse_sidecar(
+            workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml"),
+            sidecar_bytes,
+        )
+    try:
+        selection = resolve_language_profile(sidecar)
+    except WorkflowLanguageCompatibilityError as exc:
+        _fail("sidecar.language_compatibility", exc.code, str(exc))
     unknown_top = sorted(set(document) - TOP_LEVEL_FIELDS)
+    if (
+        unknown_top
+        and selection.effective_profile is WorkflowLanguageProfile.ARCHON_2026_07
+    ):
+        raise WorkflowValidationError(
+            tuple(
+                ValidationIssue(
+                    path=field,
+                    code="archon_unknown_top_level_field",
+                    message=f"Archon profile does not support top-level field: {field}",
+                    source_line=top_lines.get(field),
+                )
+                for field in unknown_top
+            )
+        )
     issues = tuple(
         ValidationIssue(
             path=field,
@@ -1007,25 +946,25 @@ def _load_workflow_bytes(
         source_path=workflow_path,
     )
     node_ids = frozenset(node.id for node in nodes)
-    if sidecar_bytes is _READ_SIDECAR_FROM_DISK:
-        sidecar_path, sidecar = _load_sidecar(workflow_path, node_ids)
-    elif sidecar_bytes is None:
-        sidecar_path, sidecar = None, freeze_value({})
-    else:
-        assert isinstance(sidecar_bytes, bytes)
-        sidecar_path, sidecar = _parse_sidecar(
-            workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml"),
-            node_ids,
-            sidecar_bytes,
-        )
+    _validate_sidecar_node_references(sidecar, node_ids)
+    normalized = normalize_workflow(
+        definition,
+        selection=selection,
+        normalizer_version=normalizer_version,
+    )
     return WorkflowPackage(
-        definition=definition,
+        source_definition=definition,
+        definition=normalized.definition,
         root=_package_root(workflow_path),
         workflow_path=workflow_path,
         sidecar_path=sidecar_path,
         sidecar=sidecar,
         source=source,
         precedence=precedence,
+        language=normalized.metadata,
+        compatibility_findings=language_compatibility_findings(
+            definition, normalized.metadata
+        ),
         validation_issues=issues,
     )
 
@@ -1056,6 +995,7 @@ def load_workflow_snapshot(
     sidecar_bytes: bytes | None,
     source: str = "explicit",
     precedence: int = 0,
+    normalizer_version: int = WORKFLOW_NORMALIZER_VERSION,
 ) -> WorkflowPackage:
     """Parse caller-authenticated bytes without reopening definition files."""
     workflow_path = Path(path).expanduser().absolute()
@@ -1067,6 +1007,7 @@ def load_workflow_snapshot(
         sidecar_bytes=sidecar_bytes,
         source=source,
         precedence=precedence,
+        normalizer_version=normalizer_version,
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import json
 import os
 import shutil
@@ -114,6 +115,37 @@ def test_reused_key_with_changed_digest_conflicts(tmp_path, workflow_writer):
     assert second.disposition == "rejected"
     assert second.reason_code == "idempotency_conflict"
     assert len(store.list_runs()) == 1
+
+
+def test_legacy_digest_fallback_rejects_current_and_tampered_snapshots(
+    tmp_path, workflow_writer
+):
+    store = RunStore(tmp_path / "home")
+    prepared = _prepared(store, workflow_writer, tmp_path)
+    current_retry = store.clone_prepared_snapshot(prepared)
+    tampered_retry = store.clone_prepared_snapshot(prepared)
+    first = store.start_run(_request(prepared), immutable_snapshot=prepared)
+
+    current_retry = replace(current_retry, input_manifest_digest="1" * 64)
+    current = store.start_run(
+        _request(current_retry), immutable_snapshot=current_retry
+    )
+
+    (tampered_retry.staging_directory / "resources.json").write_text("not json\n")
+    tampered_retry = replace(tampered_retry, input_manifest_digest="2" * 64)
+    tampered = store.start_run(
+        _request(tampered_retry), immutable_snapshot=tampered_retry
+    )
+
+    assert first.disposition == "created"
+    assert (current.disposition, current.reason_code) == (
+        "rejected",
+        "idempotency_conflict",
+    )
+    assert (tampered.disposition, tampered.reason_code) == (
+        "rejected",
+        "idempotency_conflict",
+    )
 
 
 def test_overlap_policies_queue_forbid_and_allow(tmp_path, workflow_writer):

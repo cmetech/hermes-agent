@@ -4,16 +4,32 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import re
+import secrets
 import shlex
+import shutil
+import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Mapping
+from typing import Iterable, Mapping
 
 import yaml
 
 
 _COMMAND_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_AUTHORITY_DESCRIPTOR_KEY = "__hermes_authenticated_local_mcp"
+_AUTHORITY_CWD_KEY = "__hermes_private_mcp_cwd"
+_AUTHORITY_MAX_FILES = 512
+_AUTHORITY_MAX_FILE_BYTES = 1 * 1024 * 1024
+_AUTHORITY_MAX_TOTAL_BYTES = 8 * 1024 * 1024
+_AUTHORITY_MANIFEST_NAME = ".hermes-authority-manifest-v1.json"
+_AUTHORITY_CONTROL_DIRECTORY = "control"
+_AUTHORITY_PAYLOAD_DIRECTORY = "payload"
+_AUTHORITY_MAX_MANIFEST_BYTES = 4_000_000
+logger = logging.getLogger(__name__)
 _VARIABLE = re.compile(
     r"\$(?:(?P<position>[1-9][0-9]*)|"
     r"(?P<node>[A-Za-z_][A-Za-z0-9_-]*)\.output(?:\.(?P<dot>[A-Za-z0-9_.-]+))?|"
@@ -44,7 +60,8 @@ def _quote_shell_value(value: str, quote: str | None) -> str:
         return value.replace("'", "'\\''")
     if quote == '"':
         return (
-            value.replace("\\", "\\\\")
+            value
+            .replace("\\", "\\\\")
             .replace('"', '\\"')
             .replace("$", "\\$")
             .replace("`", "\\`")
@@ -64,23 +81,290 @@ class CommandResource:
 class ScriptResource:
     path: Path
     runtime: str
+    authenticated_bytes: bytes | None = None
+
+
+class AuthenticatedExecutionMaterializer:
+    """Private, disposable files whose consumers verify bytes before execution."""
+
+    def __init__(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="hermes-workflow-authority-"))
+        try:
+            self.root.chmod(0o700)
+        except OSError:
+            pass
+        self.control_root = self.root / _AUTHORITY_CONTROL_DIRECTORY
+        self.payload_root = self.root / _AUTHORITY_PAYLOAD_DIRECTORY
+        self.control_root.mkdir(mode=0o700)
+        self.payload_root.mkdir(mode=0o700)
+        self._closed = False
+        self._entries: dict[str, tuple[str, Path]] = {}
+        self._descriptor: dict[str, object] | None = None
+
+    @staticmethod
+    def _canonical_relative(relative: str) -> PurePosixPath:
+        logical = PurePosixPath(relative)
+        if (
+            not relative
+            or "\\" in relative
+            or "\0" in relative
+            or logical.is_absolute()
+            or logical.as_posix() != relative
+            or any(part in {"", ".", ".."} for part in logical.parts)
+        ):
+            raise ValueError("authenticated execution path must be canonical")
+        return logical
+
+    def materialize(self, relative: str, data: bytes) -> Path:
+        if self._closed:
+            raise RuntimeError("authenticated execution materializer is closed")
+        if self._descriptor is not None:
+            raise RuntimeError("authenticated execution materializer is finalized")
+        logical = self._canonical_relative(relative)
+        if len(data) > _AUTHORITY_MAX_FILE_BYTES:
+            raise ValueError("authenticated execution file exceeds 1048576 bytes")
+        digest = hashlib.sha256(data).hexdigest()
+        previous = self._entries.get(relative)
+        if previous is not None:
+            if previous[0] != digest:
+                raise ValueError("authenticated execution path has conflicting bytes")
+            return previous[1]
+        if len(self._entries) >= _AUTHORITY_MAX_FILES:
+            raise ValueError("authenticated execution closure exceeds 512 files")
+        if (
+            sum(path.stat().st_size for _, path in self._entries.values()) + len(data)
+            > _AUTHORITY_MAX_TOTAL_BYTES
+        ):
+            raise ValueError("authenticated execution closure exceeds 8388608 bytes")
+        path = self.payload_root.joinpath(*logical.parts)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags, 0o400)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        self._entries[relative] = (digest, path)
+        return path
+
+    def materialize_all(self, contents: Mapping[str, bytes]) -> dict[str, object]:
+        if self._descriptor is not None:
+            expected = {
+                relative: hashlib.sha256(bytes(data)).hexdigest()
+                for relative, data in contents.items()
+            }
+            observed = {
+                relative: digest for relative, (digest, _path) in self._entries.items()
+            }
+            if expected != observed:
+                raise ValueError(
+                    "authenticated execution closure has conflicting bytes"
+                )
+            return dict(self._descriptor)
+        files: dict[str, dict[str, object]] = {}
+        for relative in sorted(contents):
+            data = bytes(contents[relative])
+            self.materialize(relative, data)
+            files[relative] = {
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "size": len(data),
+            }
+        nonce = secrets.token_hex(32)
+        manifest = {
+            "version": 1,
+            "nonce": nonce,
+            "files": files,
+        }
+        encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        if len(encoded) > _AUTHORITY_MAX_MANIFEST_BYTES:
+            raise ValueError("authenticated execution manifest is too large")
+        manifest_path = self.control_root / _AUTHORITY_MANIFEST_NAME
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(manifest_path, flags, 0o400)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            manifest_path.unlink(missing_ok=True)
+            raise
+        root_stat = self.root.lstat()
+        self._descriptor = {
+            "version": 2,
+            "root": str(self.root),
+            "payload": _AUTHORITY_PAYLOAD_DIRECTORY,
+            "manifest": (
+                f"{_AUTHORITY_CONTROL_DIRECTORY}/{_AUTHORITY_MANIFEST_NAME}"
+            ),
+            "manifest_sha256": hashlib.sha256(encoded).hexdigest(),
+            "file_count": len(files),
+            "total_bytes": sum(int(metadata["size"]) for metadata in files.values()),
+            "nonce": nonce,
+            "root_identity": {
+                "device": root_stat.st_dev,
+                "inode": root_stat.st_ino,
+            },
+        }
+        return dict(self._descriptor)
+
+    def cleanup(self) -> None:
+        if self._closed:
+            return
+        try:
+            self.root.chmod(0o700)
+        except OSError:
+            pass
+        failure: OSError | None = None
+        for attempt in range(3):
+            try:
+                shutil.rmtree(self.root)
+                self._closed = True
+                return
+            except FileNotFoundError:
+                self._closed = True
+                return
+            except OSError as exc:
+                failure = exc
+                logger.warning(
+                    "authenticated execution cleanup attempt %d failed: %s",
+                    attempt + 1,
+                    exc,
+                )
+                if attempt < 2:
+                    time.sleep(0.01 * (attempt + 1))
+        raise OSError("authenticated execution authority cleanup failed") from failure
 
 
 class ResourceResolver:
     """Resolve package resources without permitting path traversal."""
 
     def __init__(
-        self, package_root: str | Path, *, global_root: str | Path | None = None
+        self,
+        package_root: str | Path,
+        *,
+        global_root: str | Path | None = None,
+        sealed_paths: Iterable[str] | None = None,
+        sealed_bytes: Mapping[str, bytes] | None = None,
     ):
-        self.package_root = Path(package_root).resolve()
+        raw_root = Path(package_root).expanduser()
+        self.package_root = Path(os.path.abspath(raw_root))
         self.global_root = (
-            Path(global_root).resolve() if global_root is not None else None
+            Path(os.path.abspath(Path(global_root).expanduser()))
+            if global_root is not None
+            else None
         )
+        self.sealed_paths = (
+            frozenset(sealed_paths) if sealed_paths is not None else None
+        )
+        self.sealed_bytes = (
+            {str(path): bytes(data) for path, data in sealed_bytes.items()}
+            if sealed_bytes is not None
+            else None
+        )
+        if (
+            self.sealed_bytes is not None
+            and self.sealed_paths is not None
+            and frozenset(self.sealed_bytes) != self.sealed_paths
+        ):
+            raise ValueError("authenticated resource bytes must match sealed paths")
+        if self.sealed_bytes is not None:
+            for relative, data in self.sealed_bytes.items():
+                logical = PurePosixPath(relative)
+                if (
+                    not relative
+                    or "\\" in relative
+                    or "\0" in relative
+                    or logical.is_absolute()
+                    or logical.as_posix() != relative
+                    or any(part in {"", ".", ".."} for part in logical.parts)
+                    or not isinstance(data, bytes)
+                ):
+                    raise ValueError("authenticated resource path or bytes are invalid")
+
+    def _is_sealed(self, path: Path) -> bool:
+        if self.sealed_paths is None:
+            return True
+        try:
+            relative = path.relative_to(self.package_root).as_posix()
+        except ValueError:
+            return False
+        return relative in self.sealed_paths
+
+    def _relative(self, path: Path) -> str:
+        try:
+            return path.relative_to(self.package_root).as_posix()
+        except ValueError as exc:
+            raise ValueError("resource escapes authenticated package") from exc
+
+    def _authenticated_bytes(self, path: Path) -> bytes:
+        """Return scheduler-authenticated bytes or read a live admitted source."""
+        relative = self._relative(path)
+        if self.sealed_bytes is None:
+            return path.read_bytes()
+        expected = self.sealed_bytes.get(relative)
+        if expected is None:
+            raise ValueError(f"resource is not authenticated: {relative}")
+        return expected
+
+    def read_bytes(self, relative: str) -> bytes:
+        """Load one contained resource through the scheduler's byte authority."""
+        normalized = relative.replace("\\", "/")
+        logical = PurePosixPath(normalized)
+        if (
+            not relative
+            or logical.is_absolute()
+            or logical.as_posix() != normalized
+            or any(part in {"", ".", ".."} for part in logical.parts)
+        ):
+            raise ValueError("resource must be a contained relative path")
+        candidate = self.package_root / normalized
+        if self.sealed_bytes is not None:
+            try:
+                return self.sealed_bytes[normalized]
+            except KeyError as exc:
+                raise FileNotFoundError(f"resource is missing: {relative}") from exc
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(self.package_root)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise FileNotFoundError(f"resource is missing: {relative}") from exc
+        if (
+            candidate.is_symlink()
+            or not resolved.is_file()
+            or not self._is_sealed(resolved)
+        ):
+            raise FileNotFoundError(f"resource is missing: {relative}")
+        return self._authenticated_bytes(resolved)
+
+    def text(self, relative: str) -> str:
+        """Load one contained UTF-8 resource through the byte authority."""
+        return self.read_bytes(relative).decode("utf-8")
 
     def command(self, name: str) -> CommandResource:
         if not isinstance(name, str) or not _COMMAND_NAME.fullmatch(name):
             raise ValueError("command must be a contained command name")
         filename = name if name.endswith(".md") else f"{name}.md"
+        if self.sealed_bytes is not None:
+            relative = f"commands/{filename}"
+            try:
+                encoded = self.sealed_bytes[relative]
+            except KeyError as exc:
+                raise FileNotFoundError(f"command resource is missing: {name}") from exc
+            return self._parse_command(
+                self.package_root / relative,
+                text=encoded.decode("utf-8"),
+            )
         roots = [self.package_root]
         if self.global_root is not None:
             roots.append(self.global_root)
@@ -91,9 +375,16 @@ class ResourceResolver:
                 resolved.relative_to(root)
             except (FileNotFoundError, OSError, ValueError):
                 continue
-            if candidate.is_symlink() or not resolved.is_file():
+            if (
+                candidate.is_symlink()
+                or not resolved.is_file()
+                or not self._is_sealed(resolved)
+            ):
                 continue
-            return self._parse_command(resolved)
+            return self._parse_command(
+                resolved,
+                text=self._authenticated_bytes(resolved).decode("utf-8"),
+            )
         raise FileNotFoundError(f"command resource is missing: {name}")
 
     def script(self, name: str, *, runtime: str) -> ScriptResource:
@@ -119,6 +410,17 @@ class ResourceResolver:
             names = (normalized, f"{normalized}.py")
         else:
             names = (normalized, f"{normalized}.ts", f"{normalized}.js")
+        if self.sealed_bytes is not None:
+            for candidate_name in names:
+                relative_name = f"scripts/{candidate_name}"
+                authenticated = self.sealed_bytes.get(relative_name)
+                if authenticated is not None:
+                    return ScriptResource(
+                        path=self.package_root / relative_name,
+                        runtime=runtime,
+                        authenticated_bytes=authenticated,
+                    )
+            raise FileNotFoundError(f"script resource is missing: {name}")
         roots = [self.package_root]
         if self.global_root is not None:
             roots.append(self.global_root)
@@ -130,12 +432,28 @@ class ResourceResolver:
                     resolved.relative_to(root / "scripts")
                 except (FileNotFoundError, OSError, ValueError):
                     continue
-                if candidate.is_symlink() or not resolved.is_file():
+                if (
+                    candidate.is_symlink()
+                    or not resolved.is_file()
+                    or not self._is_sealed(resolved)
+                ):
                     continue
-                return ScriptResource(path=resolved, runtime=runtime)
+                authenticated = self._authenticated_bytes(resolved)
+                return ScriptResource(
+                    path=resolved,
+                    runtime=runtime,
+                    authenticated_bytes=(
+                        authenticated if self.sealed_bytes is not None else None
+                    ),
+                )
         raise FileNotFoundError(f"script resource is missing: {name}")
 
-    def mcp_servers(self, reference: str) -> dict[str, dict[str, object]]:
+    def mcp_servers(
+        self,
+        reference: str,
+        *,
+        materializer: AuthenticatedExecutionMaterializer | None = None,
+    ) -> dict[str, dict[str, object]]:
         """Load one contained, snapshotted MCP definition without interpolation."""
         normalized = reference.replace("\\", "/")
         relative = PurePosixPath(normalized)
@@ -152,20 +470,31 @@ class ResourceResolver:
             (self.package_root / "mcp" / normalized).with_suffix(".yaml"),
         )
         path = None
-        for candidate in candidates:
-            try:
-                resolved = candidate.resolve(strict=True)
-                resolved.relative_to(self.package_root)
-            except (FileNotFoundError, OSError, ValueError):
-                continue
-            if not candidate.is_symlink() and resolved.is_file():
-                path = resolved
-                break
+        if self.sealed_bytes is not None:
+            for candidate in candidates:
+                if self._relative(candidate) in self.sealed_bytes:
+                    path = candidate
+                    break
+        else:
+            for candidate in candidates:
+                try:
+                    resolved = candidate.resolve(strict=True)
+                    resolved.relative_to(self.package_root)
+                except (FileNotFoundError, OSError, ValueError):
+                    continue
+                if (
+                    not candidate.is_symlink()
+                    and resolved.is_file()
+                    and self._is_sealed(resolved)
+                ):
+                    path = resolved
+                    break
         if path is None:
             raise FileNotFoundError(f"MCP definition is missing: {reference}")
-        if path.stat().st_size > 256_000:
+        encoded = self._authenticated_bytes(path)
+        if len(encoded) > 256_000:
             raise ValueError("MCP definition exceeds 256000 bytes")
-        document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        document = yaml.safe_load(encoded.decode("utf-8")) or {}
         if not isinstance(document, dict):
             raise ValueError("MCP definition must be a mapping")
         raw_servers = document.get("mcp_servers", document)
@@ -180,11 +509,23 @@ class ResourceResolver:
             if not isinstance(raw, dict):
                 raise ValueError(f"MCP server {name} must be a mapping")
             servers[name] = dict(raw)
+        if self.sealed_bytes is not None:
+            if materializer is None:
+                raise ValueError(
+                    "authenticated MCP resources require private execution materialization"
+                )
+            closure = materializer.materialize_all(self.sealed_bytes)
+            for server in servers.values():
+                server[_AUTHORITY_DESCRIPTOR_KEY] = {
+                    **closure,
+                    "source_root": str(self.package_root),
+                }
         return servers
 
     @staticmethod
-    def _parse_command(path: Path) -> CommandResource:
-        text = path.read_text(encoding="utf-8")
+    def _parse_command(path: Path, *, text: str | None = None) -> CommandResource:
+        if text is None:
+            text = path.read_text(encoding="utf-8")
         metadata: dict[str, object] = {}
         body = text
         if text.startswith("---\n"):

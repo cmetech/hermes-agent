@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import os
 
 import pytest
 
 from plugins.workflow.compat import (
     ARCHON_TOOL_ALIASES,
+    CompatibilityFinding,
     CompatibilityLevel,
     assess_compatibility,
 )
+from plugins.workflow.cli import doctor_package
+from plugins.workflow.models import CompatibilityFinding as ModelCompatibilityFinding
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.schema import HOOK_EVENTS
 from plugins.workflow.admission import RunAdmissionRequest
@@ -157,8 +161,217 @@ def test_unknown_top_level_fields_are_explicit_compatibility_findings(
 
     finding = next(item for item in report.findings if item.path == "futureOption")
     assert finding.level is CompatibilityLevel.UNSUPPORTED
+    assert finding.code == "unknown_top_level_field"
     assert finding.blocking is False
+    assert finding.effective_profile is package.language.effective_profile
     assert report.runnable is True
+
+
+@pytest.mark.parametrize("declaration", [None, "hermes-legacy"])
+def test_legacy_profile_finding_is_stable_for_default_and_explicit_declarations(
+    workflow_writer, tmp_path, declaration
+):
+    path = workflow_writer(tmp_path / str(declaration))
+    if declaration is not None:
+        path.with_name(f"{path.stem}.hermes.yaml").write_text(
+            f"language_compatibility: {declaration}\n", encoding="utf-8"
+        )
+
+    finding = next(
+        item
+        for item in assess_compatibility(load_workflow(path)).findings
+        if item.code == "legacy_language_profile"
+    )
+
+    assert finding.blocking is False
+    assert finding.severity == "warning"
+    assert finding.effective_profile.value == "hermes-legacy"
+    assert finding.migration
+
+
+@pytest.mark.parametrize(
+    ("profile", "node_options", "code", "blocking", "severity"),
+    [
+        (
+            "hermes-legacy",
+            {"timeout": 2},
+            "legacy_timeout_seconds",
+            False,
+            "warning",
+        ),
+        (
+            "hermes-legacy",
+            {"retry": {"max_attempts": 2}},
+            "legacy_retry_total_attempts",
+            False,
+            "warning",
+        ),
+        (
+            "hermes-legacy",
+            {"output_format": {"type": "object"}},
+            "legacy_output_format_post_validation",
+            False,
+            "warning",
+        ),
+        (
+            "hermes-legacy",
+            {"output_type": "text"},
+            "legacy_output_type_not_published",
+            False,
+            "warning",
+        ),
+        (
+            "archon-2026-07",
+            {"timeout": 2},
+            "archon_timeout_semantics_unavailable",
+            True,
+            "error",
+        ),
+        (
+            "archon-2026-07",
+            {"retry": {"max_attempts": 2}},
+            "archon_retry_semantics_unavailable",
+            True,
+            "error",
+        ),
+        (
+            "archon-2026-07",
+            {"output_format": {"type": "object"}},
+            "archon_output_format_unavailable",
+            True,
+            "error",
+        ),
+        (
+            "archon-2026-07",
+            {"output_type": "text"},
+            "archon_output_type_unavailable",
+            True,
+            "error",
+        ),
+        (
+            "archon-2026-07",
+            {"maxBudgetUsd": 1},
+            "archon_budget_enforcement_unavailable",
+            True,
+            "error",
+        ),
+        (
+            "archon-2026-07",
+            {"sandbox": {"enabled": True}},
+            "archon_sandbox_enforcement_unavailable",
+            True,
+            "error",
+        ),
+    ],
+)
+def test_language_profile_fields_emit_stable_findings(
+    workflow_writer,
+    tmp_path,
+    profile,
+    node_options,
+    code,
+    blocking,
+    severity,
+):
+    node = (
+        {"id": "agent", "bash": "true", **node_options}
+        if "timeout" in node_options
+        else {"id": "agent", "prompt": "x", **node_options}
+    )
+    path = workflow_writer(tmp_path / code, nodes=[node])
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        f"language_compatibility: {profile}\n", encoding="utf-8"
+    )
+
+    finding = next(
+        item
+        for item in assess_compatibility(load_workflow(path)).findings
+        if item.code == code
+    )
+
+    assert finding.blocking is blocking
+    assert finding.severity == severity
+    assert finding.effective_profile.value == profile
+    assert finding.migration
+
+
+def test_archon_profile_with_enforceable_fields_remains_runnable(
+    workflow_writer, tmp_path
+):
+    path = workflow_writer(tmp_path, nodes=[{"id": "start", "bash": "true"}])
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+
+    report = assess_compatibility(load_workflow(path))
+
+    assert report.runnable is True
+    assert not report.blocking_findings
+
+
+def test_doctor_preserves_finding_codes_instead_of_deriving_them_from_prose(
+    workflow_writer, tmp_path
+):
+    package = load_workflow(workflow_writer(tmp_path))
+    package = replace(
+        package,
+        compatibility_findings=(
+            CompatibilityFinding(
+                path="nodes[0].allowed_tools[0]",
+                level=CompatibilityLevel.MAPPED,
+                message="unknown Archon tool alias appears only as explanatory prose",
+                blocking=False,
+                code="stable_contract_code",
+                severity="warning",
+                effective_profile=package.language.effective_profile,
+                migration="keep the backend-issued code",
+            ),
+        ),
+    )
+
+    report = doctor_package(package, hermes_home=tmp_path / "profile")
+
+    assert any(
+        finding.code == "stable_contract_code" for finding in report.findings
+    )
+    assert not any(finding.code == "unknown_tool_alias" for finding in report.findings)
+
+
+def test_doctor_dynamic_findings_carry_the_package_effective_profile(
+    workflow_writer, tmp_path
+):
+    package = load_workflow(workflow_writer(tmp_path))
+
+    report = doctor_package(package, hermes_home=tmp_path / "profile")
+    finding = next(
+        item
+        for item in report.findings
+        if item.code == "effective_admission_capacity"
+    )
+
+    assert finding.effective_profile is package.language.effective_profile
+
+
+def test_default_finding_severity_tracks_blocking_state():
+    blocking = CompatibilityFinding(
+        path="field",
+        level=CompatibilityLevel.UNSUPPORTED,
+        message="unsupported",
+        blocking=True,
+    )
+    ordinary = CompatibilityFinding(
+        path="field",
+        level=CompatibilityLevel.MAPPED,
+        message="mapped",
+        blocking=False,
+    )
+
+    assert blocking.severity == "error"
+    assert ordinary.severity == "info"
+
+
+def test_compatibility_module_reexports_the_shared_finding_class():
+    assert CompatibilityFinding is ModelCompatibilityFinding
 
 
 def test_ai_only_fields_on_non_ai_nodes_block_instead_of_being_ignored(

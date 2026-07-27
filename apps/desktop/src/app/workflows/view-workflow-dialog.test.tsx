@@ -219,6 +219,30 @@ describe('workflow View dialog', () => {
     expect(dialog.querySelector('[data-workflow-view-scroll]')).toBeTruthy()
   })
 
+  it('explains server-authored legacy semantics without inventing a profile', async () => {
+    currentDetail = detail({
+      language: {
+        declared_profile: null,
+        effective_profile: 'hermes-legacy',
+        legacy: true,
+        normalized_definition_digest: 'a'.repeat(64),
+        normalizer_version: 1
+      }
+    })
+    renderView()
+    const dialog = await openView()
+
+    expect(await within(dialog).findByText('Legacy semantics')).toBeTruthy()
+    expect(
+      within(dialog).getByText(
+        'Existing Hermes behavior is preserved. Review compatibility findings before migrating to Archon 2026-07.'
+      )
+    ).toBeTruthy()
+    expect(within(dialog).getByText('Normalizer 1')).toBeTruthy()
+    const digest = within(dialog).getByText('aaaaaaaaaaaa…')
+    expect(digest.getAttribute('title')).toBe('a'.repeat(64))
+  })
+
   it('preserves the shared dialog vertical scroll while clipping horizontal overflow', async () => {
     renderView()
     const dialog = await openView()

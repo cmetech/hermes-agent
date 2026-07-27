@@ -16,10 +16,15 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 
 
 def _run_apply_profile_override(
-    tmp_path, monkeypatch, *, hermes_home: str | None, active_profile: str | None,
+    tmp_path,
+    monkeypatch,
+    *,
+    hermes_home: str | None,
+    active_profile: str | None,
     argv: list[str] | None = None,
 ):
     """Run _apply_profile_override in isolation.
@@ -45,6 +50,7 @@ def _run_apply_profile_override(
     monkeypatch.setattr(sys, "argv", argv or ["hermes", "gateway", "start"])
 
     from hermes_cli.main import _apply_profile_override
+
     _apply_profile_override()
 
     return os.environ.get("HERMES_HOME")
@@ -105,6 +111,7 @@ class TestApplyProfileOverrideHermesHomeGuard:
         monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "start"])
 
         from hermes_cli.main import _apply_profile_override
+
         _apply_profile_override()
 
         assert os.environ.get("HERMES_HOME") == str(profile_dir), (
@@ -125,7 +132,9 @@ class TestApplyProfileOverrideHermesHomeGuard:
         assert result is not None
         assert "coder" in result
 
-    def test_sudo_explicit_profile_resolves_invoking_users_profile(self, tmp_path, monkeypatch):
+    def test_sudo_explicit_profile_resolves_invoking_users_profile(
+        self, tmp_path, monkeypatch
+    ):
         """sudo elias ... should resolve `-p elias` under SUDO_USER, not root."""
         root_home = tmp_path / "root"
         user_home = tmp_path / "home" / "hermes"
@@ -137,13 +146,18 @@ class TestApplyProfileOverrideHermesHomeGuard:
         monkeypatch.setenv("SUDO_USER", "hermes")
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
-        monkeypatch.setattr(sys, "argv", ["hermes", "-p", "elias", "gateway", "install", "--system"])
+        monkeypatch.setattr(
+            sys, "argv", ["hermes", "-p", "elias", "gateway", "install", "--system"]
+        )
 
         import pwd
 
-        monkeypatch.setattr(pwd, "getpwnam", lambda name: SimpleNamespace(pw_dir=str(user_home)))
+        monkeypatch.setattr(
+            pwd, "getpwnam", lambda name: SimpleNamespace(pw_dir=str(user_home))
+        )
 
         from hermes_cli.main import _apply_profile_override
+
         _apply_profile_override()
 
         assert os.environ.get("HERMES_HOME") == str(profile_dir)
@@ -160,6 +174,7 @@ class TestApplyProfileOverrideHermesHomeGuard:
         (hermes_root / "active_profile").write_text("default")
 
         from hermes_cli.main import _apply_profile_override
+
         _apply_profile_override()
 
         assert os.environ.get("HERMES_HOME") is None
@@ -194,12 +209,122 @@ class TestApplyProfileOverrideHermesHomeGuard:
         monkeypatch.setattr(sys, "argv", list(argv))
 
         from hermes_cli.main import _apply_profile_override
+
         _apply_profile_override()
 
         assert os.environ.get("HERMES_HOME") is None
         assert sys.argv == argv
 
-    def test_profile_after_chat_subcommand_is_still_consumed(self, tmp_path, monkeypatch):
+    def test_workflow_schema_language_profile_is_not_consumed(
+        self, tmp_path, monkeypatch
+    ):
+        """A nested command's documented --profile option stays local."""
+        argv = [
+            "hermes",
+            "workflow",
+            "schema",
+            "--profile",
+            "archon-2026-07",
+            "--json",
+        ]
+
+        result = _run_apply_profile_override(
+            tmp_path,
+            monkeypatch,
+            hermes_home=None,
+            active_profile=None,
+            argv=argv,
+        )
+
+        assert result is None
+        assert sys.argv == argv
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["hermes", "config", "set", "workflow", "schema", "--profile", "coder"],
+            ["hermes", "config", "set", "--profile", "coder", "workflow", "schema"],
+        ],
+    )
+    def test_workflow_schema_positional_values_do_not_own_profile(
+        self, tmp_path, monkeypatch, argv
+    ):
+        """Only the exact top-level workflow/schema action owns --profile."""
+        result = _run_apply_profile_override(
+            tmp_path,
+            monkeypatch,
+            hermes_home=None,
+            active_profile="coder",
+            argv=argv,
+        )
+
+        assert result is not None
+        assert result.endswith("coder")
+        assert "--profile" not in sys.argv
+
+    @pytest.mark.parametrize(
+        ("argv", "remaining"),
+        [
+            (
+                [
+                    "hermes",
+                    "--profile",
+                    "coder",
+                    "workflow",
+                    "schema",
+                    "--profile",
+                    "archon-2026-07",
+                    "--json",
+                ],
+                [
+                    "hermes",
+                    "workflow",
+                    "schema",
+                    "--profile",
+                    "archon-2026-07",
+                    "--json",
+                ],
+            ),
+            (
+                [
+                    "hermes",
+                    "workflow",
+                    "schema",
+                    "--profile",
+                    "hermes-legacy",
+                    "--json",
+                    "-p",
+                    "coder",
+                ],
+                [
+                    "hermes",
+                    "workflow",
+                    "schema",
+                    "--profile",
+                    "hermes-legacy",
+                    "--json",
+                ],
+            ),
+        ],
+    )
+    def test_global_and_workflow_language_profiles_remain_distinct(
+        self, tmp_path, monkeypatch, argv, remaining
+    ):
+        result = _run_apply_profile_override(
+            tmp_path,
+            monkeypatch,
+            hermes_home=None,
+            active_profile="coder",
+            argv=argv,
+        )
+
+        assert result is not None
+        assert result.endswith("coder")
+        assert sys.argv == remaining
+
+    def test_profile_after_chat_subcommand_is_still_consumed(
+        self, tmp_path, monkeypatch
+    ):
         """Profile flags historically work after normal Hermes subcommands."""
         result = _run_apply_profile_override(
             tmp_path,
@@ -213,7 +338,9 @@ class TestApplyProfileOverrideHermesHomeGuard:
         assert result.endswith("coder")
         assert sys.argv == ["hermes", "chat", "-q", "hello"]
 
-    def test_top_level_profile_after_value_flag_is_consumed(self, tmp_path, monkeypatch):
+    def test_top_level_profile_after_value_flag_is_consumed(
+        self, tmp_path, monkeypatch
+    ):
         """Top-level --profile still works after other top-level value flags."""
         result = _run_apply_profile_override(
             tmp_path,
@@ -227,7 +354,9 @@ class TestApplyProfileOverrideHermesHomeGuard:
         assert result.endswith("coder")
         assert sys.argv == ["hermes", "-m", "gpt-5", "chat"]
 
-    def test_top_level_profile_after_continue_flag_is_consumed(self, tmp_path, monkeypatch):
+    def test_top_level_profile_after_continue_flag_is_consumed(
+        self, tmp_path, monkeypatch
+    ):
         """--continue has an optional value, so a following --profile is a flag."""
         result = _run_apply_profile_override(
             tmp_path,
@@ -278,6 +407,7 @@ class TestSupervisedChildIgnoresStickyProfile:
         monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run"])
 
         from hermes_cli.main import _apply_profile_override
+
         _apply_profile_override()
 
         assert os.environ.get("HERMES_HOME") == str(hermes_root), (
@@ -317,9 +447,9 @@ class TestSupervisedChildIgnoresStickyProfile:
         monkeypatch.setattr(sys, "argv", ["hermes", "-p", "coder", "gateway", "run"])
 
         from hermes_cli.main import _apply_profile_override
+
         _apply_profile_override()
 
         result = os.environ.get("HERMES_HOME")
         assert result is not None
         assert result.endswith("coder")
-

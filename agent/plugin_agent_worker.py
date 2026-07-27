@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 import hashlib
+import ipaddress
 import json
+import os
 from pathlib import Path
 import re
 import sys
 import threading
+import unicodedata
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 
 _PROTOCOL_VERSION = 1
@@ -25,6 +29,777 @@ class PackageMCPUnavailable(RuntimeError):
     """A request-carried MCP cannot be supplied to Hermes' tool loop."""
 
     failure_kind = "package_mcp_unavailable"
+
+
+_AUTHORITY_DESCRIPTOR_KEY = "__hermes_authenticated_local_mcp"
+_AUTHORITY_CWD_KEY = "__hermes_private_mcp_cwd"
+_AUTHORITY_ROOT_PREFIX = "hermes-workflow-authority-"
+_AUTHORITY_CONTROL_DIRECTORY = "control"
+_AUTHORITY_PAYLOAD_DIRECTORY = "payload"
+_AUTHORITY_MANIFEST_NAME = ".hermes-authority-manifest-v1.json"
+_AUTHORITY_MAX_FILES = 512
+_AUTHORITY_MAX_FILE_BYTES = 1 * 1024 * 1024
+_AUTHORITY_MAX_TOTAL_BYTES = 8 * 1024 * 1024
+_AUTHORITY_MAX_MANIFEST_BYTES = 4_000_000
+_AUTHORITY_LOADER = (
+    "import os,runpy,sys;"
+    "r,e=sys.argv[1:3];p=os.path.join(r,*e.split('/'));"
+    "os.chdir(r);sys.path[:]=[os.path.dirname(p),r,*sys.path];"
+    "sys.argv=[p,*sys.argv[3:]];runpy.run_path(p,run_name='__main__')"
+)
+
+
+def _canonical_authority_relative(value: object) -> str:
+    if not isinstance(value, str) or not value or "\\" in value or "\0" in value:
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority is invalid"
+        )
+    logical = Path(value)
+    if (
+        logical.is_absolute()
+        or value != logical.as_posix()
+        or any(part in {"", ".", ".."} for part in logical.parts)
+    ):
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority is invalid"
+        )
+    return value
+
+
+def _validate_authority_descriptor(
+    descriptor: object,
+) -> tuple[Path, Path, dict[str, dict[str, object]]]:
+    if not isinstance(descriptor, dict) or descriptor.get("version") != 2:
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority is invalid"
+        )
+    root_value = descriptor.get("root")
+    source_value = descriptor.get("source_root")
+    payload_value = descriptor.get("payload")
+    manifest_value = descriptor.get("manifest")
+    manifest_digest = descriptor.get("manifest_sha256")
+    nonce = descriptor.get("nonce")
+    file_count = descriptor.get("file_count")
+    total_bytes = descriptor.get("total_bytes")
+    root_identity = descriptor.get("root_identity")
+    if (
+        not isinstance(root_value, str)
+        or not os.path.isabs(root_value)
+        or not isinstance(source_value, str)
+        or not os.path.isabs(source_value)
+        or payload_value != _AUTHORITY_PAYLOAD_DIRECTORY
+        or manifest_value
+        != f"{_AUTHORITY_CONTROL_DIRECTORY}/{_AUTHORITY_MANIFEST_NAME}"
+        or not isinstance(manifest_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", manifest_digest) is None
+        or not isinstance(nonce, str)
+        or re.fullmatch(r"[0-9a-f]{64}", nonce) is None
+        or isinstance(file_count, bool)
+        or not isinstance(file_count, int)
+        or not 0 < file_count <= _AUTHORITY_MAX_FILES
+        or isinstance(total_bytes, bool)
+        or not isinstance(total_bytes, int)
+        or not 0 <= total_bytes <= _AUTHORITY_MAX_TOTAL_BYTES
+        or not isinstance(root_identity, dict)
+        or isinstance(root_identity.get("device"), bool)
+        or not isinstance(root_identity.get("device"), int)
+        or isinstance(root_identity.get("inode"), bool)
+        or not isinstance(root_identity.get("inode"), int)
+    ):
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority is invalid"
+        )
+    root = Path(root_value)
+    payload_root = root / _AUTHORITY_PAYLOAD_DIRECTORY
+    control_root = root / _AUTHORITY_CONTROL_DIRECTORY
+    source_root = Path(os.path.abspath(source_value))
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority is missing"
+        ) from exc
+    if (
+        root.is_symlink()
+        or not root.is_dir()
+        or not root.name.startswith(_AUTHORITY_ROOT_PREFIX)
+    ):
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority is invalid"
+        )
+    if (root_stat.st_dev, root_stat.st_ino) != (
+        root_identity["device"],
+        root_identity["inode"],
+    ):
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority changed"
+        )
+    try:
+        payload_stat = payload_root.lstat()
+        control_stat = control_root.lstat()
+        if (
+            payload_root.is_symlink()
+            or not payload_root.is_dir()
+            or control_root.is_symlink()
+            or not control_root.is_dir()
+            or {path.name for path in root.iterdir()}
+            != {_AUTHORITY_CONTROL_DIRECTORY, _AUTHORITY_PAYLOAD_DIRECTORY}
+        ):
+            raise OSError("authority layout is invalid")
+    except OSError as exc:
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority changed"
+        ) from exc
+    manifest_path = root / manifest_value
+    try:
+        manifest_before = manifest_path.lstat()
+        if (
+            manifest_path.is_symlink()
+            or not manifest_path.is_file()
+            or manifest_before.st_size > _AUTHORITY_MAX_MANIFEST_BYTES
+        ):
+            raise OSError("manifest is not a bounded regular file")
+        manifest_bytes = manifest_path.read_bytes()
+        manifest_after = manifest_path.lstat()
+    except OSError as exc:
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority changed"
+        ) from exc
+    if (
+        len(manifest_bytes) != manifest_before.st_size
+        or (
+            manifest_before.st_dev,
+            manifest_before.st_ino,
+            manifest_before.st_size,
+            manifest_before.st_mtime_ns,
+        )
+        != (
+            manifest_after.st_dev,
+            manifest_after.st_ino,
+            manifest_after.st_size,
+            manifest_after.st_mtime_ns,
+        )
+        or hashlib.sha256(manifest_bytes).hexdigest() != manifest_digest
+    ):
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority changed"
+        )
+    try:
+        manifest = json.loads(manifest_bytes)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority is invalid"
+        ) from exc
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != {"version", "nonce", "files"}
+        or manifest.get("version") != 1
+        or manifest.get("nonce") != nonce
+        or not isinstance(manifest.get("files"), dict)
+    ):
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority is invalid"
+        )
+    files = manifest["files"]
+    if len(files) != file_count:
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority changed"
+        )
+    for relative, metadata in files.items():
+        _canonical_authority_relative(relative)
+        if not isinstance(metadata, dict) or set(metadata) != {"sha256", "size"}:
+            raise PackageMCPUnavailable(
+                "package_mcp_unavailable: authenticated MCP authority is invalid"
+            )
+    observed: set[str] = set()
+    observed_directories: set[str] = set()
+    total = 0
+    for current, directories, names in os.walk(payload_root, followlinks=False):
+        current_path = Path(current)
+        for directory in directories:
+            path = current_path / directory
+            if path.is_symlink() or not path.is_dir():
+                raise PackageMCPUnavailable(
+                    "package_mcp_unavailable: authenticated MCP authority is invalid"
+                )
+            observed_directories.add(path.relative_to(payload_root).as_posix())
+        for filename in names:
+            path = current_path / filename
+            try:
+                relative = path.relative_to(payload_root).as_posix()
+                metadata = files[relative]
+                before = path.lstat()
+            except (KeyError, OSError, ValueError) as exc:
+                raise PackageMCPUnavailable(
+                    "package_mcp_unavailable: authenticated MCP authority changed"
+                ) from exc
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or not isinstance(metadata, dict)
+            ):
+                raise PackageMCPUnavailable(
+                    "package_mcp_unavailable: authenticated MCP authority changed"
+                )
+            expected_size = metadata.get("size")
+            expected_digest = metadata.get("sha256")
+            if (
+                isinstance(expected_size, bool)
+                or not isinstance(expected_size, int)
+                or not 0 <= expected_size <= _AUTHORITY_MAX_FILE_BYTES
+                or not isinstance(expected_digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_digest)
+                or before.st_size != expected_size
+            ):
+                raise PackageMCPUnavailable(
+                    "package_mcp_unavailable: authenticated MCP authority changed"
+                )
+            try:
+                data = path.read_bytes()
+                after = path.lstat()
+            except OSError as exc:
+                raise PackageMCPUnavailable(
+                    "package_mcp_unavailable: authenticated MCP authority changed"
+                ) from exc
+            if (
+                before.st_dev != after.st_dev
+                or before.st_ino != after.st_ino
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or hashlib.sha256(data).hexdigest() != expected_digest
+            ):
+                raise PackageMCPUnavailable(
+                    "package_mcp_unavailable: authenticated MCP authority changed"
+                )
+            total += len(data)
+            if total > _AUTHORITY_MAX_TOTAL_BYTES:
+                raise PackageMCPUnavailable(
+                    "package_mcp_unavailable: authenticated MCP authority is too large"
+                )
+            observed.add(relative)
+    try:
+        final_root_stat = root.lstat()
+        final_payload_stat = payload_root.lstat()
+        final_control_stat = control_root.lstat()
+        final_manifest_stat = manifest_path.lstat()
+        final_manifest_bytes = manifest_path.read_bytes()
+        control_entries = {path.name for path in control_root.iterdir()}
+        root_entries = {path.name for path in root.iterdir()}
+    except OSError as exc:
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority changed"
+        ) from exc
+    expected_directories = {
+        parent.as_posix()
+        for relative in files
+        for parent in Path(relative).parents
+        if parent.as_posix() != "."
+    }
+    if (
+        observed != set(files)
+        or observed_directories != expected_directories
+        or control_entries != {_AUTHORITY_MANIFEST_NAME}
+        or root_entries
+        != {_AUTHORITY_CONTROL_DIRECTORY, _AUTHORITY_PAYLOAD_DIRECTORY}
+        or total != total_bytes
+        or hashlib.sha256(final_manifest_bytes).hexdigest() != manifest_digest
+        or (
+            manifest_after.st_dev,
+            manifest_after.st_ino,
+            manifest_after.st_size,
+            manifest_after.st_mtime_ns,
+        )
+        != (
+            final_manifest_stat.st_dev,
+            final_manifest_stat.st_ino,
+            final_manifest_stat.st_size,
+            final_manifest_stat.st_mtime_ns,
+        )
+        or (
+            payload_stat.st_dev,
+            payload_stat.st_ino,
+            payload_stat.st_size,
+            payload_stat.st_mtime_ns,
+        )
+        != (
+            final_payload_stat.st_dev,
+            final_payload_stat.st_ino,
+            final_payload_stat.st_size,
+            final_payload_stat.st_mtime_ns,
+        )
+        or (
+            control_stat.st_dev,
+            control_stat.st_ino,
+            control_stat.st_size,
+            control_stat.st_mtime_ns,
+        )
+        != (
+            final_control_stat.st_dev,
+            final_control_stat.st_ino,
+            final_control_stat.st_size,
+            final_control_stat.st_mtime_ns,
+        )
+        or (
+            root_stat.st_dev,
+            root_stat.st_ino,
+            root_stat.st_size,
+            root_stat.st_mtime_ns,
+        )
+        != (
+            final_root_stat.st_dev,
+            final_root_stat.st_ino,
+            final_root_stat.st_size,
+            final_root_stat.st_mtime_ns,
+        )
+    ):
+        raise PackageMCPUnavailable(
+            "package_mcp_unavailable: authenticated MCP authority changed"
+        )
+    return payload_root, source_root, files
+
+
+_PATHLIKE_EXTENSIONS = frozenset({
+    ".bash",
+    ".cjs",
+    ".crt",
+    ".exe",
+    ".ini",
+    ".js",
+    ".json",
+    ".jsx",
+    ".key",
+    ".mjs",
+    ".pem",
+    ".py",
+    ".pyw",
+    ".sh",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".yaml",
+    ".yml",
+})
+_PATH_OPTION = re.compile(
+    r"^--?(?:config|cwd|dir|directory|entry|file|manifest|path|root|script)(?:[-_].*)?$",
+    re.IGNORECASE,
+)
+_COMPOUND_OPTION_ASSIGNMENT = re.compile(r"^(?P<option>--?[^=\s]+)=(?P<value>.*)$")
+_PATH_ENV = re.compile(
+    r"(?:^|_)(?:CONFIG|CWD|DIR|DIRECTORY|ENTRY|FILE|MANIFEST|PATH|ROOT|SCRIPT)$",
+    re.IGNORECASE,
+)
+_URI_SCHEME = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*):(?P<body>.*)$")
+_NETWORK_URI_SCHEMES = frozenset({"http", "https", "ws", "wss"})
+_NETWORK_ENCODED_AMBIGUITY = re.compile(
+    r"%(?:25)*(?:0[0-9a-f]|1[0-9a-f]|20|5c|7f)", re.IGNORECASE
+)
+_NETWORK_FORBIDDEN_UNICODE_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
+_CLASSIFICATION_MAX_BYTES = 256_000
+_CLASSIFICATION_MAX_DECODE_PASSES = 64
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_SCOPED_PACKAGE = re.compile(r"^@[^/\\\s]+/[^/\\\s]+$")
+_PACKAGE_SPEC = re.compile(
+    r"^(?:@[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*|"
+    r"[A-Za-z0-9][A-Za-z0-9._-]*)(?:@[A-Za-z0-9][A-Za-z0-9._+*~^<>=|-]*)?$"
+)
+_PACKAGE_ASSIGNMENT_OPTIONS = {
+    "npx": frozenset({"--package", "-p"}),
+    "uvx": frozenset({"--from", "--with", "-w", "--with-editable"}),
+}
+_PYTHON_EXECUTABLE = re.compile(r"pythonw?(?:3(?:\.\d+)?)?")
+_PYTHON_MODULE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
+_CLOSURE_ERROR = (
+    "package_mcp_unavailable: authenticated local MCP runtime closure cannot be "
+    "proven; place the Python server and every local dependency in the workflow "
+    "package, reference them with canonical relative paths, then re-trust and "
+    "start a new run"
+)
+
+
+def _authority_relative(
+    value: str, source_root: Path, *, compound: bool = False
+) -> tuple[str, str] | None:
+    option, candidate = _path_candidate(value, compound=compound)
+    prefix = f"{option}=" if option else ""
+    if candidate.startswith("./"):
+        candidate = candidate[2:]
+    path = Path(candidate)
+    if path.is_absolute():
+        try:
+            candidate = path.relative_to(source_root).as_posix()
+        except ValueError:
+            return None
+    try:
+        return prefix, _canonical_authority_relative(candidate)
+    except PackageMCPUnavailable:
+        return None
+
+
+def _has_valid_percent_syntax(value: str) -> bool:
+    return all(
+        character != "%"
+        or (
+            index + 2 < len(value)
+            and value[index + 1] in _HEX_DIGITS
+            and value[index + 2] in _HEX_DIGITS
+        )
+        for index, character in enumerate(value)
+    )
+
+
+def _contains_forbidden_network_characters(value: str) -> bool:
+    return "\\" in value or any(
+        character.isspace()
+        or unicodedata.category(character) in _NETWORK_FORBIDDEN_UNICODE_CATEGORIES
+        for character in value
+    )
+
+
+def _has_ambiguous_network_encoding(value: str) -> bool:
+    decoded = value
+    max_passes = min(max(len(value), 1), _CLASSIFICATION_MAX_DECODE_PASSES)
+    for _ in range(max_passes):
+        if _contains_forbidden_network_characters(decoded):
+            return True
+        if "%" not in decoded or not _has_valid_percent_syntax(decoded):
+            return False
+        try:
+            expanded = unquote(decoded, errors="strict")
+        except UnicodeDecodeError:
+            return True
+        if len(expanded) >= len(decoded):
+            return False
+        decoded = expanded
+    return True
+
+
+def _supported_network_url(candidate: str) -> bool:
+    if (
+        not candidate
+        or _has_ambiguous_network_encoding(candidate)
+        or not _has_valid_percent_syntax(candidate)
+        or _NETWORK_ENCODED_AMBIGUITY.search(candidate) is not None
+    ):
+        return False
+    try:
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        parsed.port
+    except (UnicodeError, ValueError):
+        return False
+    if (
+        parsed.scheme.lower() not in _NETWORK_URI_SCHEMES
+        or not parsed.netloc
+        or not hostname
+        or "%" in parsed.netloc
+    ):
+        return False
+    userinfo, separator, authority = parsed.netloc.rpartition("@")
+    if not separator:
+        authority = parsed.netloc
+    elif not userinfo or "@" in userinfo:
+        return False
+    if authority.endswith(":"):
+        return False
+    if authority.startswith("["):
+        closing = authority.find("]")
+        suffix = authority[closing + 1 :]
+        if closing < 0 or (suffix and re.fullmatch(r":[0-9]+", suffix) is None):
+            return False
+        try:
+            ipaddress.IPv6Address(hostname)
+        except ValueError:
+            return False
+    elif authority.count(":") > 1:
+        return False
+    if re.fullmatch(r"[0-9.]+", hostname):
+        try:
+            ipaddress.IPv4Address(hostname)
+        except ValueError:
+            return False
+    try:
+        hostname.encode("idna")
+    except UnicodeError:
+        return False
+    return True
+
+
+def _supported_network_view(value: str, *, compound: bool) -> bool:
+    candidate = value
+    if compound:
+        assignment = _COMPOUND_OPTION_ASSIGNMENT.fullmatch(candidate)
+        if assignment is not None:
+            candidate = assignment.group("value")
+    return _supported_network_url(candidate)
+
+
+def _normalized_classification_value(value: str, *, compound: bool) -> str:
+    """Return a bounded, unambiguous view used only for safety classification."""
+    try:
+        encoded_size = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise PackageMCPUnavailable(_CLOSURE_ERROR) from exc
+    if encoded_size > _CLASSIFICATION_MAX_BYTES:
+        raise PackageMCPUnavailable(_CLOSURE_ERROR)
+    normalized = value
+    max_passes = min(max(len(value), 1), _CLASSIFICATION_MAX_DECODE_PASSES)
+    for _ in range(max_passes):
+        if _supported_network_view(normalized, compound=compound):
+            return normalized
+        if "%" not in normalized:
+            return normalized
+        if not _has_valid_percent_syntax(normalized):
+            raise PackageMCPUnavailable(_CLOSURE_ERROR)
+        try:
+            expanded = unquote(normalized, errors="strict")
+        except UnicodeDecodeError as exc:
+            raise PackageMCPUnavailable(_CLOSURE_ERROR) from exc
+        if len(expanded) >= len(normalized):
+            raise PackageMCPUnavailable(_CLOSURE_ERROR)
+        normalized = expanded
+    raise PackageMCPUnavailable(_CLOSURE_ERROR)
+
+
+def _path_candidate(value: str, *, compound: bool = False) -> tuple[str, str]:
+    normalized = _normalized_classification_value(value, compound=compound)
+    if compound:
+        match = _COMPOUND_OPTION_ASSIGNMENT.fullmatch(normalized)
+        if match is not None:
+            return match.group("option"), match.group("value")
+    return "", normalized
+
+
+def _uri_disposition(value: str, *, compound: bool = False) -> str | None:
+    """Classify explicit URIs without consulting mutable filesystem state."""
+    candidate = _path_candidate(value, compound=compound)[1]
+    if _supported_network_url(candidate):
+        return "network"
+    match = _URI_SCHEME.fullmatch(candidate)
+    if match is None:
+        return None
+    return "unsafe"
+
+
+def _looks_path_like(value: str, *, compound: bool = False) -> bool:
+    option, candidate = _path_candidate(value, compound=compound)
+    uri_disposition = _uri_disposition(value, compound=compound)
+    if uri_disposition == "network":
+        return False
+    if uri_disposition == "unsafe":
+        return True
+    if not candidate:
+        return False
+    if (
+        candidate.startswith(("./", "../", ".\\", "..\\", "/", "~"))
+        or "/" in candidate
+        or "\\" in candidate
+        or re.match(r"^[A-Za-z]:", candidate)
+        or Path(candidate).suffix.lower() in _PATHLIKE_EXTENSIONS
+    ):
+        return True
+    return bool(option and _PATH_OPTION.fullmatch(option))
+
+
+def _is_package_spec_argument(value: str, executable: str) -> bool:
+    options = _PACKAGE_ASSIGNMENT_OPTIONS.get(executable)
+    if options is None:
+        return False
+    option, candidate = _path_candidate(value, compound=True)
+    if option:
+        return option in options and _PACKAGE_SPEC.fullmatch(candidate) is not None
+    return _SCOPED_PACKAGE.fullmatch(candidate) is not None
+
+
+def _finalize_authenticated_mcp_config(
+    servers: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    finalized: dict[str, dict[str, Any]] = {}
+    validated: dict[str, tuple[Path, Path, dict[str, dict[str, object]]]] = {}
+    for name, raw in servers.items():
+        config = dict(raw)
+        descriptor = config.pop(_AUTHORITY_DESCRIPTOR_KEY, None)
+        if descriptor is None:
+            finalized[name] = config
+            continue
+        if not isinstance(descriptor, dict):
+            raise PackageMCPUnavailable(
+                "package_mcp_unavailable: authenticated MCP authority is invalid"
+            )
+        try:
+            cache_key = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise PackageMCPUnavailable(
+                "package_mcp_unavailable: authenticated MCP authority is invalid"
+            ) from exc
+        authority = validated.get(cache_key)
+        if authority is None:
+            authority = _validate_authority_descriptor(descriptor)
+            validated[cache_key] = authority
+        root, source_root, files = authority
+        command = config.get("command")
+        args = config.get("args", [])
+        local_references: set[str] = set()
+
+        def reject_unproven() -> None:
+            raise PackageMCPUnavailable(_CLOSURE_ERROR)
+
+        def rewrite(
+            value: object,
+            *,
+            compound: bool = False,
+            required: bool = False,
+            path_hint: bool = False,
+            allow_path_literal: bool = False,
+        ) -> tuple[object, str | None]:
+            if not isinstance(value, str):
+                if required:
+                    reject_unproven()
+                return value, None
+            reference = _authority_relative(value, source_root, compound=compound)
+            if reference is None:
+                if required or path_hint or (
+                    not allow_path_literal
+                    and _looks_path_like(value, compound=compound)
+                ):
+                    reject_unproven()
+                return value, None
+            prefix, relative = reference
+            if relative not in files:
+                candidate = _path_candidate(value, compound=compound)[1]
+                path = Path(candidate)
+                if path.is_absolute():
+                    try:
+                        path.relative_to(source_root)
+                    except ValueError:
+                        pass
+                    else:
+                        raise PackageMCPUnavailable(
+                            "package_mcp_unavailable: authenticated MCP authority changed"
+                        )
+                if required or path_hint or (
+                    not allow_path_literal
+                    and _looks_path_like(value, compound=compound)
+                ):
+                    reject_unproven()
+                return value, None
+            local_references.add(relative)
+            return f"{prefix}{root.joinpath(*Path(relative).parts)}", relative
+
+        if command is None and isinstance(config.get("url"), str):
+            if _uri_disposition(config["url"]) != "network":
+                reject_unproven()
+            finalized[name] = config
+            continue
+        if not isinstance(command, str) or not command:
+            raise PackageMCPUnavailable(
+                "package_mcp_unavailable: authenticated MCP launch config is invalid"
+            )
+        if not isinstance(args, list):
+            raise PackageMCPUnavailable(
+                "package_mcp_unavailable: authenticated MCP launch config is invalid"
+            )
+        executable = re.split(r"[/\\]", command)[-1].lower().removesuffix(".exe")
+        is_python = _PYTHON_EXECUTABLE.fullmatch(executable) is not None
+        command_path_hint = _looks_path_like(command) and not is_python
+        rewritten_command, _command_relative = rewrite(
+            command,
+            path_hint=command_path_hint,
+            allow_path_literal=is_python,
+        )
+        config["command"] = rewritten_command
+
+        rewritten: list[str] = []
+        argument_references: list[str | None] = []
+        for index, value in enumerate(args):
+            if not isinstance(value, str):
+                raise PackageMCPUnavailable(
+                    "package_mcp_unavailable: authenticated MCP launch config is invalid"
+                )
+            package_spec = _is_package_spec_argument(value, executable)
+            python_code = is_python and index > 0 and args[index - 1] == "-c"
+            rewritten_value, relative = rewrite(
+                value,
+                compound=True,
+                path_hint=(
+                    not package_spec
+                    and not python_code
+                    and _looks_path_like(value, compound=True)
+                ),
+                allow_path_literal=package_spec or python_code,
+            )
+            rewritten.append(str(rewritten_value))
+            argument_references.append(relative)
+        rewritten_env = config.get("env")
+        if rewritten_env is not None and not isinstance(rewritten_env, dict):
+            raise PackageMCPUnavailable(
+                "package_mcp_unavailable: authenticated MCP launch config is invalid"
+            )
+        if isinstance(rewritten_env, dict):
+            rewritten_environment: dict[object, object] = {}
+            for key, value in rewritten_env.items():
+                path_hint = (
+                    isinstance(value, str)
+                    and (
+                        _looks_path_like(value)
+                        or (isinstance(key, str) and _PATH_ENV.search(key) is not None)
+                    )
+                )
+                rewritten_environment[key] = rewrite(value, path_hint=path_hint)[0]
+            config["env"] = rewritten_environment
+        runtime_files = config.get("runtime_files")
+        if runtime_files is not None:
+            if not isinstance(runtime_files, list):
+                raise PackageMCPUnavailable(
+                    "package_mcp_unavailable: authenticated MCP launch config is invalid"
+                )
+            config["runtime_files"] = [
+                rewrite(value, required=True)[0] for value in runtime_files
+            ]
+
+        if is_python:
+            isolated_args = rewritten[1:] if rewritten[:1] == ["-I"] else rewritten
+            isolated_refs = (
+                argument_references[1:]
+                if rewritten[:1] == ["-I"]
+                else argument_references
+            )
+            if isolated_args[:1] == ["-c"]:
+                if len(isolated_args) < 2:
+                    raise PackageMCPUnavailable(
+                        "package_mcp_unavailable: authenticated MCP launch config is invalid"
+                    )
+                config["args"] = ["-I", *isolated_args]
+            elif isolated_args[:1] == ["-m"]:
+                if (
+                    len(isolated_args) < 2
+                    or _PYTHON_MODULE.fullmatch(isolated_args[1]) is None
+                ):
+                    reject_unproven()
+                config["args"] = ["-I", *isolated_args]
+            else:
+                entry = isolated_refs[0] if isolated_refs else None
+                if (
+                    entry is None
+                    or not entry.lower().endswith((".py", ".pyw"))
+                    or not isolated_args
+                ):
+                    reject_unproven()
+                config["args"] = [
+                    "-I",
+                    "-c",
+                    _AUTHORITY_LOADER,
+                    str(root),
+                    entry,
+                    *isolated_args[1:],
+                ]
+            config[_AUTHORITY_CWD_KEY] = str(root)
+        elif local_references:
+            reject_unproven()
+        else:
+            config["args"] = rewritten
+        finalized[name] = config
+    return finalized
+
 
 _ARCHON_HOOK_EVENT_MAP = {
     "PreToolUse": "pre_tool_call",
@@ -420,6 +1195,7 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             str(name): worker_mcp._interpolate_env_vars(dict(config))
             for name, config in raw_mcp.items()
         }
+        resolved_mcp = _finalize_authenticated_mcp_config(resolved_mcp)
         enabled_mcp_names = {
             name
             for name, config in resolved_mcp.items()
@@ -603,9 +1379,7 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             history = None
             if request.context_mode == "shared":
                 if session_db.get_session(request.session_id) is None:
-                    raise ValueError(
-                        "session_id does not identify an existing session"
-                    )
+                    raise ValueError("session_id does not identify an existing session")
                 history = session_db.get_messages_as_conversation(request.session_id)
 
             prompt = request.prompt
@@ -732,10 +1506,7 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             if node_hook_manager is not None and original_node_hooks is not None:
                 node_hook_manager._hooks.clear()
                 node_hook_manager._hooks.update(original_node_hooks)
-            if (
-                node_hook_manager is not None
-                and original_node_middleware is not None
-            ):
+            if node_hook_manager is not None and original_node_middleware is not None:
                 node_hook_manager._middleware.clear()
                 node_hook_manager._middleware.update(original_node_middleware)
         finally:

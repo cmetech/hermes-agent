@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 import yaml
 
 from agent.plugin_agent import PluginAgentRunResult, PluginAgentRunner
+from agent.plugin_agent_worker import _finalize_authenticated_mcp_config
 from hermes_cli.plugin_services import BackgroundServiceContext
 from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
 from plugins.workflow.admission import RunAdmissionRequest
@@ -38,6 +39,7 @@ import plugins.workflow.api_admission as api_admission_module
 import plugins.workflow.catalog_api as catalog_api_module
 import plugins.workflow.runner_binding as runner_binding_module
 import plugins.workflow.showcase as showcase_module
+from tools.mcp_tool import _interpolate_env_vars
 from plugins.workflow.trust import (
     WorkflowResourceReadBudget,
     WorkflowTrustStore,
@@ -54,6 +56,46 @@ EXPECTED_MCP_SERVERS = {
 }
 
 
+def _assert_authenticated_mcp_servers(
+    servers,
+    *,
+    require_live_authority: bool = True,
+) -> Path:
+    assert set(servers) == {"echo"}
+    server = servers["echo"]
+    assert server["command"] == "python"
+    assert server["env"] == {}
+    assert server["args"] == ["mcp/echo-server.py"]
+    authority = server["__hermes_authenticated_local_mcp"]
+    assert authority["version"] == 2
+    assert authority["file_count"] > 0
+    assert authority["total_bytes"] > 0
+    assert "entry" not in authority
+    assert "files" not in authority
+    authority_root = Path(authority["root"])
+    payload_root = authority_root / authority["payload"]
+    assert authority_root.is_absolute()
+    assert "hermes-workflow-authority-" in authority_root.as_posix()
+    if not require_live_authority:
+        return authority_root
+    assert authority_root.is_dir()
+
+    # Match the real worker boundary exactly: JSON-carried config first resolves
+    # environment placeholders, then validates and finalizes the private launch.
+    interpolated = {
+        name: _interpolate_env_vars(dict(config)) for name, config in servers.items()
+    }
+    finalized = _finalize_authenticated_mcp_config(interpolated)["echo"]
+    assert finalized["args"][0:2] == ["-I", "-c"]
+    assert "runpy.run_path" in finalized["args"][2]
+    assert finalized["args"][3:5] == [
+        str(payload_root),
+        "mcp/echo-server.py",
+    ]
+    assert finalized["__hermes_private_mcp_cwd"] == str(payload_root)
+    return authority_root
+
+
 class CapabilityDeclaringRecordingRunner:
     """Record sealed requests without claiming to start their MCP servers."""
 
@@ -62,7 +104,7 @@ class CapabilityDeclaringRecordingRunner:
 
     def run(self, request, *, is_cancelled=None) -> PluginAgentRunResult:
         assert is_cancelled is None or not is_cancelled()
-        assert request.mcp_servers == EXPECTED_MCP_SERVERS
+        _assert_authenticated_mcp_servers(request.mcp_servers)
         assert request.allowed_tools is None
         self.requests.append(request)
         return PluginAgentRunResult(
@@ -493,10 +535,12 @@ def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
             "shared",
         ]
         assert len(recording_runner.requests) == 2
-        assert all(
-            request.mcp_servers == EXPECTED_MCP_SERVERS
-            for request in recording_runner.requests
-        )
+        for request in recording_runner.requests:
+            authority_root = _assert_authenticated_mcp_servers(
+                request.mcp_servers,
+                require_live_authority=False,
+            )
+            assert not authority_root.exists()
         assert trust_store.path.read_bytes() == trust_before
         assert _persisted_start_digest(store, run_id) == (
             RunStore._start_digest_from_projection(store.get_run_status(run_id))

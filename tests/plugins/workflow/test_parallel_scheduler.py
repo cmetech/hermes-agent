@@ -148,6 +148,7 @@ def test_ready_layers_are_replenished_fairly_across_active_runs(
     first_wave = []
     active = 0
     maximum = 0
+    first_wave_barrier = threading.Barrier(2)
 
     class RecordingExecutor:
         def execute(self, context):
@@ -156,7 +157,8 @@ def test_ready_layers_are_replenished_fairly_across_active_runs(
                 active += 1
                 maximum = max(maximum, active)
                 first_wave.append(context.workflow_name)
-            time.sleep(0.05)
+            if len(first_wave) <= 2:
+                first_wave_barrier.wait(timeout=10)
             with lock:
                 active -= 1
             return NodeExecutionResult("succeeded")

@@ -11,6 +11,7 @@ from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.models import WorkflowValidationError
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.trust import (
+    WorkflowResourceReadBudget,
     WorkflowTrustError,
     WorkflowTrustStore,
     build_risk_summary,
@@ -28,11 +29,18 @@ def _package(workflow_writer, root):
     (root / "scripts" / "helper.py").write_text("print('ok')\n", encoding="utf-8")
     (root / "mcp").mkdir()
     (root / "mcp" / "echo.yaml").write_text(
-        "command: python\nargs: [servers/echo.py]\nenv: {TOKEN: '${TOKEN}'}\n",
+        "command: python\n"
+        "args: [servers/echo.py, --config=config/settings.json]\n"
+        "runtime_files: [data/value.txt]\n"
+        "env: {TOKEN: '${TOKEN}'}\n",
         encoding="utf-8",
     )
     (root / "servers").mkdir()
     (root / "servers" / "echo.py").write_text("print('echo')\n", encoding="utf-8")
+    (root / "config").mkdir()
+    (root / "config" / "settings.json").write_text("{}\n", encoding="utf-8")
+    (root / "data").mkdir()
+    (root / "data" / "value.txt").write_text("sealed\n", encoding="utf-8")
     path = workflow_writer(
         root / "workflows",
         name="risky",
@@ -73,6 +81,8 @@ def test_digest_covers_yaml_sidecar_and_executable_resources(workflow_writer, tm
 
     assert original.covered_relative_paths == (
         "commands/audit.md",
+        "config/settings.json",
+        "data/value.txt",
         "mcp/echo.yaml",
         "scripts/helper.py",
         "servers/echo.py",
@@ -86,6 +96,60 @@ def test_digest_covers_yaml_sidecar_and_executable_resources(workflow_writer, tm
         target = clone_root / relative_path
         target.write_bytes(target.read_bytes() + b"# mutation\n")
         assert compute_package_digest(clone).sha256 != original.sha256
+
+
+@pytest.mark.parametrize("mutation", ["delete", "rename", "symlink"])
+def test_cached_mcp_transitive_digest_survives_mutable_path_races(
+    workflow_writer, tmp_path, mutation
+):
+    package = _package(workflow_writer, tmp_path / "package")
+    covered = compute_package_digest(package).covered_relative_paths
+    contents = {
+        relative: (package.root / relative).read_bytes() for relative in covered
+    }
+    authority = WorkflowResourceReadBudget.from_authenticated(package.root, contents)
+    expected = compute_package_digest(package, read_budget=authority)
+    target = package.root / "config/settings.json"
+    if mutation == "delete":
+        target.unlink()
+    elif mutation == "rename":
+        target.rename(target.with_suffix(".gone"))
+    else:
+        target.unlink()
+        target.symlink_to(tmp_path / "outside.json")
+
+    observed = compute_package_digest(package, read_budget=authority)
+
+    assert observed == expected
+    assert "config/settings.json" in observed.covered_relative_paths
+
+
+@pytest.mark.parametrize("mutation", ["delete", "rename", "replace", "symlink"])
+def test_mutable_boundary_verification_still_detects_cached_resource_races(
+    workflow_writer, tmp_path, mutation
+):
+    package = _package(workflow_writer, tmp_path / "package")
+    target = package.root / "config/settings.json"
+    authority = WorkflowResourceReadBudget(
+        max_file_bytes=1024 * 1024,
+        max_total_bytes=8 * 1024 * 1024,
+        max_files=512,
+    )
+    authority.read(target)
+    if mutation == "delete":
+        target.unlink()
+    elif mutation == "rename":
+        target.rename(target.with_suffix(".gone"))
+    elif mutation == "replace":
+        target.write_bytes(b"[]\n")
+    else:
+        outside = tmp_path / "outside.json"
+        outside.write_bytes(b"{}\n")
+        target.unlink()
+        target.symlink_to(outside)
+
+    with pytest.raises(OSError):
+        authority.read(target, verify_cached_identity=True)
 
 
 def test_moving_identical_package_preserves_digest_but_not_profile_trust(

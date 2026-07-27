@@ -19,7 +19,11 @@ from plugins.workflow.executors.base import (
     conservative_provider_retry_count,
     validated_provider_retry_count,
 )
-from plugins.workflow.resources import ResourceResolver, VariableContext
+from plugins.workflow.resources import (
+    AuthenticatedExecutionMaterializer,
+    ResourceResolver,
+    VariableContext,
+)
 from plugins.workflow.sessions import NodeSessionKey, NodeSessionRegistry
 from plugins.workflow.store import ArtifactRef
 
@@ -91,7 +95,11 @@ class AgentNodeExecutor:
         node = context.node
         if node.node_type == "command":
             template = (
-                ResourceResolver(context.run_directory).command(str(node.value)).body
+                ResourceResolver(
+                    context.run_directory,
+                    sealed_paths=context.sealed_resource_paths,
+                    sealed_bytes=context.sealed_resource_bytes,
+                ).command(str(node.value)).body
             )
         else:
             template = str(node.value)
@@ -99,11 +107,12 @@ class AgentNodeExecutor:
         if not isinstance(variables, VariableContext):
             variables = VariableContext(workflow_id=context.run_id)
         prompt = variables.render_prompt(template)
-        skill_path = context.run_directory / "node-skills" / f"{node.id}.md"
         if node.options.get("skills"):
-            if not skill_path.is_file():
-                raise ValueError(f"snapshotted skills are missing for node {node.id}")
-            skill_text = skill_path.read_text(encoding="utf-8")
+            skill_text = ResourceResolver(
+                context.run_directory,
+                sealed_paths=context.sealed_resource_paths,
+                sealed_bytes=context.sealed_resource_bytes,
+            ).text(f"node-skills/{node.id}.md")
             prompt = f"{skill_text}\n\n{prompt}"
         return prompt
 
@@ -124,17 +133,13 @@ class AgentNodeExecutor:
                     denied.append(forbidden)
             instructions = ""
             if raw.get("skills"):
-                path = (
-                    context.run_directory
-                    / "node-agent-skills"
-                    / context.node.id
-                    / f"{agent_id}.md"
+                instructions = ResourceResolver(
+                    context.run_directory,
+                    sealed_paths=context.sealed_resource_paths,
+                    sealed_bytes=context.sealed_resource_bytes,
+                ).text(
+                    f"node-agent-skills/{context.node.id}/{agent_id}.md"
                 )
-                if not path.is_file():
-                    raise ValueError(
-                        f"snapshotted inline-agent skills are missing for {agent_id}"
-                    )
-                instructions = path.read_text(encoding="utf-8")
             definitions[str(agent_id)] = {
                 "description": str(raw["description"]),
                 "prompt": str(raw["prompt"]),
@@ -150,6 +155,7 @@ class AgentNodeExecutor:
         node = context.node
         if node.node_type not in {"command", "prompt"}:
             return self._failure("unsupported_ai_node", node.node_type)
+        materializer: AuthenticatedExecutionMaterializer | None = None
         try:
             agent_runner = entitled_agent_runner(
                 context.ai_entitlement,
@@ -270,9 +276,16 @@ class AgentNodeExecutor:
                 for event, entries in node.options.get("hooks", {}).items()
                 for entry in entries
             )
+            if "mcp" in node.options and context.sealed_resource_bytes is not None:
+                materializer = AuthenticatedExecutionMaterializer()
             mcp_servers = (
-                ResourceResolver(context.run_directory).mcp_servers(
-                    str(node.options["mcp"])
+                ResourceResolver(
+                    context.run_directory,
+                    sealed_paths=context.sealed_resource_paths,
+                    sealed_bytes=context.sealed_resource_bytes,
+                ).mcp_servers(
+                    str(node.options["mcp"]),
+                    materializer=materializer,
                 )
                 if "mcp" in node.options
                 else None
@@ -412,6 +425,9 @@ class AgentNodeExecutor:
                     )
                 },
             )
+        finally:
+            if materializer is not None:
+                materializer.cleanup()
 
         metadata: dict[str, object] = {
             "session_id": result.session_id,

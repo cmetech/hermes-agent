@@ -115,6 +115,13 @@ function CatalogRow({
                 ? t.operations.workflowSourceProfile
                 : t.operations.workflowSourceProject}
           </span>
+          {item.language ? (
+            <Badge variant={item.language.legacy ? 'muted' : 'default'}>
+              {item.language.legacy
+                ? t.operations.workflowLanguageLegacy
+                : t.operations.workflowLanguageArchon}
+            </Badge>
+          ) : null}
           {item.compatibility?.runnable === false ? (
             <Badge variant="warn">{t.operations.workflowIncompatible}</Badge>
           ) : null}

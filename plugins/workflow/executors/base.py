@@ -61,6 +61,8 @@ class NodeExecutionContext:
             wait_timeout_seconds=2,
         )
     )
+    sealed_resource_paths: frozenset[str] | None = None
+    sealed_resource_bytes: Mapping[str, bytes] | None = None
 
 
 @dataclass(frozen=True)

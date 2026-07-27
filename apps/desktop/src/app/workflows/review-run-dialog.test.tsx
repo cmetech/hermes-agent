@@ -263,6 +263,34 @@ describe('Review & Run workflow dialog', () => {
     expect($notifications.get()[0]?.message).toBe('Started')
   })
 
+  it('reviews the server-authored language profile beside digest-bound trust and risk', async () => {
+    catalogDefinition = definition({
+      language: { effective_profile: 'hermes-legacy', legacy: true }
+    })
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        language: {
+          declared_profile: 'archon-2026-07',
+          effective_profile: 'archon-2026-07',
+          legacy: false,
+          normalized_definition_digest: 'd'.repeat(64),
+          normalizer_version: 1
+        },
+        risk_summary: { package_digest: 'p'.repeat(64), risk_level: 'low' }
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(within(dialog).getByText('Archon 2026-07')).toBeTruthy()
+    expect(within(dialog).getByText('Normalizer 1')).toBeTruthy()
+    const digest = within(dialog).getByText('dddddddddddd…')
+    expect(digest.getAttribute('title')).toBe('d'.repeat(64))
+    expect(within(dialog).queryByText('Legacy semantics')).toBeNull()
+    expect(within(dialog).getByText('p'.repeat(64))).toBeTruthy()
+  })
+
   it('derives schedule eligibility from run support and normalizes the local picker instant', async () => {
     catalogDefinition = definition({
       run_support: { reason: 'schedule_required', supported: false },
@@ -896,6 +924,33 @@ describe('Review & Run workflow dialog', () => {
     expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
       0
     )
+  })
+
+  it('does not derive Run eligibility from definition fields or finding codes', async () => {
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        compatibility: {
+          findings: [
+            {
+              blocking: true,
+              code: 'server-only-finding',
+              level: 'unsupported',
+              message: 'Server-authored advisory',
+              path: 'nodes[0].timeout'
+            }
+          ],
+          level: 'unsupported',
+          runnable: true
+        },
+        definition: { name: WORKFLOW_NAME, nodes: [{ id: 'start', timeout: 5 }] }
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(false)
+    expect(within(dialog).queryByText('Server-authored advisory')).toBeNull()
   })
 
   it('shows a global validation message when the rejected field is not rendered', async () => {

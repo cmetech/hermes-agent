@@ -239,6 +239,9 @@ jobs:
           - index: 4
             files: >-
               tests/plugins/workflow/test_ai_extensions_middleware_e2e.py
+              tests/plugins/workflow/test_language.py
+              tests/plugins/workflow/test_language_snapshot.py
+              tests/plugins/workflow/test_language_schema.py
               tests/plugins/workflow/test_scheduling_middleware_e2e.py
               tests/plugins/workflow/test_showcase_catalog.py
               tests/plugins/workflow/test_coordinator_multiprocess.py
@@ -247,6 +250,7 @@ jobs:
               tests/plugins/workflow/test_runner_binding.py
               tests/plugins/workflow/test_portable_compatibility_e2e.py
               tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
+              tests/plugins/workflow/test_workflow_language_desktop_e2e.py
               tests/plugins/workflow/test_shutdown_recovery.py
               tests/plugins/workflow/test_schema_migrations.py
               tests/plugins/workflow/test_evidence_api.py
@@ -280,7 +284,7 @@ jobs:
           NOUS_API_KEY: ""
           PYTHONUTF8: "1"
         run: |
-          uv run --no-sync python -m pytest -q ${{ matrix.slice.files }}
+          uv run --no-sync bash scripts/run_tests.sh ${{ matrix.slice.files }} -q
 
   # ─────────────────────────────────────────────────────────────────────
   # Live-updating PR review comment.

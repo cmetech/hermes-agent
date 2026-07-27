@@ -4,6 +4,7 @@ from pathlib import Path
 import os
 import re
 import subprocess
+import sys
 
 import yaml
 
@@ -11,6 +12,26 @@ import yaml
 ROOT = Path(__file__).parents[2]
 GATE = ROOT / "scripts/test_workflow_merge_gate.sh"
 CI = ROOT / ".github/workflows/ci.yml"
+MANIFEST = ROOT / "docs/upstream-customizations/workflow-orchestration.yaml"
+CUSTOMIZATION_CHECKER = ROOT / "scripts/check_upstream_customizations.py"
+PHASE_1_LANGUAGE_BACKEND_SUITES = (
+    "tests/plugins/workflow/test_language.py",
+    "tests/plugins/workflow/test_language_snapshot.py",
+    "tests/plugins/workflow/test_language_schema.py",
+    "tests/plugins/workflow/test_workflow_language_desktop_e2e.py",
+)
+PHASE_1_LANGUAGE_DESKTOP_SUITES = (
+    "src/app/workflows/index.test.tsx",
+    "src/app/workflows/view-workflow-dialog.test.tsx",
+)
+PHASE_1_LANGUAGE_CUSTOMIZATION_IDS = {
+    "workflow-language-contracts",
+    "workflow-language-profile-normalization",
+    "workflow-language-admission-pinning",
+    "workflow-language-schema-cli",
+    "workflow-language-desktop-status",
+    "workflow-language-authoring-reference",
+}
 WORKFLOW_GATE_OPTOUTS = {
     path: "covered by the standard Python suite; outside the focused release gates"
     for path in (
@@ -60,6 +81,25 @@ EXPECTED_SHOWCASE_IDS = {
     "resilience",
     "scheduling",
 }
+
+
+def test_live_customization_ledger_has_one_rehearsable_upstream_baseline() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CUSTOMIZATION_CHECKER),
+            "--manifest",
+            str(MANIFEST),
+            "--print-verified-upstream",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert re.fullmatch(r"[0-9a-f]{40}\n", result.stdout)
 
 
 def test_merge_gate_references_only_existing_invariant_tests() -> None:
@@ -158,6 +198,25 @@ def test_portability_slices_cover_every_pinned_file_exactly_once() -> None:
     # surface as a confusing "file or directory not found" inside CI.
     missing = [path for path in files if not (ROOT / path).is_file()]
     assert not missing, f"portability slices name files that do not exist: {missing}"
+
+
+def test_portability_job_uses_uv_with_the_cross_platform_isolated_runner() -> None:
+    job = yaml.safe_load(CI.read_text())["jobs"]["workflow-portability"]
+    step = next(
+        item
+        for item in job["steps"]
+        if item.get("name") == "Run portable workflow and installed-showcase gates"
+    )
+
+    assert step["shell"] == "bash"
+    assert step["run"].strip() == (
+        "uv run --no-sync bash scripts/run_tests.sh "
+        "${{ matrix.slice.files }} -q"
+    )
+    assert "python -m pytest" not in step["run"]
+    runner = (ROOT / "scripts/run_tests.sh").read_text()
+    assert 'PYTHONUTF8="${PYTHONUTF8:-1}"' in runner
+    assert "Scripts/python.exe" in runner
 
 
 def test_laptop_diagnostic_middleware_e2e_is_exactly_pinned_in_release_gates() -> None:
@@ -268,6 +327,31 @@ def test_merge_gate_pins_desktop_review_run_contract() -> None:
     assert "src/components/assistant-ui/embeds/workflow-topology.test.tsx" in source
 
 
+def test_phase_1_language_contracts_are_pinned_in_base_gate() -> None:
+    source = GATE.read_text()
+
+    for path in PHASE_1_LANGUAGE_BACKEND_SUITES + PHASE_1_LANGUAGE_DESKTOP_SUITES:
+        assert source.count(path) == 1
+
+
+def test_phase_1_language_contracts_are_pinned_in_native_matrix() -> None:
+    source = CI.read_text()
+    portable_files = _portability_files()
+
+    for path in PHASE_1_LANGUAGE_BACKEND_SUITES:
+        assert source.count(path) == 1
+        assert portable_files.count(path) == 1
+
+
+def test_phase_1_language_customizations_and_regression_gate_are_tracked() -> None:
+    customization_ids = {
+        entry["id"] for entry in yaml.safe_load(MANIFEST.read_text())["upstream_changes"]
+    }
+
+    assert PHASE_1_LANGUAGE_CUSTOMIZATION_IDS <= customization_ids
+    assert "workflow-language-regression-gates" in customization_ids
+
+
 def test_native_workflow_matrix_covers_every_release_gate() -> None:
     source = CI.read_text()
 
@@ -312,6 +396,13 @@ def test_merge_gate_shares_workspace_root_dependencies_with_temp_worktrees() -> 
 
     assert 'ln -s "$SHARED_ROOT/node_modules" node_modules' in source
     assert '[[ -d node_modules ]]' in source
+
+
+def test_base_gate_uses_the_canonical_per_file_test_runner() -> None:
+    source = GATE.read_text()
+
+    assert source.count('"$ROOT/scripts/run_tests.sh"') == 2
+    assert '"$PYTHON_BIN" -m pytest' not in source
 
 
 def test_merge_gate_rejects_invalid_phase_and_unknown_brand() -> None:
@@ -430,3 +521,22 @@ def test_base_gate_propagates_customization_checker_failure(tmp_path: Path) -> N
     )
 
     assert result.returncode == 9
+
+
+def test_gate_resolves_relative_python_before_switching_repositories(
+    tmp_path: Path,
+) -> None:
+    repo, _base = _brand_repo(tmp_path)
+    env = os.environ.copy()
+    env["WORKFLOW_MERGE_GATE_FAST"] = "1"
+    env["PYTHON_BIN"] = os.path.relpath(sys.executable, ROOT)
+
+    result = subprocess.run(
+        [GATE, "--repo", repo, "--phase", "base"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr

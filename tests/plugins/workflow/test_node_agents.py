@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from agent.plugin_agent import PluginAgentRunResult
 from agent.plugin_agent_worker import _build_inline_agent_handler
 from plugins.workflow.executors.ai import AgentNodeExecutor
@@ -47,6 +49,49 @@ def test_declared_agents_are_scoped_and_aliases_resolve_without_delegate(tmp_pat
     assert child["denied_tools"] == ["terminal", "delegate_task"]
     assert child["max_iterations"] == 3
     assert "delegate_task" in runner.requests[0].denied_tools
+
+
+@pytest.mark.parametrize("mutation", ["delete", "rename", "replace"])
+def test_inline_agent_skill_uses_authenticated_bytes_without_reopening_source(
+    tmp_path, mutation
+):
+    runner = FakeAgentRunner("done")
+    node = _node(
+        "parent",
+        "coordinate",
+        agents={
+            "reviewer": {
+                "description": "Review evidence",
+                "prompt": "Review it",
+                "skills": ["reviewing"],
+            }
+        },
+    )
+    relative = "node-agent-skills/parent/reviewer.md"
+    skill = tmp_path / "run" / relative
+    skill.parent.mkdir(parents=True)
+    authenticated = b"AUTHENTICATED CHILD SKILL"
+    skill.write_bytes(authenticated)
+    context = _context(
+        tmp_path,
+        node,
+        sealed_resource_paths=frozenset({relative}),
+        sealed_resource_bytes={relative: authenticated},
+    )
+    if mutation == "delete":
+        skill.unlink()
+    elif mutation == "rename":
+        skill.rename(skill.with_suffix(".gone"))
+    else:
+        skill.write_text("FORGED CHILD SKILL", encoding="utf-8")
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "succeeded"
+    assert (
+        runner.requests[0].inline_agents["reviewer"]["instructions"]
+        == "AUTHENTICATED CHILD SKILL"
+    )
 
 
 class ChildRunner:

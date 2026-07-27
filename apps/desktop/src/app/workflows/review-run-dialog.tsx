@@ -610,6 +610,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
         new TextEncoder().encode(String(values[input.name] ?? '')).byteLength > input.max_bytes
     ) ||
     detail.inputs.some(input => input.type === 'enum' && enumValues(detail, input.name).length === 0)
+
   const immediateBlocked = commonBlocked || !workflowSupportsImmediateRun(runSupport)
   const scheduledBlocked = commonBlocked || !workflowSupportsScheduledRun(runSupport)
 
@@ -666,6 +667,26 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
                     ? copy.workflowTrusted
                     : copy.workflowUntrusted}
               </Badge>
+              {detail.language ? (
+                <div className="flex flex-wrap items-center gap-2 text-xs text-(--ui-text-secondary)">
+                  <Badge variant={detail.language.legacy ? 'muted' : 'default'}>
+                    {detail.language.legacy ? copy.workflowLanguageLegacy : copy.workflowLanguageArchon}
+                  </Badge>
+                  {detail.language.normalizer_version !== undefined ? (
+                    <span>
+                      {copy.workflowLanguageNormalizer} {detail.language.normalizer_version}
+                    </span>
+                  ) : null}
+                  {detail.language.normalized_definition_digest ? (
+                    <span className="flex items-center gap-1">
+                      <span>{copy.workflowLanguageDigest}</span>
+                      <span className="font-mono" title={detail.language.normalized_definition_digest}>
+                        {detail.language.normalized_definition_digest.slice(0, 12)}…
+                      </span>
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
             </section>
             <section className="grid gap-2 border-t border-(--ui-stroke-tertiary) pt-3">
               <h2 className="text-xs font-medium text-(--ui-text-primary)">{copy.workflowRunRisk}</h2>

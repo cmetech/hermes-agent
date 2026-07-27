@@ -32,7 +32,8 @@ CHECKER="$ROOT/scripts/check_upstream_customizations.py"
 MANIFEST="$ROOT/docs/upstream-customizations/workflow-orchestration.yaml"
 GATE="$ROOT/scripts/test_workflow_merge_gate.sh"
 SCHEMA="$ROOT/docs/upstream-customizations/merge-evidence.schema.json"
-for required in "$CHECKER" "$MANIFEST" "$GATE" "$SCHEMA"; do
+LEDGER_RUNNER="$ROOT/scripts/run_workflow_ledger_invariants.py"
+for required in "$CHECKER" "$MANIFEST" "$GATE" "$SCHEMA" "$LEDGER_RUNNER"; do
   [[ -f "$required" ]] || { echo "partial workflow merge gate: missing $required" >&2; exit 1; }
 done
 
@@ -121,6 +122,24 @@ if [[ $GATE_STATUS -ne 0 ]]; then
   exit 6
 fi
 record_command "base-invariant-gate" "passed" "$started"
+
+LEDGER_RESULTS="$REPORT_DIR/ledger-invariants.json"
+started="$(now_ms)"
+set +e
+"$PYTHON_BIN" "$BASE_WT/scripts/run_workflow_ledger_invariants.py" \
+  --repo "$BASE_WT" \
+  --manifest "$BASE_WT/docs/upstream-customizations/workflow-orchestration.yaml" \
+  --output "$LEDGER_RESULTS" \
+  --platform "$PLATFORM" >"$REPORT_DIR/ledger-invariants.log" 2>&1
+LEDGER_STATUS=$?
+set -e
+if [[ $LEDGER_STATUS -ne 0 ]]; then
+  record_command "ledger-declared-invariants" "failed" "$started"
+  tail -n 80 "$REPORT_DIR/ledger-invariants.log" >&2 || true
+  echo "declared ledger invariant failed; no refs were advanced" >&2
+  exit 9
+fi
+record_command "ledger-declared-invariants" "passed" "$started"
 
 BRANDS_TSV="$REPORT_DIR/brands.tsv"
 : >"$BRANDS_TSV"
@@ -219,7 +238,8 @@ else
   MERGE_SKILL_SHA="$($PYTHON_BIN -c 'import hashlib; print(hashlib.sha256(b"").hexdigest())')"
 fi
 
-"$PYTHON_BIN" - "$MANIFEST" "$OVERLAP" "$COMMANDS_TSV" "$BRANDS_TSV" \
+"$PYTHON_BIN" - "$BASE_WT/docs/upstream-customizations/workflow-orchestration.yaml" \
+  "$OVERLAP" "$COMMANDS_TSV" "$LEDGER_RESULTS" "$BRANDS_TSV" \
   "$DECISIONS_FILE" "$ROOT" "$BASE_SHA" "$TESTED_BASE_SHA" "$REPORT_DIR/merge-evidence.json" \
   "$BASELINE" "$UPSTREAM_SHA" "$BASE_TREE" "$PATCH_SHA" "$PLATFORM" \
   "$MERGE_SKILL_LABEL" "$MERGE_SKILL_SHA" <<'PY'
@@ -232,7 +252,7 @@ import sys
 import yaml
 
 (
-    manifest_path, overlap_path, commands_path, brands_path, decisions_path,
+    manifest_path, overlap_path, commands_path, ledger_results_path, brands_path, decisions_path,
     repo, base_sha, tested_base_sha, output_path, baseline, upstream_sha,
     base_tree, patch_sha, platform, merge_skill_path, merge_skill_sha,
 ) = sys.argv[1:]
@@ -259,7 +279,10 @@ for line in Path(commands_path).read_text(encoding="utf-8").splitlines():
         "duration_ms": int(duration),
         "platform": command_platform,
     })
-base_gate = next(item for item in commands if item["name"] == "base-invariant-gate")
+ledger_results = {
+    item["path"]: item
+    for item in json.loads(Path(ledger_results_path).read_text(encoding="utf-8"))
+}
 
 def git(*args: str) -> str:
     return subprocess.check_output(["git", "-C", repo, *args], text=True).strip()
@@ -285,7 +308,7 @@ for entry in manifest["upstream_changes"]:
         "conflict_files": [],
         "retained_commit_subjects": retained,
         "removed_commit_subjects": removed,
-        "tests": [{**base_gate, "name": "entry invariants: " + ", ".join(entry["tests"])}],
+        "tests": [ledger_results[test_path] for test_path in entry["tests"]],
     })
 
 brands = []

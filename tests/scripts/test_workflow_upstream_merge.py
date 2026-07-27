@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 import pytest
+from jsonschema import ValidationError, validate
 
 from scripts.check_upstream_customizations import classify_upstream_overlap
 from tests.scripts.test_check_upstream_customizations import _git, _manifest, _repo
@@ -83,7 +84,18 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
         + "\n".join(f"# stable filler {index}" for index in range(20))
         + "\n"
     )
-    (repo / "invariant.txt").write_text("invariant\n")
+    (repo / "tests").mkdir()
+    (repo / "tests/test_invariant.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "import sys\n\n"
+        "def test_synthetic_invariant():\n"
+        "    for name in ('HERMES_PYTHON', 'PYTEST_ADDOPTS', 'PYTHON_BIN', "
+        "'WORKFLOW_MERGE_GATE_FAST'):\n"
+        "        assert name not in os.environ\n"
+        "    assert os.environ['WORKFLOW_LEDGER_PRESERVED_PROBE'] == 'preserved'\n"
+        "    assert Path(sys.executable).is_absolute()\n"
+    )
     (repo / "unmanaged.txt").write_text("common\n")
     (repo / "apps/desktop").mkdir(parents=True)
     (repo / "apps/desktop/package.json").write_text(
@@ -101,6 +113,9 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
     (repo / "brands").mkdir()
     shutil.copy2(ROOT / "scripts/check_upstream_customizations.py", repo / "scripts")
     shutil.copy2(ROOT / "scripts/test_workflow_upstream_merge.sh", repo / "scripts")
+    shutil.copy2(
+        ROOT / "scripts/run_workflow_ledger_invariants.py", repo / "scripts"
+    )
     shutil.copy2(
         ROOT / "docs/upstream-customizations/merge-evidence.schema.json",
         repo / "docs/upstream-customizations/merge-evidence.schema.json",
@@ -134,7 +149,7 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
         "  owner: workflow-orchestration\n"
         "  files: [core.py]\n"
         "  owned_symbols: [Owned]\n"
-        "  tests: [invariant.txt]\n"
+        "  tests: [tests/test_invariant.py]\n"
         "  expected_commit_subject: local customization\n"
         "  upstream_candidate: true\n"
         "  merge_guidance: preserve the owned contract\n"
@@ -191,8 +206,11 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
 
 def _run_synthetic(repo: Path, report: Path, *extra: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
+    env["HERMES_PYTHON"] = "/orchestration-only/hermes-python"
+    env["PYTEST_ADDOPTS"] = "--orchestration-only-option"
     env["PYTHON_BIN"] = sys.executable
     env["WORKFLOW_MERGE_GATE_FAST"] = "1"
+    env["WORKFLOW_LEDGER_PRESERVED_PROBE"] = "preserved"
     return subprocess.run(
         [
             REHEARSAL,
@@ -230,9 +248,145 @@ def test_rehearsal_auto_merges_safe_overlap_and_emits_valid_evidence(
     evidence = json.loads((report / "merge-evidence.json").read_text())
     assert evidence["entries"][0]["overlap_class"] == overlap.replace("-", "_")
     assert evidence["entries"][0]["decision"] == "not-required"
+    invariant = evidence["entries"][0]["tests"][0]
+    assert invariant["kind"] == "executed"
+    assert invariant["path"] == "tests/test_invariant.py"
+    assert invariant["result"] == "passed"
+    assert invariant["duration_ms"] >= 0
     assert all(command["result"] == "passed" for command in evidence["commands"])
     assert evidence["brands"][0]["contains_tested_base"] is True
     assert "apps/desktop/package.json" in (report / "otto-merge.log").read_text()
+
+
+def test_rehearsal_reference_only_invariants_cannot_claim_execution(
+    tmp_path: Path,
+) -> None:
+    repo = _synthetic_rehearsal_repo(tmp_path, "none")
+    fixture_path = "tests/fixtures/invariant.yaml"
+    fixture = repo / fixture_path
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("contract: stable\n")
+    manifest = repo / "docs/upstream-customizations/workflow-orchestration.yaml"
+    data = __import__("yaml").safe_load(manifest.read_text())
+    data["upstream_changes"][0]["tests"] = [fixture_path]
+    manifest.write_text(__import__("yaml").safe_dump(data, sort_keys=False))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "install reference-only invariant")
+
+    report = tmp_path / "report-reference-invariant"
+    result = _run_synthetic(repo, report)
+
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads((report / "merge-evidence.json").read_text())
+    reference = evidence["entries"][0]["tests"][0]
+    assert reference == {
+        "kind": "reference",
+        "name": reference["name"],
+        "path": fixture_path,
+        "reason": "non-executable invariant reference",
+    }
+    assert "result" not in reference
+    assert "duration_ms" not in reference
+
+
+@pytest.mark.parametrize(
+    "test_path",
+    (
+        "tests/test_packaging_build_guard.py",
+        "tests/scripts/test_workflow_upstream_merge.py",
+    ),
+)
+def test_rehearsal_cannot_report_an_unexecuted_ledger_test_as_passed(
+    tmp_path: Path,
+    test_path: str,
+) -> None:
+    repo = _synthetic_rehearsal_repo(tmp_path, "none")
+    invariant = repo / test_path
+    invariant.parent.mkdir(parents=True, exist_ok=True)
+    invariant.write_text("def test_execution_probe():\n    assert False\n")
+    manifest = repo / "docs/upstream-customizations/workflow-orchestration.yaml"
+    data = __import__("yaml").safe_load(manifest.read_text())
+    data["upstream_changes"][0]["tests"] = [test_path]
+    manifest.write_text(__import__("yaml").safe_dump(data, sort_keys=False))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "install failing execution probe")
+    refs_before = _git(repo, "show-ref", "--heads")
+    report = tmp_path / f"report-unexecuted-{invariant.stem}"
+
+    result = _run_synthetic(repo, report)
+
+    assert result.returncode == 9
+    assert test_path in result.stderr
+    assert _git(repo, "show-ref", "--heads") == refs_before
+    assert not (report / "merge-evidence.json").exists()
+
+
+def test_rehearsal_emits_single_oversized_invariant_as_bounded_exact_evidence(
+    tmp_path: Path,
+) -> None:
+    repo = _synthetic_rehearsal_repo(tmp_path, "none")
+    manifest = repo / "docs/upstream-customizations/workflow-orchestration.yaml"
+    data = __import__("yaml").safe_load(manifest.read_text())
+    segments = [f"segment-{index:02d}-{'x' * 70}" for index in range(7)]
+    test_path = "/".join(["tests", *segments, "test_invariant.py"])
+    invariant = repo / test_path
+    invariant.parent.mkdir(parents=True)
+    invariant.write_text("def test_deep_invariant():\n    assert True\n")
+    entry_id = "entry-" + ("i" * 500)
+    data["upstream_changes"][0]["id"] = entry_id
+    data["upstream_changes"][0]["tests"] = [test_path]
+    manifest.write_text(__import__("yaml").safe_dump(data, sort_keys=False))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "install oversized invariant identity")
+
+    report = tmp_path / "report-oversized-entry-test"
+    result = _run_synthetic(repo, report)
+
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads((report / "merge-evidence.json").read_text())
+    invariant_evidence = evidence["entries"][0]["tests"][0]
+    assert evidence["entries"][0]["id"] == entry_id
+    assert invariant_evidence["kind"] == "executed"
+    assert invariant_evidence["path"] == test_path
+    assert invariant_evidence["result"] == "passed"
+    assert len(invariant_evidence["name"]) <= 512
+
+
+def test_rehearsal_preserves_existing_file_path_over_safe_text_limit(
+    tmp_path: Path,
+) -> None:
+    repo = _synthetic_rehearsal_repo(tmp_path, "none")
+    manifest = repo / "docs/upstream-customizations/workflow-orchestration.yaml"
+    data = __import__("yaml").safe_load(manifest.read_text())
+    segments = [f"owned-{index:02d}-{'f' * 70}" for index in range(7)]
+    file_path = "/".join(["owned", *segments, "contract.py"])
+    owned_file = repo / file_path
+    owned_file.parent.mkdir(parents=True)
+    owned_file.write_text("class OwnedBoundary:\n    pass\n")
+    assert 512 < len(file_path) < 4096
+    data["upstream_changes"][0]["files"] = [file_path]
+    data["upstream_changes"][0]["owned_symbols"] = ["OwnedBoundary"]
+    manifest.write_text(__import__("yaml").safe_dump(data, sort_keys=False))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "install long owned file path")
+
+    report = tmp_path / "report-long-owned-file"
+    result = _run_synthetic(repo, report)
+
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads((report / "merge-evidence.json").read_text())
+    assert evidence["entries"][0]["files"] == [file_path]
+
+
+def test_evidence_repository_path_accepts_4096_and_rejects_4097() -> None:
+    schema = json.loads(
+        (ROOT / "docs/upstream-customizations/merge-evidence.schema.json").read_text()
+    )
+    repository_path = schema["$defs"]["repositoryPath"]
+
+    validate("p" * 4096, repository_path)
+    with pytest.raises(ValidationError, match="too long"):
+        validate("p" * 4097, repository_path)
 
 
 @pytest.mark.parametrize("overlap", ["owned-symbol", "upstream-equivalent"])

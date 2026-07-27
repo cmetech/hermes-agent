@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import shutil
@@ -8,6 +9,7 @@ import time
 import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.models import WorkflowNode, freeze_value
@@ -15,7 +17,63 @@ from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
-from tools.managed_process import TerminationPolicy
+from tools.managed_process import ProcessResourceLimits, TerminationPolicy
+
+
+def test_node_execution_context_preserves_pre_sealed_resource_positional_order(
+    tmp_path: Path,
+) -> None:
+    node = WorkflowNode(
+        id="script",
+        node_type="script",
+        value="print('ok')\n",
+        depends_on=(),
+        source_index=0,
+        source_line=1,
+        options=freeze_value({"runtime": "uv", "deps": ()}),
+    )
+    monotonic = lambda: 17.0
+    termination_policy = TerminationPolicy(
+        cooperative_grace_seconds=1,
+        term_grace_seconds=2,
+        kill_grace_seconds=3,
+        wait_timeout_seconds=4,
+    )
+
+    context = NodeExecutionContext(
+        "run-1",
+        tmp_path,
+        node,
+        "attempt-1",
+        10.0,
+        1024,
+        2048,
+        None,
+        "workflow",
+        {},
+        None,
+        {},
+        {},
+        "local",
+        AIEntitlementResolution("real"),
+        None,
+        ProcessResourceLimits(),
+        None,
+        5,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        monotonic,
+        termination_policy,
+    )
+
+    assert context.monotonic is monotonic
+    assert context.termination_policy is termination_policy
+    assert context.sealed_resource_paths is None
+    assert context.sealed_resource_bytes is None
 
 
 def test_named_script_prefers_exact_package_resource_before_runtime_suffix(
@@ -32,6 +90,126 @@ def test_named_script_prefers_exact_package_resource_before_runtime_suffix(
 
     assert resource.path == exact.resolve()
     assert resource.runtime == "uv"
+
+
+def test_named_script_ignores_unsealed_extensionless_shadow(tmp_path: Path) -> None:
+    package = tmp_path / "package"
+    scripts = package / "scripts"
+    scripts.mkdir(parents=True)
+    shadow = scripts / "diagnose"
+    shadow.write_text("print('shadow')\n", encoding="utf-8")
+    sealed = scripts / "diagnose.py"
+    sealed.write_text("print('sealed')\n", encoding="utf-8")
+
+    resource = ResourceResolver(
+        package, sealed_paths={"scripts/diagnose.py"}
+    ).script("diagnose", runtime="uv")
+
+    assert resource.path == sealed.resolve()
+
+
+def test_script_executor_resolves_only_scheduler_verified_resources(
+    tmp_path: Path,
+) -> None:
+    scripts = tmp_path / "run" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "diagnose").write_text("print('shadow')\n", encoding="utf-8")
+    sealed = scripts / "diagnose.py"
+    sealed.write_text("print('sealed')\n", encoding="utf-8")
+    context = replace(
+        _context(tmp_path, runtime="uv", script="diagnose"),
+        sealed_resource_paths=frozenset({"scripts/diagnose.py"}),
+    )
+
+    argv, _warnings = ScriptExecutor()._argv(context, "/fake/uv")
+
+    assert argv[-1] == str(sealed.resolve())
+
+
+@pytest.mark.parametrize("mutation", ["delete", "rename", "replace"])
+def test_script_executor_uses_authenticated_bytes_without_reopening_source(
+    tmp_path: Path, mutation: str
+) -> None:
+    scripts = tmp_path / "run" / "scripts"
+    scripts.mkdir(parents=True)
+    script = scripts / "diagnose.py"
+    authenticated = b"print('authenticated')\n"
+    script.write_bytes(authenticated)
+    context = replace(
+        _context(tmp_path, runtime="uv", script="diagnose"),
+        sealed_resource_paths=frozenset({"scripts/diagnose.py"}),
+        sealed_resource_bytes={"scripts/diagnose.py": authenticated},
+    )
+    if mutation == "delete":
+        script.unlink()
+    elif mutation == "rename":
+        script.rename(script.with_suffix(".gone"))
+    else:
+        script.write_text("print('forged')\n", encoding="utf-8")
+
+    argv, _warnings, source = ScriptExecutor()._execution_plan(context, "/fake/uv")
+
+    assert argv[-2:] == ["python", "-"]
+    assert source == authenticated
+
+
+@pytest.mark.parametrize(
+    ("runtime", "authenticated_source", "forged_source"),
+    [
+        ("uv", b"print('authenticated-child')\n", b"print('forged-child')\n"),
+        (
+            "bun",
+            b"console.log('authenticated-child')\n",
+            b"console.log('forged-child')\n",
+        ),
+    ],
+)
+def test_named_script_child_reads_authenticated_bytes_not_raced_original(
+    tmp_path: Path,
+    runtime: str,
+    authenticated_source: bytes,
+    forged_source: bytes,
+) -> None:
+    real_runtime = shutil.which(runtime)
+    if real_runtime is None:
+        pytest.skip(f"{runtime} is not installed")
+    suffix = ".py" if runtime == "uv" else ".js"
+    script = tmp_path / "run" / "scripts" / f"race{suffix}"
+    script.parent.mkdir(parents=True)
+    script.write_bytes(authenticated_source)
+    wrapper = tmp_path / f"race-{runtime}-wrapper.py"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib,subprocess,sys\n"
+        "source=sys.stdin.buffer.read()\n"
+        f"target=pathlib.Path({str(script)!r})\n"
+        f"target.write_bytes({forged_source!r})\n"
+        "if not source: source=target.read_bytes()\n"
+        + (
+            "exec(compile(source, str(target), 'exec'))\n"
+            if runtime == "uv"
+            else (
+                f"raise SystemExit(subprocess.run([{real_runtime!r}, "
+                "'--no-env-file', 'run', '-'], input=source).returncode)\n"
+            )
+        ),
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    context = replace(
+        _context(tmp_path, runtime=runtime, script=f"race{suffix}"),
+        sealed_resource_paths=frozenset({f"scripts/race{suffix}"}),
+        sealed_resource_bytes={f"scripts/race{suffix}": authenticated_source},
+    )
+
+    result = ScriptExecutor(
+        runtime_locator=lambda _runtime: str(wrapper)
+    ).execute(context)
+
+    assert script.read_bytes() == forged_source
+    assert result.status == "succeeded"
+    output = context.run_directory / result.artifacts[0].relative_path
+    assert output.read_text() == "authenticated-child"
 
 
 @pytest.mark.parametrize(

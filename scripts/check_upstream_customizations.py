@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
@@ -16,6 +16,8 @@ import yaml
 
 
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
+_MAX_EVIDENCE_ID_LENGTH = 512
+_MAX_REPOSITORY_PATH_LENGTH = 4096
 _EPHEMERAL_COVERAGE_PATHS = frozenset({".superpowers/sdd/progress.md"})
 _REQUIRED = {
     "id", "change_class", "owner", "files", "owned_symbols", "tests",
@@ -124,6 +126,11 @@ def load_and_validate_manifest(
         entry_id = entry.get("id")
         if not isinstance(entry_id, str) or not entry_id or entry_id in ids:
             raise ValueError(f"duplicate or invalid customization id: {entry_id!r}")
+        if len(entry_id) > _MAX_EVIDENCE_ID_LENGTH:
+            raise ValueError(
+                f"{entry_id[:32]!r}... id must be at most "
+                f"{_MAX_EVIDENCE_ID_LENGTH} characters"
+            )
         ids.add(entry_id)
         baseline = entry.get("last_verified_upstream")
         if not isinstance(baseline, str) or not _HEX40.fullmatch(baseline):
@@ -135,6 +142,21 @@ def load_and_validate_manifest(
             for raw in values:
                 if not isinstance(raw, str):
                     raise ValueError(f"{entry_id}.{field} paths must be strings")
+                if len(raw) > _MAX_REPOSITORY_PATH_LENGTH:
+                    raise ValueError(
+                        f"{entry_id}.{field} path must be at most "
+                        f"{_MAX_REPOSITORY_PATH_LENGTH} characters"
+                    )
+                portable = PurePosixPath(raw)
+                if (
+                    portable.is_absolute()
+                    or ".." in portable.parts
+                    or portable.as_posix() != raw
+                ):
+                    raise ValueError(
+                        f"{entry_id}.{field} path must be normalized "
+                        f"repository-relative POSIX: {raw}"
+                    )
                 path = _contained(repo, raw)
                 if not path.is_file():
                     raise ValueError(f"ledger path does not exist: {raw}")
