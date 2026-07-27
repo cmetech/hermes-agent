@@ -514,6 +514,7 @@ def test_sealed_mcp_rejects_local_embed_and_unknown_uri_schemes(tmp_path, field,
         "data:text/plain,embedded",
         "vscode://file/tmp/mutable.py",
         "unknown://host/resource",
+        "https:///missing-authority",
         _nested_percent_encode("file:///tmp/mutable.sock", 6),
         "https%3A%2F%2Fnetwork.example.test%2F%ZZ",
     ],
@@ -548,9 +549,7 @@ def test_sealed_mcp_preserves_explicit_network_urls(tmp_path, scheme):
             f"--endpoint={scheme.upper()}://network.example.test/c/%25?ratio=100%25",
         ],
         "env": {
-            "REMOTE_ENDPOINT": (
-                f"  {scheme}://network.example.test/e/%25?ratio=100%25  "
-            )
+            "REMOTE_ENDPOINT": f"{scheme}://network.example.test/e/%25?ratio=100%25"
         },
     }
     authenticated = {"mcp/echo.yaml": yaml.safe_dump({"echo": server}).encode()}
@@ -563,6 +562,105 @@ def test_sealed_mcp_preserves_explicit_network_urls(tmp_path, scheme):
         ).mcp_servers("echo", materializer=materializer)["echo"]
 
         assert _finalize_authenticated_mcp_config({"echo": resolved})["echo"] == server
+    finally:
+        materializer.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("field", "url"),
+    [
+        ("arg", "https://network.example.test/a/%25?q=100%25#fragment%25"),
+        ("compound", "http://127.0.0.1:8080/a/%25"),
+        ("env", "wss://[2001:db8::1]:8443/socket?ratio=100%25"),
+        ("url", "https://例え.テスト/パス?q=%25#部分%25"),
+        ("arg", "https://user:password@network.example.test:443/a/%25"),
+        ("compound", "ws://localhost:65535/events/%25"),
+        ("url", "https://network.example.test:0080/a/%25"),
+        ("env", "https://[2001:db8::1]:0080/a/%25"),
+    ],
+)
+def test_sealed_mcp_preserves_strict_supported_network_url_forms(
+    tmp_path, field, url
+):
+    if field == "url":
+        server = {"url": url}
+    else:
+        server = {"command": "mcp-server-fetch", "args": []}
+        if field == "arg":
+            server["args"] = [url]
+        elif field == "compound":
+            server["args"] = [f"--endpoint={url}"]
+        else:
+            server["env"] = {"REMOTE_ENDPOINT": url}
+    authenticated = {"mcp/echo.yaml": yaml.safe_dump({"echo": server}).encode()}
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        resolved = ResourceResolver(
+            tmp_path / "run",
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+
+        assert _finalize_authenticated_mcp_config({"echo": resolved})["echo"] == server
+    finally:
+        materializer.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("field", "url"),
+    [
+        ("arg", "https:///missing-authority"),
+        ("compound", "https://:443/missing-host"),
+        ("env", "https://network.example.test/a b"),
+        ("url", "https://network.example.test/a%20b"),
+        ("arg", "https://network.example.test/a\tb"),
+        ("compound", "https://network.example.test/a%09b"),
+        ("env", "https://network.example.test/a%250db"),
+        ("url", "https://network.example.test/a%c2%80b"),
+        ("arg", "https://network.example.test/a%c2%a0b"),
+        ("url", "https://network.example.test:invalid/path"),
+        ("arg", "https://network.example.test:65536/path"),
+        ("compound", "https://network.example.test:/path"),
+        ("env", "https://[2001:db8::1/path"),
+        ("url", "https://[not-ipv6]/path"),
+        ("arg", "https://2001:db8::1/path"),
+        ("compound", "https://network.example.test\\mutable"),
+        ("env", "https:\\network.example.test\\mutable"),
+        ("url", "https://network.example.test/%5cmutable"),
+        ("arg", "https://network.example.test/%255cmutable"),
+        ("compound", "//network.example.test/scheme-relative"),
+        ("env", "prefix=https://network.example.test/path"),
+        ("url", "https://user@@network.example.test/path"),
+        ("arg", "https://@network.example.test/path"),
+        ("compound", "https://999.999.999.999/path"),
+    ],
+)
+def test_sealed_mcp_rejects_invalid_or_ambiguous_network_url_forms(
+    tmp_path, field, url
+):
+    if field == "url":
+        server = {"url": url}
+    else:
+        server = {"command": "mcp-server-fetch", "args": []}
+        if field == "arg":
+            server["args"] = [url]
+        elif field == "compound":
+            server["args"] = [f"--endpoint={url}"]
+        else:
+            server["env"] = {"REMOTE_ENDPOINT": url}
+    authenticated = {"mcp/echo.yaml": yaml.safe_dump({"echo": server}).encode()}
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        resolved = ResourceResolver(
+            tmp_path / "run",
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+
+        with pytest.raises(
+            PackageMCPUnavailable, match="runtime closure cannot be proven"
+        ):
+            _finalize_authenticated_mcp_config({"echo": resolved})
     finally:
         materializer.cleanup()
 

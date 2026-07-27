@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ import re
 import sys
 import threading
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 
 _PROTOCOL_VERSION = 1
@@ -388,6 +389,9 @@ _PATH_ENV = re.compile(
 )
 _URI_SCHEME = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*):(?P<body>.*)$")
 _NETWORK_URI_SCHEMES = frozenset({"http", "https", "ws", "wss"})
+_NETWORK_ENCODED_AMBIGUITY = re.compile(
+    r"%(?:25)*(?:0[0-9a-f]|1[0-9a-f]|20|5c|7f)", re.IGNORECASE
+)
 _CLASSIFICATION_MAX_BYTES = 256_000
 _CLASSIFICATION_MAX_DECODE_PASSES = 64
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -441,18 +445,91 @@ def _has_valid_percent_syntax(value: str) -> bool:
     )
 
 
+def _contains_forbidden_network_characters(value: str) -> bool:
+    return "\\" in value or any(
+        character.isspace()
+        or ord(character) < 32
+        or 127 <= ord(character) <= 159
+        for character in value
+    )
+
+
+def _has_ambiguous_network_encoding(value: str) -> bool:
+    decoded = value
+    max_passes = min(max(len(value), 1), _CLASSIFICATION_MAX_DECODE_PASSES)
+    for _ in range(max_passes):
+        if _contains_forbidden_network_characters(decoded):
+            return True
+        if "%" not in decoded or not _has_valid_percent_syntax(decoded):
+            return False
+        try:
+            expanded = unquote(decoded, errors="strict")
+        except UnicodeDecodeError:
+            return False
+        if len(expanded) >= len(decoded):
+            return False
+        decoded = expanded
+    return True
+
+
+def _supported_network_url(candidate: str) -> bool:
+    if (
+        not candidate
+        or _has_ambiguous_network_encoding(candidate)
+        or not _has_valid_percent_syntax(candidate)
+        or _NETWORK_ENCODED_AMBIGUITY.search(candidate) is not None
+    ):
+        return False
+    try:
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        parsed.port
+    except (UnicodeError, ValueError):
+        return False
+    if (
+        parsed.scheme.lower() not in _NETWORK_URI_SCHEMES
+        or not parsed.netloc
+        or not hostname
+        or "%" in parsed.netloc
+    ):
+        return False
+    userinfo, separator, authority = parsed.netloc.rpartition("@")
+    if not separator:
+        authority = parsed.netloc
+    elif not userinfo or "@" in userinfo:
+        return False
+    if authority.endswith(":"):
+        return False
+    if authority.startswith("["):
+        closing = authority.find("]")
+        suffix = authority[closing + 1 :]
+        if closing < 0 or (suffix and re.fullmatch(r":[0-9]+", suffix) is None):
+            return False
+        try:
+            ipaddress.IPv6Address(hostname)
+        except ValueError:
+            return False
+    elif authority.count(":") > 1:
+        return False
+    if re.fullmatch(r"[0-9.]+", hostname):
+        try:
+            ipaddress.IPv4Address(hostname)
+        except ValueError:
+            return False
+    try:
+        hostname.encode("idna")
+    except UnicodeError:
+        return False
+    return True
+
+
 def _supported_network_view(value: str, *, compound: bool) -> bool:
-    candidate = value.strip()
+    candidate = value
     if compound:
         assignment = _COMPOUND_OPTION_ASSIGNMENT.fullmatch(candidate)
         if assignment is not None:
             candidate = assignment.group("value")
-    match = _URI_SCHEME.fullmatch(candidate)
-    return bool(
-        match is not None
-        and match.group("scheme").lower() in _NETWORK_URI_SCHEMES
-        and match.group("body").startswith("//")
-    )
+    return _supported_network_url(candidate)
 
 
 def _normalized_classification_value(value: str, *, compound: bool) -> str:
@@ -467,11 +544,9 @@ def _normalized_classification_value(value: str, *, compound: bool) -> str:
     max_passes = min(max(len(value), 1), _CLASSIFICATION_MAX_DECODE_PASSES)
     for _ in range(max_passes):
         if _supported_network_view(normalized, compound=compound):
-            if not _has_valid_percent_syntax(normalized):
-                raise PackageMCPUnavailable(_CLOSURE_ERROR)
-            return normalized.strip()
+            return normalized
         if "%" not in normalized:
-            return normalized.strip()
+            return normalized
         if not _has_valid_percent_syntax(normalized):
             raise PackageMCPUnavailable(_CLOSURE_ERROR)
         try:
@@ -487,22 +562,20 @@ def _normalized_classification_value(value: str, *, compound: bool) -> str:
 def _path_candidate(value: str, *, compound: bool = False) -> tuple[str, str]:
     normalized = _normalized_classification_value(value, compound=compound)
     if compound:
-        match = _COMPOUND_OPTION_ASSIGNMENT.fullmatch(normalized.strip())
+        match = _COMPOUND_OPTION_ASSIGNMENT.fullmatch(normalized)
         if match is not None:
             return match.group("option"), match.group("value")
-    return "", normalized.strip()
+    return "", normalized
 
 
 def _uri_disposition(value: str, *, compound: bool = False) -> str | None:
     """Classify explicit URIs without consulting mutable filesystem state."""
     candidate = _path_candidate(value, compound=compound)[1]
+    if _supported_network_url(candidate):
+        return "network"
     match = _URI_SCHEME.fullmatch(candidate)
     if match is None:
         return None
-    scheme = match.group("scheme").lower()
-    body = match.group("body")
-    if scheme in _NETWORK_URI_SCHEMES and body.startswith("//"):
-        return "network"
     return "unsafe"
 
 
