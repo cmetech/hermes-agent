@@ -168,7 +168,7 @@ def test_digest_covers_yaml_sidecar_and_executable_resources(workflow_writer, tm
 
 
 def test_production_authority_accepts_512_files_and_refuses_513_before_admission(
-    workflow_writer, tmp_path
+    workflow_writer, tmp_path, monkeypatch
 ):
     accepted_home = tmp_path / "accepted"
     accepted_package = _resource_boundary_package(
@@ -213,6 +213,19 @@ def test_production_authority_accepts_512_files_and_refuses_513_before_admission
     before_events = refused_store.list_admission_events()
     before_run_entries = tuple(refused_store.runs_root.iterdir())
     before_staging_entries = tuple(refused_store.staging_root.iterdir())
+    preparation_calls = []
+
+    def forbidden_prepare(*_args, **_kwargs):
+        preparation_calls.append(True)
+        raise AssertionError(
+            "513-file authority reached forbidden snapshot preparation"
+        )
+
+    monkeypatch.setattr(
+        refused_store,
+        "prepare_run_snapshot",
+        forbidden_prepare,
+    )
 
     with pytest.raises(ApiAdmissionError) as exc_info:
         start_api_run(
@@ -231,6 +244,7 @@ def test_production_authority_accepts_512_files_and_refuses_513_before_admission
     assert exc_info.value.code == "workflow_catalog_capacity"
     assert exc_info.value.status_code == 503
     assert exc_info.value.retryable is True
+    assert preparation_calls == []
     assert refused_store.list_runs() == before_runs == ()
     assert refused_store.list_admission_events() == before_events == ()
     assert tuple(refused_store.runs_root.iterdir()) == before_run_entries == ()

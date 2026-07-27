@@ -3469,7 +3469,8 @@ upstream_changes:
     them and detect replacement even when a canonical read is deduplicated.
     Retain mutation-resistant coverage that makes same-byte normalizer drift
     fail at verified scheduler load and pins production admission to accepting
-    512 canonical package files while refusing 513 before run persistence.
+    512 canonical package files while refusing 513 before snapshot preparation
+    is entered or any run state is persisted.
     Every later
     command, named script, MCP definition and transitive local server, prompt
     skill, inline-agent skill, and input/template consumer must either read the
