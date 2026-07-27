@@ -589,7 +589,7 @@ def test_coordinator_health_distinguishes_missing_fresh_and_stale(tmp_path) -> N
     assert stale.reason_code == "coordinator_lease_expired"
 
 
-def _wait_until(predicate, *, timeout: float = 2.0) -> None:
+def _wait_until(predicate, *, timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():

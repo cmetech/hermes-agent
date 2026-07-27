@@ -2429,6 +2429,7 @@ upstream_changes:
   - ApprovalExecutor failure, runner-exception, and authorization accounting
   - conservative_provider_retry_count
   - validated_provider_retry_count
+  - loaded-gate scheduler fairness barrier regression
   tests:
   - tests/plugins/workflow/test_ai_e2e.py
   - tests/plugins/workflow/test_ai_executor.py
@@ -2457,6 +2458,9 @@ upstream_changes:
     node/run allowance left after durable prior consumption, and an exhausted
     replay must fail before executor invocation. Accept reported provider retries
     only as non-boolean integers in the inclusive zero to grant-minus-one range.
+    Prove cross-run pool fairness with a synchronization barrier rather than a
+    scheduler-sensitive sleep so loaded release gates cannot create false serial
+    execution evidence.
   removal_condition: Remove when upstream enforces equivalent immutable per-run
     concurrency, worker, deadline, retry, resource-tree, and termination-grace
     ceilings without resizing or retiming shared coordinator infrastructure.
@@ -2683,6 +2687,7 @@ upstream_changes:
   - coordinator-to-scheduler wall and monotonic clock threading
   - RunScheduler promotion wall-clock sampling
   - scheduled wake and clock base-gate membership
+  - loaded-gate coordinator health wait bound
   tests:
   - tests/plugins/workflow/test_coordinator.py
   - tests/plugins/workflow/test_scheduled_runs.py
@@ -2714,6 +2719,8 @@ upstream_changes:
     a backward wall jump refuses the compare-and-set and a later due sample
     promotes exactly once. Keep every backoff and local-wake timeout at or below
     five monotonic seconds, independent of far-future wall time and local offset.
+    Coordinator health tests may wait up to ten seconds for loaded CI hosts, but
+    production election, heartbeat, and sweep timing contracts remain unchanged.
   removal_condition: Remove when upstream provides equivalent exact due-aware
     coordinator paging, one-shot early-wake deferral, atomic promotion recheck,
     saturated periodic-page liveness, prefix-safe cursor advancement, injected
