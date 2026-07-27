@@ -419,8 +419,13 @@ class _PythonSymbolCollector(ast.NodeVisitor):
     def _record(self, symbol: str, node: ast.AST) -> None:
         if not hasattr(node, "lineno"):
             return
+        start = node.lineno
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            start = min(
+                [start, *(decorator.lineno for decorator in node.decorator_list)]
+            )
         self.spans.setdefault(symbol, []).append(
-            (node.lineno, getattr(node, "end_lineno", node.lineno))
+            (start, getattr(node, "end_lineno", node.lineno))
         )
 
     def _record_scoped(self, name: str, node: ast.AST) -> None:
@@ -484,9 +489,46 @@ class _PythonSymbolCollector(ast.NodeVisitor):
             self._record(".".join([*self.scope, target.id]), target)
 
 
-def _strip_non_python_comments_and_strings(source: str, suffix: str) -> str:
-    slash_comments = suffix in {".js", ".jsx", ".mjs", ".ts", ".tsx"}
-    hash_comments = suffix in {".sh", ".bash", ".yaml", ".yml", ".toml"}
+def _strip_non_python_comments(source: str, path: str) -> str:
+    suffix = Path(path).suffix.lower()
+    slash_line = suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
+    hash_line = suffix in {
+        ".sh",
+        ".bash",
+        ".ps1",
+        ".psm1",
+        ".psd1",
+        ".yaml",
+        ".yml",
+        ".toml",
+    }
+    slash_block = suffix in {
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".tsx",
+        ".css",
+        ".scss",
+        ".less",
+    }
+    powershell_block = suffix in {".ps1", ".psm1", ".psd1"}
+    markdown_block = suffix in {".md", ".markdown"}
+    quote_chars = {"'", '"'}
+    if suffix in {
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".tsx",
+        ".sh",
+        ".bash",
+        ".md",
+        ".markdown",
+    }:
+        quote_chars.add("`")
     result = list(source)
     index = 0
     quote = ""
@@ -494,33 +536,46 @@ def _strip_non_python_comments_and_strings(source: str, suffix: str) -> str:
         char = source[index]
         following = source[index + 1] if index + 1 < len(source) else ""
         if quote:
-            if char == "\\":
+            if char == "\\" or (powershell_block and char == "`"):
                 index += 2
                 continue
             if char == quote:
                 quote = ""
             index += 1
             continue
-        if char in {"'", '"', "`"}:
+        if powershell_block and char == "`":
+            index += 2
+            continue
+        if char in quote_chars:
             quote = char
             index += 1
             continue
-        if slash_comments and char == "/" and following == "/":
+        if slash_line and char == "/" and following == "/":
             while index < len(source) and source[index] != "\n":
                 result[index] = " "
                 index += 1
             continue
-        if slash_comments and char == "/" and following == "*":
-            result[index] = result[index + 1] = " "
-            index += 2
-            while index + 1 < len(source) and source[index : index + 2] != "*/":
+        block: tuple[str, str] | None = None
+        if slash_block and source.startswith("/*", index):
+            block = ("/*", "*/")
+        elif powershell_block and source.startswith("<#", index):
+            block = ("<#", "#>")
+        elif markdown_block and source.startswith("<!--", index):
+            block = ("<!--", "-->")
+        if block:
+            opener, closer = block
+            for offset in range(len(opener)):
+                result[index + offset] = " "
+            index += len(opener)
+            while index < len(source) and not source.startswith(closer, index):
                 result[index] = "\n" if source[index] == "\n" else " "
                 index += 1
-            if index + 1 < len(source):
-                result[index] = result[index + 1] = " "
-                index += 2
+            if source.startswith(closer, index):
+                for offset in range(len(closer)):
+                    result[index + offset] = " "
+                index += len(closer)
             continue
-        if hash_comments and char == "#":
+        if hash_line and char == "#":
             while index < len(source) and source[index] != "\n":
                 result[index] = " "
                 index += 1
@@ -546,7 +601,7 @@ def _symbol_spans(
         for symbol in symbols:
             spans[symbol].extend(collector.spans.get(symbol, []))
         return spans
-    searchable = _strip_non_python_comments_and_strings(source, Path(path).suffix)
+    searchable = _strip_non_python_comments(source, path)
     for symbol in symbols:
         if "." in symbol:
             owner, member = symbol.split(".", 1)

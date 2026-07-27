@@ -21,6 +21,7 @@ import threading
 import time
 from typing import Any
 
+import psutil
 import yaml
 
 
@@ -93,29 +94,119 @@ class _BoundedCapture:
         return rendered
 
 
-def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
+def _snapshot_process_group(process_group: int) -> dict[int, float]:
+    members: dict[int, float] = {}
+    if os.name != "posix":
+        return members
+    for candidate in psutil.process_iter(["pid", "create_time"]):
+        try:
+            if os.getpgid(candidate.pid) == process_group:
+                members[candidate.pid] = float(candidate.info["create_time"])
+        except (ProcessLookupError, PermissionError, psutil.Error):
+            continue
+    return members
+
+
+def _known_group_member_alive(
+    process_group: int,
+    known_members: dict[int, float],
+) -> bool:
+    for pid, created_at in known_members.items():
+        try:
+            candidate = psutil.Process(pid)
+            if (
+                candidate.create_time() == created_at
+                and (os.name != "posix" or os.getpgid(pid) == process_group)
+            ):
+                return True
+        except (ProcessLookupError, PermissionError, psutil.Error):
+            continue
+    return False
+
+
+def _refresh_known_group_members(
+    process_group: int,
+    known_members: dict[int, float],
+) -> None:
+    if not _known_group_member_alive(process_group, known_members):
         return
-    try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                capture_output=True,
-                check=False,
-            )
-        process.wait(timeout=_TERMINATE_GRACE_SECONDS)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
-        if process.poll() is None:
+    for pid, created_at in list(known_members.items()):
+        try:
+            parent = psutil.Process(pid)
+            if parent.create_time() != created_at or (
+                os.name == "posix" and os.getpgid(pid) != process_group
+            ):
+                continue
+            descendants = parent.children(recursive=True)
+        except (ProcessLookupError, PermissionError, psutil.Error):
+            continue
+        for descendant in descendants:
             try:
-                if os.name == "posix":
-                    os.killpg(process.pid, signal.SIGKILL)
-                else:
-                    process.kill()
-            except ProcessLookupError:
-                pass
-            process.wait()
+                if os.name != "posix" or os.getpgid(descendant.pid) == process_group:
+                    known_members[descendant.pid] = descendant.create_time()
+            except (ProcessLookupError, PermissionError, psutil.Error):
+                continue
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[bytes],
+    process_group: int,
+    known_members: dict[int, float],
+) -> None:
+    if os.name != "posix":
+        _refresh_known_group_members(process_group, known_members)
+        targets: list[psutil.Process] = []
+        for pid, created_at in known_members.items():
+            try:
+                candidate = psutil.Process(pid)
+                if candidate.create_time() == created_at:
+                    candidate.terminate()
+                    targets.append(candidate)
+            except (ProcessLookupError, PermissionError, psutil.Error):
+                continue
+        _gone, alive = psutil.wait_procs(targets, timeout=_TERMINATE_GRACE_SECONDS)
+        for candidate in alive:
+            try:
+                candidate.kill()
+            except (ProcessLookupError, PermissionError, psutil.Error):
+                continue
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        return
+
+    _refresh_known_group_members(process_group, known_members)
+    if not _known_group_member_alive(process_group, known_members):
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        process.wait()
+        return
+    known_members.update(_snapshot_process_group(process_group))
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        return
+
+    deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        _refresh_known_group_members(process_group, known_members)
+        if _known_group_member_alive(process_group, known_members):
+            known_members.update(_snapshot_process_group(process_group))
+        time.sleep(_POLL_SECONDS)
+
+    if _known_group_member_alive(process_group, known_members):
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    process.wait()
 
 
 def _execute_attempt(
@@ -168,6 +259,11 @@ def _execute_attempt(
             "_stdout": "",
             "_stderr": str(exc),
         }
+    process_group = process.pid
+    try:
+        known_group_members = {process.pid: psutil.Process(process.pid).create_time()}
+    except (ProcessLookupError, psutil.Error):
+        known_group_members = {}
     stdout = _BoundedCapture(output_limit_bytes)
     stderr = _BoundedCapture(output_limit_bytes)
     readers = [
@@ -180,16 +276,18 @@ def _execute_attempt(
     timed_out = False
     try:
         while process.poll() is None:
+            _refresh_known_group_members(process_group, known_group_members)
             if cancel_event.is_set():
-                _terminate_process_group(process)
                 raise CancelledError()
             if time.monotonic() >= deadline:
                 timed_out = True
-                _terminate_process_group(process)
+                _terminate_process_group(process, process_group, known_group_members)
                 break
             time.sleep(_POLL_SECONDS)
+        if not timed_out and process.returncode is not None and process.returncode < 0:
+            _terminate_process_group(process, process_group, known_group_members)
     except BaseException:
-        _terminate_process_group(process)
+        _terminate_process_group(process, process_group, known_group_members)
         raise
     finally:
         for reader in readers:

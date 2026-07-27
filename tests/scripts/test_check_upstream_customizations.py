@@ -327,6 +327,114 @@ def test_overlap_triple_dot_uses_merge_base_and_non_head_right(tmp_path: Path) -
     assert overlap["classification"] == "same_file"
 
 
+def test_stacked_decorator_only_change_hits_owned_function_span(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    (repo / "core.py").write_text(
+        "def outer(value):\n    return value\n\n"
+        "def old(value):\n    return value\n\n"
+        "def new(value):\n    return value\n\n"
+        "@outer\n@old\ndef owned():\n    return True\n"
+    )
+    _git(repo, "commit", "-am", "install stacked decorated function")
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["upstream_changes"][0]["overlap_policy"] = "owned_symbol"
+    raw["upstream_changes"][0]["owned_symbols"] = ["owned"]
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    entry = load_and_validate_manifest(manifest, repo)["upstream_changes"][0]
+
+    (repo / "core.py").write_text((repo / "core.py").read_text().replace("@old", "@new"))
+    _git(repo, "commit", "-am", "change only inner decorator")
+
+    overlap = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
+
+    assert overlap["classification"] == "owned_symbol"
+
+
+def test_nested_decorator_change_uses_non_head_right_definition_blob(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    original = (
+        "def outer(value):\n    return value\n\n"
+        "def old(value):\n    return value\n\n"
+        "def new(value):\n    return value\n\n"
+        "class Owner:\n"
+        "    @outer\n"
+        "    @old\n"
+        "    def owned(self):\n"
+        "        return True\n"
+    )
+    (repo / "core.py").write_text(original)
+    _git(repo, "commit", "-am", "install nested decorated method")
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["upstream_changes"][0]["overlap_policy"] = "owned_symbol"
+    raw["upstream_changes"][0]["owned_symbols"] = ["Owner.owned"]
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    entry = load_and_validate_manifest(manifest, repo)["upstream_changes"][0]
+
+    (repo / "core.py").write_text(original.replace("@old", "@new"))
+    _git(repo, "commit", "-am", "change only nested decorator")
+    right = _git(repo, "rev-parse", "HEAD")
+    (repo / "core.py").write_text(original)
+    _git(repo, "commit", "-am", "move checkout beyond reviewed right blob")
+
+    overlap = classify_upstream_overlap(entry, repo, f"{baseline}..{right}")
+
+    assert overlap["classification"] == "owned_symbol"
+
+
+@pytest.mark.parametrize(
+    ("suffix", "comment_only", "real_code"),
+    [
+        (
+            ".ps1",
+            "# ExactToken\n<# multiline\nExactToken\n#>\nWrite-Output stable # ExactToken\n",
+            "Write-Output 'ExactToken'\n",
+        ),
+        (
+            ".md",
+            "<!-- ExactToken -->\nvisible <!-- multiline\nExactToken\n-->\n",
+            "## ExactToken\n",
+        ),
+        (
+            ".css",
+            "/* ExactToken */\nbody { color: black; } /* multiline\nExactToken\n*/\n",
+            ".ExactToken { color: black; }\n",
+        ),
+    ],
+)
+def test_non_python_owned_symbol_ignores_language_comments_but_accepts_code(
+    tmp_path: Path,
+    suffix: str,
+    comment_only: str,
+    real_code: str,
+) -> None:
+    repo = _repo(tmp_path)
+    source_path = repo / f"owned{suffix}"
+    source_path.write_text(comment_only)
+    _git(repo, "add", source_path.name)
+    _git(repo, "commit", "-m", f"add {suffix} comment fixture")
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    raw = yaml.safe_load(manifest.read_text())
+    entry = raw["upstream_changes"][0]
+    entry["files"] = [source_path.name]
+    entry["owned_symbols"] = ["ExactToken"]
+    entry["overlap_policy"] = "owned_symbol"
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+    source_path.write_text(real_code)
+    _git(repo, "commit", "-am", f"add {suffix} real code fixture")
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
 def test_overlap_reporting_is_read_only_for_git_and_baseline(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     baseline = _git(repo, "rev-parse", "HEAD")

@@ -8,8 +8,11 @@ upstream commit against which the behavior was last verified.
 `owned_symbols` is reserved for bounded, exact identifiers that the checker
 can locate in a declared file at the committed `HEAD`; dirty checkout bytes and
 comments never satisfy ownership. Python identifiers are resolved through the
-AST with qualified owner identity preserved. Other languages use bounded exact
-literal-token matching after comments are removed. Behavioral prose belongs in
+AST with qualified owner identity preserved; owned definition spans include all
+stacked decorator lines. Other languages use bounded exact literal-token
+matching after language-aware comment removal, including PowerShell, Markdown,
+CSS, shell, TypeScript/JavaScript, YAML, and TOML comments without discarding
+string literals or code. Behavioral prose belongs in
 the optional bounded `owned_invariants` list. New or migrated entries may select
 `overlap_policy: owned_symbol` (the compatibility default) or
 `overlap_policy: any_owned_file`. The latter makes every change to a declared
@@ -51,4 +54,7 @@ in flight per runtime. Each attempt has a bounded timeout and bounded stdout and
 stderr capture. Only an ordinary test failure is retried once; timeouts,
 signals, infrastructure failures, and cancellation are terminal. Evidence
 records the exact attempt sequence, output truncation, signal number when
-applicable, and whether a failed first attempt passed on retry.
+applicable, and whether a failed first attempt passed on retry. Teardown tracks
+the original process-group member identities and escalates after the grace
+period even when the leader exited, so signal-resistant descendants cannot
+escape and a reused unrelated process group is never targeted.

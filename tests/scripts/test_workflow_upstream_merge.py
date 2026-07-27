@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -887,6 +888,91 @@ def test_ledger_runner_never_exceeds_two_concurrent_python_files(tmp_path: Path)
     assert result.returncode == 0, result.stderr
     assert all(record["result"] == "passed" for record in records)
     assert (tmp_path / "ledger-fixture/.maximum-count").read_text() == "2"
+
+
+def _resistant_descendant_source(*, signal_parent: bool) -> str:
+    parent_action = (
+        "    time.sleep(0.2)\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"
+        "    os.kill(os.getpid(), signal.SIGTERM)\n"
+        if signal_parent
+        else "    time.sleep(30)\n"
+    )
+    return (
+        "import os\n"
+        "from pathlib import Path\n"
+        "import signal\n"
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n\n"
+        "def test_resistant_descendant():\n"
+        "    child = (\"import os, signal, time; from pathlib import Path; \"\n"
+        "        \"signal.signal(signal.SIGTERM, signal.SIG_IGN); \"\n"
+        "        \"Path('.resistant-child.ready').write_text(str(os.getpid())); \"\n"
+        "        \"time.sleep(3); Path('.resistant-child.marker').write_text('escaped'); \"\n"
+        "        \"time.sleep(30)\")\n"
+        "    subprocess.Popen([sys.executable, '-c', child])\n"
+        "    ready = Path('.resistant-child.ready')\n"
+        "    deadline = time.monotonic() + 2\n"
+        "    while not ready.exists() and time.monotonic() < deadline:\n"
+        "        time.sleep(0.01)\n"
+        "    assert ready.exists()\n"
+        + parent_action
+    )
+
+
+def _assert_resistant_descendant_was_reaped(repo: Path) -> None:
+    ready = repo / ".resistant-child.ready"
+    marker = repo / ".resistant-child.marker"
+    assert ready.is_file()
+    child_pid = int(ready.read_text())
+    time.sleep(3.2)
+    escaped = marker.exists()
+    try:
+        os.kill(child_pid, 0)
+    except ProcessLookupError:
+        alive = False
+    else:
+        alive = True
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                f"import os, signal; os.kill({child_pid}, signal.SIGKILL)",
+            ],
+            capture_output=True,
+            check=False,
+        )
+    assert escaped is False
+    assert alive is False
+
+
+def test_ledger_runner_escalates_group_after_timeout_leader_exits(
+    tmp_path: Path,
+) -> None:
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {"tests/test_resistant_timeout.py": _resistant_descendant_source(signal_parent=False)},
+        timeout_seconds=0.5,
+    )
+
+    assert result.returncode == 1
+    assert [attempt["result"] for attempt in records[0]["attempts"]] == ["timed_out"]
+    _assert_resistant_descendant_was_reaped(tmp_path / "ledger-fixture")
+
+
+def test_ledger_runner_reaps_resistant_group_after_leader_signal(
+    tmp_path: Path,
+) -> None:
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {"tests/test_resistant_signal.py": _resistant_descendant_source(signal_parent=True)},
+        timeout_seconds=3,
+    )
+
+    assert result.returncode == 1
+    assert [attempt["result"] for attempt in records[0]["attempts"]] == ["signaled"]
+    _assert_resistant_descendant_was_reaped(tmp_path / "ledger-fixture")
 
 
 def test_rehearsal_records_reconciled_conflict_files(tmp_path: Path) -> None:
