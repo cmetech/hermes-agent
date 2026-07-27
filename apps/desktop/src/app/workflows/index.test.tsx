@@ -273,6 +273,40 @@ describe('WorkflowsView', () => {
     expect(within(rows[2]!).queryByText('Legacy semantics')).toBeNull()
   })
 
+  it('renders an unknown future workflow language profile without relabeling it as Archon', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowDefinitions.mockResolvedValue({
+      items: [
+        definition({
+          language: { effective_profile: 'future-workflow-language' as never, legacy: false }
+        })
+      ],
+      truncated: false
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    const row = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row')[1]!
+    expect(within(row).getByText('future-workflow-language')).toBeTruthy()
+    expect(within(row).queryByText('Archon 2026-07')).toBeNull()
+  })
+
+  it('renders generic localized language copy when the backend profile has no safe label', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowDefinitions.mockResolvedValue({
+      items: [definition({ language: { effective_profile: '' as never, legacy: false } })],
+      truncated: false
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    const row = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row')[1]!
+    expect(within(row).getByText('Workflow language')).toBeTruthy()
+    expect(within(row).queryByText('Archon 2026-07')).toBeNull()
+  })
+
   it('shows authenticated AI metadata as information without changing Run policy', async () => {
     $workflowSelectedRunId.set(null)
     listWorkflowDefinitions.mockResolvedValue({
@@ -525,6 +559,30 @@ describe('WorkflowsView', () => {
     )
   })
 
+  it('keeps Run disabled for an unknown backend run-support reason', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowDefinitions.mockResolvedValue({
+      items: [
+        definition({
+          compatibility: { level: 'unsupported', runnable: false },
+          run_support: { reason: 'future_backend_rule' as never, supported: false },
+          trust_state: 'trusted'
+        })
+      ],
+      truncated: false
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    const row = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row')[1]!
+    const run = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
+    expect(run.disabled).toBe(true)
+    expect(globalThis.document.getElementById(run.getAttribute('aria-describedby')!)?.textContent).toBe(
+      'Run is unavailable until the Hermes backend supports this workflow catalog version.'
+    )
+  })
+
   it('renders a typed error row for a corrupt catalog entry without actions', async () => {
     $workflowSelectedRunId.set(null)
     listWorkflowDefinitions.mockResolvedValue({
@@ -639,7 +697,9 @@ describe('WorkflowsView', () => {
     // predicates, which a plain function expression can never satisfy. The stub
     // is behaviourally a boolean predicate, so cast it back onto the slot.
     HTMLElement.prototype.matches = function (this: HTMLElement, selector: string): boolean {
-      if (selector === ':focus-visible') {return this === document.activeElement}
+      if (selector === ':focus-visible') {
+        return this === document.activeElement
+      }
 
       return originalMatches.call(this, selector)
     } as typeof HTMLElement.prototype.matches

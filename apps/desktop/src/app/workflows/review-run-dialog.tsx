@@ -24,6 +24,8 @@ import { Play } from '@/lib/icons'
 import type { WorkflowDefinition, WorkflowDefinitionInput, WorkflowDetail } from '@/types/hermes'
 
 import {
+  desktopWorkflowLanguageLabel,
+  desktopWorkflowRunDisabledReason,
   workflowSupportsImmediateRun,
   workflowSupportsScheduledRun,
   workflowTrustAllowsRun
@@ -138,9 +140,7 @@ function initialValues(inputs: readonly WorkflowDefinitionInput[]): Record<strin
 
 export function canonicalWorkflowScheduleAt(value: string, now = new Date()): string | null {
   const matched =
-    /^(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})T(?<hour>\d{2}):(?<minute>\d{2})(?::(?<second>\d{2}))?$/.exec(
-      value
-    )
+    /^(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})T(?<hour>\d{2}):(?<minute>\d{2})(?::(?<second>\d{2}))?$/.exec(value)
 
   if (!matched?.groups) {
     return null
@@ -575,28 +575,12 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
 
   const runSupport = detail?.run_support
 
-  const runSupportCopy = {
-    schedule_required: null,
-    showcase_cli_required: copy.workflowRunShowcaseFromCli,
-    supported: null,
-    unsupported_inputs: copy.workflowRunUnsupportedInputs
-  }
-
-  const runDisabledReason =
-    detail && !runSupport
-      ? copy.workflowRunSupportUnavailable
-      : detail && runSupport && !workflowSupportsScheduledRun(runSupport)
-        ? runSupportCopy[runSupport.reason]
-        : detail && detail.compatibility.runnable !== true
-          ? copy.workflowRunIncompatible
-          : detail && !workflowTrustAllowsRun(detail.trust_state)
-            ? copy.workflowRunUntrusted
-            : detail && !detail.coordinator.healthy
-              ? copy.workflowRunCoordinatorUnavailable
-              : null
+  const runDisabledReason = detail ? desktopWorkflowRunDisabledReason(detail, copy) : null
 
   const runSupportMessage =
-    (runSupport?.supported === false && runSupport.reason !== 'schedule_required') || !runSupport
+    runDisabledReason === copy.workflowRunSupportUnavailable ||
+    runDisabledReason === copy.workflowRunUnsupportedInputs ||
+    runDisabledReason === copy.workflowRunShowcaseFromCli
       ? runDisabledReason
       : null
 
@@ -670,7 +654,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
               {detail.language ? (
                 <div className="flex flex-wrap items-center gap-2 text-xs text-(--ui-text-secondary)">
                   <Badge variant={detail.language.legacy ? 'muted' : 'default'}>
-                    {detail.language.legacy ? copy.workflowLanguageLegacy : copy.workflowLanguageArchon}
+                    {desktopWorkflowLanguageLabel(detail.language, copy)}
                   </Badge>
                   {detail.language.normalizer_version !== undefined ? (
                     <span>

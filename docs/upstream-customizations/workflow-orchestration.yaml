@@ -3763,6 +3763,53 @@ upstream_changes:
     language projection with skew-safe read-only Desktop presentation and
     backend-owned compatibility and Run gating.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-language-desktop-capability-skew
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  files:
+  - apps/desktop/src/app/workflows/catalog-run-policy.ts
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  owned_symbols:
+  - desktopWorkflowRunDisabledReason
+  - desktopWorkflowLanguageLabel
+  - workflowLanguage
+  - fail-closed unknown and incoherent Desktop run-support handling
+  - future workflow-language profile presentation
+  tests:
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  expected_commit_subject: 'fix(desktop): fail closed on workflow capability skew'
+  upstream_candidate: true
+  merge_guidance: >-
+    Keep one pure Desktop Run-disabled-reason resolver shared by catalog,
+    detail, and review-run surfaces. Unknown, absent, or incoherent run-support
+    projections must return localized generic unavailable copy before
+    compatibility, trust, and coordinator gates are considered. Preserve the
+    established supported:false schedule_required projection as the one known
+    scheduling-capability exception, with immediate and scheduled button gates
+    remaining separate. Treat language profiles as additive server-authored
+    values: known profiles retain localized labels, future nonempty strings are
+    shown verbatim, and malformed or empty values use localized generic workflow
+    language copy instead of being relabeled as the current Archon version.
+    Desktop remains read-only and backend admission remains mutation authority.
+  removal_condition: >-
+    Remove when upstream Desktop provides an equivalent centralized,
+    locale-complete, fail-closed capability-skew policy across all workflow Run
+    surfaces and future-safe server-authored workflow-language labels.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-language-authoring-reference
   change_class: workflow-compatibility
   owner: workflow-orchestration

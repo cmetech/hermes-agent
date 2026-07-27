@@ -1833,6 +1833,7 @@ export const en: Translations = {
     workflowUntrusted: 'untrusted',
     workflowVerifiedBundle: 'verified bundle',
     workflowIncompatible: 'Incompatible',
+    workflowLanguage: 'Workflow language',
     workflowLanguageArchon: 'Archon 2026-07',
     workflowLanguageLegacy: 'Legacy semantics',
     workflowLanguageLegacyDescription:

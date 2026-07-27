@@ -1523,6 +1523,7 @@ export interface Translations {
     workflowUntrusted: string
     workflowVerifiedBundle: string
     workflowIncompatible: string
+    workflowLanguage: string
     workflowLanguageArchon: string
     workflowLanguageLegacy: string
     workflowLanguageLegacyDescription: string

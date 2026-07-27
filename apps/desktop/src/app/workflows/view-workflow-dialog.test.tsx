@@ -243,6 +243,17 @@ describe('workflow View dialog', () => {
     expect(digest.getAttribute('title')).toBe('a'.repeat(64))
   })
 
+  it('shows a future server-authored workflow language profile instead of Archon copy', async () => {
+    currentDetail = detail({
+      language: { effective_profile: 'future-workflow-language' as never, legacy: false }
+    })
+    renderView()
+    const dialog = await openView()
+
+    expect(await within(dialog).findByText('future-workflow-language')).toBeTruthy()
+    expect(within(dialog).queryByText('Archon 2026-07')).toBeNull()
+  })
+
   it('preserves the shared dialog vertical scroll while clipping horizontal overflow', async () => {
     renderView()
     const dialog = await openView()
@@ -410,6 +421,22 @@ describe('workflow View dialog', () => {
 
   it('fails closed without crashing when an older backend omits detail run support', async () => {
     currentDetail = detail({ run_support: undefined as never })
+    renderView()
+    const dialog = await openView()
+
+    await within(dialog).findByTestId('shared-mermaid-renderer')
+    expectDisabledRunReason(
+      dialog,
+      'Run is unavailable until the Hermes backend supports this workflow catalog version.'
+    )
+  })
+
+  it('keeps Run disabled for an unknown backend run-support reason', async () => {
+    currentDetail = detail({
+      compatibility: { findings: [], level: 'unsupported', runnable: false },
+      run_support: { reason: 'future_backend_rule' as never, supported: false },
+      trust_state: 'trusted'
+    })
     renderView()
     const dialog = await openView()
 

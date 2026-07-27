@@ -291,6 +291,23 @@ describe('Review & Run workflow dialog', () => {
     expect(within(dialog).getByText('p'.repeat(64))).toBeTruthy()
   })
 
+  it('reviews a future server-authored workflow language profile without Archon relabeling', async () => {
+    catalogDefinition = definition({
+      language: { effective_profile: 'future-workflow-language' as never, legacy: false }
+    })
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        language: { effective_profile: 'future-workflow-language' as never, legacy: false }
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(within(dialog).getByText('future-workflow-language')).toBeTruthy()
+    expect(within(dialog).queryByText('Archon 2026-07')).toBeNull()
+  })
+
   it('derives schedule eligibility from run support and normalizes the local picker instant', async () => {
     catalogDefinition = definition({
       run_support: { reason: 'schedule_required', supported: false },
@@ -344,7 +361,9 @@ describe('Review & Run workflow dialog', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Run later' }))
 
     expect((await within(dialog).findByRole('alert')).textContent).toContain(message)
-    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(0)
+    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
+      0
+    )
   })
 
   it('uses typed controls, serializes flat values as strings, and binds preflight plus start to the opening profile', async () => {
@@ -892,6 +911,43 @@ describe('Review & Run workflow dialog', () => {
     expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
       0
     )
+  })
+
+  it('keeps Run disabled for an unknown backend run-support reason', async () => {
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        compatibility: { findings: [], level: 'unsupported', runnable: false },
+        run_support: { reason: 'future_backend_rule' as never, supported: false },
+        trust_state: 'trusted'
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(
+      within(dialog).getByText('Run is unavailable until the Hermes backend supports this workflow catalog version.')
+    ).toBeTruthy()
+    expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
+      0
+    )
+  })
+
+  it('shows generic support copy for an incoherent supported unknown reason', async () => {
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        run_support: { reason: 'future_backend_rule' as never, supported: true }
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(
+      within(dialog).getByText('Run is unavailable until the Hermes backend supports this workflow catalog version.')
+    ).toBeTruthy()
+    expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
   it('shows blocking compatibility findings and refuses to POST a non-runnable workflow', async () => {
