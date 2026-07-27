@@ -433,6 +433,7 @@ def test_workflow_compatibility_full_enforces_authoritative_report_state() -> No
         "blocking": True,
         "code": "compatibility_findings_truncated",
     }
+    retained = [{**mapped, "path": f"mapped[{index}]"} for index in range(511)]
 
     valid = [
         {
@@ -466,9 +467,9 @@ def test_workflow_compatibility_full_enforces_authoritative_report_state() -> No
         {
             "level": "unsupported",
             "runnable": False,
-            "findings": [mapped, truncation_sentinel],
+            "findings": [*retained, truncation_sentinel],
             "findings_truncated": True,
-            "finding_count": 9,
+            "finding_count": 519,
         },
     ]
     invalid = [
@@ -524,9 +525,9 @@ def test_workflow_compatibility_full_enforces_authoritative_report_state() -> No
         {
             "level": "unsupported",
             "runnable": False,
-            "findings": [mapped, truncation_sentinel],
+            "findings": [*retained, truncation_sentinel],
             "findings_truncated": True,
-            "finding_count": 8,
+            "finding_count": 518,
         },
     ]
 
@@ -535,6 +536,163 @@ def test_workflow_compatibility_full_enforces_authoritative_report_state() -> No
     for payload in invalid:
         with pytest.raises(ValidationError):
             module.WorkflowCompatibilityFull.model_validate(payload)
+
+
+def test_workflow_compatibility_full_rejects_malformed_truncation_sentinels() -> None:
+    module = _module()
+    mapped = {
+        "path": "nodes[0].model",
+        "level": "mapped",
+        "message": "model resolves through Hermes provider profiles",
+        "blocking": False,
+        "code": "provider_profile_resolution",
+    }
+    retained = [{**mapped, "path": f"mapped[{index}]"} for index in range(511)]
+
+    def sentinel(*, level: str, blocking: bool, count: str) -> dict[str, object]:
+        return {
+            "path": "compatibility.findings",
+            "level": level,
+            "message": (
+                f"Compatibility findings truncated: {count} omitted; "
+                f"aggregate level {level}"
+            ),
+            "blocking": blocking,
+            "code": "compatibility_findings_truncated",
+        }
+
+    invalid = [
+        {
+            "level": "unsupported",
+            "runnable": True,
+            "findings": [
+                *retained,
+                sentinel(level="unsupported", blocking=False, count="0"),
+            ],
+            "findings_truncated": True,
+            "finding_count": 511,
+        },
+        {
+            "level": "unsupported",
+            "runnable": True,
+            "findings": [
+                *retained,
+                sentinel(level="unsupported", blocking=False, count="01"),
+            ],
+            "findings_truncated": True,
+            "finding_count": 512,
+        },
+        {
+            "level": "unsupported",
+            "runnable": True,
+            "findings": [sentinel(level="unsupported", blocking=False, count="1")],
+            "findings_truncated": True,
+            "finding_count": 1,
+        },
+        {
+            "level": "mapped",
+            "runnable": True,
+            "findings": [
+                *retained,
+                sentinel(level="portable", blocking=False, count="1"),
+            ],
+            "findings_truncated": True,
+            "finding_count": 512,
+        },
+        {
+            "level": "unsupported",
+            "runnable": False,
+            "findings": [
+                *retained,
+                sentinel(level="mapped", blocking=True, count="1"),
+            ],
+            "findings_truncated": True,
+            "finding_count": 512,
+        },
+    ]
+
+    for payload in invalid:
+        with pytest.raises(ValidationError):
+            module.WorkflowCompatibilityFull.model_validate(payload)
+
+
+def test_workflow_compatibility_full_accepts_only_complete_legacy_shape() -> None:
+    module = _module()
+    mapped = {
+        "path": "nodes[0].model",
+        "level": "mapped",
+        "message": "model resolves through Hermes provider profiles",
+        "blocking": False,
+        "code": "provider_profile_resolution",
+    }
+    complete_legacy = {
+        "level": "mapped",
+        "runnable": True,
+        "findings": [mapped],
+    }
+
+    validated = module.WorkflowCompatibilityFull.model_validate(complete_legacy)
+
+    assert validated.findings_truncated is False
+    assert validated.finding_count == 1
+    for partial in (
+        {**complete_legacy, "findings_truncated": False},
+        {**complete_legacy, "finding_count": 1},
+    ):
+        with pytest.raises(ValidationError):
+            module.WorkflowCompatibilityFull.model_validate(partial)
+
+    truncated_legacy = {
+        "level": "unsupported",
+        "runnable": True,
+        "findings": [
+            *({**mapped, "path": f"mapped[{index}]"} for index in range(511)),
+            {
+                "path": "compatibility.findings",
+                "level": "unsupported",
+                "message": (
+                    "Compatibility findings truncated: 1 omitted; "
+                    "aggregate level unsupported"
+                ),
+                "blocking": False,
+                "code": "compatibility_findings_truncated",
+            },
+        ],
+    }
+    with pytest.raises(ValidationError):
+        module.WorkflowCompatibilityFull.model_validate(truncated_legacy)
+
+
+def test_workflow_compatibility_full_rejects_payload_at_one_mib() -> None:
+    module = _module()
+    retained = [
+        {
+            "path": f"mapped[{index}]" + "p" * 16_000,
+            "level": "mapped",
+            "message": "m" * 16_000,
+            "blocking": False,
+            "code": "mapped_finding",
+        }
+        for index in range(511)
+    ]
+    sentinel = {
+        "path": "compatibility.findings",
+        "level": "mapped",
+        "message": (
+            "Compatibility findings truncated: 1 omitted; aggregate level mapped"
+        ),
+        "blocking": False,
+        "code": "compatibility_findings_truncated",
+    }
+
+    with pytest.raises(ValidationError):
+        module.WorkflowCompatibilityFull.model_validate({
+            "level": "mapped",
+            "runnable": True,
+            "findings": [*retained, sentinel],
+            "findings_truncated": True,
+            "finding_count": 512,
+        })
 
 
 def test_workflow_compatibility_finding_api_projection_normalizes_only_empty_paths() -> None:
@@ -1293,6 +1451,56 @@ def test_workflow_detail_bounds_more_than_512_real_findings_and_keeps_omitted_bl
     assert sentinel["code"] == "compatibility_findings_truncated"
     assert sentinel["level"] == "unsupported"
     assert sentinel["blocking"] is True
+
+
+def test_workflow_detail_bounds_hostile_unicode_and_escaped_compatibility_payload(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    hostile_suffix = "😀" * 240
+    unknown_fields = {
+        f"future_{index:04d}_{hostile_suffix}": "x" for index in range(508)
+    }
+    unknown_fields.update({
+        "future_control_" + "\x01" * 600: "x",
+        "future_quote_" + '"' * 600: "x",
+        "future_backslash_" + "\\" * 600: "x",
+        "future_mixed_" + '😀\x01"\\' * 150: "x",
+    })
+    workflow_path = workflow_writer(
+        home / "workflows",
+        name="hostile-compatibility-payload",
+        filename="hostile-compatibility-payload.yaml",
+        **unknown_fields,
+    )
+    # Keep the valid definition below its independent read budget while retaining
+    # astral Unicode that expands when repeated into compatibility path + message.
+    document = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    workflow_path.write_text(
+        yaml.safe_dump(document, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    response = _detail_get(
+        _module().router,
+        "hostile-compatibility-payload",
+        source="profile",
+        token=_reader(),
+    )
+
+    assert response.status_code == 200
+    compatibility = response.json()["compatibility"]
+    serialized_compatibility = json.dumps(
+        compatibility,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert len(serialized_compatibility) < 1024 * 1024
+    assert len(response.content) < 1024 * 1024
+    assert compatibility["findings_truncated"] is True
+    assert compatibility["finding_count"] == 513
+    assert len(compatibility["findings"]) == 512
 
 
 def test_workflow_catalog_projects_declared_text_bounds_and_support_modes(

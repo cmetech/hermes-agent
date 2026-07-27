@@ -32,6 +32,7 @@ from hermes_constants import get_hermes_home
 from plugins.workflow.actions import MUTATION_ACTIONS, mutation_is_valid
 from plugins.workflow.compat import (
     WORKFLOW_COMPATIBILITY_FINDINGS_MAX,
+    WORKFLOW_COMPATIBILITY_PAYLOAD_MAX_BYTES,
     derive_compatibility_report_state,
 )
 from plugins.workflow.evidence import EVIDENCE_KINDS, EvidenceReader
@@ -53,7 +54,7 @@ _RUNTIME_LOCK = threading.Lock()
 _WORKFLOW_RESPONSE_TEXT_MAX = 16_384
 WORKFLOW_COMPATIBILITY_UNKNOWN_PATH = "<unknown-path>"
 _WORKFLOW_COMPATIBILITY_SENTINEL_MESSAGE = re.compile(
-    r"^Compatibility findings truncated: ([0-9]{1,9}) omitted; "
+    r"^Compatibility findings truncated: ([1-9][0-9]{0,8}) omitted; "
     r"aggregate level (portable|mapped|unsupported)$"
 )
 
@@ -325,6 +326,13 @@ class WorkflowCompatibilityFull(WorkflowCompatibilitySummary):
         findings = value.get("findings")
         if not isinstance(findings, list):
             return value
+        if any(
+            isinstance(finding, Mapping)
+            and finding.get("code") == "compatibility_findings_truncated"
+            and finding.get("path") == "compatibility.findings"
+            for finding in findings
+        ):
+            return value
         projected = dict(value)
         projected["findings_truncated"] = False
         projected["finding_count"] = len(findings)
@@ -346,9 +354,18 @@ class WorkflowCompatibilityFull(WorkflowCompatibilitySummary):
                 "findings_truncated must match one final truncation sentinel"
             )
         if self.findings_truncated:
+            if len(self.findings) != WORKFLOW_COMPATIBILITY_FINDINGS_MAX:
+                raise ValueError(
+                    "truncated compatibility must retain exactly the fixed bound"
+                )
             sentinel = self.findings[-1]
             match = _WORKFLOW_COMPATIBILITY_SENTINEL_MESSAGE.fullmatch(sentinel.message)
-            if match is None or match.group(2) != sentinel.level:
+            if (
+                match is None
+                or match.group(2) != sentinel.level
+                or sentinel.level == "portable"
+                or (sentinel.blocking and sentinel.level != "unsupported")
+            ):
                 raise ValueError(
                     "truncation sentinel must carry bounded aggregate state"
                 )
@@ -362,6 +379,13 @@ class WorkflowCompatibilityFull(WorkflowCompatibilitySummary):
         )
         if self.level != expected_level or self.runnable != expected_runnable:
             raise ValueError("compatibility level and runnable must match findings")
+        serialized = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(serialized) >= WORKFLOW_COMPATIBILITY_PAYLOAD_MAX_BYTES:
+            raise ValueError("compatibility payload must remain below 1 MiB")
         return self
 
 

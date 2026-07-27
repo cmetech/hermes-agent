@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, AbstractSet, Iterable, Literal, Mapping, Protocol
 
@@ -16,8 +17,9 @@ if TYPE_CHECKING:
 
 
 WORKFLOW_COMPATIBILITY_FINDINGS_MAX = 512
-_WORKFLOW_COMPATIBILITY_PATH_MAX = 256
-_WORKFLOW_COMPATIBILITY_MESSAGE_MAX = 512
+WORKFLOW_COMPATIBILITY_PAYLOAD_MAX_BYTES = 1024 * 1024
+_WORKFLOW_COMPATIBILITY_PATH_JSON_MAX_BYTES = 256
+_WORKFLOW_COMPATIBILITY_MESSAGE_JSON_MAX_BYTES = 512
 _WORKFLOW_COMPATIBILITY_TRUNCATION_CODE = "compatibility_findings_truncated"
 _WORKFLOW_COMPATIBILITY_TRUNCATION_PATH = "compatibility.findings"
 _WORKFLOW_COMPATIBILITY_TRUNCATION_PREFIX = "Compatibility findings truncated: "
@@ -205,13 +207,55 @@ _PROVIDER_FIELDS = {
 }
 
 
-def _bounded_author_text(value: str, *, max_chars: int) -> str:
-    if len(value) <= max_chars:
+def _json_string_character_bytes(character: str) -> int:
+    """Return the bytes used by one character in an ensure-ASCII JSON string."""
+    codepoint = ord(character)
+    if character in {'"', "\\"}:
+        return 2
+    if codepoint < 0x20:
+        return 6
+    if codepoint < 0x80:
+        return 1
+    if codepoint <= 0xFFFF:
+        return 6
+    return 12
+
+
+def _json_string_bytes(value: str) -> int:
+    return 2 + sum(_json_string_character_bytes(character) for character in value)
+
+
+def _bounded_author_text(
+    value: str,
+    *,
+    max_json_bytes: int,
+    collision_safe: bool = False,
+) -> str:
+    """Bound one author string by its conservative serialized JSON byte size."""
+    if _json_string_bytes(value) <= max_json_bytes:
         return value
-    return (
-        value[: max_chars - len(_WORKFLOW_COMPATIBILITY_TEXT_SUFFIX)]
-        + _WORKFLOW_COMPATIBILITY_TEXT_SUFFIX
-    )
+
+    suffix = _WORKFLOW_COMPATIBILITY_TEXT_SUFFIX
+    if collision_safe:
+        digest = hashlib.sha256(
+            value.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+        suffix = f"…[TRUNCATED:{digest}]"
+    remaining = max_json_bytes - _json_string_bytes(suffix)
+    retained: list[str] = []
+    for character in value:
+        encoded_bytes = _json_string_character_bytes(character)
+        if encoded_bytes > remaining:
+            break
+        retained.append(character)
+        remaining -= encoded_bytes
+    return "".join(retained) + suffix
+
+
+@dataclass(frozen=True)
+class _OmittedCompatibilityState:
+    level: CompatibilityLevel
+    blocking: bool
 
 
 def _truncation_omitted_count(finding: CompatibilityFinding) -> int | None:
@@ -245,12 +289,18 @@ class _FindingAccumulator:
     def _merge_omitted_state(
         self, *, count: int, level: CompatibilityLevel, blocking: bool
     ) -> None:
+        states: list[_OmittedCompatibilityState] = []
+        if self._omitted:
+            states.append(
+                _OmittedCompatibilityState(
+                    level=self._omitted_level,
+                    blocking=self._omitted_blocking,
+                )
+            )
+        states.append(_OmittedCompatibilityState(level=level, blocking=blocking))
+        self._omitted_level, _runnable = derive_compatibility_report_state(states)
         self._omitted += count
         self._omitted_blocking |= blocking
-        if level is CompatibilityLevel.UNSUPPORTED:
-            self._omitted_level = CompatibilityLevel.UNSUPPORTED
-        elif self._omitted_level is CompatibilityLevel.PORTABLE:
-            self._omitted_level = CompatibilityLevel.MAPPED
 
     def add(self, finding: CompatibilityFinding) -> None:
         omitted = _truncation_omitted_count(finding)
@@ -270,10 +320,13 @@ class _FindingAccumulator:
         bounded = replace(
             finding,
             path=_bounded_author_text(
-                finding.path, max_chars=_WORKFLOW_COMPATIBILITY_PATH_MAX
+                finding.path,
+                max_json_bytes=_WORKFLOW_COMPATIBILITY_PATH_JSON_MAX_BYTES,
+                collision_safe=True,
             ),
             message=_bounded_author_text(
-                finding.message, max_chars=_WORKFLOW_COMPATIBILITY_MESSAGE_MAX
+                finding.message,
+                max_json_bytes=_WORKFLOW_COMPATIBILITY_MESSAGE_JSON_MAX_BYTES,
             ),
         )
         if len(self._findings) >= WORKFLOW_COMPATIBILITY_FINDINGS_MAX - 1:

@@ -3660,6 +3660,8 @@ upstream_changes:
   - WORKFLOW_LANGUAGE_PACKAGE_FINDINGS_MAX
   - derive_compatibility_report_state
   - WORKFLOW_COMPATIBILITY_FINDINGS_MAX
+  - WORKFLOW_COMPATIBILITY_PAYLOAD_MAX_BYTES
+  - _bounded_author_text
   - _FindingAccumulator
   - CompatibilityReport.findings_truncated
   - CompatibilityReport.finding_count
@@ -3706,7 +3708,15 @@ upstream_changes:
     and user compatibility summaries bounded, cap compatibility production at
     512 insertion-ordered findings with O(1) `(code, path)` deduplication, and
     reserve the final slot for one bounded aggregate truncation sentinel that
-    preserves omitted blocker state. Retain the verified showcase full-report
+    preserves omitted blocker state through the authoritative report-state
+    rule. Bound author-controlled paths and messages by their conservative
+    serialized JSON byte size (including Unicode and escape amplification),
+    and retain distinct truncated paths with a deterministic digest suffix so
+    every compatibility payload remains below 1 MiB. Accept a truncation
+    sentinel only with a positive canonical omitted count, exactly 512 retained
+    findings, a non-portable aggregate, and consistent blocker state; accept
+    legacy response shapes only when they are complete and non-truncated.
+    Retain the verified showcase full-report
     payload for old clients without passing its findings through generic list
     clipping. Full compatibility responses must contain only the five projected
     finding fields plus level, runnable, findings_truncated, and finding_count;
