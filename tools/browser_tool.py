@@ -4757,12 +4757,24 @@ def _cleanup_old_recordings(max_age_hours=72):
 # Cleanup and Management Functions
 # ============================================================================
 
-def cleanup_browser(task_id: Optional[str] = None) -> None:
+def cleanup_browser(task_id: Optional[str] = None, *, keep_enrolled: bool = False) -> None:
     """
     Clean up browser session(s) for a task.
 
     Called automatically when a task completes or when inactivity timeout is reached.
     Closes both the agent-browser/Browserbase session and Camofox sessions.
+
+    OTTO: ``keep_enrolled=True`` spares an enrolled sidecar. The PER-TURN hook
+    (``agent.chat_completion_helpers.cleanup_task_resources``) passes it; the
+    end-of-task path does NOT, so end-of-task reaping is unchanged. Without it
+    every turn dropped the enrolled session's memo, handle and registry binding
+    while the real browser stayed alive, so the next turn's first trusted
+    navigation re-acquired -- and ``acquire()`` runs ``close --all`` daemon
+    hygiene, which is process-wide, so one conversation's re-acquire could tear
+    down another conversation's in-flight session (review finding H-2). The
+    headed-mode skip does not cover this: it reads the GLOBAL ``browser.headed``,
+    while the seeded enrolled profile sets ``headed`` at PROFILE level, so the
+    skip never fired.
 
     When ``task_id`` is a bare task identifier (no ``::local``/``::enrolled``
     suffix), reaps the cloud/primary session PLUS any hybrid-routing local
@@ -4796,7 +4808,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
         with _cleanup_lock:
             if sidecar_key in _active_sessions:
                 session_keys.append(sidecar_key)
-            if enrolled_key in _active_sessions:
+            if enrolled_key in _active_sessions and not keep_enrolled:
                 session_keys.append(enrolled_key)
         bare_task_id = task_id
 
@@ -4811,6 +4823,11 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     if _is_local_sidecar_key(task_id) or _is_enrolled_session_key(task_id):
         if _last_active_session_key.get(bare_task_id) == task_id:
             _last_active_session_key.pop(bare_task_id, None)
+    elif keep_enrolled and _last_active_session_key.get(bare_task_id) == f"{bare_task_id}{_ENROLLED_SUFFIX}":
+        # The spared enrolled session is still the live one; dropping the
+        # binding here would send the next click/snapshot to the bare key and
+        # a different browser.
+        pass
     else:
         _last_active_session_key.pop(bare_task_id, None)
 

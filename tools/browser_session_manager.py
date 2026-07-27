@@ -71,8 +71,43 @@ def _agent_browser_cmd() -> List[str]:
     return [browser_cmd]
 
 
+def _live_browser_session_keys() -> List[str]:
+    """Return the session keys browser_tool currently has open. Best-effort."""
+    from tools.browser_tool import _active_sessions, _cleanup_lock
+
+    with _cleanup_lock:
+        return list(_active_sessions)
+
+
 def _run_daemon_hygiene() -> None:
-    """Close every agent-browser session so a wedged daemon can't poison us."""
+    """Close every agent-browser session so a wedged daemon can't poison us.
+
+    ``close --all`` is unscoped and CANNOT be narrowed to the session being
+    acquired: at this point that session does not exist yet (acquire() runs
+    before ``_get_or_create_session`` registers anything) and agent-browser
+    session names are freshly-generated UUIDs, so there is no name to close.
+    What CAN be scoped is WHEN it runs: if this process already has live browser
+    sessions, ``close --all`` would tear down other tasks' in-flight browsers,
+    which is strictly worse than skipping the hygiene (review finding H-2). With
+    no live sessions, the only thing ``close --all`` can reach is an orphaned or
+    wedged daemon -- exactly what it is for.
+
+    Residual: a daemon that wedges WHILE another session is live is no longer
+    cleared here. That surfaces as a bounded command failure on this acquire
+    rather than as a silent teardown of someone else's session, which is the
+    trade we want. Errors reading the session table fail toward SKIPPING.
+    """
+    try:
+        live = _live_browser_session_keys()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("daemon hygiene skipped (session table unreadable): %s", exc)
+        return
+    if live:
+        logger.debug(
+            "daemon hygiene skipped: %d live browser session(s) would be torn "
+            "down by `close --all` (%s)", len(live), live,
+        )
+        return
     try:
         subprocess.run(
             _agent_browser_cmd() + ["close", "--all"],

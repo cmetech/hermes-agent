@@ -857,3 +857,105 @@ class TestLightpandaPreRouteIsGatedOffCdpSessions:
         calls = self._capture_preroute(monkeypatch)
         browser_tool.browser_vision("what is on the page?", task_id="t")
         assert calls == ["t"]
+
+
+class TestPerTurnCleanupSparesTheEnrolledSession:
+    """H-2: the per-turn hook ran a bare-id cleanup_browser EVERY turn.
+
+    Its headed-mode skip reads the GLOBAL `browser.headed`; the seeded enrolled
+    profile sets `headed` at PROFILE level, so the skip never fired. Every turn
+    dropped the enrolled memo/handle/binding while the real browser stayed
+    alive, so the next turn's first trusted navigation re-acquired -- and
+    `acquire()` runs process-wide `close --all` hygiene, which can tear down a
+    CONCURRENT conversation's in-flight session.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _sessions(self, monkeypatch, _reset_module_caches):
+        reaped = []
+        monkeypatch.setattr(
+            browser_tool, "_cleanup_single_browser_session", reaped.append
+        )
+        browser_tool._active_sessions["t"] = {"session_name": "bare"}
+        browser_tool._active_sessions["t::enrolled"] = {"session_name": "corp"}
+        browser_tool._active_sessions["t::local"] = {"session_name": "side"}
+        browser_tool._last_active_session_key["t"] = "t::enrolled"
+        self.reaped = reaped
+
+    def test_per_turn_cleanup_keeps_the_enrolled_sidecar(self):
+        browser_tool.cleanup_browser("t", keep_enrolled=True)
+        assert "t::enrolled" not in self.reaped, (
+            "the live enrolled session was torn down by per-turn cleanup"
+        )
+        # everything else is still reaped exactly as before
+        assert "t" in self.reaped and "t::local" in self.reaped
+
+    def test_per_turn_cleanup_keeps_the_last_active_binding(self):
+        browser_tool.cleanup_browser("t", keep_enrolled=True)
+        assert browser_tool._last_active_session_key.get("t") == "t::enrolled", (
+            "the next click/snapshot would be routed to a different browser"
+        )
+
+    def test_end_of_task_cleanup_still_reaps_it(self):
+        """Task 6 deliberately made end-of-task reaping work -- keep it."""
+        browser_tool.cleanup_browser("t")
+        assert "t::enrolled" in self.reaped
+        assert browser_tool._last_active_session_key.get("t") is None
+
+
+class TestPerTurnHookPassesKeepEnrolled:
+    def test_cleanup_task_resources_spares_enrolled_sessions(self, monkeypatch):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+
+        from agent.chat_completion_helpers import cleanup_task_resources
+
+        with (
+            patch("tools.browser_tool._is_headed_mode", return_value=False),
+            patch("run_agent.cleanup_vm"),
+            patch("run_agent.cleanup_browser") as mock_cb,
+            patch("agent.chat_completion_helpers.is_persistent_env", return_value=False),
+        ):
+            cleanup_task_resources(SimpleNamespace(verbose_logging=False), "task-x")
+        mock_cb.assert_called_once_with("task-x", keep_enrolled=True)
+
+
+class TestDaemonHygieneIsScoped:
+    """H-2, second half: `acquire()`'s `close --all` is process-wide."""
+
+    @pytest.fixture(autouse=True)
+    def _no_subprocess(self, monkeypatch):
+        ran = []
+        monkeypatch.setattr(
+            browser_session_manager, "_agent_browser_cmd", lambda: ["agent-browser"]
+        )
+        monkeypatch.setattr(
+            browser_session_manager.subprocess, "run",
+            lambda *a, **kw: ran.append(a[0] if a else kw.get("args")),
+        )
+        self.ran = ran
+
+    def test_hygiene_runs_when_nothing_else_is_open(self, monkeypatch):
+        monkeypatch.setattr(browser_session_manager, "_live_browser_session_keys", list)
+        browser_session_manager._run_daemon_hygiene()
+        assert self.ran, "a wedged daemon would never be cleared"
+
+    def test_hygiene_is_skipped_while_another_session_is_live(self, monkeypatch):
+        monkeypatch.setattr(
+            browser_session_manager, "_live_browser_session_keys",
+            lambda: ["other-conversation"],
+        )
+        browser_session_manager._run_daemon_hygiene()
+        assert self.ran == [], (
+            "`close --all` tore down another conversation's live session"
+        )
+
+    def test_unreadable_session_table_fails_toward_skipping(self, monkeypatch):
+        def _boom():
+            raise RuntimeError("no session table")
+
+        monkeypatch.setattr(
+            browser_session_manager, "_live_browser_session_keys", _boom
+        )
+        browser_session_manager._run_daemon_hygiene()
+        assert self.ran == []
