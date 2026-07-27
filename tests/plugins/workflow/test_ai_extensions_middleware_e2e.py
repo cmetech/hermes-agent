@@ -385,19 +385,14 @@ def _start_provider_trap() -> tuple[ThreadingHTTPServer, str]:
     return server, f"http://{host}:{port}/v1"
 
 
-def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
+def _run_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
     tmp_path,
     monkeypatch,
-    client: TestClient | None = None,
+    client: TestClient,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
-    if client is None:
-        with _production_client(monkeypatch) as active_client:
-            return test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
-                tmp_path, monkeypatch, client=active_client
-            )
     _write_runtime_config(home, api_mode="chat_completions")
     showcase_module._clear_verified_showcase_cache_for_tests()
     store = RunStore(home)
@@ -548,19 +543,14 @@ def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
-def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
+def _run_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
     tmp_path,
     monkeypatch,
-    client: TestClient | None = None,
+    client: TestClient,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
-    if client is None:
-        with _production_client(monkeypatch) as active_client:
-            return test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
-                tmp_path, monkeypatch, client=active_client
-            )
     provider, base_url = _start_provider_trap()
     _write_runtime_config(
         home,
@@ -622,19 +612,14 @@ def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
-def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
+def _run_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
     tmp_path,
     monkeypatch,
-    client: TestClient | None = None,
+    client: TestClient,
 ) -> None:
     home = tmp_path / "non-ai"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
-    if client is None:
-        with _production_client(monkeypatch) as active_client:
-            return test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
-                tmp_path, monkeypatch, client=active_client
-            )
     _write_runtime_config(home, api_mode="chat_completions")
     showcase_module._clear_verified_showcase_cache_for_tests()
     store = RunStore(home)
@@ -718,19 +703,14 @@ def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
-def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
+def _run_explicit_real_digest_mismatch_fails_before_coordinator_runner(
     tmp_path,
     monkeypatch,
-    client: TestClient | None = None,
+    client: TestClient,
 ) -> None:
     home = tmp_path / "digest-mismatch"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
-    if client is None:
-        with _production_client(monkeypatch) as active_client:
-            return test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
-                tmp_path, monkeypatch, client=active_client
-            )
     _write_runtime_config(home, api_mode="chat_completions")
     showcase_module._clear_verified_showcase_cache_for_tests()
     store = RunStore(home)
@@ -773,19 +753,14 @@ def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
-def test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
+def _run_capable_admission_then_actual_app_server_runtime_fails_before_provider(
     tmp_path,
     monkeypatch,
-    client: TestClient | None = None,
+    client: TestClient,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
-    if client is None:
-        with _production_client(monkeypatch) as active_client:
-            return test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
-                tmp_path, monkeypatch, client=active_client
-            )
     provider, base_url = _start_provider_trap()
     _write_runtime_config(home, api_mode="chat_completions", base_url=base_url)
     showcase_module._clear_verified_showcase_cache_for_tests()
@@ -839,6 +814,51 @@ def test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
+
+
+def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
+    tmp_path, monkeypatch
+) -> None:
+    with _production_client(monkeypatch) as client:
+        _run_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
+            tmp_path, monkeypatch, client
+        )
+
+
+def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
+    tmp_path, monkeypatch
+) -> None:
+    with _production_client(monkeypatch) as client:
+        _run_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
+            tmp_path, monkeypatch, client
+        )
+
+
+def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
+    tmp_path, monkeypatch
+) -> None:
+    with _production_client(monkeypatch) as client:
+        _run_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
+            tmp_path, monkeypatch, client
+        )
+
+
+def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
+    tmp_path, monkeypatch
+) -> None:
+    with _production_client(monkeypatch) as client:
+        _run_explicit_real_digest_mismatch_fails_before_coordinator_runner(
+            tmp_path, monkeypatch, client
+        )
+
+
+def test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
+    tmp_path, monkeypatch
+) -> None:
+    with _production_client(monkeypatch) as client:
+        _run_capable_admission_then_actual_app_server_runtime_fails_before_provider(
+            tmp_path, monkeypatch, client
+        )
 
 
 def test_production_api_and_coordinator_share_binding_declaration_and_no_request_seam(
