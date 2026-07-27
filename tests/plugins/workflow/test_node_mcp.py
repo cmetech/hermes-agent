@@ -429,6 +429,116 @@ def test_sealed_mcp_rejects_undeclared_path_like_values_after_interpolation(
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("command", "file:///tmp/mutable-server"),
+        ("arg", "FiLe:///tmp/mutable.txt"),
+        ("arg", "  FILE://localhost/tmp/mutable.txt  "),
+        ("arg", "file:%2f%2f%2ftmp%2fmutable.txt"),
+        ("arg", "%66ile%3A%252F%252Ftmp%252Fmutable.txt"),
+        ("arg", "sqlite:///tmp/mutable.db"),
+        ("arg", "unix:///tmp/mutable.sock"),
+        ("arg", "jar:file:///tmp/mutable.jar!/server.py"),
+        ("arg", "data:text/plain;base64,c2VhbGVk"),
+        ("arg", "data:text/plain;base64,UQ=="),
+        ("arg", "vscode://file/tmp/mutable.py"),
+        ("arg", "unknown+local://host/tmp/mutable"),
+        ("arg", "--config=SQLITE%3A%2F%2F%2Ftmp%2Fmutable.db"),
+        ("env", "uNiX:%2F%2F%2Ftmp%2Fmutable.sock"),
+        ("runtime_files", "file:///tmp/mutable.txt"),
+    ],
+)
+def test_sealed_mcp_rejects_local_embed_and_unknown_uri_schemes(tmp_path, field, value):
+    run = tmp_path / "run"
+    definition = {
+        "command": sys.executable,
+        "args": ["servers/echo.py"],
+    }
+    if field == "command":
+        definition["command"] = value
+        definition["args"] = []
+    elif field == "arg":
+        definition["args"].append(value)
+    elif field == "env":
+        definition["env"] = {"WORKFLOW_DEPENDENCY": value}
+    else:
+        definition["runtime_files"] = [value]
+    authenticated = {
+        "mcp/echo.yaml": yaml.safe_dump({"echo": definition}).encode(),
+        "servers/echo.py": b"print('sealed')\n",
+    }
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        server = ResourceResolver(
+            run,
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+
+        with pytest.raises(
+            PackageMCPUnavailable, match="runtime closure cannot be proven"
+        ):
+            _finalize_authenticated_mcp_config({"echo": server})
+    finally:
+        materializer.cleanup()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file:///tmp/mutable.sock",
+        "SQLITE%3A%2F%2F%2Ftmp%2Fmutable.db",
+        "data:text/plain,embedded",
+        "vscode://file/tmp/mutable.py",
+        "unknown://host/resource",
+    ],
+)
+def test_sealed_remote_config_rejects_non_network_uri_schemes(tmp_path, url):
+    run = tmp_path / "run"
+    server = {"url": url}
+    authenticated = {"mcp/echo.yaml": yaml.safe_dump({"echo": server}).encode()}
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        resolved = ResourceResolver(
+            run,
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+
+        with pytest.raises(
+            PackageMCPUnavailable, match="runtime closure cannot be proven"
+        ):
+            _finalize_authenticated_mcp_config({"echo": resolved})
+    finally:
+        materializer.cleanup()
+
+
+@pytest.mark.parametrize("scheme", ["http", "https", "ws", "wss"])
+def test_sealed_mcp_preserves_explicit_network_urls(tmp_path, scheme):
+    run = tmp_path / "run"
+    server = {
+        "command": "mcp-server-fetch",
+        "args": [
+            f"{scheme}://network.example.test/a/b",
+            f"--endpoint={scheme.upper()}://network.example.test/c/d",
+        ],
+        "env": {"REMOTE_ENDPOINT": f"  {scheme}://network.example.test/e/f  "},
+    }
+    authenticated = {"mcp/echo.yaml": yaml.safe_dump({"echo": server}).encode()}
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        resolved = ResourceResolver(
+            run,
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+
+        assert _finalize_authenticated_mcp_config({"echo": resolved})["echo"] == server
+    finally:
+        materializer.cleanup()
+
+
+@pytest.mark.parametrize(
     ("server", "python_mode"),
     [
         (
@@ -446,7 +556,12 @@ def test_sealed_mcp_rejects_undeclared_path_like_values_after_interpolation(
         (
             {
                 "command": "mcp-server-fetch",
-                "args": ["--mode=stdio", "ordinary-literal", "https://example.test/a/b"],
+                "args": [
+                    "--mode=stdio",
+                    "ordinary-literal",
+                    "ordinary=value",
+                    "https://example.test/a/b",
+                ],
             },
             None,
         ),
@@ -519,6 +634,70 @@ def test_real_worker_rejects_interpolated_undeclared_paths_before_mcp_spawn(
     else:
         server["runtime_files"] = ["${MISSING_RUNTIME_FILE}"]
         monkeypatch.setenv("MISSING_RUNTIME_FILE", "mutable/helper.py")
+    definition = yaml.safe_dump({"node_echo": server}).encode()
+    authenticated = {
+        "mcp/echo.yaml": definition,
+        "servers/sealed.py": sealed_server,
+    }
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        resolved = ResourceResolver(
+            run,
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)
+        result = PluginAgentRunner("workflow/test").run(
+            PluginAgentRunRequest(
+                prompt="must fail before MCP spawn",
+                allowed_tools=("mcp__node_echo__missing",),
+                mcp_servers=resolved,
+                workdir=run,
+                max_api_attempts=1,
+                idle_timeout_seconds=10,
+                wall_timeout_seconds=20,
+                provider_request_timeout_seconds=5,
+            )
+        )
+    finally:
+        materializer.cleanup()
+
+    assert result.status == "failed"
+    assert result.audit["failure_kind"] == "package_mcp_unavailable"
+    assert "runtime closure cannot be proven" in str(result.audit["error"])
+    assert not pid_file.exists()
+
+
+@pytest.mark.parametrize(
+    ("uri_field", "value"),
+    [
+        ("exact", "FiLe:///tmp/mutable.txt"),
+        ("compound", "SQLITE://localhost/tmp/mutable.db"),
+        ("env", "  fIlE://localhost/tmp/mutable.txt  "),
+        ("encoded", "%66ile%3A%252F%252Ftmp%252Fmutable.txt"),
+    ],
+)
+def test_real_worker_rejects_local_uri_before_mcp_spawn(
+    tmp_path, monkeypatch, uri_field, value
+):
+    _write_provider_config("http://127.0.0.1:1/v1", api_mode="chat_completions")
+    run = tmp_path / "run"
+    run.mkdir()
+    pid_file = tmp_path / f"{uri_field}.pid"
+    sealed_server = (
+        f"from pathlib import Path\nPath({str(pid_file)!r}).write_text('spawned')\n"
+    ).encode()
+    server = {
+        "command": sys.executable,
+        "args": ["servers/sealed.py"],
+        "connect_timeout": 1,
+    }
+    monkeypatch.setenv("LOCAL_URI", value)
+    if uri_field == "compound":
+        server["args"].append("--config=${LOCAL_URI}")
+    elif uri_field == "env":
+        server["env"] = {"WORKFLOW_DEPENDENCY": "${LOCAL_URI}"}
+    else:
+        server["args"].append("${LOCAL_URI}")
     definition = yaml.safe_dump({"node_echo": server}).encode()
     authenticated = {
         "mcp/echo.yaml": definition,

@@ -11,6 +11,7 @@ import re
 import sys
 import threading
 from typing import Any
+from urllib.parse import unquote
 
 
 _PROTOCOL_VERSION = 1
@@ -380,11 +381,13 @@ _PATH_OPTION = re.compile(
     r"^--?(?:config|cwd|dir|directory|entry|file|manifest|path|root|script)(?:[-_].*)?$",
     re.IGNORECASE,
 )
+_COMPOUND_OPTION_ASSIGNMENT = re.compile(r"^(?P<option>--?[^=\s]+)=(?P<value>.*)$")
 _PATH_ENV = re.compile(
     r"(?:^|_)(?:CONFIG|CWD|DIR|DIRECTORY|ENTRY|FILE|MANIFEST|PATH|ROOT|SCRIPT)$",
     re.IGNORECASE,
 )
-_REMOTE_URL = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_URI_SCHEME = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*):(?P<body>.*)$")
+_NETWORK_URI_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 _SCOPED_PACKAGE = re.compile(r"^@[^/\\\s]+/[^/\\\s]+$")
 _PYTHON_EXECUTABLE = re.compile(r"pythonw?(?:3(?:\.\d+)?)?")
 _PYTHON_MODULE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
@@ -399,11 +402,8 @@ _CLOSURE_ERROR = (
 def _authority_relative(
     value: str, source_root: Path, *, compound: bool = False
 ) -> tuple[str, str] | None:
-    prefix = ""
-    candidate = value
-    if compound and "=" in value:
-        head, candidate = value.split("=", 1)
-        prefix = f"{head}="
+    option, candidate = _path_candidate(value, compound=compound)
+    prefix = f"{option}=" if option else ""
     if candidate.startswith("./"):
         candidate = candidate[2:]
     path = Path(candidate)
@@ -419,15 +419,40 @@ def _authority_relative(
 
 
 def _path_candidate(value: str, *, compound: bool = False) -> tuple[str, str]:
-    if compound and "=" in value:
-        head, candidate = value.split("=", 1)
-        return head, candidate
+    if compound:
+        match = _COMPOUND_OPTION_ASSIGNMENT.fullmatch(value)
+        if match is not None:
+            return match.group("option"), match.group("value")
     return "", value
+
+
+def _uri_disposition(value: str, *, compound: bool = False) -> str | None:
+    """Classify explicit URIs without consulting mutable filesystem state."""
+    candidate = _path_candidate(value, compound=compound)[1]
+    decoded = candidate
+    for _ in range(3):
+        expanded = unquote(decoded)
+        if expanded == decoded:
+            break
+        decoded = expanded
+    match = _URI_SCHEME.fullmatch(decoded.strip())
+    if match is None:
+        return None
+    scheme = match.group("scheme").lower()
+    body = match.group("body")
+    if scheme in _NETWORK_URI_SCHEMES and body.startswith("//"):
+        return "network"
+    return "unsafe"
 
 
 def _looks_path_like(value: str, *, compound: bool = False) -> bool:
     option, candidate = _path_candidate(value, compound=compound)
-    if not candidate or _REMOTE_URL.match(candidate):
+    uri_disposition = _uri_disposition(value, compound=compound)
+    if uri_disposition == "network":
+        return False
+    if uri_disposition == "unsafe":
+        return True
+    if not candidate:
         return False
     if (
         candidate.startswith(("./", "../", ".\\", "..\\", "/", "~"))
@@ -516,6 +541,8 @@ def _finalize_authenticated_mcp_config(
             return f"{prefix}{root.joinpath(*Path(relative).parts)}", relative
 
         if command is None and isinstance(config.get("url"), str):
+            if _uri_disposition(config["url"]) != "network":
+                reject_unproven()
             finalized[name] = config
             continue
         if not isinstance(command, str) or not command:

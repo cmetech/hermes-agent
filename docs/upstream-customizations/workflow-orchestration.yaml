@@ -3298,6 +3298,7 @@ upstream_changes:
   - plugin-agent worker authenticated MCP authority validation
   - plugin-agent worker post-interpolation local reference classification
   - plugin-agent worker post-interpolation lexical default-deny path policy
+  - plugin-agent worker explicit network URI allow-list and encoded URI rejection
   - plugin-agent worker isolated Python inline and module launch policy
   - plugin-agent worker compact manifest validation and nonlocal metadata stripping
   - MCPServerTask authenticated private working directory
@@ -3409,15 +3410,23 @@ upstream_changes:
     rewrite authenticated manifest members, and default-deny undeclared explicit
     relative, forward-slash, Windows-backslash, script/extension, executable,
     compound option, environment-dependency, and runtime-file path shapes without
-    consulting mutable filesystem existence. Launch authenticated Python scripts
+    consulting mutable filesystem existence. Recursively percent-decode a bounded
+    number of times and normalize surrounding whitespace and scheme case only for
+    classification. Preserve explicit HTTP, HTTPS, WS, and WSS network URIs with
+    authority delimiters, but reject local, embedded, IDE, database, socket, and
+    unknown URI schemes in commands, exact or compound arguments, environment
+    values, runtime files, and top-level remote configurations before MCP spawn.
+    Only parse `-x=value` and `--key=value` as compound option assignments; an
+    arbitrary literal containing `=` must retain its complete value for URI
+    classification. Launch authenticated Python scripts
     isolated from the mutable run cwd with private cwd, sys.path, and __file__
     semantics while preserving MCP protocol stdin. Add `-I` and the private
     payload cwd for authenticated Python `-c` and valid installed-module `-m`
     modes so mutable cwd modules cannot shadow installed imports. Unsupported
     post-interpolation local launch shapes fail closed; genuinely installed bare
-    commands, ordinary flags/literals/URLs, npx/uvx package specs including scoped
-    packages, and remote configurations discard internal metadata and retain their
-    compatible behavior. The compact handoff must keep every otherwise-valid 512-file
+    commands, ordinary flags/literals, npx/uvx package specs including scoped
+    packages, and explicitly allowed network URLs/configurations discard internal
+    metadata and retain their compatible behavior. The compact handoff must keep every otherwise-valid 512-file
     workflow below the plugin-agent 256 KB MCP-config contract while genuinely
     oversized configs still reject. The worker must load from the same source
     tree as its parent.
