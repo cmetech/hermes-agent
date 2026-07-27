@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -16,6 +15,7 @@ from plugins.workflow.trust import (
     build_risk_summary,
     compute_package_digest,
 )
+from plugins.workflow.dashboard import plugin_api as workflow_plugin_api
 
 
 def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
@@ -80,12 +80,7 @@ def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    mounted_route = next(
-        route
-        for route in web_server.app.routes
-        if getattr(route, "path", None) == "/api/plugins/workflow/workflows"
-    )
-    mounted_plugin = sys.modules[mounted_route.endpoint.__module__]
+    workflow_plugin_api._close_runtime()
     client = TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
@@ -191,5 +186,5 @@ def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
         }
     finally:
         client.close()
-        mounted_plugin._close_runtime()
-        assert mounted_plugin._RUNTIME is None
+        workflow_plugin_api._close_runtime()
+        assert workflow_plugin_api._RUNTIME is None

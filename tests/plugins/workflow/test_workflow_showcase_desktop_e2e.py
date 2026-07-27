@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 import json
 import shutil
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -16,6 +15,7 @@ from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.trust import WorkflowTrustStore
+from plugins.workflow.dashboard import plugin_api as workflow_plugin_api
 
 
 @contextmanager
@@ -96,14 +96,7 @@ def test_bundled_showcase_catalog_detail_and_admission_cross_real_middleware(
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    mounted_route = next(
-        route
-        for route in web_server.app.routes
-        if getattr(route, "path", None) == "/api/plugins/workflow/workflows"
-    )
-    mounted_plugin = sys.modules[mounted_route.endpoint.__module__]
-    mounted_plugin._close_runtime()
-    mounted_plugin._runtime()
+    workflow_plugin_api._close_runtime()
     client = TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
@@ -212,5 +205,5 @@ def test_bundled_showcase_catalog_detail_and_admission_cross_real_middleware(
         }
     finally:
         client.close()
-        mounted_plugin._close_runtime()
-        assert mounted_plugin._RUNTIME is None
+        workflow_plugin_api._close_runtime()
+        assert workflow_plugin_api._RUNTIME is None

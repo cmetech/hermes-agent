@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import sys
 import threading
 import time
 
@@ -24,6 +23,7 @@ from plugins.workflow.lease_clock import LeaseClockSample, current_boot_id
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.runner_binding import RunnerCapabilities, WorkflowRunnerBinding
 from plugins.workflow.store import RunStore
+from plugins.workflow.dashboard import plugin_api as workflow_plugin_api
 import plugins.workflow.showcase as showcase_module
 from tools.managed_process import ProcessIdentity
 
@@ -162,23 +162,17 @@ def _leader(
 def _production_client(
     monkeypatch: pytest.MonkeyPatch,
     clocks: _Clocks,
-) -> tuple[TestClient, object]:
+) -> TestClient:
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    mounted_route = next(
-        route
-        for route in web_server.app.routes
-        if getattr(route, "path", None) == "/api/plugins/workflow/runs"
-    )
-    mounted_plugin = sys.modules[mounted_route.endpoint.__module__]
-    mounted_plugin._close_runtime()
-    monkeypatch.setattr(mounted_plugin, "_schedule_now_utc", clocks.utcnow)
+    workflow_plugin_api._close_runtime()
+    monkeypatch.setattr(workflow_plugin_api, "_schedule_now_utc", clocks.utcnow)
     client = TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
     )
-    return client, mounted_plugin
+    return client
 
 
 def _schedule_showcase(
@@ -295,7 +289,7 @@ def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
     coordinator, identity, epoch = _leader(store, clocks, "task-4-7-success")
     runner = _RecordingAIRunner()
     binding = _binding(runner)
-    client, mounted_plugin = _production_client(monkeypatch, clocks)
+    client = _production_client(monkeypatch, clocks)
     service, scheduler = _service_and_scheduler(
         home, store, clocks, identity, epoch, binding
     )
@@ -386,7 +380,7 @@ def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
     finally:
         scheduler.shutdown(deadline_seconds=5)
         client.close()
-        mounted_plugin._close_runtime()
+        workflow_plugin_api._close_runtime()
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -406,7 +400,7 @@ def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
     store = RunStore(home, lease_clock=clocks.lease_sample)
     coordinator, identity, epoch = _leader(store, clocks, "task-4-7-cancel")
     runner = _RecordingAIRunner()
-    client, mounted_plugin = _production_client(monkeypatch, clocks)
+    client = _production_client(monkeypatch, clocks)
 
     try:
         run_id, schedule_at = _schedule_showcase(
@@ -432,7 +426,7 @@ def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
         )
 
         client.close()
-        mounted_plugin._close_runtime()
+        workflow_plugin_api._close_runtime()
         restarted = RunStore(home, lease_clock=clocks.lease_sample)
         clocks.wall = datetime.fromisoformat(schedule_at.replace("Z", "+00:00"))
         service, scheduler = _service_and_scheduler(
@@ -465,7 +459,7 @@ def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
         assert _ProviderTrap.requests == 0
     finally:
         client.close()
-        mounted_plugin._close_runtime()
+        workflow_plugin_api._close_runtime()
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -485,7 +479,7 @@ def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
     store = RunStore(home, lease_clock=clocks.lease_sample)
     coordinator, identity, epoch = _leader(store, clocks, "task-4-7-rebuild")
     runner = _RecordingAIRunner()
-    client, mounted_plugin = _production_client(monkeypatch, clocks)
+    client = _production_client(monkeypatch, clocks)
 
     try:
         run_id, schedule_at = _schedule_showcase(
@@ -495,7 +489,7 @@ def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
             key="task-4-7-scheduling-rebuild",
         )
         client.close()
-        mounted_plugin._close_runtime()
+        workflow_plugin_api._close_runtime()
         store.database.unlink()
 
         rebuilt = RunStore(home, lease_clock=clocks.lease_sample)
@@ -551,7 +545,7 @@ def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
         assert _ProviderTrap.requests == 0
     finally:
         client.close()
-        mounted_plugin._close_runtime()
+        workflow_plugin_api._close_runtime()
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -582,7 +576,7 @@ def test_scheduled_ai_revalidates_actual_runner_and_runtime_before_claim(
     store = RunStore(home, lease_clock=clocks.lease_sample)
     coordinator, identity, epoch = _leader(store, clocks, f"task-4-7-{context}")
     runner = _RecordingAIRunner()
-    client, mounted_plugin = _production_client(monkeypatch, clocks)
+    client = _production_client(monkeypatch, clocks)
 
     try:
         run_id, schedule_at = _schedule_showcase(
@@ -623,7 +617,7 @@ def test_scheduled_ai_revalidates_actual_runner_and_runtime_before_claim(
             assert len(_run_events(store, run_id, "run_promoted")) == 1
     finally:
         client.close()
-        mounted_plugin._close_runtime()
+        workflow_plugin_api._close_runtime()
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()

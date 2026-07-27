@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from plugins.workflow.trust import WorkflowTrustStore
+from plugins.workflow.dashboard import plugin_api as workflow_plugin_api
 
 
 def _tree_snapshot(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
@@ -56,13 +56,7 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    mounted_route = next(
-        route
-        for route in web_server.app.routes
-        if getattr(route, "path", None) == "/api/plugins/workflow/workflows"
-    )
-    mounted_plugin = sys.modules[mounted_route.endpoint.__module__]
-    mounted_plugin._close_runtime()
+    workflow_plugin_api._close_runtime()
     before_home = _tree_snapshot(home)
     before_project = _tree_snapshot(workdir)
     client = TestClient(
@@ -142,4 +136,4 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
         assert _tree_snapshot(workdir) == before_project
     finally:
         client.close()
-        mounted_plugin._close_runtime()
+        workflow_plugin_api._close_runtime()

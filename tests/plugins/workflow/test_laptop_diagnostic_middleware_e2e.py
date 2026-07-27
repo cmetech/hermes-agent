@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
-import sys
 import threading
 import time
 
@@ -25,6 +24,7 @@ from plugins.workflow.evidence import EVIDENCE_KINDS
 from plugins.workflow.scheduler import RunScheduler
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.store import RunStore
+from plugins.workflow.dashboard import plugin_api as workflow_plugin_api
 from plugins.workflow.trust import (
     WorkflowResourceReadBudget,
     WorkflowTrustStore,
@@ -117,22 +117,16 @@ def _stop_service(
     assert not thread.is_alive()
 
 
-def _production_client(monkeypatch) -> tuple[TestClient, object]:
+def _production_client(monkeypatch) -> TestClient:
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    mounted_route = next(
-        route
-        for route in web_server.app.routes
-        if getattr(route, "path", None) == "/api/plugins/workflow/runs"
-    )
-    mounted_plugin = sys.modules[mounted_route.endpoint.__module__]
-    mounted_plugin._close_runtime()
+    workflow_plugin_api._close_runtime()
     client = TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
     )
-    return client, mounted_plugin
+    return client
 
 
 def _exact_start_material(status: dict[str, object]) -> dict[str, object]:
@@ -379,7 +373,7 @@ def _exercise_laptop_branch(
 
         monkeypatch.setattr(PluginAgentRunner, "run", forbidden_real_run)
 
-    client, mounted_plugin = _production_client(monkeypatch)
+    client = _production_client(monkeypatch)
     stop = None
     thread = None
     idempotency_key = f"laptop-diagnostic-task-2-6-{branch}"
@@ -538,7 +532,7 @@ def _exercise_laptop_branch(
     finally:
         _stop_service(store, stop, thread)
         client.close()
-        mounted_plugin._close_runtime()
+        workflow_plugin_api._close_runtime()
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 

@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
-import sys
 import threading
 import time
 
@@ -24,6 +23,7 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.dashboard.plugin_api import StartRunRequest
+from plugins.workflow.dashboard import plugin_api as workflow_plugin_api
 from plugins.workflow.entitlement import DeterministicAgentRunner
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.provenance import TriggerProvenance
@@ -194,22 +194,16 @@ def _healthy_admission_lease(store: RunStore, label: str):
     return identity, acquired.lease
 
 
-def _production_client(monkeypatch) -> tuple[TestClient, object]:
+def _production_client(monkeypatch) -> TestClient:
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    mounted_route = next(
-        route
-        for route in web_server.app.routes
-        if getattr(route, "path", None) == "/api/plugins/workflow/runs"
-    )
-    mounted_plugin = sys.modules[mounted_route.endpoint.__module__]
-    mounted_plugin._close_runtime()
+    workflow_plugin_api._close_runtime()
     client = TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
     )
-    return client, mounted_plugin
+    return client
 
 
 def _capable_test_binding(runner) -> WorkflowRunnerBinding:
@@ -411,7 +405,7 @@ def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
         Path(showcase_module.__file__).with_name("showcases")
     )
     recording_runner = CapabilityDeclaringRecordingRunner()
-    client, mounted_plugin = _production_client(monkeypatch)
+    client = _production_client(monkeypatch)
     stop = None
     thread = None
     request_body = {
@@ -548,7 +542,7 @@ def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
     finally:
         _stop_service(store, stop, thread)
         client.close()
-        mounted_plugin._close_runtime()
+        workflow_plugin_api._close_runtime()
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
@@ -570,7 +564,7 @@ def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
     trust_store = WorkflowTrustStore(home)
     trust_store.trust("a" * 64, actor="existing-operator", risk_digest="b" * 64)
     trust_before = trust_store.path.read_bytes()
-    client, mounted_plugin = _production_client(monkeypatch)
+    client = _production_client(monkeypatch)
 
     try:
         catalog_response = client.get("/api/plugins/workflow/workflows")
@@ -617,7 +611,7 @@ def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
         assert _ProviderCallTrap.requests == 0
     finally:
         client.close()
-        mounted_plugin._close_runtime()
+        workflow_plugin_api._close_runtime()
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -654,7 +648,7 @@ def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
         "verified_showcase_run_metadata",
         explicit_real_non_ai_metadata,
     )
-    client, mounted_plugin = _production_client(monkeypatch)
+    client = _production_client(monkeypatch)
     stop = None
     thread = None
 
@@ -712,7 +706,7 @@ def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
     finally:
         _stop_service(store, stop, thread)
         client.close()
-        mounted_plugin._close_runtime()
+        workflow_plugin_api._close_runtime()
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
@@ -744,7 +738,7 @@ def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
         epoch=lease.epoch,
         now=datetime.now(timezone.utc),
     )
-    client, mounted_plugin = _production_client(monkeypatch)
+    client = _production_client(monkeypatch)
     stop = None
     thread = None
 
@@ -764,7 +758,7 @@ def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
     finally:
         _stop_service(store, stop, thread)
         client.close()
-        mounted_plugin._close_runtime()
+        workflow_plugin_api._close_runtime()
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
@@ -780,7 +774,7 @@ def test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
     showcase_module._clear_verified_showcase_cache_for_tests()
     store = RunStore(home)
     identity, lease = _healthy_admission_lease(store, "task-3-4-runtime-change")
-    client, mounted_plugin = _production_client(monkeypatch)
+    client = _production_client(monkeypatch)
     stop = None
     thread = None
 
@@ -827,7 +821,7 @@ def test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
     finally:
         _stop_service(store, stop, thread)
         client.close()
-        mounted_plugin._close_runtime()
+        workflow_plugin_api._close_runtime()
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
