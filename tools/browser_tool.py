@@ -495,6 +495,17 @@ _session_cdp_urls: Dict[str, str] = {}
 # Per-key locks so exactly one thread acquires a given session's browser.
 # The dict lock alone is not enough: acquire() runs `close --all` hygiene, so a
 # second concurrent acquire tears down the first session mid-navigation (EBL-003).
+#
+# DELIBERATELY UNPRUNED -- do NOT "fix" this by popping a key on cleanup. The
+# naive `_session_cdp_keylocks.pop(key)` reintroduces the very race the locks
+# exist to prevent: thread B can be BLOCKED on the lock while cleanup removes
+# it, then the next acquire for that key calls setdefault() and gets a FRESH,
+# unheld lock -- so B and the new thread both enter acquire() and one's
+# `close --all` tears down the other's session. `lock.locked()` cannot make the
+# pop safe either; it is racy by construction (true the instant after you read
+# it as false). The dict is bounded by the number of distinct session keys the
+# process ever sees, and each entry is a bare threading.Lock, so the leak is a
+# few dozen bytes per task -- cheaper than the race.
 _session_cdp_keylocks: Dict[str, threading.Lock] = {}
 # Live BrowserSession handles, so cleanup can release() exactly once (EBL-005).
 _session_handles: Dict[str, Any] = {}
@@ -697,6 +708,12 @@ def _session_cdp_url(session_key: Optional[str]) -> str:
         session = acquire(profile.name, session_key=key, attach_global=False)
         cdp_url = _resolve_cdp_override(str(session.cdp_url or ""))
         if not cdp_url:
+            # Currently unreachable (acquire() raises rather than returning an
+            # enrolled session with no endpoint), but if that ever changes, the
+            # session would be leaked here: it is not yet in _session_handles,
+            # so nothing else would ever release() it or unbind its registry
+            # entry -- and a bound-but-orphaned key keeps enrolled trust.
+            session.release()
             raise ProfileError(
                 f"browser profile {profile.name!r} exposed no CDP endpoint"
             )

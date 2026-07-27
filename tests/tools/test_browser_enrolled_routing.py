@@ -3,6 +3,8 @@
 Design: docs/plans/2026-07-26-per-navigation-browser-profile-design.md
 """
 
+import json
+
 import pytest
 
 from tools import browser_profiles, browser_session_manager, browser_session_registry, browser_tool
@@ -431,12 +433,18 @@ class TestRedirectParity:
         return browser_tool.browser_navigate(TRUSTED, task_id="t")
 
     def test_redirect_to_a_trusted_origin_is_permitted(self, monkeypatch):
+        """Assert SUCCESS, not the absence of one error string.
+
+        The redirect-block text is "private/internal address"; the PRE-NAV guard
+        says "private or internal address". A negative assertion on the former
+        stayed green even when the navigation never happened because the pre-nav
+        guard blocked it, so it could not tell "permitted" from "blocked for a
+        different reason" (review finding L-3).
+        """
         out = self._navigate_landing_on(monkeypatch, "https://wiki.corp.example/home")
-        # The redirect-block error text is "private/internal address" (see
-        # test_browser_ssrf_local.py:271, a protected suite this task must not
-        # edit) -- distinct from the pre-nav guard's "private or internal
-        # address" wording. Assert against the real production string.
-        assert "private/internal address" not in out
+        payload = json.loads(out)
+        assert payload["success"] is True, payload
+        assert payload["url"] == "https://wiki.corp.example/home"
 
     def test_redirect_to_an_unlisted_private_origin_is_blocked(self, monkeypatch):
         out = self._navigate_landing_on(monkeypatch, "https://other.corp.example/x")
@@ -743,8 +751,17 @@ class TestSnapshotGuardForcedOnForEnrolled:
         assert "private or internal address" not in out
 
     def test_snapshot_metadata_floor_outranks_enrolled_trust(self, monkeypatch):
-        """`_snapshot_blocked_url` checks the always-blocked floor first."""
-        out = self._snapshot(monkeypatch, "t::enrolled", METADATA)
+        """`_snapshot_blocked_url` checks the always-blocked floor FIRST.
+
+        Forced over a TRUSTED url, mirroring
+        test_browser_default_profile.py::TestSnapshotGuardHelper::
+        test_metadata_floor_outranks_trust. Asserting on METADATA instead would
+        be untestable here: the profile never trusts 169.254.169.254, so the
+        ordinary private-address branch emits the same message and deleting the
+        floor branch entirely would leave this green.
+        """
+        monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda u: True)
+        out = self._snapshot(monkeypatch, "t::enrolled", TRUSTED)
         assert "private or internal address" in out
 
 
@@ -784,7 +801,10 @@ class TestVisionGuardForcedOnForEnrolled:
         assert "private or internal address" not in out
 
     def test_vision_metadata_floor_outranks_enrolled_trust(self, monkeypatch):
-        out = self._vision_call(monkeypatch, "t::enrolled", METADATA)
+        """Forced over a TRUSTED url -- see the snapshot twin for why METADATA
+        cannot distinguish the floor branch from the ordinary private branch."""
+        monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda u: True)
+        out = self._vision_call(monkeypatch, "t::enrolled", TRUSTED)
         assert "private or internal address" in out
 
 
