@@ -2525,6 +2525,7 @@ upstream_changes:
   - ai-extensions production-mounted middleware E2E
   - ai-extensions exact base-gate and native-matrix selection
   - Task 3.0 real request-MCP proof preservation
+  - serialized request-MCP authority and worker-finalization assertion
   tests:
   - tests/plugins/workflow/test_ai_extensions_middleware_e2e.py
   - tests/plugins/workflow/test_node_mcp.py
@@ -2536,7 +2537,12 @@ upstream_changes:
     and real coordinator path for the authenticated AI showcase. Keep capability
     injection limited to the coordinator binding seam, require server-derived
     real entitlement and Desktop background provenance, and assert the recording
-    runner receives sealed package MCP without treating it as MCP startup proof.
+    runner receives the JSON-serializable sealed package MCP authority descriptor
+    without treating it as MCP startup proof. Assert the pre-worker config keeps
+    its canonical sealed relative entry, then apply the exact worker ordering of
+    environment interpolation followed by private-authority validation and prove
+    the finalized isolated `-c` loader, cwd, and entry arguments. After execution,
+    prove the serialized authority root was cleaned.
     Keep incapable admission residue-free, explicit-real integrity failures
     runner-free, and an actual app-server runtime change mapped to the existing
     package_mcp_unavailable node error before provider traffic. Select this E2E
