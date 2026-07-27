@@ -73,6 +73,7 @@ def _assert_authenticated_mcp_servers(
     assert "entry" not in authority
     assert "files" not in authority
     authority_root = Path(authority["root"])
+    payload_root = authority_root / authority["payload"]
     assert authority_root.is_absolute()
     assert "hermes-workflow-authority-" in authority_root.as_posix()
     if not require_live_authority:
@@ -88,10 +89,10 @@ def _assert_authenticated_mcp_servers(
     assert finalized["args"][0:2] == ["-I", "-c"]
     assert "runpy.run_path" in finalized["args"][2]
     assert finalized["args"][3:5] == [
-        str(authority_root),
+        str(payload_root),
         "mcp/echo-server.py",
     ]
-    assert finalized["__hermes_private_mcp_cwd"] == str(authority_root)
+    assert finalized["__hermes_private_mcp_cwd"] == str(payload_root)
     return authority_root
 
 

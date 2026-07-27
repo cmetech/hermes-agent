@@ -26,6 +26,8 @@ _AUTHORITY_MAX_FILES = 512
 _AUTHORITY_MAX_FILE_BYTES = 1 * 1024 * 1024
 _AUTHORITY_MAX_TOTAL_BYTES = 8 * 1024 * 1024
 _AUTHORITY_MANIFEST_NAME = ".hermes-authority-manifest-v1.json"
+_AUTHORITY_CONTROL_DIRECTORY = "control"
+_AUTHORITY_PAYLOAD_DIRECTORY = "payload"
 _AUTHORITY_MAX_MANIFEST_BYTES = 4_000_000
 logger = logging.getLogger(__name__)
 _VARIABLE = re.compile(
@@ -91,6 +93,10 @@ class AuthenticatedExecutionMaterializer:
             self.root.chmod(0o700)
         except OSError:
             pass
+        self.control_root = self.root / _AUTHORITY_CONTROL_DIRECTORY
+        self.payload_root = self.root / _AUTHORITY_PAYLOAD_DIRECTORY
+        self.control_root.mkdir(mode=0o700)
+        self.payload_root.mkdir(mode=0o700)
         self._closed = False
         self._entries: dict[str, tuple[str, Path]] = {}
         self._descriptor: dict[str, object] | None = None
@@ -130,7 +136,7 @@ class AuthenticatedExecutionMaterializer:
             > _AUTHORITY_MAX_TOTAL_BYTES
         ):
             raise ValueError("authenticated execution closure exceeds 8388608 bytes")
-        path = self.root.joinpath(*logical.parts)
+        path = self.payload_root.joinpath(*logical.parts)
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
@@ -180,7 +186,7 @@ class AuthenticatedExecutionMaterializer:
         )
         if len(encoded) > _AUTHORITY_MAX_MANIFEST_BYTES:
             raise ValueError("authenticated execution manifest is too large")
-        manifest_path = self.root / _AUTHORITY_MANIFEST_NAME
+        manifest_path = self.control_root / _AUTHORITY_MANIFEST_NAME
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -197,7 +203,10 @@ class AuthenticatedExecutionMaterializer:
         self._descriptor = {
             "version": 2,
             "root": str(self.root),
-            "manifest": _AUTHORITY_MANIFEST_NAME,
+            "payload": _AUTHORITY_PAYLOAD_DIRECTORY,
+            "manifest": (
+                f"{_AUTHORITY_CONTROL_DIRECTORY}/{_AUTHORITY_MANIFEST_NAME}"
+            ),
             "manifest_sha256": hashlib.sha256(encoded).hexdigest(),
             "file_count": len(files),
             "total_bytes": sum(int(metadata["size"]) for metadata in files.values()),

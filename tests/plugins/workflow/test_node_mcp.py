@@ -318,7 +318,7 @@ def test_sealed_mcp_classifies_local_references_only_after_env_interpolation(
         {"command": sys.executable, "args": ["-c", "print('inline')"]},
     ],
 )
-def test_sealed_nonlocal_mcp_configs_strip_authority_without_behavior_change(
+def test_sealed_nonlocal_mcp_configs_preserve_behavior_and_isolate_inline_python(
     tmp_path, server
 ):
     run = tmp_path / "run"
@@ -338,7 +338,12 @@ def test_sealed_nonlocal_mcp_configs_strip_authority_without_behavior_change(
 
         finalized = _finalize_authenticated_mcp_config({"echo": resolved})["echo"]
 
-        assert finalized == server
+        if server.get("args", [None])[0] == "-c":
+            assert finalized["command"] == server["command"]
+            assert finalized["args"] == ["-I", *server["args"]]
+            assert Path(finalized["__hermes_private_mcp_cwd"]).name == "payload"
+        else:
+            assert finalized == server
     finally:
         materializer.cleanup()
 
@@ -367,6 +372,184 @@ def test_post_interpolation_local_mcp_with_unsupported_command_fails_closed(
             _finalize_authenticated_mcp_config({"echo": _interpolate_env_vars(server)})
     finally:
         materializer.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("command", "./bin/missing-server"),
+        ("command", "bin\\missing-server.exe"),
+        ("entry", "servers/missing.py"),
+        ("entry", "./missing.py"),
+        ("entry", "..\\missing.py"),
+        ("arg", "--config=config/missing.json"),
+        ("arg", "settings.yaml"),
+        ("env", "data/missing.txt"),
+        ("env", "..\\secrets.json"),
+        ("runtime_files", "helpers/missing.py"),
+    ],
+)
+def test_sealed_mcp_rejects_undeclared_path_like_values_after_interpolation(
+    tmp_path, field, value
+):
+    run = tmp_path / "run"
+    definition = {
+        "command": sys.executable,
+        "args": ["servers/echo.py"],
+    }
+    if field == "command":
+        definition["command"] = value
+        definition["args"] = []
+    elif field == "entry":
+        definition["args"] = [value]
+    elif field == "arg":
+        definition["args"].append(value)
+    elif field == "env":
+        definition["env"] = {"WORKFLOW_DATA": value}
+    else:
+        definition["runtime_files"] = [value]
+    authenticated = {
+        "mcp/echo.yaml": yaml.safe_dump({"echo": definition}).encode(),
+        "servers/echo.py": b"print('sealed')\n",
+    }
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        server = ResourceResolver(
+            run,
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+
+        with pytest.raises(
+            PackageMCPUnavailable, match="runtime closure cannot be proven"
+        ):
+            _finalize_authenticated_mcp_config({"echo": server})
+    finally:
+        materializer.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("server", "python_mode"),
+    [
+        (
+            {"command": "npx", "args": ["-y", "@scope/package", "--mode=stdio"]},
+            None,
+        ),
+        ({"command": "uvx", "args": ["mcp-server-fetch", "--quiet"]}, None),
+        (
+            {
+                "url": "https://mcp.example.test/sse",
+                "headers": {"Authorization": "Bearer ordinary-token"},
+            },
+            None,
+        ),
+        (
+            {
+                "command": "mcp-server-fetch",
+                "args": ["--mode=stdio", "ordinary-literal", "https://example.test/a/b"],
+            },
+            None,
+        ),
+        ({"command": sys.executable, "args": ["-c", "print('a/b')"]}, "-c"),
+        ({"command": sys.executable, "args": ["-m", "installed.module"]}, "-m"),
+    ],
+)
+def test_sealed_mcp_compatibility_table_preserves_nonpath_forms_without_mutable_cwd(
+    tmp_path, server, python_mode
+):
+    run = tmp_path / "run"
+    authenticated = {"mcp/echo.yaml": yaml.safe_dump({"echo": server}).encode()}
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        resolved = ResourceResolver(
+            run,
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+
+        finalized = _finalize_authenticated_mcp_config({"echo": resolved})["echo"]
+
+        if python_mode is None:
+            assert finalized == server
+        else:
+            assert finalized["command"] == server["command"]
+            assert finalized["args"] == ["-I", *server["args"]]
+            assert Path(finalized["__hermes_private_mcp_cwd"]).name == "payload"
+    finally:
+        materializer.cleanup()
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["command", "entry", "compound_config", "env", "runtime_files"],
+)
+def test_real_worker_rejects_interpolated_undeclared_paths_before_mcp_spawn(
+    tmp_path, monkeypatch, missing_field
+):
+    _write_provider_config("http://127.0.0.1:1/v1", api_mode="chat_completions")
+    run = tmp_path / "run"
+    run.mkdir()
+    pid_file = tmp_path / f"{missing_field}.pid"
+    mutable_server = run / "mutable-server.py"
+    mutable_server.write_text(
+        f"from pathlib import Path\nPath({str(pid_file)!r}).write_text('spawned')\n",
+        encoding="utf-8",
+    )
+    mutable_server.chmod(0o700)
+    sealed_server = (
+        f"from pathlib import Path\nPath({str(pid_file)!r}).write_text('spawned')\n"
+    ).encode()
+    server = {
+        "command": sys.executable,
+        "args": ["servers/sealed.py"],
+        "connect_timeout": 1,
+    }
+    if missing_field == "command":
+        server = {"command": "${MISSING_COMMAND}", "connect_timeout": 1}
+        monkeypatch.setenv("MISSING_COMMAND", "./mutable-server.py")
+    elif missing_field == "entry":
+        server["args"] = ["${MISSING_ENTRY}"]
+        monkeypatch.setenv("MISSING_ENTRY", "mutable-server.py")
+    elif missing_field == "compound_config":
+        server["args"].append("--config=${MISSING_CONFIG}")
+        monkeypatch.setenv("MISSING_CONFIG", "mutable/settings.json")
+    elif missing_field == "env":
+        server["env"] = {"WORKFLOW_DATA": "${MISSING_DATA}"}
+        monkeypatch.setenv("MISSING_DATA", "mutable/data.txt")
+    else:
+        server["runtime_files"] = ["${MISSING_RUNTIME_FILE}"]
+        monkeypatch.setenv("MISSING_RUNTIME_FILE", "mutable/helper.py")
+    definition = yaml.safe_dump({"node_echo": server}).encode()
+    authenticated = {
+        "mcp/echo.yaml": definition,
+        "servers/sealed.py": sealed_server,
+    }
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        resolved = ResourceResolver(
+            run,
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)
+        result = PluginAgentRunner("workflow/test").run(
+            PluginAgentRunRequest(
+                prompt="must fail before MCP spawn",
+                allowed_tools=("mcp__node_echo__missing",),
+                mcp_servers=resolved,
+                workdir=run,
+                max_api_attempts=1,
+                idle_timeout_seconds=10,
+                wall_timeout_seconds=20,
+                provider_request_timeout_seconds=5,
+            )
+        )
+    finally:
+        materializer.cleanup()
+
+    assert result.status == "failed"
+    assert result.audit["failure_kind"] == "package_mcp_unavailable"
+    assert "runtime closure cannot be proven" in str(result.audit["error"])
+    assert not pid_file.exists()
 
 
 def test_maximum_valid_mcp_workflow_authority_fits_plugin_agent_request_limit(
@@ -433,6 +616,8 @@ def test_compact_authority_manifest_is_private_bounded_and_digest_revalidated(
         assert secret.decode().strip() not in serialized
         if os.name != "nt":
             assert stat.S_IMODE(root.stat().st_mode) == 0o700
+            assert stat.S_IMODE((root / authority["payload"]).stat().st_mode) == 0o700
+            assert stat.S_IMODE(manifest.parent.stat().st_mode) == 0o700
             assert stat.S_IMODE(manifest.stat().st_mode) == 0o400
 
         manifest.chmod(0o600)
@@ -441,6 +626,43 @@ def test_compact_authority_manifest_is_private_bounded_and_digest_revalidated(
             PackageMCPUnavailable, match="authenticated MCP authority changed"
         ):
             _finalize_authenticated_mcp_config({"echo": server})
+    finally:
+        materializer.cleanup()
+
+
+def test_authority_control_manifest_cannot_collide_with_authenticated_resources(
+    tmp_path,
+):
+    run = tmp_path / "run"
+    manifest_name = ".hermes-authority-manifest-v1.json"
+    authenticated = {
+        "mcp/echo.yaml": (
+            f"command: {json.dumps(sys.executable)}\nargs: [servers/echo.py]\n"
+        ).encode(),
+        "servers/echo.py": b"print('sealed')\n",
+        manifest_name: b"authenticated top-level resource\n",
+        f"nested/{manifest_name}": b"authenticated nested resource\n",
+    }
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        server = ResourceResolver(
+            run,
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+        authority = server["__hermes_authenticated_local_mcp"]
+        outer_root = Path(authority["root"])
+        payload_root = outer_root / authority["payload"]
+        control_manifest = outer_root / authority["manifest"]
+
+        assert control_manifest.parent == outer_root / "control"
+        assert payload_root.name == "payload"
+        assert (payload_root / manifest_name).read_bytes() == authenticated[manifest_name]
+        assert (payload_root / "nested" / manifest_name).read_bytes() == authenticated[
+            f"nested/{manifest_name}"
+        ]
+        finalized = _finalize_authenticated_mcp_config({"echo": server})["echo"]
+        assert finalized["__hermes_private_mcp_cwd"] == str(payload_root)
     finally:
         materializer.cleanup()
 
@@ -707,10 +929,11 @@ def test_mcp_materialized_authority_is_cleaned_after_terminal_outcome(
         def run(self, request, **_kwargs):
             authority = request.mcp_servers["echo"]["__hermes_authenticated_local_mcp"]
             root = Path(str(authority["root"]))
+            manifest = root / str(authority["manifest"])
             self.materialized_paths = [
                 path
                 for path in root.rglob("*")
-                if path.is_file() and path.name != authority["manifest"]
+                if path.is_file() and path != manifest
             ]
             assert all(path.exists() for path in self.materialized_paths)
             if outcome == "failure":

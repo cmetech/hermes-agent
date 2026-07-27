@@ -1166,7 +1166,11 @@ def test_historical_mcp_consumers_rebind_same_size_bytes_for_every_seal_mode(
         authority = next(iter(servers.values()))[
             "__hermes_authenticated_local_mcp"
         ]
-        private_target = Path(authority["root"]) / target.relative_to(run)
+        private_target = (
+            Path(authority["root"])
+            / authority["payload"]
+            / target.relative_to(run)
+        )
         assert private_target.read_bytes() == original
     finally:
         materializer.cleanup()

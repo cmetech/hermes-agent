@@ -2546,10 +2546,10 @@ upstream_changes:
     capability without treating it as MCP startup proof and without duplicating
     entry or per-file maps into the request. Assert the pre-worker config keeps
     its canonical sealed relative entry, then apply the exact worker ordering of
-    environment interpolation followed by private-manifest/tree validation and
-    prove the finalized isolated `-c` loader, cwd, and entry arguments. After
-    execution, prove the serialized authority root and private manifest were
-    cleaned.
+    environment interpolation followed by private control-manifest/payload-tree
+    validation and prove the finalized isolated `-c` loader, payload cwd, and
+    entry arguments. After execution, prove the serialized outer authority root,
+    control manifest, and payload were cleaned.
     Keep incapable admission residue-free, explicit-real integrity failures
     runner-free, and an actual app-server runtime change mapped to the existing
     package_mcp_unavailable node error before provider traffic. Select this E2E
@@ -3290,12 +3290,15 @@ upstream_changes:
   - AuthenticatedExecutionMaterializer
   - AuthenticatedExecutionMaterializer canonical closure materialization
   - AuthenticatedExecutionMaterializer compact private manifest capability
+  - AuthenticatedExecutionMaterializer control/payload namespace separation
   - ScriptExecutor authenticated stdin execution plan
   - ResourceResolver authenticated local Python MCP loader
   - ResourceResolver universal sealed MCP authority handoff
   - PluginAgentRunner same-source worker bootstrap
   - plugin-agent worker authenticated MCP authority validation
   - plugin-agent worker post-interpolation local reference classification
+  - plugin-agent worker post-interpolation lexical default-deny path policy
+  - plugin-agent worker isolated Python inline and module launch policy
   - plugin-agent worker compact manifest validation and nonlocal metadata stripping
   - MCPServerTask authenticated private working directory
   - compute_package_digest exact and compound MCP closure discovery
@@ -3390,30 +3393,38 @@ upstream_changes:
     uv and Bun scripts from inherited anonymous byte streams, never their
     reopened package path. For authenticated local Python MCP servers,
     materialize the complete sealed byte closure at canonical relative paths in
-    one private disposable authority outside the run tree. Store the bounded
-    per-file digest manifest as a restrictive private file and carry only a
+    one private disposable authority outside the run tree. Keep the control
+    manifest under a private outer control directory and the complete runtime
+    package under a disjoint private payload directory used as cwd, so valid
+    top-level or nested resources named `.hermes-authority-manifest-v1.json`
+    cannot collide with internal control state. Store the bounded per-file digest
+    manifest as a restrictive private file and carry only a
     compact authenticated capability through JSON IPC: manifest digest, count,
     total, nonce, root identity, and source-root binding, never raw authority
     bytes or a duplicate files map. Every MCP server config produced from sealed
     resource bytes must carry that capability even when its pre-interpolation
     strings appear nonlocal. After environment interpolation the worker must
-    revalidate the manifest hash and exact private tree, classify command, exact
-    and compound arguments, environment values, and declared runtime files,
-    rewrite authenticated local references, and launch Python isolated from the
-    mutable run cwd with private cwd, sys.path, and __file__ semantics while
-    preserving MCP protocol stdin. Unsupported post-interpolation local launch
-    shapes fail closed; genuinely installed, npx/uvx, remote, and dependency-free
-    inline configurations discard internal metadata and retain their prior
-    behavior. The compact handoff must keep every otherwise-valid 512-file
+    revalidate the manifest hash and exact control/payload tree, classify command,
+    exact and compound arguments, environment values, and declared runtime files,
+    rewrite authenticated manifest members, and default-deny undeclared explicit
+    relative, forward-slash, Windows-backslash, script/extension, executable,
+    compound option, environment-dependency, and runtime-file path shapes without
+    consulting mutable filesystem existence. Launch authenticated Python scripts
+    isolated from the mutable run cwd with private cwd, sys.path, and __file__
+    semantics while preserving MCP protocol stdin. Add `-I` and the private
+    payload cwd for authenticated Python `-c` and valid installed-module `-m`
+    modes so mutable cwd modules cannot shadow installed imports. Unsupported
+    post-interpolation local launch shapes fail closed; genuinely installed bare
+    commands, ordinary flags/literals/URLs, npx/uvx package specs including scoped
+    packages, and remote configurations discard internal metadata and retain their
+    compatible behavior. The compact handoff must keep every otherwise-valid 512-file
     workflow below the plugin-agent 256 KB MCP-config contract while genuinely
     oversized configs still reject. The worker must load from the same source
     tree as its parent.
     Clean the authority after success, failure, or cancellation with retry-and-
     surface behavior, make duplicate relpath-plus-digest materialization
     idempotent, and fail closed with stable migration guidance for local
-    executable shapes whose complete closure cannot be proven. Installed
-    commands, npx servers, inline Python without sealed dependencies, and remote
-    servers retain their existing launch behavior.
+    executable shapes whose complete closure cannot be proven.
     Scheduled revalidation must compare projection and resources language plus
     sealed-tree identities. One canonical-deduplicated WorkflowResourceReadBudget
     and byte cache must span fire-time sealed-snapshot verification, live catalog
