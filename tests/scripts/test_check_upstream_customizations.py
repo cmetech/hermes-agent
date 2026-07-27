@@ -28,7 +28,14 @@ def _repo(tmp_path: Path) -> Path:
     _git(repo, "config", "user.email", "test@example.com")
     _git(repo, "config", "user.name", "Test")
     (repo / "core.py").write_text("class Owned:\n    pass\n")
-    (repo / "test_core.py").write_text("def test_owned():\n    pass\n")
+    # References ``Owned`` on purpose: the checker verifies that every
+    # identifier-shaped owned_symbol appears in its entry's files, and
+    # test_manifest_bounds_evidence_identity_and_exact_repository_paths stubs
+    # ``_contained`` so EVERY declared path resolves to this file. A test for
+    # ``Owned`` that never mentions it would be odd anyway.
+    (repo / "test_core.py").write_text(
+        "from core import Owned\n\n\ndef test_owned():\n    assert Owned\n"
+    )
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "base")
     return repo
