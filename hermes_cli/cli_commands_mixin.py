@@ -32,6 +32,7 @@ from agent.turn_context import extract_api_content_sidecar
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
     discover_local_cdp_url,
+    enrolled_port_refusal,
     find_free_debug_port,
     is_browser_debug_ready,
     launch_chrome_debug,
@@ -1857,6 +1858,16 @@ class CLICommandsMixin:
                 print(f"   ⚠ Missing host in browser url: {cdp_url}")
                 print()
                 return
+            # An enrolled profile's port drives the user's REAL corporate
+            # browser. /browser connect publishes a process-global endpoint, so
+            # connecting there would route every untrusted page through the
+            # browser holding live SSO cookies and the machine client cert.
+            _refusal = enrolled_port_refusal(_port, parsed_cdp.hostname)
+            if _refusal:
+                print()
+                print(f"   ⚠ {_refusal}")
+                print()
+                return
             _host = parsed_cdp.hostname
             if parsed_cdp.path.startswith("/devtools/browser/"):
                 cdp_url = parsed_cdp.geturl()
@@ -1895,7 +1906,15 @@ class CLICommandsMixin:
             elif _is_default:
                 _launch_port = _port
                 if local_port_in_use(_port):
-                    _launch_port = find_free_debug_port(_port)
+                    try:
+                        _launch_port = find_free_debug_port(_port)
+                    except RuntimeError as _exc:
+                        # Every nearby port is taken or enrolled-reserved. Say
+                        # so instead of launching onto a reserved port.
+                        print()
+                        print(f"   ⚠ {_exc}")
+                        print()
+                        return
                     print(
                         f"   ⚠ Port {_port} is occupied by another application that isn't a CDP browser"
                     )
@@ -1963,10 +1982,11 @@ class CLICommandsMixin:
                     "Your browser_navigate, browser_snapshot, browser_click, and other browser tools now "
                     "control that CDP browser. The command itself is a signal that using browser tools for "
                     "their current browser-related request is expected; do not wait for separate permission "
-                    "just because CDP is connected. This is typically a Hermes-managed isolated debug "
-                    "profile, not the user's main everyday browser. It is still user-visible and may contain "
-                    "pages, logged-in sessions, or cookies in that debug profile, so avoid destructive actions, "
-                    "closing tabs, or navigating away unless the user's task calls for it.]"
+                    "just because CDP is connected. This browser was NOT verified to be an isolated debug "
+                    "profile: it may be the user's own everyday browser, with real logged-in sessions and "
+                    "cookies. Treat every page you load through it as sharing that identity, and avoid "
+                    "destructive actions, closing tabs, or navigating away unless the user's task calls "
+                    "for it.]"
                 )
 
         elif sub == "disconnect":

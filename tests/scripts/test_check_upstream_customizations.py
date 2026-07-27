@@ -277,3 +277,61 @@ def test_manifest_coverage_ignores_only_local_sdd_progress_ledger(
     _git(repo, "commit", "-m", "add unregistered sdd artifact")
     with pytest.raises(ValueError, match=r"\.superpowers/sdd/unregistered\.md"):
         validate_diff_coverage(data, repo, f"{baseline}..HEAD")
+
+
+# ── Security-critical ownership fixture (review finding LOW-008) ─────────────
+#
+# The checker validates SHAPE, and now also that a declared identifier exists in
+# its files. What it cannot derive is the reverse: an owner silently DELETED
+# from the ledger while still load-bearing in code. That mutation
+# (`_navigation_session_key` removed from owned_symbols) exited 0, leaving the
+# highest-churn merge contract dependent on reviewer memory.
+#
+# This fixture pins it. Each name below is a routing decision, a mutable-state
+# owner, or one of the six SSRF guard-forcing sites -- losing any of them to an
+# upstream merge silently un-scopes corporate-browser trust with no build error.
+# If a customization is genuinely retired, delete its line here in the SAME
+# commit and say why.
+
+_BROWSER_PROFILE_CRITICAL_OWNERS = {
+    "enrolled-browser-launch-wiring": {
+        # Routing: which browser drives which URL.
+        "_navigation_session_key",
+        "_is_enrolled_session_key",
+        "_session_browser_profile",
+        "_ENROLLED_SUFFIX",
+        # The six guard-forcing sites.
+        "_eval_ssrf_guard_active",
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_vision",
+        # Per-session endpoint state + its lifecycle.
+        "_session_cdp_url",
+        "_session_cdp_urls",
+        "_session_handles",
+        "_release_session_handle",
+        "cleanup_browser",
+        "_cleanup_single_browser_session",
+    },
+}
+
+
+def test_ledger_still_declares_every_security_critical_owner() -> None:
+    repo = Path(__file__).resolve().parents[2]
+    manifest = repo / "docs/upstream-customizations/browser-profiles.yaml"
+    data = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    entries = {
+        entry["id"]: entry
+        for entry in data["upstream_changes"]
+        if isinstance(entry, dict)
+    }
+    for entry_id, required in _BROWSER_PROFILE_CRITICAL_OWNERS.items():
+        assert entry_id in entries, f"ledger entry {entry_id!r} disappeared"
+        declared = set(entries[entry_id].get("owned_symbols", []))
+        missing = sorted(required - declared)
+        assert not missing, (
+            f"{entry_id}.owned_symbols no longer declares {missing}. These are "
+            "routing/guard/lifecycle owners; dropping one from the ledger "
+            "downgrades an upstream rewrite of it from an owned-symbol hit to "
+            "the weakest same-file signal, with no other failure."
+        )

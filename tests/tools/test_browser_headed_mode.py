@@ -99,7 +99,10 @@ class TestCleanupTaskResourcesHeadedSkip:
             ),
         ):
             cleanup_task_resources(_make_agent(), "task-x")
-            mock_cb.assert_called_once_with("task-x")
+            # keep_enrolled: this hook runs per TURN and its headed skip reads
+            # the GLOBAL browser.headed, which an enrolled profile's own
+            # profile-level `headed` never sets (review finding H-2).
+            mock_cb.assert_called_once_with("task-x", keep_enrolled=True)
 
     def test_headed_skips_browser_cleanup(self):
         from agent.chat_completion_helpers import cleanup_task_resources

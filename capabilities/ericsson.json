@@ -32,7 +32,7 @@
           "kind": "enrolled",
           "executable": "auto",
           "user_data_dir": "${HERMES_HOME}/browser-profiles/enrolled",
-          "cdp_port": 9222,
+          "cdp_port": 9333,
           "headed": true,
           "trusted_origins": [
             "https://*.ericsson.com",

@@ -103,7 +103,7 @@ ENROLLED_DEFAULTS = {
         "default_profile": "",
         "profiles": {
             "enrolled": {
-                "cdp_port": 9222,
+                "cdp_port": 9333,
                 "executable": "auto",
                 "headed": True,
                 "kind": "enrolled",
@@ -128,7 +128,7 @@ def test_seeds_the_enrolled_profile_from_the_capability_manifest(tmp_path, monke
 
     profile = fake_config["cfg"]["browser"]["profiles"]["enrolled"]
     assert profile["kind"] == "enrolled"
-    assert profile["cdp_port"] == 9222
+    assert profile["cdp_port"] == 9333
     # A LIST, not a comma-joined string -- the exact mistake the runbook warns
     # about, and the one that makes the profile trust nothing.
     assert profile["trusted_origins"] == ["https://*.ericsson.com", "https://*.ericsson.net"]
@@ -230,5 +230,11 @@ def test_the_vendored_ericsson_manifest_really_carries_the_enrolled_profile():
     assert profile["executable"] == "auto"
     assert profile["headed"] is True
     assert profile["trusted_origins"] == ["https://*.ericsson.com", "https://*.ericsson.net"]
+    # NOT /browser connect's port (BP-1): sharing it lets a plain
+    # `/browser connect` adopt the corporate browser as the process-global CDP
+    # endpoint, so every untrusted page would run inside the user's live SSO
+    # session.
+    from hermes_cli.browser_connect import DEFAULT_BROWSER_CDP_PORT
+    assert profile["cdp_port"] != DEFAULT_BROWSER_CDP_PORT
     # Activation is the user's decision, made through the Settings toggle.
     assert defaults["browser"]["default_profile"] == ""
