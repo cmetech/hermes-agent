@@ -10,6 +10,7 @@ import stat
 import sys
 import threading
 import time
+from urllib.parse import quote
 
 import psutil
 import pytest
@@ -36,6 +37,12 @@ from tools.mcp_tool import _interpolate_env_vars
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mcp" / "echo_server.py"
+
+
+def _nested_percent_encode(value: str, passes: int) -> str:
+    for _ in range(passes):
+        value = quote(value, safe="")
+    return value
 
 
 class _MockProviderHandler(BaseHTTPRequestHandler):
@@ -436,6 +443,8 @@ def test_sealed_mcp_rejects_undeclared_path_like_values_after_interpolation(
         ("arg", "  FILE://localhost/tmp/mutable.txt  "),
         ("arg", "file:%2f%2f%2ftmp%2fmutable.txt"),
         ("arg", "%66ile%3A%252F%252Ftmp%252Fmutable.txt"),
+        ("arg", _nested_percent_encode("file:///tmp/mutable.txt", 6)),
+        ("arg", _nested_percent_encode("file:///tmp/mutable.txt", 65)),
         ("arg", "sqlite:///tmp/mutable.db"),
         ("arg", "unix:///tmp/mutable.sock"),
         ("arg", "jar:file:///tmp/mutable.jar!/server.py"),
@@ -444,8 +453,16 @@ def test_sealed_mcp_rejects_undeclared_path_like_values_after_interpolation(
         ("arg", "vscode://file/tmp/mutable.py"),
         ("arg", "unknown+local://host/tmp/mutable"),
         ("arg", "--config=SQLITE%3A%2F%2F%2Ftmp%2Fmutable.db"),
+        ("arg", "--endpoint%3Dfile%3A%2F%2F%2Ftmp%2Fmutable.txt"),
+        ("arg", _nested_percent_encode("--config=file:///tmp/mutable.txt", 6)),
+        ("arg", "--config%3Dfile%2"),
+        ("arg", "file%3"),
         ("env", "uNiX:%2F%2F%2Ftmp%2Fmutable.sock"),
+        ("env", _nested_percent_encode("unix:///tmp/mutable.sock", 6)),
+        ("env", "%FF"),
         ("runtime_files", "file:///tmp/mutable.txt"),
+        ("runtime_files", _nested_percent_encode("file:///tmp/mutable.txt", 6)),
+        ("runtime_files", "%25"),
     ],
 )
 def test_sealed_mcp_rejects_local_embed_and_unknown_uri_schemes(tmp_path, field, value):
@@ -491,6 +508,8 @@ def test_sealed_mcp_rejects_local_embed_and_unknown_uri_schemes(tmp_path, field,
         "data:text/plain,embedded",
         "vscode://file/tmp/mutable.py",
         "unknown://host/resource",
+        _nested_percent_encode("file:///tmp/mutable.sock", 6),
+        "https%3A%2F%2Fnetwork.example.test%2F%ZZ",
     ],
 )
 def test_sealed_remote_config_rejects_non_network_uri_schemes(tmp_path, url):
@@ -538,6 +557,36 @@ def test_sealed_mcp_preserves_explicit_network_urls(tmp_path, scheme):
         materializer.cleanup()
 
 
+def test_sealed_mcp_preserves_encoded_network_and_ordinary_literal_values(tmp_path):
+    server = {
+        "command": "mcp-server-fetch",
+        "args": [
+            _nested_percent_encode("https://network.example.test/a/b", 6),
+            _nested_percent_encode(
+                "--endpoint=wss://network.example.test/socket", 6
+            ),
+            "ordinary%20encoded%20literal",
+        ],
+        "env": {
+            "REMOTE_ENDPOINT": _nested_percent_encode(
+                "ws://network.example.test/events", 6
+            )
+        },
+    }
+    authenticated = {"mcp/echo.yaml": yaml.safe_dump({"echo": server}).encode()}
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        resolved = ResourceResolver(
+            tmp_path / "run",
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+
+        assert _finalize_authenticated_mcp_config({"echo": resolved})["echo"] == server
+    finally:
+        materializer.cleanup()
+
+
 @pytest.mark.parametrize(
     ("server", "python_mode"),
     [
@@ -545,10 +594,31 @@ def test_sealed_mcp_preserves_explicit_network_urls(tmp_path, scheme):
             {"command": "npx", "args": ["-y", "@scope/package", "--mode=stdio"]},
             None,
         ),
+        (
+            {
+                "command": "npx",
+                "args": [
+                    "--package%3D%40scope%2Fpackage",
+                    "-p=ordinary-package@1.2.3",
+                    "--mode=stdio",
+                ],
+            },
+            None,
+        ),
         ({"command": "uvx", "args": ["mcp-server-fetch", "--quiet"]}, None),
         (
             {
-                "url": "https://mcp.example.test/sse",
+                "command": "uvx",
+                "args": [
+                    "--from%3Dprovider-package",
+                    "--with=dependency-package%3E%3D1.2",
+                ],
+            },
+            None,
+        ),
+        (
+            {
+                "url": _nested_percent_encode("https://mcp.example.test/sse", 6),
                 "headers": {"Authorization": "Bearer ordinary-token"},
             },
             None,
@@ -590,6 +660,40 @@ def test_sealed_mcp_compatibility_table_preserves_nonpath_forms_without_mutable_
             assert finalized["command"] == server["command"]
             assert finalized["args"] == ["-I", *server["args"]]
             assert Path(finalized["__hermes_private_mcp_cwd"]).name == "payload"
+    finally:
+        materializer.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("command", "value"),
+    [
+        ("npx", "--config=@scope/package"),
+        ("npx", "--package=../mutable-package"),
+        ("npx", "--package=file:///tmp/mutable-package"),
+        ("uvx", "--package=@scope/package"),
+        ("npx", "--with=@scope/package"),
+        ("mcp-server-fetch", "--package=@scope/package"),
+        ("npx", "--package=@scope/package/extra"),
+        ("npx", "--config%3D%40scope%2Fpackage"),
+    ],
+)
+def test_sealed_mcp_package_option_exemption_is_context_bounded(
+    tmp_path, command, value
+):
+    server = {"command": command, "args": [value]}
+    authenticated = {"mcp/echo.yaml": yaml.safe_dump({"echo": server}).encode()}
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        resolved = ResourceResolver(
+            tmp_path / "run",
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+
+        with pytest.raises(
+            PackageMCPUnavailable, match="runtime closure cannot be proven"
+        ):
+            _finalize_authenticated_mcp_config({"echo": resolved})
     finally:
         materializer.cleanup()
 
@@ -672,8 +776,11 @@ def test_real_worker_rejects_interpolated_undeclared_paths_before_mcp_spawn(
     [
         ("exact", "FiLe:///tmp/mutable.txt"),
         ("compound", "SQLITE://localhost/tmp/mutable.db"),
+        ("compound_encoded", "file%3A%2F%2F%2Ftmp%2Fmutable.txt"),
         ("env", "  fIlE://localhost/tmp/mutable.txt  "),
         ("encoded", "%66ile%3A%252F%252Ftmp%252Fmutable.txt"),
+        ("deep_encoded", _nested_percent_encode("file:///tmp/mutable.txt", 6)),
+        ("malformed", "file%3"),
     ],
 )
 def test_real_worker_rejects_local_uri_before_mcp_spawn(
@@ -694,6 +801,8 @@ def test_real_worker_rejects_local_uri_before_mcp_spawn(
     monkeypatch.setenv("LOCAL_URI", value)
     if uri_field == "compound":
         server["args"].append("--config=${LOCAL_URI}")
+    elif uri_field == "compound_encoded":
+        server["args"].append("--config%3D${LOCAL_URI}")
     elif uri_field == "env":
         server["env"] = {"WORKFLOW_DEPENDENCY": "${LOCAL_URI}"}
     else:

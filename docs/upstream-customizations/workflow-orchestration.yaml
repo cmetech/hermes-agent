@@ -3299,6 +3299,8 @@ upstream_changes:
   - plugin-agent worker post-interpolation local reference classification
   - plugin-agent worker post-interpolation lexical default-deny path policy
   - plugin-agent worker explicit network URI allow-list and encoded URI rejection
+  - plugin-agent worker stable bounded percent-normalization classification view
+  - plugin-agent worker executable-scoped package option classification
   - plugin-agent worker isolated Python inline and module launch policy
   - plugin-agent worker compact manifest validation and nonlocal metadata stripping
   - MCPServerTask authenticated private working directory
@@ -3410,15 +3412,24 @@ upstream_changes:
     rewrite authenticated manifest members, and default-deny undeclared explicit
     relative, forward-slash, Windows-backslash, script/extension, executable,
     compound option, environment-dependency, and runtime-file path shapes without
-    consulting mutable filesystem existence. Recursively percent-decode a bounded
-    number of times and normalize surrounding whitespace and scheme case only for
-    classification. Preserve explicit HTTP, HTTPS, WS, and WSS network URIs with
+    consulting mutable filesystem existence. Before parsing assignments, schemes,
+    or paths, build one classification-only normalized view: enforce the existing
+    256 KB MCP field ceiling, repeatedly strict-percent-decode until stable with at
+    most 64 shrinking passes, and reject malformed encoding, invalid UTF-8,
+    non-shrinking or residual ambiguous percent syntax, and inputs that still need
+    decoding at the safety bound. Normalize surrounding whitespace and scheme case
+    only for classification and preserve the original value only after the
+    normalized view is proven allowed. Preserve explicit HTTP, HTTPS, WS, and WSS network URIs with
     authority delimiters, but reject local, embedded, IDE, database, socket, and
     unknown URI schemes in commands, exact or compound arguments, environment
     values, runtime files, and top-level remote configurations before MCP spawn.
-    Only parse `-x=value` and `--key=value` as compound option assignments; an
-    arbitrary literal containing `=` must retain its complete value for URI
-    classification. Launch authenticated Python scripts
+    Only parse normalized `-x=value` and `--key=value` as compound option
+    assignments; an arbitrary literal containing `=` must retain its complete
+    value for URI classification. For npx, exempt only decoded registry package
+    specs carried by `--package` or `-p`; for uvx, limit the same contextual check
+    to its package-valued `--from`, `--with`, `-w`, and `--with-editable` options.
+    Mismatched executables/options and local, URI, or path RHS values remain under
+    lexical default-deny. Launch authenticated Python scripts
     isolated from the mutable run cwd with private cwd, sys.path, and __file__
     semantics while preserving MCP protocol stdin. Add `-I` and the private
     payload cwd for authenticated Python `-c` and valid installed-module `-m`

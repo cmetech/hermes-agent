@@ -388,7 +388,18 @@ _PATH_ENV = re.compile(
 )
 _URI_SCHEME = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*):(?P<body>.*)$")
 _NETWORK_URI_SCHEMES = frozenset({"http", "https", "ws", "wss"})
+_CLASSIFICATION_MAX_BYTES = 256_000
+_CLASSIFICATION_MAX_DECODE_PASSES = 64
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _SCOPED_PACKAGE = re.compile(r"^@[^/\\\s]+/[^/\\\s]+$")
+_PACKAGE_SPEC = re.compile(
+    r"^(?:@[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*|"
+    r"[A-Za-z0-9][A-Za-z0-9._-]*)(?:@[A-Za-z0-9][A-Za-z0-9._+*~^<>=|-]*)?$"
+)
+_PACKAGE_ASSIGNMENT_OPTIONS = {
+    "npx": frozenset({"--package", "-p"}),
+    "uvx": frozenset({"--from", "--with", "-w", "--with-editable"}),
+}
 _PYTHON_EXECUTABLE = re.compile(r"pythonw?(?:3(?:\.\d+)?)?")
 _PYTHON_MODULE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
 _CLOSURE_ERROR = (
@@ -418,24 +429,49 @@ def _authority_relative(
         return None
 
 
+def _normalized_classification_value(value: str) -> str:
+    """Return a bounded, unambiguous view used only for safety classification."""
+    try:
+        encoded_size = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise PackageMCPUnavailable(_CLOSURE_ERROR) from exc
+    if encoded_size > _CLASSIFICATION_MAX_BYTES:
+        raise PackageMCPUnavailable(_CLOSURE_ERROR)
+    normalized = value
+    max_passes = min(max(len(value), 1), _CLASSIFICATION_MAX_DECODE_PASSES)
+    for _ in range(max_passes):
+        if "%" not in normalized:
+            return normalized.strip()
+        for index, character in enumerate(normalized):
+            if character == "%" and (
+                index + 2 >= len(normalized)
+                or normalized[index + 1] not in _HEX_DIGITS
+                or normalized[index + 2] not in _HEX_DIGITS
+            ):
+                raise PackageMCPUnavailable(_CLOSURE_ERROR)
+        try:
+            expanded = unquote(normalized, errors="strict")
+        except UnicodeDecodeError as exc:
+            raise PackageMCPUnavailable(_CLOSURE_ERROR) from exc
+        if len(expanded) >= len(normalized):
+            raise PackageMCPUnavailable(_CLOSURE_ERROR)
+        normalized = expanded
+    raise PackageMCPUnavailable(_CLOSURE_ERROR)
+
+
 def _path_candidate(value: str, *, compound: bool = False) -> tuple[str, str]:
+    normalized = _normalized_classification_value(value)
     if compound:
-        match = _COMPOUND_OPTION_ASSIGNMENT.fullmatch(value)
+        match = _COMPOUND_OPTION_ASSIGNMENT.fullmatch(normalized.strip())
         if match is not None:
             return match.group("option"), match.group("value")
-    return "", value
+    return "", normalized.strip()
 
 
 def _uri_disposition(value: str, *, compound: bool = False) -> str | None:
     """Classify explicit URIs without consulting mutable filesystem state."""
     candidate = _path_candidate(value, compound=compound)[1]
-    decoded = candidate
-    for _ in range(3):
-        expanded = unquote(decoded)
-        if expanded == decoded:
-            break
-        decoded = expanded
-    match = _URI_SCHEME.fullmatch(decoded.strip())
+    match = _URI_SCHEME.fullmatch(candidate)
     if match is None:
         return None
     scheme = match.group("scheme").lower()
@@ -463,6 +499,16 @@ def _looks_path_like(value: str, *, compound: bool = False) -> bool:
     ):
         return True
     return bool(option and _PATH_OPTION.fullmatch(option))
+
+
+def _is_package_spec_argument(value: str, executable: str) -> bool:
+    options = _PACKAGE_ASSIGNMENT_OPTIONS.get(executable)
+    if options is None:
+        return False
+    option, candidate = _path_candidate(value, compound=True)
+    if option:
+        return option in options and _PACKAGE_SPEC.fullmatch(candidate) is not None
+    return _SCOPED_PACKAGE.fullmatch(candidate) is not None
 
 
 def _finalize_authenticated_mcp_config(
@@ -570,10 +616,7 @@ def _finalize_authenticated_mcp_config(
                 raise PackageMCPUnavailable(
                     "package_mcp_unavailable: authenticated MCP launch config is invalid"
                 )
-            package_spec = (
-                executable in {"npx", "uvx"}
-                and _SCOPED_PACKAGE.fullmatch(value) is not None
-            )
+            package_spec = _is_package_spec_argument(value, executable)
             python_code = is_python and index > 0 and args[index - 1] == "-c"
             rewritten_value, relative = rewrite(
                 value,
