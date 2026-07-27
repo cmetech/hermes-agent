@@ -75,6 +75,52 @@ _LINUX_BIN_NAMES = tuple(name for names, _ in _LINUX_BROWSER_GROUPS for name in 
 _LINUX_INSTALL_PATHS = tuple(path for _, paths in _LINUX_BROWSER_GROUPS for path in paths)
 
 
+def enrolled_port_refusal(port: int) -> str | None:
+    """Return a refusal message when ``port`` belongs to an enrolled browser.
+
+    ``/browser connect`` sets the PROCESS-GLOBAL ``BROWSER_CDP_URL``. Once it is
+    set, ``_navigation_session_key`` returns the bare task key for every URL and
+    ``_session_cdp_url`` falls through to the override -- so every navigation,
+    including attacker-controlled public pages, is driven by whatever browser is
+    on the other end. Pointing it at an enrolled profile's port hands untrusted
+    pages the user's live SSO cookies and machine client certificate: exactly the
+    process-global leak the per-navigation routing was built to remove.
+
+    The reserved set is ``browser_profiles.enrolled_cdp_ports()`` -- every
+    configured enrolled profile's ``cdp_port`` plus the reserved default -- so a
+    user who hand-sets the enrolled profile onto ``/browser connect``'s own
+    default port is protected too.
+
+    Returns ``None`` when the port is free to connect to. Fails OPEN (returns
+    ``None``) if the profile registry cannot be read: a broken config must not
+    make ``/browser connect`` unusable.
+    """
+    try:
+        from tools.browser_profiles import enrolled_cdp_ports
+
+        owners = enrolled_cdp_ports()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("enrolled port check skipped: %s", exc)
+        return None
+    if port not in owners:
+        return None
+    owner = owners[port]
+    who = (
+        f"the enrolled browser profile {owner!r}"
+        if owner
+        else "the reserved enrolled-browser port"
+    )
+    return (
+        f"Refusing to connect: port {port} is {who}.\n"
+        "     /browser connect makes ONE browser drive every page in this "
+        "session, including untrusted public sites.\n"
+        "     Connecting to the enrolled browser would hand those pages your "
+        "live SSO session and client certificate.\n"
+        "     Use a different port (e.g. /browser connect http://127.0.0.1:9222), "
+        "or change browser.profiles.<name>.cdp_port."
+    )
+
+
 def get_chrome_debug_candidates(system: str) -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()
@@ -229,6 +275,11 @@ def find_free_debug_port(preferred: int = DEFAULT_BROWSER_CDP_PORT, attempts: in
     import socket
 
     for port in range(preferred + 1, preferred + 1 + attempts):
+        # Never park a throwaway debug browser on an enrolled profile's port:
+        # the enrolled launcher reuses whatever already listens there, which
+        # would bind corporate origin trust to a browser with no SSO.
+        if enrolled_port_refusal(port) is not None:
+            continue
         bindable = True
         for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
             try:

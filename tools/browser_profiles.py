@@ -35,7 +35,17 @@ KIND_EPHEMERAL = "ephemeral"
 KIND_ENROLLED = "enrolled"
 _VALID_KINDS = frozenset({KIND_EPHEMERAL, KIND_ENROLLED})
 
-DEFAULT_CDP_PORT = 9222
+# NOT 9222. 9222 is the port `/browser connect` defaults to and auto-launches a
+# throwaway debug Chrome on (hermes_cli.browser_connect.DEFAULT_BROWSER_CDP_PORT),
+# and it is the conventional port for every ad-hoc `--remote-debugging-port`
+# recipe on the internet. An enrolled profile sharing it means `/browser connect`
+# discovers the user's REAL corporate browser, sets the process-global
+# BROWSER_CDP_URL, and from then on every navigation -- including attacker-
+# controlled public pages -- is driven by the browser holding live SSO cookies
+# and the machine client certificate. Keep the enrolled default on its own port.
+# `hermes_cli.browser_connect` refuses to connect to any port in
+# ``enrolled_cdp_ports()``, which always contains this value.
+DEFAULT_CDP_PORT = 9333
 
 # Sentinel used while normalizing a ``*.`` wildcard pattern. Must be a valid
 # hostname label so urlsplit still parses the pattern.
@@ -178,6 +188,30 @@ def load_profiles() -> Dict[str, BrowserProfile]:
 def get_profile(name: str) -> Optional[BrowserProfile]:
     """Return a profile by name, or None when it does not exist."""
     return load_profiles().get(str(name).strip())
+
+
+def enrolled_cdp_ports() -> Dict[int, str]:
+    """Return ``{port: profile_name}`` for every port an enrolled browser owns.
+
+    ``DEFAULT_CDP_PORT`` is ALWAYS present (mapped to ``""``) even when no
+    enrolled profile is configured yet: the port is reserved for the enrolled
+    browser by construction, and a debug browser parked there would later be
+    reused -- and origin-trusted -- by the enrolled profile the first time the
+    user activates it.
+
+    Used by ``/browser connect`` to refuse pointing the process-global
+    ``BROWSER_CDP_URL`` at the user's real corporate browser. Fail-open on a
+    config error (the reserved default is still returned), so a broken config
+    cannot break ``/browser connect`` entirely.
+    """
+    ports: Dict[int, str] = {DEFAULT_CDP_PORT: ""}
+    try:
+        for name, profile in load_profiles().items():
+            if profile.is_enrolled:
+                ports[profile.cdp_port] = name
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("browser_profiles: could not enumerate enrolled ports: %s", exc)
+    return ports
 
 
 def _normalize_origin(url: str) -> Optional[Tuple[str, str, Optional[int]]]:
