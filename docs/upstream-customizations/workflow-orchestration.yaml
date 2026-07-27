@@ -3713,12 +3713,14 @@ upstream_changes:
     rule. Bound author-controlled paths and messages by their conservative
     serialized JSON byte size (including Unicode and escape amplification),
     and retain distinct truncated paths with a deterministic digest suffix so
-    every compatibility payload remains below 1 MiB. Keep source-key identity
-    across report normalization and allocate public `(code, path)` keys
-    separately: when an authored literal occupies a generated digest form,
-    resolve it through a bounded deterministic collision sequence and check
-    every candidate before use, including through wrapper appends. Accept a
-    truncation
+    every compatibility payload remains below 1 MiB. Deduplicate source
+    `(code, path)` keys only in the initial assessment pass, then normalize
+    report batches solely from ordered public dataclass values without hidden
+    provenance or a second source-dedup pass. When an authored literal occupies
+    a generated digest form, resolve it through a bounded deterministic
+    collision sequence and check every candidate before use, including through
+    wrapper appends; emitted distinct public keys must be an idempotent fixed
+    point under later normalization. Accept a truncation
     sentinel only with a positive canonical omitted count, exactly 512 retained
     findings, a non-portable aggregate, and consistent blocker state; accept
     legacy response shapes only when they are complete and non-truncated.

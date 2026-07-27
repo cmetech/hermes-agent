@@ -24,9 +24,6 @@ _WORKFLOW_COMPATIBILITY_TRUNCATION_CODE = "compatibility_findings_truncated"
 _WORKFLOW_COMPATIBILITY_TRUNCATION_PATH = "compatibility.findings"
 _WORKFLOW_COMPATIBILITY_TRUNCATION_PREFIX = "Compatibility findings truncated: "
 _WORKFLOW_COMPATIBILITY_TEXT_SUFFIX = "…[TRUNCATED]"
-# Non-dataclass provenance survives internal report wrapping without entering
-# dataclass serialization or the five-field public finding projection.
-_WORKFLOW_COMPATIBILITY_SOURCE_PATH_ATTR = "_hermes_compatibility_source_path"
 
 
 @dataclass(frozen=True)
@@ -279,33 +276,6 @@ def _disambiguated_author_path(value: str, collision_index: int) -> str:
     )
 
 
-def _finding_source_path(finding: CompatibilityFinding) -> str:
-    source_path = getattr(
-        finding,
-        _WORKFLOW_COMPATIBILITY_SOURCE_PATH_ATTR,
-        finding.path,
-    )
-    return source_path if isinstance(source_path, str) else finding.path
-
-
-def _replace_compatibility_finding(
-    finding: CompatibilityFinding, **changes
-) -> CompatibilityFinding:
-    replaced = replace(finding, **changes)
-    source_path = getattr(
-        finding,
-        _WORKFLOW_COMPATIBILITY_SOURCE_PATH_ATTR,
-        None,
-    )
-    if isinstance(source_path, str):
-        object.__setattr__(
-            replaced,
-            _WORKFLOW_COMPATIBILITY_SOURCE_PATH_ATTR,
-            source_path,
-        )
-    return replaced
-
-
 @dataclass(frozen=True)
 class _OmittedCompatibilityState:
     level: CompatibilityLevel
@@ -330,10 +300,16 @@ def _truncation_omitted_count(finding: CompatibilityFinding) -> int | None:
 class _FindingAccumulator:
     """Retain first occurrences in order while bounding the public report."""
 
-    def __init__(self, initial: Iterable[CompatibilityFinding] = ()) -> None:
-        self._findings: dict[tuple[str, str], CompatibilityFinding] = {}
+    def __init__(
+        self,
+        initial: Iterable[CompatibilityFinding] = (),
+        *,
+        deduplicate_sources: bool = True,
+    ) -> None:
+        self._findings: list[CompatibilityFinding] = []
         self._seen: set[tuple[str, str]] = set()
         self._public_keys: set[tuple[str, str]] = set()
+        self._deduplicate_sources = deduplicate_sources
         self._omitted = 0
         self._omitted_blocking = False
         self._omitted_level = CompatibilityLevel.PORTABLE
@@ -368,11 +344,11 @@ class _FindingAccumulator:
             self._sentinel_effective_profile = finding.effective_profile
             return
 
-        source_path = _finding_source_path(finding)
-        key = (finding.code, source_path)
-        if key in self._seen:
-            return
-        self._seen.add(key)
+        source_key = (finding.code, finding.path)
+        if self._deduplicate_sources:
+            if source_key in self._seen:
+                return
+            self._seen.add(source_key)
         if len(self._findings) >= WORKFLOW_COMPATIBILITY_FINDINGS_MAX - 1:
             self._merge_omitted_state(
                 count=1,
@@ -381,21 +357,21 @@ class _FindingAccumulator:
             )
             return
         public_path = _bounded_author_text(
-            source_path,
+            finding.path,
             max_json_bytes=_WORKFLOW_COMPATIBILITY_PATH_JSON_MAX_BYTES,
             collision_safe=True,
         )
         public_key = (finding.code, public_path)
         if public_key in self._public_keys:
             for collision_index in range(1, WORKFLOW_COMPATIBILITY_FINDINGS_MAX + 1):
-                candidate = _disambiguated_author_path(source_path, collision_index)
+                candidate = _disambiguated_author_path(finding.path, collision_index)
                 public_key = (finding.code, candidate)
                 if public_key not in self._public_keys:
                     public_path = candidate
                     break
             else:  # pragma: no cover - retained rows are bounded below candidates
                 raise RuntimeError("compatibility public path space exhausted")
-        bounded = _replace_compatibility_finding(
+        bounded = replace(
             finding,
             path=public_path,
             message=_bounded_author_text(
@@ -403,16 +379,11 @@ class _FindingAccumulator:
                 max_json_bytes=_WORKFLOW_COMPATIBILITY_MESSAGE_JSON_MAX_BYTES,
             ),
         )
-        object.__setattr__(
-            bounded,
-            _WORKFLOW_COMPATIBILITY_SOURCE_PATH_ATTR,
-            source_path,
-        )
-        self._findings[key] = bounded
+        self._findings.append(bounded)
         self._public_keys.add(public_key)
 
     def finish(self, *, effective_profile=None) -> tuple[CompatibilityFinding, ...]:
-        findings = list(self._findings.values())
+        findings = list(self._findings)
         if self._omitted:
             omitted = min(self._omitted, 999_999_999)
             findings.append(
@@ -433,10 +404,7 @@ class _FindingAccumulator:
             )
         if effective_profile is not None:
             findings = [
-                _replace_compatibility_finding(
-                    finding,
-                    effective_profile=effective_profile,
-                )
+                replace(finding, effective_profile=effective_profile)
                 for finding in findings
             ]
         return tuple(findings)
@@ -445,7 +413,7 @@ class _FindingAccumulator:
 def _bounded_compatibility_findings(
     findings: Iterable[CompatibilityFinding],
 ) -> tuple[CompatibilityFinding, ...]:
-    return _FindingAccumulator(findings).finish()
+    return _FindingAccumulator(findings, deduplicate_sources=False).finish()
 
 
 def _finding(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 import os
 
@@ -306,6 +306,94 @@ def test_authored_generated_path_collisions_survive_normalization_and_append(
     assert [finding.path for finding in wrapped_again.findings] == [
         finding.path for finding in wrapped.findings
     ]
+
+    equal_copy = replace(unknown[0])
+    assert equal_copy == unknown[0]
+    assert hash(equal_copy) == hash(unknown[0])
+    original_values = (unknown[0], equal_copy)
+    substituted_values = (equal_copy, replace(equal_copy))
+    assert original_values == substituted_values
+    assert hash(original_values) == hash(substituted_values)
+    normalized_with_original = CompatibilityReport(
+        level=report.level,
+        findings=original_values,
+        runnable=report.runnable,
+    )
+    normalized_with_equal_copy = CompatibilityReport(
+        level=report.level,
+        findings=substituted_values,
+        runnable=report.runnable,
+    )
+    assert normalized_with_original.findings == normalized_with_equal_copy.findings
+    assert (
+        normalized_with_original.finding_count
+        == normalized_with_equal_copy.finding_count
+        == 2
+    )
+
+    message_replaced = replace(unknown[0], message="message-only replacement")
+    replaced_report = CompatibilityReport(
+        level=report.level,
+        findings=tuple(
+            message_replaced if finding is unknown[0] else finding
+            for finding in report.findings
+        ),
+        runnable=report.runnable,
+    )
+    assert replaced_report.finding_count == report.finding_count
+    assert [(finding.code, finding.path) for finding in replaced_report.findings] == [
+        (finding.code, finding.path) for finding in report.findings
+    ]
+
+    for finding in wrapped_unknown:
+        assert vars(finding) == asdict(finding)
+        assert repr(finding).startswith("CompatibilityFinding(")
+        assert repr(finding).count("=") == len(asdict(finding))
+
+
+def test_public_path_collision_resolution_is_deep_and_idempotent() -> None:
+    colliding = tuple(
+        CompatibilityFinding(
+            path="authored-reserved-path",
+            level=CompatibilityLevel.MAPPED,
+            message=f"ordered collision {index}",
+            blocking=False,
+            code="mapped_finding",
+        )
+        for index in range(511)
+    )
+
+    first = CompatibilityReport(
+        level=CompatibilityLevel.MAPPED,
+        findings=colliding,
+        runnable=True,
+    )
+    second = CompatibilityReport(
+        level=first.level,
+        findings=first.findings,
+        runnable=first.runnable,
+    )
+    third = CompatibilityReport(
+        level=second.level,
+        findings=second.findings,
+        runnable=second.runnable,
+    )
+
+    assert first.finding_count == 511
+    assert first.findings_truncated is False
+    assert len({(finding.code, finding.path) for finding in first.findings}) == 511
+    assert first.findings[0].message == "ordered collision 0"
+    assert first.findings[-1].message == "ordered collision 510"
+    assert all(
+        len(json.dumps(finding.path, ensure_ascii=True).encode("utf-8")) <= 256
+        for finding in first.findings
+    )
+    assert tuple(asdict(finding) for finding in second.findings) == tuple(
+        asdict(finding) for finding in first.findings
+    )
+    assert tuple(asdict(finding) for finding in third.findings) == tuple(
+        asdict(finding) for finding in first.findings
+    )
 
 
 def test_omitted_mapped_blocker_forces_unsupported_sentinel() -> None:
