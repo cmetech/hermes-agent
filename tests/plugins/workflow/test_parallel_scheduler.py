@@ -335,8 +335,12 @@ def test_runnable_request_does_not_jump_an_older_fifo_waiter(
     assert RunScheduler(setup_store).advance(blocker.run_id)["status"] == "succeeded"
 
     store = RunStore(home, max_executing_runs=1)
+    always_run_nodes = RunScheduler(store).verified_always_run_nodes(
+        resumable.run_id
+    )
     resumed = store.resume_run(
         resumable.run_id,
+        always_run_nodes=always_run_nodes,
         expected_state_version=resume_state["state_version"],
     )
 
