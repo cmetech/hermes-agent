@@ -786,3 +786,74 @@ class TestVisionGuardForcedOnForEnrolled:
     def test_vision_metadata_floor_outranks_enrolled_trust(self, monkeypatch):
         out = self._vision_call(monkeypatch, "t::enrolled", METADATA)
         assert "private or internal address" in out
+
+
+class TestLightpandaPreRouteIsGatedOffCdpSessions:
+    """M-1: `browser_vision`'s screenshot pre-route was never gated.
+
+    `_should_inject_engine` is session-blind. With a global
+    `browser.engine: lightpanda` alongside an enrolled profile, the pre-route
+    called `_chrome_fallback_screenshot("t::enrolled", ...)`, which reads the
+    internal URL off the enrolled session and then spawns the BUNDLED browser
+    and navigates it there -- a silent fallback to the throwaway browser for a
+    trusted origin, and an internal URL opened in an unmanaged profile. Site one
+    (inside `_run_browser_command`) was gated on `session_info["cdp_url"]`; this
+    is the same gate for a call site that only has the session key.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _vision(self, monkeypatch, tmp_path, _reset_module_caches, _default_enrolled):
+        import hermes_constants
+
+        monkeypatch.setattr(hermes_constants, "get_hermes_dir", lambda *a, **k: tmp_path)
+        monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
+        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: True)
+        # A LOCAL install with lightpanda configured globally: this is exactly
+        # the combination that makes _should_inject_engine() return True.
+        monkeypatch.setattr(browser_tool, "_get_browser_engine", lambda: "lightpanda")
+        monkeypatch.setattr(browser_tool, "_is_local_mode", lambda: True)
+        monkeypatch.setattr(
+            browser_tool, "_run_browser_command",
+            lambda *a, **kw: {"success": False, "error": "no browser in this test"},
+        )
+
+    @staticmethod
+    def _capture_preroute(monkeypatch):
+        calls = []
+
+        def _fallback(task_id, args, timeout):
+            calls.append(task_id)
+            return {"success": False, "error": "stubbed"}
+
+        monkeypatch.setattr(browser_tool, "_chrome_fallback_screenshot", _fallback)
+        return calls
+
+    def test_enrolled_session_is_never_pre_routed_to_the_bundled_browser(
+        self, monkeypatch
+    ):
+        calls = self._capture_preroute(monkeypatch)
+        browser_tool.browser_vision("what is on the page?", task_id="t::enrolled")
+        assert calls == [], (
+            "an enrolled session's screenshot was pre-routed to the bundled "
+            f"browser: {calls}"
+        )
+
+    def test_cdp_attached_session_is_never_pre_routed(self, monkeypatch):
+        """Any CDP-attached session, not just enrolled ones (parity with the
+        `session_info['cdp_url']` gate on site one)."""
+        calls = self._capture_preroute(monkeypatch)
+        browser_tool._active_sessions["t"] = {
+            "session_name": "s", "cdp_url": "ws://127.0.0.1:9333/devtools/browser/x",
+        }
+        try:
+            browser_tool.browser_vision("what is on the page?", task_id="t")
+        finally:
+            browser_tool._active_sessions.pop("t", None)
+        assert calls == []
+
+    def test_ordinary_lightpanda_session_still_pre_routes(self, monkeypatch):
+        """The gate must not disable the feature for the sessions it exists for."""
+        calls = self._capture_preroute(monkeypatch)
+        browser_tool.browser_vision("what is on the page?", task_id="t")
+        assert calls == ["t"]

@@ -36,7 +36,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from tools import browser_profiles, browser_session_registry
 
@@ -100,24 +100,121 @@ def _cdp_alive(cdp_url: str) -> bool:
         return False
 
 
-def _cdp_browser_identity(cdp_url: str) -> Optional[str]:
-    """Return the ``Browser`` string from /json/version, or None.
+def _cdp_version_payload(cdp_url: str) -> Optional[Dict[str, Any]]:
+    """Return the parsed ``/json/version`` document, or None.
 
-    Reusing whatever answers on the port lets an unrelated listener -- or
-    another profile's browser -- inherit this profile's trust (EBL-004).
-    Fails CLOSED: any connection error, timeout, non-JSON body, missing
-    ``Browser`` key, or empty value returns None, which must lead to
-    launching our own browser, never to reusing the unknown listener.
+    Fails CLOSED: connection error, timeout, non-JSON body, or a JSON body that
+    is not an object all return None.
     """
     try:
         with urllib.request.urlopen(
             f"{cdp_url}/json/version", timeout=CDP_PROBE_TIMEOUT_S
         ) as response:
             payload = json.loads(response.read().decode("utf-8", "replace"))
-        browser = str(payload.get("Browser") or "").strip()
-        return browser or None
     except Exception:  # noqa: BLE001
         return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _cdp_browser_identity(cdp_url: str) -> Optional[str]:
+    """Return the ``Browser`` string from /json/version, or None.
+
+    LIVENESS + shape only. Every CDP endpoint answers with a non-empty
+    ``Browser`` string, so this ALONE cannot tell the enrolled browser apart
+    from Chrome for Testing, ``/browser connect``'s throwaway Chrome in
+    ``$HERMES_HOME/chrome-debug``, or any other Chromium on the port. It is the
+    cheap first gate; ``_endpoint_is_profile_browser`` is the one that
+    establishes identity, and BOTH must pass before a listener is reused.
+
+    Fails CLOSED: any connection error, timeout, non-JSON body, missing
+    ``Browser`` key, or empty value returns None, which must lead to
+    launching our own browser, never to reusing the unknown listener.
+    """
+    payload = _cdp_version_payload(cdp_url)
+    if payload is None:
+        return None
+    browser = str(payload.get("Browser") or "").strip()
+    return browser or None
+
+
+# Chromium writes this file into its --user-data-dir as soon as the DevTools
+# HTTP server is listening: line 1 is the port, line 2 the browser target path
+# ("/devtools/browser/<uuid>"). It is removed on a clean exit.
+_DEVTOOLS_PORT_FILE = "DevToolsActivePort"
+
+
+def _devtools_active_target(user_data_dir: str) -> Optional[Tuple[int, str]]:
+    """Return ``(port, ws_target_path)`` from a profile dir's DevToolsActivePort.
+
+    Fails CLOSED: a missing/unreadable file, a short file, a non-numeric port,
+    or a target path that is not absolute all return None.
+    """
+    try:
+        raw = open(
+            os.path.join(user_data_dir, _DEVTOOLS_PORT_FILE), encoding="utf-8"
+        ).read()
+    except OSError:
+        return None
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+    try:
+        port = int(lines[0])
+    except ValueError:
+        return None
+    target = lines[1]
+    if not target.startswith("/"):
+        return None
+    return (port, target)
+
+
+def _endpoint_is_profile_browser(
+    profile: browser_profiles.BrowserProfile, cdp_url: str
+) -> bool:
+    """Return True only when ``cdp_url`` is the browser using THIS profile's dir.
+
+    The identity proof (review finding H-1). A non-empty ``Browser`` string
+    proves nothing -- every CDP endpoint has one -- so before this check, a
+    ``/browser connect`` throwaway Chrome left running in
+    ``$HERMES_HOME/chrome-debug``, a stray Chrome for Testing, or any other
+    listener on the port was indistinguishable from the enrolled browser, and
+    the ``::enrolled`` key's corporate origin trust would be bound to a browser
+    with no SSO and no client certificate: a SILENT downgrade.
+
+    The proof is anchored on the profile's own ``user_data_dir``, which only the
+    enrolled browser ever uses: Chromium writes ``DevToolsActivePort`` there
+    (port + ``/devtools/browser/<uuid>`` target) when its DevTools server comes
+    up, and the running endpoint reports the same target in
+    ``webSocketDebuggerUrl``. Matching the two proves the listener on this port
+    is the browser holding this profile directory. It works across process
+    restarts, so a browser a PREVIOUS run left holding the profile dir and port
+    is still legitimately reusable -- the attach-or-launch behaviour this module
+    is built on.
+
+    Fails CLOSED on every unexpected input. A false negative costs a relaunch;
+    a false positive costs the corporate session.
+    """
+    try:
+        target = _devtools_active_target(
+            browser_profiles.resolve_user_data_dir(profile)
+        )
+        if target is None:
+            return False
+        recorded_port, ws_path = target
+        if recorded_port != int(profile.cdp_port):
+            return False
+        payload = _cdp_version_payload(cdp_url)
+        if payload is None:
+            return False
+        ws_url = str(payload.get("webSocketDebuggerUrl") or "")
+        if not ws_url:
+            return False
+        from urllib.parse import urlsplit
+
+        return urlsplit(ws_url).path == ws_path
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("endpoint identity check failed for %s: %s", cdp_url, exc)
+        return False
 
 
 def _spawn_browser(executable: str, args: List[str]) -> None:
@@ -146,12 +243,18 @@ def _ensure_enrolled_cdp(profile: browser_profiles.BrowserProfile, headless: boo
     cdp_url = _cdp_url_for(profile)
 
     identity = _cdp_browser_identity(cdp_url)
-    if identity:
+    if identity and _endpoint_is_profile_browser(profile, cdp_url):
         logger.info(
             "browser profile %r: reusing CDP listener on %s (%s)",
             profile.name, cdp_url, identity,
         )
         return cdp_url
+    if identity:
+        logger.warning(
+            "browser profile %r: a CDP endpoint (%s) is listening on %s but is NOT "
+            "the browser holding this profile's user-data-dir; not reusing it",
+            profile.name, identity, cdp_url,
+        )
 
     executable = browser_profiles.resolve_executable(profile)
     if not executable:
@@ -180,11 +283,17 @@ def _ensure_enrolled_cdp(profile: browser_profiles.BrowserProfile, headless: boo
 
     for _ in range(READY_POLL_ATTEMPTS):
         time.sleep(READY_POLL_INTERVAL_S)
-        if _cdp_alive(cdp_url):
+        # Identity is checked here too, not just on the reuse path: if a foreign
+        # listener holds the port, our launch cannot bind it, yet _cdp_alive
+        # would happily report the SQUATTER as "ready" and we would return its
+        # endpoint as the enrolled browser.
+        if _cdp_alive(cdp_url) and _endpoint_is_profile_browser(profile, cdp_url):
             return cdp_url
 
     raise ProfileError(
-        f"browser for profile {profile.name!r} did not expose CDP on {cdp_url} in time"
+        f"browser for profile {profile.name!r} did not expose CDP on {cdp_url} in time "
+        "(if something else is listening on that port, give the profile its own "
+        "cdp_port)"
     )
 
 

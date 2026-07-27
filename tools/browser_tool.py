@@ -609,6 +609,29 @@ def _session_uses_enrolled_browser(session_key: Optional[str]) -> bool:
     return bool(profile is not None and profile.is_enrolled)
 
 
+def _session_is_cdp_attached(session_key: Optional[str]) -> bool:
+    """OTTO: True when this session drives a CDP endpoint, not a bundled browser.
+
+    The pure equivalent of the ``session_info.get("cdp_url")`` gate on the
+    Lightpanda fallback inside ``_run_browser_command`` (which already holds the
+    session record). Call sites that only have a session KEY -- notably
+    ``browser_vision``'s screenshot pre-route -- need the same answer without
+    launching anything: ``_should_inject_engine`` is session-blind, so with a
+    global ``browser.engine: lightpanda`` it would pre-route an ENROLLED
+    session's screenshot to ``_chrome_fallback_screenshot``, which reads the
+    internal URL off the enrolled session and then opens it in the BUNDLED
+    browser -- a silent fallback to the throwaway browser for a trusted origin,
+    and an internal URL loaded in an unmanaged profile.
+    """
+    if not session_key:
+        return False
+    with _cleanup_lock:
+        info = _active_sessions.get(str(session_key))
+    if isinstance(info, dict) and info.get("cdp_url"):
+        return True
+    return _session_uses_enrolled_browser(session_key)
+
+
 def _default_profile_launchable() -> bool:
     """OTTO: True when browser.default_profile names a launchable enrolled browser.
 
@@ -4447,7 +4470,16 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     engine = _get_browser_engine()
     _lp_prerouted = False
     _lp_fallback_warning = None
-    if engine == "lightpanda" and _should_inject_engine(engine):
+    # OTTO: gated on _session_is_cdp_attached exactly like the fallback site in
+    # _run_browser_command. A CDP-attached (including enrolled) session never
+    # gets `--engine` appended, so it never ran Lightpanda no matter what the
+    # global browser.engine says -- and pre-routing it here would hand a trusted
+    # internal URL to the BUNDLED browser.
+    if (
+        engine == "lightpanda"
+        and _should_inject_engine(engine)
+        and not _session_is_cdp_attached(effective_task_id)
+    ):
         logger.debug("browser_vision: pre-routing screenshot to Chrome (engine=lightpanda)")
         screenshot_args = []
         if annotate:
