@@ -113,6 +113,7 @@ upstream_changes:
   - tests/tools/test_browser_profiles.py
   - tests/tools/test_browser_enrolled_routing.py
   - tests/tools/test_browser_enrolled_port_guard.py
+  - tests/tools/test_browser_enrolled_authority_boundary.py
   - tests/tools/test_browser_headed_mode.py
   owned_symbols:
   - _ENROLLED_SUFFIX
@@ -126,6 +127,49 @@ upstream_changes:
   - _session_cdp_keylocks
   - _session_handles
   - _session_cdp_keylock
+  # Second adversarial pass (2026-07-27). Each of these closes a way the
+  # per-navigation trust boundary could still be bypassed AFTER the first
+  # remediation round; every one is silent-revert prone (no build error, no
+  # type error, and no failing test outside
+  # tests/tools/test_browser_enrolled_authority_boundary.py).
+  #
+  # CRIT-001 -- the ONLY classifier for "does this endpoint reach the corporate
+  # browser?". If an upstream merge reroutes _get_cdp_override past
+  # _reject_enrolled_override, browser.cdp_url/BROWSER_CDP_URL again hand a BARE
+  # key the enrolled endpoint with all six guard disjuncts inactive.
+  - _reject_enrolled_override
+  - enrolled_endpoint_owner
+  - is_local_host
+  # CRIT-002/MED-006 -- the free-port fallback must never return a reserved or
+  # unchecked port, and the refusal is scoped by hostname so remote CDP works.
+  - find_free_debug_port
+  - enrolled_port_refusal
+  - _dual_stack_bindable
+  - _ephemeral_loopback_port
+  # HIGH-003 -- process-global `close --all` must not run beside another
+  # acquire. Liveness is three things: active sessions, registry bindings, and
+  # in-flight reservations.
+  - _inflight_acquires
+  - _reserve_acquire
+  - _release_acquire
+  - _run_daemon_hygiene
+  - bound_session_keys
+  # HIGH-004 -- an acquire in flight when its task is reaped must release, not
+  # publish. The tombstone is bumped BEFORE teardown and read BEFORE acquire.
+  - _session_generations
+  - _bump_session_generation
+  - _enrolled_sidecar_has_state
+  # MED-005 -- the availability gate proves the data dir is usable, and a
+  # relative configured path is anchored on the Hermes home, not the CWD.
+  - data_dir_problem
+  - resolve_user_data_dir
+  # MED-007 -- one wall-clock bound on acquisition, so a same-key waiter cannot
+  # be parked for minutes before a 30s browser command starts.
+  - ENROLLED_READY_DEADLINE_S
+  - ACQUIRE_WORST_CASE_S
+  # LOW-009 -- ref-counted key locks: bounded, without reopening the
+  # single-flight race a naive pop() would.
+  - _KeyLockEntry
   - _release_session_handle
   - _forget_session_cdp_url
   - _reset_session_cdp_cache
@@ -452,6 +496,80 @@ upstream_changes:
 
     The untouched upstream browser SSRF and hybrid-routing suites must stay green
     UNEDITED. If either needs editing after a merge, the merge altered this seam.
+
+    SECOND ADVERSARIAL PASS (2026-07-27). A review of the EBL-007 remediation
+    above found four further ways the boundary could be bypassed. All are fixed
+    here and covered by tests/tools/test_browser_enrolled_authority_boundary.py;
+    each was confirmed by mutation to fail that file and NOTHING else, so a
+    green suite elsewhere proves nothing about them.
+
+    (h) THE SECOND DOOR (CRIT-001). Paragraph (d) above said the non-enrolled
+    path "returns _get_cdp_override() unchanged ... untouched". That was the
+    hole. browser.cdp_url and BROWSER_CDP_URL are PROCESS-GLOBAL: once either
+    is set, _navigation_session_key returns the BARE key for EVERY url (its
+    first early return) and _session_cdp_url falls through to the override. Set
+    to the local enrolled listener, an attacker-controlled public page is then
+    driven by the corporate browser with all six disjuncts in (c) INACTIVE,
+    because the key is not ::enrolled. Reproduced at the remediation tip. The
+    parked ruling that "nothing seeds it" was false: the OpenClaw migration
+    copies browser.cdpUrl into browser.cdp_url. _get_cdp_override now calls
+    _reject_enrolled_override on the RAW value BEFORE _resolve_cdp_override
+    (which would otherwise send a discovery request to the corporate browser)
+    and returns "" when browser_profiles.enrolled_endpoint_owner classifies it
+    as a LOCAL enrolled endpoint. Dropping the override rather than raising is
+    deliberate: with no override, routing resumes, so a trusted origin still
+    reaches the real browser on a GUARDED ::enrolled key while everything else
+    gets the throwaway browser. enrolled_endpoint_owner/is_local_host are the
+    single classifier -- every surface that can point the agent at a CDP
+    endpoint must consult it or the door reopens.
+
+    (i) PORT SEARCH (CRIT-002) and HOSTNAME SCOPE (MED-006).
+    find_free_debug_port skipped reserved enrolled ports inside its loop and
+    then returned `preferred + 1` UNCHECKED on exhaustion -- which can be the
+    very port it just refused, letting both connect surfaces discover and
+    globally adopt an already-running corporate browser. It now falls back to a
+    kernel-assigned ephemeral port, still validated, and RAISES rather than
+    return an unsafe integer; both callers handle that. enrolled_port_refusal
+    also takes the parsed hostname: it reserved ports globally, so an unrelated
+    remote endpoint (wss://cdp.vendor.example:9333) was refused because a LOCAL
+    browser owns 9333. host=None still means local (the free-port search).
+
+    (j) HYGIENE LIVENESS IS THREE THINGS (HIGH-003). `close --all` is
+    process-global and its gate only read _active_sessions, so a DIFFERENT
+    key's acquire could run it after another acquire had already launched its
+    browser but before anything recorded it. acquire() now reserves its key
+    (_reserve_acquire) BEFORE hygiene and holds the reservation until the
+    session is bound, and hygiene additionally skips when
+    browser_session_registry.bound_session_keys() is non-empty -- acquire binds
+    before returning and release() unbinds, so a binding covers the whole
+    lifetime. Keep all three checks; each covers a window the others do not.
+
+    (k) CLEANUP VS IN-FLIGHT ACQUIRE (HIGH-004). Bare end-of-task cleanup only
+    reaped an enrolled sidecar already in _active_sessions, so an acquire still
+    in flight republished the memo, handle and registry binding AFTER its
+    task's reaper ran -- enrolled authority outliving its task. Two halves,
+    both needed: _cleanup_single_browser_session bumps _session_generations
+    FIRST (before any teardown), and _session_cdp_url reads the generation
+    BEFORE acquire and, on return, releases instead of publishing if it moved.
+    Separately, the sidecar is reaped whenever _enrolled_sidecar_has_state says
+    any of the four records exist -- _session_cdp_url publishes memo/handle/
+    binding BEFORE _get_session_info publishes the active record, so gating on
+    _active_sessions alone missed a real window. Do NOT reap unconditionally:
+    that fires per-key teardown (notably Camofox close) for a sidecar that
+    never existed. keep_enrolled=True must still skip BOTH the bump and reap.
+
+    (l) MED-005/MED-007/LOW-009. default_profile_launchable proves the data dir
+    is USABLE via data_dir_problem (an absolute path under a regular file
+    passed the old isabs-only check and then failed at first acquire with
+    NotADirectoryError); resolve_user_data_dir anchors a configured RELATIVE
+    path on the Hermes home, not the CWD, so it cannot differ between CLI,
+    `hermes serve` and Desktop. _ensure_enrolled_cdp is bounded by
+    ENROLLED_READY_DEADLINE_S as well as the attempt count, because slow probes
+    made the iteration count a poor proxy for elapsed time and the whole
+    acquire runs under the per-key lock. The key-lock table is ref-counted
+    (_KeyLockEntry) rather than never-pruned; the refcount covers owner PLUS
+    waiters and is taken before blocking, which is what makes pruning safe --
+    a bare pop() on cleanup would reopen the single-flight race.
   removal_condition: >-
     Remove when upstream can drive a user-supplied, already-installed browser
     binary with a persistent user-data-dir as a first-class session backend,
