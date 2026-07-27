@@ -3662,6 +3662,7 @@ upstream_changes:
   - WORKFLOW_COMPATIBILITY_FINDINGS_MAX
   - WORKFLOW_COMPATIBILITY_PAYLOAD_MAX_BYTES
   - _bounded_author_text
+  - _disambiguated_author_path
   - _FindingAccumulator
   - CompatibilityReport.findings_truncated
   - CompatibilityReport.finding_count
@@ -3712,7 +3713,12 @@ upstream_changes:
     rule. Bound author-controlled paths and messages by their conservative
     serialized JSON byte size (including Unicode and escape amplification),
     and retain distinct truncated paths with a deterministic digest suffix so
-    every compatibility payload remains below 1 MiB. Accept a truncation
+    every compatibility payload remains below 1 MiB. Keep source-key identity
+    across report normalization and allocate public `(code, path)` keys
+    separately: when an authored literal occupies a generated digest form,
+    resolve it through a bounded deterministic collision sequence and check
+    every candidate before use, including through wrapper appends. Accept a
+    truncation
     sentinel only with a positive canonical omitted count, exactly 512 retained
     findings, a non-portable aggregate, and consistent blocker state; accept
     legacy response shapes only when they are complete and non-truncated.

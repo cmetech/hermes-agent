@@ -223,6 +223,91 @@ def test_bounded_paths_keep_public_code_path_keys_unique(
     ]
 
 
+def test_authored_generated_path_collisions_survive_normalization_and_append(
+    workflow_writer, tmp_path
+) -> None:
+    long_path = "p" * 2_000 + "alpha"
+    probe = load_workflow(
+        workflow_writer(
+            tmp_path / "probe",
+            name="probe-generated-path",
+            **{long_path: "x"},
+        )
+    )
+    generated_literal = next(
+        finding.path
+        for finding in assess_compatibility(probe).findings
+        if finding.code == "unknown_top_level_field"
+    )
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "collision",
+            name="authored-generated-path-collision",
+            **{long_path: "x", generated_literal: "x"},
+        )
+    )
+
+    report = assess_compatibility(package)
+    unknown = [
+        finding
+        for finding in report.findings
+        if finding.code == "unknown_top_level_field"
+    ]
+    repeated = assess_compatibility(package)
+
+    assert len(unknown) == 2
+    assert report.finding_count == 3
+    assert unknown[0].path == generated_literal
+    assert len({(finding.code, finding.path) for finding in unknown}) == 2
+    assert all(
+        len(json.dumps(finding.path, ensure_ascii=True).encode("utf-8")) <= 256
+        for finding in unknown
+    )
+    assert [finding.path for finding in repeated.findings] == [
+        finding.path for finding in report.findings
+    ]
+
+    normalized = CompatibilityReport(
+        level=report.level,
+        findings=report.findings,
+        runnable=report.runnable,
+    )
+    authored_reserved_path = replace(
+        unknown[1],
+        path=unknown[1].path,
+        message="literal authored collision-resolution path",
+    )
+    wrapped = CompatibilityReport(
+        level=report.level,
+        findings=(*normalized.findings, authored_reserved_path),
+        runnable=report.runnable,
+    )
+    wrapped_again = CompatibilityReport(
+        level=wrapped.level,
+        findings=wrapped.findings,
+        runnable=wrapped.runnable,
+    )
+    wrapped_unknown = [
+        finding
+        for finding in wrapped.findings
+        if finding.code == "unknown_top_level_field"
+    ]
+
+    assert normalized.finding_count == report.finding_count
+    assert [finding.path for finding in normalized.findings] == [
+        finding.path for finding in report.findings
+    ]
+    assert wrapped.finding_count == 4
+    assert len(wrapped_unknown) == 3
+    assert len({(finding.code, finding.path) for finding in wrapped_unknown}) == 3
+    assert [finding.path for finding in wrapped_unknown[:2]] == [
+        finding.path for finding in unknown
+    ]
+    assert [finding.path for finding in wrapped_again.findings] == [
+        finding.path for finding in wrapped.findings
+    ]
+
+
 def test_omitted_mapped_blocker_forces_unsupported_sentinel() -> None:
     report = CompatibilityReport(
         level=CompatibilityLevel.UNSUPPORTED,

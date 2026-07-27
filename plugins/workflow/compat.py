@@ -24,6 +24,9 @@ _WORKFLOW_COMPATIBILITY_TRUNCATION_CODE = "compatibility_findings_truncated"
 _WORKFLOW_COMPATIBILITY_TRUNCATION_PATH = "compatibility.findings"
 _WORKFLOW_COMPATIBILITY_TRUNCATION_PREFIX = "Compatibility findings truncated: "
 _WORKFLOW_COMPATIBILITY_TEXT_SUFFIX = "…[TRUNCATED]"
+# Non-dataclass provenance survives internal report wrapping without entering
+# dataclass serialization or the five-field public finding projection.
+_WORKFLOW_COMPATIBILITY_SOURCE_PATH_ATTR = "_hermes_compatibility_source_path"
 
 
 @dataclass(frozen=True)
@@ -225,6 +228,23 @@ def _json_string_bytes(value: str) -> int:
     return 2 + sum(_json_string_character_bytes(character) for character in value)
 
 
+def _author_text_with_suffix(
+    value: str,
+    *,
+    max_json_bytes: int,
+    suffix: str,
+) -> str:
+    remaining = max_json_bytes - _json_string_bytes(suffix)
+    retained: list[str] = []
+    for character in value:
+        encoded_bytes = _json_string_character_bytes(character)
+        if encoded_bytes > remaining:
+            break
+        retained.append(character)
+        remaining -= encoded_bytes
+    return "".join(retained) + suffix
+
+
 def _bounded_author_text(
     value: str,
     *,
@@ -241,15 +261,49 @@ def _bounded_author_text(
             value.encode("utf-8", errors="surrogatepass")
         ).hexdigest()
         suffix = f"…[TRUNCATED:{digest}]"
-    remaining = max_json_bytes - _json_string_bytes(suffix)
-    retained: list[str] = []
-    for character in value:
-        encoded_bytes = _json_string_character_bytes(character)
-        if encoded_bytes > remaining:
-            break
-        retained.append(character)
-        remaining -= encoded_bytes
-    return "".join(retained) + suffix
+    return _author_text_with_suffix(
+        value,
+        max_json_bytes=max_json_bytes,
+        suffix=suffix,
+    )
+
+
+def _disambiguated_author_path(value: str, collision_index: int) -> str:
+    digest = hashlib.sha256(
+        f"{collision_index}\0{value}".encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+    return _author_text_with_suffix(
+        value,
+        max_json_bytes=_WORKFLOW_COMPATIBILITY_PATH_JSON_MAX_BYTES,
+        suffix=f"…[COLLISION:{collision_index}:{digest}]",
+    )
+
+
+def _finding_source_path(finding: CompatibilityFinding) -> str:
+    source_path = getattr(
+        finding,
+        _WORKFLOW_COMPATIBILITY_SOURCE_PATH_ATTR,
+        finding.path,
+    )
+    return source_path if isinstance(source_path, str) else finding.path
+
+
+def _replace_compatibility_finding(
+    finding: CompatibilityFinding, **changes
+) -> CompatibilityFinding:
+    replaced = replace(finding, **changes)
+    source_path = getattr(
+        finding,
+        _WORKFLOW_COMPATIBILITY_SOURCE_PATH_ATTR,
+        None,
+    )
+    if isinstance(source_path, str):
+        object.__setattr__(
+            replaced,
+            _WORKFLOW_COMPATIBILITY_SOURCE_PATH_ATTR,
+            source_path,
+        )
+    return replaced
 
 
 @dataclass(frozen=True)
@@ -279,6 +333,7 @@ class _FindingAccumulator:
     def __init__(self, initial: Iterable[CompatibilityFinding] = ()) -> None:
         self._findings: dict[tuple[str, str], CompatibilityFinding] = {}
         self._seen: set[tuple[str, str]] = set()
+        self._public_keys: set[tuple[str, str]] = set()
         self._omitted = 0
         self._omitted_blocking = False
         self._omitted_level = CompatibilityLevel.PORTABLE
@@ -313,22 +368,11 @@ class _FindingAccumulator:
             self._sentinel_effective_profile = finding.effective_profile
             return
 
-        key = (finding.code, finding.path)
+        source_path = _finding_source_path(finding)
+        key = (finding.code, source_path)
         if key in self._seen:
             return
         self._seen.add(key)
-        bounded = replace(
-            finding,
-            path=_bounded_author_text(
-                finding.path,
-                max_json_bytes=_WORKFLOW_COMPATIBILITY_PATH_JSON_MAX_BYTES,
-                collision_safe=True,
-            ),
-            message=_bounded_author_text(
-                finding.message,
-                max_json_bytes=_WORKFLOW_COMPATIBILITY_MESSAGE_JSON_MAX_BYTES,
-            ),
-        )
         if len(self._findings) >= WORKFLOW_COMPATIBILITY_FINDINGS_MAX - 1:
             self._merge_omitted_state(
                 count=1,
@@ -336,7 +380,36 @@ class _FindingAccumulator:
                 blocking=finding.blocking,
             )
             return
+        public_path = _bounded_author_text(
+            source_path,
+            max_json_bytes=_WORKFLOW_COMPATIBILITY_PATH_JSON_MAX_BYTES,
+            collision_safe=True,
+        )
+        public_key = (finding.code, public_path)
+        if public_key in self._public_keys:
+            for collision_index in range(1, WORKFLOW_COMPATIBILITY_FINDINGS_MAX + 1):
+                candidate = _disambiguated_author_path(source_path, collision_index)
+                public_key = (finding.code, candidate)
+                if public_key not in self._public_keys:
+                    public_path = candidate
+                    break
+            else:  # pragma: no cover - retained rows are bounded below candidates
+                raise RuntimeError("compatibility public path space exhausted")
+        bounded = _replace_compatibility_finding(
+            finding,
+            path=public_path,
+            message=_bounded_author_text(
+                finding.message,
+                max_json_bytes=_WORKFLOW_COMPATIBILITY_MESSAGE_JSON_MAX_BYTES,
+            ),
+        )
+        object.__setattr__(
+            bounded,
+            _WORKFLOW_COMPATIBILITY_SOURCE_PATH_ATTR,
+            source_path,
+        )
         self._findings[key] = bounded
+        self._public_keys.add(public_key)
 
     def finish(self, *, effective_profile=None) -> tuple[CompatibilityFinding, ...]:
         findings = list(self._findings.values())
@@ -360,7 +433,10 @@ class _FindingAccumulator:
             )
         if effective_profile is not None:
             findings = [
-                replace(finding, effective_profile=effective_profile)
+                _replace_compatibility_finding(
+                    finding,
+                    effective_profile=effective_profile,
+                )
                 for finding in findings
             ]
         return tuple(findings)
