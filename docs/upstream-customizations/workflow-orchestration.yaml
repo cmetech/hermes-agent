@@ -3174,6 +3174,8 @@ upstream_changes:
   - plugins/workflow/discovery.py
   - plugins/workflow/compat.py
   - plugins/workflow/cli.py
+  - plugins/workflow/gateway_command.py
+  - plugins/workflow/api_admission.py
   - plugins/workflow/runner_binding.py
   - plugins/workflow/showcase.py
   owned_symbols:
@@ -3191,11 +3193,16 @@ upstream_changes:
   - assess_package_execution environment compatibility finding
   - _verified_distribution_assessment environment compatibility finding
   - validate and doctor language projections
+  - WorkflowCompatibilityBlockedError
+  - require_runnable
+  - compatibility refusal before CLI trust/run, Gateway, and API persistence
   tests:
   - tests/plugins/workflow/test_schema.py
   - tests/plugins/workflow/test_discovery.py
   - tests/plugins/workflow/test_compat_matrix.py
   - tests/plugins/workflow/test_cli.py
+  - tests/plugins/workflow/test_notification_delivery.py
+  - tests/plugins/workflow/test_desktop_api.py
   - tests/plugins/workflow/test_catalog_api.py
   - tests/plugins/workflow/test_runner_binding.py
   - tests/plugins/workflow/test_showcase_catalog.py
@@ -3215,7 +3222,10 @@ upstream_changes:
     wrappers, and identical validate and doctor language projections. Workflows
     without a declaration and explicit hermes-legacy workflows must remain
     permissive with actionable warnings; declared archon-2026-07 workflows must
-    fail closed only for invalid or currently unenforceable semantics.
+    fail closed only for invalid or currently unenforceable semantics. Use the
+    dependency-neutral runnable guard at every authoring, trust, and start
+    boundary before any mutable admission state is created, while preserving
+    the existing stable API and Gateway refusal contracts.
   removal_condition: >-
     Remove when upstream provides equivalent profile-before-policy loading,
     companion-aware cache invalidation, source and normalized package contracts,

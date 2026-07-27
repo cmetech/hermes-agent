@@ -152,6 +152,82 @@ def _write(workflow_writer, workdir):
     )
 
 
+def _archon_package(workflow_writer, tmp_path, *, field, value):
+    """Write one declared Archon package with a Phase 1 deferred field."""
+    node = (
+        {"id": "start", "bash": "true", field: value}
+        if field == "timeout"
+        else {"id": "start", "prompt": "x", field: value}
+    )
+    path = workflow_writer(
+        tmp_path / ".hermes" / "workflows",
+        name=f"archon-{field}",
+        filename=f"archon-{field}.yaml",
+        nodes=[node],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    "field, value, code",
+    [
+        ("timeout", 1000, "archon_timeout_semantics_unavailable"),
+        ("retry", {"max_attempts": 2}, "archon_retry_semantics_unavailable"),
+        ("output_format", {"type": "object"}, "archon_output_format_unavailable"),
+        ("output_type", "report", "archon_output_type_unavailable"),
+        ("maxBudgetUsd", 1.0, "archon_budget_enforcement_unavailable"),
+        ("sandbox", {"enabled": True}, "archon_sandbox_enforcement_unavailable"),
+    ],
+)
+def test_archon_deferred_fields_block_validate_trust_and_run(
+    workflow_writer, tmp_path, capsys, field, value, code
+):
+    path = _archon_package(workflow_writer, tmp_path, field=field, value=value)
+    parser = _parser()
+    home = tmp_path / "home"
+    common = ["--workdir", str(tmp_path), "--hermes-home", str(home)]
+
+    validate = parser.parse_args([*common, "validate", path.stem, "--json"])
+    assert validate.func(validate) == machine_contract.EXIT_BLOCKING_FINDING
+    validation = _json_envelope(capsys)
+    assert validation["error"]["code"] == "validation_failed"
+    identities = {
+        (issue["code"], issue["path"])
+        for issue in validation["result"]["issues"]
+    }
+    assert (code, f"nodes[0].{field}") in identities
+    assert len(validation["result"]["issues"]) == len(identities)
+
+    package = load_workflow(path)
+    digest = compute_package_digest(package).sha256
+    trust = parser.parse_args(
+        [*common, "trust", path.stem, "--digest", digest, "--json"]
+    )
+    assert trust.func(trust) == machine_contract.EXIT_BLOCKING_FINDING
+    assert _json_envelope(capsys)["error"]["code"] == "workflow_compatibility_blocked"
+    assert WorkflowTrustStore(home).check(digest) == "untrusted"
+
+    run = parser.parse_args(
+        [
+            *common,
+            "run",
+            path.stem,
+            "--foreground",
+            "--idempotency-key",
+            "archon-refusal",
+            "--json",
+        ]
+    )
+    assert run.func(run) == machine_contract.EXIT_BLOCKING_FINDING
+    assert _json_envelope(capsys)["error"]["code"] == "workflow_compatibility_blocked"
+    store = RunStore(home)
+    assert list(store.runs_root.rglob("run.json")) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
 def test_plugin_registers_cli_command_and_background_coordinator():
     class Context:
         def __init__(self):
@@ -1216,6 +1292,7 @@ def test_invalid_workflow_validation_uses_documented_blocking_exit(
         "plugins.workflow.cli.validate_package",
         lambda _package: (
             ValidationIssue("nodes", "invalid", "invalid workflow", blocking=True),
+            ValidationIssue("nodes", "invalid", "invalid workflow", blocking=True),
         ),
     )
     args = _parser().parse_args([
@@ -1230,6 +1307,11 @@ def test_invalid_workflow_validation_uses_documented_blocking_exit(
     envelope = _json_envelope(capsys)
     assert envelope["ok"] is False
     assert envelope["error"]["code"] == "validation_failed"
+    identities = {
+        (issue["code"], issue["path"])
+        for issue in envelope["result"]["issues"]
+    }
+    assert len(envelope["result"]["issues"]) == len(identities)
 
 
 def test_machine_start_requires_stable_key_and_background_owner(

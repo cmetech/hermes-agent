@@ -30,7 +30,9 @@ from plugins.workflow.compat import (
     CompatibilityReport,
     DoctorReport,
     InputRequirement,
+    WorkflowCompatibilityBlockedError,
     assess_compatibility,
+    require_runnable,
 )
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.discovery import discover_workflows
@@ -924,11 +926,21 @@ def _language_payload(package: WorkflowPackage) -> dict[str, object]:
 def _cmd_validate(args: argparse.Namespace) -> int:
     package = _resolve(args, args.name)
     issues = validate_package(package)
-    payload = {
-        "name": package.definition.name,
-        "valid": not any(issue.blocking for issue in issues),
-        "language": _language_payload(package),
-        "issues": [
+    compatibility = assess_compatibility(package)
+    if any(issue.blocking for issue in issues) and compatibility.runnable:
+        compatibility = replace(
+            compatibility,
+            level=CompatibilityLevel.UNSUPPORTED,
+            runnable=False,
+        )
+    issue_entries = []
+    seen_issues = set()
+    for issue in issues:
+        identity = (issue.code, issue.path)
+        if identity in seen_issues:
+            continue
+        seen_issues.add(identity)
+        issue_entries.append(
             {
                 "path": issue.path,
                 "code": issue.code,
@@ -937,16 +949,37 @@ def _cmd_validate(args: argparse.Namespace) -> int:
                 "blocking": issue.blocking,
                 "source_line": issue.source_line,
             }
-            for issue in issues
-        ],
+        )
+    for finding in compatibility.findings:
+        identity = (finding.code, finding.path)
+        if identity in seen_issues:
+            continue
+        seen_issues.add(identity)
+        issue_entries.append(
+            {
+                "path": finding.path,
+                "code": finding.code,
+                "message": finding.message,
+                "severity": finding.severity,
+                "blocking": finding.blocking,
+                "source_line": None,
+            }
+        )
+    payload = {
+        "name": package.definition.name,
+        "valid": compatibility.runnable,
+        "language": _language_payload(package),
+        "issues": issue_entries,
     }
-    if args.json and not payload["valid"]:
+    try:
+        require_runnable(compatibility)
+    except WorkflowCompatibilityBlockedError as exc:
         raise WorkflowCommandError(
             "validation_failed",
             "workflow validation found blocking issues",
             exit_code=EXIT_BLOCKING_FINDING,
             result=payload,
-        )
+        ) from exc
     if args.json:
         _emit(payload, as_json=True)
     else:
@@ -1522,13 +1555,16 @@ def _cmd_trust(args: argparse.Namespace) -> int:
             exit_code=EXIT_INVOCATION,
         )
     compatibility = assess_compatibility(package)
+    require_runnable(compatibility)
     risk = build_risk_summary(package, compatibility)
     fresh_package = load_workflow(
         package.workflow_path,
         source=package.source,
         precedence=package.precedence,
     )
-    fresh_risk = build_risk_summary(fresh_package, assess_compatibility(fresh_package))
+    fresh_compatibility = assess_compatibility(fresh_package)
+    require_runnable(fresh_compatibility)
+    fresh_risk = build_risk_summary(fresh_package, fresh_compatibility)
     after = compute_package_digest(fresh_package)
     if (
         before != after
@@ -1675,7 +1711,9 @@ def _cmd_run(
     package = _resolve(args, args.name)
     runtime = _runtime_config(args.hermes_home, sidecar=package.sidecar)
     digest = compute_package_digest(package)
-    risk = build_risk_summary(package, assess_compatibility(package))
+    compatibility = assess_compatibility(package)
+    require_runnable(compatibility)
+    risk = build_risk_summary(package, compatibility)
     if (
         WorkflowTrustStore(args.hermes_home).check(
             digest.sha256, risk_digest=risk.risk_digest
@@ -2331,6 +2369,24 @@ def workflow_command(
         else:
             print(str(exc), file=sys.stderr)
         return exc.exit_code
+    except WorkflowCompatibilityBlockedError as exc:
+        error = WorkflowCommandError(
+            exc.code,
+            str(exc),
+            exit_code=EXIT_BLOCKING_FINDING,
+        )
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    error_envelope(command, error.error),
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(str(error), file=sys.stderr)
+        return error.exit_code
     except WorkflowTrustError as exc:
         error = MachineError("trust_required", str(exc))
         if getattr(args, "json", False):

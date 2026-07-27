@@ -1558,7 +1558,7 @@ def test_post_runs_changed_authenticated_fixture_identity_conflicts_without_raw_
     assert status["input_manifest_digest"] == captured_requests[0].input_manifest_digest
 
 
-def test_post_runs_rejects_environment_incompatible_showcase_before_persistence(
+def test_post_runs_maps_shared_compatibility_refusal_to_conflict_before_persistence(
     tmp_path, monkeypatch
 ) -> None:
     home = tmp_path / "home"

@@ -35,6 +35,23 @@ class CompatibilityReport:
         return tuple(finding for finding in self.findings if finding.blocking)
 
 
+class WorkflowCompatibilityBlockedError(RuntimeError):
+    """Raised when a compatibility assessment cannot be admitted to run."""
+
+    code = "workflow_compatibility_blocked"
+
+    def __init__(self, report: CompatibilityReport) -> None:
+        self.report = report
+        super().__init__("workflow compatibility has blocking findings")
+
+
+def require_runnable(report: CompatibilityReport) -> CompatibilityReport:
+    """Return a runnable report or refuse admission with its authoritative state."""
+    if not report.runnable:
+        raise WorkflowCompatibilityBlockedError(report)
+    return report
+
+
 class _CompatibilityStateFinding(Protocol):
     level: CompatibilityLevel | str
     blocking: bool
