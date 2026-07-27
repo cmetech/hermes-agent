@@ -3232,6 +3232,36 @@ upstream_changes:
     stable coded compatibility findings, and CLI language projections while
     preserving legacy behavior and Archon fail-closed semantics.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-machine-command-outcomes
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/main.py
+  - plugins/workflow/cli.py
+  - tests/plugins/workflow/test_cli.py
+  owned_symbols:
+  - hermes_cli.main.main command-status return
+  - hermes_cli.main module SystemExit propagation
+  - workflow_command WorkflowLanguageCompatibilityError machine code projection
+  - workflow_command WorkflowValidationError primary issue code and bounded issues projection
+  - doctor text sanitized code/path/migration diagnostics
+  tests:
+  - tests/plugins/workflow/test_cli.py
+  - tests/hermes_cli/test_placeholder_usage.py
+  - tests/hermes_cli/test_plugins_cmd.py
+  expected_commit_subject: 'fix(workflow): honor machine command outcomes'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve the selected command handler's integer status at the terminal
+    entrypoint while treating None as success for legacy handlers. Keep module
+    execution as SystemExit(main()). Preserve stable workflow language and
+    validation issue codes in JSON envelopes, retain only a bounded safe issue
+    projection, and render human doctor diagnostics from existing findings with
+    sanitized code, path, and migration values only.
+  removal_condition: >-
+    Remove when upstream preserves plugin command exit statuses and provides
+    equivalent typed workflow diagnostic envelopes and safe doctor text.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-language-admission-pinning
   change_class: workflow-security
   owner: workflow-orchestration

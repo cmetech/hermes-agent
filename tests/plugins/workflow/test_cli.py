@@ -249,6 +249,110 @@ def test_archon_validate_text_reports_field_specific_compatibility_finding(
     assert "Archon timeout semantics are not enforceable in Phase 1" in output.out
 
 
+def test_module_entrypoint_propagates_blocking_doctor_exit(
+    tmp_path, workflow_writer
+):
+    """Catch a top-level dispatcher that discards a workflow handler status."""
+    workdir = tmp_path / "repo"
+    path = workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="sample",
+        nodes=[{"id": "start", "bash": "true", "timeout": 1_000}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+
+    completed, *_ = _run_packaged_schema(
+        tmp_path,
+        [
+            "workflow",
+            "--workdir",
+            str(workdir),
+            "doctor",
+            "sample",
+            "--mode",
+            "foreground",
+            "--compat-report",
+            "--json",
+        ],
+    )
+
+    assert completed.returncode == machine_contract.EXIT_BLOCKING_FINDING
+    assert json.loads(completed.stdout)["error"]["code"] == (
+        "blocking_doctor_findings"
+    )
+
+
+@pytest.mark.parametrize(
+    ("sidecar", "definition", "expected_code"),
+    [
+        (
+            "language_compatibility: unsupported-profile\n",
+            {},
+            "workflow_language_profile_unsupported",
+        ),
+        (
+            "language_compatibility: archon-2026-07\n",
+            {"future_archon_option": True},
+            "archon_unknown_top_level_field",
+        ),
+    ],
+    ids=["unsupported-profile", "unknown-archon-top-level"],
+)
+def test_json_load_failures_preserve_typed_workflow_issue_codes(
+    workflow_writer, tmp_path, capsys, sidecar, definition, expected_code
+):
+    """Catch a generic invalid_request envelope that hides load diagnostics."""
+    path = workflow_writer(
+        tmp_path / ".hermes" / "workflows",
+        name="typed-load-error",
+        **definition,
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        sidecar, encoding="utf-8"
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(tmp_path),
+        "validate",
+        path.stem,
+        "--json",
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_INVOCATION
+    envelope = _json_envelope(capsys)
+    assert envelope["error"]["code"] == expected_code
+    assert envelope["error"]["details"]["issues"][0]["code"] == expected_code
+
+
+def test_doctor_text_renders_sanitized_finding_code_path_and_migration(
+    workflow_writer, tmp_path, capsys
+):
+    """Catch doctor text that omits actionable safe finding diagnostics."""
+    path = _archon_package(
+        workflow_writer, tmp_path, field="timeout", value=1_000
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(tmp_path),
+        "--hermes-home",
+        str(tmp_path / "profile"),
+        "doctor",
+        path.stem,
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_BLOCKING_FINDING
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert "archon_timeout_semantics_unavailable" in output.out
+    assert "nodes[0].timeout" in output.out
+    assert "Remove timeout or wait for Phase 3 timeout semantics." in output.out
+    assert "SECRET_BODY" not in output.out
+    assert str(tmp_path) not in output.out
+
+
 @pytest.mark.parametrize(
     "declared_profile",
     [None, "hermes-legacy"],

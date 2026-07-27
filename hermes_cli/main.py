@@ -14578,10 +14578,10 @@ def _try_workflow_schema_readonly() -> bool:
     return True
 
 
-def main():
+def main() -> int:
     """Main entry point for hermes CLI."""
     if _try_workflow_schema_readonly():
-        return
+        return 0
 
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
@@ -14619,9 +14619,9 @@ def main():
         pass
 
     if _try_termux_fast_tui_launch():
-        return
+        return 0
     if _try_termux_fast_cli_launch():
-        return
+        return 0
 
     # Brand runtime: write the discoverable $HERMES_HOME/brand.json (for external tooling
     # like the tray) and run the capability-staging seam (no-op today — empty sets). Both
@@ -16616,7 +16616,7 @@ def main():
     # Handle --version flag
     if args.version:
         cmd_version(args)
-        return
+        return 0
 
     # --yolo: set HERMES_YOLO_MODE *before* plugin discovery.  The call to
     # _prepare_agent_startup() below triggers discover_plugins() → tool
@@ -16659,7 +16659,7 @@ def main():
             if not hasattr(args, attr):
                 setattr(args, attr, default)
         cmd_chat(args)
-        return
+        return 0
 
     # Default to chat if no command specified
     if args.command is None:
@@ -16676,14 +16676,14 @@ def main():
             if not hasattr(args, attr):
                 setattr(args, attr, default)
         cmd_chat(args)
-        return
+        return 0
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
-    else:
-        parser.print_help()
+        return int(args.func(args) or 0)
+    parser.print_help()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

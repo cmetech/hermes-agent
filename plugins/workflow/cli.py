@@ -22,7 +22,10 @@ from typing import AbstractSet, Callable, Iterable, Mapping
 import yaml
 
 from hermes_constants import get_hermes_home
-from plugins.workflow.language import language_projection
+from plugins.workflow.language import (
+    WorkflowLanguageCompatibilityError,
+    language_projection,
+)
 from plugins.workflow.compat import (
     ARCHON_TOOL_ALIASES,
     CompatibilityFinding,
@@ -1543,6 +1546,21 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             f"{payload['risk_summary']['execution_environment']}"
         )
         print(f"Remediation: {payload['remediation']}")
+        for finding in payload.get("findings", []):
+            if not isinstance(finding, Mapping):
+                continue
+            diagnostic = sanitize_projection({
+                "code": finding.get("code"),
+                "path": finding.get("path"),
+                "migration": finding.get("migration"),
+            })
+            if not isinstance(diagnostic, Mapping):
+                continue
+            print(f"- code: {diagnostic.get('code')}")
+            print(f"  path: {diagnostic.get('path')}")
+            migration = diagnostic.get("migration")
+            if migration is not None:
+                print(f"  migration: {migration}")
     return EXIT_BLOCKING_FINDING if blocking else 0
 
 
@@ -2395,7 +2413,35 @@ def workflow_command(
         else:
             print(str(exc), file=sys.stderr)
         return EXIT_AUTHORIZATION
-    except (ValueError, WorkflowValidationError) as exc:
+    except WorkflowLanguageCompatibilityError as exc:
+        error = MachineError(exc.code, str(exc))
+        if getattr(args, "json", False):
+            print(json.dumps(error_envelope(command, error), sort_keys=True, indent=2))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_INVOCATION
+    except WorkflowValidationError as exc:
+        issues = [
+            {
+                "code": issue.code,
+                "path": issue.path,
+                "severity": issue.severity,
+                "blocking": issue.blocking,
+            }
+            for issue in exc.issues[:200]
+        ]
+        primary_code = issues[0]["code"] if issues else "workflow_validation_failed"
+        error = MachineError(
+            primary_code,
+            str(exc),
+            details={"issues": issues},
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(error_envelope(command, error), sort_keys=True, indent=2))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_INVOCATION
+    except ValueError as exc:
         error = MachineError("invalid_request", str(exc))
         if getattr(args, "json", False):
             print(json.dumps(error_envelope(command, error), sort_keys=True, indent=2))
