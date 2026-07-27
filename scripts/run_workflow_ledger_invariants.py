@@ -150,7 +150,11 @@ _WINDOWS_JOB_BOOTSTRAP = (
     "import subprocess, sys\n"
     "if sys.stdin.buffer.read(1) != b'1':\n"
     "    raise SystemExit(125)\n"
-    "child = subprocess.Popen(sys.argv[1:])\n"
+    "try:\n"
+    "    child = subprocess.Popen(sys.argv[1:])\n"
+    "except OSError as exc:\n"
+    "    print(f'invariant bootstrap failed: {exc}', file=sys.stderr)\n"
+    "    raise SystemExit(125)\n"
     "raise SystemExit(child.wait())\n"
 )
 _POSIX_GROUP_BOOTSTRAP = (
@@ -604,7 +608,10 @@ def _execute_attempt(
     returncode = (
         target_returncode if target_returncode is not None else process.returncode
     )
-    if cleanup_error is not None:
+    supervisor_failed = (
+        status_read_fd is not None and target_returncode is None and not timed_out
+    )
+    if cleanup_error is not None or supervisor_failed:
         result = "infrastructure_error"
     elif timed_out:
         result = "timed_out"
@@ -790,6 +797,19 @@ def main() -> int:
             parser.error("--base-ref must resolve to a local commit")
         if base.stdout.strip() != head.stdout.strip():
             parser.error("--base-ref must resolve to the tested checkout HEAD")
+        tracked_status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if tracked_status.returncode:
+            parser.error("cannot verify tracked changes for --base-ref")
+        if tracked_status.stdout.strip():
+            parser.error(
+                "--base-ref requires a checkout with no tracked changes"
+            )
     manifest_path = args.manifest or (
         repo / "docs/upstream-customizations/workflow-orchestration.yaml"
     )

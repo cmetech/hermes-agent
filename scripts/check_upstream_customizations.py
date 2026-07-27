@@ -116,6 +116,14 @@ def _is_shallow_clone(repo: Path) -> bool:
     return proc.stdout.strip() == "true"
 
 
+def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    return subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=repo,
+        capture_output=True,
+    ).returncode == 0
+
+
 def _contained(repo: Path, raw: str) -> Path:
     path = (repo / raw).resolve()
     try:
@@ -150,13 +158,15 @@ def load_and_validate_manifest(
     entries = data.get("upstream_changes")
     if not isinstance(entries, list) or not entries:
         raise ValueError("manifest upstream_changes must be a non-empty list")
-    head_revision = _resolve_commit(repo, source_revision, "source revision")
-    head_sources: dict[str, str] = {}
+    resolved_source_revision = _resolve_commit(repo, source_revision, "source revision")
+    source_revision_files: dict[str, str] = {}
 
-    def head_source(path: str) -> str:
-        if path not in head_sources:
-            head_sources[path] = _blob_text(repo, head_revision, path)
-        return head_sources[path]
+    def revision_source(path: str) -> str:
+        if path not in source_revision_files:
+            source_revision_files[path] = _blob_text(
+                repo, resolved_source_revision, path
+            )
+        return source_revision_files[path]
 
     coverage = data.get("coverage")
     if coverage is not None:
@@ -182,7 +192,16 @@ def load_and_validate_manifest(
                 raise ValueError(f"excluded commit {sha} must have a non-empty reason")
             excluded_shas.add(sha)
         if check_git and not shallow:
-            _validate_coverage_commits(coverage, repo, "HEAD")
+            coverage_base = _resolve_commit(
+                repo, coverage["base_commit"], "coverage base"
+            )
+            if not _is_ancestor(repo, coverage_base, resolved_source_revision):
+                raise ValueError(
+                    "coverage base is not an ancestor of source revision"
+                )
+            _validate_coverage_commits(
+                coverage, repo, resolved_source_revision
+            )
     ids: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict):
@@ -225,7 +244,12 @@ def load_and_validate_manifest(
                         f"repository-relative POSIX: {raw}"
                     )
                 path = _contained(repo, raw)
-                if not path.is_file():
+                if strict:
+                    if not _existed_at(repo, resolved_source_revision, raw):
+                        raise ValueError(
+                            f"ledger path {raw} does not exist at source revision"
+                        )
+                elif not path.is_file():
                     raise ValueError(f"ledger path does not exist: {raw}")
         symbols = entry.get("owned_symbols")
         if not isinstance(symbols, list) or not symbols or not all(
@@ -266,7 +290,7 @@ def load_and_validate_manifest(
         for symbol in strict_symbols:
             if not any(
                 _source_contains_symbol(
-                    head_source(raw),
+                    revision_source(raw),
                     symbol,
                     path=raw,
                 )
@@ -274,7 +298,7 @@ def load_and_validate_manifest(
             ):
                 raise ValueError(
                     f"{entry_id} owned symbol {symbol!r} does not exist in "
-                    "declared files at HEAD"
+                    "declared files at source revision"
                 )
         for field in ("expected_commit_subject", "merge_guidance", "removal_condition"):
             if not isinstance(entry.get(field), str) or not entry[field].strip():
@@ -287,11 +311,10 @@ def load_and_validate_manifest(
                 )
                 if proc.returncode:
                     raise ValueError(f"{entry_id} baseline is not a local commit")
-            proc = subprocess.run(
-                ["git", "merge-base", "--is-ancestor", baseline, "HEAD"], cwd=repo
-            )
-            if proc.returncode:
-                raise ValueError(f"{entry_id} baseline is not an ancestor of HEAD")
+            if not _is_ancestor(repo, baseline, resolved_source_revision):
+                raise ValueError(
+                    f"{entry_id} baseline is not an ancestor of source revision"
+                )
     return data
 
 
@@ -691,6 +714,22 @@ def _shell_without_comments(source: str) -> str:
 def _typescript_without_comments(source: str) -> str:
     """Remove JS/TS comments, including comments inside template expressions."""
     result = list(source)
+    regex_prefix_keywords = frozenset(
+        {
+            "await",
+            "case",
+            "delete",
+            "in",
+            "instanceof",
+            "new",
+            "of",
+            "return",
+            "throw",
+            "typeof",
+            "void",
+            "yield",
+        }
+    )
     # Stack entries are mode, template-expression brace depth, regex eligibility.
     stack: list[tuple[str, int, bool]] = [("code", 0, True)]
     index = 0
@@ -782,7 +821,8 @@ def _typescript_without_comments(source: str) -> str:
                 source[cursor].isalnum() or source[cursor] in "_$"
             ):
                 cursor += 1
-            stack[-1] = (mode, depth, False)
+            token = source[index:cursor]
+            stack[-1] = (mode, depth, token in regex_prefix_keywords)
             index = cursor
         else:
             stack[-1] = (
@@ -820,6 +860,25 @@ def _css_without_comments(source: str) -> str:
     return "".join(result)
 
 
+def _markdown_container_content(line: str) -> str:
+    """Return a line relative to its bounded CommonMark container prefix."""
+    cursor = 0
+    while cursor < len(line):
+        remainder = line[cursor:]
+        blockquote = re.match(r" {0,3}>[ \t]?", remainder)
+        if blockquote:
+            cursor += blockquote.end()
+            continue
+        list_item = re.match(
+            r" {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$)", remainder
+        )
+        if list_item:
+            cursor += list_item.end()
+            continue
+        break
+    return line[cursor:]
+
+
 def _markdown_without_comments(source: str) -> str:
     result = list(source)
     fence: tuple[str, int] | None = None
@@ -828,14 +887,18 @@ def _markdown_without_comments(source: str) -> str:
     offset = 0
     for line in source.splitlines(keepends=True):
         body = line.rstrip("\r\n")
+        container_content = _markdown_container_content(body)
         fence_match = (
             None
             if html_comment_end > offset
-            else re.match(r" {0,3}(`{3,}|~{3,})(.*)$", body)
+            else re.match(r" {0,3}(`{3,}|~{3,})(.*)$", container_content)
         )
         if fence is not None:
             marker, width = fence
-            if re.fullmatch(rf" {{0,3}}{re.escape(marker)}{{{width},}}[ \t]*", body):
+            if re.fullmatch(
+                rf" {{0,3}}{re.escape(marker)}{{{width},}}[ \t]*",
+                container_content,
+            ):
                 fence = None
             offset += len(line)
             continue
@@ -1015,6 +1078,44 @@ def _toml_string_tokens(source: str) -> list[tuple[str, int, int]]:
     return tokens
 
 
+def _toml_bare_key_tokens(source: str) -> list[tuple[str, int, int]]:
+    """Locate TOML bare keys without making scalar values searchable."""
+    searchable = list(_toml_without_comments(source))
+    index = 0
+    while index < len(source):
+        if searchable[index] not in "'\"":
+            index += 1
+            continue
+        end = _toml_string_end(source, index)
+        _blank(searchable, source, index, end)
+        index = end
+
+    tokens: list[tuple[str, int, int]] = []
+    offset = 0
+    key_expression = r"[A-Za-z0-9_-]+(?:[ \t]*\.[ \t]*[A-Za-z0-9_-]+)*"
+    for line in "".join(searchable).splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        regions: list[tuple[int, int]] = []
+        table = re.match(
+            rf"^[ \t]*\[\[?[ \t]*({key_expression})[ \t]*\]\]?[ \t]*$",
+            body,
+        )
+        if table:
+            regions.append(table.span(1))
+        for assignment in re.finditer(
+            rf"(?:^|[{{,]])[ \t]*({key_expression})[ \t]*=",
+            body,
+        ):
+            regions.append(assignment.span(1))
+        for start, end in regions:
+            for token in re.finditer(r"[A-Za-z0-9_-]+", body[start:end]):
+                absolute = offset + start + token.start()
+                line_number = source.count("\n", 0, absolute) + 1
+                tokens.append((token.group(), line_number, line_number))
+        offset += len(line)
+    return tokens
+
+
 def _exact_pattern(symbol: str) -> re.Pattern[str]:
     return re.compile(rf"(?<![A-Za-z0-9_$]){re.escape(symbol)}(?![A-Za-z0-9_$])")
 
@@ -1066,14 +1167,15 @@ def _structured_spans(
             parsed = tomllib.loads(source)
         except tomllib.TOMLDecodeError as exc:
             raise _parse_error(path, "TOML", exc) from exc
-        searchable = _toml_without_comments(source)
-        decoded_tokens = _toml_string_tokens(source)
+        decoded_tokens = [
+            *_toml_string_tokens(source),
+            *_toml_bare_key_tokens(source),
+        ]
     else:
         try:
             parsed = json.loads(source)
         except json.JSONDecodeError as exc:
             raise _parse_error(path, "JSON", exc) from exc
-        searchable = source
         decoded_tokens = _json_string_tokens(source)
     semantic = _semantic_strings(parsed)
     for symbol in symbols:
@@ -1083,10 +1185,6 @@ def _structured_spans(
         for value, start_line, end_line in decoded_tokens:
             if pattern.search(value):
                 spans[symbol].append((start_line, end_line))
-        for match in pattern.finditer(searchable):
-            line = searchable.count("\n", 0, match.start()) + 1
-            if (line, line) not in spans[symbol]:
-                spans[symbol].append((line, line))
     return spans
 
 

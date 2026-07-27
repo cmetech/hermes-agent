@@ -156,7 +156,8 @@ set +e
   --repo "$BASE_WT" \
   --manifest "$BASE_WT/docs/upstream-customizations/workflow-orchestration.yaml" \
   --output "$LEDGER_RESULTS" \
-  --platform "$PLATFORM" >"$REPORT_DIR/ledger-invariants.log" 2>&1
+  --platform "$PLATFORM" \
+  --base-ref "$TESTED_BASE_SHA" >"$REPORT_DIR/ledger-invariants.log" 2>&1
 LEDGER_STATUS=$?
 set -e
 if [[ $LEDGER_STATUS -ne 0 ]]; then

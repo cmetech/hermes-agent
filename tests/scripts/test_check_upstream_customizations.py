@@ -583,6 +583,34 @@ def test_typescript_regex_brace_does_not_expose_template_expression_comment(
 @pytest.mark.parametrize(
     "source",
     [
+        (
+            "const value = `${(() => { return /}}/.test('}}') "
+            "/* ExactToken */ })()}`\n"
+        ),
+        (
+            "const value = `${(function* () { yield /}}/.test('}}') "
+            "/* ExactToken */ })().next()}`\n"
+        ),
+        (
+            "const value = `${(() => { throw /}}/.test('}}') "
+            "/* ExactToken */ })()}`\n"
+        ),
+    ],
+)
+def test_typescript_keyword_regex_braces_stay_inside_template_expression(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    """Treating a keyword-following slash as division exposes comment text."""
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
         "const value = `prefix ExactToken`\n",
         "const value = `prefix ${ExactToken}`\n",
     ],
@@ -604,6 +632,59 @@ def test_markdown_tilde_fence_preserves_html_comment_literal(tmp_path: Path) -> 
     )
 
     load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "- ~~~html\n  <!-- ExactToken -->\n  ~~~\n",
+        "> ~~~html\n> <!-- ExactToken -->\n> ~~~\n",
+        "> - ~~~~html\n>   <!-- ExactToken -->\n>   ~~~~\n",
+    ],
+)
+def test_markdown_commonmark_container_fences_preserve_comment_literals(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".md", source)
+
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_markdown_container_fence_closes_only_at_sufficient_width(
+    tmp_path: Path,
+) -> None:
+    repo, source, manifest = _non_python_manifest(
+        tmp_path,
+        ".md",
+        (
+            "> ~~~~html\n"
+            "> <!-- ExactToken -->\n"
+            "> ~~~\n"
+            "> <!-- still fenced -->\n"
+            ">   ~~~~\n"
+            "<!-- ExactToken before -->\n"
+        ),
+    )
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    source.write_text(
+        (
+            "> ~~~~html\n"
+            "> <!-- ExactToken -->\n"
+            "> ~~~\n"
+            "> <!-- still fenced -->\n"
+            ">   ~~~~\n"
+            "<!-- ExactToken after -->\n"
+        )
+    )
+    _git(repo, "commit", "-am", "change ordinary comment after nested fence")
+
+    report = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
+
+    assert report["classification"] == "same_file"
 
 
 def test_toml_multiline_string_preserves_hash_token_but_comment_does_not(
@@ -637,6 +718,134 @@ def test_structured_escaped_string_value_has_owned_span(
     repo, _source, manifest = _non_python_manifest(tmp_path, suffix, source)
 
     load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "before", "after"),
+    [
+        (
+            ".json",
+            '{"Exact\\u0054oken": "stable", "other": 1}\n',
+            '{"Other": "stable", "other": 1}\n',
+        ),
+        (
+            ".toml",
+            '"Exact\\u0054oken" = "stable"\nother = 1\n',
+            '"Other" = "stable"\nother = 1\n',
+        ),
+    ],
+)
+def test_structured_escaped_key_has_positioned_owned_span(
+    tmp_path: Path,
+    suffix: str,
+    before: str,
+    after: str,
+) -> None:
+    repo, source, manifest = _non_python_manifest(tmp_path, suffix, before)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    source.write_text(after)
+    _git(repo, "commit", "-am", "change escaped structured key")
+
+    report = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
+
+    assert report["classification"] == "owned_symbol"
+
+
+@pytest.mark.parametrize(
+    ("suffix", "before", "after"),
+    [
+        (
+            ".json",
+            '{\n  "first": "Exact\\u0054oken",\n  "second": "ExactToken"\n}\n',
+            '{\n  "first": "Exact\\u0054oken",\n  "second": "Other"\n}\n',
+        ),
+        (
+            ".toml",
+            'first = "Exact\\u0054oken"\nsecond = "ExactToken"\n',
+            'first = "Exact\\u0054oken"\nsecond = "Other"\n',
+        ),
+    ],
+)
+def test_duplicate_decoded_structured_strings_each_retain_their_span(
+    tmp_path: Path,
+    suffix: str,
+    before: str,
+    after: str,
+) -> None:
+    repo, source, manifest = _non_python_manifest(tmp_path, suffix, before)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    source.write_text(after)
+    _git(repo, "commit", "-am", "change second decoded string")
+
+    report = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
+
+    assert report["classification"] == "owned_symbol"
+
+
+@pytest.mark.parametrize(
+    ("suffix", "before", "after", "symbol"),
+    [
+        (
+            ".json",
+            '{\n  "string": "123",\n  "number": 123\n}\n',
+            '{\n  "string": "123",\n  "number": 456\n}\n',
+            "123",
+        ),
+        (
+            ".toml",
+            'string = "true"\nboolean = true\n',
+            'string = "true"\nboolean = false\n',
+            "true",
+        ),
+    ],
+)
+def test_structured_non_string_scalar_does_not_inherit_string_span(
+    tmp_path: Path,
+    suffix: str,
+    before: str,
+    after: str,
+    symbol: str,
+) -> None:
+    repo, source, manifest = _non_python_manifest(tmp_path, suffix, before)
+    data = yaml.safe_load(manifest.read_text())
+    data["upstream_changes"][0]["owned_symbols"] = [symbol]
+    manifest.write_text(yaml.safe_dump(data, sort_keys=False))
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    source.write_text(after)
+    _git(repo, "commit", "-am", "change only non-string structured scalar")
+
+    report = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
+
+    assert report["classification"] == "same_file"
+
+
+def test_toml_multiline_string_span_covers_each_owned_scalar_line(
+    tmp_path: Path,
+) -> None:
+    repo, source, manifest = _non_python_manifest(
+        tmp_path,
+        ".toml",
+        'value = """ExactToken\nbefore\n"""\nother = true\n',
+    )
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    source.write_text('value = """ExactToken\nafter\n"""\nother = true\n')
+    _git(repo, "commit", "-am", "change multiline TOML scalar body")
+
+    report = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
+
+    assert report["classification"] == "owned_symbol"
 
 
 def test_toml_multiline_closing_quote_run_stops_span_before_following_comment(
@@ -939,3 +1148,76 @@ def test_strict_cli_validates_owned_symbols_at_requested_base_ref(
         ["--manifest", str(manifest), "--strict", "--base-ref", "HEAD"]
     ) == 1
     assert "does not exist in declared files" in capsys.readouterr().err
+
+
+def test_strict_requested_revision_uses_its_committed_path_inventory(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    requested = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, requested)
+    (repo / "core.py").unlink()
+    _git(repo, "commit", "-am", "delete owned file after requested revision")
+
+    load_and_validate_manifest(
+        manifest,
+        repo,
+        source_revision=requested,
+        strict=True,
+    )
+
+    future = repo / "future.py"
+    future.write_text("class FutureOwned:\n    pass\n")
+    _git(repo, "add", "future.py")
+    _git(repo, "commit", "-m", "add future owned file")
+    data = yaml.safe_load(manifest.read_text())
+    data["upstream_changes"][0]["files"] = ["future.py"]
+    data["upstream_changes"][0]["owned_symbols"] = ["FutureOwned"]
+    manifest.write_text(yaml.safe_dump(data, sort_keys=False))
+
+    with pytest.raises(ValueError, match="future.py.*source revision"):
+        load_and_validate_manifest(
+            manifest,
+            repo,
+            source_revision=requested,
+            strict=True,
+        )
+
+
+def test_strict_requested_revision_rejects_newer_verified_baseline(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    requested = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "commit", "--allow-empty", "-m", "newer verification point")
+    newer = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, newer)
+
+    with pytest.raises(ValueError, match="baseline is not an ancestor of source revision"):
+        load_and_validate_manifest(
+            manifest,
+            repo,
+            source_revision=requested,
+            strict=True,
+        )
+
+
+def test_strict_requested_revision_rejects_newer_coverage_base(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    requested = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "commit", "--allow-empty", "-m", "future coverage point")
+    newer = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, requested)
+    data = yaml.safe_load(manifest.read_text())
+    data["coverage"] = {"base_commit": newer, "excluded_commits": []}
+    manifest.write_text(yaml.safe_dump(data, sort_keys=False))
+
+    with pytest.raises(ValueError, match="coverage base is not an ancestor of source revision"):
+        load_and_validate_manifest(
+            manifest,
+            repo,
+            source_revision=requested,
+            strict=True,
+        )

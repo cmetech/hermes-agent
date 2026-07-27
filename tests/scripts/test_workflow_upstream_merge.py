@@ -279,6 +279,51 @@ def test_rehearsal_discovers_repository_virtualenv(tmp_path: Path) -> None:
     assert (report / "merge-evidence.json").is_file()
 
 
+def test_rehearsal_seals_ledger_execution_to_tested_base_sha(tmp_path: Path) -> None:
+    """Dropping --base-ref must make the executable rehearsal fixture refuse."""
+    repo = _synthetic_rehearsal_repo(tmp_path, "none")
+    runner = repo / "scripts/run_workflow_ledger_invariants.py"
+    runner.write_text(
+        "import argparse, hashlib, json, subprocess\n"
+        "from pathlib import Path\n\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--repo', type=Path, required=True)\n"
+        "parser.add_argument('--manifest', type=Path, required=True)\n"
+        "parser.add_argument('--output', type=Path, required=True)\n"
+        "parser.add_argument('--platform', required=True)\n"
+        "parser.add_argument('--base-ref', required=True)\n"
+        "args = parser.parse_args()\n"
+        "resolved = subprocess.check_output(\n"
+        "    ['git', 'rev-parse', '--verify', f'{args.base_ref}^{{commit}}'],\n"
+        "    cwd=args.repo, text=True,\n"
+        ").strip()\n"
+        "head = subprocess.check_output(\n"
+        "    ['git', 'rev-parse', '--verify', 'HEAD^{commit}'],\n"
+        "    cwd=args.repo, text=True,\n"
+        ").strip()\n"
+        "if resolved != head:\n"
+        "    raise SystemExit(23)\n"
+        "path = 'tests/test_invariant.py'\n"
+        "digest = hashlib.sha256(path.encode()).hexdigest()\n"
+        "args.output.write_text(json.dumps([{\n"
+        "    'kind': 'executed', 'name': f'ledger invariant {digest}',\n"
+        "    'path': path, 'result': 'passed', 'duration_ms': 0,\n"
+        "    'platform': args.platform,\n"
+        "    'attempts': [{'attempt': 1, 'result': 'passed',\n"
+        "                  'duration_ms': 0, 'output_truncated': False}],\n"
+        "    'flaky_on_first_attempt': False,\n"
+        "}]) + '\\n')\n"
+    )
+    _git(repo, "add", str(runner.relative_to(repo)))
+    _git(repo, "commit", "-m", "require tested revision sealing")
+    report = tmp_path / "report-sealed-ledger-runner"
+
+    result = _run_synthetic(repo, report)
+
+    assert result.returncode == 0, result.stderr
+    assert (report / "merge-evidence.json").is_file()
+
+
 def test_rehearsal_reference_only_invariants_cannot_claim_execution(
     tmp_path: Path,
 ) -> None:
@@ -732,6 +777,84 @@ def test_ledger_runner_accepts_report_path_and_exact_base_ref(tmp_path: Path) ->
     assert json.loads(report.read_text())[0]["result"] == "passed"
 
 
+@pytest.mark.parametrize("staged", [False, True], ids=["unstaged", "staged"])
+@pytest.mark.parametrize(
+    ("committed_assertion", "dirty_assertion"),
+    [("False", "True"), ("True", "False")],
+    ids=["committed-fail-dirty-pass", "committed-pass-dirty-fail"],
+)
+def test_ledger_runner_refuses_dirty_tracked_executable_at_sealed_base(
+    tmp_path: Path,
+    staged: bool,
+    committed_assertion: str,
+    dirty_assertion: str,
+) -> None:
+    repo = tmp_path / "runner-dirty-repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    test_path = repo / "tests/test_sealed.py"
+    test_path.parent.mkdir()
+    committed_source = (
+        "def test_committed_contract():\n"
+        f"    assert {committed_assertion}\n"
+    )
+    dirty_source = (
+        "def test_committed_contract():\n"
+        f"    assert {dirty_assertion}\n"
+    )
+    test_path.write_text(committed_source)
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"upstream_changes": [{"tests": ["tests/test_sealed.py"]}]},
+            sort_keys=False,
+        )
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "committed invariant")
+    test_path.write_text(dirty_source)
+    if staged:
+        _git(repo, "add", str(test_path.relative_to(repo)))
+    status_before = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=repo,
+        text=True,
+    )
+    report = repo / "report.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--report-path",
+            str(report),
+            "--platform",
+            "synthetic",
+            "--base-ref",
+            "HEAD",
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 2
+    assert "tracked changes" in result.stderr
+    assert not report.exists()
+    assert test_path.read_text() == dirty_source
+    assert subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=repo,
+        text=True,
+    ) == status_before
+
+
 def _run_ledger_fixture(
     tmp_path: Path,
     sources: dict[str, str],
@@ -891,6 +1014,73 @@ def test_ledger_runner_does_not_retry_pytest_infrastructure_error(
     assert [item["result"] for item in records[0]["attempts"]] == [
         "infrastructure_error"
     ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX supervisor bootstrap policy")
+def test_posix_supervisor_spawn_failure_is_terminal_infrastructure(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "missing-executable-repo"
+    desktop = repo / "apps/desktop"
+    desktop.mkdir(parents=True)
+    test_path = desktop / "missing.test.ts"
+    test_path.write_text("throw new Error('must never execute')\n")
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"upstream_changes": [{"tests": ["apps/desktop/missing.test.ts"]}]},
+            sort_keys=False,
+        )
+    )
+    report = repo / "report.json"
+    empty_path = repo / "empty-path"
+    empty_path.mkdir()
+    env = os.environ.copy()
+    env["PATH"] = str(empty_path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--output",
+            str(report),
+            "--platform",
+            "synthetic",
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    attempts = json.loads(report.read_text())[0]["attempts"]
+    assert [attempt["result"] for attempt in attempts] == ["infrastructure_error"]
+
+
+def test_windows_job_bootstrap_reserves_spawn_failure_as_infrastructure(
+    tmp_path: Path,
+) -> None:
+    """The real bootstrap must not encode a setup failure as retryable exit 1."""
+    missing = tmp_path / "definitely-missing-executable"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            ledger_runner._WINDOWS_JOB_BOOTSTRAP,
+            str(missing),
+        ],
+        text=True,
+        capture_output=True,
+        input="1",
+    )
+
+    assert completed.returncode == 125
 
 
 def test_ledger_runner_never_exceeds_two_concurrent_python_files(tmp_path: Path) -> None:
