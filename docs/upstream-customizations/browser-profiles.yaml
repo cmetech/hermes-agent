@@ -95,20 +95,50 @@ upstream_changes:
   - tools/browser_tool.py
   - tools/browser_profiles.py
   - tools/browser_session_registry.py
+  - tools/browser_session_manager.py
   - tests/tools/test_browser_enrolled_launch.py
   - tests/tools/test_browser_profiles.py
+  - tests/tools/test_browser_enrolled_routing.py
   owned_symbols:
+  - _ENROLLED_SUFFIX
+  - _is_enrolled_session_key
   - _session_cdp_url
   - _session_browser_profile
   - _session_uses_enrolled_browser
   - _default_profile_launchable
+  - _session_cdp_lock
+  - _session_cdp_urls
+  - _session_cdp_keylocks
+  - _session_handles
+  - _session_cdp_keylock
+  - _release_session_handle
   - _forget_session_cdp_url
   - _reset_session_cdp_cache
+  - _evict_dead_enrolled_session
+  - _navigation_session_key
+  - _get_session_info
+  - _run_browser_command
+  - _cleanup_single_browser_session
+  - cleanup_browser
+  - _bare_task_id_for_session_key
+  - check_browser_requirements
+  - _eval_ssrf_guard_active
+  - default_profile_trusts_url
   - default_profile_launchable
+  - session_trusts_url
   - _enrolled_candidates
+  - _is_runnable
+  - resolve_executable
+  - load_profiles
+  - acquire
+  - _cdp_browser_identity
+  - _ensure_enrolled_cdp
   tests:
   - tests/tools/test_browser_enrolled_launch.py
+  - tests/tools/test_browser_enrolled_routing.py
   - tests/tools/test_browser_profiles.py
+  - tests/tools/test_browser_default_profile.py
+  - tests/tools/test_browser_session_manager.py
   - tests/tools/test_browser_hybrid_routing.py
   - tests/tools/test_browser_cdp_override.py
   - tests/tools/test_browser_chromium_check.py
@@ -125,39 +155,100 @@ upstream_changes:
     exactly that state, and it presents as an mTLS or connectivity failure on
     internal sites rather than as a missing feature.
 
-    Three pieces, and the ORDER between them is a correctness constraint, not a
-    preference.
+    This entry was rewritten (2026-07-26, EBL-007) after an adversarial review
+    found that the ORIGINAL launch wiring made the CDP endpoint a PROCESS-GLOBAL
+    side effect: acquire() exported it to os.environ via _attach_cdp, and every
+    unswapped call site read it back through _get_cdp_override(). That is a
+    defect, not a feature -- it means a single enrolled acquire() anywhere in
+    the process makes EVERY subsequent ephemeral, untrusted-origin task inherit
+    the corporate browser and its live SSO/mTLS session, defeating the whole
+    point of the trust seam. Do not restore it. The fix makes routing and the
+    CDP endpoint both PER-SESSION-KEY:
 
-    (1) _enrolled_candidates() in browser_profiles.py lists Chrome BEFORE Edge on
-    all three platforms and includes real Windows Chrome paths (Program Files,
-    Program Files (x86), and LOCALAPPDATA for per-user installs). What must never
-    be relaxed is the exclusion of agent-browser's bundled Chrome for Testing:
-    it is a different binary, not merely a different profile, and it is the one
-    browser that cannot present machine certificates. Adding it would silently
-    reinstate the original bug. The order itself is a fleet observation (Chrome
-    is policy-managed on the target fleet, confirmed 2026-07-26), so flipping it
-    back is a config decision, not a regression -- the exclusion is not.
+    (a) _navigation_session_key(task_id, url) now routes an origin that
+    browser.default_profile explicitly trusts to f"{task_id}::enrolled"
+    (_ENROLLED_SUFFIX), via browser_session_registry.default_profile_trusts_url.
+    This check is ordered AFTER the CDP-override and Camofox early returns
+    (those backends own the whole session) and BEFORE the cloud/hybrid-local
+    split, so an explicitly trusted origin outranks a local sidecar. Every
+    other URL -- public pages, untrusted private addresses -- stays on the bare
+    task key and the throwaway browser. _is_enrolled_session_key is the pure
+    suffix predicate (mirrors _is_local_sidecar_key) that every guard site below
+    consults; it must stay pure (no config read, no launch) because guards call
+    it on every action. _bare_task_id_for_session_key strips EITHER suffix
+    (::local or ::enrolled) back to the owning task id.
 
-    (2) _session_cdp_url(session_key) in browser_tool.py is the wiring, and
-    mirrors how _session_trusts_url was introduced: one delegating helper plus a
-    call-site swap. It resolves the session's profile (explicit bind, else
-    browser.default_profile) and, when enrolled, returns
-    acquire(profile, session_key=...).cdp_url; otherwise it returns
-    _get_cdp_override() unchanged, so BROWSER_CDP_URL / browser.cdp_url
-    precedence and /browser connect are untouched. The single launch call site is
-    _get_session_info, guarded by `"" if force_local else ...` so hybrid-routing
-    sidecars keep their deliberately local Chromium -- matching the previous code,
-    where the value was ignored whenever force_local was set.
+    (b) _session_browser_profile(session_key) resolves the profile an explicit
+    bind() always wins; browser.default_profile applies ONLY when the key is
+    ::enrolled-suffixed. A bare key is therefore never enrolled, even if
+    default_profile is set -- routing is what creates enrolled keys, so the
+    ephemeral session has no path to inherit corporate trust. This is the
+    guard's own defense in depth, independent of (a).
 
-    Two properties inside it are load-bearing and neither is enforced by types.
-    MEMOIZATION per session_key is not an optimization: acquire() runs
-    _run_daemon_hygiene(), which executes `close --all`, so calling it per tool
-    invocation tears the browser down between navigate and click. A FAILED
+    (c) THE SIX GUARD-FORCING SITES are the single highest silent-revert risk
+    in this whole change. Upstream's SSRF guard is `not _is_local_backend()`,
+    which is False (guard OFF) whenever ANY CDP override is active -- including
+    the enrolled browser's own CDP endpoint, which upstream has no reason to
+    treat specially. Every guard site is therefore changed from
+    `not _is_local_backend()` to
+    `(not _is_local_backend() or _is_enrolled_session_key(<key>))` so the guard
+    is FORCED ON for an enrolled key regardless of CDP state. The six sites (all
+    in tools/browser_tool.py): the sensitive-query-param check and both the
+    pre-navigation and post-redirect private-URL checks in browser_navigate,
+    the pre-return check in browser_snapshot, the pre-capture check in
+    browser_vision, and _eval_ssrf_guard_active (which several other guard call
+    sites, e.g. eval and page-action checks, delegate to). Dropping the
+    `or _is_enrolled_session_key(...)` disjunct from even ONE of the six
+    silently loses origin-scoping for that one surface, with NO build error and
+    NO failing test other than TestGuardForcedOnForEnrolled (in
+    tests/tools/test_browser_enrolled_routing.py), which pins all six. If a
+    merge touches any of these six conditionals, re-verify against that test
+    class by name, not just by running the suite green.
+
+    (d) _session_cdp_url(session_key) in browser_tool.py resolves the PER-KEY
+    endpoint: it resolves the session's profile via _session_browser_profile
+    and, when enrolled, returns
+    acquire(profile, session_key=key, attach_global=False).cdp_url; otherwise
+    it returns _get_cdp_override() unchanged, so BROWSER_CDP_URL /
+    browser.cdp_url precedence and /browser connect are untouched for every
+    non-enrolled session. attach_global=False is what closes the EBL-001 hole:
+    the agent is the ONLY caller that passes it, so the endpoint is returned to
+    the caller and cached in the module-level _session_cdp_urls dict keyed by
+    session_key -- never written to os.environ from this path. Scripted
+    callers of acquire() keep the attach_global=True default, so /browser
+    connect and other direct callers are unaffected. The single launch call
+    site is _get_session_info, guarded by `"" if force_local else ...` so
+    hybrid-routing sidecars keep their deliberately local Chromium.
+
+    Concurrency and lifecycle around this cache are load-bearing and none of
+    it is enforced by types. _session_cdp_lock guards the _session_cdp_urls /
+    _session_cdp_keylocks / _session_handles dicts; _session_cdp_keylock(key)
+    hands out a per-key threading.Lock so acquire() single-flights per session
+    -- acquire() runs _run_daemon_hygiene() (`close --all`), so two concurrent
+    acquires for the SAME key would tear down the winner's session, and the
+    per-key lock (re-checked after acquiring it, since a competing thread may
+    have published while this one waited) is what prevents that. A FAILED
     acquire must NOT be cached (a transient launch failure has to be able to
     recover) and must propagate: acquire() raises ProfileError rather than
-    falling back to the unmanaged bundled browser, and preserving that is the
-    entire point -- a silent fallback fails corporate mTLS and reads as a broken
-    connection instead of a misconfigured profile.
+    falling back to the unmanaged bundled browser -- a silent fallback fails
+    corporate mTLS and reads as a broken connection instead of a misconfigured
+    profile. _session_handles retains the live BrowserSession per key so
+    cleanup can release() it exactly once; _release_session_handle is
+    idempotent and unbinds the registry, so a released key stops being
+    enrolled-trusted even if browser.default_profile is still set.
+    cleanup_browser, when called with a bare task_id, now reaps the
+    ::enrolled sidecar alongside the existing ::local one -- before this fix
+    the primary end-of-task cleanup path never released or forgot an enrolled
+    session's handle/CDP memo at all. _forget_session_cdp_url and
+    _reset_session_cdp_cache (test helper) drop the memo; a dead browser is
+    additionally handled by _evict_dead_enrolled_session, triggered from
+    _run_browser_command when a failed enrolled-session command's error text
+    matches _DEAD_CDP_MARKERS, so the NEXT call relaunches rather than being
+    driven at a stale endpoint forever (it deliberately does not retry the
+    failed command itself, since that command may not be idempotent). The
+    Lightpanda-fallback branch in _run_browser_command is gated off
+    session_info.get("cdp_url") so a CDP-attached (including enrolled) session
+    is never misdiagnosed as a Lightpanda failure needing a Chrome retry.
 
     The Chromium fast-fail gate in _run_browser_command consults the PURE
     predicate _session_uses_enrolled_browser, never _session_cdp_url. That
@@ -166,21 +257,54 @@ upstream_changes:
     close one.
 
     Unswapped call sites (_is_local_mode, _is_local_backend,
-    _ensure_cdp_supervisor) stay correct because acquire() exports
-    BROWSER_CDP_URL via _attach_cdp, so _get_cdp_override() already returns the
-    enrolled endpoint by the time they run. That side effect is part of acquire's
-    contract; if upstream churn makes it unreliable, swap those sites rather than
-    duplicating the resolution.
+    _ensure_cdp_supervisor) are UNCHANGED by this rewrite and stay on the
+    process-global _get_cdp_override() path deliberately -- they answer
+    "is a CDP override active at all", not "which session should this be",
+    and they are not routed through _session_cdp_url. They no longer benefit
+    from acquire()'s old BROWSER_CDP_URL side effect (attach_global=False for
+    the agent's per-session path means it usually is not set), which is
+    correct: those call sites govern local-Chromium-availability decisions
+    that must not silently start treating an enrolled session as the whole
+    process's backend again.
 
-    (3) check_browser_requirements() gains an early return for a launchable
-    enrolled default profile, beside the existing _get_cdp_override() one. This
-    must land only AFTER (2). On its own it advertises browser tools that then
-    launch agent-browser with no Chromium and hang until the command timeout --
-    the failure the comment above that Chromium check already warns about. It is
-    scoped to "would actually work" (toggle on AND executable resolves), mirroring
-    the Termux branch's rule against advertising a tool that fails on first use;
-    the underlying predicate lives in browser_session_registry so the footprint in
-    the churned file stays a thin fail-closed delegator.
+    (e) _enrolled_candidates() in browser_profiles.py lists Chrome BEFORE Edge on
+    all three platforms and includes real Windows Chrome paths (Program Files,
+    Program Files (x86), and LOCALAPPDATA for per-user installs). What must never
+    be relaxed is the exclusion of agent-browser's bundled Chrome for Testing:
+    it is a different binary, not merely a different profile, and it is the one
+    browser that cannot present machine certificates. Adding it would silently
+    reinstate the original bug. The order itself is a fleet observation (Chrome
+    is policy-managed on the target fleet, confirmed 2026-07-26), so flipping it
+    back is a config decision, not a regression -- the exclusion is not.
+    resolve_executable/_is_runnable require a REGULAR, executable file
+    (os.path.isfile + os.access(X_OK) on POSIX; Windows has no execute bit, so
+    the check there is isfile-only) -- os.path.exists alone would accept a
+    directory or a non-executable file and fail at first launch instead of at
+    the availability check. load_profiles() rejects a second enrolled profile
+    that reuses an already-claimed cdp_port (fail-open: first claim wins, a
+    warning is logged, the loser is dropped from the profile map) -- two
+    profiles sharing one port would let one profile's trust apply to whatever
+    browser actually answers on it. _cdp_browser_identity (in
+    browser_session_manager.py) closes that same hole at connect time: before
+    reusing a listener on the profile's port, it reads /json/version and
+    requires a non-empty "Browser" string, failing CLOSED (launch our own
+    browser) on any connection error, timeout, non-JSON body, or missing key --
+    so an unrelated process squatting on the port is never mistaken for the
+    enrolled browser. _cdp_alive (unchanged) is liveness-only and still serves
+    the POST-launch readiness poll, where identity is already established.
+
+    (f) check_browser_requirements() gains an early return for a launchable
+    enrolled default profile (_default_profile_launchable, which validates the
+    toggle AND that the executable resolves AND that user_data_dir/cdp_port are
+    usable), beside the existing _get_cdp_override() one. This early return
+    must land only AFTER the agent-browser CLI check earlier in the same
+    function. On its own it would advertise browser tools that then launch
+    agent-browser with no Chromium and hang until the command timeout -- the
+    failure the comment above that Chromium check already warns about. It is
+    scoped to "would actually work", mirroring the Termux branch's rule against
+    advertising a tool that fails on first use; the underlying predicate lives
+    in browser_session_registry so the footprint in the churned file stays a
+    thin fail-closed delegator.
 
     The untouched upstream browser SSRF and hybrid-routing suites must stay green
     UNEDITED. If either needs editing after a merge, the merge altered this seam.
