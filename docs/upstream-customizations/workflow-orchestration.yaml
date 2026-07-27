@@ -3313,6 +3313,7 @@ upstream_changes:
   - make_language_snapshot
   - read_language_snapshot
   - verify_language_snapshot
+  - test_verified_load_rejects_normalizer_drift_for_authenticated_bytes
   - PreparedRunSnapshot.language
   - PreparedRunSnapshot.sealed_snapshot_digest
   - run projection snapshot_format_version
@@ -3347,6 +3348,7 @@ upstream_changes:
   - ResourceResolver sealed-byte-exclusive resource reads
   - WorkflowResourceReadBudget.from_authenticated
   - WorkflowResourceReadBudget canonical shared-run accounting
+  - test_production_authority_accepts_512_files_and_refuses_513_before_admission
   - verify_sealed_snapshot shared fire-time read budget
   - revalidate_scheduled_run shared fire-time read budget
   - _ScheduledPromotionAuthorization resource read budget authority
@@ -3465,6 +3467,9 @@ upstream_changes:
     policy, resources, package resources, inputs, and skills for both current
     and historical runs; reject over-limit files from metadata before opening
     them and detect replacement even when a canonical read is deduplicated.
+    Retain mutation-resistant coverage that makes same-byte normalizer drift
+    fail at verified scheduler load and pins production admission to accepting
+    512 canonical package files while refusing 513 before run persistence.
     Every later
     command, named script, MCP definition and transitive local server, prompt
     skill, inline-agent skill, and input/template consumer must either read the

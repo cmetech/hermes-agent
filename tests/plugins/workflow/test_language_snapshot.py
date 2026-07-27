@@ -364,6 +364,40 @@ def test_resume_reads_sealed_definition_after_installed_source_changes(
     assert loaded.language.effective_profile.value == "archon-2026-07"
 
 
+def test_verified_load_rejects_normalizer_drift_for_authenticated_bytes(
+    tmp_path, workflow_writer, monkeypatch
+):
+    package = _profile_package(workflow_writer, tmp_path, profile="archon-2026-07")
+    store, run_id = _admit(package, tmp_path / "home")
+    scheduler = RunScheduler(store)
+    original_parser = scheduler_module.load_workflow_snapshot
+
+    def parse_with_normalizer_drift(*args, **kwargs):
+        parsed = original_parser(*args, **kwargs)
+        drifted_digest = "0" * 64
+        assert parsed.language.normalized_definition_digest != drifted_digest
+        return replace(
+            parsed,
+            language=replace(
+                parsed.language,
+                normalized_definition_digest=drifted_digest,
+            ),
+        )
+
+    monkeypatch.setattr(
+        scheduler_module,
+        "load_workflow_snapshot",
+        parse_with_normalizer_drift,
+    )
+    try:
+        with pytest.raises(WorkflowLanguageCompatibilityError) as exc_info:
+            scheduler._load_verified_run_package(run_id)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert exc_info.value.code == "workflow_language_snapshot_mismatch"
+
+
 def test_resume_ignores_post_admission_artifacts_outside_sealed_paths(
     tmp_path, workflow_writer
 ):
