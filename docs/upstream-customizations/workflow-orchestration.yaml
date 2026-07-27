@@ -3302,6 +3302,7 @@ upstream_changes:
   - plugin-agent worker stable bounded percent-normalization classification view
   - plugin-agent worker supported-network percent-preservation boundary
   - plugin-agent worker centralized strict supported-network URL predicate
+  - plugin-agent worker decoded Unicode control and surrogate rejection
   - plugin-agent worker executable-scoped package option classification
   - plugin-agent worker isolated Python inline and module launch policy
   - plugin-agent worker compact manifest validation and nonlocal metadata stripping
@@ -3425,16 +3426,20 @@ upstream_changes:
     Parse that full candidate with the standard URL parser; allow only HTTP,
     HTTPS, WS, or WSS with nonempty authority and hostname, a parser-valid
     in-range port, valid bracketed IPv6 or numeric IPv4 when those forms are used,
-    an IDNA-encodable hostname, and at most one nonempty userinfo prefix. Reject
-    literal or recursively percent-decoded whitespace, controls, and backslashes,
-    malformed authority/bracket/port syntax, encoded authority ambiguity,
+    an IDNA-encodable hostname, and at most one nonempty userinfo prefix. At every
+    recursively percent-decoded network view, reject whitespace, backslashes, and
+    every Unicode control, format-control, or surrogate code point (categories
+    Cc, Cf, and Cs), including invalid UTF-8 percent encodings that could
+    represent a surrogate. Also reject malformed authority/bracket/port syntax,
+    encoded authority ambiguity,
     prefixes, whitespace-padded values, scheme-relative values, unknown/local
     schemes, and malformed assignments. Preserve valid `%25` spelling in
     supported network paths, queries, and fragments without reprocessing its
-    decoded literal percent, preserve original userinfo, IDN, IP, and leading-zero
-    port spelling after validation, and normalize scheme case only for the
-    allow-list decision. Continue stable decoding until deeply encoded
-    local/unknown schemes and assignments are classified or rejected. Preserve
+    decoded literal percent, preserve original userinfo, IDN, combining marks,
+    emoji path content, IP, and leading-zero port spelling after validation, and
+    normalize scheme case only for the allow-list decision. Continue stable
+    decoding until deeply encoded local/unknown schemes and assignments are
+    classified or rejected. Preserve
     explicit HTTP, HTTPS, WS, and WSS network URIs that satisfy this predicate,
     but reject local, embedded, IDE, database, socket, and
     unknown URI schemes in commands, exact or compound arguments, environment

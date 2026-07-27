@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import sys
 import threading
+import unicodedata
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
@@ -392,6 +393,7 @@ _NETWORK_URI_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 _NETWORK_ENCODED_AMBIGUITY = re.compile(
     r"%(?:25)*(?:0[0-9a-f]|1[0-9a-f]|20|5c|7f)", re.IGNORECASE
 )
+_NETWORK_FORBIDDEN_UNICODE_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
 _CLASSIFICATION_MAX_BYTES = 256_000
 _CLASSIFICATION_MAX_DECODE_PASSES = 64
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -448,8 +450,7 @@ def _has_valid_percent_syntax(value: str) -> bool:
 def _contains_forbidden_network_characters(value: str) -> bool:
     return "\\" in value or any(
         character.isspace()
-        or ord(character) < 32
-        or 127 <= ord(character) <= 159
+        or unicodedata.category(character) in _NETWORK_FORBIDDEN_UNICODE_CATEGORIES
         for character in value
     )
 
@@ -465,7 +466,7 @@ def _has_ambiguous_network_encoding(value: str) -> bool:
         try:
             expanded = unquote(decoded, errors="strict")
         except UnicodeDecodeError:
-            return False
+            return True
         if len(expanded) >= len(decoded):
             return False
         decoded = expanded

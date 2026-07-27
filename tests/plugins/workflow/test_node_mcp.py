@@ -25,6 +25,7 @@ from agent.plugin_agent import (
 from agent.plugin_agent_worker import (
     PackageMCPUnavailable,
     _finalize_authenticated_mcp_config,
+    _supported_network_url,
 )
 from plugins.workflow.resources import (
     AuthenticatedExecutionMaterializer,
@@ -577,6 +578,10 @@ def test_sealed_mcp_preserves_explicit_network_urls(tmp_path, scheme):
         ("compound", "ws://localhost:65535/events/%25"),
         ("url", "https://network.example.test:0080/a/%25"),
         ("env", "https://[2001:db8::1]:0080/a/%25"),
+        (
+            "env",
+            "https://cafe\u0301.example.test/a/\U0001f680?q=nai\u0308ve#re\u0301sume\u0301",
+        ),
     ],
 )
 def test_sealed_mcp_preserves_strict_supported_network_url_forms(
@@ -606,6 +611,67 @@ def test_sealed_mcp_preserves_strict_supported_network_url_forms(
         materializer.cleanup()
 
 
+@pytest.mark.parametrize("location", ["hostname", "path", "query", "fragment"])
+def test_supported_network_url_rejects_surrogate_without_parser_error(location):
+    surrogate = chr(0xD800)
+    candidate = {
+        "hostname": f"https://network{surrogate}.example.test/path",
+        "path": f"https://network.example.test/a{surrogate}b",
+        "query": f"https://network.example.test/path?q=a{surrogate}b",
+        "fragment": f"https://network.example.test/path#a{surrogate}b",
+    }[location]
+
+    assert _supported_network_url(candidate) is False
+
+
+@pytest.mark.parametrize(
+    ("field", "location"),
+    [
+        ("arg", "path"),
+        ("compound", "query"),
+        ("env", "fragment"),
+        ("url", "hostname"),
+    ],
+)
+def test_sealed_mcp_rejects_surrogate_network_urls_without_unsafe_encoding(
+    tmp_path, field, location
+):
+    surrogate = chr(0xD800)
+    url = {
+        "hostname": f"https://network{surrogate}.example.test/path",
+        "path": f"https://network.example.test/a{surrogate}b",
+        "query": f"https://network.example.test/path?q=a{surrogate}b",
+        "fragment": f"https://network.example.test/path#a{surrogate}b",
+    }[location]
+    if field == "url":
+        server = {"url": url}
+    else:
+        server = {"command": "mcp-server-fetch", "args": []}
+        if field == "arg":
+            server["args"] = [url]
+        elif field == "compound":
+            server["args"] = [f"--endpoint={url}"]
+        else:
+            server["env"] = {"REMOTE_ENDPOINT": url}
+    authenticated = {
+        "mcp/echo.yaml": yaml.safe_dump({"echo": server}).encode("ascii")
+    }
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        resolved = ResourceResolver(
+            tmp_path / "run",
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+
+        with pytest.raises(
+            PackageMCPUnavailable, match="runtime closure cannot be proven"
+        ):
+            _finalize_authenticated_mcp_config({"echo": resolved})
+    finally:
+        materializer.cleanup()
+
+
 @pytest.mark.parametrize(
     ("field", "url"),
     [
@@ -618,6 +684,15 @@ def test_sealed_mcp_preserves_strict_supported_network_url_forms(
         ("env", "https://network.example.test/a%250db"),
         ("url", "https://network.example.test/a%c2%80b"),
         ("arg", "https://network.example.test/a%c2%a0b"),
+        ("arg", "https://network\u202e.example.test/path"),
+        ("compound", "https://network.example.test/a%e2%80%8bb"),
+        ("env", "https://network.example.test/path?q=a\ufeffb"),
+        ("url", "https://network.example.test/path#a%c2%adb"),
+        ("url", "https://network%e2%80%ae.example.test/path"),
+        ("arg", "https://network.example.test/a\u200bb"),
+        ("compound", "https://network.example.test/path?q=a%ef%bb%bfb"),
+        ("env", "https://network.example.test/path#a\u00adb"),
+        ("url", "https://network.example.test/a%ed%a0%80b"),
         ("url", "https://network.example.test:invalid/path"),
         ("arg", "https://network.example.test:65536/path"),
         ("compound", "https://network.example.test:/path"),
