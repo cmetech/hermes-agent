@@ -7,17 +7,86 @@ import pytest
 
 from plugins.workflow.compat import (
     ARCHON_TOOL_ALIASES,
+    WORKFLOW_COMPATIBILITY_FINDINGS_MAX,
     CompatibilityFinding,
     CompatibilityLevel,
     assess_compatibility,
 )
 from plugins.workflow.cli import doctor_package
 from plugins.workflow.models import CompatibilityFinding as ModelCompatibilityFinding
+from plugins.workflow.models import ValidationIssue
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.schema import HOOK_EVENTS
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.evidence import EvidenceReader
 from plugins.workflow.store import RunStore
+
+
+class _ComparisonCountingStr(str):
+    comparisons = 0
+
+    def __eq__(self, other: object) -> bool:
+        type(self).comparisons += 1
+        return super().__eq__(other)
+
+    __hash__ = str.__hash__
+
+
+def test_compatibility_dedup_work_is_linear_and_reserves_a_bounded_sentinel(
+    workflow_writer, tmp_path
+) -> None:
+    package = load_workflow(workflow_writer(tmp_path))
+    issue_count = 2_000
+    issues = tuple(
+        ValidationIssue(
+            path=_ComparisonCountingStr(f"unknown[{index}]"),
+            code=_ComparisonCountingStr("unknown_top_level_field"),
+            message="unknown",
+            blocking=index == issue_count - 1,
+        )
+        for index in range(issue_count)
+    )
+    package = replace(package, validation_issues=issues)
+    _ComparisonCountingStr.comparisons = 0
+
+    report = assess_compatibility(package, available_tools=set())
+
+    assert _ComparisonCountingStr.comparisons <= 10 * issue_count
+    assert len(report.findings) == WORKFLOW_COMPATIBILITY_FINDINGS_MAX
+    sentinel = report.findings[-1]
+    assert sentinel.code == "compatibility_findings_truncated"
+    assert sentinel.path == "compatibility.findings"
+    assert sentinel.level is CompatibilityLevel.UNSUPPORTED
+    assert sentinel.blocking is True
+    assert report.level is CompatibilityLevel.UNSUPPORTED
+    assert report.runnable is False
+
+
+def test_compatibility_bounds_author_controlled_finding_text_without_losing_code(
+    workflow_writer, tmp_path
+) -> None:
+    package = load_workflow(workflow_writer(tmp_path))
+    package = replace(
+        package,
+        validation_issues=(
+            ValidationIssue(
+                path="p" * 20_000,
+                code="unknown_top_level_field",
+                message="m" * 20_000,
+                blocking=False,
+            ),
+        ),
+    )
+
+    finding = next(
+        item
+        for item in assess_compatibility(package).findings
+        if item.code == "unknown_top_level_field"
+    )
+
+    assert len(finding.path) <= 512
+    assert len(finding.message) <= 1_024
+    assert finding.code == "unknown_top_level_field"
 
 
 def test_portable_mapped_and_unsupported_fields_are_reported(workflow_writer, tmp_path):

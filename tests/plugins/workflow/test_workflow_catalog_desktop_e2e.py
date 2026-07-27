@@ -29,6 +29,19 @@ def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
         filename="desktop-catalog-e2e.yaml",
         nodes=[{"id": "still-pending", "bash": "sleep 30"}],
     )
+    workflow_writer(
+        home / "workflows",
+        name="bounded-findings-e2e",
+        filename="bounded-findings-e2e.yaml",
+        nodes=[
+            {
+                "id": "agent",
+                "prompt": "bounded",
+                "allowed_tools": ["UnknownTool"],
+            }
+        ],
+        **{f"future_{index:04d}": "x" * 32 for index in range(600)},
+    )
     (home / "workflows" / "broken-neighbor.yaml").write_text(
         "name: broken-neighbor\nnodes: [invalid\n", encoding="utf-8"
     )
@@ -85,28 +98,28 @@ def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
             item for item in catalog_items if item.get("source") != "showcase"
         ]
         assert [item["name"] for item in user_items] == [
+            "bounded-findings-e2e",
             "broken-neighbor",
             "desktop-catalog-e2e",
             "duplicate-neighbor",
             "oversized-neighbor",
         ]
-        assert user_items[0] == {
+        assert user_items[1] == {
             "name": "broken-neighbor",
             "error": "invalid_definition",
         }
-        assert user_items[2] == {
+        assert user_items[3] == {
             "name": "duplicate-neighbor",
             "error": "invalid_definition",
         }
-        assert user_items[3] == {
+        assert user_items[4] == {
             "name": "oversized-neighbor",
             "error": "catalog_capacity",
         }
         approval_showcase = next(
             item
             for item in catalog_items
-            if item.get("source") == "showcase"
-            and item.get("name") == "approval-gate"
+            if item.get("source") == "showcase" and item.get("name") == "approval-gate"
         )
         assert approval_showcase["trust_state"] == "verified_bundled"
 
@@ -117,6 +130,19 @@ def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
         topology = detail_response.json()["topology"]
         assert topology["text"]
         assert topology["mermaid"]
+
+        bounded_response = client.get(
+            "/api/plugins/workflow/workflows/bounded-findings-e2e"
+        )
+        assert bounded_response.status_code == 200
+        assert len(bounded_response.content) < 1024 * 1024
+        bounded = bounded_response.json()["compatibility"]
+        assert bounded["level"] == "unsupported"
+        assert bounded["runnable"] is False
+        assert bounded["findings_truncated"] is True
+        assert bounded["finding_count"] == 602
+        assert len(bounded["findings"]) == 512
+        assert bounded["findings"][-1]["code"] == "compatibility_findings_truncated"
 
         for invalid_name, expected_status, expected_code, retryable in (
             ("broken-neighbor", 422, "workflow_invalid_definition", False),

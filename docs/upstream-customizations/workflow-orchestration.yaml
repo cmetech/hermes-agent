@@ -1870,6 +1870,8 @@ upstream_changes:
   - plugins/workflow/catalog_api.py
   - plugins/workflow/dashboard/plugin_api.py
   - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
   - tests/plugins/workflow/test_workflow_detail_api.py
   owned_symbols:
   - CatalogSource
@@ -3657,11 +3659,14 @@ upstream_changes:
   - WORKFLOW_LANGUAGE_FINDINGS_PER_NODE_MAX
   - WORKFLOW_LANGUAGE_PACKAGE_FINDINGS_MAX
   - derive_compatibility_report_state
-  - WORKFLOW_COMPATIBILITY_FINDINGS_PER_NODE_MAX
-  - WORKFLOW_COMPATIBILITY_PACKAGE_FINDINGS_MAX
   - WORKFLOW_COMPATIBILITY_FINDINGS_MAX
+  - _FindingAccumulator
+  - CompatibilityReport.findings_truncated
+  - CompatibilityReport.finding_count
   - WORKFLOW_COMPATIBILITY_UNKNOWN_PATH
   - _sanitize_compatibility_finding_projection
+  - _sanitize_full_compatibility_projection
+  - _sanitize_catalog_item_projection
   - _catalog_language_projection
   - _compatibility_summary
   - _compatibility_projection
@@ -3685,6 +3690,8 @@ upstream_changes:
   - workflowLanguageDigest
   tests:
   - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
   - tests/plugins/workflow/test_workflow_detail_api.py
   - tests/plugins/workflow/test_workflow_language_desktop_e2e.py
   - apps/desktop/src/app/workflows/index.test.tsx
@@ -3696,14 +3703,16 @@ upstream_changes:
   merge_guidance: >-
     Preserve backend authority for profile resolution, normalization,
     compatibility findings, and Run eligibility. Keep catalog language status
-    and user compatibility summaries bounded, derive the full-report finding
-    ceiling from the complete definition projection's node, byte, and
-    container limits plus producer field inventories, retain the existing
-    verified showcase compatibility payload, and expose expanded metadata and
-    findings only in detail without generic sanitizer truncation. Full compatibility
-    responses must contain only the five projected finding fields and their
-    level/runnable pair must be derived from the complete finding set using the
-    same authority rule as CompatibilityReport. Preserve API-specific finding
+    and user compatibility summaries bounded, cap compatibility production at
+    512 insertion-ordered findings with O(1) `(code, path)` deduplication, and
+    reserve the final slot for one bounded aggregate truncation sentinel that
+    preserves omitted blocker state. Retain the verified showcase full-report
+    payload for old clients without passing its findings through generic list
+    clipping. Full compatibility responses must contain only the five projected
+    finding fields plus level, runnable, findings_truncated, and finding_count;
+    level/runnable must be derived from retained findings and the authoritative
+    omitted-state sentinel using the same rule as CompatibilityReport. Keep
+    project/profile catalog rows summary-only. Preserve API-specific finding
     sanitization, including the stable nonempty unknown-path marker when ANSI
     and filesystem-path redaction leave no diagnostic path. Desktop language
     data must remain optional for old-backend skew and strictly presentational:

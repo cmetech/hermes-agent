@@ -1,17 +1,38 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import json
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
+import yaml
 
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.trust import WorkflowTrustStore
+
+
+@contextmanager
+def _test_bundle_path(root: Path):
+    yield root.resolve()
+
+
+def _restamp_showcase_package(root: Path, showcase_id: str) -> None:
+    manifest_path = root / "digests.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["packages"][showcase_id] = showcase_module._tree_digest(
+        root / "packages" / showcase_id
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _tree_snapshot(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
@@ -34,7 +55,23 @@ def test_bundled_showcase_catalog_detail_and_admission_cross_real_middleware(
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
+    definition_path = (
+        copied / "packages" / "approval-gate" / "workflows" / "approval-gate.yaml"
+    )
+    definition = yaml.safe_load(definition_path.read_text(encoding="utf-8"))
+    definition.update({f"future_{index:04d}": "x" * 32 for index in range(600)})
+    definition_path.write_text(
+        yaml.safe_dump(definition, sort_keys=False), encoding="utf-8"
+    )
+    _restamp_showcase_package(copied, "approval-gate")
     showcase_module._clear_verified_showcase_cache_for_tests()
+    monkeypatch.setattr(
+        showcase_module,
+        "_bundle_path",
+        lambda explicit=None: _test_bundle_path(copied),
+    )
     store = RunStore(home)
     acquired = CoordinatorStore(store.database).try_acquire(
         CoordinatorIdentity(
@@ -80,11 +117,19 @@ def test_bundled_showcase_catalog_detail_and_admission_cross_real_middleware(
         row = next(
             item
             for item in catalog_response.json()["items"]
-            if item.get("source") == "showcase"
-            and item.get("name") == "approval-gate"
+            if item.get("source") == "showcase" and item.get("name") == "approval-gate"
         )
         assert row["trust_state"] == "verified_bundled"
         assert row["run_support"] == {"supported": True, "reason": "supported"}
+        compatibility = row["compatibility"]
+        assert compatibility["level"] == "unsupported"
+        assert compatibility["runnable"] is True
+        assert compatibility["findings_truncated"] is True
+        assert compatibility["finding_count"] == 601
+        assert len(compatibility["findings"]) == 512
+        assert compatibility["findings"][-1]["code"] == (
+            "compatibility_findings_truncated"
+        )
 
         detail_response = client.get(
             "/api/plugins/workflow/workflows/approval-gate",
@@ -92,6 +137,8 @@ def test_bundled_showcase_catalog_detail_and_admission_cross_real_middleware(
         )
         assert detail_response.status_code == 200
         detail = detail_response.json()
+        assert detail["compatibility"] == compatibility
+        assert len(detail_response.content) < 1024 * 1024
         assert detail["topology"]["mermaid"]
         assert detail["definition"]["nodes"][0]["value"] == "[REDACTED]"
         assert _tree_snapshot(home / "workflows") == store_before_reads

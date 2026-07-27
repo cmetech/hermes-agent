@@ -10,18 +10,18 @@ from plugins.workflow.models import (
     CompatibilityLevel,
     WorkflowPackage,
 )
-from plugins.workflow.language import (
-    WORKFLOW_LANGUAGE_FINDINGS_PER_NODE_MAX,
-    WORKFLOW_LANGUAGE_PACKAGE_FINDINGS_MAX,
-)
-from plugins.workflow.projection_limits import (
-    WORKFLOW_DEFINITION_MAX_BYTES,
-    WORKFLOW_DEFINITION_MAX_CONTAINER_ITEMS,
-    WORKFLOW_DEFINITION_MAX_NODES,
-)
 
 if TYPE_CHECKING:
     from plugins.workflow.trust import WorkflowRiskSummary
+
+
+WORKFLOW_COMPATIBILITY_FINDINGS_MAX = 512
+_WORKFLOW_COMPATIBILITY_PATH_MAX = 256
+_WORKFLOW_COMPATIBILITY_MESSAGE_MAX = 512
+_WORKFLOW_COMPATIBILITY_TRUNCATION_CODE = "compatibility_findings_truncated"
+_WORKFLOW_COMPATIBILITY_TRUNCATION_PATH = "compatibility.findings"
+_WORKFLOW_COMPATIBILITY_TRUNCATION_PREFIX = "Compatibility findings truncated: "
+_WORKFLOW_COMPATIBILITY_TEXT_SUFFIX = "…[TRUNCATED]"
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,24 @@ class CompatibilityReport:
     level: CompatibilityLevel
     findings: tuple[CompatibilityFinding, ...]
     runnable: bool
+
+    def __post_init__(self) -> None:
+        bounded = _bounded_compatibility_findings(self.findings)
+        if bounded != self.findings:
+            object.__setattr__(self, "findings", bounded)
+
+    @property
+    def findings_truncated(self) -> bool:
+        return bool(
+            self.findings and _truncation_omitted_count(self.findings[-1]) is not None
+        )
+
+    @property
+    def finding_count(self) -> int:
+        if not self.findings_truncated:
+            return len(self.findings)
+        omitted = _truncation_omitted_count(self.findings[-1])
+        return len(self.findings) - 1 + (omitted or 0)
 
     @property
     def blocking_findings(self) -> tuple[CompatibilityFinding, ...]:
@@ -186,55 +204,123 @@ _PROVIDER_FIELDS = {
     "sandbox": "sandbox",
 }
 
-# A detail response is admitted only after the complete definition projection
-# succeeds. These ceilings therefore bound every compatibility producer loop:
-# two tool lists can each emit one finding per projected list member, hook
-# findings are one per supported event, and all remaining fields are singular.
-# The byte ceiling safely bounds legacy unknown top-level keys because each
-# issue requires a distinct key represented in that same complete projection.
-_SINGULAR_COMMAND_FINDING_FIELDS = frozenset({
-    "persist_session",
-    "skills",
-    "mcp",
-    "agents",
-    "provider",
-    "model",
-    "effort",
-    "thinking",
-    "maxBudgetUsd",
-    "fallbackModel",
-    "betas",
-    "sandbox",
-    "systemPrompt",
-})
-WORKFLOW_COMPATIBILITY_FINDINGS_PER_NODE_MAX = (
-    WORKFLOW_LANGUAGE_FINDINGS_PER_NODE_MAX
-    + 1  # context
-    + len(_AI_ONLY_FIELDS)
-    + 2 * WORKFLOW_DEFINITION_MAX_CONTAINER_ITEMS  # allowed_tools + denied_tools
-    + len(_SINGULAR_COMMAND_FINDING_FIELDS)
-    + len(MAPPED_HOOK_EVENTS | UNSUPPORTED_HOOK_EVENTS)
-)
-WORKFLOW_COMPATIBILITY_PACKAGE_FINDINGS_MAX = (
-    WORKFLOW_DEFINITION_MAX_BYTES  # non-fatal unknown top-level issues
-    + WORKFLOW_LANGUAGE_PACKAGE_FINDINGS_MAX
-    + 2  # provider + model
-    + 1  # persist_sessions
-    + 2  # interactive + tags
-    + WORKFLOW_DEFINITION_MAX_CONTAINER_ITEMS  # requires
-    + 1  # worktree
-    + len(_PROVIDER_FIELDS)
-    + 1  # execution-environment finding added by the runner binding
-)
-WORKFLOW_COMPATIBILITY_FINDINGS_MAX = (
-    WORKFLOW_DEFINITION_MAX_NODES
-    * WORKFLOW_COMPATIBILITY_FINDINGS_PER_NODE_MAX
-    + WORKFLOW_COMPATIBILITY_PACKAGE_FINDINGS_MAX
-)
+
+def _bounded_author_text(value: str, *, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return (
+        value[: max_chars - len(_WORKFLOW_COMPATIBILITY_TEXT_SUFFIX)]
+        + _WORKFLOW_COMPATIBILITY_TEXT_SUFFIX
+    )
+
+
+def _truncation_omitted_count(finding: CompatibilityFinding) -> int | None:
+    if (
+        finding.code != _WORKFLOW_COMPATIBILITY_TRUNCATION_CODE
+        or finding.path != _WORKFLOW_COMPATIBILITY_TRUNCATION_PATH
+        or not finding.message.startswith(_WORKFLOW_COMPATIBILITY_TRUNCATION_PREFIX)
+    ):
+        return None
+    count, separator, _remainder = finding.message[
+        len(_WORKFLOW_COMPATIBILITY_TRUNCATION_PREFIX) :
+    ].partition(" ")
+    if not separator or not count.isascii() or not count.isdigit():
+        return None
+    return int(count)
+
+
+class _FindingAccumulator:
+    """Retain first occurrences in order while bounding the public report."""
+
+    def __init__(self, initial: Iterable[CompatibilityFinding] = ()) -> None:
+        self._findings: dict[tuple[str, str], CompatibilityFinding] = {}
+        self._seen: set[tuple[str, str]] = set()
+        self._omitted = 0
+        self._omitted_blocking = False
+        self._omitted_level = CompatibilityLevel.PORTABLE
+        self._sentinel_effective_profile = None
+        for finding in initial:
+            self.add(finding)
+
+    def _merge_omitted_state(
+        self, *, count: int, level: CompatibilityLevel, blocking: bool
+    ) -> None:
+        self._omitted += count
+        self._omitted_blocking |= blocking
+        if level is CompatibilityLevel.UNSUPPORTED:
+            self._omitted_level = CompatibilityLevel.UNSUPPORTED
+        elif self._omitted_level is CompatibilityLevel.PORTABLE:
+            self._omitted_level = CompatibilityLevel.MAPPED
+
+    def add(self, finding: CompatibilityFinding) -> None:
+        omitted = _truncation_omitted_count(finding)
+        if omitted is not None:
+            self._merge_omitted_state(
+                count=omitted,
+                level=finding.level,
+                blocking=finding.blocking,
+            )
+            self._sentinel_effective_profile = finding.effective_profile
+            return
+
+        key = (finding.code, finding.path)
+        if key in self._seen:
+            return
+        self._seen.add(key)
+        bounded = replace(
+            finding,
+            path=_bounded_author_text(
+                finding.path, max_chars=_WORKFLOW_COMPATIBILITY_PATH_MAX
+            ),
+            message=_bounded_author_text(
+                finding.message, max_chars=_WORKFLOW_COMPATIBILITY_MESSAGE_MAX
+            ),
+        )
+        if len(self._findings) >= WORKFLOW_COMPATIBILITY_FINDINGS_MAX - 1:
+            self._merge_omitted_state(
+                count=1,
+                level=finding.level,
+                blocking=finding.blocking,
+            )
+            return
+        self._findings[key] = bounded
+
+    def finish(self, *, effective_profile=None) -> tuple[CompatibilityFinding, ...]:
+        findings = list(self._findings.values())
+        if self._omitted:
+            omitted = min(self._omitted, 999_999_999)
+            findings.append(
+                CompatibilityFinding(
+                    path=_WORKFLOW_COMPATIBILITY_TRUNCATION_PATH,
+                    level=self._omitted_level,
+                    message=(
+                        f"{_WORKFLOW_COMPATIBILITY_TRUNCATION_PREFIX}{omitted} "
+                        f"omitted; aggregate level {self._omitted_level.value}"
+                    ),
+                    blocking=self._omitted_blocking,
+                    code=_WORKFLOW_COMPATIBILITY_TRUNCATION_CODE,
+                    severity="error" if self._omitted_blocking else "warning",
+                    effective_profile=(
+                        effective_profile or self._sentinel_effective_profile
+                    ),
+                )
+            )
+        if effective_profile is not None:
+            findings = [
+                replace(finding, effective_profile=effective_profile)
+                for finding in findings
+            ]
+        return tuple(findings)
+
+
+def _bounded_compatibility_findings(
+    findings: Iterable[CompatibilityFinding],
+) -> tuple[CompatibilityFinding, ...]:
+    return _FindingAccumulator(findings).finish()
 
 
 def _finding(
-    findings: list[CompatibilityFinding],
+    findings: _FindingAccumulator,
     path: str,
     level: CompatibilityLevel,
     message: str,
@@ -243,9 +329,7 @@ def _finding(
     blocking: bool = False,
     severity: str | None = None,
 ) -> None:
-    if any(finding.code == code and finding.path == path for finding in findings):
-        return
-    findings.append(
+    findings.add(
         CompatibilityFinding(
             path=path,
             level=level,
@@ -267,7 +351,7 @@ def _provider_for(package: WorkflowPackage, node_index: int | None = None) -> st
 
 
 def _check_provider_field(
-    findings: list[CompatibilityFinding],
+    findings: _FindingAccumulator,
     *,
     path: str,
     field: str,
@@ -308,7 +392,7 @@ def assess_compatibility(
     tools = available_tools
     services = available_services
     capabilities = provider_capabilities or {}
-    findings = list(package.compatibility_findings)
+    findings = _FindingAccumulator(package.compatibility_findings)
     options = package.definition.options
 
     for issue in package.validation_issues:
@@ -548,14 +632,10 @@ def assess_compatibility(
                     blocking=True,
                 )
 
-    findings = [
-        replace(
-            finding,
-            effective_profile=package.language.effective_profile,
-        )
-        for finding in findings
-    ]
-    level, runnable = derive_compatibility_report_state(findings)
+    bounded_findings = findings.finish(
+        effective_profile=package.language.effective_profile
+    )
+    level, runnable = derive_compatibility_report_state(bounded_findings)
     return CompatibilityReport(
-        level=level, findings=tuple(findings), runnable=runnable
+        level=level, findings=bounded_findings, runnable=runnable
     )

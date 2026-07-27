@@ -349,7 +349,13 @@ def test_workflow_compatibility_response_models_are_exact_bounded_and_strict() -
         "blocking": True,
         "code": "archon_timeout_semantics_unavailable",
     }
-    full = {"level": "unsupported", "runnable": False, "findings": [finding]}
+    full = {
+        "level": "unsupported",
+        "runnable": False,
+        "findings": [finding],
+        "findings_truncated": False,
+        "finding_count": 1,
+    }
 
     assert module.WorkflowCompatibilitySummary.model_validate(summary)
     assert module.WorkflowCompatibilityFull.model_validate(full)
@@ -381,6 +387,10 @@ def test_workflow_compatibility_response_models_are_exact_bounded_and_strict() -
         },
         {**full, "findings": [{**finding, "migration": "Remove timeout."}]},
         {**full, "findings": [{**finding, "extra": "escape"}]},
+        {**full, "findings_truncated": 0},
+        {**full, "finding_count": True},
+        {**full, "finding_count": 0},
+        {**full, "findings_truncated": True},
     ]
 
     for payload in invalid_summaries:
@@ -414,25 +424,110 @@ def test_workflow_compatibility_full_enforces_authoritative_report_state() -> No
         "blocking": False,
         "code": "unknown_top_level_field",
     }
+    truncation_sentinel = {
+        "path": "compatibility.findings",
+        "level": "unsupported",
+        "message": (
+            "Compatibility findings truncated: 8 omitted; aggregate level unsupported"
+        ),
+        "blocking": True,
+        "code": "compatibility_findings_truncated",
+    }
 
     valid = [
-        {"level": "portable", "runnable": True, "findings": []},
-        {"level": "mapped", "runnable": True, "findings": [mapped]},
-        {"level": "unsupported", "runnable": False, "findings": [blocking]},
+        {
+            "level": "portable",
+            "runnable": True,
+            "findings": [],
+            "findings_truncated": False,
+            "finding_count": 0,
+        },
+        {
+            "level": "mapped",
+            "runnable": True,
+            "findings": [mapped],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "unsupported",
+            "runnable": False,
+            "findings": [blocking],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
         {
             "level": "unsupported",
             "runnable": True,
             "findings": [nonblocking_unsupported],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "unsupported",
+            "runnable": False,
+            "findings": [mapped, truncation_sentinel],
+            "findings_truncated": True,
+            "finding_count": 9,
         },
     ]
     invalid = [
-        {"level": "unsupported", "runnable": True, "findings": []},
-        {"level": "portable", "runnable": False, "findings": [blocking]},
-        {"level": "portable", "runnable": True, "findings": [mapped]},
-        {"level": "mapped", "runnable": True, "findings": []},
-        {"level": "mapped", "runnable": False, "findings": [mapped]},
-        {"level": "mapped", "runnable": True, "findings": [nonblocking_unsupported]},
-        {"level": "unsupported", "runnable": True, "findings": [blocking]},
+        {
+            "level": "unsupported",
+            "runnable": True,
+            "findings": [],
+            "findings_truncated": False,
+            "finding_count": 0,
+        },
+        {
+            "level": "portable",
+            "runnable": False,
+            "findings": [blocking],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "portable",
+            "runnable": True,
+            "findings": [mapped],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "mapped",
+            "runnable": True,
+            "findings": [],
+            "findings_truncated": False,
+            "finding_count": 0,
+        },
+        {
+            "level": "mapped",
+            "runnable": False,
+            "findings": [mapped],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "mapped",
+            "runnable": True,
+            "findings": [nonblocking_unsupported],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "unsupported",
+            "runnable": True,
+            "findings": [blocking],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "unsupported",
+            "runnable": False,
+            "findings": [mapped, truncation_sentinel],
+            "findings_truncated": True,
+            "finding_count": 8,
+        },
     ]
 
     for payload in valid:
@@ -503,7 +598,13 @@ def test_workflow_catalog_response_model_enforces_source_projection_and_old_opti
         "language": {"effective_profile": "hermes-legacy", "legacy": True},
     }
     summary = {"level": "mapped", "runnable": True}
-    full = {"level": "portable", "runnable": True, "findings": []}
+    full = {
+        "level": "portable",
+        "runnable": True,
+        "findings": [],
+        "findings_truncated": False,
+        "finding_count": 0,
+    }
 
     assert module.WorkflowCatalogEntry.model_validate({**base, "compatibility": summary})
     assert module.WorkflowCatalogEntry.model_validate(base).compatibility is None
@@ -559,6 +660,13 @@ def test_workflow_catalog_openapi_closes_language_and_compatibility_objects() ->
         schemas["WorkflowCompatibilityFull"]["properties"]["findings"]["maxItems"]
         == module.WORKFLOW_COMPATIBILITY_FINDINGS_MAX
     )
+    assert set(schemas["WorkflowCompatibilityFull"]["properties"]) == {
+        "level",
+        "runnable",
+        "findings",
+        "findings_truncated",
+        "finding_count",
+    }
 
 
 def test_workflow_catalog_keeps_isolation_incompatibility_scenario_local(
@@ -1144,6 +1252,47 @@ def test_workflow_catalog_projects_archon_language_and_bounded_compatibility(
     }
     assert set(row["language"]) == {"effective_profile", "legacy"}
     assert set(row["compatibility"]) == {"level", "runnable"}
+
+
+def test_workflow_detail_bounds_more_than_512_real_findings_and_keeps_omitted_blocker(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    unknown_fields = {f"future_{index:04d}": "x" * 32 for index in range(600)}
+    workflow_writer(
+        home / "workflows",
+        name="bounded-findings",
+        filename="bounded-findings.yaml",
+        nodes=[
+            {
+                "id": "agent",
+                "prompt": "bounded",
+                "allowed_tools": ["UnknownTool"],
+            }
+        ],
+        **unknown_fields,
+    )
+
+    response = _detail_get(
+        _module().router,
+        "bounded-findings",
+        source="profile",
+        token=_reader(),
+    )
+
+    assert response.status_code == 200
+    assert len(response.content) < 1024 * 1024
+    compatibility = response.json()["compatibility"]
+    assert compatibility["level"] == "unsupported"
+    assert compatibility["runnable"] is False
+    assert compatibility["findings_truncated"] is True
+    assert compatibility["finding_count"] == 602
+    assert len(compatibility["findings"]) == 512
+    sentinel = compatibility["findings"][-1]
+    assert sentinel["code"] == "compatibility_findings_truncated"
+    assert sentinel["level"] == "unsupported"
+    assert sentinel["blocking"] is True
 
 
 def test_workflow_catalog_projects_declared_text_bounds_and_support_modes(

@@ -52,6 +52,10 @@ _RUNTIME: WorkflowApiRuntime | None = None
 _RUNTIME_LOCK = threading.Lock()
 _WORKFLOW_RESPONSE_TEXT_MAX = 16_384
 WORKFLOW_COMPATIBILITY_UNKNOWN_PATH = "<unknown-path>"
+_WORKFLOW_COMPATIBILITY_SENTINEL_MESSAGE = re.compile(
+    r"^Compatibility findings truncated: ([0-9]{1,9}) omitted; "
+    r"aggregate level (portable|mapped|unsupported)$"
+)
 
 
 def _runtime() -> WorkflowApiRuntime:
@@ -305,12 +309,54 @@ class WorkflowCompatibilityFinding(BaseModel):
 class WorkflowCompatibilityFull(WorkflowCompatibilitySummary):
     model_config = ConfigDict(extra="forbid")
 
+    findings_truncated: StrictBool
+    finding_count: StrictInt = Field(..., ge=0, le=1_000_000_510)
     findings: list[WorkflowCompatibilityFinding] = Field(
         ..., max_length=WORKFLOW_COMPATIBILITY_FINDINGS_MAX
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def accept_complete_legacy_projection(cls, value):
+        if not isinstance(value, Mapping):
+            return value
+        if "findings_truncated" in value or "finding_count" in value:
+            return value
+        findings = value.get("findings")
+        if not isinstance(findings, list):
+            return value
+        projected = dict(value)
+        projected["findings_truncated"] = False
+        projected["finding_count"] = len(findings)
+        return projected
+
     @model_validator(mode="after")
     def require_authoritative_report_state(self):
+        sentinel_indexes = [
+            index
+            for index, finding in enumerate(self.findings)
+            if (
+                finding.code == "compatibility_findings_truncated"
+                and finding.path == "compatibility.findings"
+            )
+        ]
+        expected_truncated = sentinel_indexes == [len(self.findings) - 1]
+        if self.findings_truncated != expected_truncated:
+            raise ValueError(
+                "findings_truncated must match one final truncation sentinel"
+            )
+        if self.findings_truncated:
+            sentinel = self.findings[-1]
+            match = _WORKFLOW_COMPATIBILITY_SENTINEL_MESSAGE.fullmatch(sentinel.message)
+            if match is None or match.group(2) != sentinel.level:
+                raise ValueError(
+                    "truncation sentinel must carry bounded aggregate state"
+                )
+            omitted = int(match.group(1))
+            if self.finding_count != len(self.findings) - 1 + omitted:
+                raise ValueError("finding_count must include exactly omitted findings")
+        elif self.finding_count != len(self.findings):
+            raise ValueError("finding_count must match complete findings")
         expected_level, expected_runnable = derive_compatibility_report_state(
             self.findings
         )
@@ -341,6 +387,43 @@ def _sanitize_compatibility_finding_projection(
             candidate["path"] = WORKFLOW_COMPATIBILITY_UNKNOWN_PATH
     projected = sanitize_projection(candidate)
     assert isinstance(projected, dict)
+    return projected
+
+
+def _sanitize_full_compatibility_projection(
+    compatibility: Mapping[str, object],
+) -> dict[str, object]:
+    """Preserve one complete producer-bounded report across generic clipping."""
+    findings = compatibility.get("findings")
+    if not isinstance(findings, list):
+        raise TypeError("full compatibility findings must be a list")
+    projected_findings: list[dict[str, object]] = []
+    for finding in findings:
+        if not isinstance(finding, Mapping):
+            raise TypeError("full compatibility findings must contain mappings")
+        projected_findings.append(_sanitize_compatibility_finding_projection(finding))
+    return {
+        "level": compatibility["level"],
+        "runnable": compatibility["runnable"],
+        "findings_truncated": compatibility["findings_truncated"],
+        "finding_count": compatibility["finding_count"],
+        "findings": projected_findings,
+    }
+
+
+def _sanitize_catalog_item_projection(
+    item: Mapping[str, object],
+) -> dict[str, object]:
+    compatibility = item.get("compatibility")
+    full_compatibility = None
+    if isinstance(compatibility, Mapping) and isinstance(
+        compatibility.get("findings"), list
+    ):
+        full_compatibility = _sanitize_full_compatibility_projection(compatibility)
+    projected = sanitize_projection(item)
+    assert isinstance(projected, dict)
+    if full_compatibility is not None:
+        projected["compatibility"] = full_compatibility
     return projected
 
 
@@ -466,7 +549,7 @@ def list_workflows(
             detail={"code": "workflow_trust_unavailable", "retryable": True},
         ) from exc
     return {
-        "items": [sanitize_projection(item) for item in items],
+        "items": [_sanitize_catalog_item_projection(item) for item in items],
         "truncated": truncated,
     }
 
@@ -532,6 +615,9 @@ def workflow_detail(
                 "retryable": False,
             },
         ) from exc
+    compatibility = detail["compatibility"]
+    assert isinstance(compatibility, Mapping)
+    full_compatibility = _sanitize_full_compatibility_projection(compatibility)
     sanitized = sanitize_projection(detail)
     assert isinstance(sanitized, dict)
     # build_workflow_detail already supplies the shared semantically redacted,
@@ -540,18 +626,7 @@ def workflow_detail(
     # Preserve the complete producer report instead of applying the generic
     # sanitizer's unrelated 200-item list limit. Sanitize each closed finding
     # independently so path/text redaction remains in force.
-    compatibility = detail["compatibility"]
-    assert isinstance(compatibility, dict)
-    findings = compatibility["findings"]
-    assert isinstance(findings, list)
-    sanitized["compatibility"] = {
-        "level": compatibility["level"],
-        "runnable": compatibility["runnable"],
-        "findings": [
-            _sanitize_compatibility_finding_projection(finding)
-            for finding in findings
-        ],
-    }
+    sanitized["compatibility"] = full_compatibility
     return sanitized
 
 
