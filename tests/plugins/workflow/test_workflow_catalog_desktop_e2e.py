@@ -15,7 +15,6 @@ from plugins.workflow.trust import (
     build_risk_summary,
     compute_package_digest,
 )
-from plugins.workflow.dashboard import plugin_api as workflow_plugin_api
 
 
 def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
@@ -80,12 +79,10 @@ def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    workflow_plugin_api._close_runtime()
-    client = TestClient(
+    with TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
-    )
-    try:
+    ) as client:
         catalog_response = client.get("/api/plugins/workflow/workflows")
         assert catalog_response.status_code == 200
         catalog_items = catalog_response.json()["items"]
@@ -184,7 +181,3 @@ def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
         assert admitted["run_id"] in {
             item["run_id"] for item in board_response.json()["runs"]
         }
-    finally:
-        client.close()
-        workflow_plugin_api._close_runtime()
-        assert workflow_plugin_api._RUNTIME is None

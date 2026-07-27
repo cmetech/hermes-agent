@@ -15,7 +15,6 @@ from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.trust import WorkflowTrustStore
-from plugins.workflow.dashboard import plugin_api as workflow_plugin_api
 
 
 @contextmanager
@@ -96,12 +95,10 @@ def test_bundled_showcase_catalog_detail_and_admission_cross_real_middleware(
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    workflow_plugin_api._close_runtime()
-    client = TestClient(
+    with TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
-    )
-    try:
+    ) as client:
         store_before_reads = _tree_snapshot(home / "workflows")
         trust_before_reads = trust_store.path.read_bytes()
 
@@ -203,7 +200,3 @@ def test_bundled_showcase_catalog_detail_and_admission_cross_real_middleware(
         assert admitted["run_id"] in {
             item["run_id"] for item in board_response.json()["runs"]
         }
-    finally:
-        client.close()
-        workflow_plugin_api._close_runtime()
-        assert workflow_plugin_api._RUNTIME is None

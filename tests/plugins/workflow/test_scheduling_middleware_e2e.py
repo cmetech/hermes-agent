@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -23,7 +24,6 @@ from plugins.workflow.lease_clock import LeaseClockSample, current_boot_id
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.runner_binding import RunnerCapabilities, WorkflowRunnerBinding
 from plugins.workflow.store import RunStore
-from plugins.workflow.dashboard import plugin_api as workflow_plugin_api
 import plugins.workflow.showcase as showcase_module
 from tools.managed_process import ProcessIdentity
 
@@ -159,20 +159,16 @@ def _leader(
     return coordinator, identity, acquired.lease.epoch
 
 
-def _production_client(
-    monkeypatch: pytest.MonkeyPatch,
-    clocks: _Clocks,
-) -> TestClient:
+@contextmanager
+def _production_client(monkeypatch: pytest.MonkeyPatch):
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    workflow_plugin_api._close_runtime()
-    monkeypatch.setattr(workflow_plugin_api, "_schedule_now_utc", clocks.utcnow)
-    client = TestClient(
+    with TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
-    )
-    return client
+    ) as client:
+        yield client
 
 
 def _schedule_showcase(
@@ -289,7 +285,8 @@ def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
     coordinator, identity, epoch = _leader(store, clocks, "task-4-7-success")
     runner = _RecordingAIRunner()
     binding = _binding(runner)
-    client = _production_client(monkeypatch, clocks)
+    client_context = _production_client(monkeypatch)
+    client = client_context.__enter__()
     service, scheduler = _service_and_scheduler(
         home, store, clocks, identity, epoch, binding
     )
@@ -297,13 +294,10 @@ def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
     try:
         from hermes_cli import web_server
 
-        unauthenticated_client = TestClient(web_server.app)
-        try:
+        with TestClient(web_server.app) as unauthenticated_client:
             unauthenticated = unauthenticated_client.get(
                 "/api/plugins/workflow/workflows"
             )
-        finally:
-            unauthenticated_client.close()
         assert unauthenticated.status_code == 401
         run_id, schedule_at = _schedule_showcase(
             client,
@@ -379,8 +373,7 @@ def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
         assert _ProviderTrap.requests == 0
     finally:
         scheduler.shutdown(deadline_seconds=5)
-        client.close()
-        workflow_plugin_api._close_runtime()
+        client_context.__exit__(None, None, None)
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -400,7 +393,8 @@ def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
     store = RunStore(home, lease_clock=clocks.lease_sample)
     coordinator, identity, epoch = _leader(store, clocks, "task-4-7-cancel")
     runner = _RecordingAIRunner()
-    client = _production_client(monkeypatch, clocks)
+    client_context = _production_client(monkeypatch)
+    client = client_context.__enter__()
 
     try:
         run_id, schedule_at = _schedule_showcase(
@@ -425,8 +419,8 @@ def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
             event["event_type"] == "run_cancelled" for event in events.json()["events"]
         )
 
-        client.close()
-        workflow_plugin_api._close_runtime()
+        client_context.__exit__(None, None, None)
+        client_context = None
         restarted = RunStore(home, lease_clock=clocks.lease_sample)
         clocks.wall = datetime.fromisoformat(schedule_at.replace("Z", "+00:00"))
         service, scheduler = _service_and_scheduler(
@@ -458,8 +452,8 @@ def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
         assert runner.requests == []
         assert _ProviderTrap.requests == 0
     finally:
-        client.close()
-        workflow_plugin_api._close_runtime()
+        if client_context is not None:
+            client_context.__exit__(None, None, None)
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -479,7 +473,8 @@ def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
     store = RunStore(home, lease_clock=clocks.lease_sample)
     coordinator, identity, epoch = _leader(store, clocks, "task-4-7-rebuild")
     runner = _RecordingAIRunner()
-    client = _production_client(monkeypatch, clocks)
+    client_context = _production_client(monkeypatch)
+    client = client_context.__enter__()
 
     try:
         run_id, schedule_at = _schedule_showcase(
@@ -488,8 +483,8 @@ def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
             workflow="scheduling",
             key="task-4-7-scheduling-rebuild",
         )
-        client.close()
-        workflow_plugin_api._close_runtime()
+        client_context.__exit__(None, None, None)
+        client_context = None
         store.database.unlink()
 
         rebuilt = RunStore(home, lease_clock=clocks.lease_sample)
@@ -544,8 +539,8 @@ def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
         assert runner.requests == []
         assert _ProviderTrap.requests == 0
     finally:
-        client.close()
-        workflow_plugin_api._close_runtime()
+        if client_context is not None:
+            client_context.__exit__(None, None, None)
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -576,7 +571,8 @@ def test_scheduled_ai_revalidates_actual_runner_and_runtime_before_claim(
     store = RunStore(home, lease_clock=clocks.lease_sample)
     coordinator, identity, epoch = _leader(store, clocks, f"task-4-7-{context}")
     runner = _RecordingAIRunner()
-    client = _production_client(monkeypatch, clocks)
+    client_context = _production_client(monkeypatch)
+    client = client_context.__enter__()
 
     try:
         run_id, schedule_at = _schedule_showcase(
@@ -616,8 +612,7 @@ def test_scheduled_ai_revalidates_actual_runner_and_runtime_before_claim(
         else:
             assert len(_run_events(store, run_id, "run_promoted")) == 1
     finally:
-        client.close()
-        workflow_plugin_api._close_runtime()
+        client_context.__exit__(None, None, None)
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()

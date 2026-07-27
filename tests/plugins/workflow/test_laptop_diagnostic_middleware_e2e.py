@@ -24,7 +24,6 @@ from plugins.workflow.evidence import EVIDENCE_KINDS
 from plugins.workflow.scheduler import RunScheduler
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.store import RunStore
-from plugins.workflow.dashboard import plugin_api as workflow_plugin_api
 from plugins.workflow.trust import (
     WorkflowResourceReadBudget,
     WorkflowTrustStore,
@@ -117,16 +116,16 @@ def _stop_service(
     assert not thread.is_alive()
 
 
-def _production_client(monkeypatch) -> TestClient:
+@contextmanager
+def _production_client(monkeypatch):
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    workflow_plugin_api._close_runtime()
-    client = TestClient(
+    with TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
-    )
-    return client
+    ) as client:
+        yield client
 
 
 def _exact_start_material(status: dict[str, object]) -> dict[str, object]:
@@ -373,7 +372,8 @@ def _exercise_laptop_branch(
 
         monkeypatch.setattr(PluginAgentRunner, "run", forbidden_real_run)
 
-    client = _production_client(monkeypatch)
+    client_context = _production_client(monkeypatch)
+    client = client_context.__enter__()
     stop = None
     thread = None
     idempotency_key = f"laptop-diagnostic-task-2-6-{branch}"
@@ -531,8 +531,7 @@ def _exercise_laptop_branch(
         return final_status, real_runner_calls
     finally:
         _stop_service(store, stop, thread)
-        client.close()
-        workflow_plugin_api._close_runtime()
+        client_context.__exit__(None, None, None)
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 

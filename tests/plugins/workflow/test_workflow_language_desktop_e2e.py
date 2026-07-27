@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 from fastapi.testclient import TestClient
 
 from plugins.workflow.trust import WorkflowTrustStore
-from plugins.workflow.dashboard import plugin_api as workflow_plugin_api
 
 
 def _tree_snapshot(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
@@ -21,6 +21,31 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
         else:
             snapshot[relative] = ("file", path.read_bytes())
     return snapshot
+
+
+def _workflow_store_io_workers() -> list[str]:
+    return sorted(
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("workflow-store-io")
+    )
+
+
+def test_testclient_lifespan_closes_workflow_store_workers(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    from hermes_cli import web_server
+
+    monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
+    assert _workflow_store_io_workers() == []
+    with TestClient(
+        web_server.app,
+        headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
+    ) as client:
+        response = client.get("/api/plugins/workflow/runs/not-a-real-run/events")
+        assert response.status_code == 404
+        assert _workflow_store_io_workers()
+    assert _workflow_store_io_workers() == []
 
 
 def test_language_status_crosses_real_desktop_middleware_without_mutation(
@@ -56,14 +81,12 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    workflow_plugin_api._close_runtime()
-    before_home = _tree_snapshot(home)
-    before_project = _tree_snapshot(workdir)
-    client = TestClient(
+    with TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
-    )
-    try:
+    ) as client:
+        before_home = _tree_snapshot(home)
+        before_project = _tree_snapshot(workdir)
         catalog_response = client.get("/api/plugins/workflow/workflows")
         assert catalog_response.status_code == 200
         rows = {
@@ -134,6 +157,3 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
         assert "authoring_schema" not in detail
         assert _tree_snapshot(home) == before_home
         assert _tree_snapshot(workdir) == before_project
-    finally:
-        client.close()
-        workflow_plugin_api._close_runtime()

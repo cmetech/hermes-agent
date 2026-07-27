@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
@@ -22,8 +23,6 @@ from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
-from plugins.workflow.dashboard.plugin_api import StartRunRequest
-from plugins.workflow.dashboard import plugin_api as workflow_plugin_api
 from plugins.workflow.entitlement import DeterministicAgentRunner
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.provenance import TriggerProvenance
@@ -194,16 +193,16 @@ def _healthy_admission_lease(store: RunStore, label: str):
     return identity, acquired.lease
 
 
-def _production_client(monkeypatch) -> TestClient:
+@contextmanager
+def _production_client(monkeypatch):
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    workflow_plugin_api._close_runtime()
-    client = TestClient(
+    with TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
-    )
-    return client
+    ) as client:
+        yield client
 
 
 def _capable_test_binding(runner) -> WorkflowRunnerBinding:
@@ -405,7 +404,8 @@ def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
         Path(showcase_module.__file__).with_name("showcases")
     )
     recording_runner = CapabilityDeclaringRecordingRunner()
-    client = _production_client(monkeypatch)
+    client_context = _production_client(monkeypatch)
+    client = client_context.__enter__()
     stop = None
     thread = None
     request_body = {
@@ -541,8 +541,7 @@ def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
         )
     finally:
         _stop_service(store, stop, thread)
-        client.close()
-        workflow_plugin_api._close_runtime()
+        client_context.__exit__(None, None, None)
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
@@ -564,7 +563,8 @@ def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
     trust_store = WorkflowTrustStore(home)
     trust_store.trust("a" * 64, actor="existing-operator", risk_digest="b" * 64)
     trust_before = trust_store.path.read_bytes()
-    client = _production_client(monkeypatch)
+    client_context = _production_client(monkeypatch)
+    client = client_context.__enter__()
 
     try:
         catalog_response = client.get("/api/plugins/workflow/workflows")
@@ -610,8 +610,7 @@ def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
         assert list(store.staging_root.iterdir()) == []
         assert _ProviderCallTrap.requests == 0
     finally:
-        client.close()
-        workflow_plugin_api._close_runtime()
+        client_context.__exit__(None, None, None)
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -648,7 +647,8 @@ def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
         "verified_showcase_run_metadata",
         explicit_real_non_ai_metadata,
     )
-    client = _production_client(monkeypatch)
+    client_context = _production_client(monkeypatch)
+    client = client_context.__enter__()
     stop = None
     thread = None
 
@@ -705,8 +705,7 @@ def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
         )
     finally:
         _stop_service(store, stop, thread)
-        client.close()
-        workflow_plugin_api._close_runtime()
+        client_context.__exit__(None, None, None)
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
@@ -738,7 +737,8 @@ def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
         epoch=lease.epoch,
         now=datetime.now(timezone.utc),
     )
-    client = _production_client(monkeypatch)
+    client_context = _production_client(monkeypatch)
+    client = client_context.__enter__()
     stop = None
     thread = None
 
@@ -757,8 +757,7 @@ def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
         )
     finally:
         _stop_service(store, stop, thread)
-        client.close()
-        workflow_plugin_api._close_runtime()
+        client_context.__exit__(None, None, None)
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
@@ -774,7 +773,8 @@ def test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
     showcase_module._clear_verified_showcase_cache_for_tests()
     store = RunStore(home)
     identity, lease = _healthy_admission_lease(store, "task-3-4-runtime-change")
-    client = _production_client(monkeypatch)
+    client_context = _production_client(monkeypatch)
+    client = client_context.__enter__()
     stop = None
     thread = None
 
@@ -820,8 +820,7 @@ def test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
         assert _ProviderCallTrap.requests == 0
     finally:
         _stop_service(store, stop, thread)
-        client.close()
-        workflow_plugin_api._close_runtime()
+        client_context.__exit__(None, None, None)
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -871,14 +870,25 @@ def test_production_api_and_coordinator_share_binding_declaration_and_no_request
     finally:
         scheduler.shutdown()
 
-    forbidden = {
-        "runner",
-        "runner_binding",
-        "runner_capabilities",
-        "runtime_capabilities",
-        "mcp_available",
-        "ai_entitlement",
-        "consent",
-        "confirmation_token",
-    }
-    assert forbidden.isdisjoint(StartRunRequest.model_fields)
+    from hermes_cli import web_server
+
+    with TestClient(
+        web_server.app,
+        headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
+    ) as client:
+        rejected = client.post(
+            "/api/plugins/workflow/runs",
+            json={
+                "workflow": "unreachable",
+                "values": {},
+                "idempotency_key": "task-7-request-contract",
+                "concurrency_policy": "queue",
+                "runner_binding": "test-only-seam",
+            },
+        )
+    assert rejected.status_code == 422
+    assert any(
+        issue["loc"] == ["body", "runner_binding"]
+        and issue["type"] == "extra_forbidden"
+        for issue in rejected.json()["detail"]
+    )
