@@ -274,6 +274,39 @@ def is_origin_trusted(profile: Optional[BrowserProfile], url: str) -> bool:
     return False
 
 
+_HERMES_HOME_TOKENS = ("${HERMES_HOME}", "$HERMES_HOME", "%HERMES_HOME%")
+
+
+def resolve_user_data_dir(profile: BrowserProfile) -> str:
+    """Return ``profile``'s persistent profile directory as an ABSOLUTE path.
+
+    ``${HERMES_HOME}`` is expanded through ``hermes_constants.get_hermes_home()``
+    rather than ``os.path.expandvars``. ``HERMES_HOME`` is only exported into
+    ``os.environ`` on the ``--profile`` override path: on the plain CLI and on
+    ``hermes serve`` it is unset, so ``expandvars`` returns the literal
+    ``${HERMES_HOME}/browser-profiles/enrolled`` and ``os.makedirs`` creates that
+    directory RELATIVE TO THE CWD. The persistent SSO profile this whole feature
+    exists for would then live in whatever directory the agent happened to be in
+    and would not survive a CWD change (review finding M-3).
+
+    Going through the resolver is also strictly more correct than the env var:
+    it honours the context-local home override, which ``expandvars`` cannot see.
+
+    An empty ``user_data_dir`` falls back to ``<home>/browser-profiles/<name>``
+    so a hand-written profile without one still gets a persistent directory
+    instead of failing in ``os.makedirs("")``.
+    """
+    from hermes_constants import get_hermes_home
+
+    home = str(get_hermes_home())
+    raw = (profile.user_data_dir or "").strip()
+    if not raw:
+        return os.path.abspath(os.path.join(home, "browser-profiles", profile.name))
+    for token in _HERMES_HOME_TOKENS:
+        raw = raw.replace(token, home)
+    return os.path.abspath(os.path.expandvars(os.path.expanduser(raw)))
+
+
 def _enrolled_candidates() -> List[str]:
     """Return likely enrolled-browser executable paths for this platform.
 

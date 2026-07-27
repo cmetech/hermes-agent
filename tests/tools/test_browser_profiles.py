@@ -315,3 +315,70 @@ class TestCandidateOrder:
             assert "chrome-headless-shell" not in lowered
             assert "agent-browser" not in lowered
             assert "ms-playwright" not in lowered
+
+
+class TestResolveUserDataDir:
+    """M-3: ``${HERMES_HOME}`` never reached ``expandvars`` with a value.
+
+    HERMES_HOME is only exported to ``os.environ`` on the ``--profile`` override
+    path. On the plain CLI and on ``hermes serve`` it is unset, so the old
+    ``os.path.expandvars`` returned the LITERAL and ``os.makedirs`` created
+    ``./${HERMES_HOME}/browser-profiles/enrolled`` relative to the CWD -- the
+    persistent SSO profile the whole feature exists for did not survive a
+    directory change.
+    """
+
+    @staticmethod
+    def _profile(user_data_dir, name="enrolled"):
+        return browser_profiles.BrowserProfile(
+            name=name,
+            kind=browser_profiles.KIND_ENROLLED,
+            user_data_dir=user_data_dir,
+        )
+
+    @pytest.fixture()
+    def _home(self, tmp_path, monkeypatch):
+        import hermes_constants
+
+        home = tmp_path / "brandhome"
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: home)
+        return home
+
+    def test_unset_hermes_home_still_yields_an_absolute_path(self, _home):
+        resolved = browser_profiles.resolve_user_data_dir(
+            self._profile("${HERMES_HOME}/browser-profiles/enrolled")
+        )
+        import os
+
+        assert os.path.isabs(resolved)
+        assert resolved == str(_home / "browser-profiles" / "enrolled")
+
+    def test_the_literal_token_never_survives(self, _home):
+        for raw in ("${HERMES_HOME}/p", "$HERMES_HOME/p", "%HERMES_HOME%/p"):
+            resolved = browser_profiles.resolve_user_data_dir(self._profile(raw))
+            assert "HERMES_HOME" not in resolved, raw
+            assert resolved == str(_home / "p")
+
+    def test_env_var_path_still_works(self, tmp_path, monkeypatch):
+        """Where HERMES_HOME IS exported, the resolver agrees with it."""
+        import hermes_constants
+
+        home = tmp_path / "envhome"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        # get_hermes_home() reads HERMES_HOME; assert against the real resolver.
+        assert str(hermes_constants.get_hermes_home()) == str(home)
+        resolved = browser_profiles.resolve_user_data_dir(
+            self._profile("${HERMES_HOME}/browser-profiles/enrolled")
+        )
+        assert resolved == str(home / "browser-profiles" / "enrolled")
+
+    def test_a_relative_path_is_made_absolute(self, _home):
+        import os
+
+        resolved = browser_profiles.resolve_user_data_dir(self._profile("rel/dir"))
+        assert os.path.isabs(resolved)
+
+    def test_empty_user_data_dir_falls_back_under_the_home(self, _home):
+        resolved = browser_profiles.resolve_user_data_dir(self._profile("", name="corp"))
+        assert resolved == str(_home / "browser-profiles" / "corp")

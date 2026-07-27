@@ -160,7 +160,7 @@ def _ensure_enrolled_cdp(profile: browser_profiles.BrowserProfile, headless: boo
             "Set browser.profiles.<name>.executable to an absolute path."
         )
 
-    user_data_dir = os.path.expandvars(profile.user_data_dir)
+    user_data_dir = browser_profiles.resolve_user_data_dir(profile)
     os.makedirs(user_data_dir, exist_ok=True)
 
     args = [

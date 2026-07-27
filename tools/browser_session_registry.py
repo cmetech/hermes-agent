@@ -123,7 +123,11 @@ def default_profile_launchable() -> bool:
     if not name:
         return False
     try:
-        from tools.browser_profiles import get_profile, resolve_executable
+        from tools.browser_profiles import (
+            get_profile,
+            resolve_executable,
+            resolve_user_data_dir,
+        )
 
         profile = get_profile(name)
         if profile is None or not profile.is_enrolled:
@@ -132,8 +136,12 @@ def default_profile_launchable() -> bool:
             return False
         # A launch that cannot create its user-data-dir, or whose port is out of
         # range, fails on every acquire -- do not advertise the tools for it.
-        data_dir = os.path.expandvars(profile.user_data_dir or "")
-        if not data_dir:
+        # resolve_user_data_dir, not expandvars: HERMES_HOME is unset on the CLI
+        # and `hermes serve` paths, where expandvars leaves the literal
+        # "${HERMES_HOME}/..." in place -- non-empty, so this check passed while
+        # the directory it described was CWD-relative (review finding M-3).
+        data_dir = resolve_user_data_dir(profile)
+        if not data_dir or not os.path.isabs(data_dir):
             return False
         if not (1 <= int(profile.cdp_port) <= 65535):
             return False
