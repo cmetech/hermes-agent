@@ -5,6 +5,15 @@ support edge capabilities. Each manifest identifies exact files and symbols,
 the independent commit boundary, regression tests, merge guidance, and the
 upstream commit against which the behavior was last verified.
 
+`owned_symbols` is reserved for bounded, exact identifiers that the checker
+can locate in a declared file at `HEAD`; behavioral prose belongs in the
+optional bounded `owned_invariants` list. New or migrated entries may select
+`overlap_policy: owned_symbol` (the compatibility default) or
+`overlap_policy: any_owned_file`. The latter makes every change to a declared
+file decision-required even when no exact symbol span changed, and is required
+for security, admission, exact-byte authority, Desktop capability, schema, and
+release-gate seams.
+
 Validate feature-diff coverage:
 
 ```bash
@@ -21,7 +30,10 @@ python3 scripts/check_upstream_customizations.py \
   --upstream-diff RANGE --report overlap-report.json
 ```
 
-An `owned_symbol` or `possible_upstream_equivalent` result requires an explicit
-review acknowledgement in the report. Textual merge cleanliness is never proof
-that the recorded behavior survived. Baselines advance only through the
-controlled upstream-merge workflow after the named tests pass.
+Every report row marked `decision_required` requires an explicit `preserve`,
+`adapt`, or `remove-as-upstream-equivalent` decision. This includes
+`owned_symbol` and `possible_upstream_equivalent` results plus `same_file`
+results governed by `any_owned_file`; a prior acknowledgement never substitutes
+for the current decision. Textual merge cleanliness is never proof that the
+recorded behavior survived. Baselines advance only through the controlled
+upstream-merge workflow after the named tests pass.

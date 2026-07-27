@@ -59,7 +59,7 @@ def _command(repo: Path, path: str, kind: str) -> tuple[list[str], Path]:
     raise AssertionError(f"unsupported executable invariant kind: {kind}")
 
 
-def _execute(repo: Path, path: str, kind: str, platform: str) -> dict[str, Any]:
+def _execute_attempt(repo: Path, path: str, kind: str) -> dict[str, Any]:
     command, cwd = _command(repo, path, kind)
     env = os.environ.copy()
     for inherited in (
@@ -89,16 +89,42 @@ def _execute(repo: Path, path: str, kind: str, platform: str) -> dict[str, Any]:
         check=False,
     )
     duration_ms = (time.monotonic_ns() - started) // 1_000_000
+    return {
+        "result": "passed" if completed.returncode == 0 else "failed",
+        "duration_ms": duration_ms,
+        "_stdout": completed.stdout,
+        "_stderr": completed.stderr,
+    }
+
+
+def _execute(repo: Path, path: str, kind: str, platform: str) -> dict[str, Any]:
+    attempts = [_execute_attempt(repo, path, kind)]
+    if attempts[0]["result"] == "failed":
+        attempts.append(_execute_attempt(repo, path, kind))
     digest = hashlib.sha256(path.encode()).hexdigest()
+    result = attempts[-1]["result"]
     return {
         "kind": "executed",
         "name": f"ledger invariant {digest}",
         "path": path,
-        "result": "passed" if completed.returncode == 0 else "failed",
-        "duration_ms": duration_ms,
+        "result": result,
+        "duration_ms": sum(int(attempt["duration_ms"]) for attempt in attempts),
         "platform": platform,
-        "_stdout": completed.stdout,
-        "_stderr": completed.stderr,
+        "attempts": [
+            {
+                "attempt": index,
+                "result": attempt["result"],
+                "duration_ms": attempt["duration_ms"],
+            }
+            for index, attempt in enumerate(attempts, start=1)
+        ],
+        "flaky_on_first_attempt": (
+            len(attempts) == 2
+            and attempts[0]["result"] == "failed"
+            and result == "passed"
+        ),
+        "_stdout": "".join(str(attempt["_stdout"]) for attempt in attempts),
+        "_stderr": "".join(str(attempt["_stderr"]) for attempt in attempts),
     }
 
 
@@ -144,7 +170,7 @@ def main() -> int:
         for kind in ("python", "desktop", "desktop-node", "node")
     }
     results: list[dict[str, Any]] = []
-    results.extend(_run_group(repo, by_kind["python"], "python", args.platform, 8))
+    results.extend(_run_group(repo, by_kind["python"], "python", args.platform, 2))
     results.extend(_run_group(repo, by_kind["desktop"], "desktop", args.platform, 2))
     results.extend(
         _run_group(

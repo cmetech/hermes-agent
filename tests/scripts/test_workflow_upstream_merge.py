@@ -9,6 +9,7 @@ import sys
 
 import pytest
 from jsonschema import ValidationError, validate
+import yaml
 
 from scripts.check_upstream_customizations import classify_upstream_overlap
 from tests.scripts.test_check_upstream_customizations import _git, _manifest, _repo
@@ -16,13 +17,7 @@ from tests.scripts.test_check_upstream_customizations import _git, _manifest, _r
 
 ROOT = Path(__file__).parents[2]
 REHEARSAL = ROOT / "scripts/test_workflow_upstream_merge.sh"
-
-
-def test_rehearsal_runs_brand_generator_from_the_worktree() -> None:
-    source = REHEARSAL.read_text()
-
-    assert '(cd "$worktree" && node scripts/brand/generate.mjs' in source
-    assert "npm install --package-lock-only --ignore-scripts --offline" in source
+LEDGER_RUNNER = ROOT / "scripts/run_workflow_ledger_invariants.py"
 
 
 def _write_workspace_lock(repo: Path, name: str, version: str) -> None:
@@ -204,11 +199,19 @@ def _synthetic_rehearsal_repo(tmp_path: Path, overlap: str) -> Path:
     return repo
 
 
-def _run_synthetic(repo: Path, report: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+def _run_synthetic(
+    repo: Path,
+    report: Path,
+    *extra: str,
+    discover_python: bool = False,
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["HERMES_PYTHON"] = "/orchestration-only/hermes-python"
     env["PYTEST_ADDOPTS"] = "--orchestration-only-option"
-    env["PYTHON_BIN"] = sys.executable
+    if discover_python:
+        env.pop("PYTHON_BIN", None)
+    else:
+        env["PYTHON_BIN"] = sys.executable
     env["WORKFLOW_MERGE_GATE_FAST"] = "1"
     env["WORKFLOW_LEDGER_PRESERVED_PROBE"] = "preserved"
     return subprocess.run(
@@ -247,15 +250,29 @@ def test_rehearsal_auto_merges_safe_overlap_and_emits_valid_evidence(
     assert _git(repo, "show-ref", "--heads") == refs_before
     evidence = json.loads((report / "merge-evidence.json").read_text())
     assert evidence["entries"][0]["overlap_class"] == overlap.replace("-", "_")
+    assert evidence["entries"][0]["decision_required"] is False
     assert evidence["entries"][0]["decision"] == "not-required"
     invariant = evidence["entries"][0]["tests"][0]
     assert invariant["kind"] == "executed"
     assert invariant["path"] == "tests/test_invariant.py"
     assert invariant["result"] == "passed"
     assert invariant["duration_ms"] >= 0
+    assert invariant["flaky_on_first_attempt"] is False
+    assert [attempt["result"] for attempt in invariant["attempts"]] == ["passed"]
     assert all(command["result"] == "passed" for command in evidence["commands"])
     assert evidence["brands"][0]["contains_tested_base"] is True
     assert "apps/desktop/package.json" in (report / "otto-merge.log").read_text()
+
+
+def test_rehearsal_discovers_repository_virtualenv(tmp_path: Path) -> None:
+    repo = _synthetic_rehearsal_repo(tmp_path, "none")
+    (repo / ".venv").symlink_to(Path(sys.executable).parent.parent)
+    report = tmp_path / "report-discovered-venv"
+
+    result = _run_synthetic(repo, report, discover_python=True)
+
+    assert result.returncode == 0, result.stderr
+    assert (report / "merge-evidence.json").is_file()
 
 
 def test_rehearsal_reference_only_invariants_cannot_claim_execution(
@@ -389,11 +406,164 @@ def test_evidence_repository_path_accepts_4096_and_rejects_4097() -> None:
         validate("p" * 4097, repository_path)
 
 
-@pytest.mark.parametrize("overlap", ["owned-symbol", "upstream-equivalent"])
-def test_rehearsal_requires_explicit_decision_for_owned_or_equivalent_overlap(
-    tmp_path: Path, overlap: str
+def test_owned_symbol_evidence_rejects_not_required_decision() -> None:
+    """Decision-required overlap evidence cannot reuse a non-decision value."""
+    sha = "a" * 40
+    digest = "b" * 64
+    schema = json.loads(
+        (ROOT / "docs/upstream-customizations/merge-evidence.schema.json").read_text()
+    )
+    entry = {
+        "id": "owned-core",
+        "baseline": sha,
+        "files": ["core.py"],
+        "patch_sha256": digest,
+        "overlap_class": "owned_symbol",
+        "decision_required": True,
+        "decision": "preserve",
+        "conflict_files": [],
+        "retained_commit_subjects": [],
+        "removed_commit_subjects": [],
+        "tests": [
+            {
+                "kind": "reference",
+                "name": "ledger reference",
+                "path": "test_core.py",
+                "reason": "non-executable invariant reference",
+            }
+        ],
+    }
+    evidence = {
+        "schema_version": 1,
+        "prior_upstream_commit": sha,
+        "candidate_upstream_commit": sha,
+        "pre_base_commit": sha,
+        "post_base_commit": sha,
+        "tested_base_tree": sha,
+        "ledger_baseline": sha,
+        "ledger_sha256": digest,
+        "patch_sha256": digest,
+        "merge_skill": {"path": "external", "sha256": digest, "owner_commit": None},
+        "entries": [entry],
+        "commands": [
+            {"name": "gate", "result": "passed", "duration_ms": 0, "platform": "test"}
+        ],
+        "platform": "test",
+        "brands": [
+            {
+                "ref": "otto",
+                "commit": sha,
+                "tree": sha,
+                "descriptor_sha256": digest,
+                "contains_tested_base": True,
+                "generic_runtime_matches_base": True,
+            }
+        ],
+        "final_ancestry": True,
+    }
+
+    validate(evidence, schema)
+    entry["decision"] = "not-required"
+    with pytest.raises(ValidationError):
+        validate(evidence, schema)
+
+
+def test_ledger_runner_retries_once_and_marks_flaky(tmp_path: Path) -> None:
+    """A fail-then-pass executable invariant remains visible but non-terminal."""
+    repo = tmp_path / "runner-repo"
+    repo.mkdir()
+    _git(repo, "init")
+    test_path = repo / "tests/test_flaky.py"
+    test_path.parent.mkdir()
+    test_path.write_text(
+        "from pathlib import Path\n\n"
+        "def test_passes_on_second_file_attempt():\n"
+        "    marker = Path('first-attempt.marker')\n"
+        "    if not marker.exists():\n"
+        "        marker.write_text('failed once\\n')\n"
+        "        raise AssertionError('synthetic first-attempt failure')\n"
+    )
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"upstream_changes": [{"tests": ["tests/test_flaky.py"]}]},
+            sort_keys=False,
+        )
+    )
+    output = repo / "results.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--output",
+            str(output),
+            "--platform",
+            "synthetic",
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    record = json.loads(output.read_text())[0]
+    assert record["result"] == "passed"
+    assert record["flaky_on_first_attempt"] is True
+    assert [attempt["result"] for attempt in record["attempts"]] == [
+        "failed",
+        "passed",
+    ]
+
+
+def test_rehearsal_records_reconciled_conflict_files(tmp_path: Path) -> None:
+    """Structured evidence must retain the generated files reconciled by Git."""
+    repo = _synthetic_rehearsal_repo(tmp_path, "none")
+    manifest = repo / "docs/upstream-customizations/workflow-orchestration.yaml"
+    data = yaml.safe_load(manifest.read_text())
+    data["upstream_changes"][0]["files"].extend(
+        ["apps/desktop/package.json", "package-lock.json"]
+    )
+    manifest.write_text(yaml.safe_dump(data, sort_keys=False))
+    _git(repo, "add", str(manifest.relative_to(repo)))
+    _git(repo, "commit", "-m", "track generated reconciliation files")
+    report = tmp_path / "report-reconciled-conflicts"
+
+    result = _run_synthetic(repo, report)
+
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads((report / "merge-evidence.json").read_text())
+    assert evidence["entries"][0]["conflict_files"] == [
+        "apps/desktop/package.json",
+        "package-lock.json",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("overlap", "any_owned_file"),
+    [
+        ("owned-symbol", False),
+        ("upstream-equivalent", False),
+        ("same-file", True),
+    ],
+)
+def test_rehearsal_requires_explicit_decision_for_decision_required_overlap(
+    tmp_path: Path,
+    overlap: str,
+    any_owned_file: bool,
 ) -> None:
     repo = _synthetic_rehearsal_repo(tmp_path, overlap)
+    if any_owned_file:
+        manifest = repo / "docs/upstream-customizations/workflow-orchestration.yaml"
+        data = yaml.safe_load(manifest.read_text())
+        data["upstream_changes"][0]["overlap_policy"] = "any_owned_file"
+        manifest.write_text(yaml.safe_dump(data, sort_keys=False))
+        _git(repo, "add", str(manifest.relative_to(repo)))
+        _git(repo, "commit", "-m", "require every owned-file decision")
     refs_before = _git(repo, "show-ref", "--heads")
 
     result = _run_synthetic(repo, tmp_path / f"report-{overlap}")

@@ -76,14 +76,40 @@
     },
     "executedTest": {
       "type": "object",
-      "required": ["kind", "name", "path", "result", "duration_ms", "platform"],
+      "required": [
+        "kind",
+        "name",
+        "path",
+        "result",
+        "duration_ms",
+        "platform",
+        "attempts",
+        "flaky_on_first_attempt"
+      ],
       "properties": {
         "kind": {"const": "executed"},
         "name": {"$ref": "#/$defs/safeText"},
         "path": {"$ref": "#/$defs/repositoryPath"},
         "result": {"enum": ["passed", "failed"]},
         "duration_ms": {"type": "integer", "minimum": 0},
-        "platform": {"$ref": "#/$defs/safeText"}
+        "platform": {"$ref": "#/$defs/safeText"},
+        "attempts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {"$ref": "#/$defs/testAttempt"}
+        },
+        "flaky_on_first_attempt": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "testAttempt": {
+      "type": "object",
+      "required": ["attempt", "result", "duration_ms"],
+      "properties": {
+        "attempt": {"type": "integer", "minimum": 1, "maximum": 2},
+        "result": {"enum": ["passed", "failed"]},
+        "duration_ms": {"type": "integer", "minimum": 0}
       },
       "additionalProperties": false
     },
@@ -121,6 +147,7 @@
         "files",
         "patch_sha256",
         "overlap_class",
+        "decision_required",
         "decision",
         "conflict_files",
         "retained_commit_subjects",
@@ -139,12 +166,13 @@
         "overlap_class": {
           "enum": ["none", "same_file", "owned_symbol", "possible_upstream_equivalent"]
         },
+        "decision_required": {"type": "boolean"},
         "decision": {
           "enum": ["not-required", "preserve", "adapt", "remove-as-upstream-equivalent"]
         },
         "conflict_files": {
           "type": "array",
-          "items": {"$ref": "#/$defs/safeText"}
+          "items": {"$ref": "#/$defs/repositoryPath"}
         },
         "retained_commit_subjects": {
           "type": "array",
@@ -165,6 +193,21 @@
           }
         }
       },
+      "allOf": [
+        {
+          "if": {
+            "required": ["decision_required"],
+            "properties": {"decision_required": {"const": true}}
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": ["preserve", "adapt", "remove-as-upstream-equivalent"]
+              }
+            }
+          }
+        }
+      ],
       "additionalProperties": false
     },
     "brand": {

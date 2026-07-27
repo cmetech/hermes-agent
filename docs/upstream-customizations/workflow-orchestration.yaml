@@ -173,7 +173,7 @@ upstream_changes:
   - tests/scripts/test_workflow_merge_gate.py
   owned_symbols:
   - showcase schedule confirmation base-gate membership
-  - test_showcase_schedule_confirmation_suite_is_promoted_into_base_gate
+  - test_base_gate_executes_the_release_contract_through_fixture_commands
   tests:
   - tests/plugins/workflow/test_showcase_schedule_e2e.py
   - tests/scripts/test_workflow_merge_gate.py
@@ -1473,7 +1473,7 @@ upstream_changes:
   - trusted package-to-immutable snapshot digest comparison
   - workflow_filename_components_are_distinct
   - test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary
-  - test_merge_gate_pins_workflow_catalog_desktop_e2e_contract
+  - test_base_gate_executes_the_release_contract_through_fixture_commands
   tests:
   - tests/plugins/workflow/test_desktop_api.py
   - tests/plugins/workflow/test_store.py
@@ -3132,6 +3132,7 @@ upstream_changes:
 - id: workflow-language-contracts
   change_class: workflow-compatibility
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - plugins/workflow/language.py
   - plugins/workflow/models.py
@@ -3145,6 +3146,7 @@ upstream_changes:
   - normalize_workflow
   - bind_semantic_fingerprint
   - language_projection
+  owned_invariants:
   - YAML-native scalar canonicalization
   - strict non-finite JSON float canonicalization
   - collision-proof typed normalized value graph
@@ -3169,6 +3171,7 @@ upstream_changes:
 - id: workflow-language-profile-normalization
   change_class: workflow-compatibility
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - plugins/workflow/language.py
   - plugins/workflow/models.py
@@ -3187,20 +3190,21 @@ upstream_changes:
   - WorkflowPackage.language
   - WorkflowPackage.compatibility_findings
   - language_compatibility_findings
-  - profile-aware unknown top-level field policy
-  - explicit language declaration type enforcement
-  - companion-aware discovery cache signature
-  - stable compatibility finding codes
   - DynamicCompatibilityCode
   - DYNAMIC_LANGUAGE_COMPATIBILITY_CODES
   - legacy_idle_timeout_seconds
   - archon_idle_timeout_semantics_unavailable
+  - WorkflowCompatibilityBlockedError
+  - require_runnable
+  owned_invariants:
+  - profile-aware unknown top-level field policy
+  - explicit language declaration type enforcement
+  - companion-aware discovery cache signature
+  - stable compatibility finding codes
   - compatibility finding effective-profile invariant
   - assess_package_execution environment compatibility finding
   - _verified_distribution_assessment environment compatibility finding
   - validate and doctor language projections
-  - WorkflowCompatibilityBlockedError
-  - require_runnable
   - compatibility refusal before CLI trust/run, Gateway, and API persistence
   tests:
   - tests/plugins/workflow/test_schema.py
@@ -3280,6 +3284,7 @@ upstream_changes:
 - id: workflow-language-admission-pinning
   change_class: workflow-security
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - plugins/workflow/language.py
   - plugins/workflow/admission.py
@@ -3316,19 +3321,8 @@ upstream_changes:
   - test_verified_load_rejects_normalizer_drift_for_authenticated_bytes
   - PreparedRunSnapshot.language
   - PreparedRunSnapshot.sealed_snapshot_digest
-  - run projection snapshot_format_version
-  - resources.json language metadata
-  - resources.json sealed_paths metadata
-  - run projection language metadata
-  - run projection sealed_snapshot_digest
-  - load_workflow_snapshot normalizer_version pin
-  - RunScheduler._load_verified_run_package atomic verification result
-  - RunScheduler._load_run_package sealed language verification
   - RunScheduler.verified_always_run_nodes
   - RunScheduler._legacy_package_with_valid_resource_precedence
-  - RunStore.resume_run always_run_nodes
-  - _cmd_resume authenticated resume policy
-  - mutate_run authenticated resume policy
   - RunScheduler._verify_legacy_journaled_seals
   - RunScheduler._legacy_raw_package_paths
   - RunScheduler._legacy_raw_package_bytes
@@ -3337,24 +3331,36 @@ upstream_changes:
   - RunScheduler._verify_legacy_postparse_identity
   - RunScheduler._legacy_package_digest_for_identity
   - read_sealed_snapshot_paths
+  - NodeExecutionContext.sealed_resource_paths
+  - NodeExecutionContext.sealed_resource_bytes
+  - WorkflowResourceReadBudget.from_authenticated
+  - test_production_authority_accepts_512_files_and_refuses_513_before_admission
+  - AuthenticatedExecutionMaterializer
+  owned_invariants:
+  - run projection snapshot_format_version
+  - resources.json language metadata
+  - resources.json sealed_paths metadata
+  - run projection language metadata
+  - run projection sealed_snapshot_digest
+  - load_workflow_snapshot normalizer_version pin
+  - RunScheduler._load_verified_run_package atomic verification result
+  - RunScheduler._load_run_package sealed language verification
+  - RunStore.resume_run always_run_nodes
+  - _cmd_resume authenticated resume policy
+  - mutate_run authenticated resume policy
   - sealed_snapshot_digest admitted-path verification
   - sealed_snapshot_digest allow_unsealed_regular_files
   - verify_sealed_snapshot language identity verification
-  - NodeExecutionContext.sealed_resource_paths
-  - NodeExecutionContext.sealed_resource_bytes
   - NodeExecutionContext positional constructor compatibility
   - ResourceResolver sealed-path candidate authorization
   - ResourceResolver authenticated-byte rebinding
   - ResourceResolver sealed-byte-exclusive resource reads
-  - WorkflowResourceReadBudget.from_authenticated
   - WorkflowResourceReadBudget canonical shared-run accounting
-  - test_production_authority_accepts_512_files_and_refuses_513_before_admission
   - verify_sealed_snapshot shared fire-time read budget
   - revalidate_scheduled_run shared fire-time read budget
   - _ScheduledPromotionAuthorization resource read budget authority
   - RunScheduler scheduled promotion-to-package budget threading
   - authoritative workflow resource capacity limits
-  - AuthenticatedExecutionMaterializer
   - AuthenticatedExecutionMaterializer canonical closure materialization
   - AuthenticatedExecutionMaterializer compact private manifest capability
   - AuthenticatedExecutionMaterializer control/payload namespace separation
@@ -3569,6 +3575,7 @@ upstream_changes:
 - id: workflow-language-schema-cli
   change_class: workflow-compatibility
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - hermes_cli/main.py
   - plugins/workflow/language_schema.py
@@ -3584,21 +3591,22 @@ upstream_changes:
   - FieldCompatibility
   - StructuralRequirement
   - STRUCTURAL_REQUIREMENTS
-  - JSON truthiness schema helper
   - FIELD_INVENTORY
   - definition_field_names
   - common_node_field_names
   - structural_node_field_names
   - inapplicable_node_fields
   - sidecar_field_names
-  - nested parser field inventory accessors
   - definition_json_schema
   - sidecar_json_schema
   - compatibility_code_catalog
   - workflow_authoring_contract
-  - workflow schema CLI command
   - configure_schema_parser
   - emit_schema
+  owned_invariants:
+  - JSON truthiness schema helper
+  - nested parser field inventory accessors
+  - workflow schema CLI command
   - exact top-level workflow schema action resolution
   - parsed normal dispatch target precedence
   - workflow schema local and global profile option routing
@@ -3651,6 +3659,7 @@ upstream_changes:
 - id: workflow-language-desktop-status
   change_class: workflow-compatibility
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - plugins/workflow/projection_limits.py
   - plugins/workflow/cli.py
@@ -3772,6 +3781,7 @@ upstream_changes:
 - id: workflow-language-desktop-capability-skew
   change_class: workflow-compatibility
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - apps/desktop/src/app/workflows/catalog-run-policy.ts
   - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
@@ -3790,6 +3800,7 @@ upstream_changes:
   - desktopWorkflowRunDisabledReason
   - desktopWorkflowLanguageLabel
   - workflowLanguage
+  owned_invariants:
   - fail-closed unknown and incoherent Desktop run-support handling
   - explicit catalog-versus-detail Desktop Run policy shape
   - null-safe absent, undefined, and null workflow readiness projections
@@ -3870,11 +3881,14 @@ upstream_changes:
 - id: workflow-language-regression-gates
   change_class: workflow-testing
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - scripts/test_workflow_merge_gate.sh
   - tests/scripts/test_workflow_merge_gate.py
   - .github/workflows/ci.yml
   owned_symbols:
+  - PYTHON_BIN
+  owned_invariants:
   - Phase 1 language base merge-gate suite selection
   - Phase 1 language native portability matrix suite selection
   - relative PYTHON_BIN canonicalization before repository switching

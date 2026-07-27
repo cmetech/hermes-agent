@@ -18,6 +18,11 @@ import yaml
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _MAX_EVIDENCE_ID_LENGTH = 512
 _MAX_REPOSITORY_PATH_LENGTH = 4096
+_MAX_OWNED_SYMBOL_LENGTH = 256
+_MAX_OWNED_INVARIANT_LENGTH = 512
+_MAX_OWNED_INVARIANTS = 128
+_OVERLAP_POLICIES = frozenset({"owned_symbol", "any_owned_file"})
+_MACHINE_SYMBOL = re.compile(r"^\S+$")
 _EPHEMERAL_COVERAGE_PATHS = frozenset({".superpowers/sdd/progress.md"})
 _REQUIRED = {
     "id", "change_class", "owner", "files", "owned_symbols", "tests",
@@ -160,11 +165,48 @@ def load_and_validate_manifest(
                 path = _contained(repo, raw)
                 if not path.is_file():
                     raise ValueError(f"ledger path does not exist: {raw}")
-        for field in ("owned_symbols",):
-            if not isinstance(entry.get(field), list) or not all(
-                isinstance(value, str) and value for value in entry[field]
-            ):
-                raise ValueError(f"{entry_id}.{field} must contain names")
+        symbols = entry.get("owned_symbols")
+        if not isinstance(symbols, list) or not symbols or not all(
+            isinstance(value, str) and value for value in symbols
+        ):
+            raise ValueError(f"{entry_id}.owned_symbols must contain names")
+        overlap_policy = entry.get("overlap_policy", "owned_symbol")
+        if overlap_policy not in _OVERLAP_POLICIES:
+            raise ValueError(
+                f"{entry_id}.overlap_policy must be owned_symbol or any_owned_file"
+            )
+        invariants = entry.get("owned_invariants", [])
+        if not isinstance(invariants, list) or len(invariants) > _MAX_OWNED_INVARIANTS:
+            raise ValueError(
+                f"{entry_id}.owned_invariants must be a list with at most "
+                f"{_MAX_OWNED_INVARIANTS} items"
+            )
+        if not all(
+            isinstance(value, str)
+            and bool(value.strip())
+            and len(value) <= _MAX_OWNED_INVARIANT_LENGTH
+            for value in invariants
+        ):
+            raise ValueError(
+                f"{entry_id}.owned_invariants must contain bounded non-empty prose"
+            )
+        strict_symbols = _strict_owned_symbols(entry)
+        if "overlap_policy" in entry and len(strict_symbols) != len(symbols):
+            phrase = next(symbol for symbol in symbols if symbol not in strict_symbols)
+            raise ValueError(
+                f"{entry_id}.owned_symbols must contain exact machine-locatable "
+                f"identifiers; move prose to owned_invariants: {phrase!r}"
+            )
+        sources = [
+            _contained(repo, raw).read_text(encoding="utf-8", errors="replace")
+            for raw in entry["files"]
+        ]
+        for symbol in strict_symbols:
+            if not any(_source_contains_symbol(source, symbol) for source in sources):
+                raise ValueError(
+                    f"{entry_id} owned symbol {symbol!r} does not exist in "
+                    "declared files at HEAD"
+                )
         for field in ("expected_commit_subject", "merge_guidance", "removal_condition"):
             if not isinstance(entry.get(field), str) or not entry[field].strip():
                 raise ValueError(f"{entry_id}.{field} must be non-empty")
@@ -202,9 +244,6 @@ def _range_right(diff_range: str) -> str:
 
 
 def _range_base(data: dict[str, Any], repo: Path, diff_range: str) -> str:
-    coverage = data.get("coverage")
-    if isinstance(coverage, dict):
-        return str(coverage["base_commit"])
     if "..." in diff_range:
         left, right = diff_range.split("...", 1)
         return _git(repo, "merge-base", left, right).strip()
@@ -222,9 +261,9 @@ def _existed_at(repo: Path, revision: str, path: str) -> bool:
 
 
 def _validate_coverage_commits(
-    coverage: dict[str, Any], repo: Path, right: str
+    coverage: dict[str, Any], repo: Path, right: str, *, left: str | None = None
 ) -> list[str]:
-    base = coverage["base_commit"]
+    base = left or coverage["base_commit"]
     for label, commit in (("coverage base", base), ("coverage range tip", right)):
         proc = subprocess.run(
             ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
@@ -242,13 +281,7 @@ def _validate_coverage_commits(
     commits = _git(repo, "rev-list", "--reverse", f"{base}..{right}").splitlines()
     in_range = set(commits)
     excluded = {item["commit"] for item in coverage.get("excluded_commits", [])}
-    outside = excluded - in_range
-    if outside:
-        raise ValueError(
-            "excluded commits are outside the coverage range: "
-            + ", ".join(sorted(outside))
-        )
-    return [commit for commit in commits if commit not in excluded]
+    return [commit for commit in commits if commit not in (excluded & in_range)]
 
 
 def _coverage_changes(
@@ -257,7 +290,9 @@ def _coverage_changes(
     coverage = data.get("coverage")
     if coverage is None:
         return None
-    commits = _validate_coverage_commits(coverage, repo, _range_right(diff_range))
+    right = _range_right(diff_range)
+    left = _range_base(data, repo, diff_range)
+    commits = _validate_coverage_commits(coverage, repo, right, left=left)
     changes: list[tuple[str, list[str]]] = []
     for commit in commits:
         changes.extend(_changed_paths(repo, f"{commit}^..{commit}"))
@@ -368,6 +403,29 @@ def _symbol_spans(source: str, symbols: list[str]) -> dict[str, list[tuple[int, 
     return spans
 
 
+def _source_contains_symbol(source: str, symbol: str) -> bool:
+    terminal = symbol.rsplit(".", 1)[-1]
+    spans = _symbol_spans(source, [symbol])
+    if spans[symbol]:
+        return True
+    for candidate in (symbol, terminal):
+        if re.search(
+            rf"(?<![A-Za-z0-9_$]){re.escape(candidate)}(?![A-Za-z0-9_$])",
+            source,
+        ):
+            return True
+    return False
+
+
+def _strict_owned_symbols(entry: dict[str, Any]) -> list[str]:
+    return [
+        symbol
+        for symbol in entry["owned_symbols"]
+        if len(symbol) <= _MAX_OWNED_SYMBOL_LENGTH
+        and bool(_MACHINE_SYMBOL.fullmatch(symbol))
+    ]
+
+
 def _changed_line_numbers(diff: str) -> tuple[set[int], set[int]]:
     old_lines: set[int] = set()
     new_lines: set[int] = set()
@@ -393,6 +451,7 @@ def _owned_symbol_hits(
 ) -> list[str]:
     left = diff_range.split("..", 1)[0]
     hits: set[str] = set()
+    symbols = _strict_owned_symbols(entry)
     for path in paths:
         diff = _git(repo, "diff", "--unified=0", diff_range, "--", path)
         old_changed, new_changed = _changed_line_numbers(diff)
@@ -401,14 +460,14 @@ def _owned_symbol_hits(
         except OSError:
             new_source = ""
         old_source = _git(repo, "show", f"{left}:{path}", check=False)
-        for symbol, spans in _symbol_spans(new_source, entry["owned_symbols"]).items():
+        for symbol, spans in _symbol_spans(new_source, symbols).items():
             if any(any(start <= line <= end for line in new_changed) for start, end in spans):
                 hits.add(symbol)
-        for symbol, spans in _symbol_spans(old_source, entry["owned_symbols"]).items():
+        for symbol, spans in _symbol_spans(old_source, symbols).items():
             if any(any(start <= line <= end for line in old_changed) for start, end in spans):
                 hits.add(symbol)
         changed_text = _changed_lines(repo, diff_range, [path])
-        for symbol in entry["owned_symbols"]:
+        for symbol in symbols:
             if re.search(rf"\b{re.escape(symbol)}\b", changed_text):
                 hits.add(symbol)
     return sorted(hits)
@@ -421,7 +480,7 @@ def classify_upstream_overlap(
     changed = {path for _status, paths in changes for path in paths}
     owned_files = set(entry["files"])
     same_files = sorted(changed & owned_files)
-    symbols = entry["owned_symbols"]
+    symbols = _strict_owned_symbols(entry)
     owned_hits = _owned_symbol_hits(entry, repo, diff_range, same_files)
     if owned_hits:
         classification = "owned_symbol"
@@ -445,13 +504,25 @@ def classify_upstream_overlap(
         "id": entry["id"],
         "change_class": entry["change_class"],
         "files": entry["files"],
-        "owned_symbols": entry["owned_symbols"],
+        "owned_symbols": symbols,
+        "owned_invariants": [
+            *entry.get("owned_invariants", []),
+            *[symbol for symbol in entry["owned_symbols"] if symbol not in symbols],
+        ],
+        "overlap_policy": entry.get("overlap_policy", "owned_symbol"),
         "expected_commit_subject": entry["expected_commit_subject"],
         "classification": classification,
         "rationale": rationale,
         "merge_guidance": entry["merge_guidance"],
         "removal_condition": entry["removal_condition"],
         "tests": entry["tests"],
+        "decision_required": bool(
+            classification in {"owned_symbol", "possible_upstream_equivalent"}
+            or (
+                classification == "same_file"
+                and entry.get("overlap_policy", "owned_symbol") == "any_owned_file"
+            )
+        ),
         "acknowledged": False,
     }
 
@@ -519,11 +590,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
             else:
                 print(json.dumps(report, indent=2))
-            if any(
-                item["classification"] in {"owned_symbol", "possible_upstream_equivalent"}
-                and not item["acknowledged"]
-                for item in overlaps
-            ):
+            if any(item["decision_required"] for item in overlaps):
                 return 2
     except ValueError as exc:
         print(f"customization ledger error: {exc}", file=sys.stderr)

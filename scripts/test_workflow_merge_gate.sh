@@ -54,6 +54,10 @@ esac
 [[ -x "$PYTHON_BIN" ]] || { echo "python interpreter is not executable: $PYTHON_BIN" >&2; exit 1; }
 
 cd "$ROOT"
+if [[ "$PHASE" == "base" ]] && [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+  echo "tracked working tree is dirty; refusing to seal TESTED_BASE_SHA" >&2
+  exit 1
+fi
 "$PYTHON_BIN" "$CHECKER" --manifest "$MANIFEST"
 
 if [[ "$PHASE" == "base" ]]; then

@@ -88,7 +88,7 @@ def test_manifest_bounds_evidence_identity_and_exact_repository_paths(
     monkeypatch.setattr(
         customization_checker,
         "_contained",
-        lambda _repo, _raw: repo / "test_core.py",
+        lambda _repo, _raw: repo / "core.py",
     )
     data["upstream_changes"][0]["tests"] = ["t" * 4096]
     manifest.write_text(yaml.safe_dump(data))
@@ -181,6 +181,38 @@ def test_overlap_classification_distinguishes_file_symbol_and_equivalent(
     assert classify_upstream_overlap(entry, repo, f"{third}..HEAD")["classification"] == "possible_upstream_equivalent"
 
 
+def test_any_owned_file_overlap_requires_explicit_decision(tmp_path: Path) -> None:
+    """Removing the policy branch would let same-file security churn continue."""
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["upstream_changes"][0]["overlap_policy"] = "any_owned_file"
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    entry = load_and_validate_manifest(manifest, repo)["upstream_changes"][0]
+
+    (repo / "core.py").write_text("class Owned:\n    pass\n# upstream security edit\n")
+    _git(repo, "commit", "-am", "upstream same-file security edit")
+
+    overlap = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
+    assert overlap["classification"] == "same_file"
+    assert overlap["decision_required"] is True
+
+
+def test_strict_owned_symbol_must_exist_in_declared_files(tmp_path: Path) -> None:
+    """Renaming away a strict identifier must invalidate the ledger immediately."""
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["upstream_changes"][0]["overlap_policy"] = "owned_symbol"
+    raw["upstream_changes"][0]["owned_symbols"] = ["RenamedAway"]
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+
+    with pytest.raises(ValueError, match="RenamedAway.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
 def test_overlap_reporting_is_read_only_for_git_and_baseline(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     baseline = _git(repo, "rev-parse", "HEAD")
@@ -241,13 +273,34 @@ def test_manifest_coverage_scope_excludes_pre_feature_and_named_release_commits(
     manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
     data = load_and_validate_manifest(manifest, repo)
 
-    validate_diff_coverage(data, repo, f"{root}..HEAD")
+    validate_diff_coverage(data, repo, f"{feature_base}..HEAD")
 
     (repo / "unledgered_feature.py").write_text("value = 1\n")
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "feature scope leak")
     with pytest.raises(ValueError, match="unledgered_feature.py"):
-        validate_diff_coverage(data, repo, f"{root}..HEAD")
+        validate_diff_coverage(data, repo, f"{feature_base}..HEAD")
+
+
+def test_diff_coverage_honors_requested_left_revision(tmp_path: Path) -> None:
+    """A narrow caller range must not inherit unrelated older ledger debt."""
+    repo = _repo(tmp_path)
+    coverage_base = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, coverage_base)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["coverage"] = {"base_commit": coverage_base, "excluded_commits": []}
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+
+    (repo / "older_unrelated.py").write_text("value = 'outside requested range'\n")
+    _git(repo, "add", "older_unrelated.py")
+    _git(repo, "commit", "-m", "older unrelated customization")
+    requested_left = _git(repo, "rev-parse", "HEAD")
+
+    (repo / "core.py").write_text("class Owned:\n    value = 1\n")
+    _git(repo, "commit", "-am", "feat: owned")
+    data = load_and_validate_manifest(manifest, repo)
+
+    validate_diff_coverage(data, repo, f"{requested_left}..HEAD")
 
 
 def test_manifest_coverage_ignores_only_local_sdd_progress_ledger(
