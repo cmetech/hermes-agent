@@ -273,10 +273,16 @@ def _run_events(store: RunStore, run_id: str, event_type: str) -> list[dict]:
 def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    client: TestClient | None = None,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
+    if client is None:
+        with _production_client(monkeypatch) as active_client:
+            return test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
+                tmp_path, monkeypatch, client=active_client
+            )
     provider, base_url = _provider_trap()
     _write_runtime_config(home, base_url)
     showcase_module._clear_verified_showcase_cache_for_tests()
@@ -285,8 +291,6 @@ def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
     coordinator, identity, epoch = _leader(store, clocks, "task-4-7-success")
     runner = _RecordingAIRunner()
     binding = _binding(runner)
-    client_context = _production_client(monkeypatch)
-    client = client_context.__enter__()
     service, scheduler = _service_and_scheduler(
         home, store, clocks, identity, epoch, binding
     )
@@ -373,7 +377,6 @@ def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
         assert _ProviderTrap.requests == 0
     finally:
         scheduler.shutdown(deadline_seconds=5)
-        client_context.__exit__(None, None, None)
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -382,10 +385,16 @@ def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
 def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    client: TestClient | None = None,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
+    if client is None:
+        with _production_client(monkeypatch) as active_client:
+            return test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
+                tmp_path, monkeypatch, client=active_client
+            )
     provider, base_url = _provider_trap()
     _write_runtime_config(home, base_url)
     showcase_module._clear_verified_showcase_cache_for_tests()
@@ -393,8 +402,6 @@ def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
     store = RunStore(home, lease_clock=clocks.lease_sample)
     coordinator, identity, epoch = _leader(store, clocks, "task-4-7-cancel")
     runner = _RecordingAIRunner()
-    client_context = _production_client(monkeypatch)
-    client = client_context.__enter__()
 
     try:
         run_id, schedule_at = _schedule_showcase(
@@ -419,8 +426,6 @@ def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
             event["event_type"] == "run_cancelled" for event in events.json()["events"]
         )
 
-        client_context.__exit__(None, None, None)
-        client_context = None
         restarted = RunStore(home, lease_clock=clocks.lease_sample)
         clocks.wall = datetime.fromisoformat(schedule_at.replace("Z", "+00:00"))
         service, scheduler = _service_and_scheduler(
@@ -452,8 +457,6 @@ def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
         assert runner.requests == []
         assert _ProviderTrap.requests == 0
     finally:
-        if client_context is not None:
-            client_context.__exit__(None, None, None)
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -462,10 +465,16 @@ def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
 def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    client: TestClient | None = None,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
+    if client is None:
+        with _production_client(monkeypatch) as active_client:
+            return test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
+                tmp_path, monkeypatch, client=active_client
+            )
     provider, base_url = _provider_trap()
     _write_runtime_config(home, base_url)
     showcase_module._clear_verified_showcase_cache_for_tests()
@@ -473,8 +482,6 @@ def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
     store = RunStore(home, lease_clock=clocks.lease_sample)
     coordinator, identity, epoch = _leader(store, clocks, "task-4-7-rebuild")
     runner = _RecordingAIRunner()
-    client_context = _production_client(monkeypatch)
-    client = client_context.__enter__()
 
     try:
         run_id, schedule_at = _schedule_showcase(
@@ -483,8 +490,6 @@ def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
             workflow="scheduling",
             key="task-4-7-scheduling-rebuild",
         )
-        client_context.__exit__(None, None, None)
-        client_context = None
         store.database.unlink()
 
         rebuilt = RunStore(home, lease_clock=clocks.lease_sample)
@@ -539,8 +544,6 @@ def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
         assert runner.requests == []
         assert _ProviderTrap.requests == 0
     finally:
-        if client_context is not None:
-            client_context.__exit__(None, None, None)
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -560,10 +563,21 @@ def test_scheduled_ai_revalidates_actual_runner_and_runtime_before_claim(
     context: str,
     expected_status: str,
     expected_requests: int,
+    client: TestClient | None = None,
 ) -> None:
     home = tmp_path / context
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
+    if client is None:
+        with _production_client(monkeypatch) as active_client:
+            return test_scheduled_ai_revalidates_actual_runner_and_runtime_before_claim(
+                tmp_path,
+                monkeypatch,
+                context,
+                expected_status,
+                expected_requests,
+                client=active_client,
+            )
     provider, base_url = _provider_trap()
     _write_runtime_config(home, base_url)
     showcase_module._clear_verified_showcase_cache_for_tests()
@@ -571,8 +585,6 @@ def test_scheduled_ai_revalidates_actual_runner_and_runtime_before_claim(
     store = RunStore(home, lease_clock=clocks.lease_sample)
     coordinator, identity, epoch = _leader(store, clocks, f"task-4-7-{context}")
     runner = _RecordingAIRunner()
-    client_context = _production_client(monkeypatch)
-    client = client_context.__enter__()
 
     try:
         run_id, schedule_at = _schedule_showcase(
@@ -612,7 +624,6 @@ def test_scheduled_ai_revalidates_actual_runner_and_runtime_before_claim(
         else:
             assert len(_run_events(store, run_id, "run_promoted")) == 1
     finally:
-        client_context.__exit__(None, None, None)
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()

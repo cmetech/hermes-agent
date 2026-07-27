@@ -13,6 +13,7 @@ import threading
 import time
 
 from fastapi.testclient import TestClient
+import pytest
 
 from agent.plugin_agent import PluginAgentRunner
 from hermes_cli.plugin_services import BackgroundServiceContext
@@ -298,12 +299,28 @@ def _exercise_laptop_branch(
     caplog,
     *,
     branch: str,
+    client: TestClient | None = None,
+    after_client_start=None,
+    stop_service=_stop_service,
 ) -> tuple[dict[str, object], int]:
     home = tmp_path / "home"
-    copied = tmp_path / "showcases"
-    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
+    if client is None:
+        with _production_client(monkeypatch) as active_client:
+            if after_client_start is not None:
+                after_client_start(active_client)
+            return _exercise_laptop_branch(
+                tmp_path,
+                monkeypatch,
+                caplog,
+                branch=branch,
+                client=active_client,
+                stop_service=stop_service,
+            )
+
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
     monkeypatch.setattr(
         showcase_module,
         "_bundle_path",
@@ -372,8 +389,6 @@ def _exercise_laptop_branch(
 
         monkeypatch.setattr(PluginAgentRunner, "run", forbidden_real_run)
 
-    client_context = _production_client(monkeypatch)
-    client = client_context.__enter__()
     stop = None
     thread = None
     idempotency_key = f"laptop-diagnostic-task-2-6-{branch}"
@@ -492,7 +507,7 @@ def _exercise_laptop_branch(
             )
             assert outcome["nodes"]["review-plan"]["approval_rework_attempts"] == 1
 
-        _stop_service(store, stop, thread)
+        stop_service(store, stop, thread)
         stop = None
         thread = None
         final_status, start_material = _assert_exact_identity_and_limits(
@@ -530,8 +545,7 @@ def _exercise_laptop_branch(
         )
         return final_status, real_runner_calls
     finally:
-        _stop_service(store, stop, thread)
-        client_context.__exit__(None, None, None)
+        stop_service(store, stop, thread)
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
@@ -569,3 +583,51 @@ def test_laptop_diagnostic_real_middleware_rejects_with_bounded_offline_rework(
     assert outcome["status"] == "cancelled"
     assert outcome["nodes"]["review-plan"]["approval_rework_attempts"] == 1
     assert real_runner_calls == 0
+
+
+def test_laptop_client_lifespan_exits_after_post_enter_setup_failure(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    def fail_after_worker_starts(client: TestClient) -> None:
+        response = client.get("/api/plugins/workflow/runs/not-a-real-run/events")
+        assert response.status_code == 404
+        raise RuntimeError("post-enter setup failure")
+
+    with pytest.raises(RuntimeError, match="post-enter setup failure"):
+        _exercise_laptop_branch(
+            tmp_path,
+            monkeypatch,
+            caplog,
+            branch="approve",
+            after_client_start=fail_after_worker_starts,
+        )
+    assert not any(
+        thread.name.startswith("workflow-store-io")
+        for thread in threading.enumerate()
+    )
+
+
+def test_laptop_client_lifespan_exits_when_service_cleanup_raises(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    def start_worker(client: TestClient) -> None:
+        response = client.get("/api/plugins/workflow/runs/not-a-real-run/events")
+        assert response.status_code == 404
+
+    def stop_then_raise(store, stop, thread) -> None:
+        _stop_service(store, stop, thread)
+        raise RuntimeError("service cleanup failure")
+
+    with pytest.raises(RuntimeError, match="service cleanup failure"):
+        _exercise_laptop_branch(
+            tmp_path,
+            monkeypatch,
+            caplog,
+            branch="approve",
+            after_client_start=start_worker,
+            stop_service=stop_then_raise,
+        )
+    assert not any(
+        thread.name.startswith("workflow-store-io")
+        for thread in threading.enumerate()
+    )

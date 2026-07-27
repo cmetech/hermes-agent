@@ -388,10 +388,16 @@ def _start_provider_trap() -> tuple[ThreadingHTTPServer, str]:
 def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
     tmp_path,
     monkeypatch,
+    client: TestClient | None = None,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
+    if client is None:
+        with _production_client(monkeypatch) as active_client:
+            return test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
+                tmp_path, monkeypatch, client=active_client
+            )
     _write_runtime_config(home, api_mode="chat_completions")
     showcase_module._clear_verified_showcase_cache_for_tests()
     store = RunStore(home)
@@ -404,8 +410,6 @@ def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
         Path(showcase_module.__file__).with_name("showcases")
     )
     recording_runner = CapabilityDeclaringRecordingRunner()
-    client_context = _production_client(monkeypatch)
-    client = client_context.__enter__()
     stop = None
     thread = None
     request_body = {
@@ -541,17 +545,22 @@ def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
         )
     finally:
         _stop_service(store, stop, thread)
-        client_context.__exit__(None, None, None)
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
 def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
     tmp_path,
     monkeypatch,
+    client: TestClient | None = None,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
+    if client is None:
+        with _production_client(monkeypatch) as active_client:
+            return test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
+                tmp_path, monkeypatch, client=active_client
+            )
     provider, base_url = _start_provider_trap()
     _write_runtime_config(
         home,
@@ -563,8 +572,6 @@ def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
     trust_store = WorkflowTrustStore(home)
     trust_store.trust("a" * 64, actor="existing-operator", risk_digest="b" * 64)
     trust_before = trust_store.path.read_bytes()
-    client_context = _production_client(monkeypatch)
-    client = client_context.__enter__()
 
     try:
         catalog_response = client.get("/api/plugins/workflow/workflows")
@@ -610,7 +617,6 @@ def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
         assert list(store.staging_root.iterdir()) == []
         assert _ProviderCallTrap.requests == 0
     finally:
-        client_context.__exit__(None, None, None)
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -619,10 +625,16 @@ def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
 def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
     tmp_path,
     monkeypatch,
+    client: TestClient | None = None,
 ) -> None:
     home = tmp_path / "non-ai"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
+    if client is None:
+        with _production_client(monkeypatch) as active_client:
+            return test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
+                tmp_path, monkeypatch, client=active_client
+            )
     _write_runtime_config(home, api_mode="chat_completions")
     showcase_module._clear_verified_showcase_cache_for_tests()
     store = RunStore(home)
@@ -647,8 +659,6 @@ def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
         "verified_showcase_run_metadata",
         explicit_real_non_ai_metadata,
     )
-    client_context = _production_client(monkeypatch)
-    client = client_context.__enter__()
     stop = None
     thread = None
 
@@ -705,17 +715,22 @@ def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
         )
     finally:
         _stop_service(store, stop, thread)
-        client_context.__exit__(None, None, None)
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
 def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
     tmp_path,
     monkeypatch,
+    client: TestClient | None = None,
 ) -> None:
     home = tmp_path / "digest-mismatch"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
+    if client is None:
+        with _production_client(monkeypatch) as active_client:
+            return test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
+                tmp_path, monkeypatch, client=active_client
+            )
     _write_runtime_config(home, api_mode="chat_completions")
     showcase_module._clear_verified_showcase_cache_for_tests()
     store = RunStore(home)
@@ -737,8 +752,6 @@ def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
         epoch=lease.epoch,
         now=datetime.now(timezone.utc),
     )
-    client_context = _production_client(monkeypatch)
-    client = client_context.__enter__()
     stop = None
     thread = None
 
@@ -757,24 +770,27 @@ def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
         )
     finally:
         _stop_service(store, stop, thread)
-        client_context.__exit__(None, None, None)
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
 def test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
     tmp_path,
     monkeypatch,
+    client: TestClient | None = None,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
+    if client is None:
+        with _production_client(monkeypatch) as active_client:
+            return test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
+                tmp_path, monkeypatch, client=active_client
+            )
     provider, base_url = _start_provider_trap()
     _write_runtime_config(home, api_mode="chat_completions", base_url=base_url)
     showcase_module._clear_verified_showcase_cache_for_tests()
     store = RunStore(home)
     identity, lease = _healthy_admission_lease(store, "task-3-4-runtime-change")
-    client_context = _production_client(monkeypatch)
-    client = client_context.__enter__()
     stop = None
     thread = None
 
@@ -820,7 +836,6 @@ def test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
         assert _ProviderCallTrap.requests == 0
     finally:
         _stop_service(store, stop, thread)
-        client_context.__exit__(None, None, None)
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
