@@ -429,7 +429,33 @@ def _authority_relative(
         return None
 
 
-def _normalized_classification_value(value: str) -> str:
+def _has_valid_percent_syntax(value: str) -> bool:
+    return all(
+        character != "%"
+        or (
+            index + 2 < len(value)
+            and value[index + 1] in _HEX_DIGITS
+            and value[index + 2] in _HEX_DIGITS
+        )
+        for index, character in enumerate(value)
+    )
+
+
+def _supported_network_view(value: str, *, compound: bool) -> bool:
+    candidate = value.strip()
+    if compound:
+        assignment = _COMPOUND_OPTION_ASSIGNMENT.fullmatch(candidate)
+        if assignment is not None:
+            candidate = assignment.group("value")
+    match = _URI_SCHEME.fullmatch(candidate)
+    return bool(
+        match is not None
+        and match.group("scheme").lower() in _NETWORK_URI_SCHEMES
+        and match.group("body").startswith("//")
+    )
+
+
+def _normalized_classification_value(value: str, *, compound: bool) -> str:
     """Return a bounded, unambiguous view used only for safety classification."""
     try:
         encoded_size = len(value.encode("utf-8"))
@@ -440,15 +466,14 @@ def _normalized_classification_value(value: str) -> str:
     normalized = value
     max_passes = min(max(len(value), 1), _CLASSIFICATION_MAX_DECODE_PASSES)
     for _ in range(max_passes):
+        if _supported_network_view(normalized, compound=compound):
+            if not _has_valid_percent_syntax(normalized):
+                raise PackageMCPUnavailable(_CLOSURE_ERROR)
+            return normalized.strip()
         if "%" not in normalized:
             return normalized.strip()
-        for index, character in enumerate(normalized):
-            if character == "%" and (
-                index + 2 >= len(normalized)
-                or normalized[index + 1] not in _HEX_DIGITS
-                or normalized[index + 2] not in _HEX_DIGITS
-            ):
-                raise PackageMCPUnavailable(_CLOSURE_ERROR)
+        if not _has_valid_percent_syntax(normalized):
+            raise PackageMCPUnavailable(_CLOSURE_ERROR)
         try:
             expanded = unquote(normalized, errors="strict")
         except UnicodeDecodeError as exc:
@@ -460,7 +485,7 @@ def _normalized_classification_value(value: str) -> str:
 
 
 def _path_candidate(value: str, *, compound: bool = False) -> tuple[str, str]:
-    normalized = _normalized_classification_value(value)
+    normalized = _normalized_classification_value(value, compound=compound)
     if compound:
         match = _COMPOUND_OPTION_ASSIGNMENT.fullmatch(normalized.strip())
         if match is not None:

@@ -452,8 +452,14 @@ def test_sealed_mcp_rejects_undeclared_path_like_values_after_interpolation(
         ("arg", "data:text/plain;base64,UQ=="),
         ("arg", "vscode://file/tmp/mutable.py"),
         ("arg", "unknown+local://host/tmp/mutable"),
+        ("arg", "prefixhttps://network.example.test/a/%25"),
+        ("arg", "file:https://network.example.test/a/%25"),
+        ("arg", "https://network.example.test/a/%ZZ"),
         ("arg", "--config=SQLITE%3A%2F%2F%2Ftmp%2Fmutable.db"),
         ("arg", "--endpoint%3Dfile%3A%2F%2F%2Ftmp%2Fmutable.txt"),
+        ("arg", "--endpoint%3Dfile%253Ahttps%253A%252F%252Fnetwork.example.test"),
+        ("arg", "--endpoint=%20https://network.example.test/a/%25"),
+        ("arg", "junk%3Dhttps://network.example.test/a/%25"),
         ("arg", _nested_percent_encode("--config=file:///tmp/mutable.txt", 6)),
         ("arg", "--config%3Dfile%2"),
         ("arg", "file%3"),
@@ -538,10 +544,14 @@ def test_sealed_mcp_preserves_explicit_network_urls(tmp_path, scheme):
     server = {
         "command": "mcp-server-fetch",
         "args": [
-            f"{scheme}://network.example.test/a/b",
-            f"--endpoint={scheme.upper()}://network.example.test/c/d",
+            f"{scheme}://network.example.test/a/%25literal?ratio=100%25",
+            f"--endpoint={scheme.upper()}://network.example.test/c/%25?ratio=100%25",
         ],
-        "env": {"REMOTE_ENDPOINT": f"  {scheme}://network.example.test/e/f  "},
+        "env": {
+            "REMOTE_ENDPOINT": (
+                f"  {scheme}://network.example.test/e/%25?ratio=100%25  "
+            )
+        },
     }
     authenticated = {"mcp/echo.yaml": yaml.safe_dump({"echo": server}).encode()}
     materializer = AuthenticatedExecutionMaterializer()
@@ -561,15 +571,17 @@ def test_sealed_mcp_preserves_encoded_network_and_ordinary_literal_values(tmp_pa
     server = {
         "command": "mcp-server-fetch",
         "args": [
-            _nested_percent_encode("https://network.example.test/a/b", 6),
             _nested_percent_encode(
-                "--endpoint=wss://network.example.test/socket", 6
+                "https://network.example.test/a/%25?ratio=100%25", 6
+            ),
+            _nested_percent_encode(
+                "--endpoint=wss://network.example.test/%25?ratio=100%25", 6
             ),
             "ordinary%20encoded%20literal",
         ],
         "env": {
             "REMOTE_ENDPOINT": _nested_percent_encode(
-                "ws://network.example.test/events", 6
+                "ws://network.example.test/%25?ratio=100%25", 6
             )
         },
     }
@@ -618,7 +630,9 @@ def test_sealed_mcp_preserves_encoded_network_and_ordinary_literal_values(tmp_pa
         ),
         (
             {
-                "url": _nested_percent_encode("https://mcp.example.test/sse", 6),
+                "url": _nested_percent_encode(
+                    "https://mcp.example.test/%25?ratio=100%25", 6
+                ),
                 "headers": {"Authorization": "Bearer ordinary-token"},
             },
             None,

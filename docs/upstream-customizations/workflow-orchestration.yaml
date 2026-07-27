@@ -3300,6 +3300,7 @@ upstream_changes:
   - plugin-agent worker post-interpolation lexical default-deny path policy
   - plugin-agent worker explicit network URI allow-list and encoded URI rejection
   - plugin-agent worker stable bounded percent-normalization classification view
+  - plugin-agent worker supported-network percent-preservation boundary
   - plugin-agent worker executable-scoped package option classification
   - plugin-agent worker isolated Python inline and module launch policy
   - plugin-agent worker compact manifest validation and nonlocal metadata stripping
@@ -3417,9 +3418,16 @@ upstream_changes:
     256 KB MCP field ceiling, repeatedly strict-percent-decode until stable with at
     most 64 shrinking passes, and reject malformed encoding, invalid UTF-8,
     non-shrinking or residual ambiguous percent syntax, and inputs that still need
-    decoding at the safety bound. Normalize surrounding whitespace and scheme case
-    only for classification and preserve the original value only after the
-    normalized view is proven allowed. Preserve explicit HTTP, HTTPS, WS, and WSS network URIs with
+    decoding at the safety bound. At each bounded decode stage, stop recursion only
+    when the complete value or a real normalized compound RHS is already a
+    syntactically valid HTTP, HTTPS, WS, or WSS network URI with valid current
+    percent escapes; this preserves `%25` in supported network paths and queries
+    without reprocessing its decoded literal percent. Never search inside prefixes,
+    whitespace-padded RHS values, unknown/local schemes, or malformed assignments
+    for a network-looking substring, and continue stable decoding until deeply
+    encoded local/unknown schemes and assignments are classified or rejected.
+    Normalize surrounding whitespace and scheme case only for classification and
+    preserve the original value only after the normalized view is proven allowed. Preserve explicit HTTP, HTTPS, WS, and WSS network URIs with
     authority delimiters, but reject local, embedded, IDE, database, socket, and
     unknown URI schemes in commands, exact or compound arguments, environment
     values, runtime files, and top-level remote configurations before MCP spawn.
