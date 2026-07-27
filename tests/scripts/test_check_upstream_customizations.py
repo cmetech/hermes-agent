@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import subprocess
 
 import pytest
@@ -213,6 +214,119 @@ def test_strict_owned_symbol_must_exist_in_declared_files(tmp_path: Path) -> Non
         load_and_validate_manifest(manifest, repo, check_git=False)
 
 
+@pytest.mark.parametrize(
+    ("source", "symbol"),
+    [
+        ("class Owned:\n    pass\n# CommentOnly\n", "CommentOnly"),
+        (
+            "class Owned:\n    pass\n\nclass OtherOwner:\n"
+            "    def terminal(self):\n        pass\n",
+            "MissingOwner.terminal",
+        ),
+    ],
+)
+def test_strict_owned_symbol_ignores_comments_and_qualified_collisions(
+    tmp_path: Path,
+    source: str,
+    symbol: str,
+) -> None:
+    repo = _repo(tmp_path)
+    (repo / "core.py").write_text(source)
+    _git(repo, "commit", "-am", "replace symbol source")
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["upstream_changes"][0]["overlap_policy"] = "owned_symbol"
+    raw["upstream_changes"][0]["owned_symbols"] = [symbol]
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+
+    with pytest.raises(ValueError, match=rf"{re.escape(symbol)}.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_strict_owned_symbol_uses_committed_head_not_dirty_bytes(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["upstream_changes"][0]["overlap_policy"] = "owned_symbol"
+    raw["upstream_changes"][0]["owned_symbols"] = ["DirtyOnly"]
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    (repo / "core.py").write_text("class Owned:\n    pass\n\nclass DirtyOnly:\n    pass\n")
+
+    with pytest.raises(ValueError, match="DirtyOnly.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_manifest_rejects_malformed_policy_and_invariant_shapes(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    raw = yaml.safe_load(manifest.read_text())
+    entry = raw["upstream_changes"][0]
+
+    entry["overlap_policy"] = ["owned_symbol"]
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    with pytest.raises(ValueError, match="overlap_policy must be a string"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+    entry["overlap_policy"] = "owned_symbol"
+    entry["owned_invariants"] = {"not": "a list"}
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    with pytest.raises(ValueError, match="owned_invariants must be a list"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+    entry["owned_invariants"] = ["bounded"] * 129
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    with pytest.raises(ValueError, match="at most 128"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+    entry["owned_invariants"] = ["x" * 513]
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    with pytest.raises(ValueError, match="bounded non-empty prose"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_overlap_uses_non_head_right_blob_not_checkout_bytes(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(_manifest(repo, baseline), repo)[
+        "upstream_changes"
+    ][0]
+    (repo / "core.py").write_text(
+        "class Owned:\n    pass\n\n    def added_on_right(self):\n        return True\n"
+    )
+    _git(repo, "commit", "-am", "right changes owned span")
+    right = _git(repo, "rev-parse", "HEAD")
+    (repo / "core.py").write_text("class Owned:\n    pass\n")
+    _git(repo, "commit", "-am", "later checkout no longer has right bytes")
+
+    overlap = classify_upstream_overlap(entry, repo, f"{baseline}..{right}")
+
+    assert overlap["classification"] == "owned_symbol"
+
+
+def test_overlap_triple_dot_uses_merge_base_and_non_head_right(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(_manifest(repo, baseline), repo)[
+        "upstream_changes"
+    ][0]
+    _git(repo, "checkout", "-b", "left")
+    (repo / "core.py").write_text("class Owned:\n    left_only = True\n")
+    _git(repo, "commit", "-am", "left owned change")
+    left = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-b", "right", baseline)
+    (repo / "core.py").write_text("class Owned:\n    pass\n# right same-file edit\n")
+    _git(repo, "commit", "-am", "right same-file change")
+    right = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "left")
+
+    overlap = classify_upstream_overlap(entry, repo, f"{left}...{right}")
+
+    assert overlap["classification"] == "same_file"
+
+
 def test_overlap_reporting_is_read_only_for_git_and_baseline(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     baseline = _git(repo, "rev-parse", "HEAD")
@@ -298,6 +412,93 @@ def test_diff_coverage_honors_requested_left_revision(tmp_path: Path) -> None:
 
     (repo / "core.py").write_text("class Owned:\n    value = 1\n")
     _git(repo, "commit", "-am", "feat: owned")
+    data = load_and_validate_manifest(manifest, repo)
+
+    validate_diff_coverage(data, repo, f"{requested_left}..HEAD")
+
+
+def test_diff_coverage_accepts_exact_divergent_two_dot_range(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["coverage"] = {"base_commit": baseline, "excluded_commits": []}
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+
+    _git(repo, "checkout", "-b", "left")
+    (repo / "left_only.py").write_text("LEFT = True\n")
+    _git(repo, "add", "left_only.py")
+    _git(repo, "commit", "-m", "left-only history")
+    left = _git(repo, "rev-parse", "HEAD")
+
+    _git(repo, "checkout", "-b", "right", baseline)
+    (repo / "core.py").write_text("class Owned:\n    value = 'right'\n")
+    _git(repo, "commit", "-am", "feat: owned")
+    right = _git(repo, "rev-parse", "HEAD")
+    data = load_and_validate_manifest(manifest, repo)
+
+    validate_diff_coverage(data, repo, f"{left}..{right}")
+
+
+def test_diff_coverage_handles_merge_commit_inside_requested_range(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["coverage"] = {"base_commit": baseline, "excluded_commits": []}
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    primary = _git(repo, "branch", "--show-current")
+
+    _git(repo, "checkout", "-b", "owned-side")
+    (repo / "core.py").write_text("class Owned:\n    merged = True\n")
+    _git(repo, "commit", "-am", "feat: owned")
+    _git(repo, "checkout", primary)
+    (repo / "docs").mkdir()
+    (repo / "docs/main.md").write_text("main line\n")
+    _git(repo, "add", "docs/main.md")
+    _git(repo, "commit", "-m", "docs: main line")
+    _git(repo, "merge", "--no-ff", "owned-side", "-m", "merge owned side")
+    merged = _git(repo, "rev-parse", "HEAD")
+    data = load_and_validate_manifest(manifest, repo)
+
+    validate_diff_coverage(data, repo, f"{baseline}..{merged}")
+
+
+def test_diff_coverage_fails_honestly_for_malformed_revision(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["coverage"] = {"base_commit": baseline, "excluded_commits": []}
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    data = load_and_validate_manifest(manifest, repo)
+
+    with pytest.raises(ValueError, match="range left is not a local commit"):
+        validate_diff_coverage(data, repo, "definitely-missing..HEAD")
+
+
+def test_diff_coverage_applies_exclusions_only_inside_exact_range(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    (repo / "outside.py").write_text("OUTSIDE = True\n")
+    _git(repo, "add", "outside.py")
+    _git(repo, "commit", "-m", "outside caller range")
+    requested_left = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "commit", "--allow-empty", "-m", "release-only inside range")
+    excluded_inside = _git(repo, "rev-parse", "HEAD")
+    (repo / "core.py").write_text("class Owned:\n    value = 1\n")
+    _git(repo, "commit", "-am", "feat: owned")
+
+    manifest = _manifest(repo, baseline)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["coverage"] = {
+        "base_commit": baseline,
+        "excluded_commits": [
+            {"commit": baseline, "reason": "outside exact range"},
+            {"commit": excluded_inside, "reason": "release-only inside range"},
+        ],
+    }
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
     data = load_and_validate_manifest(manifest, repo)
 
     validate_diff_coverage(data, repo, f"{requested_left}..HEAD")

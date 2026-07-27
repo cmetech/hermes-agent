@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 from jsonschema import ValidationError, validate
@@ -250,6 +251,7 @@ def test_rehearsal_auto_merges_safe_overlap_and_emits_valid_evidence(
     assert _git(repo, "show-ref", "--heads") == refs_before
     evidence = json.loads((report / "merge-evidence.json").read_text())
     assert evidence["entries"][0]["overlap_class"] == overlap.replace("-", "_")
+    assert evidence["entries"][0]["overlap_policy"] == "owned_symbol"
     assert evidence["entries"][0]["decision_required"] is False
     assert evidence["entries"][0]["decision"] == "not-required"
     invariant = evidence["entries"][0]["tests"][0]
@@ -406,25 +408,30 @@ def test_evidence_repository_path_accepts_4096_and_rejects_4097() -> None:
         validate("p" * 4097, repository_path)
 
 
-def test_owned_symbol_evidence_rejects_not_required_decision() -> None:
-    """Decision-required overlap evidence cannot reuse a non-decision value."""
+def _evidence_entry(
+    *,
+    overlap_class: str = "owned_symbol",
+    overlap_policy: str = "owned_symbol",
+    decision_required: bool = True,
+    decision: str = "preserve",
+    tests: list[dict] | None = None,
+) -> dict:
     sha = "a" * 40
     digest = "b" * 64
-    schema = json.loads(
-        (ROOT / "docs/upstream-customizations/merge-evidence.schema.json").read_text()
-    )
-    entry = {
+    return {
         "id": "owned-core",
         "baseline": sha,
         "files": ["core.py"],
         "patch_sha256": digest,
-        "overlap_class": "owned_symbol",
-        "decision_required": True,
-        "decision": "preserve",
+        "overlap_class": overlap_class,
+        "overlap_policy": overlap_policy,
+        "decision_required": decision_required,
+        "decision": decision,
         "conflict_files": [],
         "retained_commit_subjects": [],
         "removed_commit_subjects": [],
-        "tests": [
+        "tests": tests
+        or [
             {
                 "kind": "reference",
                 "name": "ledger reference",
@@ -433,6 +440,11 @@ def test_owned_symbol_evidence_rejects_not_required_decision() -> None:
             }
         ],
     }
+
+
+def _evidence_document(entry: dict) -> dict:
+    sha = "a" * 40
+    digest = "b" * 64
     evidence = {
         "schema_version": 1,
         "prior_upstream_commit": sha,
@@ -461,11 +473,164 @@ def test_owned_symbol_evidence_rejects_not_required_decision() -> None:
         ],
         "final_ancestry": True,
     }
+    return evidence
 
-    validate(evidence, schema)
-    entry["decision"] = "not-required"
+
+@pytest.mark.parametrize(
+    ("overlap_class", "overlap_policy", "decision_required", "decision"),
+    [
+        ("owned_symbol", "owned_symbol", False, "not-required"),
+        ("possible_upstream_equivalent", "owned_symbol", False, "not-required"),
+        ("same_file", "any_owned_file", False, "not-required"),
+        ("same_file", "owned_symbol", True, "preserve"),
+        ("none", "any_owned_file", True, "preserve"),
+    ],
+)
+def test_evidence_rejects_self_asserted_or_contradictory_decision_state(
+    overlap_class: str,
+    overlap_policy: str,
+    decision_required: bool,
+    decision: str,
+) -> None:
+    schema = json.loads(
+        (ROOT / "docs/upstream-customizations/merge-evidence.schema.json").read_text()
+    )
+    evidence = _evidence_document(
+        _evidence_entry(
+            overlap_class=overlap_class,
+            overlap_policy=overlap_policy,
+            decision_required=decision_required,
+            decision=decision,
+        )
+    )
+
     with pytest.raises(ValidationError):
         validate(evidence, schema)
+
+
+@pytest.mark.parametrize(
+    ("overlap_class", "overlap_policy", "decision_required", "decision"),
+    [
+        ("owned_symbol", "owned_symbol", True, "preserve"),
+        ("possible_upstream_equivalent", "any_owned_file", True, "adapt"),
+        ("same_file", "any_owned_file", True, "remove-as-upstream-equivalent"),
+        ("same_file", "owned_symbol", False, "not-required"),
+        ("none", "any_owned_file", False, "not-required"),
+    ],
+)
+def test_evidence_accepts_only_derived_decision_states(
+    overlap_class: str,
+    overlap_policy: str,
+    decision_required: bool,
+    decision: str,
+) -> None:
+    schema = json.loads(
+        (ROOT / "docs/upstream-customizations/merge-evidence.schema.json").read_text()
+    )
+    evidence = _evidence_document(
+        _evidence_entry(
+            overlap_class=overlap_class,
+            overlap_policy=overlap_policy,
+            decision_required=decision_required,
+            decision=decision,
+        )
+    )
+
+    validate(evidence, schema)
+
+
+def _attempt(
+    attempt: int,
+    result: str,
+    *,
+    signal_number: int | None = None,
+    output_truncated: bool = False,
+) -> dict:
+    item = {
+        "attempt": attempt,
+        "result": result,
+        "duration_ms": 1,
+        "output_truncated": output_truncated,
+    }
+    if signal_number is not None:
+        item["termination_signal"] = signal_number
+    return item
+
+
+def _executed_test(
+    result: str,
+    attempts: list[dict],
+    *,
+    flaky: bool = False,
+) -> dict:
+    return {
+        "kind": "executed",
+        "name": "ledger invariant",
+        "path": "tests/test_invariant.py",
+        "result": result,
+        "duration_ms": sum(item["duration_ms"] for item in attempts),
+        "platform": "test",
+        "attempts": attempts,
+        "flaky_on_first_attempt": flaky,
+    }
+
+
+@pytest.mark.parametrize(
+    ("result", "attempts", "flaky"),
+    [
+        ("passed", [_attempt(1, "failed")], False),
+        ("passed", [_attempt(1, "failed"), _attempt(2, "passed")], False),
+        ("failed", [_attempt(1, "failed")], False),
+        ("failed", [_attempt(1, "passed")], False),
+        ("failed", [_attempt(1, "failed"), _attempt(2, "passed")], False),
+        ("passed", [_attempt(2, "passed")], False),
+        ("failed", [_attempt(1, "signaled")], False),
+        ("failed", [_attempt(1, "timed_out"), _attempt(2, "failed")], False),
+    ],
+)
+def test_evidence_rejects_contradictory_attempt_state_machine(
+    result: str,
+    attempts: list[dict],
+    flaky: bool,
+) -> None:
+    schema = json.loads(
+        (ROOT / "docs/upstream-customizations/merge-evidence.schema.json").read_text()
+    )
+    test = _executed_test(result, attempts, flaky=flaky)
+    evidence = _evidence_document(_evidence_entry(tests=[test]))
+
+    with pytest.raises(ValidationError):
+        validate(evidence, schema)
+
+
+@pytest.mark.parametrize(
+    ("result", "attempts", "flaky"),
+    [
+        ("passed", [_attempt(1, "passed")], False),
+        ("passed", [_attempt(1, "failed"), _attempt(2, "passed")], True),
+        ("failed", [_attempt(1, "failed"), _attempt(2, "failed")], False),
+        ("failed", [_attempt(1, "timed_out")], False),
+        ("failed", [_attempt(1, "signaled", signal_number=15)], False),
+        ("failed", [_attempt(1, "infrastructure_error")], False),
+        (
+            "failed",
+            [_attempt(1, "failed"), _attempt(2, "signaled", signal_number=2)],
+            False,
+        ),
+    ],
+)
+def test_evidence_accepts_consistent_attempt_state_machine(
+    result: str,
+    attempts: list[dict],
+    flaky: bool,
+) -> None:
+    schema = json.loads(
+        (ROOT / "docs/upstream-customizations/merge-evidence.schema.json").read_text()
+    )
+    test = _executed_test(result, attempts, flaky=flaky)
+    evidence = _evidence_document(_evidence_entry(tests=[test]))
+
+    validate(evidence, schema)
 
 
 def test_ledger_runner_retries_once_and_marks_flaky(tmp_path: Path) -> None:
@@ -518,6 +683,210 @@ def test_ledger_runner_retries_once_and_marks_flaky(tmp_path: Path) -> None:
         "failed",
         "passed",
     ]
+    assert all(attempt["output_truncated"] is False for attempt in record["attempts"])
+
+
+def _run_ledger_fixture(
+    tmp_path: Path,
+    sources: dict[str, str],
+    *,
+    timeout_seconds: float = 0.4,
+    output_limit_bytes: int = 2048,
+) -> tuple[subprocess.CompletedProcess[str], list[dict]]:
+    repo = tmp_path / "ledger-fixture"
+    repo.mkdir()
+    for path, source in sources.items():
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source)
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"upstream_changes": [{"tests": sorted(sources)}]},
+            sort_keys=False,
+        )
+    )
+    output = repo / "results.json"
+    started = time.monotonic()
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--output",
+            str(output),
+            "--platform",
+            "synthetic",
+            "--timeout-seconds",
+            str(timeout_seconds),
+            "--output-limit-bytes",
+            str(output_limit_bytes),
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    result.elapsed_seconds = time.monotonic() - started  # type: ignore[attr-defined]
+    records = json.loads(output.read_text()) if output.exists() else []
+    return result, records
+
+
+def test_ledger_runner_times_out_hang_without_retry(tmp_path: Path) -> None:
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {"tests/test_hang.py": "import time\n\ndef test_hang():\n    time.sleep(30)\n"},
+    )
+
+    assert result.returncode == 1
+    assert result.elapsed_seconds < 5  # type: ignore[attr-defined]
+    assert [item["result"] for item in records[0]["attempts"]] == ["timed_out"]
+    assert records[0]["result"] == "failed"
+
+
+def test_ledger_runner_timeout_terminates_spawned_process_group(tmp_path: Path) -> None:
+    marker = tmp_path / "ledger-fixture/escaped-child.marker"
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {
+            "tests/test_process_group.py": (
+                "import subprocess\nimport sys\nimport time\n\n"
+                "def test_process_group():\n"
+                "    subprocess.Popen([sys.executable, '-c', "
+                "\"import time; from pathlib import Path; time.sleep(1); \""
+                "\"Path('escaped-child.marker').write_text('escaped')\"])\n"
+                "    time.sleep(30)\n"
+            )
+        },
+    )
+    time.sleep(1.2)
+
+    assert result.returncode == 1
+    assert records[0]["attempts"][0]["result"] == "timed_out"
+    assert not marker.exists()
+
+
+def test_ledger_runner_caps_oversized_output_and_retries_test_failure(
+    tmp_path: Path,
+) -> None:
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {
+            "tests/test_output.py": (
+                "def test_output():\n"
+                "    print('X' * 100_000)\n"
+                "    raise AssertionError('ordinary failure')\n"
+            )
+        },
+    )
+
+    assert result.returncode == 1
+    assert len(result.stderr.encode()) < 10_000
+    assert [item["result"] for item in records[0]["attempts"]] == [
+        "failed",
+        "failed",
+    ]
+    assert all(item["output_truncated"] for item in records[0]["attempts"])
+
+
+@pytest.mark.parametrize(("signal_name", "signal_number"), [("SIGTERM", 15), ("SIGINT", 2)])
+def test_ledger_runner_does_not_retry_signaled_process(
+    tmp_path: Path,
+    signal_name: str,
+    signal_number: int,
+) -> None:
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {
+            "tests/test_signal.py": (
+                "import os\nimport signal\n\n"
+                "def test_signal():\n"
+                f"    signal.signal(signal.{signal_name}, signal.SIG_DFL)\n"
+                f"    os.kill(os.getpid(), signal.{signal_name})\n"
+            )
+        },
+    )
+
+    assert result.returncode == 1
+    assert [item["result"] for item in records[0]["attempts"]] == ["signaled"]
+    assert records[0]["attempts"][0]["termination_signal"] == signal_number
+
+
+def test_ledger_runner_retries_ordinary_failure_once_then_fails(tmp_path: Path) -> None:
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {
+            "tests/test_fail.py": (
+                "def test_fail():\n    raise AssertionError('ordinary failure')\n"
+            )
+        },
+    )
+
+    assert result.returncode == 1
+    assert [item["result"] for item in records[0]["attempts"]] == [
+        "failed",
+        "failed",
+    ]
+    assert records[0]["flaky_on_first_attempt"] is False
+
+
+def test_ledger_runner_does_not_retry_pytest_infrastructure_error(
+    tmp_path: Path,
+) -> None:
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {"tests/test_invalid.py": "def this_is_not_valid_python(:\n"},
+    )
+
+    assert result.returncode == 1
+    assert [item["result"] for item in records[0]["attempts"]] == [
+        "infrastructure_error"
+    ]
+
+
+def test_ledger_runner_never_exceeds_two_concurrent_python_files(tmp_path: Path) -> None:
+    source = (
+        "from pathlib import Path\n"
+        "import time\n\n"
+        "def locked_update(delta):\n"
+        "    lock = Path('.counter-lock')\n"
+        "    while True:\n"
+        "        try:\n"
+        "            lock.mkdir()\n"
+        "            break\n"
+        "        except FileExistsError:\n"
+        "            time.sleep(0.01)\n"
+        "    try:\n"
+        "        active_path = Path('.active-count')\n"
+        "        active = int(active_path.read_text()) if active_path.exists() else 0\n"
+        "        active += delta\n"
+        "        active_path.write_text(str(active))\n"
+        "        maximum = Path('.maximum-count')\n"
+        "        seen = int(maximum.read_text()) if maximum.exists() else 0\n"
+        "        maximum.write_text(str(max(seen, active)))\n"
+        "        return active\n"
+        "    finally:\n"
+        "        lock.rmdir()\n\n"
+        "def test_concurrency():\n"
+        "    active = locked_update(1)\n"
+        "    try:\n"
+        "        assert active <= 2\n"
+        "        time.sleep(0.35)\n"
+        "    finally:\n"
+        "        locked_update(-1)\n"
+    )
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {f"tests/test_concurrency_{index}.py": source for index in range(3)},
+        timeout_seconds=3,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert all(record["result"] == "passed" for record in records)
+    assert (tmp_path / "ledger-fixture/.maximum-count").read_text() == "2"
 
 
 def test_rehearsal_records_reconciled_conflict_files(tmp_path: Path) -> None:

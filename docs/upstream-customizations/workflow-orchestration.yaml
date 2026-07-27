@@ -2141,7 +2141,7 @@ upstream_changes:
   - tests/plugins/workflow/test_catalog_api.py
   - tests/plugins/workflow/test_showcase_catalog.py
   owned_symbols:
-  - VerifiedShowcasePackage.compatibility
+  - CatalogEntry.compatibility
   - _verified_distribution_assessment
   - scenario-local execution-environment compatibility projection
   tests:

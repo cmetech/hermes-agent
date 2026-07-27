@@ -6,8 +6,11 @@ the independent commit boundary, regression tests, merge guidance, and the
 upstream commit against which the behavior was last verified.
 
 `owned_symbols` is reserved for bounded, exact identifiers that the checker
-can locate in a declared file at `HEAD`; behavioral prose belongs in the
-optional bounded `owned_invariants` list. New or migrated entries may select
+can locate in a declared file at the committed `HEAD`; dirty checkout bytes and
+comments never satisfy ownership. Python identifiers are resolved through the
+AST with qualified owner identity preserved. Other languages use bounded exact
+literal-token matching after comments are removed. Behavioral prose belongs in
+the optional bounded `owned_invariants` list. New or migrated entries may select
 `overlap_policy: owned_symbol` (the compatibility default) or
 `overlap_policy: any_owned_file`. The latter makes every change to a declared
 file decision-required even when no exact symbol span changed, and is required
@@ -37,3 +40,15 @@ results governed by `any_owned_file`; a prior acknowledgement never substitutes
 for the current decision. Textual merge cleanliness is never proof that the
 recorded behavior survived. Baselines advance only through the controlled
 upstream-merge workflow after the named tests pass.
+
+Two-dot ranges are literal Git revision sets: `A..B` examines commits reachable
+from `B` but not `A`, even when the tips diverge. Triple-dot ranges compare the
+merge base of `A` and `B` to `B`. Symbol overlap always reads the resolved left
+and right commit blobs, never the current checkout.
+
+Executable ledger invariants run in fresh process groups with at most two files
+in flight per runtime. Each attempt has a bounded timeout and bounded stdout and
+stderr capture. Only an ordinary test failure is retried once; timeouts,
+signals, infrastructure failures, and cancellation are terminal. Evidence
+records the exact attempt sequence, output truncation, signal number when
+applicable, and whether a failed first attempt passed on retry.

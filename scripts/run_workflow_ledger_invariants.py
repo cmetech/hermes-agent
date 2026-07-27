@@ -9,17 +9,25 @@ never receive a test result and therefore cannot satisfy an executed invariant.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
 import yaml
+
+
+_DEFAULT_TIMEOUT_SECONDS = 900.0
+_DEFAULT_OUTPUT_LIMIT_BYTES = 1_048_576
+_POLL_SECONDS = 0.05
+_TERMINATE_GRACE_SECONDS = 1.0
 
 
 def _kind(path: str) -> str:
@@ -59,7 +67,66 @@ def _command(repo: Path, path: str, kind: str) -> tuple[list[str], Path]:
     raise AssertionError(f"unsupported executable invariant kind: {kind}")
 
 
-def _execute_attempt(repo: Path, path: str, kind: str) -> dict[str, Any]:
+class _BoundedCapture:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.data = bytearray()
+        self.truncated = False
+        self.lock = threading.Lock()
+
+    def consume(self, stream: Any) -> None:
+        try:
+            while chunk := stream.read(65_536):
+                with self.lock:
+                    remaining = self.limit - len(self.data)
+                    if remaining > 0:
+                        self.data.extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        self.truncated = True
+        finally:
+            stream.close()
+
+    def text(self) -> str:
+        rendered = bytes(self.data).decode("utf-8", errors="replace")
+        if self.truncated:
+            rendered += "\n...[output truncated]"
+        return rendered
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                check=False,
+            )
+        process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        if process.poll() is None:
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            process.wait()
+
+
+def _execute_attempt(
+    repo: Path,
+    path: str,
+    kind: str,
+    *,
+    timeout_seconds: float,
+    output_limit_bytes: int,
+    cancel_event: threading.Event,
+) -> dict[str, Any]:
     command, cwd = _command(repo, path, kind)
     env = os.environ.copy()
     for inherited in (
@@ -80,29 +147,111 @@ def _execute_attempt(repo: Path, path: str, kind: str) -> dict[str, Any]:
         }
     )
     started = time.monotonic_ns()
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    duration_ms = (time.monotonic_ns() - started) // 1_000_000
-    return {
-        "result": "passed" if completed.returncode == 0 else "failed",
-        "duration_ms": duration_ms,
-        "_stdout": completed.stdout,
-        "_stderr": completed.stderr,
+    popen_options: dict[str, Any] = {
+        "cwd": cwd,
+        "env": env,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
     }
+    if os.name == "posix":
+        popen_options["start_new_session"] = True
+    elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    try:
+        process = subprocess.Popen(command, **popen_options)
+    except OSError as exc:
+        duration_ms = (time.monotonic_ns() - started) // 1_000_000
+        return {
+            "result": "infrastructure_error",
+            "duration_ms": duration_ms,
+            "output_truncated": False,
+            "_stdout": "",
+            "_stderr": str(exc),
+        }
+    stdout = _BoundedCapture(output_limit_bytes)
+    stderr = _BoundedCapture(output_limit_bytes)
+    readers = [
+        threading.Thread(target=stdout.consume, args=(process.stdout,), daemon=True),
+        threading.Thread(target=stderr.consume, args=(process.stderr,), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    deadline = time.monotonic() + timeout_seconds
+    timed_out = False
+    try:
+        while process.poll() is None:
+            if cancel_event.is_set():
+                _terminate_process_group(process)
+                raise CancelledError()
+            if time.monotonic() >= deadline:
+                timed_out = True
+                _terminate_process_group(process)
+                break
+            time.sleep(_POLL_SECONDS)
+    except BaseException:
+        _terminate_process_group(process)
+        raise
+    finally:
+        for reader in readers:
+            reader.join(timeout=_TERMINATE_GRACE_SECONDS)
+    duration_ms = (time.monotonic_ns() - started) // 1_000_000
+    returncode = process.returncode
+    if timed_out:
+        result = "timed_out"
+    elif returncode == 0:
+        result = "passed"
+    elif returncode is not None and returncode < 0:
+        result = "signaled"
+    elif returncode == 1:
+        result = "failed"
+    else:
+        result = "infrastructure_error"
+    record = {
+        "result": result,
+        "duration_ms": duration_ms,
+        "output_truncated": stdout.truncated or stderr.truncated,
+        "_stdout": stdout.text(),
+        "_stderr": stderr.text(),
+    }
+    if result == "signaled" and returncode is not None:
+        record["termination_signal"] = -returncode
+    return record
 
 
-def _execute(repo: Path, path: str, kind: str, platform: str) -> dict[str, Any]:
-    attempts = [_execute_attempt(repo, path, kind)]
+def _execute(
+    repo: Path,
+    path: str,
+    kind: str,
+    platform: str,
+    timeout_seconds: float,
+    output_limit_bytes: int,
+    cancel_event: threading.Event,
+) -> dict[str, Any]:
+    attempts = [
+        _execute_attempt(
+            repo,
+            path,
+            kind,
+            timeout_seconds=timeout_seconds,
+            output_limit_bytes=output_limit_bytes,
+            cancel_event=cancel_event,
+        )
+    ]
     if attempts[0]["result"] == "failed":
-        attempts.append(_execute_attempt(repo, path, kind))
+        if cancel_event.is_set():
+            raise CancelledError()
+        attempts.append(
+            _execute_attempt(
+                repo,
+                path,
+                kind,
+                timeout_seconds=timeout_seconds,
+                output_limit_bytes=output_limit_bytes,
+                cancel_event=cancel_event,
+            )
+        )
     digest = hashlib.sha256(path.encode()).hexdigest()
-    result = attempts[-1]["result"]
+    result = "passed" if attempts[-1]["result"] == "passed" else "failed"
     return {
         "kind": "executed",
         "name": f"ledger invariant {digest}",
@@ -115,6 +264,12 @@ def _execute(repo: Path, path: str, kind: str, platform: str) -> dict[str, Any]:
                 "attempt": index,
                 "result": attempt["result"],
                 "duration_ms": attempt["duration_ms"],
+                "output_truncated": attempt["output_truncated"],
+                **(
+                    {"termination_signal": attempt["termination_signal"]}
+                    if "termination_signal" in attempt
+                    else {}
+                ),
             }
             for index, attempt in enumerate(attempts, start=1)
         ],
@@ -134,17 +289,39 @@ def _run_group(
     kind: str,
     platform: str,
     workers: int,
+    timeout_seconds: float,
+    output_limit_bytes: int,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     if not paths:
         return results
-    with ThreadPoolExecutor(max_workers=min(workers, len(paths))) as executor:
+    cancel_event = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=min(workers, len(paths)))
+    futures: dict[Any, str] = {}
+    try:
         futures = {
-            executor.submit(_execute, repo, path, kind, platform): path
+            executor.submit(
+                _execute,
+                repo,
+                path,
+                kind,
+                platform,
+                timeout_seconds,
+                output_limit_bytes,
+                cancel_event,
+            ): path
             for path in paths
         }
         for future in as_completed(futures):
             results.append(future.result())
+    except BaseException:
+        cancel_event.set()
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
     return results
 
 
@@ -154,7 +331,20 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--platform", required=True)
+    parser.add_argument("--timeout-seconds", type=float, default=_DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument(
+        "--output-limit-bytes", type=int, default=_DEFAULT_OUTPUT_LIMIT_BYTES
+    )
     args = parser.parse_args()
+    if not 0 < args.timeout_seconds <= _DEFAULT_TIMEOUT_SECONDS:
+        parser.error(
+            f"--timeout-seconds must be in (0, {_DEFAULT_TIMEOUT_SECONDS:g}]"
+        )
+    if not 1 <= args.output_limit_bytes <= _DEFAULT_OUTPUT_LIMIT_BYTES:
+        parser.error(
+            "--output-limit-bytes must be in "
+            f"[1, {_DEFAULT_OUTPUT_LIMIT_BYTES}]"
+        )
 
     repo = args.repo.resolve()
     manifest = yaml.safe_load(args.manifest.read_text(encoding="utf-8"))
@@ -170,8 +360,15 @@ def main() -> int:
         for kind in ("python", "desktop", "desktop-node", "node")
     }
     results: list[dict[str, Any]] = []
-    results.extend(_run_group(repo, by_kind["python"], "python", args.platform, 2))
-    results.extend(_run_group(repo, by_kind["desktop"], "desktop", args.platform, 2))
+    group_options = (args.timeout_seconds, args.output_limit_bytes)
+    results.extend(
+        _run_group(repo, by_kind["python"], "python", args.platform, 2, *group_options)
+    )
+    results.extend(
+        _run_group(
+            repo, by_kind["desktop"], "desktop", args.platform, 2, *group_options
+        )
+    )
     results.extend(
         _run_group(
             repo,
@@ -179,9 +376,12 @@ def main() -> int:
             "desktop-node",
             args.platform,
             2,
+            *group_options,
         )
     )
-    results.extend(_run_group(repo, by_kind["node"], "node", args.platform, 2))
+    results.extend(
+        _run_group(repo, by_kind["node"], "node", args.platform, 2, *group_options)
+    )
     executed = {item["path"] for item in results}
     for path in paths:
         if path in executed:

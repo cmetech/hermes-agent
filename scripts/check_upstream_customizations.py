@@ -40,6 +40,54 @@ def _git(repo: Path, *args: str, check: bool = True) -> str:
     return proc.stdout
 
 
+def _resolve_commit(repo: Path, revision: str, label: str) -> str:
+    if not revision or ".." in revision:
+        raise ValueError(f"{label} is not a local commit: {revision or '<empty>'}")
+    proc = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode:
+        raise ValueError(f"{label} is not a local commit: {revision}")
+    return proc.stdout.strip()
+
+
+def _resolved_diff_endpoints(repo: Path, diff_range: str) -> tuple[str, str]:
+    if "..." in diff_range:
+        if diff_range.count("...") != 1:
+            raise ValueError(f"malformed diff range: {diff_range}")
+        left_raw, right_raw = diff_range.split("...", 1)
+        left_tip = _resolve_commit(repo, left_raw, "range left")
+        right = _resolve_commit(repo, right_raw, "range right")
+        proc = subprocess.run(
+            ["git", "merge-base", left_tip, right],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode or not proc.stdout.strip():
+            raise ValueError("triple-dot range has no merge base")
+        return proc.stdout.strip(), right
+    if ".." in diff_range:
+        if diff_range.count("..") != 1:
+            raise ValueError(f"malformed diff range: {diff_range}")
+        left_raw, right_raw = diff_range.split("..", 1)
+        return (
+            _resolve_commit(repo, left_raw, "range left"),
+            _resolve_commit(repo, right_raw, "range right"),
+        )
+    right = _resolve_commit(repo, diff_range, "range right")
+    return _resolve_commit(repo, f"{right}^", "range left"), right
+
+
+def _blob_text(repo: Path, revision: str, path: str) -> str:
+    return _git(repo, "show", f"{revision}:{path}", check=False)
+
+
 def _is_shallow_clone(repo: Path) -> bool:
     """True when this clone lacks the history the commit assertions need.
 
@@ -96,6 +144,14 @@ def load_and_validate_manifest(
     entries = data.get("upstream_changes")
     if not isinstance(entries, list) or not entries:
         raise ValueError("manifest upstream_changes must be a non-empty list")
+    head_revision = _resolve_commit(repo, "HEAD", "HEAD")
+    head_sources: dict[str, str] = {}
+
+    def head_source(path: str) -> str:
+        if path not in head_sources:
+            head_sources[path] = _blob_text(repo, head_revision, path)
+        return head_sources[path]
+
     coverage = data.get("coverage")
     if coverage is not None:
         if not isinstance(coverage, dict):
@@ -171,12 +227,16 @@ def load_and_validate_manifest(
         ):
             raise ValueError(f"{entry_id}.owned_symbols must contain names")
         overlap_policy = entry.get("overlap_policy", "owned_symbol")
+        if not isinstance(overlap_policy, str):
+            raise ValueError(f"{entry_id}.overlap_policy must be a string")
         if overlap_policy not in _OVERLAP_POLICIES:
             raise ValueError(
                 f"{entry_id}.overlap_policy must be owned_symbol or any_owned_file"
             )
         invariants = entry.get("owned_invariants", [])
-        if not isinstance(invariants, list) or len(invariants) > _MAX_OWNED_INVARIANTS:
+        if not isinstance(invariants, list):
+            raise ValueError(f"{entry_id}.owned_invariants must be a list")
+        if len(invariants) > _MAX_OWNED_INVARIANTS:
             raise ValueError(
                 f"{entry_id}.owned_invariants must be a list with at most "
                 f"{_MAX_OWNED_INVARIANTS} items"
@@ -197,12 +257,15 @@ def load_and_validate_manifest(
                 f"{entry_id}.owned_symbols must contain exact machine-locatable "
                 f"identifiers; move prose to owned_invariants: {phrase!r}"
             )
-        sources = [
-            _contained(repo, raw).read_text(encoding="utf-8", errors="replace")
-            for raw in entry["files"]
-        ]
         for symbol in strict_symbols:
-            if not any(_source_contains_symbol(source, symbol) for source in sources):
+            if not any(
+                _source_contains_symbol(
+                    head_source(raw),
+                    symbol,
+                    path=raw,
+                )
+                for raw in entry["files"]
+            ):
                 raise ValueError(
                     f"{entry_id} owned symbol {symbol!r} does not exist in "
                     "declared files at HEAD"
@@ -235,23 +298,6 @@ def _changed_paths(repo: Path, diff_range: str) -> list[tuple[str, list[str]]]:
     return rows
 
 
-def _range_right(diff_range: str) -> str:
-    if "..." in diff_range:
-        return diff_range.split("...", 1)[1]
-    if ".." in diff_range:
-        return diff_range.split("..", 1)[1]
-    return diff_range
-
-
-def _range_base(data: dict[str, Any], repo: Path, diff_range: str) -> str:
-    if "..." in diff_range:
-        left, right = diff_range.split("...", 1)
-        return _git(repo, "merge-base", left, right).strip()
-    if ".." in diff_range:
-        return diff_range.split("..", 1)[0]
-    return f"{diff_range}^"
-
-
 def _existed_at(repo: Path, revision: str, path: str) -> bool:
     return subprocess.run(
         ["git", "cat-file", "-e", f"{revision}:{path}"],
@@ -263,21 +309,8 @@ def _existed_at(repo: Path, revision: str, path: str) -> bool:
 def _validate_coverage_commits(
     coverage: dict[str, Any], repo: Path, right: str, *, left: str | None = None
 ) -> list[str]:
-    base = left or coverage["base_commit"]
-    for label, commit in (("coverage base", base), ("coverage range tip", right)):
-        proc = subprocess.run(
-            ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
-            cwd=repo,
-            capture_output=True,
-        )
-        if proc.returncode:
-            raise ValueError(f"{label} is not a local commit: {commit}")
-    if subprocess.run(
-        ["git", "merge-base", "--is-ancestor", base, right],
-        cwd=repo,
-        capture_output=True,
-    ).returncode:
-        raise ValueError("coverage.base_commit is not an ancestor of the range tip")
+    base = _resolve_commit(repo, left or coverage["base_commit"], "range left")
+    right = _resolve_commit(repo, right, "range right")
     commits = _git(repo, "rev-list", "--reverse", f"{base}..{right}").splitlines()
     in_range = set(commits)
     excluded = {item["commit"] for item in coverage.get("excluded_commits", [])}
@@ -290,8 +323,7 @@ def _coverage_changes(
     coverage = data.get("coverage")
     if coverage is None:
         return None
-    right = _range_right(diff_range)
-    left = _range_base(data, repo, diff_range)
+    left, right = _resolved_diff_endpoints(repo, diff_range)
     commits = _validate_coverage_commits(coverage, repo, right, left=left)
     changes: list[tuple[str, list[str]]] = []
     for commit in commits:
@@ -300,6 +332,8 @@ def _coverage_changes(
 
 
 def validate_diff_coverage(data: dict[str, Any], repo: Path, diff_range: str) -> None:
+    range_left, range_right = _resolved_diff_endpoints(repo, diff_range)
+    resolved_range = f"{range_left}..{range_right}"
     covered = {
         path
         for entry in data["upstream_changes"]
@@ -311,8 +345,8 @@ def validate_diff_coverage(data: dict[str, Any], repo: Path, diff_range: str) ->
     )
     additive_prefixes = ("plugins/", "scripts/")
     scoped = _coverage_changes(data, repo, diff_range)
-    changes = scoped[0] if scoped is not None else _changed_paths(repo, diff_range)
-    baseline = _range_base(data, repo, diff_range)
+    changes = scoped[0] if scoped is not None else _changed_paths(repo, resolved_range)
+    baseline = range_left
     missing: set[str] = set()
     for _status, paths in changes:
         for path in paths:
@@ -355,7 +389,7 @@ def validate_diff_coverage(data: dict[str, Any], repo: Path, diff_range: str) ->
                 repo,
                 "log",
                 "--format=%s",
-                diff_range,
+                resolved_range,
                 "--",
                 *sorted(touched),
             ).splitlines()
@@ -377,44 +411,175 @@ def validate_diff_coverage(data: dict[str, Any], repo: Path, diff_range: str) ->
             )
 
 
-def _changed_lines(repo: Path, diff_range: str, paths: list[str] | None = None) -> str:
-    args = ["diff", "--unified=0", diff_range]
-    if paths:
-        args.extend(["--", *paths])
-    text = _git(repo, *args)
-    return "\n".join(
-        line for line in text.splitlines()
-        if (line.startswith("+") and not line.startswith("+++"))
-        or (line.startswith("-") and not line.startswith("---"))
-    )
+class _PythonSymbolCollector(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.scope: list[str] = []
+        self.spans: dict[str, list[tuple[int, int]]] = {}
+
+    def _record(self, symbol: str, node: ast.AST) -> None:
+        if not hasattr(node, "lineno"):
+            return
+        self.spans.setdefault(symbol, []).append(
+            (node.lineno, getattr(node, "end_lineno", node.lineno))
+        )
+
+    def _record_scoped(self, name: str, node: ast.AST) -> None:
+        self._record(name, node)
+        if self.scope:
+            self._record(".".join([*self.scope, name]), node)
+
+    def _visit_definition(self, node: ast.AST, name: str) -> None:
+        self._record_scoped(name, node)
+        self.scope.append(name)
+        self.generic_visit(node)
+        self.scope.pop()
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._visit_definition(node, node.name)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_definition(node, node.name)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_definition(node, node.name)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        self._record(node.id, node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        parts = [node.attr]
+        value = node.value
+        while isinstance(value, ast.Attribute):
+            parts.append(value.attr)
+            value = value.value
+        if isinstance(value, ast.Name):
+            parts.append(value.id)
+            self._record(".".join(reversed(parts)), node)
+            if value.id in {"self", "cls"} and self.scope:
+                self._record(".".join([self.scope[0], *reversed(parts[:-1])]), node)
+        self.generic_visit(node)
+
+    def visit_arg(self, node: ast.arg) -> None:
+        self._record(node.arg, node)
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if isinstance(node.value, str):
+            self._record(node.value, node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for target in node.targets:
+            self._record_assignment_target(target)
+            if isinstance(target, ast.Name):
+                for child in ast.walk(node.value):
+                    if isinstance(child, ast.Constant) and isinstance(child.value, str):
+                        self._record(f"{target.id}.{child.value}", child)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._record_assignment_target(node.target)
+        self.generic_visit(node)
+
+    def _record_assignment_target(self, target: ast.expr) -> None:
+        if isinstance(target, ast.Name) and self.scope:
+            self._record(".".join([*self.scope, target.id]), target)
 
 
-def _symbol_spans(source: str, symbols: list[str]) -> dict[str, list[tuple[int, int]]]:
-    wanted = {symbol.rsplit(".", 1)[-1]: symbol for symbol in symbols}
+def _strip_non_python_comments_and_strings(source: str, suffix: str) -> str:
+    slash_comments = suffix in {".js", ".jsx", ".mjs", ".ts", ".tsx"}
+    hash_comments = suffix in {".sh", ".bash", ".yaml", ".yml", ".toml"}
+    result = list(source)
+    index = 0
+    quote = ""
+    while index < len(source):
+        char = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            index += 1
+            continue
+        if slash_comments and char == "/" and following == "/":
+            while index < len(source) and source[index] != "\n":
+                result[index] = " "
+                index += 1
+            continue
+        if slash_comments and char == "/" and following == "*":
+            result[index] = result[index + 1] = " "
+            index += 2
+            while index + 1 < len(source) and source[index : index + 2] != "*/":
+                result[index] = "\n" if source[index] == "\n" else " "
+                index += 1
+            if index + 1 < len(source):
+                result[index] = result[index + 1] = " "
+                index += 2
+            continue
+        if hash_comments and char == "#":
+            while index < len(source) and source[index] != "\n":
+                result[index] = " "
+                index += 1
+            continue
+        index += 1
+    return "".join(result)
+
+
+def _symbol_spans(
+    source: str,
+    symbols: list[str],
+    *,
+    path: str,
+) -> dict[str, list[tuple[int, int]]]:
     spans = {symbol: [] for symbol in symbols}
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    if Path(path).suffix == ".py":
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return spans
+        collector = _PythonSymbolCollector()
+        collector.visit(tree)
+        for symbol in symbols:
+            spans[symbol].extend(collector.spans.get(symbol, []))
         return spans
-    for node in ast.walk(tree):
-        name = getattr(node, "name", None)
-        if name in wanted and hasattr(node, "lineno"):
-            spans[wanted[name]].append((node.lineno, getattr(node, "end_lineno", node.lineno)))
+    searchable = _strip_non_python_comments_and_strings(source, Path(path).suffix)
+    for symbol in symbols:
+        if "." in symbol:
+            owner, member = symbol.split(".", 1)
+            declaration = re.search(
+                rf"\b(?:interface|class|type|namespace)\s+{re.escape(owner)}\b[^{{]{{0,512}}\{{",
+                searchable,
+            )
+            if declaration:
+                depth = 1
+                cursor = declaration.end()
+                while cursor < len(searchable) and depth:
+                    depth += (searchable[cursor] == "{") - (searchable[cursor] == "}")
+                    cursor += 1
+                body = searchable[declaration.end() : cursor - 1]
+                member_match = re.search(
+                    rf"(?<![A-Za-z0-9_$]){re.escape(member)}(?![A-Za-z0-9_$])",
+                    body,
+                )
+                if member_match:
+                    offset = declaration.end() + member_match.start()
+                    line = searchable.count("\n", 0, offset) + 1
+                    spans[symbol].append((line, line))
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_$]){re.escape(symbol)}(?![A-Za-z0-9_$])"
+        )
+        for match in pattern.finditer(searchable):
+            line = searchable.count("\n", 0, match.start()) + 1
+            spans[symbol].append((line, line))
     return spans
 
 
-def _source_contains_symbol(source: str, symbol: str) -> bool:
-    terminal = symbol.rsplit(".", 1)[-1]
-    spans = _symbol_spans(source, [symbol])
-    if spans[symbol]:
-        return True
-    for candidate in (symbol, terminal):
-        if re.search(
-            rf"(?<![A-Za-z0-9_$]){re.escape(candidate)}(?![A-Za-z0-9_$])",
-            source,
-        ):
-            return True
-    return False
+def _source_contains_symbol(source: str, symbol: str, *, path: str) -> bool:
+    return bool(_symbol_spans(source, [symbol], path=path)[symbol])
 
 
 def _strict_owned_symbols(entry: dict[str, Any]) -> list[str]:
@@ -447,28 +612,20 @@ def _changed_line_numbers(diff: str) -> tuple[set[int], set[int]]:
 
 
 def _owned_symbol_hits(
-    entry: dict[str, Any], repo: Path, diff_range: str, paths: list[str]
+    entry: dict[str, Any], repo: Path, left: str, right: str, paths: list[str]
 ) -> list[str]:
-    left = diff_range.split("..", 1)[0]
     hits: set[str] = set()
     symbols = _strict_owned_symbols(entry)
     for path in paths:
-        diff = _git(repo, "diff", "--unified=0", diff_range, "--", path)
+        diff = _git(repo, "diff", "--unified=0", f"{left}..{right}", "--", path)
         old_changed, new_changed = _changed_line_numbers(diff)
-        try:
-            new_source = (repo / path).read_text(encoding="utf-8")
-        except OSError:
-            new_source = ""
-        old_source = _git(repo, "show", f"{left}:{path}", check=False)
-        for symbol, spans in _symbol_spans(new_source, symbols).items():
+        new_source = _blob_text(repo, right, path)
+        old_source = _blob_text(repo, left, path)
+        for symbol, spans in _symbol_spans(new_source, symbols, path=path).items():
             if any(any(start <= line <= end for line in new_changed) for start, end in spans):
                 hits.add(symbol)
-        for symbol, spans in _symbol_spans(old_source, symbols).items():
+        for symbol, spans in _symbol_spans(old_source, symbols, path=path).items():
             if any(any(start <= line <= end for line in old_changed) for start, end in spans):
-                hits.add(symbol)
-        changed_text = _changed_lines(repo, diff_range, [path])
-        for symbol in symbols:
-            if re.search(rf"\b{re.escape(symbol)}\b", changed_text):
                 hits.add(symbol)
     return sorted(hits)
 
@@ -476,12 +633,13 @@ def _owned_symbol_hits(
 def classify_upstream_overlap(
     entry: dict[str, Any], repo: Path, diff_range: str
 ) -> dict[str, Any]:
-    changes = _changed_paths(repo, diff_range)
+    left, right = _resolved_diff_endpoints(repo, diff_range)
+    changes = _changed_paths(repo, f"{left}..{right}")
     changed = {path for _status, paths in changes for path in paths}
     owned_files = set(entry["files"])
     same_files = sorted(changed & owned_files)
     symbols = _strict_owned_symbols(entry)
-    owned_hits = _owned_symbol_hits(entry, repo, diff_range, same_files)
+    owned_hits = _owned_symbol_hits(entry, repo, left, right, same_files)
     if owned_hits:
         classification = "owned_symbol"
         rationale = f"owned symbols changed: {', '.join(owned_hits)}"
@@ -489,10 +647,12 @@ def classify_upstream_overlap(
         classification = "same_file"
         rationale = f"same ledger-owned file changed: {', '.join(same_files)}"
     else:
-        all_lines = _changed_lines(repo, diff_range)
-        equivalent_hits = sorted(
-            symbol for symbol in symbols
-            if re.search(rf"\b{re.escape(symbol)}\b", all_lines)
+        equivalent_hits = _owned_symbol_hits(
+            entry,
+            repo,
+            left,
+            right,
+            sorted(changed - owned_files),
         )
         if equivalent_hits:
             classification = "possible_upstream_equivalent"

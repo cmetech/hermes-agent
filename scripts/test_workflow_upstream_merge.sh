@@ -359,6 +359,7 @@ for entry in manifest["upstream_changes"]:
         "files": entry["files"],
         "patch_sha256": hashlib.sha256(patch).hexdigest(),
         "overlap_class": overlap["classification"],
+        "overlap_policy": overlap["overlap_policy"],
         "decision_required": overlap["decision_required"],
         "decision": decisions.get(entry["id"], "not-required"),
         "conflict_files": sorted(reconciled_conflicts & set(entry["files"])),
