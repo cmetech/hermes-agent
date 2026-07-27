@@ -12,6 +12,8 @@ from typing import Any
 import yaml
 
 from plugins.workflow.language import (
+    ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
+    UNKNOWN_TOP_LEVEL_FIELD_CODE,
     WORKFLOW_NORMALIZER_VERSION,
     WorkflowLanguageCompatibilityError,
     language_compatibility_findings,
@@ -890,7 +892,7 @@ def _load_workflow_bytes(
             tuple(
                 ValidationIssue(
                     path=field,
-                    code="archon_unknown_top_level_field",
+                    code=ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
                     message=f"Archon profile does not support top-level field: {field}",
                     source_line=top_lines.get(field),
                 )
@@ -900,7 +902,7 @@ def _load_workflow_bytes(
     issues = tuple(
         ValidationIssue(
             path=field,
-            code="unknown_top_level_field",
+            code=UNKNOWN_TOP_LEVEL_FIELD_CODE,
             message=f"unknown top-level field: {field}",
             severity="warning",
             blocking=False,

@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from plugins.workflow.language import WORKFLOW_NORMALIZER_VERSION
+from plugins.workflow.language import (
+    DYNAMIC_LANGUAGE_COMPATIBILITY_CODES,
+    WORKFLOW_NORMALIZER_VERSION,
+)
 from plugins.workflow.models import WorkflowLanguageProfile
 
 
@@ -47,17 +50,6 @@ class StructuralRequirement:
     equals: object
     required_field: str
     required_shape: str
-
-
-@dataclass(frozen=True, slots=True)
-class DynamicCompatibilityCode:
-    """A stable loader/profile code not attached to one inventory field."""
-
-    code: str
-    profiles: frozenset[WorkflowLanguageProfile]
-    status: str
-    enforcement_phase: int
-    fields: tuple[str, ...]
 
 
 def _compatibility(
@@ -121,38 +113,6 @@ def _field(
 NODE_TYPES = ("command", "prompt", "bash", "script", "loop", "approval", "cancel")
 _AI_NODE_TYPES = ("command", "prompt")
 _NON_LOOP_NODE_TYPES = tuple(item for item in NODE_TYPES if item != "loop")
-
-
-_DYNAMIC_COMPATIBILITY_CODES = (
-    DynamicCompatibilityCode(
-        code="workflow_language_profile_unsupported",
-        profiles=frozenset(_PROFILES),
-        status="blocking",
-        enforcement_phase=1,
-        fields=("sidecar.language_compatibility",),
-    ),
-    DynamicCompatibilityCode(
-        code="workflow_normalizer_version_unsupported",
-        profiles=frozenset(_PROFILES),
-        status="blocking",
-        enforcement_phase=1,
-        fields=("normalizer_version",),
-    ),
-    DynamicCompatibilityCode(
-        code="unknown_top_level_field",
-        profiles=frozenset({WorkflowLanguageProfile.HERMES_LEGACY}),
-        status="warning",
-        enforcement_phase=1,
-        fields=("*",),
-    ),
-    DynamicCompatibilityCode(
-        code="archon_unknown_top_level_field",
-        profiles=frozenset({WorkflowLanguageProfile.ARCHON_2026_07}),
-        status="blocking",
-        enforcement_phase=1,
-        fields=("*",),
-    ),
-)
 
 
 _DEFINITION_FIELDS = (
@@ -609,6 +569,18 @@ def structural_node_field_names(node_type: str) -> frozenset[str]:
     )
 
 
+def inapplicable_node_fields(node_type: str) -> dict[str, frozenset[str]]:
+    """Return structurally valid fields that are not semantically applicable."""
+    if node_type not in NODE_TYPES:
+        raise ValueError(f"unsupported workflow node type: {node_type}")
+    return {
+        spec.yaml_name: spec.applicable_node_types
+        for spec in _specs("node")
+        if node_type in spec.structural_node_types
+        and node_type not in spec.applicable_node_types
+    }
+
+
 def sidecar_field_names() -> frozenset[str]:
     return _field_names("sidecar")
 
@@ -975,7 +947,7 @@ def compatibility_code_catalog(
         fields = entry["fields"]
         assert isinstance(fields, list)
         fields.append(_contract_path(spec))
-    for spec in _DYNAMIC_COMPATIBILITY_CODES:
+    for spec in DYNAMIC_LANGUAGE_COMPATIBILITY_CODES:
         if selected not in spec.profiles:
             continue
         grouped[spec.code] = {

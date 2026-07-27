@@ -3191,6 +3191,8 @@ upstream_changes:
   - explicit language declaration type enforcement
   - companion-aware discovery cache signature
   - stable compatibility finding codes
+  - DynamicCompatibilityCode
+  - DYNAMIC_LANGUAGE_COMPATIBILITY_CODES
   - legacy_idle_timeout_seconds
   - archon_idle_timeout_semantics_unavailable
   - compatibility finding effective-profile invariant
@@ -3231,7 +3233,9 @@ upstream_changes:
     Phase 3 provides millisecond normalization. Use the
     dependency-neutral runnable guard at every authoring, trust, and start
     boundary before any mutable admission state is created, while preserving
-    the existing stable API and Gateway refusal contracts.
+    the existing stable API and Gateway refusal contracts. Keep dynamic
+    profile, normalizer, and top-level-field code metadata shared by the
+    emitting runtime and generated authoring catalog so neither can drift.
   removal_condition: >-
     Remove when upstream provides equivalent profile-before-policy loading,
     companion-aware cache invalidation, source and normalized package contracts,
@@ -3564,6 +3568,7 @@ upstream_changes:
   - plugins/workflow/language_schema.py
   - plugins/workflow/schema_cli.py
   - plugins/workflow/schema.py
+  - plugins/workflow/compat.py
   - plugins/workflow/cli.py
   - tests/hermes_cli/test_apply_profile_override.py
   - tests/plugins/workflow/test_language_schema.py
@@ -3571,7 +3576,6 @@ upstream_changes:
   owned_symbols:
   - WorkflowFieldSpec
   - FieldCompatibility
-  - DynamicCompatibilityCode
   - StructuralRequirement
   - STRUCTURAL_REQUIREMENTS
   - JSON truthiness schema helper
@@ -3579,6 +3583,7 @@ upstream_changes:
   - definition_field_names
   - common_node_field_names
   - structural_node_field_names
+  - inapplicable_node_fields
   - sidecar_field_names
   - nested parser field inventory accessors
   - definition_json_schema
@@ -3607,8 +3612,10 @@ upstream_changes:
     code, blocking status, and enforcement phase. Keep structural_node_types
     distinct from compatibility applicability: the schema and loader consume
     the former, while known AI/provider fields remain structurally loadable on
-    other nodes so doctor can issue field_not_applicable. Publish the bounded
-    stable profile, normalizer, and unknown-top-level loader codes alongside
+    other nodes so doctor can issue field_not_applicable. Derive those
+    production compatibility findings from the inventory's
+    applicable_node_types rather than a duplicate field-name policy. Publish
+    the bounded stable profile, normalizer, and unknown-top-level loader codes alongside
     inventory-derived codes. Derive nested structural
     requirements from immutable inventory metadata, including script runtime,
     interactive-loop gate (including exact loader-compatible JSON truthiness),

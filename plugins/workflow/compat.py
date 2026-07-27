@@ -6,6 +6,7 @@ import hashlib
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, AbstractSet, Iterable, Literal, Mapping, Protocol
 
+from plugins.workflow.language_schema import NODE_TYPES, inapplicable_node_fields
 from plugins.workflow.models import (
     CompatibilityFinding,
     CompatibilityLevel,
@@ -149,26 +150,6 @@ def resolve_tool_name(name: str) -> str:
         raise ValueError(f"unknown Archon tool alias: {normalized}")
     return normalized
 
-
-_AI_ONLY_FIELDS = frozenset({
-    "persist_session",
-    "provider",
-    "model",
-    "output_format",
-    "allowed_tools",
-    "denied_tools",
-    "hooks",
-    "mcp",
-    "skills",
-    "agents",
-    "effort",
-    "thinking",
-    "maxBudgetUsd",
-    "systemPrompt",
-    "fallbackModel",
-    "betas",
-    "sandbox",
-})
 
 MAPPED_HOOK_EVENTS = frozenset({
     "PreToolUse",
@@ -582,16 +563,22 @@ def assess_compatibility(
                 "shared context resumes only a cache-fingerprint-compatible predecessor",
                 code="shared_context_fingerprint",
             )
+        inapplicable = inapplicable_node_fields(node.node_type)
+        for field in sorted(inapplicable.keys() & node_options.keys()):
+            applicable_types = " and ".join(
+                candidate
+                for candidate in NODE_TYPES
+                if candidate in inapplicable[field]
+            )
+            _finding(
+                findings,
+                f"{prefix}.{field}",
+                CompatibilityLevel.UNSUPPORTED,
+                f"{field} applies only to {applicable_types} nodes",
+                code="field_not_applicable",
+                blocking=True,
+            )
         if node.node_type not in {"command", "prompt"}:
-            for field in sorted(_AI_ONLY_FIELDS.intersection(node_options)):
-                _finding(
-                    findings,
-                    f"{prefix}.{field}",
-                    CompatibilityLevel.UNSUPPORTED,
-                    f"{field} applies only to command and prompt nodes",
-                    code="field_not_applicable",
-                    blocking=True,
-                )
             continue
         if "persist_session" in node_options:
             _finding(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import json
 from pathlib import Path
 
@@ -9,6 +9,8 @@ from jsonschema import Draft202012Validator
 import pytest
 import yaml
 
+import plugins.workflow.language as workflow_language
+import plugins.workflow.language_schema as language_schema
 from plugins.workflow.language_schema import (
     FIELD_INVENTORY,
     NODE_TYPES,
@@ -287,6 +289,35 @@ def test_node_field_structural_and_compatibility_sets_are_distinct_and_exact():
         spec = _NODE_FIELD_SPECS[field]
         assert spec.structural_node_types == set(NODE_TYPES)
         assert spec.applicable_node_types == {"command", "prompt"}
+
+
+def test_compatibility_applicability_consumes_the_live_field_inventory(monkeypatch):
+    revised_inventory = tuple(
+        replace(
+            spec,
+            applicable_node_types=spec.applicable_node_types - {"bash"},
+        )
+        if spec.scope == "node" and spec.yaml_name == "always_run"
+        else spec
+        for spec in FIELD_INVENTORY
+    )
+    monkeypatch.setattr(language_schema, "FIELD_INVENTORY", revised_inventory)
+    package = load_workflow_snapshot(
+        "inventory-authority.yaml",
+        workflow_bytes=yaml.safe_dump(
+            _workflow({"id": "n", "bash": "true", "always_run": True}),
+            sort_keys=False,
+        ).encode(),
+        sidecar_bytes=None,
+    )
+
+    findings = assess_compatibility(package).findings
+
+    assert any(
+        finding.code == "field_not_applicable"
+        and finding.path == "nodes[0].always_run"
+        for finding in findings
+    )
 
 
 @pytest.mark.parametrize(
@@ -639,6 +670,78 @@ def test_compatibility_code_catalog_covers_inventory_and_dynamic_loader_codes(
         "workflow_normalizer_version_unsupported",
     } <= set(catalog)
     assert len(json.dumps(catalog, sort_keys=True).encode()) < 32_000
+
+
+def test_dynamic_catalog_codes_are_emitted_by_real_runtime_paths():
+    workflow_bytes = yaml.safe_dump(
+        {
+            "name": "runtime-codes",
+            "description": "exercise real dynamic language code paths",
+            "nodes": [{"id": "n", "bash": "true"}],
+        },
+        sort_keys=False,
+    ).encode()
+    with pytest.raises(WorkflowValidationError) as unsupported_profile:
+        load_workflow_snapshot(
+            "unsupported-profile.yaml",
+            workflow_bytes=workflow_bytes,
+            sidecar_bytes=b"language_compatibility: future-profile\n",
+        )
+    with pytest.raises(
+        workflow_language.WorkflowLanguageCompatibilityError
+    ) as unsupported_normalizer:
+        load_workflow_snapshot(
+            "unsupported-normalizer.yaml",
+            workflow_bytes=workflow_bytes,
+            sidecar_bytes=None,
+            normalizer_version=99,
+        )
+
+    legacy = load_workflow_snapshot(
+        "legacy-unknown.yaml",
+        workflow_bytes=workflow_bytes + b"future_field: true\n",
+        sidecar_bytes=None,
+    )
+    with pytest.raises(WorkflowValidationError) as archon_unknown:
+        load_workflow_snapshot(
+            "archon-unknown.yaml",
+            workflow_bytes=workflow_bytes + b"future_field: true\n",
+            sidecar_bytes=b"language_compatibility: archon-2026-07\n",
+        )
+
+    common_runtime_codes = {
+        unsupported_profile.value.issues[0].code,
+        unsupported_normalizer.value.code,
+    }
+    runtime_codes = {
+        WorkflowLanguageProfile.HERMES_LEGACY: common_runtime_codes
+        | {legacy.validation_issues[0].code},
+        WorkflowLanguageProfile.ARCHON_2026_07: common_runtime_codes
+        | {archon_unknown.value.issues[0].code},
+    }
+    expected_codes = {
+        profile: {
+            spec.code
+            for spec in workflow_language.DYNAMIC_LANGUAGE_COMPATIBILITY_CODES
+            if profile in spec.profiles
+        }
+        for profile in WorkflowLanguageProfile
+    }
+    root = Path(__file__).parents[3]
+    references = (
+        root / "website/docs/user-guide/features/workflow-yaml-reference.md",
+        root
+        / "skills/software-development/workflow-builder/references/portable-schema.md",
+    )
+
+    assert runtime_codes == expected_codes
+    for profile, emitted_codes in runtime_codes.items():
+        assert emitted_codes <= set(compatibility_code_catalog(profile))
+        for reference in references:
+            documented = reference.read_text(encoding="utf-8")
+            assert not {
+                code for code in emitted_codes if f"`{code}`" not in documented
+            }
 
 
 def test_generated_language_codes_are_covered_by_authoring_references():
