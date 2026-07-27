@@ -25,12 +25,14 @@ from plugins.workflow.models import (
 WORKFLOW_NORMALIZER_VERSION = 1
 SUPPORTED_NORMALIZER_VERSIONS = frozenset({1})
 LEGACY_LANGUAGE_FINDING_FIELDS = frozenset({
+    "idle_timeout",
     "timeout",
     "retry.max_attempts",
     "output_format",
     "output_type",
 })
 ARCHON_LANGUAGE_FINDING_FIELDS = frozenset({
+    "idle_timeout",
     "timeout",
     "retry",
     "output_format",
@@ -197,6 +199,14 @@ def language_compatibility_findings(
         options = node.options
         prefix = f"nodes[{index}]"
         if profile is WorkflowLanguageProfile.HERMES_LEGACY:
+            if "idle_timeout" in options:
+                add(
+                    f"{prefix}.idle_timeout",
+                    "legacy_idle_timeout_seconds",
+                    "legacy idle_timeout is interpreted in seconds",
+                    "Convert idle_timeout seconds to milliseconds only after Phase 3 Archon semantics are available.",
+                    blocking=False,
+                )
             if "timeout" in options:
                 add(
                     f"{prefix}.timeout",
@@ -232,6 +242,14 @@ def language_compatibility_findings(
                 )
             continue
 
+        if "idle_timeout" in options:
+            add(
+                f"{prefix}.idle_timeout",
+                "archon_idle_timeout_semantics_unavailable",
+                "Archon idle_timeout semantics are not enforceable in Phase 1",
+                "Remove idle_timeout or wait for Phase 3 millisecond normalization.",
+                blocking=True,
+            )
         if "timeout" in options:
             add(
                 f"{prefix}.timeout",

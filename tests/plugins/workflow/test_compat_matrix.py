@@ -609,6 +609,13 @@ def test_legacy_profile_finding_is_stable_for_default_and_explicit_declarations(
     [
         (
             "hermes-legacy",
+            {"idle_timeout": 2},
+            "legacy_idle_timeout_seconds",
+            False,
+            "warning",
+        ),
+        (
+            "hermes-legacy",
             {"timeout": 2},
             "legacy_timeout_seconds",
             False,
@@ -634,6 +641,13 @@ def test_legacy_profile_finding_is_stable_for_default_and_explicit_declarations(
             "legacy_output_type_not_published",
             False,
             "warning",
+        ),
+        (
+            "archon-2026-07",
+            {"idle_timeout": 2},
+            "archon_idle_timeout_semantics_unavailable",
+            True,
+            "error",
         ),
         (
             "archon-2026-07",
@@ -690,7 +704,7 @@ def test_language_profile_fields_emit_stable_findings(
 ):
     node = (
         {"id": "agent", "bash": "true", **node_options}
-        if "timeout" in node_options
+        if {"timeout", "idle_timeout"}.intersection(node_options)
         else {"id": "agent", "prompt": "x", **node_options}
     )
     path = workflow_writer(tmp_path / code, nodes=[node])

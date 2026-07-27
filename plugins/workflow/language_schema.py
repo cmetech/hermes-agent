@@ -30,6 +30,7 @@ class WorkflowFieldSpec:
     yaml_name: str
     json_type: str
     shape: str
+    structural_node_types: frozenset[str]
     applicable_node_types: frozenset[str]
     enforcement_phase: int
     compatibility: tuple[FieldCompatibility, ...]
@@ -46,6 +47,17 @@ class StructuralRequirement:
     equals: object
     required_field: str
     required_shape: str
+
+
+@dataclass(frozen=True, slots=True)
+class DynamicCompatibilityCode:
+    """A stable loader/profile code not attached to one inventory field."""
+
+    code: str
+    profiles: frozenset[WorkflowLanguageProfile]
+    status: str
+    enforcement_phase: int
+    fields: tuple[str, ...]
 
 
 def _compatibility(
@@ -76,6 +88,7 @@ def _field(
     shape: str,
     *,
     node_types: tuple[str, ...] = (),
+    structural_node_types: tuple[str, ...] | None = None,
     required: bool = False,
     required_node_types: tuple[str, ...] = (),
     phase: int = 1,
@@ -89,6 +102,9 @@ def _field(
         yaml_name=yaml_name,
         json_type=json_type,
         shape=shape,
+        structural_node_types=frozenset(
+            node_types if structural_node_types is None else structural_node_types
+        ),
         applicable_node_types=frozenset(node_types),
         enforcement_phase=phase,
         compatibility=_compatibility(
@@ -105,6 +121,38 @@ def _field(
 NODE_TYPES = ("command", "prompt", "bash", "script", "loop", "approval", "cancel")
 _AI_NODE_TYPES = ("command", "prompt")
 _NON_LOOP_NODE_TYPES = tuple(item for item in NODE_TYPES if item != "loop")
+
+
+_DYNAMIC_COMPATIBILITY_CODES = (
+    DynamicCompatibilityCode(
+        code="workflow_language_profile_unsupported",
+        profiles=frozenset(_PROFILES),
+        status="blocking",
+        enforcement_phase=1,
+        fields=("sidecar.language_compatibility",),
+    ),
+    DynamicCompatibilityCode(
+        code="workflow_normalizer_version_unsupported",
+        profiles=frozenset(_PROFILES),
+        status="blocking",
+        enforcement_phase=1,
+        fields=("normalizer_version",),
+    ),
+    DynamicCompatibilityCode(
+        code="unknown_top_level_field",
+        profiles=frozenset({WorkflowLanguageProfile.HERMES_LEGACY}),
+        status="warning",
+        enforcement_phase=1,
+        fields=("*",),
+    ),
+    DynamicCompatibilityCode(
+        code="archon_unknown_top_level_field",
+        profiles=frozenset({WorkflowLanguageProfile.ARCHON_2026_07}),
+        status="blocking",
+        enforcement_phase=1,
+        fields=("*",),
+    ),
+)
 
 
 _DEFINITION_FIELDS = (
@@ -160,7 +208,18 @@ _NODE_FIELDS = (
     _field("node", "when", "string", "nonempty_string", node_types=NODE_TYPES),
     _field("node", "trigger_rule", "string", "trigger_rule", node_types=NODE_TYPES),
     _field("node", "context", "string", "context", node_types=NODE_TYPES),
-    _field("node", "idle_timeout", "number", "positive_number", node_types=NODE_TYPES),
+    _field(
+        "node",
+        "idle_timeout",
+        "number",
+        "positive_number",
+        node_types=NODE_TYPES,
+        phase=3,
+        legacy_status="warning",
+        legacy_code="legacy_idle_timeout_seconds",
+        archon_status="blocking",
+        archon_code="archon_idle_timeout_semantics_unavailable",
+    ),
     _field(
         "node",
         "retry",
@@ -184,30 +243,106 @@ _NODE_FIELDS = (
         archon_status="blocking",
         archon_code="archon_output_type_unavailable",
     ),
-    _field("node", "persist_session", "boolean", "boolean", node_types=_AI_NODE_TYPES),
-    _field("node", "provider", "string", "nonempty_string", node_types=_AI_NODE_TYPES),
-    _field("node", "model", "string", "nonempty_string", node_types=_AI_NODE_TYPES),
+    _field(
+        "node",
+        "persist_session",
+        "boolean",
+        "boolean",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
+    ),
+    _field(
+        "node",
+        "provider",
+        "string",
+        "nonempty_string",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
+    ),
+    _field(
+        "node",
+        "model",
+        "string",
+        "nonempty_string",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
+    ),
     _field(
         "node",
         "output_format",
         "object",
         "mapping",
         node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
         phase=2,
         legacy_status="warning",
         legacy_code="legacy_output_format_post_validation",
         archon_status="blocking",
         archon_code="archon_output_format_unavailable",
     ),
-    _field("node", "allowed_tools", "array", "string_list", node_types=_AI_NODE_TYPES),
-    _field("node", "denied_tools", "array", "string_list", node_types=_AI_NODE_TYPES),
-    _field("node", "hooks", "object", "hooks", node_types=_AI_NODE_TYPES),
-    _field("node", "mcp", "string", "nonempty_string", node_types=_AI_NODE_TYPES),
-    _field("node", "skills", "array", "string_list", node_types=_AI_NODE_TYPES),
-    _field("node", "agents", "object", "agents", node_types=_AI_NODE_TYPES),
-    _field("node", "effort", "string", "effort", node_types=_AI_NODE_TYPES),
     _field(
-        "node", "thinking", "string or object", "thinking", node_types=_AI_NODE_TYPES
+        "node",
+        "allowed_tools",
+        "array",
+        "string_list",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
+    ),
+    _field(
+        "node",
+        "denied_tools",
+        "array",
+        "string_list",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
+    ),
+    _field(
+        "node",
+        "hooks",
+        "object",
+        "hooks",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
+    ),
+    _field(
+        "node",
+        "mcp",
+        "string",
+        "nonempty_string",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
+    ),
+    _field(
+        "node",
+        "skills",
+        "array",
+        "string_list",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
+    ),
+    _field(
+        "node",
+        "agents",
+        "object",
+        "agents",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
+    ),
+    _field(
+        "node",
+        "effort",
+        "string",
+        "effort",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
+    ),
+    _field(
+        "node",
+        "thinking",
+        "string or object",
+        "thinking",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
     ),
     _field(
         "node",
@@ -215,23 +350,42 @@ _NODE_FIELDS = (
         "number",
         "positive_number",
         node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
         phase=5,
         archon_status="blocking",
         archon_code="archon_budget_enforcement_unavailable",
     ),
     _field(
-        "node", "systemPrompt", "string", "nonempty_string", node_types=_AI_NODE_TYPES
+        "node",
+        "systemPrompt",
+        "string",
+        "nonempty_string",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
     ),
     _field(
-        "node", "fallbackModel", "string", "nonempty_string", node_types=_AI_NODE_TYPES
+        "node",
+        "fallbackModel",
+        "string",
+        "nonempty_string",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
     ),
-    _field("node", "betas", "array", "string_list", node_types=_AI_NODE_TYPES),
+    _field(
+        "node",
+        "betas",
+        "array",
+        "string_list",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
+    ),
     _field(
         "node",
         "sandbox",
         "object",
         "mapping",
         node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
         phase=5,
         archon_status="blocking",
         archon_code="archon_sandbox_enforcement_unavailable",
@@ -442,6 +596,17 @@ def definition_field_names() -> frozenset[str]:
 
 def common_node_field_names() -> frozenset[str]:
     return _field_names("node")
+
+
+def structural_node_field_names(node_type: str) -> frozenset[str]:
+    """Return node fields the loader and JSON Schema accept structurally."""
+    if node_type not in NODE_TYPES:
+        raise ValueError(f"unsupported workflow node type: {node_type}")
+    return frozenset(
+        spec.yaml_name
+        for spec in _specs("node")
+        if node_type in spec.structural_node_types
+    )
 
 
 def sidecar_field_names() -> frozenset[str]:
@@ -715,7 +880,7 @@ def _nodes_schema(profile: WorkflowLanguageProfile) -> dict[str, Any]:
         properties = {
             spec.yaml_name: _field_schema(spec, profile)
             for spec in specs
-            if node_type in spec.applicable_node_types
+            if node_type in spec.structural_node_types
         }
         variants.append({
             "type": "object",
@@ -810,6 +975,16 @@ def compatibility_code_catalog(
         fields = entry["fields"]
         assert isinstance(fields, list)
         fields.append(_contract_path(spec))
+    for spec in _DYNAMIC_COMPATIBILITY_CODES:
+        if selected not in spec.profiles:
+            continue
+        grouped[spec.code] = {
+            "status": spec.status,
+            "severity": "error" if spec.status == "blocking" else "warning",
+            "blocking": spec.status == "blocking",
+            "enforcement_phase": spec.enforcement_phase,
+            "fields": list(spec.fields),
+        }
     return {
         code: {**entry, "fields": sorted(entry["fields"])}
         for code, entry in sorted(grouped.items())

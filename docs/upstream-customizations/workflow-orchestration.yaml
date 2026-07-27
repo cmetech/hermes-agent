@@ -3191,6 +3191,8 @@ upstream_changes:
   - explicit language declaration type enforcement
   - companion-aware discovery cache signature
   - stable compatibility finding codes
+  - legacy_idle_timeout_seconds
+  - archon_idle_timeout_semantics_unavailable
   - compatibility finding effective-profile invariant
   - assess_package_execution environment compatibility finding
   - _verified_distribution_assessment environment compatibility finding
@@ -3224,7 +3226,9 @@ upstream_changes:
     wrappers, and identical validate and doctor language projections. Workflows
     without a declaration and explicit hermes-legacy workflows must remain
     permissive with actionable warnings; declared archon-2026-07 workflows must
-    fail closed only for invalid or currently unenforceable semantics. Use the
+    fail closed only for invalid or currently unenforceable semantics. Keep
+    idle_timeout seconds unchanged under legacy and block it under Archon until
+    Phase 3 provides millisecond normalization. Use the
     dependency-neutral runnable guard at every authoring, trust, and start
     boundary before any mutable admission state is created, while preserving
     the existing stable API and Gateway refusal contracts.
@@ -3567,12 +3571,14 @@ upstream_changes:
   owned_symbols:
   - WorkflowFieldSpec
   - FieldCompatibility
+  - DynamicCompatibilityCode
   - StructuralRequirement
   - STRUCTURAL_REQUIREMENTS
   - JSON truthiness schema helper
   - FIELD_INVENTORY
   - definition_field_names
   - common_node_field_names
+  - structural_node_field_names
   - sidecar_field_names
   - nested parser field inventory accessors
   - definition_json_schema
@@ -3598,7 +3604,12 @@ upstream_changes:
     in schema.py, legacy top-level unknown fields permissive with warnings,
     Archon unknown fields strict, companion fields strict under both profiles,
     and every deferred annotation aligned with the runtime's stable finding
-    code, blocking status, and enforcement phase. Derive nested structural
+    code, blocking status, and enforcement phase. Keep structural_node_types
+    distinct from compatibility applicability: the schema and loader consume
+    the former, while known AI/provider fields remain structurally loadable on
+    other nodes so doctor can issue field_not_applicable. Publish the bounded
+    stable profile, normalizer, and unknown-top-level loader codes alongside
+    inventory-derived codes. Derive nested structural
     requirements from immutable inventory metadata, including script runtime,
     interactive-loop gate (including exact loader-compatible JSON truthiness),
     event-bound hook output (including loader-valid explicit null), retry,
@@ -3759,6 +3770,7 @@ upstream_changes:
   - Legacy HERMES_WORKFLOW_RUN_DIR scratch and ARTIFACTS_DIR guidance
   - workflow-builder generated-contract authoring recipe
   - workflow-builder deferred-field decision recipe
+  - workflow-builder idle_timeout profile-unit decision
   - workflow language backend-version floor guidance
   - OTTO V1 incompatible authoring-skill guidance
   tests:
@@ -3772,7 +3784,9 @@ upstream_changes:
     unversioned hermes-legacy behavior for bytes consumed by pre-Phase-1
     backends that reject unknown companion fields. Keep deferred Archon fields
     as explicit two-choice authoring stops rather than silent legacy
-    downgrades, retain validate/doctor and digest-bound trust gates, keep
+    downgrades, including legacy idle_timeout seconds versus Phase 3-deferred
+    Archon millisecond normalization. Retain validate/doctor and digest-bound
+    trust gates, keep
     legacy scratch/state compatibility explicit while recommending
     ARTIFACTS_DIR and denying added run-root files any execution authority, and keep
     the global create-workflow skill's OTTO V1 steps, produces, context_from,
