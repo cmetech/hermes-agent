@@ -228,6 +228,87 @@ def test_archon_deferred_fields_block_validate_trust_and_run(
     assert list(store.staging_root.iterdir()) == []
 
 
+def test_archon_validate_text_reports_field_specific_compatibility_finding(
+    workflow_writer, tmp_path, capsys
+):
+    path = _archon_package(
+        workflow_writer, tmp_path, field="timeout", value=1000
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(tmp_path),
+        "validate",
+        path.stem,
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_BLOCKING_FINDING
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert "archon-timeout: invalid" in output.out
+    assert "nodes[0].timeout" in output.out
+    assert "Archon timeout semantics are not enforceable in Phase 1" in output.out
+
+
+@pytest.mark.parametrize(
+    "declared_profile",
+    [None, "hermes-legacy"],
+    ids=["unversioned", "explicit-legacy"],
+)
+def test_legacy_timeout_and_retry_validate_trust_and_run_with_warnings(
+    workflow_writer, tmp_path, capsys, declared_profile
+):
+    path = workflow_writer(
+        tmp_path / ".hermes" / "workflows",
+        name="legacy-timeout-retry",
+        filename="legacy-timeout-retry.yaml",
+        nodes=[
+            {
+                "id": "start",
+                "bash": "true",
+                "timeout": 1,
+                "retry": {"max_attempts": 2},
+            }
+        ],
+    )
+    if declared_profile is not None:
+        path.with_name(f"{path.stem}.hermes.yaml").write_text(
+            f"language_compatibility: {declared_profile}\n", encoding="utf-8"
+        )
+    home = tmp_path / "home"
+    common = ["--workdir", str(tmp_path), "--hermes-home", str(home)]
+    parser = _parser()
+
+    validate = parser.parse_args([*common, "validate", path.stem, "--json"])
+    assert validate.func(validate) == 0
+    validation = _json_result(capsys)
+    assert validation["language"]["effective_profile"] == "hermes-legacy"
+    assert {
+        issue["code"] for issue in validation["issues"]
+    } >= {"legacy_timeout_seconds", "legacy_retry_total_attempts"}
+
+    package = load_workflow(path)
+    digest = compute_package_digest(package).sha256
+    trust = parser.parse_args(
+        [*common, "trust", path.stem, "--digest", digest, "--json"]
+    )
+    assert trust.func(trust) == 0
+    assert _json_result(capsys)["status"] == "trusted"
+
+    run = parser.parse_args(
+        [
+            *common,
+            "run",
+            path.stem,
+            "--foreground",
+            "--idempotency-key",
+            f"legacy-{declared_profile or 'unversioned'}",
+            "--json",
+        ]
+    )
+    assert run.func(run) == 0
+    assert _json_result(capsys)["status"] == "succeeded"
+
+
 def test_plugin_registers_cli_command_and_background_coordinator():
     class Context:
         def __init__(self):

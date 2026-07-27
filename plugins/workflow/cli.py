@@ -974,12 +974,13 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     try:
         require_runnable(compatibility)
     except WorkflowCompatibilityBlockedError as exc:
-        raise WorkflowCommandError(
-            "validation_failed",
-            "workflow validation found blocking issues",
-            exit_code=EXIT_BLOCKING_FINDING,
-            result=payload,
-        ) from exc
+        if args.json:
+            raise WorkflowCommandError(
+                "validation_failed",
+                "workflow validation found blocking issues",
+                exit_code=EXIT_BLOCKING_FINDING,
+                result=payload,
+            ) from exc
     if args.json:
         _emit(payload, as_json=True)
     else:
