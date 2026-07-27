@@ -921,30 +921,148 @@ def _resistant_descendant_source(*, signal_parent: bool) -> str:
     )
 
 
-def _assert_resistant_descendant_was_reaped(repo: Path) -> None:
-    ready = repo / ".resistant-child.ready"
-    marker = repo / ".resistant-child.marker"
-    assert ready.is_file()
-    child_pid = int(ready.read_text())
+def _assert_resistant_descendants_were_reaped(repo: Path, *stems: str) -> None:
+    ready_paths = [repo / f".{stem}.ready" for stem in stems]
+    marker_paths = [repo / f".{stem}.marker" for stem in stems]
+    assert all(path.is_file() for path in ready_paths)
+    child_pids = [int(path.read_text()) for path in ready_paths]
     time.sleep(3.2)
-    escaped = marker.exists()
-    try:
-        os.kill(child_pid, 0)
-    except ProcessLookupError:
-        alive = False
-    else:
-        alive = True
-        subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                f"import os, signal; os.kill({child_pid}, signal.SIGKILL)",
-            ],
-            capture_output=True,
-            check=False,
-        )
-    assert escaped is False
-    assert alive is False
+    escaped = [path.exists() for path in marker_paths]
+    alive = []
+    for child_pid in child_pids:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            alive.append(False)
+        else:
+            alive.append(True)
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    f"import os, signal; os.kill({child_pid}, signal.SIGKILL)",
+                ],
+                capture_output=True,
+                check=False,
+            )
+    assert escaped == [False] * len(stems)
+    assert alive == [False] * len(stems)
+
+
+def _assert_resistant_descendant_was_reaped(repo: Path) -> None:
+    _assert_resistant_descendants_were_reaped(repo, "resistant-child")
+
+
+def _leader_exit_with_resistant_descendant_source(*, passes: bool) -> str:
+    assertion = "    assert True\n" if passes else "    raise AssertionError('retry me')\n"
+    return (
+        "from pathlib import Path\n"
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n\n"
+        "def test_leader_exit():\n"
+        "    counter = Path('.exit-attempt')\n"
+        "    attempt = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "    counter.write_text(str(attempt))\n"
+        "    stem = f'exit-child-{attempt}'\n"
+        "    child = (\"import os, signal, time; from pathlib import Path; \"\n"
+        "        \"signal.signal(signal.SIGTERM, signal.SIG_IGN); \"\n"
+        "        f\"Path('.{stem}.ready').write_text(str(os.getpid())); \"\n"
+        "        f\"time.sleep(3); Path('.{stem}.marker').write_text('escaped'); \"\n"
+        "        \"time.sleep(30)\")\n"
+        "    subprocess.Popen([sys.executable, '-c', child], stdin=subprocess.DEVNULL, "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "    ready = Path(f'.{stem}.ready')\n"
+        "    deadline = time.monotonic() + 2\n"
+        "    while not ready.exists() and time.monotonic() < deadline:\n"
+        "        time.sleep(0.01)\n"
+        "    assert ready.exists()\n"
+        + assertion
+    )
+
+
+def _leader_signal_after_fast_intermediate_source() -> str:
+    grandchild = (
+        "import os, signal, time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "Path('.fast-grandchild.ready').write_text(str(os.getpid())); "
+        "time.sleep(3); Path('.fast-grandchild.marker').write_text('escaped'); "
+        "time.sleep(30)"
+    )
+    intermediate = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL)"
+    )
+    return (
+        "from pathlib import Path\n"
+        "import os\n"
+        "import signal\n"
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n\n"
+        "def test_fast_intermediate():\n"
+        f"    intermediate = {intermediate!r}\n"
+        "    process = subprocess.Popen([sys.executable, '-c', intermediate])\n"
+        "    process.wait(timeout=2)\n"
+        "    ready = Path('.fast-grandchild.ready')\n"
+        "    deadline = time.monotonic() + 2\n"
+        "    while not ready.exists() and time.monotonic() < deadline:\n"
+        "        time.sleep(0.01)\n"
+        "    assert ready.exists()\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"
+        "    os.kill(os.getpid(), signal.SIGTERM)\n"
+    )
+
+
+def test_ledger_runner_reaps_group_after_successful_leader_exit(tmp_path: Path) -> None:
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {"tests/test_exit_zero.py": _leader_exit_with_resistant_descendant_source(passes=True)},
+        timeout_seconds=3,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert [attempt["result"] for attempt in records[0]["attempts"]] == ["passed"]
+    _assert_resistant_descendants_were_reaped(
+        tmp_path / "ledger-fixture", "exit-child-1"
+    )
+
+
+def test_ledger_runner_reaps_each_group_before_retrying_failed_leader(
+    tmp_path: Path,
+) -> None:
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {"tests/test_exit_one.py": _leader_exit_with_resistant_descendant_source(passes=False)},
+        timeout_seconds=3,
+    )
+
+    assert result.returncode == 1
+    assert [attempt["result"] for attempt in records[0]["attempts"]] == [
+        "failed",
+        "failed",
+    ]
+    _assert_resistant_descendants_were_reaped(
+        tmp_path / "ledger-fixture", "exit-child-1", "exit-child-2"
+    )
+
+
+def test_ledger_runner_reaps_grandchild_after_fast_intermediate_and_signal(
+    tmp_path: Path,
+) -> None:
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {"tests/test_fast_intermediate.py": _leader_signal_after_fast_intermediate_source()},
+        timeout_seconds=3,
+    )
+
+    assert result.returncode == 1
+    assert [attempt["result"] for attempt in records[0]["attempts"]] == ["signaled"]
+    _assert_resistant_descendants_were_reaped(
+        tmp_path / "ledger-fixture", "fast-grandchild"
+    )
 
 
 def test_ledger_runner_escalates_group_after_timeout_leader_exits(

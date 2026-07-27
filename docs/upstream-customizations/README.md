@@ -9,12 +9,14 @@ upstream commit against which the behavior was last verified.
 can locate in a declared file at the committed `HEAD`; dirty checkout bytes and
 comments never satisfy ownership. Python identifiers are resolved through the
 AST with qualified owner identity preserved; owned definition spans include all
-stacked decorator lines. Other languages use bounded exact literal-token
-matching after language-aware comment removal, including PowerShell, Markdown,
-CSS, shell, TypeScript/JavaScript, YAML, and TOML comments without discarding
-string literals or code. Behavioral prose belongs in
-the optional bounded `owned_invariants` list. New or migrated entries may select
-`overlap_policy: owned_symbol` (the compatibility default) or
+stacked decorator lines. JSON, YAML, and TOML are syntax-validated with their
+native safe parsers and search only recursive string keys and values; malformed
+documents fail validation. PowerShell, POSIX shell, TypeScript/JavaScript, CSS,
+and Markdown use separate bounded lexical scanners so their real comments do
+not satisfy ownership while strings, template text and expressions, parameter
+trims, here-documents, and code spans remain searchable. Behavioral prose
+belongs in the optional bounded `owned_invariants` list. New or migrated entries
+may select `overlap_policy: owned_symbol` (the compatibility default) or
 `overlap_policy: any_owned_file`. The latter makes every change to a declared
 file decision-required even when no exact symbol span changed, and is required
 for security, admission, exact-byte authority, Desktop capability, schema, and

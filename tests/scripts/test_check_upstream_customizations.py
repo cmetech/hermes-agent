@@ -435,6 +435,145 @@ def test_non_python_owned_symbol_ignores_language_comments_but_accepts_code(
     load_and_validate_manifest(manifest, repo, check_git=False)
 
 
+def _non_python_manifest(
+    tmp_path: Path,
+    suffix: str,
+    source: str,
+) -> tuple[Path, Path, Path]:
+    repo = _repo(tmp_path)
+    source_path = repo / f"owned{suffix}"
+    source_path.write_text(source)
+    _git(repo, "add", source_path.name)
+    _git(repo, "commit", "-m", f"add {suffix} scanner fixture")
+    manifest = _manifest(repo, _git(repo, "rev-parse", "HEAD"))
+    raw = yaml.safe_load(manifest.read_text())
+    entry = raw["upstream_changes"][0]
+    entry["files"] = [source_path.name]
+    entry["owned_symbols"] = ["ExactToken"]
+    entry["overlap_policy"] = "owned_symbol"
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    return repo, source_path, manifest
+
+
+def test_powershell_backslash_does_not_escape_comment_boundary(tmp_path: Path) -> None:
+    repo, _source, manifest = _non_python_manifest(
+        tmp_path,
+        ".ps1",
+        'Write-Output "done\\" # ExactToken\n',
+    )
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "value: |\n  first line\n  ExactToken\n",
+        "url: https://example/#ExactToken\n",
+    ],
+)
+def test_yaml_scalars_preserve_exact_string_tokens(tmp_path: Path, source: str) -> None:
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".yaml", source)
+
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_yaml_comment_does_not_satisfy_owned_symbol(tmp_path: Path) -> None:
+    repo, _source, manifest = _non_python_manifest(
+        tmp_path,
+        ".yaml",
+        "value: stable # ExactToken\n",
+    )
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "value=${input#ExactToken}\n",
+        "cat <<'TOKEN_EOF'\nExactToken\nTOKEN_EOF\n",
+    ],
+)
+def test_shell_parameter_and_quoted_heredoc_preserve_tokens(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".sh", source)
+
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_shell_comment_does_not_satisfy_owned_symbol(tmp_path: Path) -> None:
+    repo, _source, manifest = _non_python_manifest(
+        tmp_path,
+        ".sh",
+        "printf '%s\\n' stable # ExactToken\n",
+    )
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_typescript_template_expression_comment_is_removed(tmp_path: Path) -> None:
+    repo, _source, manifest = _non_python_manifest(
+        tmp_path,
+        ".ts",
+        "const value = `prefix ${/* ExactToken */ 1}`\n",
+    )
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "const value = `prefix ExactToken`\n",
+        "const value = `prefix ${ExactToken}`\n",
+    ],
+)
+def test_typescript_template_text_and_expression_code_preserve_tokens(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_toml_multiline_string_preserves_hash_token_but_comment_does_not(
+    tmp_path: Path,
+) -> None:
+    repo, source, manifest = _non_python_manifest(
+        tmp_path,
+        ".toml",
+        'value = "stable" # ExactToken\n',
+    )
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+    source.write_text('value = """prefix "quote" #ExactToken\ntail"""\n')
+    _git(repo, "commit", "-am", "install TOML multiline literal")
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_json_parser_preserves_values_and_rejects_malformed_input(tmp_path: Path) -> None:
+    repo, source, manifest = _non_python_manifest(
+        tmp_path,
+        ".json",
+        '{"value": "ExactToken"}\n',
+    )
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+    source.write_text('{"value": }\n')
+    _git(repo, "commit", "-am", "install malformed JSON")
+    with pytest.raises(ValueError, match="cannot parse .*JSON"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
 def test_overlap_reporting_is_read_only_for_git_and_baseline(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     baseline = _git(repo, "rev-parse", "HEAD")

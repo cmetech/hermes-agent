@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
+import tomllib
 from typing import Any
 
 import yaml
@@ -21,6 +22,7 @@ _MAX_REPOSITORY_PATH_LENGTH = 4096
 _MAX_OWNED_SYMBOL_LENGTH = 256
 _MAX_OWNED_INVARIANT_LENGTH = 512
 _MAX_OWNED_INVARIANTS = 128
+_MAX_SCANNED_SOURCE_BYTES = 4 * 1024 * 1024
 _OVERLAP_POLICIES = frozenset({"owned_symbol", "any_owned_file"})
 _MACHINE_SYMBOL = re.compile(r"^\S+$")
 _EPHEMERAL_COVERAGE_PATHS = frozenset({".superpowers/sdd/progress.md"})
@@ -489,99 +491,397 @@ class _PythonSymbolCollector(ast.NodeVisitor):
             self._record(".".join([*self.scope, target.id]), target)
 
 
-def _strip_non_python_comments(source: str, path: str) -> str:
-    suffix = Path(path).suffix.lower()
-    slash_line = suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
-    hash_line = suffix in {
-        ".sh",
-        ".bash",
-        ".ps1",
-        ".psm1",
-        ".psd1",
-        ".yaml",
-        ".yml",
-        ".toml",
-    }
-    slash_block = suffix in {
-        ".js",
-        ".jsx",
-        ".mjs",
-        ".cjs",
-        ".ts",
-        ".tsx",
-        ".css",
-        ".scss",
-        ".less",
-    }
-    powershell_block = suffix in {".ps1", ".psm1", ".psd1"}
-    markdown_block = suffix in {".md", ".markdown"}
-    quote_chars = {"'", '"'}
-    if suffix in {
-        ".js",
-        ".jsx",
-        ".mjs",
-        ".cjs",
-        ".ts",
-        ".tsx",
-        ".sh",
-        ".bash",
-        ".md",
-        ".markdown",
-    }:
-        quote_chars.add("`")
+def _blank(result: list[str], source: str, start: int, end: int) -> None:
+    for index in range(start, end):
+        result[index] = "\n" if source[index] == "\n" else " "
+
+
+def _powershell_without_comments(source: str) -> str:
+    """Remove PowerShell comments using PowerShell's backtick escape rules."""
+    result = list(source)
+    index = 0
+    mode = "code"
+    while index < len(source):
+        if mode == "block":
+            end = source.find("#>", index)
+            end = len(source) if end < 0 else end + 2
+            _blank(result, source, index, end)
+            index = end
+            mode = "code"
+            continue
+        char = source[index]
+        if mode == "single":
+            if source.startswith("''", index):
+                index += 2
+            else:
+                if char == "'":
+                    mode = "code"
+                index += 1
+            continue
+        if mode == "double":
+            if char == "`":
+                index += min(2, len(source) - index)
+            else:
+                if char == '"':
+                    mode = "code"
+                index += 1
+            continue
+        if source.startswith("<#", index):
+            mode = "block"
+            continue
+        if char == "#":
+            end = source.find("\n", index)
+            end = len(source) if end < 0 else end
+            _blank(result, source, index, end)
+            index = end
+        elif char == "`":
+            index += min(2, len(source) - index)
+        elif char == "'":
+            mode = "single"
+            index += 1
+        elif char == '"':
+            mode = "double"
+            index += 1
+        else:
+            index += 1
+    return "".join(result)
+
+
+_HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+
+
+def _shell_without_comments(source: str) -> str:
+    """Remove shell comments while retaining parameter trims and here-doc bodies."""
+    result = list(source)
+    mode = "code"
+    heredoc: tuple[str, bool] | None = None
+    offset = 0
+    for line in source.splitlines(keepends=True):
+        body = line[:-1] if line.endswith("\n") else line
+        if heredoc is not None:
+            delimiter, strip_tabs = heredoc
+            candidate = body.lstrip("\t") if strip_tabs else body
+            if candidate == delimiter:
+                heredoc = None
+            offset += len(line)
+            continue
+        index = 0
+        comment_at: int | None = None
+        while index < len(body):
+            char = body[index]
+            if mode == "single":
+                if char == "'":
+                    mode = "code"
+                index += 1
+                continue
+            if mode in {"double", "backtick"}:
+                closer = '"' if mode == "double" else "`"
+                if char == "\\":
+                    index += min(2, len(body) - index)
+                else:
+                    if char == closer:
+                        mode = "code"
+                    index += 1
+                continue
+            if char == "\\":
+                index += min(2, len(body) - index)
+            elif char == "'":
+                mode = "single"
+                index += 1
+            elif char == '"':
+                mode = "double"
+                index += 1
+            elif char == "`":
+                mode = "backtick"
+                index += 1
+            elif char == "#" and (
+                index == 0 or body[index - 1].isspace() or body[index - 1] in ";|&()"
+            ):
+                comment_at = index
+                break
+            else:
+                index += 1
+        visible = body if comment_at is None else body[:comment_at]
+        matches = list(_HEREDOC.finditer(visible))
+        if matches:
+            match = matches[-1]
+            heredoc = (match.group(3), match.group(1) == "-")
+        if comment_at is not None:
+            _blank(result, source, offset + comment_at, offset + len(body))
+        offset += len(line)
+    return "".join(result)
+
+
+def _typescript_without_comments(source: str) -> str:
+    """Remove JS/TS comments, including comments inside template expressions."""
+    result = list(source)
+    # Stack entries are code, expression:<brace depth>, string quote, or template.
+    stack: list[tuple[str, int]] = [("code", 0)]
+    index = 0
+    while index < len(source):
+        mode, depth = stack[-1]
+        char = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if mode in {"single", "double"}:
+            closer = "'" if mode == "single" else '"'
+            if char == "\\":
+                index += min(2, len(source) - index)
+            else:
+                if char == closer:
+                    stack.pop()
+                index += 1
+            continue
+        if mode == "template":
+            if char == "\\":
+                index += min(2, len(source) - index)
+            elif source.startswith("${", index):
+                stack.append(("expression", 1))
+                index += 2
+            elif char == "`":
+                stack.pop()
+                index += 1
+            else:
+                index += 1
+            continue
+        if char == "/" and following == "/":
+            end = source.find("\n", index)
+            end = len(source) if end < 0 else end
+            _blank(result, source, index, end)
+            index = end
+            continue
+        if char == "/" and following == "*":
+            end = source.find("*/", index + 2)
+            end = len(source) if end < 0 else end + 2
+            _blank(result, source, index, end)
+            index = end
+            continue
+        if char in {"'", '"'}:
+            stack.append(("single" if char == "'" else "double", 0))
+            index += 1
+        elif char == "`":
+            stack.append(("template", 0))
+            index += 1
+        elif mode == "expression" and char == "{":
+            stack[-1] = (mode, depth + 1)
+            index += 1
+        elif mode == "expression" and char == "}":
+            if depth == 1:
+                stack.pop()
+            else:
+                stack[-1] = (mode, depth - 1)
+            index += 1
+        else:
+            index += 1
+    return "".join(result)
+
+
+def _css_without_comments(source: str) -> str:
     result = list(source)
     index = 0
     quote = ""
     while index < len(source):
         char = source[index]
-        following = source[index + 1] if index + 1 < len(source) else ""
         if quote:
-            if char == "\\" or (powershell_block and char == "`"):
-                index += 2
-                continue
-            if char == quote:
-                quote = ""
-            index += 1
-            continue
-        if powershell_block and char == "`":
-            index += 2
-            continue
-        if char in quote_chars:
+            if char == "\\":
+                index += min(2, len(source) - index)
+            else:
+                if char == quote:
+                    quote = ""
+                index += 1
+        elif char in {"'", '"'}:
             quote = char
             index += 1
-            continue
-        if slash_line and char == "/" and following == "/":
-            while index < len(source) and source[index] != "\n":
-                result[index] = " "
-                index += 1
-            continue
-        block: tuple[str, str] | None = None
-        if slash_block and source.startswith("/*", index):
-            block = ("/*", "*/")
-        elif powershell_block and source.startswith("<#", index):
-            block = ("<#", "#>")
-        elif markdown_block and source.startswith("<!--", index):
-            block = ("<!--", "-->")
-        if block:
-            opener, closer = block
-            for offset in range(len(opener)):
-                result[index + offset] = " "
-            index += len(opener)
-            while index < len(source) and not source.startswith(closer, index):
-                result[index] = "\n" if source[index] == "\n" else " "
-                index += 1
-            if source.startswith(closer, index):
-                for offset in range(len(closer)):
-                    result[index + offset] = " "
-                index += len(closer)
-            continue
-        if hash_line and char == "#":
-            while index < len(source) and source[index] != "\n":
-                result[index] = " "
-                index += 1
-            continue
-        index += 1
+        elif source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            end = len(source) if end < 0 else end + 2
+            _blank(result, source, index, end)
+            index = end
+        else:
+            index += 1
     return "".join(result)
+
+
+def _markdown_without_comments(source: str) -> str:
+    result = list(source)
+    index = 0
+    code_ticks = 0
+    while index < len(source):
+        if source[index] == "`":
+            end = index
+            while end < len(source) and source[end] == "`":
+                end += 1
+            count = end - index
+            if code_ticks == 0:
+                code_ticks = count
+            elif count == code_ticks:
+                code_ticks = 0
+            index = end
+        elif code_ticks == 0 and source.startswith("<!--", index):
+            end = source.find("-->", index + 4)
+            end = len(source) if end < 0 else end + 3
+            _blank(result, source, index, end)
+            index = end
+        else:
+            index += 1
+    return "".join(result)
+
+
+def _toml_without_comments(source: str) -> str:
+    result = list(source)
+    index = 0
+    mode = "code"
+    while index < len(source):
+        if mode == "code":
+            if source.startswith("'''", index):
+                mode = "multiline_literal"
+                index += 3
+            elif source.startswith('\"\"\"', index):
+                mode = "multiline_basic"
+                index += 3
+            elif source[index] == "'":
+                mode = "literal"
+                index += 1
+            elif source[index] == '"':
+                mode = "basic"
+                index += 1
+            elif source[index] == "#":
+                end = source.find("\n", index)
+                end = len(source) if end < 0 else end
+                _blank(result, source, index, end)
+                index = end
+            else:
+                index += 1
+        elif mode == "multiline_literal":
+            if source.startswith("'''", index):
+                mode = "code"
+                index += 3
+            else:
+                index += 1
+        elif mode == "multiline_basic":
+            if source.startswith('\"\"\"', index):
+                mode = "code"
+                index += 3
+            elif source[index] == "\\":
+                index += min(2, len(source) - index)
+            else:
+                index += 1
+        elif mode == "literal":
+            if source[index] == "'":
+                mode = "code"
+            index += 1
+        else:
+            if source[index] == "\\":
+                index += min(2, len(source) - index)
+            else:
+                if source[index] == '"':
+                    mode = "code"
+                index += 1
+    return "".join(result)
+
+
+def _semantic_strings(value: Any) -> list[str]:
+    strings: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                strings.append(key)
+            strings.extend(_semantic_strings(item))
+    elif isinstance(value, list):
+        for item in value:
+            strings.extend(_semantic_strings(item))
+    elif isinstance(value, str):
+        strings.append(value)
+    return strings
+
+
+def _exact_pattern(symbol: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<![A-Za-z0-9_$]){re.escape(symbol)}(?![A-Za-z0-9_$])")
+
+
+def _parse_error(path: str, kind: str, exc: Exception) -> ValueError:
+    detail = " ".join(str(exc).split())[:240]
+    return ValueError(f"cannot parse {path} as {kind}: {detail}")
+
+
+def _structured_spans(
+    source: str,
+    symbols: list[str],
+    *,
+    path: str,
+    suffix: str,
+) -> dict[str, list[tuple[int, int]]]:
+    spans = {symbol: [] for symbol in symbols}
+    if suffix in {".yaml", ".yml"}:
+        try:
+            documents = list(yaml.safe_load_all(source))
+            nodes = list(yaml.compose_all(source, Loader=yaml.SafeLoader))
+        except yaml.YAMLError as exc:
+            raise _parse_error(path, "YAML", exc) from exc
+        semantic = _semantic_strings(documents)
+        for symbol in symbols:
+            pattern = _exact_pattern(symbol)
+            if not any(pattern.search(value) for value in semantic):
+                continue
+            for document in nodes:
+                if document is None:
+                    continue
+                for node in _walk_yaml_nodes(document):
+                    if (
+                        isinstance(node, yaml.nodes.ScalarNode)
+                        and node.tag == "tag:yaml.org,2002:str"
+                        and pattern.search(node.value)
+                    ):
+                        spans[symbol].append(
+                            (node.start_mark.line + 1, node.end_mark.line + 1)
+                        )
+        return spans
+    if suffix == ".toml":
+        try:
+            parsed = tomllib.loads(source)
+        except tomllib.TOMLDecodeError as exc:
+            raise _parse_error(path, "TOML", exc) from exc
+        searchable = _toml_without_comments(source)
+    else:
+        try:
+            parsed = json.loads(source)
+        except json.JSONDecodeError as exc:
+            raise _parse_error(path, "JSON", exc) from exc
+        searchable = source
+    semantic = _semantic_strings(parsed)
+    for symbol in symbols:
+        pattern = _exact_pattern(symbol)
+        if not any(pattern.search(value) for value in semantic):
+            continue
+        for match in pattern.finditer(searchable):
+            line = searchable.count("\n", 0, match.start()) + 1
+            spans[symbol].append((line, line))
+    return spans
+
+
+def _walk_yaml_nodes(node: yaml.nodes.Node) -> list[yaml.nodes.Node]:
+    nodes = [node]
+    if isinstance(node, yaml.nodes.MappingNode):
+        for key, value in node.value:
+            nodes.extend(_walk_yaml_nodes(key))
+            nodes.extend(_walk_yaml_nodes(value))
+    elif isinstance(node, yaml.nodes.SequenceNode):
+        for value in node.value:
+            nodes.extend(_walk_yaml_nodes(value))
+    return nodes
+
+
+def _searchable_non_python(source: str, suffix: str) -> str:
+    if suffix in {".ps1", ".psm1", ".psd1"}:
+        return _powershell_without_comments(source)
+    if suffix in {".sh", ".bash"}:
+        return _shell_without_comments(source)
+    if suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+        return _typescript_without_comments(source)
+    if suffix in {".css", ".scss", ".less"}:
+        return _css_without_comments(source)
+    if suffix in {".md", ".markdown"}:
+        return _markdown_without_comments(source)
+    return source
 
 
 def _symbol_spans(
@@ -591,7 +891,14 @@ def _symbol_spans(
     path: str,
 ) -> dict[str, list[tuple[int, int]]]:
     spans = {symbol: [] for symbol in symbols}
-    if Path(path).suffix == ".py":
+    if len(source) > _MAX_SCANNED_SOURCE_BYTES or len(
+        source.encode("utf-8", errors="replace")
+    ) > _MAX_SCANNED_SOURCE_BYTES:
+        raise ValueError(
+            f"cannot scan {path}: source exceeds {_MAX_SCANNED_SOURCE_BYTES} bytes"
+        )
+    suffix = Path(path).suffix.lower()
+    if suffix == ".py":
         try:
             tree = ast.parse(source)
         except SyntaxError:
@@ -601,7 +908,9 @@ def _symbol_spans(
         for symbol in symbols:
             spans[symbol].extend(collector.spans.get(symbol, []))
         return spans
-    searchable = _strip_non_python_comments(source, path)
+    if suffix in {".yaml", ".yml", ".toml", ".json"}:
+        return _structured_spans(source, symbols, path=path, suffix=suffix)
+    searchable = _searchable_non_python(source, suffix)
     for symbol in symbols:
         if "." in symbol:
             owner, member = symbol.split(".", 1)
@@ -624,9 +933,7 @@ def _symbol_spans(
                     offset = declaration.end() + member_match.start()
                     line = searchable.count("\n", 0, offset) + 1
                     spans[symbol].append((line, line))
-        pattern = re.compile(
-            rf"(?<![A-Za-z0-9_$]){re.escape(symbol)}(?![A-Za-z0-9_$])"
-        )
+        pattern = _exact_pattern(symbol)
         for match in pattern.finditer(searchable):
             line = searchable.count("\n", 0, match.start()) + 1
             spans[symbol].append((line, line))

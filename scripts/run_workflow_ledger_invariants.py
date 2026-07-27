@@ -175,37 +175,44 @@ def _terminate_process_group(
         process.wait()
         return
 
-    _refresh_known_group_members(process_group, known_members)
-    if not _known_group_member_alive(process_group, known_members):
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=_TERMINATE_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                process.kill()
-        process.wait()
-        return
-    known_members.update(_snapshot_process_group(process_group))
+    # start_new_session=True gave this attempt a process group whose PGID is
+    # the leader PID.  Tear down that owned group immediately at every leader
+    # completion.  Descendant discovery is not a safe prerequisite here: a
+    # short-lived intermediate can exit before psutil observes its resistant
+    # grandchild, while the kernel still retains the original group identity.
     try:
         os.killpg(process_group, signal.SIGTERM)
     except ProcessLookupError:
-        if process.poll() is None:
-            process.kill()
+        process.wait()
+        return
+    except PermissionError:
+        # Darwin may report EPERM rather than ESRCH for an already-empty
+        # process group.  Confirm emptiness by identity before treating that as
+        # successful cleanup; a populated inaccessible group remains an error.
+        if _snapshot_process_group(process_group):
+            raise
         process.wait()
         return
 
     deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
     while time.monotonic() < deadline:
-        _refresh_known_group_members(process_group, known_members)
-        if _known_group_member_alive(process_group, known_members):
-            known_members.update(_snapshot_process_group(process_group))
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            break
+        except PermissionError:
+            if _snapshot_process_group(process_group):
+                raise
+            break
         time.sleep(_POLL_SECONDS)
-
-    if _known_group_member_alive(process_group, known_members):
+    else:
         try:
             os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            if _snapshot_process_group(process_group):
+                raise
     process.wait()
 
 
@@ -274,6 +281,7 @@ def _execute_attempt(
         reader.start()
     deadline = time.monotonic() + timeout_seconds
     timed_out = False
+    cleanup_error: Exception | None = None
     try:
         while process.poll() is None:
             _refresh_known_group_members(process_group, known_group_members)
@@ -281,11 +289,15 @@ def _execute_attempt(
                 raise CancelledError()
             if time.monotonic() >= deadline:
                 timed_out = True
-                _terminate_process_group(process, process_group, known_group_members)
                 break
             time.sleep(_POLL_SECONDS)
-        if not timed_out and process.returncode is not None and process.returncode < 0:
+        try:
             _terminate_process_group(process, process_group, known_group_members)
+        except Exception as exc:  # cleanup failures are evidence, never silent leaks
+            cleanup_error = exc
+            if process.poll() is None:
+                process.kill()
+                process.wait()
     except BaseException:
         _terminate_process_group(process, process_group, known_group_members)
         raise
@@ -294,7 +306,9 @@ def _execute_attempt(
             reader.join(timeout=_TERMINATE_GRACE_SECONDS)
     duration_ms = (time.monotonic_ns() - started) // 1_000_000
     returncode = process.returncode
-    if timed_out:
+    if cleanup_error is not None:
+        result = "infrastructure_error"
+    elif timed_out:
         result = "timed_out"
     elif returncode == 0:
         result = "passed"
@@ -311,6 +325,8 @@ def _execute_attempt(
         "_stdout": stdout.text(),
         "_stderr": stderr.text(),
     }
+    if cleanup_error is not None:
+        record["_stderr"] += f"\nprocess-group cleanup failed: {cleanup_error}"
     if result == "signaled" and returncode is not None:
         record["termination_signal"] = -returncode
     return record
