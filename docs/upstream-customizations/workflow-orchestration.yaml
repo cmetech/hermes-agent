@@ -3244,7 +3244,10 @@ upstream_changes:
   - hermes_cli.main module SystemExit propagation
   - workflow_command WorkflowLanguageCompatibilityError machine code projection
   - workflow_command WorkflowValidationError primary issue code and bounded issues projection
+  - doctor text 200-finding ceiling and truncation notice
+  - doctor text cross-platform absolute path redaction
   - doctor text sanitized code/path/migration diagnostics
+  - non-workflow None handler process-success regression
   tests:
   - tests/plugins/workflow/test_cli.py
   - tests/hermes_cli/test_placeholder_usage.py
@@ -3256,8 +3259,9 @@ upstream_changes:
     entrypoint while treating None as success for legacy handlers. Keep module
     execution as SystemExit(main()). Preserve stable workflow language and
     validation issue codes in JSON envelopes, retain only a bounded safe issue
-    projection, and render human doctor diagnostics from existing findings with
-    sanitized code, path, and migration values only.
+    projection. Render at most 200 human doctor diagnostics from existing
+    findings, with a truncation notice and cross-platform absolute-path
+    redaction before emitting sanitized code, path, and migration values only.
   removal_condition: >-
     Remove when upstream preserves plugin command exit statuses and provides
     equivalent typed workflow diagnostic envelopes and safe doctor text.

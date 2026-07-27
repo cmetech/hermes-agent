@@ -353,6 +353,112 @@ def test_doctor_text_renders_sanitized_finding_code_path_and_migration(
     assert str(tmp_path) not in output.out
 
 
+def _doctor_text_payload(findings):
+    return {
+        "name": "sample",
+        "package_digest": "package-digest",
+        "risk_summary": {
+            "risk_digest": "risk-digest",
+            "execution_environment": "trusted_local",
+        },
+        "compatibility": "mapped",
+        "language": {"effective_profile": "hermes-legacy"},
+        "remediation": "Review diagnostics.",
+        "findings": findings,
+    }
+
+
+def test_doctor_text_bounds_finding_diagnostics_to_machine_projection_limit(
+    capsys, monkeypatch
+):
+    """Catch unbounded human output from an oversized finding collection."""
+    findings = [
+        {
+            "code": f"attacker-finding-{index}",
+            "path": f"nodes[{index}].option",
+            "migration": "Remove unsupported option.",
+        }
+        for index in range(201)
+    ]
+    monkeypatch.setattr(
+        "plugins.workflow.cli._doctor_payload",
+        lambda *_args, **_kwargs: _doctor_text_payload(findings),
+    )
+    monkeypatch.setattr("plugins.workflow.cli._resolve", lambda *_args: object())
+    args = _parser().parse_args(["doctor", "sample"])
+
+    assert args.func(args) == 0
+    output = capsys.readouterr().out
+    assert output.count("attacker-finding-") == 200
+    assert "attacker-finding-199" in output
+    assert "attacker-finding-200" not in output
+    assert "truncated after 200 findings" in output
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        "/private/workflows/secret.yaml",
+        r"C:\Users\alice\secret.yaml",
+        r"\\server\share\secret.yaml",
+    ],
+    ids=["posix", "windows-drive", "windows-unc"],
+)
+def test_doctor_text_redacts_cross_platform_absolute_finding_paths(
+    unsafe_path, capsys, monkeypatch
+):
+    """Catch OS-specific absolute paths that escape doctor text sanitization."""
+    findings = [
+        {
+            "code": "attacker-controlled-finding",
+            "path": f"sidecar.delivery_defaults.inputs.{unsafe_path}",
+            "migration": "Use a portable relative input name.",
+        }
+    ]
+    monkeypatch.setattr(
+        "plugins.workflow.cli._doctor_payload",
+        lambda *_args, **_kwargs: _doctor_text_payload(findings),
+    )
+    monkeypatch.setattr("plugins.workflow.cli._resolve", lambda *_args: object())
+    args = _parser().parse_args(["doctor", "sample"])
+
+    assert args.func(args) == 0
+    output = capsys.readouterr().out
+    assert "attacker-controlled-finding" in output
+    assert "Use a portable relative input name." in output
+    assert unsafe_path not in output
+    assert "[REDACTED_PATH]" in output
+    assert "secret.yaml" not in output
+
+
+def test_module_entrypoint_treats_none_returning_plugins_handler_as_success(tmp_path):
+    """Catch SystemExit(None) or a changed non-workflow handler exit contract."""
+    home = tmp_path / "home"
+    hermes_home = tmp_path / "hermes-home"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "plugins",
+            "list",
+            "--plain",
+            "--no-bundled",
+        ],
+        cwd=Path(__file__).parents[3],
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "HERMES_HOME": str(hermes_home),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 @pytest.mark.parametrize(
     "declared_profile",
     [None, "hermes-legacy"],

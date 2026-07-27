@@ -99,6 +99,10 @@ _MACHINE_COMMAND: ContextVar[str] = ContextVar(
     "workflow_machine_command", default="workflow"
 )
 _BENIGN_POLICY_FIELDS = frozenset({"modelReasoningEffort"})
+_DOCTOR_TEXT_FINDINGS_MAX = 200
+_DOCTOR_ABSOLUTE_PATH_SEGMENTS = re.compile(
+    r"(?:[A-Za-z]:[\\/]|\\\\)[^\s]*|/[^\s]*"
+)
 
 
 class WorkflowDefinitionProjectionCapacityError(ValueError):
@@ -1515,6 +1519,14 @@ def _doctor_payload(
     return payload
 
 
+def _doctor_text_value(value: object) -> object:
+    """Return one bounded diagnostic value without host-specific path leaks."""
+    sanitized = sanitize_projection(value)
+    if isinstance(sanitized, str):
+        return _DOCTOR_ABSOLUTE_PATH_SEGMENTS.sub("[REDACTED_PATH]", sanitized)
+    return sanitized
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     payload = _doctor_payload(
         _resolve(args, args.name),
@@ -1546,19 +1558,23 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             f"{payload['risk_summary']['execution_environment']}"
         )
         print(f"Remediation: {payload['remediation']}")
-        for finding in payload.get("findings", []):
+        findings = payload.get("findings", ())
+        if not isinstance(findings, list | tuple):
+            findings = ()
+        for index, finding in enumerate(findings):
+            if index >= _DOCTOR_TEXT_FINDINGS_MAX:
+                print(
+                    "- diagnostics truncated after "
+                    f"{_DOCTOR_TEXT_FINDINGS_MAX} findings"
+                )
+                break
             if not isinstance(finding, Mapping):
                 continue
-            diagnostic = sanitize_projection({
-                "code": finding.get("code"),
-                "path": finding.get("path"),
-                "migration": finding.get("migration"),
-            })
-            if not isinstance(diagnostic, Mapping):
-                continue
-            print(f"- code: {diagnostic.get('code')}")
-            print(f"  path: {diagnostic.get('path')}")
-            migration = diagnostic.get("migration")
+            code = _doctor_text_value(finding.get("code"))
+            path = _doctor_text_value(finding.get("path"))
+            migration = _doctor_text_value(finding.get("migration"))
+            print(f"- code: {code}")
+            print(f"  path: {path}")
             if migration is not None:
                 print(f"  migration: {migration}")
     return EXIT_BLOCKING_FINDING if blocking else 0
