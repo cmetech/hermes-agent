@@ -14,6 +14,7 @@ import threading
 import time
 
 from fastapi.testclient import TestClient
+import pytest
 import yaml
 
 from agent.plugin_agent import PluginAgentRunResult, PluginAgentRunner
@@ -389,6 +390,8 @@ def _run_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
     tmp_path,
     monkeypatch,
     client: TestClient,
+    *,
+    stop_service=_stop_service,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -519,9 +522,10 @@ def _run_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
         )
         succeeded = _wait_for_status(client, run_id, "succeeded")
 
-        _stop_service(store, stop, thread)
+        active_stop, active_thread = stop, thread
         stop = None
         thread = None
+        stop_service(store, active_stop, active_thread)
         assert succeeded["status"] == "succeeded"
         assert [request.context_mode for request in recording_runner.requests] == [
             "fresh",
@@ -539,7 +543,11 @@ def _run_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
             RunStore._start_digest_from_projection(store.get_run_status(run_id))
         )
     finally:
-        _stop_service(store, stop, thread)
+        if stop is not None or thread is not None:
+            active_stop, active_thread = stop, thread
+            stop = None
+            thread = None
+            stop_service(store, active_stop, active_thread)
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
@@ -689,9 +697,10 @@ def _run_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
         assert rejected.status_code == 200, rejected.text
         failed = _wait_for_status(client, run_id, "failed")
 
-        _stop_service(store, stop, thread)
+        active_stop, active_thread = stop, thread
         stop = None
         thread = None
+        _stop_service(store, active_stop, active_thread)
         assert runner.requests == []
         assert failed["nodes"]["review-plan"]["state"] == "failed"
         assert (
@@ -699,7 +708,11 @@ def _run_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
             == "execution_integrity"
         )
     finally:
-        _stop_service(store, stop, thread)
+        if stop is not None or thread is not None:
+            active_stop, active_thread = stop, thread
+            stop = None
+            thread = None
+            _stop_service(store, active_stop, active_thread)
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
@@ -739,9 +752,10 @@ def _run_explicit_real_digest_mismatch_fails_before_coordinator_runner(
         _service, stop, thread = _start_service(home, binding)
         failed = _wait_for_status(client, run_id, "failed")
 
-        _stop_service(store, stop, thread)
+        active_stop, active_thread = stop, thread
         stop = None
         thread = None
+        _stop_service(store, active_stop, active_thread)
         assert runner.requests == []
         assert failed["status"] == "failed"
         assert failed["nodes"]["inspect"]["state"] == "failed"
@@ -749,7 +763,11 @@ def _run_explicit_real_digest_mismatch_fails_before_coordinator_runner(
             "execution_integrity"
         )
     finally:
-        _stop_service(store, stop, thread)
+        if stop is not None or thread is not None:
+            active_stop, active_thread = stop, thread
+            stop = None
+            thread = None
+            _stop_service(store, active_stop, active_thread)
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
@@ -800,9 +818,10 @@ def _run_capable_admission_then_actual_app_server_runtime_fails_before_provider(
         _service, stop, thread = _start_service(home, capable_binding)
         failed = _wait_for_status(client, run_id, "failed")
 
-        _stop_service(store, stop, thread)
+        active_stop, active_thread = stop, thread
         stop = None
         thread = None
+        _stop_service(store, active_stop, active_thread)
         assert failed["status"] == "failed"
         assert failed.get("terminal_code") is None
         assert failed["nodes"]["inspect"]["attempts"][-1]["error_code"] == (
@@ -810,7 +829,11 @@ def _run_capable_admission_then_actual_app_server_runtime_fails_before_provider(
         )
         assert _ProviderCallTrap.requests == 0
     finally:
-        _stop_service(store, stop, thread)
+        if stop is not None or thread is not None:
+            active_stop, active_thread = stop, thread
+            stop = None
+            thread = None
+            _stop_service(store, active_stop, active_thread)
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -823,6 +846,32 @@ def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
         _run_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
             tmp_path, monkeypatch, client
         )
+
+
+def test_ai_service_cleanup_failure_runs_once_and_preserves_lifespan_exit(
+    tmp_path, monkeypatch
+) -> None:
+    cleanup_calls = []
+
+    def stop_then_raise(store, stop, thread) -> None:
+        cleanup_calls.append((stop, thread))
+        _stop_service(store, stop, thread)
+        raise RuntimeError(f"AI service cleanup failure #{len(cleanup_calls)}")
+
+    with pytest.raises(RuntimeError, match="AI service cleanup failure #1"):
+        with _production_client(monkeypatch) as client:
+            _run_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
+                tmp_path,
+                monkeypatch,
+                client,
+                stop_service=stop_then_raise,
+            )
+
+    assert len(cleanup_calls) == 1
+    assert not any(
+        thread.name.startswith("workflow-store-io")
+        for thread in threading.enumerate()
+    )
 
 
 def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
