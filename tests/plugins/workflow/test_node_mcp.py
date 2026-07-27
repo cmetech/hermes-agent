@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import stat
 import sys
 import threading
 import time
@@ -18,8 +19,12 @@ from agent.plugin_agent import (
     PluginAgentRunRequest,
     PluginAgentRunResult,
     PluginAgentRunner,
+    _validate_request,
 )
-from agent.plugin_agent_worker import _finalize_authenticated_mcp_config
+from agent.plugin_agent_worker import (
+    PackageMCPUnavailable,
+    _finalize_authenticated_mcp_config,
+)
 from plugins.workflow.resources import (
     AuthenticatedExecutionMaterializer,
     ResourceResolver,
@@ -27,6 +32,7 @@ from plugins.workflow.resources import (
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from tools.registry import registry
 from tests.plugins.workflow.test_ai_executor import FakeAgentRunner, _context, _node
+from tools.mcp_tool import _interpolate_env_vars
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mcp" / "echo_server.py"
@@ -56,9 +62,7 @@ class _MockProviderHandler(BaseHTTPRequestHandler):
                 },
                 {
                     "id": "workflow-mcp-final",
-                    "choices": [
-                        {"index": 0, "delta": {}, "finish_reason": "stop"}
-                    ],
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 },
             ]
         else:
@@ -127,23 +131,21 @@ def _wait_for_pid_exit(pid: int) -> None:
 def _write_provider_config(base_url: str, *, api_mode: str) -> None:
     hermes_home = Path(os.environ["HERMES_HOME"])
     (hermes_home / "config.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "model": {
-                    "default": "workflow-mock-model",
-                    "provider": "custom:workflow-worker-test",
-                },
-                "custom_providers": [
-                    {
-                        "name": "workflow-worker-test",
-                        "base_url": base_url,
-                        "api_key": "local-test-key",
-                        "api_mode": api_mode,
-                        "model": "workflow-mock-model",
-                    }
-                ],
-            }
-        ),
+        yaml.safe_dump({
+            "model": {
+                "default": "workflow-mock-model",
+                "provider": "custom:workflow-worker-test",
+            },
+            "custom_providers": [
+                {
+                    "name": "workflow-worker-test",
+                    "base_url": base_url,
+                    "api_key": "local-test-key",
+                    "api_mode": api_mode,
+                    "model": "workflow-mock-model",
+                }
+            ],
+        }),
         encoding="utf-8",
     )
 
@@ -190,9 +192,7 @@ def test_snapshotted_mcp_definition_is_contained_and_keeps_env_references_raw(tm
 def test_mcp_resolver_ignores_resolver_visible_mutable_output(tmp_path):
     root = tmp_path / "run"
     (root / "artifacts").mkdir(parents=True)
-    (root / "artifacts" / "echo").write_text(
-        "command: shadow\n", encoding="utf-8"
-    )
+    (root / "artifacts" / "echo").write_text("command: shadow\n", encoding="utf-8")
     sealed = root / "mcp" / "artifacts" / "echo.yaml"
     sealed.parent.mkdir(parents=True)
     sealed.write_text("command: sealed\n", encoding="utf-8")
@@ -208,9 +208,7 @@ def test_node_executor_resolves_only_scheduler_verified_mcp_resource(tmp_path):
     run = tmp_path / "run"
     (run / "mcp").mkdir(parents=True)
     (run / "mcp" / "echo").write_text("command: shadow\n", encoding="utf-8")
-    (run / "mcp" / "echo.yaml").write_text(
-        "command: sealed\n", encoding="utf-8"
-    )
+    (run / "mcp" / "echo.yaml").write_text("command: sealed\n", encoding="utf-8")
     runner = FakeAgentRunner("done")
     context = _context(
         tmp_path,
@@ -264,6 +262,199 @@ def test_node_executor_uses_authenticated_mcp_bytes_without_reopening_source(
     assert runner.requests[0].mcp_servers["echo"]["command"] == sys.executable
 
 
+def test_sealed_mcp_classifies_local_references_only_after_env_interpolation(
+    tmp_path, monkeypatch
+):
+    run = tmp_path / "run"
+    authenticated = {
+        "mcp/echo.yaml": (
+            "command: '${COMMAND}'\n"
+            "args: ['${ENTRY}', '--config=${CONFIG}']\n"
+            "env: {SERVER_DATA: '${DATA}'}\n"
+        ).encode(),
+        "servers/echo.py": b"print('sealed')\n",
+        "config/settings.json": b"{}\n",
+        "data/value.txt": b"sealed\n",
+    }
+    for relative, data in authenticated.items():
+        path = run / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        server = ResourceResolver(
+            run,
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+
+        authority = server["__hermes_authenticated_local_mcp"]
+        assert "files" not in authority
+        assert "entry" not in authority
+        monkeypatch.setenv("COMMAND", sys.executable)
+        monkeypatch.setenv("ENTRY", "servers/echo.py")
+        monkeypatch.setenv("CONFIG", "config/settings.json")
+        monkeypatch.setenv("DATA", "data/value.txt")
+
+        finalized = _finalize_authenticated_mcp_config({
+            "echo": _interpolate_env_vars(server)
+        })["echo"]
+        root = Path(finalized["__hermes_private_mcp_cwd"])
+
+        assert finalized["command"] == sys.executable
+        assert finalized["args"][3:5] == [str(root), "servers/echo.py"]
+        assert finalized["args"][5] == f"--config={root / 'config/settings.json'}"
+        assert finalized["env"]["SERVER_DATA"] == str(root / "data/value.txt")
+    finally:
+        materializer.cleanup()
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-fetch"]},
+        {"command": "uvx", "args": ["mcp-server-fetch"]},
+        {"url": "https://mcp.example.test/sse"},
+        {"command": sys.executable, "args": ["-c", "print('inline')"]},
+    ],
+)
+def test_sealed_nonlocal_mcp_configs_strip_authority_without_behavior_change(
+    tmp_path, server
+):
+    run = tmp_path / "run"
+    definition = yaml.safe_dump({"echo": server}).encode()
+    authenticated = {
+        "mcp/echo.yaml": definition,
+        "unrelated/package-resource.txt": b"sealed\n",
+    }
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        resolved = ResourceResolver(
+            run,
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+        assert "__hermes_authenticated_local_mcp" in resolved
+
+        finalized = _finalize_authenticated_mcp_config({"echo": resolved})["echo"]
+
+        assert finalized == server
+    finally:
+        materializer.cleanup()
+
+
+def test_post_interpolation_local_mcp_with_unsupported_command_fails_closed(
+    tmp_path, monkeypatch
+):
+    run = tmp_path / "run"
+    authenticated = {
+        "mcp/echo.yaml": b"command: '${COMMAND}'\nargs: ['${ENTRY}']\n",
+        "servers/echo.py": b"print('sealed')\n",
+    }
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        server = ResourceResolver(
+            run,
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+        monkeypatch.setenv("COMMAND", "node")
+        monkeypatch.setenv("ENTRY", "servers/echo.py")
+
+        with pytest.raises(
+            PackageMCPUnavailable, match="runtime closure cannot be proven"
+        ):
+            _finalize_authenticated_mcp_config({"echo": _interpolate_env_vars(server)})
+    finally:
+        materializer.cleanup()
+
+
+def test_maximum_valid_mcp_workflow_authority_fits_plugin_agent_request_limit(
+    tmp_path,
+):
+    run = tmp_path / "run"
+    runtime_files = [f"resources/{index:03d}-{'x' * 230}.json" for index in range(430)]
+    server = {
+        "command": sys.executable,
+        "args": ["servers/echo.py"],
+        "runtime_files": runtime_files,
+    }
+    definition = yaml.safe_dump({"echo": server}).encode()
+    assert len(definition) < 256_000
+    authenticated = {
+        "mcp/echo.yaml": definition,
+        "servers/echo.py": b"print('sealed')\n",
+        **{relative: b"{}\n" for relative in runtime_files},
+    }
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        resolved = ResourceResolver(
+            run,
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)
+        request = PluginAgentRunRequest(prompt="run", mcp_servers=resolved)
+
+        _validate_request(request)
+
+        encoded = json.dumps(request.mcp_servers, default=str).encode()
+        assert len(authenticated) == 432
+        assert len(encoded) <= 256_000
+    finally:
+        materializer.cleanup()
+
+
+def test_compact_authority_manifest_is_private_bounded_and_digest_revalidated(
+    tmp_path,
+):
+    run = tmp_path / "run"
+    secret = b"UNRELATED_RAW_AUTHORITY_SECRET\n"
+    authenticated = {
+        "mcp/echo.yaml": (
+            f"command: {json.dumps(sys.executable)}\nargs: [servers/echo.py]\n"
+        ).encode(),
+        "servers/echo.py": b"print('sealed')\n",
+        "private/unrelated.txt": secret,
+    }
+    materializer = AuthenticatedExecutionMaterializer()
+    try:
+        server = ResourceResolver(
+            run,
+            sealed_paths=authenticated,
+            sealed_bytes=authenticated,
+        ).mcp_servers("echo", materializer=materializer)["echo"]
+        authority = server["__hermes_authenticated_local_mcp"]
+        root = Path(authority["root"])
+        manifest = root / authority["manifest"]
+        serialized = json.dumps(authority, sort_keys=True)
+
+        assert not root.is_relative_to(run)
+        assert len(serialized.encode()) < 2048
+        assert secret.decode().strip() not in serialized
+        if os.name != "nt":
+            assert stat.S_IMODE(root.stat().st_mode) == 0o700
+            assert stat.S_IMODE(manifest.stat().st_mode) == 0o400
+
+        manifest.chmod(0o600)
+        manifest.write_bytes(manifest.read_bytes() + b" ")
+        with pytest.raises(
+            PackageMCPUnavailable, match="authenticated MCP authority changed"
+        ):
+            _finalize_authenticated_mcp_config({"echo": server})
+    finally:
+        materializer.cleanup()
+
+
+def test_genuinely_oversized_mcp_config_still_fails_plugin_agent_contract():
+    request = PluginAgentRunRequest(
+        prompt="run",
+        mcp_servers={"echo": {"command": "npx", "opaque": "x" * 256_001}},
+    )
+
+    with pytest.raises(ValueError, match="mcp_servers exceed"):
+        _validate_request(request)
+
+
 def test_mcp_child_opens_materialized_authenticated_server_after_original_race(
     tmp_path,
 ):
@@ -272,8 +463,7 @@ def test_mcp_child_opens_materialized_authenticated_server_after_original_race(
     (run / "servers").mkdir()
     definition = run / "mcp" / "echo.yaml"
     definition_bytes = (
-        f"command: {json.dumps(sys.executable)}\n"
-        "args: [servers/echo.py]\n"
+        f"command: {json.dumps(sys.executable)}\nargs: [servers/echo.py]\n"
     ).encode()
     definition.write_bytes(definition_bytes)
     server = run / "servers" / "echo.py"
@@ -282,8 +472,7 @@ def test_mcp_child_opens_materialized_authenticated_server_after_original_race(
         b"print('authenticated:' + sys.stdin.readline().strip(), flush=True)\n"
     )
     forged_server = (
-        b"import sys\n"
-        b"print('forged:' + sys.stdin.readline().strip(), flush=True)\n"
+        b"import sys\nprint('forged:' + sys.stdin.readline().strip(), flush=True)\n"
     )
     server.write_bytes(authenticated_server)
 
@@ -292,9 +481,9 @@ def test_mcp_child_opens_materialized_authenticated_server_after_original_race(
             self.materialized_paths: list[Path] = []
 
         def run(self, request, **_kwargs):
-            config = _finalize_authenticated_mcp_config(
-                {"echo": dict(request.mcp_servers["echo"])}
-            )["echo"]
+            config = _finalize_authenticated_mcp_config({
+                "echo": dict(request.mcp_servers["echo"])
+            })["echo"]
             args = [str(item) for item in config.get("args", ())]
             self.materialized_paths = [Path(config["__hermes_private_mcp_cwd"])]
             server.write_bytes(forged_server)
@@ -340,6 +529,7 @@ def test_mcp_child_opens_materialized_authenticated_server_after_original_race(
 
 def test_real_mcp_worker_uses_complete_private_runtime_closure_after_ipc(
     tmp_path,
+    monkeypatch,
 ):
     provider, base_url = _start_mock_provider()
     _write_provider_config(base_url, api_mode="chat_completions")
@@ -349,13 +539,15 @@ def test_real_mcp_worker_uses_complete_private_runtime_closure_after_ipc(
     definition_bytes = (
         "mcp_servers:\n"
         "  node_echo:\n"
-        f"    command: {json.dumps(sys.executable)}\n"
-        "    args: [servers/echo.py, --config=config/settings.json]\n"
+        "    command: '${WORKFLOW_MCP_COMMAND}'\n"
+        "    args: ['${WORKFLOW_MCP_ENTRY}', '--config=${WORKFLOW_MCP_CONFIG}']\n"
         "    runtime_files: [servers/helper.py, data/value.txt]\n"
-        "    env: {}\n    connect_timeout: 10\n"
+        "    env: {WORKFLOW_DATA_PATH: '${WORKFLOW_MCP_DATA}'}\n"
+        "    connect_timeout: 10\n"
     ).encode()
     server_bytes = f"""\
 from pathlib import Path
+import os
 import sys
 from mcp.server.fastmcp import FastMCP
 from helper import VALUE
@@ -364,7 +556,7 @@ ORIGINAL_ROOT = Path({str(run)!r})
 
 config_path = next(value.split('=', 1)[1] for value in sys.argv[1:] if value.startswith('--config='))
 config = Path(config_path).read_text(encoding='utf-8').strip()
-data = Path('data/value.txt').read_text(encoding='utf-8').strip()
+data = Path(os.environ['WORKFLOW_DATA_PATH']).read_text(encoding='utf-8').strip()
 try:
     import injected
 except ImportError:
@@ -396,6 +588,10 @@ if __name__ == '__main__':
         path = run / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
+    monkeypatch.setenv("WORKFLOW_MCP_COMMAND", sys.executable)
+    monkeypatch.setenv("WORKFLOW_MCP_ENTRY", "servers/echo.py")
+    monkeypatch.setenv("WORKFLOW_MCP_CONFIG", "config/settings.json")
+    monkeypatch.setenv("WORKFLOW_MCP_DATA", "data/value.txt")
 
     class MutatingRealRunner:
         starts_request_mcp = True
@@ -407,9 +603,7 @@ if __name__ == '__main__':
             (run / "config" / "settings.json").write_text(
                 "forged-config\n", encoding="utf-8"
             )
-            (run / "data" / "value.txt").write_text(
-                "forged-data\n", encoding="utf-8"
-            )
+            (run / "data" / "value.txt").write_text("forged-data\n", encoding="utf-8")
             (run / "injected.py").write_text(
                 "VALUE = 'forged-injected'\n", encoding="utf-8"
             )
@@ -511,12 +705,12 @@ def test_mcp_materialized_authority_is_cleaned_after_terminal_outcome(
             self.materialized_paths: list[Path] = []
 
         def run(self, request, **_kwargs):
-            authority = request.mcp_servers["echo"][
-                "__hermes_authenticated_local_mcp"
-            ]
+            authority = request.mcp_servers["echo"]["__hermes_authenticated_local_mcp"]
             root = Path(str(authority["root"]))
             self.materialized_paths = [
-                root / relative for relative in authority["files"]
+                path
+                for path in root.rglob("*")
+                if path.is_file() and path.name != authority["manifest"]
             ]
             assert all(path.exists() for path in self.materialized_paths)
             if outcome == "failure":
@@ -667,14 +861,12 @@ def test_runtime_failure_precedes_request_mcp_start_and_provider(
     else:
         hermes_home = Path(os.environ["HERMES_HOME"])
         (hermes_home / "config.yaml").write_text(
-            yaml.safe_dump(
-                {
-                    "model": {
-                        "default": "workflow-mock-model",
-                        "provider": "custom:missing-worker-provider",
-                    }
+            yaml.safe_dump({
+                "model": {
+                    "default": "workflow-mock-model",
+                    "provider": "custom:missing-worker-provider",
                 }
-            ),
+            }),
             encoding="utf-8",
         )
 
@@ -725,9 +917,7 @@ def test_incapable_runtime_fails_before_agent_construction_and_mcp_start(
 
     monkeypatch.setattr(run_agent, "AIAgent", forbidden_agent)
 
-    with pytest.raises(
-        worker.PackageMCPUnavailable, match="package_mcp_unavailable"
-    ):
+    with pytest.raises(worker.PackageMCPUnavailable, match="package_mcp_unavailable"):
         worker._run(
             _request_payload(
                 "workflow/test",

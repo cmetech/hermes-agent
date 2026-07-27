@@ -67,9 +67,11 @@ def _assert_authenticated_mcp_servers(
     assert server["env"] == {}
     assert server["args"] == ["mcp/echo-server.py"]
     authority = server["__hermes_authenticated_local_mcp"]
-    assert authority["version"] == 1
-    assert authority["entry"] == "mcp/echo-server.py"
-    assert "mcp/echo-server.py" in authority["files"]
+    assert authority["version"] == 2
+    assert authority["file_count"] > 0
+    assert authority["total_bytes"] > 0
+    assert "entry" not in authority
+    assert "files" not in authority
     authority_root = Path(authority["root"])
     assert authority_root.is_absolute()
     assert "hermes-workflow-authority-" in authority_root.as_posix()
@@ -80,8 +82,7 @@ def _assert_authenticated_mcp_servers(
     # Match the real worker boundary exactly: JSON-carried config first resolves
     # environment placeholders, then validates and finalizes the private launch.
     interpolated = {
-        name: _interpolate_env_vars(dict(config))
-        for name, config in servers.items()
+        name: _interpolate_env_vars(dict(config)) for name, config in servers.items()
     }
     finalized = _finalize_authenticated_mcp_config(interpolated)["echo"]
     assert finalized["args"][0:2] == ["-I", "-c"]

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import shutil
 import tempfile
@@ -24,6 +25,8 @@ _AUTHORITY_CWD_KEY = "__hermes_private_mcp_cwd"
 _AUTHORITY_MAX_FILES = 512
 _AUTHORITY_MAX_FILE_BYTES = 1 * 1024 * 1024
 _AUTHORITY_MAX_TOTAL_BYTES = 8 * 1024 * 1024
+_AUTHORITY_MANIFEST_NAME = ".hermes-authority-manifest-v1.json"
+_AUTHORITY_MAX_MANIFEST_BYTES = 4_000_000
 logger = logging.getLogger(__name__)
 _VARIABLE = re.compile(
     r"\$(?:(?P<position>[1-9][0-9]*)|"
@@ -55,7 +58,8 @@ def _quote_shell_value(value: str, quote: str | None) -> str:
         return value.replace("'", "'\\''")
     if quote == '"':
         return (
-            value.replace("\\", "\\\\")
+            value
+            .replace("\\", "\\\\")
             .replace('"', '\\"')
             .replace("$", "\\$")
             .replace("`", "\\`")
@@ -89,6 +93,7 @@ class AuthenticatedExecutionMaterializer:
             pass
         self._closed = False
         self._entries: dict[str, tuple[str, Path]] = {}
+        self._descriptor: dict[str, object] | None = None
 
     @staticmethod
     def _canonical_relative(relative: str) -> PurePosixPath:
@@ -107,6 +112,8 @@ class AuthenticatedExecutionMaterializer:
     def materialize(self, relative: str, data: bytes) -> Path:
         if self._closed:
             raise RuntimeError("authenticated execution materializer is closed")
+        if self._descriptor is not None:
+            raise RuntimeError("authenticated execution materializer is finalized")
         logical = self._canonical_relative(relative)
         if len(data) > _AUTHORITY_MAX_FILE_BYTES:
             raise ValueError("authenticated execution file exceeds 1048576 bytes")
@@ -118,7 +125,10 @@ class AuthenticatedExecutionMaterializer:
             return previous[1]
         if len(self._entries) >= _AUTHORITY_MAX_FILES:
             raise ValueError("authenticated execution closure exceeds 512 files")
-        if sum(path.stat().st_size for _, path in self._entries.values()) + len(data) > _AUTHORITY_MAX_TOTAL_BYTES:
+        if (
+            sum(path.stat().st_size for _, path in self._entries.values()) + len(data)
+            > _AUTHORITY_MAX_TOTAL_BYTES
+        ):
             raise ValueError("authenticated execution closure exceeds 8388608 bytes")
         path = self.root.joinpath(*logical.parts)
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -138,6 +148,19 @@ class AuthenticatedExecutionMaterializer:
         return path
 
     def materialize_all(self, contents: Mapping[str, bytes]) -> dict[str, object]:
+        if self._descriptor is not None:
+            expected = {
+                relative: hashlib.sha256(bytes(data)).hexdigest()
+                for relative, data in contents.items()
+            }
+            observed = {
+                relative: digest for relative, (digest, _path) in self._entries.items()
+            }
+            if expected != observed:
+                raise ValueError(
+                    "authenticated execution closure has conflicting bytes"
+                )
+            return dict(self._descriptor)
         files: dict[str, dict[str, object]] = {}
         for relative in sorted(contents):
             data = bytes(contents[relative])
@@ -146,7 +169,45 @@ class AuthenticatedExecutionMaterializer:
                 "sha256": hashlib.sha256(data).hexdigest(),
                 "size": len(data),
             }
-        return {"version": 1, "root": str(self.root), "files": files}
+        nonce = secrets.token_hex(32)
+        manifest = {
+            "version": 1,
+            "nonce": nonce,
+            "files": files,
+        }
+        encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        if len(encoded) > _AUTHORITY_MAX_MANIFEST_BYTES:
+            raise ValueError("authenticated execution manifest is too large")
+        manifest_path = self.root / _AUTHORITY_MANIFEST_NAME
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(manifest_path, flags, 0o400)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            manifest_path.unlink(missing_ok=True)
+            raise
+        root_stat = self.root.lstat()
+        self._descriptor = {
+            "version": 2,
+            "root": str(self.root),
+            "manifest": _AUTHORITY_MANIFEST_NAME,
+            "manifest_sha256": hashlib.sha256(encoded).hexdigest(),
+            "file_count": len(files),
+            "total_bytes": sum(int(metadata["size"]) for metadata in files.values()),
+            "nonce": nonce,
+            "root_identity": {
+                "device": root_stat.st_dev,
+                "inode": root_stat.st_ino,
+            },
+        }
+        return dict(self._descriptor)
 
     def cleanup(self) -> None:
         if self._closed:
@@ -269,7 +330,11 @@ class ResourceResolver:
             resolved.relative_to(self.package_root)
         except (FileNotFoundError, OSError, ValueError) as exc:
             raise FileNotFoundError(f"resource is missing: {relative}") from exc
-        if candidate.is_symlink() or not resolved.is_file() or not self._is_sealed(resolved):
+        if (
+            candidate.is_symlink()
+            or not resolved.is_file()
+            or not self._is_sealed(resolved)
+        ):
             raise FileNotFoundError(f"resource is missing: {relative}")
         return self._authenticated_bytes(resolved)
 
@@ -286,9 +351,7 @@ class ResourceResolver:
             try:
                 encoded = self.sealed_bytes[relative]
             except KeyError as exc:
-                raise FileNotFoundError(
-                    f"command resource is missing: {name}"
-                ) from exc
+                raise FileNotFoundError(f"command resource is missing: {name}") from exc
             return self._parse_command(
                 self.package_root / relative,
                 text=encoded.decode("utf-8"),
@@ -438,88 +501,17 @@ class ResourceResolver:
                 raise ValueError(f"MCP server {name} must be a mapping")
             servers[name] = dict(raw)
         if self.sealed_bytes is not None:
-            closure = None
-            guidance = (
-                "authenticated local MCP runtime closure cannot be proven; place "
-                "the Python server and every local dependency in the workflow "
-                "package, reference them with canonical relative paths, then "
-                "re-trust and start a new run"
-            )
-            for name, server in servers.items():
-                command = server.get("command")
-                args = server.get("args", [])
-                if not isinstance(command, str) or not isinstance(args, list):
-                    continue
-                local_values = {
-                    relative
-                    for value in self._walk_strings(server)
-                    for relative in self._local_mcp_references(value)
-                    if relative in self.sealed_bytes
-                }
-                if not local_values:
-                    continue
-                executable = Path(command).name.lower().removesuffix(".exe")
-                if re.fullmatch(r"python(?:3(?:\.\d+)?)?", executable) is None:
-                    raise ValueError(f"MCP server {name}: {guidance}")
-                entries = [
-                    relative
-                    for value in args
-                    if isinstance(value, str)
-                    for relative in self._local_mcp_references(value, exact_only=True)
-                    if relative in self.sealed_bytes and relative.endswith(".py")
-                ]
-                if len(entries) != 1:
-                    raise ValueError(f"MCP server {name}: {guidance}")
-                if materializer is None:
-                    raise ValueError(
-                        "authenticated local MCP resources require private execution materialization"
-                    )
-                if closure is None:
-                    closure = materializer.materialize_all(self.sealed_bytes)
+            if materializer is None:
+                raise ValueError(
+                    "authenticated MCP resources require private execution materialization"
+                )
+            closure = materializer.materialize_all(self.sealed_bytes)
+            for server in servers.values():
                 server[_AUTHORITY_DESCRIPTOR_KEY] = {
                     **closure,
                     "source_root": str(self.package_root),
-                    "entry": entries[0],
                 }
         return servers
-
-    def _local_mcp_references(
-        self, value: str, *, exact_only: bool = False
-    ) -> Iterable[str]:
-        candidates = [value]
-        if not exact_only and "=" in value:
-            _prefix, suffix = value.split("=", 1)
-            candidates.append(suffix)
-        for candidate in candidates:
-            normalized = candidate.replace("\\", "/")
-            if normalized.startswith("./"):
-                normalized = normalized[2:]
-            path = Path(candidate)
-            if path.is_absolute():
-                try:
-                    normalized = path.relative_to(self.package_root).as_posix()
-                except ValueError:
-                    continue
-            logical = PurePosixPath(normalized)
-            if (
-                not normalized
-                or logical.is_absolute()
-                or logical.as_posix() != normalized
-                or any(part in {"", ".", ".."} for part in logical.parts)
-            ):
-                continue
-            yield normalized
-
-    @staticmethod
-    def _walk_strings(value: object) -> Iterable[str]:
-        if isinstance(value, str):
-            yield value
-        elif isinstance(value, Mapping):
-            for item in value.values():
-                yield from ResourceResolver._walk_strings(item)
-        elif isinstance(value, list | tuple):
-            for item in value:
-                yield from ResourceResolver._walk_strings(item)
 
     @staticmethod
     def _parse_command(path: Path, *, text: str | None = None) -> CommandResource:

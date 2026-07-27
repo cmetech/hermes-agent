@@ -2530,6 +2530,7 @@ upstream_changes:
   - ai-extensions exact base-gate and native-matrix selection
   - Task 3.0 real request-MCP proof preservation
   - serialized request-MCP authority and worker-finalization assertion
+  - compact request-MCP manifest capability and post-interpolation assertion
   tests:
   - tests/plugins/workflow/test_ai_extensions_middleware_e2e.py
   - tests/plugins/workflow/test_node_mcp.py
@@ -2541,12 +2542,14 @@ upstream_changes:
     and real coordinator path for the authenticated AI showcase. Keep capability
     injection limited to the coordinator binding seam, require server-derived
     real entitlement and Desktop background provenance, and assert the recording
-    runner receives the JSON-serializable sealed package MCP authority descriptor
-    without treating it as MCP startup proof. Assert the pre-worker config keeps
+    runner receives the compact JSON-serializable sealed package MCP manifest
+    capability without treating it as MCP startup proof and without duplicating
+    entry or per-file maps into the request. Assert the pre-worker config keeps
     its canonical sealed relative entry, then apply the exact worker ordering of
-    environment interpolation followed by private-authority validation and prove
-    the finalized isolated `-c` loader, cwd, and entry arguments. After execution,
-    prove the serialized authority root was cleaned.
+    environment interpolation followed by private-manifest/tree validation and
+    prove the finalized isolated `-c` loader, cwd, and entry arguments. After
+    execution, prove the serialized authority root and private manifest were
+    cleaned.
     Keep incapable admission residue-free, explicit-real integrity failures
     runner-free, and an actual app-server runtime change mapped to the existing
     package_mcp_unavailable node error before provider traffic. Select this E2E
@@ -3286,12 +3289,17 @@ upstream_changes:
   - authoritative workflow resource capacity limits
   - AuthenticatedExecutionMaterializer
   - AuthenticatedExecutionMaterializer canonical closure materialization
+  - AuthenticatedExecutionMaterializer compact private manifest capability
   - ScriptExecutor authenticated stdin execution plan
   - ResourceResolver authenticated local Python MCP loader
+  - ResourceResolver universal sealed MCP authority handoff
   - PluginAgentRunner same-source worker bootstrap
   - plugin-agent worker authenticated MCP authority validation
+  - plugin-agent worker post-interpolation local reference classification
+  - plugin-agent worker compact manifest validation and nonlocal metadata stripping
   - MCPServerTask authenticated private working directory
   - compute_package_digest exact and compound MCP closure discovery
+  - compute_package_digest cached transitive-resource traversal
   tests:
   - tests/plugins/workflow/test_language_snapshot.py
   - tests/plugins/workflow/test_schedule_revalidation.py
@@ -3382,12 +3390,24 @@ upstream_changes:
     uv and Bun scripts from inherited anonymous byte streams, never their
     reopened package path. For authenticated local Python MCP servers,
     materialize the complete sealed byte closure at canonical relative paths in
-    one private disposable authority outside the run tree. Carry only its
-    bounded digest manifest through JSON IPC; after environment interpolation
-    the worker must validate the exact private tree, rewrite exact and compound
-    local path arguments, and launch Python isolated from the mutable run cwd
-    with private cwd, sys.path, and __file__ semantics while preserving MCP
-    protocol stdin. The worker must load from the same source tree as its parent.
+    one private disposable authority outside the run tree. Store the bounded
+    per-file digest manifest as a restrictive private file and carry only a
+    compact authenticated capability through JSON IPC: manifest digest, count,
+    total, nonce, root identity, and source-root binding, never raw authority
+    bytes or a duplicate files map. Every MCP server config produced from sealed
+    resource bytes must carry that capability even when its pre-interpolation
+    strings appear nonlocal. After environment interpolation the worker must
+    revalidate the manifest hash and exact private tree, classify command, exact
+    and compound arguments, environment values, and declared runtime files,
+    rewrite authenticated local references, and launch Python isolated from the
+    mutable run cwd with private cwd, sys.path, and __file__ semantics while
+    preserving MCP protocol stdin. Unsupported post-interpolation local launch
+    shapes fail closed; genuinely installed, npx/uvx, remote, and dependency-free
+    inline configurations discard internal metadata and retain their prior
+    behavior. The compact handoff must keep every otherwise-valid 512-file
+    workflow below the plugin-agent 256 KB MCP-config contract while genuinely
+    oversized configs still reject. The worker must load from the same source
+    tree as its parent.
     Clean the authority after success, failure, or cancellation with retry-and-
     surface behavior, make duplicate relpath-plus-digest materialization
     idempotent, and fail closed with stable migration guidance for local
@@ -3399,8 +3419,12 @@ upstream_changes:
     and byte cache must span fire-time sealed-snapshot verification, live catalog
     revalidation, transactional promotion authorization, and verified package
     preparation; boundary identity checks remain live while cached bytes are
-    never charged twice. Not-due coordinator polling stays bounded and does not
-    reopen installed workflow definitions.
+    never charged twice. MCP transitive traversal must consult this authenticated
+    cache before mutable exists/symlink checks so deletion, rename, or symlink
+    races cannot omit authenticated dependencies or drift their digest; explicit
+    mutable-boundary identity verification must still detect each race. Not-due
+    coordinator polling stays bounded and does not reopen installed workflow
+    definitions.
   removal_condition: >-
     Remove when upstream provides equivalent package-bound semantic admission
     pinning, journal-backed admitted-tree identity, sealed-byte-only resume,
