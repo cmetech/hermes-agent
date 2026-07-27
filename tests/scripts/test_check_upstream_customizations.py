@@ -466,6 +466,18 @@ def test_powershell_backslash_does_not_escape_comment_boundary(tmp_path: Path) -
         load_and_validate_manifest(manifest, repo, check_git=False)
 
 
+def test_powershell_here_string_preserves_hash_token_after_ordinary_quote(
+    tmp_path: Path,
+) -> None:
+    repo, _source, manifest = _non_python_manifest(
+        tmp_path,
+        ".ps1",
+        "$value = @'\nordinary ' quote # ExactToken\n'@\n",
+    )
+
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -506,6 +518,33 @@ def test_shell_parameter_and_quoted_heredoc_preserve_tokens(
     load_and_validate_manifest(manifest, repo, check_git=False)
 
 
+def test_shell_backslash_quoted_heredoc_preserves_token(tmp_path: Path) -> None:
+    repo, _source, manifest = _non_python_manifest(
+        tmp_path,
+        ".sh",
+        "cat <<\\EOF\n# ExactToken\nEOF\n",
+    )
+
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "printf '%s\\n' '<<EOF'\n# ExactToken\n",
+        "value=`printf ok # ExactToken\n`\n",
+    ],
+)
+def test_shell_non_heredoc_and_command_substitution_comments_do_not_own_token(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".sh", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
 def test_shell_comment_does_not_satisfy_owned_symbol(tmp_path: Path) -> None:
     repo, _source, manifest = _non_python_manifest(
         tmp_path,
@@ -528,6 +567,19 @@ def test_typescript_template_expression_comment_is_removed(tmp_path: Path) -> No
         load_and_validate_manifest(manifest, repo, check_git=False)
 
 
+def test_typescript_regex_brace_does_not_expose_template_expression_comment(
+    tmp_path: Path,
+) -> None:
+    repo, _source, manifest = _non_python_manifest(
+        tmp_path,
+        ".ts",
+        "const value = `${/}/.test('}') /* ExactToken */}`\n",
+    )
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -540,6 +592,16 @@ def test_typescript_template_text_and_expression_code_preserve_tokens(
     source: str,
 ) -> None:
     repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_markdown_tilde_fence_preserves_html_comment_literal(tmp_path: Path) -> None:
+    repo, _source, manifest = _non_python_manifest(
+        tmp_path,
+        ".md",
+        "~~~html\n<!-- ExactToken -->\n~~~\n",
+    )
 
     load_and_validate_manifest(manifest, repo, check_git=False)
 
@@ -558,6 +620,78 @@ def test_toml_multiline_string_preserves_hash_token_but_comment_does_not(
     source.write_text('value = """prefix "quote" #ExactToken\ntail"""\n')
     _git(repo, "commit", "-am", "install TOML multiline literal")
     load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "source"),
+    [
+        (".json", '{"value": "Exact\\u0054oken"}\n'),
+        (".toml", 'value = "Exact\\u0054oken"\n'),
+    ],
+)
+def test_structured_escaped_string_value_has_owned_span(
+    tmp_path: Path,
+    suffix: str,
+    source: str,
+) -> None:
+    repo, _source, manifest = _non_python_manifest(tmp_path, suffix, source)
+
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_toml_multiline_closing_quote_run_stops_span_before_following_comment(
+    tmp_path: Path,
+) -> None:
+    repo, source, manifest = _non_python_manifest(
+        tmp_path,
+        ".toml",
+        'value = """ExactToken""""\n# ExactToken before\nother = "stable"\n',
+    )
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    source.write_text(
+        'value = """ExactToken""""\n# ExactToken after\nother = "stable"\n'
+    )
+    _git(repo, "commit", "-am", "change comment after multiline TOML string")
+
+    report = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
+
+    assert report["classification"] == "same_file"
+    assert report.get("owned_symbol_changes", []) == []
+
+
+def test_yaml_block_scalar_span_stops_before_following_comment(tmp_path: Path) -> None:
+    repo, source, manifest = _non_python_manifest(
+        tmp_path,
+        ".yaml",
+        "value: |\n  ExactToken\n# before\nother: stable\n",
+    )
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    source.write_text("value: |\n  ExactToken\n# after\nother: stable\n")
+    _git(repo, "commit", "-am", "change comment after owned scalar")
+
+    report = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
+
+    assert report["classification"] == "same_file"
+    assert report.get("owned_symbol_changes", []) == []
+
+
+def test_cyclic_yaml_alias_is_traversed_once_and_comment_stays_unowned(
+    tmp_path: Path,
+) -> None:
+    repo, _source, manifest = _non_python_manifest(
+        tmp_path,
+        ".yaml",
+        "root: &root\n  - *root\n# ExactToken\n",
+    )
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
 
 
 def test_json_parser_preserves_values_and_rejects_malformed_input(tmp_path: Path) -> None:
@@ -778,3 +912,30 @@ def test_manifest_coverage_ignores_only_local_sdd_progress_ledger(
     _git(repo, "commit", "-m", "add unregistered sdd artifact")
     with pytest.raises(ValueError, match=r"\.superpowers/sdd/unregistered\.md"):
         validate_diff_coverage(data, repo, f"{baseline}..HEAD")
+
+
+def test_strict_cli_validates_owned_symbols_at_requested_base_ref(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    (repo / "core.py").write_text("class Replacement:\n    pass\n")
+    _git(repo, "commit", "-am", "replace owned definition")
+    monkeypatch.chdir(repo)
+
+    assert customization_checker.main(
+        [
+            "--manifest",
+            str(manifest),
+            "--strict",
+            "--base-ref",
+            baseline,
+        ]
+    ) == 0
+    assert customization_checker.main(
+        ["--manifest", str(manifest), "--strict", "--base-ref", "HEAD"]
+    ) == 1
+    assert "does not exist in declared files" in capsys.readouterr().err

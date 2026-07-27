@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+import ctypes
+from ctypes import wintypes
 import hashlib
 import json
 import os
@@ -29,6 +31,138 @@ _DEFAULT_TIMEOUT_SECONDS = 900.0
 _DEFAULT_OUTPUT_LIMIT_BYTES = 1_048_576
 _POLL_SECONDS = 0.05
 _TERMINATE_GRACE_SECONDS = 1.0
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def _windows_error(operation: str) -> OSError:
+    code = getattr(ctypes, "get_last_error", lambda: 0)()
+    return OSError(code, f"Windows Job Object {operation} failed")
+
+
+def _configure_windows_job_api(kernel32: Any) -> None:
+    signatures = {
+        "CreateJobObjectW": ([ctypes.c_void_p, wintypes.LPCWSTR], ctypes.c_void_p),
+        "SetInformationJobObject": (
+            [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD],
+            wintypes.BOOL,
+        ),
+        "AssignProcessToJobObject": (
+            [ctypes.c_void_p, ctypes.c_void_p],
+            wintypes.BOOL,
+        ),
+        "TerminateJobObject": (
+            [ctypes.c_void_p, wintypes.UINT],
+            wintypes.BOOL,
+        ),
+        "CloseHandle": ([ctypes.c_void_p], wintypes.BOOL),
+    }
+    for name, (argtypes, restype) in signatures.items():
+        function = getattr(kernel32, name)
+        try:
+            function.argtypes = argtypes
+            function.restype = restype
+        except AttributeError:
+            # Test doubles are ordinary bound methods rather than ctypes
+            # functions; their recorded composition is still authoritative.
+            continue
+
+
+class _WindowsJobContainment:
+    """Windows process-tree containment with kill-on-close kernel ownership."""
+
+    def __init__(self, kernel32: Any | None = None) -> None:
+        if kernel32 is None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        _configure_windows_job_api(kernel32)
+        self._kernel32 = kernel32
+        self._handle = kernel32.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise _windows_error("creation")
+        limits = _JobObjectExtendedLimitInformation()
+        limits.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            self._handle,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            kernel32.CloseHandle(self._handle)
+            self._handle = None
+            raise _windows_error("configuration")
+
+    def assign(self, process_handle: int) -> None:
+        if self._handle is None or not self._kernel32.AssignProcessToJobObject(
+            self._handle, process_handle
+        ):
+            raise _windows_error("assignment")
+
+    def terminate(self) -> None:
+        if self._handle is not None and not self._kernel32.TerminateJobObject(
+            self._handle, 1
+        ):
+            raise _windows_error("termination")
+
+    def close(self) -> None:
+        if self._handle is not None:
+            handle, self._handle = self._handle, None
+            if not self._kernel32.CloseHandle(handle):
+                raise _windows_error("close")
+
+
+_WINDOWS_JOB_BOOTSTRAP = (
+    "import subprocess, sys\n"
+    "if sys.stdin.buffer.read(1) != b'1':\n"
+    "    raise SystemExit(125)\n"
+    "child = subprocess.Popen(sys.argv[1:])\n"
+    "raise SystemExit(child.wait())\n"
+)
+_POSIX_GROUP_BOOTSTRAP = (
+    "import os, signal, subprocess, sys\n"
+    "status_fd = int(sys.argv[1])\n"
+    "child = subprocess.Popen(sys.argv[2:])\n"
+    "returncode = child.wait()\n"
+    "os.write(status_fd, f'{returncode}\\n'.encode('ascii'))\n"
+    "os.close(status_fd)\n"
+    "while True:\n"
+    "    signal.pause()\n"
+)
 
 
 def _kind(path: str) -> str:
@@ -130,6 +264,7 @@ def _refresh_known_group_members(
 ) -> None:
     if not _known_group_member_alive(process_group, known_members):
         return
+    known_members.update(_snapshot_process_group(process_group))
     for pid, created_at in list(known_members.items()):
         try:
             parent = psutil.Process(pid)
@@ -148,31 +283,90 @@ def _refresh_known_group_members(
                 continue
 
 
+def _known_group_member_running(
+    process_group: int,
+    known_members: dict[int, float],
+) -> bool:
+    for pid, created_at in known_members.items():
+        try:
+            candidate = psutil.Process(pid)
+            if (
+                candidate.create_time() == created_at
+                and os.getpgid(pid) == process_group
+                and candidate.status() != psutil.STATUS_ZOMBIE
+            ):
+                return True
+        except (ProcessLookupError, PermissionError, psutil.Error):
+            continue
+    return False
+
+
+def _require_owned_process_group(
+    process_group: int,
+    known_members: dict[int, float],
+    *,
+    leader_identity_reserved: bool = False,
+) -> bool:
+    if leader_identity_reserved:
+        known_members.update(_snapshot_process_group(process_group))
+        return True
+    if _known_group_member_alive(process_group, known_members):
+        return True
+    leader_created_at = known_members.get(process_group)
+    if leader_created_at is not None:
+        try:
+            leader = psutil.Process(process_group)
+            if leader.create_time() == leader_created_at:
+                # An unreaped original leader still reserves both its PID and
+                # the equal PGID even when Darwin no longer answers getpgid()
+                # for the zombie.  Snapshot descendants while that kernel
+                # identity proves the numeric group cannot have been reused.
+                known_members.update(_snapshot_process_group(process_group))
+                return True
+        except (ProcessLookupError, PermissionError, psutil.Error):
+            pass
+    if not _snapshot_process_group(process_group):
+        return False
+    raise RuntimeError(
+        f"process group {process_group} exists without an owned process identity"
+    )
+
+
+def _process_finished_without_reaping(process: subprocess.Popen[bytes]) -> bool:
+    if process.returncode is not None:
+        return True
+    if os.name == "posix" and all(
+        hasattr(os, name) for name in ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+    ):
+        try:
+            return os.waitid(
+                os.P_PID,
+                process.pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            ) is not None
+        except ChildProcessError:
+            return process.poll() is not None
+    return process.poll() is not None
+
+
 def _terminate_process_group(
     process: subprocess.Popen[bytes],
     process_group: int,
     known_members: dict[int, float],
+    windows_job: _WindowsJobContainment | None = None,
+    leader_identity_reserved: bool = False,
 ) -> None:
     if os.name != "posix":
-        _refresh_known_group_members(process_group, known_members)
-        targets: list[psutil.Process] = []
-        for pid, created_at in known_members.items():
-            try:
-                candidate = psutil.Process(pid)
-                if candidate.create_time() == created_at:
-                    candidate.terminate()
-                    targets.append(candidate)
-            except (ProcessLookupError, PermissionError, psutil.Error):
-                continue
-        _gone, alive = psutil.wait_procs(targets, timeout=_TERMINATE_GRACE_SECONDS)
-        for candidate in alive:
-            try:
-                candidate.kill()
-            except (ProcessLookupError, PermissionError, psutil.Error):
-                continue
-        if process.poll() is None:
+        if windows_job is None:
+            raise RuntimeError("Windows cleanup requires Job Object containment")
+        try:
+            windows_job.terminate()
+            process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
             process.kill()
-        process.wait()
+            process.wait()
+        finally:
+            windows_job.close()
         return
 
     # start_new_session=True gave this attempt a process group whose PGID is
@@ -180,6 +374,16 @@ def _terminate_process_group(
     # completion.  Descendant discovery is not a safe prerequisite here: a
     # short-lived intermediate can exit before psutil observes its resistant
     # grandchild, while the kernel still retains the original group identity.
+    if not _require_owned_process_group(
+        process_group,
+        known_members,
+        leader_identity_reserved=leader_identity_reserved,
+    ):
+        process.wait()
+        return
+    leader_identity_reserved = leader_identity_reserved or getattr(
+        process, "returncode", None
+    ) is None
     try:
         os.killpg(process_group, signal.SIGTERM)
     except ProcessLookupError:
@@ -196,16 +400,18 @@ def _terminate_process_group(
 
     deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
     while time.monotonic() < deadline:
-        try:
-            os.killpg(process_group, 0)
-        except ProcessLookupError:
-            break
-        except PermissionError:
-            if _snapshot_process_group(process_group):
-                raise
+        _refresh_known_group_members(process_group, known_members)
+        if not _known_group_member_running(process_group, known_members):
             break
         time.sleep(_POLL_SECONDS)
     else:
+        if not _require_owned_process_group(
+            process_group,
+            known_members,
+            leader_identity_reserved=leader_identity_reserved,
+        ):
+            process.wait()
+            return
         try:
             os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
@@ -245,6 +451,37 @@ def _execute_attempt(
         }
     )
     started = time.monotonic_ns()
+    windows_job: _WindowsJobContainment | None = None
+    status_read_fd: int | None = None
+    status_write_fd: int | None = None
+    if os.name != "posix":
+        try:
+            windows_job = _WindowsJobContainment()
+        except OSError as exc:
+            duration_ms = (time.monotonic_ns() - started) // 1_000_000
+            return {
+                "result": "infrastructure_error",
+                "duration_ms": duration_ms,
+                "output_truncated": False,
+                "_stdout": "",
+                "_stderr": str(exc),
+            }
+        command = [
+            str(Path(sys.executable).absolute()),
+            "-c",
+            _WINDOWS_JOB_BOOTSTRAP,
+            *command,
+        ]
+    else:
+        status_read_fd, status_write_fd = os.pipe()
+        os.set_blocking(status_read_fd, False)
+        command = [
+            str(Path(sys.executable).absolute()),
+            "-c",
+            _POSIX_GROUP_BOOTSTRAP,
+            str(status_write_fd),
+            *command,
+        ]
     popen_options: dict[str, Any] = {
         "cwd": cwd,
         "env": env,
@@ -253,11 +490,18 @@ def _execute_attempt(
     }
     if os.name == "posix":
         popen_options["start_new_session"] = True
-    elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        popen_options["pass_fds"] = (status_write_fd,)
+    else:
+        popen_options["stdin"] = subprocess.PIPE
     try:
         process = subprocess.Popen(command, **popen_options)
     except OSError as exc:
+        if status_read_fd is not None:
+            os.close(status_read_fd)
+        if status_write_fd is not None:
+            os.close(status_write_fd)
+        if windows_job is not None:
+            windows_job.close()
         duration_ms = (time.monotonic_ns() - started) // 1_000_000
         return {
             "result": "infrastructure_error",
@@ -266,6 +510,26 @@ def _execute_attempt(
             "_stdout": "",
             "_stderr": str(exc),
         }
+    if status_write_fd is not None:
+        os.close(status_write_fd)
+    if windows_job is not None:
+        try:
+            windows_job.assign(int(process._handle))  # type: ignore[attr-defined]
+            assert process.stdin is not None
+            process.stdin.write(b"1")
+            process.stdin.close()
+        except (OSError, BrokenPipeError) as exc:
+            process.kill()
+            process.wait()
+            windows_job.close()
+            duration_ms = (time.monotonic_ns() - started) // 1_000_000
+            return {
+                "result": "infrastructure_error",
+                "duration_ms": duration_ms,
+                "output_truncated": False,
+                "_stdout": "",
+                "_stderr": str(exc),
+            }
     process_group = process.pid
     try:
         known_group_members = {process.pid: psutil.Process(process.pid).create_time()}
@@ -282,9 +546,27 @@ def _execute_attempt(
     deadline = time.monotonic() + timeout_seconds
     timed_out = False
     cleanup_error: Exception | None = None
+    leader_identity_reserved = False
+    target_returncode: int | None = None
+    status_bytes = bytearray()
     try:
-        while process.poll() is None:
+        while True:
             _refresh_known_group_members(process_group, known_group_members)
+            if status_read_fd is not None:
+                try:
+                    status_bytes.extend(os.read(status_read_fd, 64))
+                except BlockingIOError:
+                    pass
+                if b"\n" in status_bytes:
+                    target_returncode = int(status_bytes.split(b"\n", 1)[0])
+                    break
+            if _process_finished_without_reaping(process):
+                leader_identity_reserved = (
+                    os.name == "posix"
+                    and hasattr(os, "WNOWAIT")
+                    and process.returncode is None
+                )
+                break
             if cancel_event.is_set():
                 raise CancelledError()
             if time.monotonic() >= deadline:
@@ -292,20 +574,36 @@ def _execute_attempt(
                 break
             time.sleep(_POLL_SECONDS)
         try:
-            _terminate_process_group(process, process_group, known_group_members)
+            _terminate_process_group(
+                process,
+                process_group,
+                known_group_members,
+                windows_job,
+                leader_identity_reserved,
+            )
         except Exception as exc:  # cleanup failures are evidence, never silent leaks
             cleanup_error = exc
             if process.poll() is None:
                 process.kill()
                 process.wait()
     except BaseException:
-        _terminate_process_group(process, process_group, known_group_members)
+        _terminate_process_group(
+            process,
+            process_group,
+            known_group_members,
+            windows_job,
+            leader_identity_reserved,
+        )
         raise
     finally:
+        if status_read_fd is not None:
+            os.close(status_read_fd)
         for reader in readers:
             reader.join(timeout=_TERMINATE_GRACE_SECONDS)
     duration_ms = (time.monotonic_ns() - started) // 1_000_000
-    returncode = process.returncode
+    returncode = (
+        target_returncode if target_returncode is not None else process.returncode
+    )
     if cleanup_error is not None:
         result = "infrastructure_error"
     elif timed_out:
@@ -441,10 +739,11 @@ def _run_group(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--repo", type=Path, required=True)
-    parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--platform", required=True)
+    parser.add_argument("--repo", type=Path)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--output", "--report-path", dest="output", type=Path, required=True)
+    parser.add_argument("--platform", default=sys.platform)
+    parser.add_argument("--base-ref")
     parser.add_argument("--timeout-seconds", type=float, default=_DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument(
         "--output-limit-bytes", type=int, default=_DEFAULT_OUTPUT_LIMIT_BYTES
@@ -460,8 +759,41 @@ def main() -> int:
             f"[1, {_DEFAULT_OUTPUT_LIMIT_BYTES}]"
         )
 
-    repo = args.repo.resolve()
-    manifest = yaml.safe_load(args.manifest.read_text(encoding="utf-8"))
+    if args.repo is None:
+        resolved_root = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if resolved_root.returncode:
+            parser.error("--repo is required outside a Git worktree")
+        repo = Path(resolved_root.stdout.strip()).resolve()
+    else:
+        repo = args.repo.resolve()
+    if args.base_ref is not None:
+        base = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{args.base_ref}^{{commit}}"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if base.returncode or head.returncode:
+            parser.error("--base-ref must resolve to a local commit")
+        if base.stdout.strip() != head.stdout.strip():
+            parser.error("--base-ref must resolve to the tested checkout HEAD")
+    manifest_path = args.manifest or (
+        repo / "docs/upstream-customizations/workflow-orchestration.yaml"
+    )
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
     paths = sorted(
         {
             path

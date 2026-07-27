@@ -4055,6 +4055,7 @@ upstream_changes:
 - id: workflow-rehearsal-executed-invariant-evidence
   change_class: workflow-testing
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - scripts/test_workflow_upstream_merge.sh
   - scripts/run_workflow_ledger_invariants.py
@@ -4063,10 +4064,25 @@ upstream_changes:
   - tests/scripts/test_workflow_upstream_merge.py
   - tests/scripts/test_check_upstream_customizations.py
   owned_symbols:
+  - load_and_validate_manifest
+  - _powershell_without_comments
+  - _shell_without_comments
+  - _typescript_without_comments
+  - _markdown_without_comments
+  - _structured_spans
+  - _walk_yaml_nodes
+  - _WindowsJobContainment
+  - _POSIX_GROUP_BOOTSTRAP
+  - _terminate_process_group
+  - _execute_attempt
+  owned_invariants:
   - isolated execution and actual duration for every executable ledger test
   - reference-only evidence type without pass or duration fields
   - digest-bounded evidence names with separate exact repository paths
   - manifest ID and repository-path construction bounds
+  - language-aware comment ownership without exposing literals or heredoc bodies
+  - source-accurate structured-value spans with cycle-safe YAML traversal
+  - process-tree containment across normal exit, timeout, interruption, and failure
   tests:
   - tests/scripts/test_workflow_upstream_merge.py
   - tests/scripts/test_check_upstream_customizations.py
@@ -4086,13 +4102,21 @@ upstream_changes:
 - id: workflow-ledger-subprocess-environment-isolation
   change_class: workflow-testing
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - scripts/run_workflow_ledger_invariants.py
   - tests/scripts/test_workflow_upstream_merge.py
   owned_symbols:
+  - _WindowsJobContainment
+  - _POSIX_GROUP_BOOTSTRAP
+  - _terminate_process_group
+  - _execute_attempt
+  owned_invariants:
   - absolute virtualenv-preserving Python test interpreter
   - scrubbed orchestration-only subprocess controls
   - preserved ordinary invariant-test environment
+  - stable owned process-group identity until cleanup completes
+  - Windows Job Object assignment before the actual test command can spawn
   tests:
   - tests/scripts/test_workflow_upstream_merge.py
   - tests/scripts/test_workflow_merge_gate.py

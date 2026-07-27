@@ -13,6 +13,7 @@ import pytest
 from jsonschema import ValidationError, validate
 import yaml
 
+import scripts.run_workflow_ledger_invariants as ledger_runner
 from scripts.check_upstream_customizations import classify_upstream_overlap
 from tests.scripts.test_check_upstream_customizations import _git, _manifest, _repo
 
@@ -687,6 +688,50 @@ def test_ledger_runner_retries_once_and_marks_flaky(tmp_path: Path) -> None:
     assert all(attempt["output_truncated"] is False for attempt in record["attempts"])
 
 
+def test_ledger_runner_accepts_report_path_and_exact_base_ref(tmp_path: Path) -> None:
+    repo = tmp_path / "runner-cli-repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    test_path = repo / "tests/test_pass.py"
+    test_path.parent.mkdir()
+    test_path.write_text("def test_pass():\n    assert True\n")
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"upstream_changes": [{"tests": ["tests/test_pass.py"]}]},
+            sort_keys=False,
+        )
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "runner fixture")
+    report = repo / "report.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--report-path",
+            str(report),
+            "--platform",
+            "synthetic",
+            "--base-ref",
+            "HEAD",
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(report.read_text())[0]["result"] == "passed"
+
+
 def _run_ledger_fixture(
     tmp_path: Path,
     sources: dict[str, str],
@@ -890,6 +935,146 @@ def test_ledger_runner_never_exceeds_two_concurrent_python_files(tmp_path: Path)
     assert (tmp_path / "ledger-fixture/.maximum-count").read_text() == "2"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group policy")
+def test_posix_cleanup_refuses_reused_group_before_term(monkeypatch) -> None:
+    class _ExitedProcess:
+        pid = 43123
+
+        def wait(self):
+            return 0
+
+    signals: list[int] = []
+    monkeypatch.setattr(
+        ledger_runner,
+        "_known_group_member_alive",
+        lambda _group, _members: False,
+    )
+    monkeypatch.setattr(
+        ledger_runner,
+        "_snapshot_process_group",
+        lambda _group: {_ExitedProcess.pid: 2.0},
+    )
+    monkeypatch.setattr(
+        ledger_runner.os,
+        "killpg",
+        lambda _group, sent_signal: signals.append(sent_signal),
+    )
+
+    with pytest.raises(RuntimeError, match="identity"):
+        ledger_runner._terminate_process_group(
+            _ExitedProcess(),
+            _ExitedProcess.pid,
+            {_ExitedProcess.pid: 1.0},
+        )
+
+    assert signals == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group policy")
+def test_posix_cleanup_rechecks_group_identity_before_kill(monkeypatch) -> None:
+    class _ExitedProcess:
+        pid = 43124
+        returncode = 0
+
+        def wait(self):
+            return 0
+
+    identity_checks = iter((True, False))
+    signals: list[int] = []
+    monkeypatch.setattr(
+        ledger_runner,
+        "_known_group_member_alive",
+        lambda _group, _members: next(identity_checks),
+    )
+    monkeypatch.setattr(ledger_runner, "_TERMINATE_GRACE_SECONDS", 0)
+    monkeypatch.setattr(
+        ledger_runner,
+        "_snapshot_process_group",
+        lambda _group: {_ExitedProcess.pid: 2.0},
+    )
+    monkeypatch.setattr(
+        ledger_runner.os,
+        "killpg",
+        lambda _group, sent_signal: signals.append(sent_signal),
+    )
+
+    with pytest.raises(RuntimeError, match="identity"):
+        ledger_runner._terminate_process_group(
+            _ExitedProcess(),
+            _ExitedProcess.pid,
+            {_ExitedProcess.pid: 1.0},
+        )
+
+    assert signals == [signal.SIGTERM]
+
+
+def test_windows_job_containment_composes_kill_on_close_lifecycle() -> None:
+    calls: list[tuple] = []
+
+    class _FakeKernel32:
+        def CreateJobObjectW(self, security, name):
+            calls.append(("create", security, name))
+            return 73
+
+        def SetInformationJobObject(self, handle, info_class, info, size):
+            calls.append(("configure", handle, info_class, size))
+            return 1
+
+        def AssignProcessToJobObject(self, handle, process_handle):
+            calls.append(("assign", handle, process_handle))
+            return 1
+
+        def TerminateJobObject(self, handle, exit_code):
+            calls.append(("terminate", handle, exit_code))
+            return 1
+
+        def CloseHandle(self, handle):
+            calls.append(("close", handle))
+            return 1
+
+    containment = ledger_runner._WindowsJobContainment(_FakeKernel32())
+    containment.assign(91)
+    containment.terminate()
+    containment.close()
+
+    assert [call[0] for call in calls] == [
+        "create",
+        "configure",
+        "assign",
+        "terminate",
+        "close",
+    ]
+    assert calls[2] == ("assign", 73, 91)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
+def test_windows_job_reaps_grandchild_from_fast_intermediate(tmp_path: Path) -> None:
+    grandchild = (
+        "import time; from pathlib import Path; "
+        "time.sleep(2); Path('windows-grandchild.marker').write_text('escaped')"
+    )
+    intermediate = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}])"
+    )
+    source = (
+        "import subprocess\nimport sys\n\n"
+        "def test_fast_intermediate():\n"
+        f"    subprocess.Popen([sys.executable, '-c', {intermediate!r}]).wait()\n"
+    )
+
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {"tests/test_windows_job.py": source},
+        timeout_seconds=3,
+    )
+    time.sleep(2.2)
+
+    assert result.returncode == 0, result.stderr
+    assert records[0]["result"] == "passed"
+    assert not (tmp_path / "ledger-fixture/windows-grandchild.marker").exists()
+
+
 def _resistant_descendant_source(*, signal_parent: bool) -> str:
     parent_action = (
         "    time.sleep(0.2)\n"
@@ -1059,7 +1244,9 @@ def test_ledger_runner_reaps_grandchild_after_fast_intermediate_and_signal(
     )
 
     assert result.returncode == 1
-    assert [attempt["result"] for attempt in records[0]["attempts"]] == ["signaled"]
+    assert [attempt["result"] for attempt in records[0]["attempts"]] == [
+        "signaled"
+    ], result.stderr
     _assert_resistant_descendants_were_reaped(
         tmp_path / "ledger-fixture", "fast-grandchild"
     )

@@ -130,6 +130,8 @@ def load_and_validate_manifest(
     repo: Path,
     *,
     check_git: bool = True,
+    source_revision: str = "HEAD",
+    strict: bool = False,
 ) -> dict[str, Any]:
     data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("schema_version") != 1:
@@ -137,6 +139,8 @@ def load_and_validate_manifest(
     # Resolved once: the commit-existence and ancestry assertions below are
     # unevaluable without full history. See _is_shallow_clone.
     shallow = check_git and _is_shallow_clone(repo)
+    if shallow and strict:
+        raise ValueError("strict validation requires complete local Git history")
     if shallow:
         print(
             f"note: {manifest_path.name}: shallow clone -- skipping commit-history "
@@ -146,7 +150,7 @@ def load_and_validate_manifest(
     entries = data.get("upstream_changes")
     if not isinstance(entries, list) or not entries:
         raise ValueError("manifest upstream_changes must be a non-empty list")
-    head_revision = _resolve_commit(repo, "HEAD", "HEAD")
+    head_revision = _resolve_commit(repo, source_revision, "source revision")
     head_sources: dict[str, str] = {}
 
     def head_source(path: str) -> str:
@@ -502,6 +506,24 @@ def _powershell_without_comments(source: str) -> str:
     index = 0
     mode = "code"
     while index < len(source):
+        if mode in {"here_single", "here_double"}:
+            marker = "'@" if mode == "here_single" else '"@'
+            line_start = index == 0 or source[index - 1] == "\n"
+            if line_start:
+                marker_at = index
+                while marker_at < len(source) and source[marker_at] in " \t":
+                    marker_at += 1
+                if source.startswith(marker, marker_at):
+                    after = marker_at + len(marker)
+                    line_end = source.find("\n", after)
+                    line_end = len(source) if line_end < 0 else line_end
+                    if not source[after:line_end].strip():
+                        mode = "code"
+                        index = after
+                        continue
+            newline = source.find("\n", index)
+            index = len(source) if newline < 0 else newline + 1
+            continue
         if mode == "block":
             end = source.find("#>", index)
             end = len(source) if end < 0 else end + 2
@@ -529,7 +551,15 @@ def _powershell_without_comments(source: str) -> str:
         if source.startswith("<#", index):
             mode = "block"
             continue
-        if char == "#":
+        if source.startswith("@'", index) or source.startswith('@"', index):
+            line_end = source.find("\n", index + 2)
+            line_end = len(source) if line_end < 0 else line_end
+            if not source[index + 2 : line_end].strip():
+                mode = "here_single" if source[index + 1] == "'" else "here_double"
+                index += 2
+            else:
+                index += 1
+        elif char == "#":
             end = source.find("\n", index)
             end = len(source) if end < 0 else end
             _blank(result, source, index, end)
@@ -547,65 +577,111 @@ def _powershell_without_comments(source: str) -> str:
     return "".join(result)
 
 
-_HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+def _shell_heredoc_at(line: str, index: int) -> tuple[int, str, bool] | None:
+    if not line.startswith("<<", index) or line.startswith("<<<", index):
+        return None
+    cursor = index + 2
+    strip_tabs = cursor < len(line) and line[cursor] == "-"
+    if strip_tabs:
+        cursor += 1
+    while cursor < len(line) and line[cursor] in " \t":
+        cursor += 1
+    delimiter: list[str] = []
+    quote = ""
+    while cursor < len(line):
+        char = line[cursor]
+        if quote:
+            if char == quote:
+                quote = ""
+                cursor += 1
+            elif quote == '"' and char == "\\" and cursor + 1 < len(line):
+                delimiter.append(line[cursor + 1])
+                cursor += 2
+            else:
+                delimiter.append(char)
+                cursor += 1
+            continue
+        if char in "'\"":
+            quote = char
+            cursor += 1
+        elif char == "\\" and cursor + 1 < len(line):
+            delimiter.append(line[cursor + 1])
+            cursor += 2
+        elif char.isspace() or char in ";|&()<>":
+            break
+        else:
+            delimiter.append(char)
+            cursor += 1
+    if quote or not delimiter:
+        return None
+    return cursor, "".join(delimiter), strip_tabs
 
 
 def _shell_without_comments(source: str) -> str:
     """Remove shell comments while retaining parameter trims and here-doc bodies."""
     result = list(source)
-    mode = "code"
-    heredoc: tuple[str, bool] | None = None
+    stack: list[tuple[str, str | None]] = [("code", None)]
+    heredocs: list[tuple[str, bool]] = []
     offset = 0
     for line in source.splitlines(keepends=True):
         body = line[:-1] if line.endswith("\n") else line
-        if heredoc is not None:
-            delimiter, strip_tabs = heredoc
+        if heredocs:
+            delimiter, strip_tabs = heredocs[0]
             candidate = body.lstrip("\t") if strip_tabs else body
             if candidate == delimiter:
-                heredoc = None
+                heredocs.pop(0)
             offset += len(line)
             continue
         index = 0
         comment_at: int | None = None
         while index < len(body):
+            mode, closer = stack[-1]
             char = body[index]
             if mode == "single":
                 if char == "'":
-                    mode = "code"
+                    stack.pop()
                 index += 1
                 continue
-            if mode in {"double", "backtick"}:
-                closer = '"' if mode == "double" else "`"
+            if mode == "double":
                 if char == "\\":
                     index += min(2, len(body) - index)
+                elif char == '"':
+                    stack.pop()
+                    index += 1
+                elif char == "`":
+                    stack.append(("code", "`"))
+                    index += 1
                 else:
-                    if char == closer:
-                        mode = "code"
                     index += 1
                 continue
-            if char == "\\":
+            if closer is not None and char == closer:
+                stack.pop()
+                index += 1
+            elif char == "\\":
                 index += min(2, len(body) - index)
             elif char == "'":
-                mode = "single"
+                stack.append(("single", None))
                 index += 1
             elif char == '"':
-                mode = "double"
+                stack.append(("double", None))
                 index += 1
             elif char == "`":
-                mode = "backtick"
+                stack.append(("code", "`"))
                 index += 1
             elif char == "#" and (
                 index == 0 or body[index - 1].isspace() or body[index - 1] in ";|&()"
             ):
                 comment_at = index
                 break
+            elif body.startswith("<<", index):
+                parsed = _shell_heredoc_at(body, index)
+                if parsed is None:
+                    index += 1
+                else:
+                    index, delimiter, strip_tabs = parsed
+                    heredocs.append((delimiter, strip_tabs))
             else:
                 index += 1
-        visible = body if comment_at is None else body[:comment_at]
-        matches = list(_HEREDOC.finditer(visible))
-        if matches:
-            match = matches[-1]
-            heredoc = (match.group(3), match.group(1) == "-")
         if comment_at is not None:
             _blank(result, source, offset + comment_at, offset + len(body))
         offset += len(line)
@@ -615,11 +691,11 @@ def _shell_without_comments(source: str) -> str:
 def _typescript_without_comments(source: str) -> str:
     """Remove JS/TS comments, including comments inside template expressions."""
     result = list(source)
-    # Stack entries are code, expression:<brace depth>, string quote, or template.
-    stack: list[tuple[str, int]] = [("code", 0)]
+    # Stack entries are mode, template-expression brace depth, regex eligibility.
+    stack: list[tuple[str, int, bool]] = [("code", 0, True)]
     index = 0
     while index < len(source):
-        mode, depth = stack[-1]
+        mode, depth, regex_allowed = stack[-1]
         char = source[index]
         following = source[index + 1] if index + 1 < len(source) else ""
         if mode in {"single", "double"}:
@@ -635,7 +711,7 @@ def _typescript_without_comments(source: str) -> str:
             if char == "\\":
                 index += min(2, len(source) - index)
             elif source.startswith("${", index):
-                stack.append(("expression", 1))
+                stack.append(("expression", 1, True))
                 index += 2
             elif char == "`":
                 stack.pop()
@@ -655,22 +731,65 @@ def _typescript_without_comments(source: str) -> str:
             _blank(result, source, index, end)
             index = end
             continue
+        if char == "/" and regex_allowed:
+            cursor = index + 1
+            in_class = False
+            closed = False
+            while cursor < len(source):
+                current = source[cursor]
+                if current == "\\":
+                    cursor += min(2, len(source) - cursor)
+                elif current == "[":
+                    in_class = True
+                    cursor += 1
+                elif current == "]" and in_class:
+                    in_class = False
+                    cursor += 1
+                elif current == "/" and not in_class:
+                    cursor += 1
+                    while cursor < len(source) and source[cursor].isalpha():
+                        cursor += 1
+                    closed = True
+                    break
+                elif current in "\r\n":
+                    break
+                else:
+                    cursor += 1
+            if closed:
+                stack[-1] = (mode, depth, False)
+                index = cursor
+                continue
         if char in {"'", '"'}:
-            stack.append(("single" if char == "'" else "double", 0))
+            stack.append(("single" if char == "'" else "double", 0, False))
             index += 1
         elif char == "`":
-            stack.append(("template", 0))
+            stack.append(("template", 0, False))
             index += 1
         elif mode == "expression" and char == "{":
-            stack[-1] = (mode, depth + 1)
+            stack[-1] = (mode, depth + 1, True)
             index += 1
         elif mode == "expression" and char == "}":
             if depth == 1:
                 stack.pop()
             else:
-                stack[-1] = (mode, depth - 1)
+                stack[-1] = (mode, depth - 1, False)
             index += 1
+        elif char.isspace():
+            index += 1
+        elif char.isalnum() or char in "_$":
+            cursor = index + 1
+            while cursor < len(source) and (
+                source[cursor].isalnum() or source[cursor] in "_$"
+            ):
+                cursor += 1
+            stack[-1] = (mode, depth, False)
+            index = cursor
         else:
+            stack[-1] = (
+                mode,
+                depth,
+                char not in ").]" and char != ".",
+            )
             index += 1
     return "".join(result)
 
@@ -703,26 +822,51 @@ def _css_without_comments(source: str) -> str:
 
 def _markdown_without_comments(source: str) -> str:
     result = list(source)
-    index = 0
-    code_ticks = 0
-    while index < len(source):
-        if source[index] == "`":
-            end = index
-            while end < len(source) and source[end] == "`":
-                end += 1
-            count = end - index
-            if code_ticks == 0:
-                code_ticks = count
-            elif count == code_ticks:
-                code_ticks = 0
-            index = end
-        elif code_ticks == 0 and source.startswith("<!--", index):
-            end = source.find("-->", index + 4)
-            end = len(source) if end < 0 else end + 3
-            _blank(result, source, index, end)
-            index = end
-        else:
-            index += 1
+    fence: tuple[str, int] | None = None
+    inline_ticks = 0
+    html_comment_end = 0
+    offset = 0
+    for line in source.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        fence_match = (
+            None
+            if html_comment_end > offset
+            else re.match(r" {0,3}(`{3,}|~{3,})(.*)$", body)
+        )
+        if fence is not None:
+            marker, width = fence
+            if re.fullmatch(rf" {{0,3}}{re.escape(marker)}{{{width},}}[ \t]*", body):
+                fence = None
+            offset += len(line)
+            continue
+        if fence_match:
+            run = fence_match.group(1)
+            if run[0] == "~" or "`" not in fence_match.group(2):
+                fence = (run[0], len(run))
+                offset += len(line)
+                continue
+        index = min(len(body), max(0, html_comment_end - offset))
+        while index < len(body):
+            if body[index] == "`":
+                end = index
+                while end < len(body) and body[end] == "`":
+                    end += 1
+                count = end - index
+                if inline_ticks == 0:
+                    inline_ticks = count
+                elif count == inline_ticks:
+                    inline_ticks = 0
+                index = end
+            elif inline_ticks == 0 and body.startswith("<!--", index):
+                absolute = offset + index
+                end = source.find("-->", absolute + 4)
+                end = len(source) if end < 0 else end + 3
+                _blank(result, source, absolute, end)
+                html_comment_end = end
+                index = len(body)
+            else:
+                index += 1
+        offset += len(line)
     return "".join(result)
 
 
@@ -753,14 +897,16 @@ def _toml_without_comments(source: str) -> str:
                 index += 1
         elif mode == "multiline_literal":
             if source.startswith("'''", index):
+                while index < len(source) and source[index] == "'":
+                    index += 1
                 mode = "code"
-                index += 3
             else:
                 index += 1
         elif mode == "multiline_basic":
             if source.startswith('\"\"\"', index):
+                while index < len(source) and source[index] == '"':
+                    index += 1
                 mode = "code"
-                index += 3
             elif source[index] == "\\":
                 index += min(2, len(source) - index)
             else:
@@ -781,17 +927,92 @@ def _toml_without_comments(source: str) -> str:
 
 def _semantic_strings(value: Any) -> list[str]:
     strings: list[str] = []
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if isinstance(key, str):
-                strings.append(key)
-            strings.extend(_semantic_strings(item))
-    elif isinstance(value, list):
-        for item in value:
-            strings.extend(_semantic_strings(item))
-    elif isinstance(value, str):
-        strings.append(value)
+    pending = [value]
+    seen_containers: set[int] = set()
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            strings.append(item)
+            continue
+        if isinstance(item, dict):
+            identity = id(item)
+            if identity in seen_containers:
+                continue
+            seen_containers.add(identity)
+            for key, child in item.items():
+                if isinstance(key, str):
+                    strings.append(key)
+                pending.append(child)
+        elif isinstance(item, (list, tuple)):
+            identity = id(item)
+            if identity in seen_containers:
+                continue
+            seen_containers.add(identity)
+            pending.extend(item)
     return strings
+
+
+def _json_string_tokens(source: str) -> list[tuple[str, int, int]]:
+    tokens: list[tuple[str, int, int]] = []
+    index = 0
+    while index < len(source):
+        if source[index] != '"':
+            index += 1
+            continue
+        start = index
+        index += 1
+        while index < len(source):
+            if source[index] == "\\":
+                index += min(2, len(source) - index)
+            elif source[index] == '"':
+                index += 1
+                break
+            else:
+                index += 1
+        decoded = json.loads(source[start:index])
+        start_line = source.count("\n", 0, start) + 1
+        end_line = source.count("\n", 0, index) + 1
+        tokens.append((decoded, start_line, end_line))
+    return tokens
+
+
+def _toml_string_end(source: str, start: int) -> int:
+    quote = source[start]
+    multiline = source.startswith(quote * 3, start)
+    index = start + (3 if multiline else 1)
+    while index < len(source):
+        if quote == '"' and source[index] == "\\":
+            index += min(2, len(source) - index)
+            continue
+        if multiline and source.startswith(quote * 3, index):
+            while index < len(source) and source[index] == quote:
+                index += 1
+            return index
+        if not multiline and source[index] == quote:
+            return index + 1
+        index += 1
+    return len(source)
+
+
+def _toml_string_tokens(source: str) -> list[tuple[str, int, int]]:
+    tokens: list[tuple[str, int, int]] = []
+    index = 0
+    while index < len(source):
+        if source[index] == "#":
+            newline = source.find("\n", index)
+            index = len(source) if newline < 0 else newline + 1
+            continue
+        if source[index] not in "'\"":
+            index += 1
+            continue
+        start = index
+        index = _toml_string_end(source, start)
+        token = source[start:index]
+        decoded = tomllib.loads(f"value = {token}\n")["value"]
+        start_line = source.count("\n", 0, start) + 1
+        end_line = source.count("\n", 0, index) + 1
+        tokens.append((decoded, start_line, end_line))
+    return tokens
 
 
 def _exact_pattern(symbol: str) -> re.Pattern[str]:
@@ -831,8 +1052,13 @@ def _structured_spans(
                         and node.tag == "tag:yaml.org,2002:str"
                         and pattern.search(node.value)
                     ):
+                        end_line = (
+                            node.end_mark.line + 1
+                            if node.end_mark.column
+                            else max(node.start_mark.line + 1, node.end_mark.line)
+                        )
                         spans[symbol].append(
-                            (node.start_mark.line + 1, node.end_mark.line + 1)
+                            (node.start_mark.line + 1, end_line)
                         )
         return spans
     if suffix == ".toml":
@@ -841,32 +1067,45 @@ def _structured_spans(
         except tomllib.TOMLDecodeError as exc:
             raise _parse_error(path, "TOML", exc) from exc
         searchable = _toml_without_comments(source)
+        decoded_tokens = _toml_string_tokens(source)
     else:
         try:
             parsed = json.loads(source)
         except json.JSONDecodeError as exc:
             raise _parse_error(path, "JSON", exc) from exc
         searchable = source
+        decoded_tokens = _json_string_tokens(source)
     semantic = _semantic_strings(parsed)
     for symbol in symbols:
         pattern = _exact_pattern(symbol)
         if not any(pattern.search(value) for value in semantic):
             continue
+        for value, start_line, end_line in decoded_tokens:
+            if pattern.search(value):
+                spans[symbol].append((start_line, end_line))
         for match in pattern.finditer(searchable):
             line = searchable.count("\n", 0, match.start()) + 1
-            spans[symbol].append((line, line))
+            if (line, line) not in spans[symbol]:
+                spans[symbol].append((line, line))
     return spans
 
 
 def _walk_yaml_nodes(node: yaml.nodes.Node) -> list[yaml.nodes.Node]:
-    nodes = [node]
-    if isinstance(node, yaml.nodes.MappingNode):
-        for key, value in node.value:
-            nodes.extend(_walk_yaml_nodes(key))
-            nodes.extend(_walk_yaml_nodes(value))
-    elif isinstance(node, yaml.nodes.SequenceNode):
-        for value in node.value:
-            nodes.extend(_walk_yaml_nodes(value))
+    nodes: list[yaml.nodes.Node] = []
+    pending = [node]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        nodes.append(current)
+        if isinstance(current, yaml.nodes.MappingNode):
+            for key, value in reversed(current.value):
+                pending.extend((value, key))
+        elif isinstance(current, yaml.nodes.SequenceNode):
+            pending.extend(reversed(current.value))
     return nodes
 
 
@@ -1063,7 +1302,13 @@ def _set_verified_upstream(path: Path, data: dict[str, Any], repo: Path, sha: st
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=Path("docs/upstream-customizations/workflow-orchestration.yaml"),
+    )
+    parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--base-ref", default="HEAD")
     parser.add_argument("--diff")
     parser.add_argument("--upstream-diff")
     parser.add_argument("--report", type=Path)
@@ -1075,7 +1320,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.set_verified_upstream:
             _set_verified_upstream(args.manifest, data, repo, args.set_verified_upstream)
-        data = load_and_validate_manifest(args.manifest, repo)
+        data = load_and_validate_manifest(
+            args.manifest,
+            repo,
+            source_revision=args.base_ref,
+            strict=args.strict,
+        )
         if args.print_verified_upstream:
             baselines = {
                 entry["last_verified_upstream"]
