@@ -68,6 +68,44 @@ def _contained(repo: Path, raw: str) -> Path:
     return path
 
 
+# An owned_symbol that looks like a code identifier (or dotted path) is checked
+# against the entry's own files. Ledgers also use free prose here to name a
+# BEHAVIOUR that no single identifier captures ("fire-time AI entitlement
+# corroboration"); those contain spaces/punctuation and are skipped.
+_SYMBOL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+
+
+def _validate_owned_symbols_exist(repo: Path, entry_id: str, entry: dict) -> None:
+    """Fail when a declared identifier-shaped owner is absent from its files.
+
+    Schema validation alone accepted any list of non-empty strings, so the
+    ledger could drift out of step with the code in either direction and still
+    exit 0 (review finding LOW-008). This catches the drift the checker CAN see:
+    a declared owner that no longer exists. The reverse -- an owner silently
+    DELETED from the ledger while still load-bearing in code -- is not
+    machine-derivable, and is pinned by the fixtures in
+    ``tests/scripts/test_check_upstream_customizations.py`` instead.
+    """
+    blobs: list[str] = []
+    for raw in entry.get("files", []):
+        path = _contained(repo, raw)
+        if path.is_file():
+            blobs.append(path.read_text(encoding="utf-8", errors="replace"))
+    if not blobs:
+        return
+    haystack = "\n".join(blobs)
+    for symbol in entry.get("owned_symbols", []):
+        if not _SYMBOL_IDENTIFIER.match(symbol):
+            continue
+        # Match the leaf so `Class.method` resolves against a method definition.
+        if symbol.split(".")[-1] not in haystack:
+            raise ValueError(
+                f"{entry_id}.owned_symbols declares {symbol!r}, which appears in "
+                "none of the entry's files: either the ledger is stale or the "
+                "customization was silently reverted"
+            )
+
+
 def load_and_validate_manifest(
     manifest_path: Path,
     repo: Path,
@@ -143,6 +181,7 @@ def load_and_validate_manifest(
                 isinstance(value, str) and value for value in entry[field]
             ):
                 raise ValueError(f"{entry_id}.{field} must contain names")
+        _validate_owned_symbols_exist(repo, entry_id, entry)
         for field in ("expected_commit_subject", "merge_guidance", "removal_condition"):
             if not isinstance(entry.get(field), str) or not entry[field].strip():
                 raise ValueError(f"{entry_id}.{field} must be non-empty")
