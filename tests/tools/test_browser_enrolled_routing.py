@@ -557,3 +557,232 @@ class TestDeadEndpointHookIntegration:
 
     def test_eviction_is_a_noop_for_a_bare_key(self, _default_enrolled):
         browser_tool._evict_dead_enrolled_session("t")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Review finding (CRITICAL): five of the six guard-forcing disjuncts had NO
+# coverage.
+#
+# `tools/browser_tool.py` amends six SSRF-guard sites with the same
+# conditional:
+#
+#     (not _is_local_backend() or _is_enrolled_session_key(<session key>))
+#
+# Only the first of the six (`_eval_ssrf_guard_active`) is a shared helper;
+# the other five are independent inline duplicates. `TestGuardForcedOnForEnrolled`
+# above calls the helper directly, so removing the disjunct from any of the
+# other five failed nothing at all -- while an enrolled browser would have been
+# free to reach ANY private origin instead of only its trusted ones.
+#
+# The classes below drive each remaining inline site through its real public
+# entry point with `_is_local_backend()` forced True -- the exact condition
+# under which the disjunct is the ONLY thing keeping the guard on -- and assert
+# both directions:
+#
+#   * enrolled key  -> the guard FIRES (the disjunct is load-bearing), and
+#   * bare key      -> the guard does NOT fire (upstream behaviour preserved,
+#                      so a mutant that forces the guard on unconditionally is
+#                      also caught).
+#
+# `browser_tool` keeps module-level caches and `scripts/run_tests.sh` isolates
+# per FILE, not per test, so every class here resets them first.
+# ---------------------------------------------------------------------------
+
+SENSITIVE = "https://wiki.corp.example/page?token=abc123"
+METADATA = "http://169.254.169.254/latest/meta-data/"
+
+
+@pytest.fixture()
+def _reset_module_caches():
+    """run_tests.sh isolates per FILE; sibling tests leave module state behind."""
+    def _wipe():
+        browser_tool._reset_session_cdp_cache()
+        browser_tool._active_sessions.clear()
+        browser_tool._last_active_session_key.clear()
+
+    _wipe()
+    yield
+    _wipe()
+
+
+@pytest.fixture()
+def _local_backend_guard_env(monkeypatch, _reset_module_caches, _default_enrolled):
+    """An ordinary LOCAL install: `_is_local_backend()` is True, so upstream
+    would switch the SSRF guard off entirely. Only the enrolled disjunct keeps
+    it on."""
+    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
+    monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+    # Only public example.com is "safe"; wiki.corp.example (trusted by the
+    # enrolled profile) and intranet.other.example (trusted by nobody) are not.
+    monkeypatch.setattr(browser_tool, "_is_safe_url", lambda u: "example.com" in u)
+    monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda u: "169.254" in u)
+
+
+def _route_to(monkeypatch, session_key):
+    """Pin the navigation routing decision so the URL under test can be held
+    constant while only the SESSION KEY varies -- which is exactly what the
+    disjunct switches on."""
+    monkeypatch.setattr(browser_tool, "_navigation_session_key", lambda t, u: session_key)
+
+
+class TestNavigateGuardsForcedOnForEnrolled:
+    """Sites 2-4: the three inline disjuncts inside `browser_navigate`
+    (sensitive-query-param check, pre-navigation private-address block,
+    post-redirect block)."""
+
+    @pytest.fixture(autouse=True)
+    def _nav(self, monkeypatch, _local_backend_guard_env):
+        monkeypatch.setattr(browser_tool, "check_website_access", lambda u: None)
+        monkeypatch.setattr(
+            browser_tool, "_get_session_info",
+            lambda k: {"session_name": "s", "bb_session_id": None, "cdp_url": None,
+                       "features": {}, "_first_nav": False},
+        )
+
+    @staticmethod
+    def _navigate(monkeypatch, url, final_url=None):
+        monkeypatch.setattr(
+            browser_tool, "_run_browser_command",
+            lambda *a, **kw: {"success": True,
+                              "data": {"title": "T", "url": final_url or url}},
+        )
+        return browser_tool.browser_navigate(url, task_id="t")
+
+    # -- Site 2: sensitive query parameter (browser_tool.py ~3125) -----------
+
+    def test_sensitive_query_param_blocked_for_an_enrolled_key(self, monkeypatch):
+        _route_to(monkeypatch, "t::enrolled")
+        assert "credential-like query parameter" in self._navigate(monkeypatch, SENSITIVE)
+
+    def test_sensitive_query_param_bare_key_keeps_upstream_behaviour(self, monkeypatch):
+        _route_to(monkeypatch, "t")
+        assert "credential-like query parameter" not in self._navigate(monkeypatch, SENSITIVE)
+
+    # -- Site 3: pre-navigation private-address block (~3152) ---------------
+
+    def test_untrusted_private_url_blocked_for_an_enrolled_key(self, monkeypatch):
+        _route_to(monkeypatch, "t::enrolled")
+        out = self._navigate(monkeypatch, UNTRUSTED_PRIVATE)
+        assert "private or internal address" in out
+
+    def test_pre_nav_bare_key_keeps_upstream_behaviour(self, monkeypatch):
+        _route_to(monkeypatch, "t")
+        out = self._navigate(monkeypatch, UNTRUSTED_PRIVATE)
+        assert "private or internal address" not in out
+
+    def test_pre_nav_guard_stays_origin_scoped_for_an_enrolled_key(self, monkeypatch):
+        """Forcing the guard on must not break the enrolled use case itself:
+        an origin the profile explicitly trusts is still reachable."""
+        _route_to(monkeypatch, "t::enrolled")
+        out = self._navigate(monkeypatch, TRUSTED)
+        assert "private or internal address" not in out
+
+    def test_metadata_floor_outranks_enrolled_trust(self, monkeypatch):
+        """The always-blocked cloud-metadata floor is checked first and is
+        never trusted -- for either key."""
+        _route_to(monkeypatch, "t::enrolled")
+        assert "cloud metadata endpoint" in self._navigate(monkeypatch, METADATA)
+        _route_to(monkeypatch, "t")
+        assert "cloud metadata endpoint" in self._navigate(monkeypatch, METADATA)
+
+    # -- Site 4: post-redirect block (~3232) --------------------------------
+
+    def test_redirect_to_untrusted_private_blocked_for_an_enrolled_key(self, monkeypatch):
+        _route_to(monkeypatch, "t::enrolled")
+        out = self._navigate(monkeypatch, TRUSTED, final_url=UNTRUSTED_PRIVATE)
+        assert "private/internal address" in out
+
+    def test_redirect_bare_key_keeps_upstream_behaviour(self, monkeypatch):
+        _route_to(monkeypatch, "t")
+        out = self._navigate(monkeypatch, TRUSTED, final_url=UNTRUSTED_PRIVATE)
+        assert "private/internal address" not in out
+
+    def test_redirect_to_a_trusted_origin_is_still_permitted(self, monkeypatch):
+        _route_to(monkeypatch, "t::enrolled")
+        out = self._navigate(monkeypatch, TRUSTED, final_url="https://wiki.corp.example/home")
+        assert "private/internal address" not in out
+
+    def test_redirect_metadata_floor_outranks_enrolled_trust(self, monkeypatch):
+        _route_to(monkeypatch, "t::enrolled")
+        out = self._navigate(monkeypatch, TRUSTED, final_url=METADATA)
+        assert "cloud metadata endpoint" in out
+
+
+class TestSnapshotGuardForcedOnForEnrolled:
+    """Site 5: the inline disjunct in `browser_snapshot`'s current-URL recheck
+    (browser_tool.py ~3354). `browser_snapshot` derives its key from
+    `_last_session_key(task_id)`, which returns an unrecorded key unchanged --
+    so passing the routing key straight in exercises the real production
+    shape."""
+
+    @pytest.fixture(autouse=True)
+    def _snap(self, monkeypatch, _local_backend_guard_env):
+        pass
+
+    @staticmethod
+    def _snapshot(monkeypatch, task_id, current_url):
+        def _cmd(session_key, command, args=None, **kw):
+            if command == "eval":
+                return {"success": True, "data": {"result": current_url}}
+            return {"success": True, "data": {"snapshot": "- page", "refs": {}}}
+
+        monkeypatch.setattr(browser_tool, "_run_browser_command", _cmd)
+        return browser_tool.browser_snapshot(task_id=task_id)
+
+    def test_private_page_snapshot_blocked_for_an_enrolled_key(self, monkeypatch):
+        out = self._snapshot(monkeypatch, "t::enrolled", UNTRUSTED_PRIVATE)
+        assert "private or internal address" in out
+
+    def test_snapshot_bare_key_keeps_upstream_behaviour(self, monkeypatch):
+        out = self._snapshot(monkeypatch, "t", UNTRUSTED_PRIVATE)
+        assert "private or internal address" not in out
+
+    def test_snapshot_of_a_trusted_origin_is_still_permitted(self, monkeypatch):
+        out = self._snapshot(monkeypatch, "t::enrolled", TRUSTED)
+        assert "private or internal address" not in out
+
+    def test_snapshot_metadata_floor_outranks_enrolled_trust(self, monkeypatch):
+        """`_snapshot_blocked_url` checks the always-blocked floor first."""
+        out = self._snapshot(monkeypatch, "t::enrolled", METADATA)
+        assert "private or internal address" in out
+
+
+class TestVisionGuardForcedOnForEnrolled:
+    """Site 6: the inline disjunct in `browser_vision`'s screenshot recheck
+    (browser_tool.py ~4416)."""
+
+    @pytest.fixture(autouse=True)
+    def _vision(self, monkeypatch, tmp_path, _local_backend_guard_env):
+        import hermes_constants
+
+        monkeypatch.setattr(hermes_constants, "get_hermes_dir", lambda *a, **k: tmp_path)
+        monkeypatch.setattr(browser_tool, "_get_browser_engine", lambda: "auto")
+
+    @staticmethod
+    def _vision_call(monkeypatch, task_id, current_url):
+        def _cmd(session_key, command, args=None, **kw):
+            if command == "eval":
+                return {"success": True, "data": {"result": current_url}}
+            # Stop the bare-key path before any real screenshot/model work: it
+            # must fail for an unrelated reason, never with the guard's message.
+            return {"success": False, "error": "no browser in this test"}
+
+        monkeypatch.setattr(browser_tool, "_run_browser_command", _cmd)
+        return browser_tool.browser_vision("what is on the page?", task_id=task_id)
+
+    def test_private_page_screenshot_blocked_for_an_enrolled_key(self, monkeypatch):
+        out = self._vision_call(monkeypatch, "t::enrolled", UNTRUSTED_PRIVATE)
+        assert "private or internal address" in out
+
+    def test_vision_bare_key_keeps_upstream_behaviour(self, monkeypatch):
+        out = self._vision_call(monkeypatch, "t", UNTRUSTED_PRIVATE)
+        assert "private or internal address" not in out
+
+    def test_vision_of_a_trusted_origin_is_still_permitted(self, monkeypatch):
+        out = self._vision_call(monkeypatch, "t::enrolled", TRUSTED)
+        assert "private or internal address" not in out
+
+    def test_vision_metadata_floor_outranks_enrolled_trust(self, monkeypatch):
+        out = self._vision_call(monkeypatch, "t::enrolled", METADATA)
+        assert "private or internal address" in out

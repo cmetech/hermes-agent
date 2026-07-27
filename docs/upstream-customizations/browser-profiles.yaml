@@ -115,6 +115,7 @@ upstream_changes:
   - _forget_session_cdp_url
   - _reset_session_cdp_cache
   - _evict_dead_enrolled_session
+  - _DEAD_CDP_MARKERS
   - _navigation_session_key
   - _get_session_info
   - _run_browser_command
@@ -200,10 +201,54 @@ upstream_changes:
     sites, e.g. eval and page-action checks, delegate to). Dropping the
     `or _is_enrolled_session_key(...)` disjunct from even ONE of the six
     silently loses origin-scoping for that one surface, with NO build error and
-    NO failing test other than TestGuardForcedOnForEnrolled (in
-    tests/tools/test_browser_enrolled_routing.py), which pins all six. If a
-    merge touches any of these six conditionals, re-verify against that test
-    class by name, not just by running the suite green.
+    no type error -- only a test failure. Only ONE of the six
+    (_eval_ssrf_guard_active) is a shared helper; the other five are
+    independent inline duplicates of the same conditional, so a test that pins
+    the helper pins NOTHING about the other five. Until 2026-07-26 only the
+    helper was covered, and removing the disjunct from any of the other five
+    passed the entire tests/tools/ suite green -- do not let that state return.
+
+    Every covering test lives in tests/tools/test_browser_enrolled_routing.py.
+    Each site is pinned in BOTH directions: an enrolled key under a forced-True
+    _is_local_backend() must trip the guard, and a bare (ephemeral) key under
+    the same local backend must NOT (so a mutant that forces the guard on
+    unconditionally is caught too). Site -> test (enrolled direction /
+    bare-key direction), all verified by mutation on 2026-07-26:
+
+    * _eval_ssrf_guard_active -- TestGuardForcedOnForEnrolled::
+      test_guard_is_forced_on_for_an_enrolled_key /
+      test_bare_key_keeps_upstream_behaviour
+    * browser_navigate, sensitive-query-param check --
+      TestNavigateGuardsForcedOnForEnrolled::
+      test_sensitive_query_param_blocked_for_an_enrolled_key /
+      test_sensitive_query_param_bare_key_keeps_upstream_behaviour
+    * browser_navigate, pre-navigation private-address block --
+      TestNavigateGuardsForcedOnForEnrolled::
+      test_untrusted_private_url_blocked_for_an_enrolled_key /
+      test_pre_nav_bare_key_keeps_upstream_behaviour
+    * browser_navigate, post-redirect block --
+      TestNavigateGuardsForcedOnForEnrolled::
+      test_redirect_to_untrusted_private_blocked_for_an_enrolled_key /
+      test_redirect_bare_key_keeps_upstream_behaviour
+    * browser_snapshot, current-URL recheck --
+      TestSnapshotGuardForcedOnForEnrolled::
+      test_private_page_snapshot_blocked_for_an_enrolled_key (and
+      test_snapshot_metadata_floor_outranks_enrolled_trust) /
+      test_snapshot_bare_key_keeps_upstream_behaviour
+    * browser_vision, screenshot recheck --
+      TestVisionGuardForcedOnForEnrolled::
+      test_private_page_screenshot_blocked_for_an_enrolled_key (and
+      test_vision_metadata_floor_outranks_enrolled_trust) /
+      test_vision_bare_key_keeps_upstream_behaviour
+
+    If a merge touches any of these six conditionals, re-verify against those
+    test names, not just by running the suite green. The three enrolled-key
+    classes also assert that the always-blocked cloud-metadata floor is still
+    checked FIRST and is never trusted, and that a trusted origin remains
+    reachable -- forcing the guard on must not break the enrolled use case
+    itself. If the disjuncts are ever re-shaped, keep BOTH directions of
+    coverage; an enrolled-only assertion cannot distinguish origin-scoping from
+    a guard that is simply always on.
 
     (d) _session_cdp_url(session_key) in browser_tool.py resolves the PER-KEY
     endpoint: it resolves the session's profile via _session_browser_profile
