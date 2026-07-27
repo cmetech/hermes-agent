@@ -418,7 +418,10 @@ def compute_package_digest(
                     if not candidate or candidate.startswith(("$", "-")):
                         continue
                     resource = package.root / candidate
-                    if resource.exists() or resource.is_symlink():
+                    if (
+                        read_budget is not None
+                        and read_budget.has_cached(resource)
+                    ) or resource.exists() or resource.is_symlink():
                         add(resource)
 
     digest = hashlib.sha256()
