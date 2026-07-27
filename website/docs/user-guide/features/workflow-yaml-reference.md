@@ -314,6 +314,21 @@ File and document sources are copied into the run's immutable `inputs/`
 snapshot before admission. Nodes must read that snapshot, not reopen the
 original mutable source path.
 
+### Runtime scratch state and artifacts
+
+Legacy workflows may keep ordinary scratch or state files under the directory
+advertised by `HERMES_WORKFLOW_RUN_DIR`. This preserves scripts that wrote
+beside run metadata before language profiles were introduced. Those added
+files are never added to the admitted sealed resource set and cannot become a
+command, script, skill, input, MCP definition, or other execution resource.
+Symlinks and special files remain invalid, and any missing or changed sealed
+member still stops verification.
+
+Use `ARTIFACTS_DIR` for durable node output whenever possible. It is the
+recommended executor-owned output location and avoids coupling a workflow to
+the layout of the run root. The legacy scratch allowance is compatibility
+behavior, not an authority or portability guarantee for the Archon profile.
+
 ### Lifecycle and resource units
 
 `limits` recognizes these current profile keys. A companion value can tighten,

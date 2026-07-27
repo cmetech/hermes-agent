@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -21,6 +22,7 @@ from plugins.workflow.catalog_api import (
 )
 from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
+    WorkflowLanguageProfile,
     make_language_snapshot,
     read_language_snapshot,
 )
@@ -124,6 +126,32 @@ def _start(store: RunStore, package, *, key: str):
     )
     assert admitted.run_id is not None
     return prepared, admitted
+
+
+def _legacy_two_node_package(workflow_writer, root: Path) -> Path:
+    return workflow_writer(
+        root / "package",
+        name="legacy-two-node",
+        nodes=[
+            {"id": "cached", "bash": "true"},
+            {
+                "id": "fail",
+                "bash": "false",
+                "depends_on": ["cached"],
+            },
+        ],
+    )
+
+
+def _admit(package, hermes_home: Path) -> tuple[RunStore, str]:
+    store = RunStore(hermes_home)
+    _prepared, admitted = _start(
+        store,
+        package,
+        key=f"{package.definition.name}-admission",
+    )
+    assert admitted.run_id is not None
+    return store, admitted.run_id
 
 
 def _prepare_pre_language_snapshot(store: RunStore, package):
@@ -358,6 +386,127 @@ def test_resume_ignores_post_admission_artifacts_outside_sealed_paths(
     loaded = _load_with_scheduler(store, admitted.run_id)
 
     assert loaded.definition.name == "archon-2026-07-snapshot"
+
+
+def test_legacy_node_run_root_write_does_not_break_next_verified_load(
+    tmp_path, workflow_writer
+):
+    package = load_workflow(_legacy_two_node_package(workflow_writer, tmp_path))
+    store, run_id = _admit(package, tmp_path / "home")
+    scheduler = RunScheduler(store)
+    run_directory = store.run_directory(run_id)
+    state = run_directory / "state.txt"
+    state.write_text("legacy state\n", encoding="utf-8")
+
+    try:
+        loaded = scheduler._load_verified_run_package(run_id)[0]
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert (
+        loaded.language.effective_profile
+        is WorkflowLanguageProfile.HERMES_LEGACY
+    )
+    assert state.read_text(encoding="utf-8") == "legacy state\n"
+
+
+@pytest.mark.parametrize("entry_kind", ["symlink", "special"])
+def test_legacy_unsealed_non_regular_entry_still_fails_verified_load(
+    tmp_path, workflow_writer, entry_kind
+):
+    package = load_workflow(_legacy_two_node_package(workflow_writer, tmp_path))
+    store, run_id = _admit(package, tmp_path / "home")
+    scheduler = RunScheduler(store)
+    run_directory = store.run_directory(run_id)
+    entry = run_directory / f"unsealed-{entry_kind}"
+    if entry_kind == "symlink":
+        outside = tmp_path / "outside.txt"
+        outside.write_text("outside\n", encoding="utf-8")
+        try:
+            entry.symlink_to(outside)
+        except OSError:
+            pytest.skip("symlinks unavailable")
+    else:
+        try:
+            os.mkfifo(entry)
+        except (AttributeError, OSError):
+            pytest.skip("special files unavailable")
+
+    try:
+        with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+            scheduler._load_verified_run_package(run_id)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert exc.value.code == "workflow_snapshot_integrity_mismatch"
+
+
+def test_legacy_changed_sealed_member_still_fails_verified_load(
+    tmp_path, workflow_writer
+):
+    package = load_workflow(_legacy_two_node_package(workflow_writer, tmp_path))
+    store, run_id = _admit(package, tmp_path / "home")
+    scheduler = RunScheduler(store)
+    definition = store.run_directory(run_id) / "definition.yaml"
+    definition.write_bytes(definition.read_bytes() + b"# changed\n")
+
+    try:
+        with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+            scheduler._load_verified_run_package(run_id)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert exc.value.code == "workflow_snapshot_integrity_mismatch"
+
+
+def test_legacy_unsealed_regular_file_never_becomes_execution_authority(
+    tmp_path, workflow_writer
+):
+    package = load_workflow(_legacy_two_node_package(workflow_writer, tmp_path))
+    store, run_id = _admit(package, tmp_path / "home")
+    scheduler = RunScheduler(store)
+    run_directory = store.run_directory(run_id)
+    shadow = run_directory / "commands" / "shadow.md"
+    shadow.parent.mkdir()
+    shadow.write_text("Unsealed command.\n", encoding="utf-8")
+
+    try:
+        _loaded, sealed_paths, sealed_bytes = (
+            scheduler._load_verified_run_package(run_id)
+        )
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert "commands/shadow.md" not in sealed_paths
+    assert "commands/shadow.md" not in sealed_bytes
+    with pytest.raises(FileNotFoundError, match="command resource is missing"):
+        ResourceResolver(
+            run_directory,
+            sealed_paths=sealed_paths,
+            sealed_bytes=sealed_bytes,
+        ).command("shadow")
+
+
+def test_verified_always_run_nodes_uses_authenticated_definition(
+    tmp_path, workflow_writer
+):
+    path = workflow_writer(
+        tmp_path / "always-run-package",
+        name="verified-always-run",
+        nodes=[
+            {"id": "cached", "bash": "true"},
+            {"id": "refresh", "bash": "true", "always_run": True},
+        ],
+    )
+    store, run_id = _admit(load_workflow(path), tmp_path / "home")
+    scheduler = RunScheduler(store)
+
+    try:
+        always_run_nodes = scheduler.verified_always_run_nodes(run_id)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert always_run_nodes == frozenset({"refresh"})
 
 
 def test_resume_rejects_symlink_inside_mutable_output_root(

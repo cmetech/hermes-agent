@@ -20,7 +20,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Iterable, Mapping
+from typing import AbstractSet, Callable, Iterable, Mapping
 
 import yaml
 
@@ -8849,18 +8849,12 @@ class RunStore:
         self,
         run_id: str,
         *,
+        always_run_nodes: AbstractSet[str],
         expected_state_version: int | None = None,
         operator_scope: str | None = None,
     ) -> dict[str, object]:
         directory = self.run_directory(run_id, operator_scope=operator_scope)
-        from plugins.workflow.schema import load_workflow
-
-        package = load_workflow(directory / "definition.yaml")
-        always_run = {
-            node.id
-            for node in package.definition.nodes
-            if node.options.get("always_run")
-        }
+        always_run = frozenset(always_run_nodes)
         with (
             workflow_lock(self.admission_lock),
             workflow_lock(self._run_lock_path(run_id)),

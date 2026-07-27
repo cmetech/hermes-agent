@@ -14,6 +14,11 @@ from plugins.workflow.catalog_api import (
     CATALOG_MAX_TRUST_STORE_BYTES,
     resolve_workflow_catalog_package,
 )
+from plugins.workflow.language import (
+    WorkflowLanguageCompatibilityError,
+    read_language_snapshot,
+)
+from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.runner_binding import (
     ExecutionCapabilityContext,
     WorkflowRunnerBinding,
@@ -106,6 +111,7 @@ def sealed_snapshot_digest(
     *,
     relative_paths: Iterable[str] | None = None,
     read_budget: WorkflowResourceReadBudget | None = None,
+    allow_unsealed_regular_files: bool = False,
 ) -> str:
     """Digest the immutable files sealed at admission, or a legacy run tree."""
     snapshot_root = Path(root)
@@ -139,7 +145,8 @@ def sealed_snapshot_digest(
                         )
                     if entry.is_dir(follow_symlinks=False):
                         if (
-                            first_part not in _MUTABLE_RUN_ROOTS
+                            not allow_unsealed_regular_files
+                            and first_part not in _MUTABLE_RUN_ROOTS
                             and relative not in sealed_directories
                         ):
                             raise ScheduledRunRevalidationError(
@@ -150,7 +157,8 @@ def sealed_snapshot_digest(
                         if relative in sealed_set:
                             entries.append((relative, path))
                         elif (
-                            relative not in _MUTABLE_RUN_FILES
+                            not allow_unsealed_regular_files
+                            and relative not in _MUTABLE_RUN_FILES
                             and first_part not in _MUTABLE_RUN_ROOTS
                         ):
                             raise ScheduledRunRevalidationError(
@@ -357,6 +365,17 @@ def verify_sealed_snapshot(
         raise ScheduledRunRevalidationError("sealed snapshot is unreadable") from exc
     if not isinstance(resources_document, Mapping):
         raise ScheduledRunRevalidationError("sealed snapshot is unreadable")
+    try:
+        projected_language = read_language_snapshot(run.get("language"))
+        sealed_language = read_language_snapshot(resources_document.get("language"))
+    except WorkflowLanguageCompatibilityError as exc:
+        raise ScheduledRunRevalidationError(
+            "sealed snapshot language identity changed"
+        ) from exc
+    if projected_language != sealed_language:
+        raise ScheduledRunRevalidationError(
+            "sealed snapshot language identity changed"
+        )
     sealed_paths = (
         read_sealed_snapshot_paths(resources_document.get("sealed_paths"))
         if projected_snapshot_digest is not None
@@ -367,14 +386,15 @@ def verify_sealed_snapshot(
             run_directory,
             relative_paths=sealed_paths,
             read_budget=budget,
+            allow_unsealed_regular_files=(
+                sealed_language is not None
+                and sealed_language.effective_profile
+                is WorkflowLanguageProfile.HERMES_LEGACY
+            ),
         )
         != expected_snapshot_digest
     ):
         raise ScheduledRunRevalidationError("sealed snapshot identity changed")
-    if run.get("language") != resources_document.get("language"):
-        raise ScheduledRunRevalidationError(
-            "sealed snapshot language identity changed"
-        )
 
 
 def _load_exact_catalog_package(

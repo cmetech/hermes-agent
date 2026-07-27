@@ -35,6 +35,7 @@ from plugins.workflow.compat import (
     derive_compatibility_report_state,
 )
 from plugins.workflow.evidence import EVIDENCE_KINDS, EvidenceReader
+from plugins.workflow.language import WorkflowLanguageCompatibilityError
 from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.runtime import (
     StoreRegistryCapacityError,
@@ -1629,8 +1630,20 @@ def mutate_run(
                     operator_scope=scope,
                 )
             elif action == "resume":
+                from hermes_cli.profiles import get_active_profile_name
+                from plugins.workflow.cli import _runtime_config, _scheduler
+
+                resume_scheduler = _scheduler(
+                    store,
+                    _runtime_config(store.hermes_home),
+                    profile_name=get_active_profile_name(),
+                )
+                always_run_nodes = resume_scheduler.verified_always_run_nodes(
+                    run_id
+                )
                 store.resume_run(
                     run_id,
+                    always_run_nodes=always_run_nodes,
                     expected_state_version=request.expected_version,
                     operator_scope=scope,
                 )
@@ -1673,6 +1686,11 @@ def mutate_run(
                     expected_state_version=request.expected_version,
                     operator_scope=scope,
                 )
+        except WorkflowLanguageCompatibilityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code},
+            ) from exc
         except RuntimeError as exc:
             raise HTTPException(
                 status_code=409,

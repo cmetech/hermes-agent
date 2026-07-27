@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 import pytest
+import yaml
 
 from plugins import workflow as workflow_plugin
 from plugins.workflow.admission import RunAdmissionRequest
@@ -970,6 +971,67 @@ def test_cleanup_cli_is_preview_only_until_exact_token_is_executed(
     executed = _json_result(capsys)
     assert executed["execute"] is True
     assert store.list_runs() == ()
+
+
+def test_resume_authenticates_always_run_before_mutating_durable_state(
+    workflow_writer, tmp_path, capsys
+) -> None:
+    home = tmp_path / "profile"
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "resume-package",
+            name="resume-authentication",
+            nodes=[
+                {"id": "cached", "bash": "true"},
+                {
+                    "id": "fail",
+                    "bash": "false",
+                    "depends_on": ["cached"],
+                },
+            ],
+        )
+    )
+    store = RunStore(home)
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="resume-authentication",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    scheduler = RunScheduler(store)
+    try:
+        assert scheduler.advance(admitted.run_id)["status"] == "failed"
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+    before = store.get_run_status(admitted.run_id)
+    definition_path = store.run_directory(admitted.run_id) / "definition.yaml"
+    definition = yaml.safe_load(definition_path.read_text(encoding="utf-8"))
+    definition["nodes"][0]["always_run"] = True
+    definition_path.write_text(
+        yaml.safe_dump(definition, sort_keys=False), encoding="utf-8"
+    )
+
+    args = _parser().parse_args([
+        "--hermes-home",
+        str(home),
+        "resume",
+        admitted.run_id,
+        "--json",
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_INVOCATION
+    assert _json_envelope(capsys)["error"]["code"] == (
+        "workflow_snapshot_integrity_mismatch"
+    )
+    assert store.get_run_status(admitted.run_id) == before
 
 
 def test_validate_doctor_trust_and_untrust(workflow_writer, tmp_path, capsys):

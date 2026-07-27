@@ -2002,8 +2002,18 @@ def _cmd_resume(
     store = _store(args, runtime)
     before = _require_run(store, args.run_id)
     foreground_conflict = False
+    resume_scheduler = _scheduler(
+        store,
+        runtime,
+        agent_runner=agent_runner,
+        profile_name=profile_name,
+    )
+    always_run_nodes = resume_scheduler.verified_always_run_nodes(args.run_id)
     try:
-        store.resume_run(args.run_id)
+        store.resume_run(
+            args.run_id,
+            always_run_nodes=always_run_nodes,
+        )
     except ForegroundExecutionConflict:
         foreground_conflict = True
     _continue_foreground_if_owned(

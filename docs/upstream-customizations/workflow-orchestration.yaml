@@ -3277,6 +3277,8 @@ upstream_changes:
   - plugins/workflow/store.py
   - plugins/workflow/scheduler.py
   - plugins/workflow/scheduled_revalidation.py
+  - plugins/workflow/cli.py
+  - plugins/workflow/dashboard/plugin_api.py
   - plugins/workflow/trust.py
   - plugins/workflow/catalog_api.py
   - plugins/workflow/resources.py
@@ -3287,6 +3289,8 @@ upstream_changes:
   - plugins/workflow/executors/script.py
   - plugins/workflow/executors/ai.py
   - tests/plugins/workflow/test_language_snapshot.py
+  - tests/plugins/workflow/test_cli.py
+  - tests/plugins/workflow/test_desktop_api.py
   - tests/plugins/workflow/test_schedule_revalidation.py
   - tests/plugins/workflow/test_script_executor.py
   - tests/plugins/workflow/test_node_mcp.py
@@ -3309,6 +3313,11 @@ upstream_changes:
   - load_workflow_snapshot normalizer_version pin
   - RunScheduler._load_verified_run_package atomic verification result
   - RunScheduler._load_run_package sealed language verification
+  - RunScheduler.verified_always_run_nodes
+  - RunScheduler._legacy_package_with_valid_resource_precedence
+  - RunStore.resume_run always_run_nodes
+  - _cmd_resume authenticated resume policy
+  - mutate_run authenticated resume policy
   - RunScheduler._verify_legacy_journaled_seals
   - RunScheduler._legacy_raw_package_paths
   - RunScheduler._legacy_raw_package_bytes
@@ -3318,6 +3327,7 @@ upstream_changes:
   - RunScheduler._legacy_package_digest_for_identity
   - read_sealed_snapshot_paths
   - sealed_snapshot_digest admitted-path verification
+  - sealed_snapshot_digest allow_unsealed_regular_files
   - verify_sealed_snapshot language identity verification
   - NodeExecutionContext.sealed_resource_paths
   - NodeExecutionContext.sealed_resource_bytes
@@ -3356,6 +3366,8 @@ upstream_changes:
   - compute_package_digest cached transitive-resource traversal
   tests:
   - tests/plugins/workflow/test_language_snapshot.py
+  - tests/plugins/workflow/test_cli.py
+  - tests/plugins/workflow/test_desktop_api.py
   - tests/plugins/workflow/test_schedule_revalidation.py
   - tests/plugins/workflow/test_fault_injection.py
   - tests/plugins/workflow/test_performance_bounds.py
@@ -3376,10 +3388,14 @@ upstream_changes:
     whole-package sealed_snapshot_digest through the journal. Resume must verify
     raw policy and resources hashes, the exact admitted definition, policy,
     inputs, skills, and package-resource bytes, equality between projected and
-    sealed language metadata, and absence of every unsealed current-tree entry
-    before parsing execution semantics. Only the code-owned nodes/ and
-    artifacts/ output roots plus exact .lock, run.json, and events.jsonl files
-    are mutable exceptions; symlinks remain forbidden. Bind command, script,
+    sealed language metadata, and authenticated sealed-tree membership before
+    parsing execution semantics. For authenticated hermes-legacy snapshots
+    only, tolerate additional ordinary scratch/state files while excluding
+    them from the sealed paths and authenticated bytes returned to execution.
+    Continue rejecting symlinks, special files, missing or changed sealed
+    members, and every unsealed entry for Archon snapshots. The code-owned
+    nodes/ and artifacts/ output roots plus exact .lock, run.json, and
+    events.jsonl files remain mutable exceptions for every profile. Bind command, script,
     and MCP resolution to the journal-corroborated sealed path set so
     higher-precedence additions and resolver-visible mutable outputs cannot
     become executable resources. Return the verified package and its sealed
@@ -3409,7 +3425,11 @@ upstream_changes:
     raw definition.yaml and policy.yaml bytes back to the original workflow and
     companion identities, preserve every other resource-relative identity, and
     require exactly one old package-digest match unless direct seals cover the
-    complete executable set or a whole-tree seal authenticates it. After parsing,
+    complete executable set or a whole-tree seal authenticates it. Derive
+    resume always_run node IDs only from
+    RunScheduler._load_verified_run_package, pass the resulting immutable set
+    into RunStore.resume_run, and never let the store reopen definition.yaml
+    before a durable resume transition. After parsing,
     require the derived resource closure to equal the preauthenticated path set
     exactly and repeat the winning raw digest comparison before execution.
     Verify the full scheduler load, not only a digest helper, against the
@@ -3709,6 +3729,7 @@ upstream_changes:
   - skills/software-development/workflow-builder/references/authoring-checklist.md
   owned_symbols:
   - Workflow YAML reference Phase 1 field inventory
+  - Legacy HERMES_WORKFLOW_RUN_DIR scratch and ARTIFACTS_DIR guidance
   - workflow-builder generated-contract authoring recipe
   - workflow-builder deferred-field decision recipe
   - workflow language backend-version floor guidance
@@ -3724,7 +3745,9 @@ upstream_changes:
     unversioned hermes-legacy behavior for bytes consumed by pre-Phase-1
     backends that reject unknown companion fields. Keep deferred Archon fields
     as explicit two-choice authoring stops rather than silent legacy
-    downgrades, retain validate/doctor and digest-bound trust gates, and keep
+    downgrades, retain validate/doctor and digest-bound trust gates, keep
+    legacy scratch/state compatibility explicit while recommending
+    ARTIFACTS_DIR and denying added run-root files any execution authority, and keep
     the global create-workflow skill's OTTO V1 steps, produces, context_from,
     verify, and iterate shapes explicitly outside the Hermes authoring
     contract. Documentation may summarize generated inventory but must be
@@ -3799,8 +3822,10 @@ upstream_changes:
   merge_guidance: >-
     Preserve retry state for the resilience showcase inside the executor-owned
     mutable artifacts namespace using ARTIFACTS_DIR. Never restore the marker
-    at the sealed run root or weaken sealed-snapshot default-deny to allow a
-    showcase-specific unsealed file. Restamp the authenticated package digest
+    at the run root merely because authenticated legacy snapshots tolerate
+    ordinary scratch/state files there: showcase state still belongs in the
+    executor-owned artifacts namespace and never gains execution authority.
+    Restamp the authenticated package digest
     whenever the bundled script changes.
   removal_condition: >-
     Remove when upstream's resilience retry fixture stores its runtime marker

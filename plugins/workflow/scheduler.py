@@ -660,6 +660,10 @@ class RunScheduler:
                     run_directory,
                     relative_paths=sealed_paths,
                     read_budget=read_budget,
+                    allow_unsealed_regular_files=(
+                        snapshot.effective_profile
+                        is WorkflowLanguageProfile.HERMES_LEGACY
+                    ),
                 )
                 verified_sealed_bytes = self._stable_snapshot_bytes(
                     run_directory,
@@ -792,6 +796,11 @@ class RunScheduler:
                 expected_package_digest,
                 snapshot,
             )
+            if snapshot.effective_profile is WorkflowLanguageProfile.HERMES_LEGACY:
+                self._legacy_package_with_valid_resource_precedence(
+                    package,
+                    run_directory=run_directory,
+                )
         else:
             package = replace(
                 package,
@@ -830,6 +839,15 @@ class RunScheduler:
         package, _sealed_paths, _sealed_bytes = self._load_verified_run_package(run_id)
         return package
 
+    def verified_always_run_nodes(self, run_id: str) -> frozenset[str]:
+        """Return resume policy only after authenticating the sealed package."""
+        package, _sealed_paths, _sealed_bytes = self._load_verified_run_package(run_id)
+        return frozenset(
+            node.id
+            for node in package.definition.nodes
+            if bool(node.options.get("always_run"))
+        )
+
     @staticmethod
     def _legacy_resource_paths(
         package: WorkflowPackage,
@@ -838,6 +856,32 @@ class RunScheduler:
         authenticated_bytes: Mapping[str, bytes],
     ) -> frozenset[str]:
         """Bind legacy resolution while rejecting ambiguous shadow candidates."""
+        sealed_package = RunScheduler._legacy_package_with_valid_resource_precedence(
+            package,
+            run_directory=run_directory,
+        )
+
+        from plugins.workflow.trust import (
+            WorkflowResourceReadBudget,
+            compute_package_digest,
+        )
+
+        return frozenset(
+            compute_package_digest(
+                sealed_package,
+                read_budget=WorkflowResourceReadBudget.from_authenticated(
+                    run_directory, authenticated_bytes
+                ),
+            ).covered_relative_paths
+        )
+
+    @staticmethod
+    def _legacy_package_with_valid_resource_precedence(
+        package: WorkflowPackage,
+        *,
+        run_directory: Path,
+    ) -> WorkflowPackage:
+        """Reject live legacy paths that could shadow authenticated resources."""
         sealed_package = replace(package, root=run_directory)
 
         def reject_ambiguous(candidates: tuple[Path, ...], kind: str) -> None:
@@ -849,7 +893,7 @@ class RunScheduler:
             if len(existing) > 1:
                 raise WorkflowLanguageCompatibilityError(
                     "workflow_snapshot_integrity_mismatch",
-                    f"pre-language workflow has ambiguous {kind} resources",
+                    f"legacy workflow has ambiguous {kind} resources",
                 )
 
         for node in sealed_package.definition.nodes:
@@ -887,19 +931,7 @@ class RunScheduler:
                     "MCP",
                 )
 
-        from plugins.workflow.trust import (
-            WorkflowResourceReadBudget,
-            compute_package_digest,
-        )
-
-        return frozenset(
-            compute_package_digest(
-                sealed_package,
-                read_budget=WorkflowResourceReadBudget.from_authenticated(
-                    run_directory, authenticated_bytes
-                ),
-            ).covered_relative_paths
-        )
+        return sealed_package
 
     @staticmethod
     def _legacy_raw_package_paths(run_directory: Path) -> frozenset[str]:
