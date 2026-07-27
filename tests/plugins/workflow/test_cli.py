@@ -396,16 +396,35 @@ def test_doctor_text_bounds_finding_diagnostics_to_machine_projection_limit(
 
 
 @pytest.mark.parametrize(
-    "unsafe_path",
+    ("unsafe_path", "leaked_fragments"),
     [
-        "/private/workflows/secret.yaml",
-        r"C:\Users\alice\secret.yaml",
-        r"\\server\share\secret.yaml",
+        ("/private/workflows/secret.yaml", ("secret.yaml",)),
+        (r"C:\Users\alice\secret.yaml", ("secret.yaml",)),
+        (r"\\server\share\secret.yaml", ("secret.yaml",)),
+        (
+            "/private/workflows/secret file.yaml",
+            ("secret file.yaml", "secret", "file.yaml"),
+        ),
+        (
+            r"C:\Users\alice\secret file.yaml",
+            ("secret file.yaml", "secret", "file.yaml"),
+        ),
+        (
+            r"\\server\share\secret file.yaml",
+            ("secret file.yaml", "secret", "file.yaml"),
+        ),
     ],
-    ids=["posix", "windows-drive", "windows-unc"],
+    ids=[
+        "posix",
+        "windows-drive",
+        "windows-unc",
+        "posix-space",
+        "windows-drive-space",
+        "windows-unc-space",
+    ],
 )
 def test_doctor_text_redacts_cross_platform_absolute_finding_paths(
-    unsafe_path, capsys, monkeypatch
+    unsafe_path, leaked_fragments, capsys, monkeypatch
 ):
     """Catch OS-specific absolute paths that escape doctor text sanitization."""
     findings = [
@@ -428,7 +447,8 @@ def test_doctor_text_redacts_cross_platform_absolute_finding_paths(
     assert "Use a portable relative input name." in output
     assert unsafe_path not in output
     assert "[REDACTED_PATH]" in output
-    assert "secret.yaml" not in output
+    for fragment in leaked_fragments:
+        assert fragment not in output
 
 
 def test_module_entrypoint_treats_none_returning_plugins_handler_as_success(tmp_path):

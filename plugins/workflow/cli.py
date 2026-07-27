@@ -100,8 +100,8 @@ _MACHINE_COMMAND: ContextVar[str] = ContextVar(
 )
 _BENIGN_POLICY_FIELDS = frozenset({"modelReasoningEffort"})
 _DOCTOR_TEXT_FINDINGS_MAX = 200
-_DOCTOR_ABSOLUTE_PATH_SEGMENTS = re.compile(
-    r"(?:[A-Za-z]:[\\/]|\\\\)[^\s]*|/[^\s]*"
+_DOCTOR_ABSOLUTE_PATH_START = re.compile(
+    r"(?:[A-Za-z]:[\\/]|\\\\|(?<![A-Za-z0-9_:/-])/)"
 )
 
 
@@ -1519,11 +1519,13 @@ def _doctor_payload(
     return payload
 
 
-def _doctor_text_value(value: object) -> object:
+def _doctor_text_value(value: object, *, path: bool = False) -> object:
     """Return one bounded diagnostic value without host-specific path leaks."""
     sanitized = sanitize_projection(value)
-    if isinstance(sanitized, str):
-        return _DOCTOR_ABSOLUTE_PATH_SEGMENTS.sub("[REDACTED_PATH]", sanitized)
+    if isinstance(sanitized, str) and path:
+        match = _DOCTOR_ABSOLUTE_PATH_START.search(sanitized)
+        if match is not None:
+            return sanitized[:match.start()] + "[REDACTED_PATH]"
     return sanitized
 
 
@@ -1571,7 +1573,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             if not isinstance(finding, Mapping):
                 continue
             code = _doctor_text_value(finding.get("code"))
-            path = _doctor_text_value(finding.get("path"))
+            path = _doctor_text_value(finding.get("path"), path=True)
             migration = _doctor_text_value(finding.get("migration"))
             print(f"- code: {code}")
             print(f"  path: {path}")

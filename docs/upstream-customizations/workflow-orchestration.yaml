@@ -3245,7 +3245,7 @@ upstream_changes:
   - workflow_command WorkflowLanguageCompatibilityError machine code projection
   - workflow_command WorkflowValidationError primary issue code and bounded issues projection
   - doctor text 200-finding ceiling and truncation notice
-  - doctor text cross-platform absolute path redaction
+  - doctor text cross-platform absolute marker-to-end path redaction
   - doctor text sanitized code/path/migration diagnostics
   - non-workflow None handler process-success regression
   tests:
@@ -3260,8 +3260,9 @@ upstream_changes:
     execution as SystemExit(main()). Preserve stable workflow language and
     validation issue codes in JSON envelopes, retain only a bounded safe issue
     projection. Render at most 200 human doctor diagnostics from existing
-    findings, with a truncation notice and cross-platform absolute-path
-    redaction before emitting sanitized code, path, and migration values only.
+    findings, with a truncation notice and cross-platform absolute-marker-to-end
+    path redaction before emitting sanitized code, path, and migration values
+    only. A path redaction must consume whitespace-containing filename suffixes.
   removal_condition: >-
     Remove when upstream preserves plugin command exit statuses and provides
     equivalent typed workflow diagnostic envelopes and safe doctor text.
