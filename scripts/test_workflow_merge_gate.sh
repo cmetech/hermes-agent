@@ -82,7 +82,8 @@ _require_root_dependencies() {
     echo "root parser dependencies require node before ledger validation" >&2
     return 1
   }
-  actual_versions="$(cd "$ROOT/scripts" && "$node_bin" --input-type=module -e '
+  actual_versions="$(cd "$ROOT/scripts" && "$node_bin" \
+    --experimental-import-meta-resolve --input-type=module -e '
     import fs from "node:fs";
     import path from "node:path";
     import { createRequire } from "node:module";

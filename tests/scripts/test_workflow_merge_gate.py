@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -418,11 +419,15 @@ def _linked_brand_checkout(tmp_path: Path) -> tuple[Path, Path, str]:
 
 
 def _run_gate_with_marker(
-    repo: Path, marker: Path, *arguments: str
+    repo: Path,
+    marker: Path,
+    *arguments: str,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["CHECKER_MARKER"] = str(marker)
     env["WORKFLOW_MERGE_GATE_FAST"] = "1"
+    env.update(extra_env or {})
     return subprocess.run(
         [GATE, "--repo", repo, *arguments],
         cwd=repo,
@@ -576,11 +581,43 @@ def test_gate_rejects_esm_exports_entrypoint_escape_before_checker(
                 "version": PARSER_VERSIONS["unified"],
                 "type": "module",
                 "main": "./index.js",
-                "exports": "./esm-entrypoint.js",
+                "exports": {
+                    ".": {
+                        "import": "./esm-entrypoint.js",
+                        "require": "./index.js",
+                    }
+                },
             }
         ),
         encoding="utf-8",
     )
+    node = shutil.which("node")
+    assert node is not None
+    require_entrypoint = subprocess.check_output(
+        [
+            node,
+            "-e",
+            "const {createRequire}=require('node:module'); "
+            "process.stdout.write(createRequire(process.argv[1]).resolve('unified'))",
+            str(repo / "scripts/extract_non_python_symbols.mjs"),
+        ],
+        cwd=repo,
+        text=True,
+    )
+    import_entrypoint = subprocess.check_output(
+        [
+            node,
+            "--experimental-import-meta-resolve",
+            "--input-type=module",
+            "-e",
+            "import {fileURLToPath} from 'node:url'; "
+            "process.stdout.write(fileURLToPath(import.meta.resolve('unified')))",
+        ],
+        cwd=repo / "scripts",
+        text=True,
+    )
+    assert Path(require_entrypoint).resolve() == (package / "index.js").resolve()
+    assert Path(import_entrypoint).resolve() == outside.resolve()
     marker = tmp_path / "esm-entrypoint-escape.marker"
 
     result = _run_gate_with_marker(repo, marker, "--phase", "base")
@@ -588,6 +625,39 @@ def test_gate_rejects_esm_exports_entrypoint_escape_before_checker(
     assert result.returncode == 1
     assert "root parser dependencies" in result.stderr
     assert not marker.exists()
+
+
+def test_gate_uses_node20_compatible_import_meta_resolve_flag(
+    tmp_path: Path,
+) -> None:
+    repo, _base = _brand_repo(tmp_path)
+    actual_node = shutil.which("node")
+    assert actual_node is not None
+    fixture_bin = tmp_path / "node20-bin"
+    fixture_bin.mkdir()
+    node_wrapper = fixture_bin / "node"
+    node_wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        "[[ \"${1:-}\" == \"--experimental-import-meta-resolve\" ]] || exit 97\n"
+        "exec \"$REAL_NODE\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    node_wrapper.chmod(0o755)
+    marker = tmp_path / "node20-compatibility.marker"
+
+    result = _run_gate_with_marker(
+        repo,
+        marker,
+        "--phase",
+        "base",
+        extra_env={
+            "PATH": f"{fixture_bin}{os.pathsep}{os.environ['PATH']}",
+            "REAL_NODE": actual_node,
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text(encoding="utf-8") == "checked\n"
 
 
 def test_gate_rejects_dangling_local_dependency_link_before_checker(
