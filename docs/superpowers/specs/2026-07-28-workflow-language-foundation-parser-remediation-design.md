@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-28
 
-**Status:** Draft for written-spec review
+**Status:** Approved
 
 **Audience:** Engineers implementing or reviewing Task 9 of the workflow
 language foundation remediation
