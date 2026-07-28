@@ -23,17 +23,21 @@ def _request(path: str, language: str, source: bytes, symbols: list[str]) -> dic
     }
 
 
-def _run_raw(*records: dict[str, object]) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
+def _run_raw(
+    *records: dict[str, object], timeout: float = 3,
+) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
     payload = "\n".join(json.dumps(item) for item in records) + "\n"
     result = subprocess.run(
         ["node", str(HELPER)], cwd=ROOT, input=payload,
-        text=True, capture_output=True, check=False,
+        text=True, capture_output=True, check=False, timeout=timeout,
     )
     return result, [json.loads(line) for line in result.stdout.splitlines()]
 
 
-def _run_helper(*requests: dict[str, object]) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
-    return _run_raw({"type": "hello", "protocol": 1}, *requests)
+def _run_helper(
+    *requests: dict[str, object], timeout: float = 3,
+) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
+    return _run_raw({"type": "hello", "protocol": 1}, *requests, timeout=timeout)
 
 
 def _expected_occurrences(source: bytes, token: bytes) -> list[list[int]]:
@@ -140,6 +144,13 @@ ExactToken
     }
 
 
+def test_markdown_parser_excludes_comments_embedded_in_raw_html() -> None:
+    source = b"<div>\n<!-- ExactToken -->\n</div>"
+    result, records = _run_helper(_request("wrapped.md", "markdown", source, ["ExactToken"]))
+    assert result.returncode == 0, result.stderr
+    assert _response(records, "wrapped.md")["spans"] == {"ExactToken": []}
+
+
 def test_helper_returns_utf8_byte_offsets_for_multibyte_prefixes() -> None:
     source = "é🙂ExactToken".encode("utf-8")
     result, records = _run_helper(_request("unicode.md", "markdown", source, ["ExactToken"]))
@@ -172,3 +183,37 @@ def test_helper_rejects_invalid_base64_utf8_and_parse_diagnostics() -> None:
         }
         assert secret not in result.stdout
         assert secret not in result.stderr
+
+
+def test_helper_rejects_empty_requested_symbols_without_hanging() -> None:
+    result, records = _run_helper(_request("empty.ts", "typescript", b"const value = 1;", [""]), timeout=1)
+    assert result.returncode != 0
+    assert records[-1] == {
+        "type": "error",
+        "id": "empty.ts",
+        "code": "invalid_symbol",
+        "detail": "invalid_symbol: empty.ts",
+    }
+
+
+def test_helper_bounds_oversized_error_metadata() -> None:
+    oversized_id = "x" * 10_000
+    request = {
+        "type": "parse",
+        "id": oversized_id,
+        "path": "oversized.ts",
+        "language": "typescript",
+        "source_base64": base64.b64encode(b"const value = 1;").decode("ascii"),
+    }
+    result, records = _run_helper(request)
+    assert result.returncode != 0
+    error = records[-1]
+    assert error == {
+        "type": "error",
+        "id": None,
+        "code": "metadata_limit",
+        "detail": "metadata_limit: null",
+    }
+    assert len(json.dumps(error, separators=(",", ":"))) <= 256
+    assert oversized_id not in result.stdout
+    assert oversized_id not in result.stderr

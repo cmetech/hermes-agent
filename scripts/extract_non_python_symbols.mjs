@@ -19,6 +19,7 @@ const EXPECTED_VERSIONS = Object.freeze({
 });
 const MAX_BLOB_BYTES = 4 * 1024 * 1024;
 const MAX_BATCH_BYTES = 16 * 1024 * 1024;
+const MAX_METADATA_BYTES = 256;
 const JAVASCRIPT_EXTENSIONS = new Set([".js", ".jsx", ".mjs", ".cjs"]);
 const TYPESCRIPT_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts"]);
 const MARKDOWN_EXTENSIONS = new Set([".md", ".markdown", ".mdown", ".mkdn"]);
@@ -89,7 +90,14 @@ function validateHello(record) {
   }
 }
 
+function enforceMetadataLimits(record) {
+  for (const value of [record.id, record.path, ...(Array.isArray(record.symbols) ? record.symbols : [])]) {
+    if (typeof value === "string" && Buffer.byteLength(value, "utf8") > MAX_METADATA_BYTES) fail("metadata_limit");
+  }
+}
+
 function validateParseRecord(record) {
+  if (record && typeof record === "object" && !Array.isArray(record)) enforceMetadataLimits(record);
   if (!record || typeof record !== "object" || Array.isArray(record) ||
       !exactKeys(record, ["type", "id", "path", "language", "source_base64", "symbols"]) || record.type !== "parse" ||
       typeof record.id !== "string" || typeof record.path !== "string" || typeof record.source_base64 !== "string" ||
@@ -97,6 +105,7 @@ function validateParseRecord(record) {
       record.symbols.some(symbol => typeof symbol !== "string")) {
     fail("invalid_request", typeof record?.id === "string" ? record.id : null);
   }
+  if (record.symbols.some(symbol => symbol.length === 0)) fail("invalid_symbol", record.id);
   const extension = extensionFor(record.path);
   const supported = (record.language === "javascript" && JAVASCRIPT_EXTENSIONS.has(extension)) ||
     (record.language === "typescript" && TYPESCRIPT_EXTENSIONS.has(extension)) ||
@@ -249,9 +258,23 @@ function extractMarkdownSpans(sourceText, sourceBytes, symbols) {
   const offsets = utf8ByteOffsets(sourceText);
   const covered = [];
   const excluded = [];
+  const htmlCommentRanges = node => {
+    const sourceStart = node?.position?.start?.offset;
+    if (typeof node.value !== "string" || !Number.isInteger(sourceStart)) fail("invalid_markdown_position");
+    const ranges = [];
+    for (const match of node.value.matchAll(/<!--[\s\S]*?-->/g)) {
+      const start = sourceStart + match.index;
+      const end = start + match[0].length;
+      if (start < 0 || end >= offsets.length) fail("invalid_markdown_position");
+      ranges.push([offsets[start], offsets[end]]);
+    }
+    return ranges;
+  };
   const visit = node => {
-    if (node.type === "html" && /^<!--(?:.|\n|\r)*-->$/.test(node.value)) excluded.push(nodeRange(node, offsets));
-    else if (node.type === "html" || SEARCHABLE_MARKDOWN.has(node.type)) covered.push(nodeRange(node, offsets));
+    if (node.type === "html") {
+      covered.push(nodeRange(node, offsets));
+      excluded.push(...htmlCommentRanges(node));
+    } else if (SEARCHABLE_MARKDOWN.has(node.type)) covered.push(nodeRange(node, offsets));
     for (const child of node.children ?? []) visit(child);
   };
   visit(tree);
