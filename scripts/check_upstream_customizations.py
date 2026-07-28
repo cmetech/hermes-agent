@@ -1999,15 +1999,17 @@ _WORD_DIFF_HUNK = re.compile(
 
 def _byte_line_boundaries(source: bytes) -> list[int]:
     boundaries = [0]
-    for line in source.splitlines(keepends=True):
-        boundaries.append(boundaries[-1] + len(line))
+    boundaries.extend(
+        offset + 1 for offset, value in enumerate(source) if value == 0x0A
+    )
+    if boundaries[-1] != len(source):
+        boundaries.append(len(source))
     return boundaries
 
 
 def _hunk_byte_bounds(
-    source: bytes, line_start: int, line_count: int
+    boundaries: Sequence[int], line_start: int, line_count: int
 ) -> tuple[int, int]:
-    boundaries = _byte_line_boundaries(source)
     line_total = len(boundaries) - 1
     if line_count == 0:
         if not 0 <= line_start <= line_total:
@@ -2070,6 +2072,8 @@ def _git_changed_byte_ranges(
         raise ValueError(f"Git character diff {exc.code}") from exc
     if diff.returncode != 0:
         raise ValueError("Git character diff process failure")
+    old_boundaries = _byte_line_boundaries(old_source)
+    new_boundaries = _byte_line_boundaries(new_source)
 
     old_ranges: list[tuple[int, int]] = []
     new_ranges: list[tuple[int, int]] = []
@@ -2094,10 +2098,10 @@ def _git_changed_byte_ranges(
             new_start = int(match.group(3))
             new_count = int(match.group(4) or b"1")
             old_cursor, old_end = _hunk_byte_bounds(
-                old_source, old_start, old_count
+                old_boundaries, old_start, old_count
             )
             new_cursor, new_end = _hunk_byte_bounds(
-                new_source, new_start, new_count
+                new_boundaries, new_start, new_count
             )
             in_hunk = True
             newline_sides.clear()
@@ -2108,20 +2112,14 @@ def _git_changed_byte_ranges(
             if not newline_sides:
                 raise ValueError("malformed Git character diff")
             advanced: set[str] = set()
-            if (
-                "old" in newline_sides
-                and old_cursor < old_end
-                and old_source[old_cursor:old_cursor + 1] == b"\n"
-            ):
+            if "old" in newline_sides and old_cursor < old_end:
+                if old_source[old_cursor:old_cursor + 1] != b"\n":
+                    raise ValueError("malformed Git character diff")
                 advanced.add("old")
-            if (
-                "new" in newline_sides
-                and new_cursor < new_end
-                and new_source[new_cursor:new_cursor + 1] == b"\n"
-            ):
+            if "new" in newline_sides and new_cursor < new_end:
+                if new_source[new_cursor:new_cursor + 1] != b"\n":
+                    raise ValueError("malformed Git character diff")
                 advanced.add("new")
-            if not advanced:
-                raise ValueError("malformed Git character diff")
             if "old" in advanced:
                 old_cursor += 1
             if "new" in advanced:

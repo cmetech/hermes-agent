@@ -1313,6 +1313,50 @@ def test_git_character_diff_bounds_repetitive_input_and_fails_closed(
     assert new_ranges == [(len(prefix) + 6, len(prefix) + 7)]
 
 
+def test_git_character_diff_builds_each_endpoint_line_table_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rebuilding a 100 KiB line table for every hunk is superlinear work."""
+    repo = _repo(tmp_path)
+    source_path = repo / "many-hunks.ts"
+    before_lines = [
+        f"{line:04d} ".encode("ascii") + (b"a" * 90) + b" X\n"
+        for line in range(1024)
+    ]
+    after_lines = list(before_lines)
+    for line in range(8, 1024, 16):
+        after_lines[line] = after_lines[line][:-2] + b"Y\n"
+    before = b"".join(before_lines)
+    after = b"".join(after_lines)
+    source_path.write_bytes(before)
+    _git(repo, "add", source_path.name)
+    _git(repo, "commit", "-m", "add many-hunk fixture")
+    left = _git(repo, "rev-parse", "HEAD")
+    source_path.write_bytes(after)
+    _git(repo, "commit", "-am", "edit separated characters")
+    real_boundaries = customization_checker._byte_line_boundaries
+    constructed_for: list[bytes] = []
+
+    def counted_boundaries(source: bytes) -> list[int]:
+        constructed_for.append(source)
+        return real_boundaries(source)
+
+    monkeypatch.setattr(
+        customization_checker, "_byte_line_boundaries", counted_boundaries
+    )
+
+    old_ranges, new_ranges = customization_checker._git_changed_byte_ranges(
+        repo, left, "HEAD", source_path.name, before, after
+    )
+
+    assert len(old_ranges) == 64
+    assert len(new_ranges) == 64
+    assert all(end - start == 1 for start, end in old_ranges)
+    assert all(end - start == 1 for start, end in new_ranges)
+    assert constructed_for == [before, after]
+
+
 def test_git_character_diff_rejects_malformed_hunk(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1361,6 +1405,42 @@ def test_git_character_diff_uses_lf_only_for_source_line_boundaries(
 
     assert old_ranges == [(changed, changed + 1)]
     assert new_ranges == [(changed, changed + 1)]
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "expected"),
+    [
+        (b"A\rB1\rC", b"A\rB2\rC", [(3, 4)]),
+        (
+            b"A\rB1\r\nkeep\nC\rD1",
+            b"A\rB2\r\nkeep\nC\rD2",
+            [(3, 4), (14, 15)],
+        ),
+    ],
+    ids=("cr-only", "mixed-line-endings"),
+)
+def test_git_character_diff_uses_lf_only_for_git_hunk_lines(
+    tmp_path: Path,
+    before: bytes,
+    after: bytes,
+    expected: list[tuple[int, int]],
+) -> None:
+    """Lone CR bytes are source content, never Git hunk line boundaries."""
+    repo = _repo(tmp_path)
+    source_path = repo / "line-endings.ts"
+    source_path.write_bytes(before)
+    _git(repo, "add", source_path.name)
+    _git(repo, "commit", "-m", "add line-ending fixture")
+    left = _git(repo, "rev-parse", "HEAD")
+    source_path.write_bytes(after)
+    _git(repo, "commit", "-am", "edit across line endings")
+
+    old_ranges, new_ranges = customization_checker._git_changed_byte_ranges(
+        repo, left, "HEAD", source_path.name, before, after
+    )
+
+    assert old_ranges == expected
+    assert new_ranges == expected
 
 
 @pytest.mark.parametrize("failure", ["timeout", "output_limit"])
