@@ -3199,6 +3199,92 @@ def test_manifest_coverage_ignores_only_local_sdd_progress_ledger(
         validate_diff_coverage(data, repo, f"{baseline}..HEAD")
 
 
+def test_strict_requested_revision_loads_its_committed_manifest(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    _git(repo, "add", "ledger.yaml")
+    _git(repo, "commit", "-m", "add historical ledger")
+    requested = _git(repo, "rev-parse", "HEAD")
+
+    (repo / "future.py").write_text("class FutureOwned:\n    pass\n")
+    newer = yaml.safe_load(manifest.read_text())
+    newer["upstream_changes"][0]["files"] = ["future.py"]
+    newer["upstream_changes"][0]["owned_symbols"] = ["FutureOwned"]
+    manifest.write_text(yaml.safe_dump(newer, sort_keys=False))
+    _git(repo, "add", "future.py", "ledger.yaml")
+    _git(repo, "commit", "-m", "replace ledger after requested revision")
+
+    loaded = load_and_validate_manifest(
+        manifest,
+        repo,
+        source_revision=requested,
+        strict=True,
+    )
+
+    assert loaded["upstream_changes"][0]["files"] == ["core.py"]
+    assert loaded["upstream_changes"][0]["owned_symbols"] == ["Owned"]
+
+
+def test_strict_requested_revision_cannot_be_satisfied_by_dirty_manifest(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    historical = yaml.safe_load(manifest.read_text())
+    historical["upstream_changes"][0]["owned_symbols"] = ["MissingHistorically"]
+    manifest.write_text(yaml.safe_dump(historical, sort_keys=False))
+    _git(repo, "add", "ledger.yaml")
+    _git(repo, "commit", "-m", "add historically invalid ledger")
+    requested = _git(repo, "rev-parse", "HEAD")
+
+    dirty = yaml.safe_load(manifest.read_text())
+    dirty["upstream_changes"][0]["owned_symbols"] = ["Owned"]
+    manifest.write_text(yaml.safe_dump(dirty, sort_keys=False))
+
+    with pytest.raises(ValueError, match="MissingHistorically.*declared files"):
+        load_and_validate_manifest(
+            manifest,
+            repo,
+            source_revision=requested,
+            strict=True,
+        )
+
+
+def test_strict_manifest_path_must_be_repository_contained(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    _git(repo, "add", "ledger.yaml")
+    _git(repo, "commit", "-m", "add historical ledger")
+    requested = _git(repo, "rev-parse", "HEAD")
+    outside_manifest = tmp_path / "outside.yaml"
+    outside_manifest.write_bytes(manifest.read_bytes())
+
+    with pytest.raises(ValueError, match="manifest path is not repository-contained"):
+        load_and_validate_manifest(
+            outside_manifest,
+            repo,
+            source_revision=requested,
+            strict=True,
+        )
+
+
+def test_non_strict_manifest_loading_keeps_using_checkout_bytes(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    _git(repo, "add", "ledger.yaml")
+    _git(repo, "commit", "-m", "add ledger")
+    manifest.write_text("schema_version: 2\n")
+
+    with pytest.raises(ValueError, match="manifest schema_version must be 1"):
+        load_and_validate_manifest(manifest, repo, strict=False)
+
+
 def test_strict_cli_validates_owned_symbols_at_requested_base_ref(
     tmp_path: Path,
     monkeypatch,
@@ -3207,6 +3293,9 @@ def test_strict_cli_validates_owned_symbols_at_requested_base_ref(
     repo = _repo(tmp_path)
     baseline = _git(repo, "rev-parse", "HEAD")
     manifest = _manifest(repo, baseline)
+    _git(repo, "add", "ledger.yaml")
+    _git(repo, "commit", "-m", "add ledger")
+    requested = _git(repo, "rev-parse", "HEAD")
     (repo / "core.py").write_text("class Replacement:\n    pass\n")
     _git(repo, "commit", "-am", "replace owned definition")
     monkeypatch.chdir(repo)
@@ -3217,7 +3306,7 @@ def test_strict_cli_validates_owned_symbols_at_requested_base_ref(
             str(manifest),
             "--strict",
             "--base-ref",
-            baseline,
+            requested,
         ]
     ) == 0
     assert customization_checker.main(
@@ -3297,8 +3386,11 @@ def test_strict_requested_revision_uses_its_committed_path_inventory(
     tmp_path: Path,
 ) -> None:
     repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    _git(repo, "add", "ledger.yaml")
+    _git(repo, "commit", "-m", "add ledger")
     requested = _git(repo, "rev-parse", "HEAD")
-    manifest = _manifest(repo, requested)
     (repo / "core.py").unlink()
     _git(repo, "commit", "-am", "delete owned file after requested revision")
 
@@ -3310,19 +3402,22 @@ def test_strict_requested_revision_uses_its_committed_path_inventory(
     )
 
     future = repo / "future.py"
-    future.write_text("class FutureOwned:\n    pass\n")
-    _git(repo, "add", "future.py")
-    _git(repo, "commit", "-m", "add future owned file")
     data = yaml.safe_load(manifest.read_text())
     data["upstream_changes"][0]["files"] = ["future.py"]
     data["upstream_changes"][0]["owned_symbols"] = ["FutureOwned"]
     manifest.write_text(yaml.safe_dump(data, sort_keys=False))
+    _git(repo, "add", "ledger.yaml")
+    _git(repo, "commit", "-m", "declare a not-yet-existing owned file")
+    future_requested = _git(repo, "rev-parse", "HEAD")
+    future.write_text("class FutureOwned:\n    pass\n")
+    _git(repo, "add", "future.py")
+    _git(repo, "commit", "-m", "add future owned file")
 
     with pytest.raises(ValueError, match="future.py.*source revision"):
         load_and_validate_manifest(
             manifest,
             repo,
-            source_revision=requested,
+            source_revision=future_requested,
             strict=True,
         )
 
@@ -3332,8 +3427,11 @@ def test_strict_requested_revision_ignores_current_checkout_symlink(
 ) -> None:
     """A later checkout symlink must not redefine an older commit's path."""
     repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    _git(repo, "add", "ledger.yaml")
+    _git(repo, "commit", "-m", "add ledger")
     requested = _git(repo, "rev-parse", "HEAD")
-    manifest = _manifest(repo, requested)
     outside = tmp_path / "outside.py"
     outside.write_text("class Owned:\n    pass\n")
     (repo / "core.py").unlink()
@@ -3360,8 +3458,11 @@ def test_strict_requested_revision_rejects_committed_symlink_even_when_current_i
     (repo / "core.py").symlink_to(target.name)
     _git(repo, "add", "core.py", target.name)
     _git(repo, "commit", "-m", "install historical symlink")
+    verified = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, verified)
+    _git(repo, "add", "ledger.yaml")
+    _git(repo, "commit", "-m", "add historical ledger")
     requested = _git(repo, "rev-parse", "HEAD")
-    manifest = _manifest(repo, requested)
     (repo / "core.py").unlink()
     (repo / "core.py").write_text("class Owned:\n    pass\n")
     _git(repo, "add", "core.py")
@@ -3380,10 +3481,14 @@ def test_strict_requested_revision_rejects_newer_verified_baseline(
     tmp_path: Path,
 ) -> None:
     repo = _repo(tmp_path)
-    requested = _git(repo, "rev-parse", "HEAD")
+    baseline = _git(repo, "rev-parse", "HEAD")
     _git(repo, "commit", "--allow-empty", "-m", "newer verification point")
     newer = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-b", "historical-ledger", baseline)
     manifest = _manifest(repo, newer)
+    _git(repo, "add", "ledger.yaml")
+    _git(repo, "commit", "-m", "add ledger with sibling baseline")
+    requested = _git(repo, "rev-parse", "HEAD")
 
     with pytest.raises(ValueError, match="baseline is not an ancestor of source revision"):
         load_and_validate_manifest(
@@ -3398,13 +3503,17 @@ def test_strict_requested_revision_rejects_newer_coverage_base(
     tmp_path: Path,
 ) -> None:
     repo = _repo(tmp_path)
-    requested = _git(repo, "rev-parse", "HEAD")
+    baseline = _git(repo, "rev-parse", "HEAD")
     _git(repo, "commit", "--allow-empty", "-m", "future coverage point")
     newer = _git(repo, "rev-parse", "HEAD")
-    manifest = _manifest(repo, requested)
+    _git(repo, "checkout", "-b", "historical-ledger", baseline)
+    manifest = _manifest(repo, baseline)
     data = yaml.safe_load(manifest.read_text())
     data["coverage"] = {"base_commit": newer, "excluded_commits": []}
     manifest.write_text(yaml.safe_dump(data, sort_keys=False))
+    _git(repo, "add", "ledger.yaml")
+    _git(repo, "commit", "-m", "add ledger with sibling coverage base")
+    requested = _git(repo, "rev-parse", "HEAD")
 
     with pytest.raises(ValueError, match="coverage base is not an ancestor of source revision"):
         load_and_validate_manifest(

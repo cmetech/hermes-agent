@@ -921,6 +921,19 @@ def _repository_relative_path(raw: str) -> PurePosixPath:
     return portable
 
 
+def _manifest_repository_path(manifest_path: Path, repo: Path) -> str:
+    """Return the manifest's lexical path inside ``repo`` without following links."""
+    absolute_repo = Path(os.path.abspath(repo))
+    absolute_manifest = Path(os.path.abspath(manifest_path))
+    try:
+        relative = absolute_manifest.relative_to(absolute_repo)
+    except ValueError as exc:
+        raise ValueError(
+            f"manifest path is not repository-contained: {manifest_path}"
+        ) from exc
+    return _repository_relative_path(relative.as_posix()).as_posix()
+
+
 def _tree_entry(
     repo: Path,
     revision: str,
@@ -966,7 +979,19 @@ def load_and_validate_manifest(
     source_revision: str = "HEAD",
     strict: bool = False,
 ) -> dict[str, Any]:
-    data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    resolved_source_revision = _resolve_commit(repo, source_revision, "source revision")
+    if strict:
+        manifest_repository_path = _manifest_repository_path(manifest_path, repo)
+        _require_regular_file_at(
+            repo, resolved_source_revision, manifest_repository_path
+        )
+        _manifest_oid, manifest_bytes = _blob_bytes(
+            repo, resolved_source_revision, manifest_repository_path
+        )
+        manifest_source = manifest_bytes.decode("utf-8", errors="strict")
+    else:
+        manifest_source = manifest_path.read_text(encoding="utf-8")
+    data = yaml.safe_load(manifest_source)
     if not isinstance(data, dict) or data.get("schema_version") != 1:
         raise ValueError("manifest schema_version must be 1")
     # Resolved once: the commit-existence and ancestry assertions below are
@@ -983,7 +1008,6 @@ def load_and_validate_manifest(
     entries = data.get("upstream_changes")
     if not isinstance(entries, list) or not entries:
         raise ValueError("manifest upstream_changes must be a non-empty list")
-    resolved_source_revision = _resolve_commit(repo, source_revision, "source revision")
     source_revision_files: dict[str, str] = {}
 
     def revision_source(path: str) -> str:
