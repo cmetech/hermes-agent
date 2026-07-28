@@ -636,6 +636,7 @@ def test_typescript_keyword_regex_braces_stay_inside_template_expression(
     source: str,
 ) -> None:
     """Treating a keyword-following slash as division exposes comment text."""
+    _assert_javascript_syntax(tmp_path, source)
     repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
 
     with pytest.raises(ValueError, match="ExactToken.*declared files"):
@@ -729,6 +730,53 @@ def test_typescript_statement_and_label_regex_goals_do_not_expose_comments(
     source: str,
 ) -> None:
     """ASI, labels, and statement closers all leave the next slash regex-eligible."""
+    _assert_javascript_syntax(tmp_path, source)
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    ("jump", "label", "boundary"),
+    [
+        ("break", "loop", "\n"),
+        ("continue", "loop", "\n"),
+        ("break", "of", "\n"),
+        ("continue", "get", "\n"),
+        ("break", "loop", ";\n"),
+        ("continue", "async", "; "),
+    ],
+)
+def test_typescript_jump_label_stays_restricted_until_statement_boundary(
+    tmp_path: Path,
+    jump: str,
+    label: str,
+    boundary: str,
+) -> None:
+    """An optional label remains in the jump statement through ASI or ``;``."""
+    condition = "true" if jump == "break" else "false"
+    source = (
+        f"const value = `${{(() => {{ {label}: while ({condition}) "
+        f"{jump} {label}{boundary}"
+        "/}}/.test('}}')\n/* ExactToken */ return 1; })()}`\n"
+    )
+    _assert_javascript_syntax(tmp_path, source)
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_typescript_unlabeled_break_asi_does_not_capture_next_division(
+    tmp_path: Path,
+) -> None:
+    """A post-ASI identifier belongs to a new expression, not a jump label."""
+    source = (
+        "let independent = 8;\n"
+        "while (true) break\n"
+        "independent / 2; /* ExactToken */\n"
+    )
     _assert_javascript_syntax(tmp_path, source)
     repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
 
@@ -985,6 +1033,121 @@ def test_markdown_contained_fence_keeps_blank_continuation_literal(
         tmp_path,
         ".md",
         "- ```html\n\n  <!-- ExactToken -->\n  ```\n",
+    )
+
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize("marker_only", [">", "> "])
+def test_markdown_marker_only_blockquote_blank_keeps_list_fence_literal(
+    tmp_path: Path,
+    marker_only: str,
+) -> None:
+    """A continued blockquote marker can carry a blank nested-list fence line."""
+    repo, _source, manifest = _non_python_manifest(
+        tmp_path,
+        ".md",
+        (
+            "> - ```html\n"
+            f"{marker_only}\n"
+            ">   <!-- ExactToken -->\n"
+            ">   ```\n"
+        ),
+    )
+
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "> > - ```html\n"
+            "> >\n"
+            "> >   <!-- ExactToken -->\n"
+            "> >   ```\n"
+        ),
+        (
+            "> - 10. ```html\n"
+            ">\n"
+            ">       <!-- ExactToken -->\n"
+            ">       ```\n"
+        ),
+    ],
+)
+def test_markdown_marker_only_blank_continues_nested_containers(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".md", source)
+
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    ("opening", "blank", "continuation"),
+    [
+        ("- ", "  ", "  "),
+        ("10. ", "    ", "    "),
+        ("-\t", "\t", "\t"),
+    ],
+)
+def test_markdown_list_only_blank_indentation_keeps_fence_literal(
+    tmp_path: Path,
+    opening: str,
+    blank: str,
+    continuation: str,
+) -> None:
+    source = (
+        f"{opening}```html\n"
+        f"{blank}\n"
+        f"{continuation}<!-- ExactToken -->\n"
+        f"{continuation}```\n"
+    )
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".md", source)
+
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize("blank", ["", "   ", " \t"])
+@pytest.mark.parametrize(
+    "following",
+    ["<!-- ExactToken -->", ">   <!-- ExactToken -->"],
+)
+def test_markdown_unmarked_blank_terminates_blockquote_contained_fence(
+    tmp_path: Path,
+    blank: str,
+    following: str,
+) -> None:
+    """A blank without ``>`` ends the quote before prefixed or outer HTML."""
+    repo, _source, manifest = _non_python_manifest(
+        tmp_path,
+        ".md",
+        f"> - ```html\n{blank}\n{following}\n",
+    )
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_markdown_marker_only_blank_does_not_hide_later_outer_comment(
+    tmp_path: Path,
+) -> None:
+    repo, _source, manifest = _non_python_manifest(
+        tmp_path,
+        ".md",
+        "> - ```html\n>\n<!-- ExactToken -->\n",
+    )
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_markdown_root_fence_keeps_raw_blank_literal_until_eof(tmp_path: Path) -> None:
+    repo, _source, manifest = _non_python_manifest(
+        tmp_path,
+        ".md",
+        "```html\n\n<!-- ExactToken -->\n",
     )
 
     load_and_validate_manifest(manifest, repo, check_git=False)

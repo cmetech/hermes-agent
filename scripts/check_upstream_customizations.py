@@ -1024,26 +1024,28 @@ def _typescript_without_comments(source: str) -> str:
                 statement_start = False
                 label_candidate = False
                 restricted_statement = None
-            elif restricted_statement == "jump":
+            elif restricted_statement == "jump_label_allowed":
                 # A break/continue label is permitted only before a line
-                # terminator; whitespace handling above already applies ASI.
+                # terminator.  Consuming it does not finish the restricted
+                # statement: ASI or an explicit semicolon still owns the next
+                # lexical-goal transition.
                 control_header_pending = False
                 regex_allowed = False
                 statement_start = False
                 label_candidate = False
-                restricted_statement = None
+                restricted_statement = "jump_label_consumed"
             elif token in {"break", "continue"}:
                 control_header_pending = False
                 regex_allowed = False
                 statement_start = False
                 label_candidate = False
-                restricted_statement = "jump"
+                restricted_statement = "jump_label_allowed"
             elif token == "debugger":
                 control_header_pending = False
                 regex_allowed = False
                 statement_start = False
                 label_candidate = False
-                restricted_statement = "debugger"
+                restricted_statement = "statement_complete"
             elif token in control_header_keywords:
                 control_header_pending = True
                 regex_allowed = False
@@ -1259,11 +1261,6 @@ def _markdown_continuation_content(
     containers: tuple[tuple[str, int], ...],
 ) -> str | None:
     """Strip one opening container stack from a continuation without guessing."""
-    # A blank line can remain inside a contained fenced block even without its
-    # list/blockquote markers.  It carries no fence closer, so preserve the
-    # child fence and let a later indented continuation decide the close.
-    if not line.strip():
-        return ""
     cursor = 0
     column = 0
     virtual_indent = 0
@@ -1286,7 +1283,14 @@ def _markdown_continuation_content(
             line, cursor, column, required
         )
         if consumed is None:
-            return None
+            # CommonMark list items admit blank fence content without the
+            # ordinary continuation indent.  That blank does not stand in for
+            # a later blockquote marker, though: keep walking the container
+            # stack so every quote continuation is proved independently.
+            if line[cursor:].strip():
+                return None
+            virtual_indent = 0
+            continue
         cursor, column, virtual_indent = consumed
     return " " * virtual_indent + _markdown_normalize_leading_indent(
         line[cursor:], column
