@@ -378,7 +378,7 @@ git commit -m "feat(workflow): add bounded symbol parser helper"
 
 - [ ] **Step 1: Write failing committed-byte and batching tests**
 
-Add `test_manifest_parser_reads_resolved_committed_blob_not_dirty_worktree`, `test_manifest_parser_reads_requested_historical_revision_not_head`, `test_manifest_parser_batches_paths_and_deduplicates_identical_requests`, and `test_parser_batches_sequentially_at_sixteen_mibibytes`. Monkeypatch `customization_checker._run_parser_batch` with this shape rather than adding a test-only production switch:
+Add `test_parser_blob_loader_reads_resolved_commit_not_dirty_worktree`, `test_parser_blob_loader_reads_requested_historical_revision_not_head`, `test_parser_resolver_batches_paths_and_deduplicates_identical_requests`, and `test_parser_batches_sequentially_at_sixteen_mibibytes`. These are direct transport-boundary tests: Task 3, not this task, owns wiring manifest validation and overlap classification to the resolver. Monkeypatch `customization_checker._run_parser_batch` with this shape rather than adding a test-only production switch:
 
 ```python
 calls: list[list[customization_checker._ParserRequest]] = []
@@ -400,7 +400,7 @@ def recording_batch(requests):
 monkeypatch.setattr(customization_checker, "_run_parser_batch", recording_batch)
 ```
 
-In the dirty-tree test, commit a TypeScript file containing `ExactToken`, replace the worktree file with a comment-only occurrence, validate at the committed revision, and assert `calls[0][0].source` equals `git show HEAD:owned.ts` bytes. In the historical test, move `HEAD` past a commit that removed the token, validate with `source_revision=older`, and assert the captured `blob_oid` equals `git rev-parse older:owned.ts`. For batching, use two request IDs with the same blob OID/language/symbols and assert one helper request supplies both results; use five blobs just below 4 MiB and assert two sequential calls whose decoded totals are each at most 16 MiB.
+In the dirty-tree test, commit a TypeScript file containing `ExactToken`, replace the worktree file with a comment-only occurrence, call `_blob_bytes(repo, resolved_revision, "owned.ts")`, construct the parser request from those returned bytes/OID, resolve it, and assert `calls[0][0].source` equals `git show HEAD:owned.ts` bytes. In the historical test, move `HEAD` past a commit that removed the token, call `_blob_bytes` with the older resolved commit, and assert the captured `blob_oid` equals `git rev-parse older:owned.ts`. For batching, use two request IDs with the same blob OID/language/symbols and assert one helper request supplies both results; use five blobs just below 4 MiB and assert two sequential calls whose decoded totals are each at most 16 MiB. End-to-end manifest and overlap authority remains a Task 3 integration test.
 
 - [ ] **Step 2: Write failing terminal-boundary tests**
 
