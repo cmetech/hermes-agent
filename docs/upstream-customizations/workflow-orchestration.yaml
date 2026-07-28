@@ -4125,6 +4125,7 @@ upstream_changes:
   - package-lock.json
   - scripts/extract_non_python_symbols.mjs
   - scripts/check_upstream_customizations.py
+  - scripts/test_workflow_merge_gate.sh
   owned_symbols:
   - PROTOCOL_VERSION
   - extractTypeScriptSpans
@@ -4133,6 +4134,7 @@ upstream_changes:
   - _NonPythonSymbolResolver
   - _run_parser_batch
   - _git_changed_byte_ranges
+  - _require_root_dependencies
   - 6.0.3
   - 11.0.5
   - 11.0.0
@@ -4143,9 +4145,11 @@ upstream_changes:
   - exact character-level Git diffs are bounded independently and fail closed before overlap classification
   - exact parser versions and bounded sequential batches fail closed without a lexical fallback
   - overlap reports replace prior evidence atomically only after complete parser success
+  - detached base and brand gates validate the bounded root parser dependency view before checker execution
   tests:
   - tests/scripts/test_extract_non_python_symbols.py
   - tests/scripts/test_check_upstream_customizations.py
+  - tests/scripts/test_workflow_merge_gate.py
   expected_commit_subject: 'feat(workflow): add bounded symbol parser helper'
   upstream_candidate: true
   merge_guidance: >-

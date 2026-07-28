@@ -12,7 +12,7 @@ while [[ $# -gt 0 ]]; do
     --phase) PHASE="${2:-}"; shift 2 ;;
     --brand) BRAND="${2:-}"; shift 2 ;;
     --tested-base-sha) TESTED_BASE_SHA="${2:-}"; shift 2 ;;
-    --repo) ROOT="$(cd "${2:-}" && pwd)"; shift 2 ;;
+    --repo) ROOT="$(cd "${2:-}" && pwd -P)"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -53,11 +53,51 @@ case "$PYTHON_BIN" in
 esac
 [[ -x "$PYTHON_BIN" ]] || { echo "python interpreter is not executable: $PYTHON_BIN" >&2; exit 1; }
 
+_require_root_dependencies() {
+  local shared_git_dir shared_root resolved_modules node_bin actual_versions
+  shared_git_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+  shared_root="$(cd "$(dirname "$shared_git_dir")" && pwd -P)"
+  if [[ ! -e "$ROOT/node_modules" && -d "$shared_root/node_modules" ]]; then
+    ln -s "$shared_root/node_modules" "$ROOT/node_modules"
+  fi
+  [[ -d "$ROOT/node_modules" ]] || {
+    echo "root parser dependencies are required before ledger validation" >&2
+    return 1
+  }
+  resolved_modules="$(cd "$ROOT/node_modules" && pwd -P)"
+  [[ "$resolved_modules" == "$ROOT/node_modules" ||
+     "$resolved_modules" == "$shared_root/node_modules" ]] || {
+    echo "root parser dependencies escape the allowed dependency roots" >&2
+    return 1
+  }
+  node_bin="$(command -v node || true)"
+  [[ -n "$node_bin" ]] || {
+    echo "root parser dependencies require node before ledger validation" >&2
+    return 1
+  }
+  actual_versions="$("$node_bin" -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const names = ["typescript", "unified", "remark-parse", "micromark"];
+    process.stdout.write(names.map(name =>
+      JSON.parse(fs.readFileSync(path.join(process.argv[1], name, "package.json"), "utf8")).version
+    ).join(" "));
+  ' "$resolved_modules")" || {
+    echo "root parser dependencies are unreadable" >&2
+    return 1
+  }
+  [[ "$actual_versions" == "6.0.3 11.0.5 11.0.0 4.0.2" ]] || {
+    echo "root parser dependency versions do not match the lockfile" >&2
+    return 1
+  }
+}
+
 cd "$ROOT"
 if [[ "$PHASE" == "base" ]] && [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
   echo "tracked working tree is dirty; refusing to seal TESTED_BASE_SHA" >&2
   exit 1
 fi
+_require_root_dependencies
 "$PYTHON_BIN" "$CHECKER" --manifest "$MANIFEST"
 
 if [[ "$PHASE" == "base" ]]; then

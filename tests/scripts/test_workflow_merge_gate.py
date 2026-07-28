@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
+import json
 import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 import yaml
 
@@ -74,6 +75,42 @@ WORKFLOW_GATE_OPTOUTS = {
     )
 }
 
+PARSER_VERSIONS = {
+    "typescript": "6.0.3",
+    "unified": "11.0.5",
+    "remark-parse": "11.0.0",
+    "micromark": "4.0.2",
+}
+
+
+def _write_parser_dependencies(root: Path) -> None:
+    for package, version in PARSER_VERSIONS.items():
+        package_dir = root / "node_modules" / package
+        package_dir.mkdir(parents=True, exist_ok=True)
+        (package_dir / "package.json").write_text(
+            json.dumps({"name": package, "version": version}), encoding="utf-8"
+        )
+
+
+def _dependency_checker_source() -> str:
+    return (
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        f"expected = {PARSER_VERSIONS!r}\n"
+        "for name, version in expected.items():\n"
+        "    manifest = Path('node_modules') / name / 'package.json'\n"
+        "    assert json.loads(manifest.read_text(encoding='utf-8'))['version'] == version\n"
+        "marker = os.environ.get('CHECKER_MARKER')\n"
+        "if marker:\n"
+        "    Path(marker).write_text('checked\\n', encoding='utf-8')\n"
+        "offline = os.environ.get('HERMES_OFFLINE') == '1'\n"
+        "credentials_empty = all(not os.environ.get(name) for name in "
+        "('OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'NOUS_API_KEY'))\n"
+        "raise SystemExit(9 if Path('FAIL_CHECK').exists() else "
+        "(0 if offline and credentials_empty else 8))\n"
+    )
+
 def test_live_customization_ledger_has_one_rehearsable_upstream_baseline() -> None:
     result = subprocess.run(
         [
@@ -98,12 +135,13 @@ def _exercise_base_gate(tmp_path: Path) -> tuple[subprocess.CompletedProcess[str
     repo = tmp_path / "gate-contract-repo"
     (repo / "scripts").mkdir(parents=True)
     (repo / "docs/upstream-customizations").mkdir(parents=True)
-    (repo / "node_modules").mkdir()
     (repo / "apps/desktop/node_modules").mkdir(parents=True)
     subprocess.run(["git", "init", "-b", "base"], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Gate Contract"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "gate@localhost"], cwd=repo, check=True)
-    (repo / "scripts/check_upstream_customizations.py").write_text("raise SystemExit(0)\n")
+    (repo / "scripts/check_upstream_customizations.py").write_text(
+        _dependency_checker_source()
+    )
     (repo / "scripts/test_workflow_upstream_merge.sh").write_text("#!/bin/sh\nexit 0\n")
     (repo / "scripts/run_tests.sh").write_text(
         "#!/usr/bin/env bash\n"
@@ -123,6 +161,7 @@ def _exercise_base_gate(tmp_path: Path) -> tuple[subprocess.CompletedProcess[str
     (fixture_bin / "npx").chmod(0o755)
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "fixture"], cwd=repo, check=True, capture_output=True)
+    _write_parser_dependencies(repo)
     capture = tmp_path / "commands.tsv"
     env = os.environ.copy()
     env.pop("WORKFLOW_MERGE_GATE_FAST", None)
@@ -340,13 +379,7 @@ def _brand_repo(tmp_path: Path) -> tuple[Path, str]:
     subprocess.run(["git", "config", "user.name", "Gate Test"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "gate@localhost"], cwd=repo, check=True)
     (repo / "scripts/check_upstream_customizations.py").write_text(
-        "import os\n"
-        "from pathlib import Path\n"
-        "offline = os.environ.get('HERMES_OFFLINE') == '1'\n"
-        "credentials_empty = all(not os.environ.get(name) for name in "
-        "('OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'NOUS_API_KEY'))\n"
-        "raise SystemExit(9 if Path('FAIL_CHECK').exists() else "
-        "(0 if offline and credentials_empty else 8))\n"
+        _dependency_checker_source()
     )
     (repo / "scripts/test_workflow_upstream_merge.sh").write_text("#!/bin/sh\nexit 0\n")
     (repo / "docs/upstream-customizations/workflow-orchestration.yaml").write_text("schema_version: 1\n")
@@ -360,7 +393,115 @@ def _brand_repo(tmp_path: Path) -> tuple[Path, str]:
     (repo / "brand.txt").write_text("otto\n")
     subprocess.run(["git", "add", "brand.txt"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "brand"], cwd=repo, check=True, capture_output=True)
+    _write_parser_dependencies(repo)
     return repo, base
+
+
+def _linked_brand_checkout(tmp_path: Path) -> tuple[Path, Path, str]:
+    shared_root, base = _brand_repo(tmp_path)
+    linked = tmp_path / "linked-brand"
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", str(linked), "otto"],
+        cwd=shared_root,
+        check=True,
+        capture_output=True,
+    )
+    return shared_root, linked, base
+
+
+def _run_gate_with_marker(
+    repo: Path, marker: Path, *arguments: str
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["CHECKER_MARKER"] = str(marker)
+    env["WORKFLOW_MERGE_GATE_FAST"] = "1"
+    return subprocess.run(
+        [GATE, "--repo", repo, *arguments],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+def test_base_gate_provisions_root_parser_dependencies_before_checker(
+    tmp_path: Path,
+) -> None:
+    shared_root, linked, _base = _linked_brand_checkout(tmp_path)
+    subprocess.run(
+        ["git", "checkout", "--detach", "base"],
+        cwd=linked,
+        check=True,
+        capture_output=True,
+    )
+    marker = tmp_path / "base-checker.marker"
+
+    result = _run_gate_with_marker(linked, marker, "--phase", "base")
+
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text(encoding="utf-8") == "checked\n"
+    assert (linked / "node_modules").resolve() == (shared_root / "node_modules").resolve()
+
+
+def test_brand_gate_provisions_root_parser_dependencies_before_checker(
+    tmp_path: Path,
+) -> None:
+    shared_root, linked, base = _linked_brand_checkout(tmp_path)
+    marker = tmp_path / "brand-checker.marker"
+
+    result = _run_gate_with_marker(
+        linked,
+        marker,
+        "--phase",
+        "brand",
+        "--brand",
+        "otto",
+        "--tested-base-sha",
+        base,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text(encoding="utf-8") == "checked\n"
+    assert (linked / "node_modules").resolve() == (shared_root / "node_modules").resolve()
+
+
+def test_gate_fails_before_checker_when_root_parser_dependencies_are_missing(
+    tmp_path: Path,
+) -> None:
+    shared_root, linked, _base = _linked_brand_checkout(tmp_path)
+    (shared_root / "node_modules/micromark/package.json").unlink()
+    marker = tmp_path / "missing-checker.marker"
+
+    result = _run_gate_with_marker(linked, marker, "--phase", "base")
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+    assert not marker.exists()
+
+
+def test_gate_rejects_broken_or_escaping_root_dependency_link(
+    tmp_path: Path,
+) -> None:
+    repo, _base = _brand_repo(tmp_path)
+    outside = tmp_path / "outside"
+    _write_parser_dependencies(outside)
+    (repo / "node_modules").rename(repo / "shared-node-modules")
+    (repo / "node_modules").symlink_to(outside / "node_modules", target_is_directory=True)
+    marker = tmp_path / "escaping-checker.marker"
+
+    result = _run_gate_with_marker(repo, marker, "--phase", "base")
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+    assert not marker.exists()
+
+    (repo / "node_modules").unlink()
+    (repo / "node_modules").symlink_to(tmp_path / "missing-node-modules")
+    result = _run_gate_with_marker(repo, marker, "--phase", "base")
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+    assert not marker.exists()
 
 
 def _brand_gate(repo: Path, base: str) -> subprocess.CompletedProcess[str]:
@@ -395,6 +536,7 @@ def test_brand_gate_rejects_tested_commit_outside_brand_ancestry(tmp_path: Path)
     subprocess.run(["git", "commit", "-m", "unrelated"], cwd=repo, check=True, capture_output=True)
     unrelated = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     subprocess.run(["git", "checkout", "otto"], cwd=repo, check=True, capture_output=True)
+    _write_parser_dependencies(repo)
 
     result = _brand_gate(repo, unrelated)
 
