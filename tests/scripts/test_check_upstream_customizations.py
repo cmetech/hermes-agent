@@ -993,6 +993,422 @@ def test_overlap_classification_distinguishes_file_symbol_and_equivalent(
     assert classify_upstream_overlap(entry, repo, f"{third}..HEAD")["classification"] == "possible_upstream_equivalent"
 
 
+def test_typescript_broad_symbols_include_as_satisfies_jsx_and_qualified_names(
+    tmp_path: Path,
+) -> None:
+    """Qualified names split by trivia must retain their semantic relationship."""
+    source = (
+        "const cast = input as AsToken;\n"
+        "const checked = input satisfies SatisfiesToken;\n"
+        "const view = <JsxToken />;\n"
+        "const qualified = Owner /* parser trivia */ . member;\n"
+    )
+    repo, source_path, manifest = _non_python_manifest(tmp_path, ".tsx", source)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["upstream_changes"][0]["owned_symbols"] = [
+        "AsToken",
+        "SatisfiesToken",
+        "JsxToken",
+        "Owner.member",
+    ]
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+
+    source_path.write_text(source.replace(". member", ". changedMember"))
+    _git(repo, "commit", "-am", "edit qualified member")
+
+    assert (
+        classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")[
+            "classification"
+        ]
+        == "owned_symbol"
+    )
+
+
+def test_markdown_broad_symbols_include_links_code_containers_and_html(
+    tmp_path: Path,
+) -> None:
+    """Narrow Markdown leaf selection must still cover every public syntax form."""
+    source = """# HeadingToken
+[LinkToken](https://example.test/DestinationToken)
+`InlineCodeToken`
+
+```txt
+FencedToken
+```
+
+> - ContainerToken
+<span>HtmlToken</span>
+<!-- CommentOnlyToken -->
+"""
+    repo, source_path, manifest = _non_python_manifest(tmp_path, ".md", source)
+    raw = yaml.safe_load(manifest.read_text())
+    raw["upstream_changes"][0]["owned_symbols"] = [
+        "HeadingToken",
+        "LinkToken",
+        "DestinationToken",
+        "InlineCodeToken",
+        "FencedToken",
+        "ContainerToken",
+        "HtmlToken",
+    ]
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+
+    source_path.write_text(
+        source.replace("DestinationToken", "DestinationT0ken")
+    )
+    _git(repo, "commit", "-am", "edit markdown link destination")
+
+    assert (
+        classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")[
+            "classification"
+        ]
+        == "owned_symbol"
+    )
+
+
+def test_non_python_overlap_uses_utf8_byte_ranges_after_multibyte_prefix(
+    tmp_path: Path,
+) -> None:
+    """Character offsets after UTF-8 prefixes must not drift onto owned bytes."""
+    repo, source_path, manifest = _non_python_manifest(
+        tmp_path, ".ts", 'const café = "ExactToken";\n'
+    )
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    left = _git(repo, "rev-parse", "HEAD")
+
+    source_path.write_text('const café = "ExactT0ken";\n', encoding="utf-8")
+    _git(repo, "add", source_path.name)
+    _git(repo, "commit", "-m", "edit owned literal")
+    assert (
+        classify_upstream_overlap(entry, repo, f"{left}..HEAD")["classification"]
+        == "owned_symbol"
+    )
+
+    _git(repo, "checkout", "-b", "unicode-sibling", left)
+    source_path.write_text('const cafe = "ExactToken";\n', encoding="utf-8")
+    _git(repo, "commit", "-am", "edit only multibyte identifier")
+    assert (
+        classify_upstream_overlap(entry, repo, f"{left}..HEAD")["classification"]
+        == "same_file"
+    )
+
+
+@pytest.mark.parametrize(
+    ("suffix", "before", "after"),
+    [
+        (
+            ".ts",
+            '// ExactToken before\nconst value = "ExactToken";\n',
+            '// ExactToken after\nconst value = "ExactToken";\n',
+        ),
+        (
+            ".md",
+            '<!-- ExactToken before -->\nExactToken\n',
+            '<!-- ExactToken after -->\nExactToken\n',
+        ),
+    ],
+)
+def test_non_python_overlap_ignores_comment_only_edits(
+    tmp_path: Path,
+    suffix: str,
+    before: str,
+    after: str,
+) -> None:
+    """A changed parser-excluded comment cannot borrow a live token elsewhere."""
+    repo, source_path, manifest = _non_python_manifest(tmp_path, suffix, before)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    source_path.write_text(after)
+    _git(repo, "commit", "-am", "edit only parser-excluded comment")
+
+    assert (
+        classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")[
+            "classification"
+        ]
+        == "same_file"
+    )
+
+
+def test_classify_all_entries_uses_one_shared_parser_resolution_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-entry parser calls would multiply work and break report-wide sharing."""
+    repo = _repo(tmp_path)
+    first = repo / "first.js"
+    second = repo / "second.md"
+    equivalent = repo / "equivalent.js"
+    first.write_text("const FirstToken = 1;\n")
+    second.write_text("SecondToken\n")
+    equivalent.write_text("const unrelated = 1;\n")
+    _git(repo, "add", first.name, second.name, equivalent.name)
+    _git(repo, "commit", "-m", "add shared parser fixtures")
+    left = _git(repo, "rev-parse", "HEAD")
+    first.write_text("const FirstT0ken = 1;\n")
+    second.write_text("SecondToken\nextra\n")
+    equivalent.write_text("const SecondToken = 1;\n")
+    _git(repo, "commit", "-am", "change three parser blobs")
+    right = _git(repo, "rev-parse", "HEAD")
+
+    template = yaml.safe_load(_manifest(repo, left).read_text())["upstream_changes"][0]
+    entries = [
+        {
+            **template,
+            "id": "first",
+            "files": [first.name],
+            "owned_symbols": ["FirstToken"],
+        },
+        {
+            **template,
+            "id": "second",
+            "files": [second.name],
+            "owned_symbols": ["SecondToken"],
+        },
+    ]
+    calls: list[list[customization_checker._ParserRequest]] = []
+
+    def parse(
+        requests: list[customization_checker._ParserRequest],
+    ) -> dict[str, dict[str, list[tuple[int, int]]]]:
+        calls.append(list(requests))
+        results: dict[str, dict[str, list[tuple[int, int]]]] = {}
+        for request in requests:
+            symbol_results: dict[str, list[tuple[int, int]]] = {}
+            for symbol in request.symbols:
+                token = symbol.encode("utf-8")
+                spans: list[tuple[int, int]] = []
+                cursor = 0
+                while (start := request.source.find(token, cursor)) >= 0:
+                    spans.append((start, start + len(token)))
+                    cursor = start + 1
+                symbol_results[symbol] = spans
+            results[request.request_id] = symbol_results
+        return results
+
+    monkeypatch.setattr(customization_checker, "_run_parser_batch", parse)
+
+    overlaps = customization_checker.classify_upstream_overlaps(
+        entries, repo, f"{left}..{right}"
+    )
+
+    assert len(calls) == 1
+    assert [request.request_id for request in calls[0]] == [
+        f"{left}:equivalent.js",
+        f"{right}:equivalent.js",
+        f"{left}:first.js",
+        f"{right}:first.js",
+        f"{left}:second.md",
+        f"{right}:second.md",
+    ]
+    assert [item["id"] for item in overlaps] == ["first", "second"]
+    assert [item["classification"] for item in overlaps] == [
+        "owned_symbol",
+        "same_file",
+    ]
+
+
+def test_manifest_uses_one_shared_parser_resolution_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolving entries independently would duplicate blobs and parser batches."""
+    repo = _repo(tmp_path)
+    javascript = repo / "shared.js"
+    markdown = repo / "guide.md"
+    javascript.write_text("const FirstToken = SecondToken;\n")
+    markdown.write_text("MarkdownToken\n")
+    _git(repo, "add", javascript.name, markdown.name)
+    _git(repo, "commit", "-m", "add manifest parser fixtures")
+    revision = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, revision)
+    template = yaml.safe_load(manifest.read_text())["upstream_changes"][0]
+    raw = {
+        "schema_version": 1,
+        "upstream_changes": [
+            {
+                **template,
+                "id": "first",
+                "files": [javascript.name, markdown.name],
+                "owned_symbols": ["FirstToken", "MarkdownToken"],
+            },
+            {
+                **template,
+                "id": "second",
+                "files": [javascript.name],
+                "owned_symbols": ["SecondToken"],
+            },
+        ],
+    }
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    calls: list[list[customization_checker._ParserRequest]] = []
+
+    def parse(requests):
+        calls.append(list(requests))
+        return {
+            request.request_id: {
+                symbol: [
+                    (start, start + len(symbol.encode("utf-8")))
+                    for start in range(len(request.source))
+                    if request.source.startswith(symbol.encode("utf-8"), start)
+                ]
+                for symbol in request.symbols
+            }
+            for request in requests
+        }
+
+    monkeypatch.setattr(customization_checker, "_run_parser_batch", parse)
+
+    data = load_and_validate_manifest(manifest, repo, check_git=False)
+
+    assert [entry["id"] for entry in data["upstream_changes"]] == [
+        "first",
+        "second",
+    ]
+    assert len(calls) == 1
+    assert [request.request_id for request in calls[0]] == [
+        f"{revision}:guide.md",
+        f"{revision}:shared.js",
+    ]
+    assert [request.symbols for request in calls[0]] == [
+        ("FirstToken", "MarkdownToken"),
+        ("FirstToken", "MarkdownToken", "SecondToken"),
+    ]
+
+
+def test_git_character_diff_bounds_repetitive_input_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A quadratic matcher would miss the five-second bound on repetitive input."""
+    repo = _repo(tmp_path)
+    source_path = repo / "repetitive.ts"
+    prefix = b"a " * 50_000
+    before = prefix + b"ExactToken\n"
+    after = prefix + b"ExactT0ken\n"
+    source_path.write_bytes(before)
+    _git(repo, "add", source_path.name)
+    _git(repo, "commit", "-m", "add repetitive parser fixture")
+    left = _git(repo, "rev-parse", "HEAD")
+    source_path.write_bytes(after)
+    _git(repo, "commit", "-am", "edit repetitive parser fixture")
+
+    started = time.monotonic()
+    old_ranges, new_ranges = customization_checker._git_changed_byte_ranges(
+        repo, left, "HEAD", source_path.name, before, after
+    )
+
+    assert time.monotonic() - started < 5
+    assert old_ranges == [(len(prefix) + 6, len(prefix) + 7)]
+    assert new_ranges == [(len(prefix) + 6, len(prefix) + 7)]
+
+
+def test_git_character_diff_rejects_malformed_hunk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trusting malformed porcelain offsets could suppress an owned overlap."""
+    monkeypatch.setattr(
+        customization_checker,
+        "_run_bounded_capture",
+        lambda *_args, **_kwargs: customization_checker._CompletedCapture(
+            returncode=0,
+            stdout=b"@@ -1 +1 @@\n-not-the-source\n+ExactToken\n~\n",
+            stderr=b"",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="malformed Git character diff"):
+        customization_checker._git_changed_byte_ranges(
+            tmp_path,
+            "a" * 40,
+            "b" * 40,
+            "owned.ts",
+            b"ExactToken\n",
+            b"ExactToken\n",
+        )
+
+
+def test_git_character_diff_uses_lf_only_for_source_line_boundaries(
+    tmp_path: Path,
+) -> None:
+    """Treating JavaScript whitespace as a line break corrupts Git hunk offsets."""
+    repo = _repo(tmp_path)
+    source_path = repo / "whitespace.ts"
+    before = b"const ExactToken = 1;\vconst other = 1;\r\n"
+    after = b"const ExactToken = 1;\vconst other = 2;\r\n"
+    source_path.write_bytes(before)
+    _git(repo, "add", source_path.name)
+    _git(repo, "commit", "-m", "add non-line JavaScript whitespace")
+    left = _git(repo, "rev-parse", "HEAD")
+    source_path.write_bytes(after)
+    _git(repo, "commit", "-am", "edit after non-line whitespace")
+    changed = before.index(b"1", before.index(b"other"))
+
+    old_ranges, new_ranges = customization_checker._git_changed_byte_ranges(
+        repo, left, "HEAD", source_path.name, before, after
+    )
+
+    assert old_ranges == [(changed, changed + 1)]
+    assert new_ranges == [(changed, changed + 1)]
+
+
+@pytest.mark.parametrize("failure", ["timeout", "output_limit"])
+def test_git_character_diff_propagates_bounded_capture_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """A bounded child failure must abort instead of returning empty ranges."""
+    def unavailable(*_args, **_kwargs):
+        raise customization_checker._BoundedCaptureFailure(failure)
+
+    monkeypatch.setattr(customization_checker, "_run_bounded_capture", unavailable)
+
+    with pytest.raises(ValueError, match=rf"Git character diff {failure}"):
+        customization_checker._git_changed_byte_ranges(
+            tmp_path,
+            "a" * 40,
+            "b" * 40,
+            "owned.ts",
+            b"ExactToken\n",
+            b"ExactToken\n",
+        )
+
+
+def test_non_python_parser_failure_cannot_fall_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restoring a lexical fallback would hide parser outages from both callers."""
+    repo, source_path, manifest = _non_python_manifest(
+        tmp_path, ".ts", "const ExactToken = true;\n"
+    )
+    left = _git(repo, "rev-parse", "HEAD")
+    entry = yaml.safe_load(manifest.read_text())["upstream_changes"][0]
+    source_path.write_text("const ExactToken = false;\n")
+    _git(repo, "commit", "-am", "edit parser fixture")
+
+    def unavailable(_requests):
+        raise ValueError("non-Python parser unavailable")
+
+    monkeypatch.setattr(customization_checker, "_run_parser_batch", unavailable)
+    with pytest.raises(ValueError, match="non-Python parser unavailable"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+    with pytest.raises(ValueError, match="non-Python parser unavailable"):
+        classify_upstream_overlap(entry, repo, f"{left}..HEAD")
+
+
 def test_any_owned_file_overlap_requires_explicit_decision(tmp_path: Path) -> None:
     """Removing the policy branch would let same-file security churn continue."""
     repo = _repo(tmp_path)
@@ -1255,7 +1671,7 @@ def _non_python_manifest(
     source_path = repo / f"owned{suffix}"
     source_path.write_text(source)
     _git(repo, "add", source_path.name)
-    _git(repo, "commit", "-m", f"add {suffix} scanner fixture")
+    _git(repo, "commit", "-m", f"add {suffix} semantic fixture")
     manifest = _manifest(repo, _git(repo, "rev-parse", "HEAD"))
     raw = yaml.safe_load(manifest.read_text())
     entry = raw["upstream_changes"][0]
@@ -1267,11 +1683,11 @@ def _non_python_manifest(
 
 
 def _assert_javascript_syntax(tmp_path: Path, source: str) -> None:
-    """Keep lexical-goal fixtures grammar-valid independently of the scanner."""
+    """Keep parser fixtures grammar-valid independently of symbol resolution."""
     node = shutil.which("node")
     if node is None:
-        pytest.skip("node is required to validate JavaScript scanner fixtures")
-    fixture = tmp_path / "scanner-syntax.mjs"
+        pytest.skip("node is required to validate JavaScript parser fixtures")
+    fixture = tmp_path / "parser-syntax.mjs"
     fixture.write_text(source, encoding="utf-8")
     checked = subprocess.run(
         [node, "--check", str(fixture)],
@@ -1283,12 +1699,12 @@ def _assert_javascript_syntax(tmp_path: Path, source: str) -> None:
 
 
 def _assert_typescript_syntax(tmp_path: Path, source: str) -> None:
-    """Validate the one TypeScript-only lexical-goal fixture with tsc."""
+    """Validate the TypeScript-only parser fixture with tsc."""
     node = shutil.which("node")
     tsc = Path(__file__).parents[2] / "node_modules/typescript/bin/tsc"
     if node is None or not tsc.is_file():
         pytest.skip("node and repository TypeScript are required for this fixture")
-    fixture = tmp_path / "scanner-syntax.ts"
+    fixture = tmp_path / "parser-syntax.ts"
     fixture.write_text(source, encoding="utf-8")
     checked = subprocess.run(
         [node, str(tsc), "--noEmit", "--skipLibCheck", "--target", "ES2022", str(fixture)],
@@ -1772,14 +2188,14 @@ def test_typescript_nested_for_headers_use_the_innermost_context(
         ),
     ],
 )
-def test_typescript_malformed_for_header_context_stays_bounded(
+def test_typescript_malformed_syntax_fails_closed(
     tmp_path: Path,
     source: str,
 ) -> None:
-    """Unclosed groups do not leak comment ownership or raise scanner errors."""
+    """Malformed TypeScript cannot downgrade into best-effort token matching."""
     repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
 
-    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+    with pytest.raises(ValueError, match="non-Python parser process_failure"):
         load_and_validate_manifest(manifest, repo, check_git=False)
 
 
@@ -2728,6 +3144,73 @@ def test_strict_cli_validates_owned_symbols_at_requested_base_ref(
         ["--manifest", str(manifest), "--strict", "--base-ref", "HEAD"]
     ) == 1
     assert "does not exist in declared files" in capsys.readouterr().err
+
+
+def test_cli_report_publication_is_atomic_and_preserves_acknowledgements(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parser failure cannot truncate the prior report; success replaces it."""
+    repo, source_path, manifest = _non_python_manifest(
+        tmp_path, ".ts", 'const ExactToken = "ExactToken";\n'
+    )
+    left = _git(repo, "rev-parse", "HEAD")
+    source_path.write_text('const ExactToken = "ExactT0ken";\n')
+    _git(repo, "commit", "-am", "edit owned parser token")
+    report_path = repo / "overlap-report.json"
+    prior = {
+        "schema_version": 1,
+        "range": "prior",
+        "overlaps": [{"id": "owned", "acknowledged": True}],
+    }
+    prior_bytes = (json.dumps(prior, indent=2) + "\n").encode("utf-8")
+    report_path.write_bytes(prior_bytes)
+    report_path.chmod(0o644)
+
+    def exact_results(
+        requests: list[customization_checker._ParserRequest],
+    ) -> dict[str, dict[str, list[tuple[int, int]]]]:
+        results: dict[str, dict[str, list[tuple[int, int]]]] = {}
+        for request in requests:
+            symbol_results: dict[str, list[tuple[int, int]]] = {}
+            for symbol in request.symbols:
+                token = symbol.encode("utf-8")
+                symbol_results[symbol] = [
+                    (start, start + len(token))
+                    for start in range(len(request.source))
+                    if request.source.startswith(token, start)
+                ]
+            results[request.request_id] = symbol_results
+        return results
+
+    calls = 0
+
+    def fail_classification(requests):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ValueError("non-Python parser unavailable")
+        return exact_results(requests)
+
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(customization_checker, "_run_parser_batch", fail_classification)
+    args = [
+        "--manifest",
+        str(manifest),
+        "--upstream-diff",
+        f"{left}..HEAD",
+        "--report",
+        str(report_path),
+    ]
+
+    assert customization_checker.main(args) == 1
+    assert report_path.read_bytes() == prior_bytes
+
+    monkeypatch.setattr(customization_checker, "_run_parser_batch", exact_results)
+    assert customization_checker.main(args) == 2
+    published = json.loads(report_path.read_text())
+    assert published["overlaps"][0]["acknowledged"] is True
+    assert report_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_strict_requested_revision_uses_its_committed_path_inventory(

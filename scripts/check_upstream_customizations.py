@@ -18,6 +18,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -236,7 +237,7 @@ def _run_bounded_capture(
     argv: Sequence[str],
     *,
     cwd: Path,
-    input_bytes: bytes | None,
+    input_bytes: bytes | None = None,
     timeout_seconds: float,
     output_limit_bytes: int,
 ) -> _CompletedCapture:
@@ -837,6 +838,34 @@ def _blob_text(repo: Path, revision: str, path: str) -> str:
     return source.decode("utf-8", errors="strict")
 
 
+def _collect_manifest_parser_requests(
+    entries: Sequence[dict[str, Any]], repo: Path, revision: str
+) -> list[_ParserRequest]:
+    symbols_by_path: dict[str, set[str]] = {}
+    for entry in entries:
+        for path in entry["files"]:
+            if _parser_language(path) is not None:
+                symbols_by_path.setdefault(path, set()).update(
+                    _strict_owned_symbols(entry)
+                )
+    requests: list[_ParserRequest] = []
+    for path in sorted(symbols_by_path):
+        blob_oid, source = _blob_bytes(repo, revision, path)
+        language = _parser_language(path)
+        assert language is not None
+        requests.append(
+            _ParserRequest(
+                request_id=f"{revision}:{path}",
+                path=path,
+                language=language,
+                blob_oid=blob_oid,
+                source=source,
+                symbols=tuple(sorted(symbols_by_path[path])),
+            )
+        )
+    return requests
+
+
 def _is_shallow_clone(repo: Path) -> bool:
     """True when this clone lacks the history the commit assertions need.
 
@@ -1077,19 +1106,6 @@ def load_and_validate_manifest(
                 f"{entry_id}.owned_symbols must contain exact machine-locatable "
                 f"identifiers; move prose to owned_invariants: {phrase!r}"
             )
-        for symbol in strict_symbols:
-            if not any(
-                _source_contains_symbol(
-                    revision_source(raw),
-                    symbol,
-                    path=raw,
-                )
-                for raw in entry["files"]
-            ):
-                raise ValueError(
-                    f"{entry_id} owned symbol {symbol!r} does not exist in "
-                    "declared files at source revision"
-                )
         for field in ("expected_commit_subject", "merge_guidance", "removal_condition"):
             if not isinstance(entry.get(field), str) or not entry[field].strip():
                 raise ValueError(f"{entry_id}.{field} must be non-empty")
@@ -1104,6 +1120,33 @@ def load_and_validate_manifest(
             if not _is_ancestor(repo, baseline, resolved_source_revision):
                 raise ValueError(
                     f"{entry_id} baseline is not an ancestor of source revision"
+                )
+
+    parser_requests = _collect_manifest_parser_requests(
+        entries, repo, resolved_source_revision
+    )
+    parser_results = _NonPythonSymbolResolver().spans(parser_requests)
+    parser_spans = {
+        request.path: parser_results[request.request_id]
+        for request in parser_requests
+    }
+    for entry in entries:
+        entry_id = entry["id"]
+        for symbol in _strict_owned_symbols(entry):
+            found = False
+            for raw in entry["files"]:
+                if _parser_language(raw) is not None:
+                    found = bool(parser_spans[raw][symbol])
+                else:
+                    found = _source_contains_symbol(
+                        revision_source(raw), symbol, path=raw
+                    )
+                if found:
+                    break
+            if not found:
+                raise ValueError(
+                    f"{entry_id} owned symbol {symbol!r} does not exist in "
+                    "declared files at source revision"
                 )
     return data
 
@@ -1501,465 +1544,6 @@ def _shell_without_comments(source: str) -> str:
     return "".join(result)
 
 
-def _typescript_without_comments(source: str) -> str:
-    """Remove JS/TS comments, including comments inside template expressions."""
-    result = list(source)
-    regex_prefix_keywords = frozenset(
-        {
-            "await",
-            "case",
-            "delete",
-            "in",
-            "instanceof",
-            "new",
-            "return",
-            "throw",
-            "typeof",
-            "void",
-            "yield",
-        }
-    )
-    control_header_keywords = frozenset(
-        {"catch", "for", "if", "switch", "while", "with"}
-    )
-    statement_prefix_keywords = frozenset({"do", "else"})
-    # Stack entries are mode, template-expression brace depth, regex eligibility,
-    # and whether the next identifier is a property name.  Property names may be
-    # keywords, but they still end an expression and therefore cannot put a
-    # following slash into the regular-expression lexical goal.
-    stack: list[tuple[str, int, bool, bool]] = [("code", 0, True, False)]
-    control_header_pending: str | None = None
-    control_parentheses: list[bool] = []
-    # A for-of delimiter is contextual: ``of`` remains an identifier everywhere
-    # except immediately after a completed left-hand side in its own for header.
-    # Header entries retain their control-parenthesis and delimiter-stack
-    # baselines.  The latter isolates nested grouping and bodies without trying
-    # to parse JavaScript: only a token at a header's own lexical top level may
-    # advance its phase.
-    for_headers: list[tuple[int, int, str]] = []
-    header_delimiters: list[str] = []
-    expression_braces: list[bool] = []
-    block_brace_pending = True
-    # These are deliberately lexical, bounded states rather than a partial
-    # JavaScript parser.  They cover the two grammar boundaries that affect a
-    # slash token here: restricted statements can end by ASI, and an identifier
-    # at the start of a statement can introduce a labeled block.
-    statement_start = True
-    label_candidate = False
-    restricted_statement: str | None = None
-
-    def active_for_header() -> int | None:
-        if not for_headers:
-            return None
-        header_parenthesis_depth, header_delimiter_depth, _state = for_headers[-1]
-        if (
-            header_parenthesis_depth == len(control_parentheses)
-            and header_delimiter_depth == len(header_delimiters)
-        ):
-            return len(for_headers) - 1
-        return None
-
-    def set_for_header_state(header_index: int, state: str) -> None:
-        header_parenthesis_depth, header_delimiter_depth, _previous = for_headers[
-            header_index
-        ]
-        for_headers[header_index] = (
-            header_parenthesis_depth,
-            header_delimiter_depth,
-            state,
-        )
-
-    def complete_closed_lhs_group() -> None:
-        header_index = active_for_header()
-        if header_index is None:
-            return
-        if for_headers[header_index][2] in {"lhs_start", "binding"}:
-            set_for_header_state(header_index, "lhs_complete")
-            mode, depth, _regex_allowed, _property_name_pending = stack[-1]
-            stack[-1] = (mode, depth, False, False)
-
-    def close_header_delimiter(kind: str) -> bool:
-        if not header_delimiters or header_delimiters[-1] != kind:
-            return False
-        header_delimiters.pop()
-        return True
-
-    index = 0
-    while index < len(source):
-        mode, depth, regex_allowed, property_name_pending = stack[-1]
-        char = source[index]
-        following = source[index + 1] if index + 1 < len(source) else ""
-        if mode in {"single", "double"}:
-            closer = "'" if mode == "single" else '"'
-            if char == "\\":
-                index += min(2, len(source) - index)
-            else:
-                if char == closer:
-                    stack.pop()
-                index += 1
-            continue
-        if mode == "template":
-            if char == "\\":
-                index += min(2, len(source) - index)
-            elif source.startswith("${", index):
-                stack.append(("expression", 1, True, False))
-                header_delimiters.append("${")
-                index += 2
-            elif char == "`":
-                stack.pop()
-                block_brace_pending = False
-                index += 1
-            else:
-                index += 1
-            continue
-        if char == "/" and following == "/":
-            end = source.find("\n", index)
-            end = len(source) if end < 0 else end
-            _blank(result, source, index, end)
-            if restricted_statement is not None:
-                restricted_statement = None
-                statement_start = True
-                label_candidate = False
-                stack[-1] = (mode, depth, True, False)
-            index = end
-            continue
-        if char == "/" and following == "*":
-            end = source.find("*/", index + 2)
-            end = len(source) if end < 0 else end + 2
-            _blank(result, source, index, end)
-            if restricted_statement is not None and any(
-                delimiter in source[index:end] for delimiter in ("\r", "\n")
-            ):
-                restricted_statement = None
-                statement_start = True
-                label_candidate = False
-                stack[-1] = (mode, depth, True, False)
-            index = end
-            continue
-        if char == "/" and regex_allowed:
-            cursor = index + 1
-            in_class = False
-            closed = False
-            while cursor < len(source):
-                current = source[cursor]
-                if current == "\\":
-                    cursor += min(2, len(source) - cursor)
-                elif current == "[":
-                    in_class = True
-                    cursor += 1
-                elif current == "]" and in_class:
-                    in_class = False
-                    cursor += 1
-                elif current == "/" and not in_class:
-                    cursor += 1
-                    while cursor < len(source) and source[cursor].isalpha():
-                        cursor += 1
-                    closed = True
-                    break
-                elif current in "\r\n":
-                    break
-                else:
-                    cursor += 1
-            if closed:
-                stack[-1] = (mode, depth, False, False)
-                block_brace_pending = False
-                statement_start = False
-                label_candidate = False
-                restricted_statement = None
-                index = cursor
-                continue
-        if char in {"'", '"'}:
-            stack[-1] = (mode, depth, False, False)
-            control_header_pending = None
-            block_brace_pending = False
-            statement_start = False
-            label_candidate = False
-            restricted_statement = None
-            stack.append(("single" if char == "'" else "double", 0, False, False))
-            index += 1
-        elif char == "`":
-            stack[-1] = (mode, depth, False, False)
-            control_header_pending = None
-            block_brace_pending = False
-            statement_start = False
-            label_candidate = False
-            restricted_statement = None
-            stack.append(("template", 0, False, False))
-            index += 1
-        elif char == "(":
-            opens_for_header = control_header_pending == "for"
-            control_parentheses.append(control_header_pending is not None)
-            header_delimiters.append("(")
-            if opens_for_header:
-                for_headers.append(
-                    (
-                        len(control_parentheses),
-                        len(header_delimiters),
-                        "lhs_start",
-                    )
-                )
-            control_header_pending = None
-            block_brace_pending = False
-            statement_start = False
-            label_candidate = False
-            restricted_statement = None
-            stack[-1] = (mode, depth, True, False)
-            index += 1
-        elif char == ")":
-            closes_for_header = (
-                bool(for_headers)
-                and for_headers[-1][0] == len(control_parentheses)
-                and for_headers[-1][1] == len(header_delimiters)
-                and bool(header_delimiters)
-                and header_delimiters[-1] == "("
-            )
-            closes_control_header = (
-                control_parentheses.pop() if control_parentheses else False
-            )
-            if closes_for_header:
-                for_headers.pop()
-            closed_group = close_header_delimiter("(")
-            if closed_group and not closes_for_header:
-                complete_closed_lhs_group()
-            control_header_pending = None
-            stack[-1] = (mode, depth, closes_control_header, False)
-            block_brace_pending = closes_control_header
-            statement_start = False
-            label_candidate = False
-            restricted_statement = None
-            index += 1
-        elif char == "{":
-            control_header_pending = None
-            opens_expression = regex_allowed and not block_brace_pending
-            expression_braces.append(opens_expression)
-            header_delimiters.append("{")
-            block_brace_pending = False
-            statement_start = not opens_expression
-            label_candidate = False
-            restricted_statement = None
-            stack[-1] = (
-                mode,
-                depth + 1 if mode == "expression" else depth,
-                True,
-                False,
-            )
-            index += 1
-        elif char == "}":
-            control_header_pending = None
-            if mode == "expression" and depth == 1:
-                stack.pop()
-                closed_group = close_header_delimiter("${")
-                block_brace_pending = False
-                statement_start = False
-            else:
-                closes_expression = expression_braces.pop() if expression_braces else False
-                closed_group = close_header_delimiter("{")
-                stack[-1] = (
-                    mode,
-                    depth - 1 if mode == "expression" else depth,
-                    not closes_expression,
-                    False,
-                )
-                block_brace_pending = not closes_expression
-                statement_start = not closes_expression
-            if closed_group:
-                complete_closed_lhs_group()
-            label_candidate = False
-            restricted_statement = None
-            index += 1
-        elif char == "[":
-            control_header_pending = None
-            header_delimiters.append("[")
-            block_brace_pending = False
-            statement_start = False
-            label_candidate = False
-            restricted_statement = None
-            stack[-1] = (mode, depth, True, False)
-            index += 1
-        elif char == "]":
-            control_header_pending = None
-            closed_group = close_header_delimiter("[")
-            if closed_group:
-                complete_closed_lhs_group()
-            block_brace_pending = False
-            statement_start = False
-            label_candidate = False
-            restricted_statement = None
-            stack[-1] = (mode, depth, False, False)
-            index += 1
-        elif char.isspace():
-            if char in "\r\n" and restricted_statement is not None:
-                restricted_statement = None
-                statement_start = True
-                label_candidate = False
-                stack[-1] = (mode, depth, True, False)
-            index += 1
-        elif source.startswith(("++", "--"), index):
-            # Prefix update retains expression-start eligibility; postfix update
-            # retains expression-end eligibility.  Looking at the prior lexical
-            # goal distinguishes the two without parsing an AST.
-            control_header_pending = None
-            stack[-1] = (mode, depth, regex_allowed, False)
-            block_brace_pending = False
-            statement_start = False
-            label_candidate = False
-            restricted_statement = None
-            index += 2
-        elif source.startswith("=>", index):
-            control_header_pending = None
-            stack[-1] = (mode, depth, True, False)
-            block_brace_pending = True
-            statement_start = True
-            label_candidate = False
-            restricted_statement = None
-            index += 2
-        elif source.startswith("?.", index):
-            control_header_pending = None
-            stack[-1] = (mode, depth, False, True)
-            block_brace_pending = False
-            statement_start = False
-            label_candidate = False
-            restricted_statement = None
-            index += 2
-        elif char == ".":
-            control_header_pending = None
-            stack[-1] = (mode, depth, False, True)
-            block_brace_pending = False
-            statement_start = False
-            label_candidate = False
-            restricted_statement = None
-            index += 1
-        elif source.startswith(("!==", "!="), index):
-            control_header_pending = None
-            block_brace_pending = False
-            statement_start = False
-            label_candidate = False
-            restricted_statement = None
-            stack[-1] = (mode, depth, True, False)
-            index += 3 if source.startswith("!==", index) else 2
-        elif char == "!":
-            # ``!`` is unary at an expression start, but TypeScript's postfix
-            # non-null assertion after an expression must retain the division
-            # lexical goal for a following slash.
-            control_header_pending = None
-            block_brace_pending = False
-            statement_start = False
-            label_candidate = False
-            restricted_statement = None
-            stack[-1] = (mode, depth, regex_allowed, False)
-            index += 1
-        elif char.isalnum() or char in "_$":
-            cursor = index + 1
-            while cursor < len(source) and (
-                source[cursor].isalnum() or source[cursor] in "_$"
-            ):
-                cursor += 1
-            token = source[index:cursor]
-            token_at_statement_start = statement_start
-            header_index = active_for_header()
-            if property_name_pending:
-                control_header_pending = None
-                regex_allowed = False
-                statement_start = False
-                label_candidate = False
-                restricted_statement = None
-            elif restricted_statement == "jump_label_allowed":
-                # A break/continue label is permitted only before a line
-                # terminator.  Consuming it does not finish the restricted
-                # statement: ASI or an explicit semicolon still owns the next
-                # lexical-goal transition.
-                control_header_pending = None
-                regex_allowed = False
-                statement_start = False
-                label_candidate = False
-                restricted_statement = "jump_label_consumed"
-            elif (
-                token in {"in", "of"}
-                and header_index is not None
-                and for_headers[header_index][2] == "lhs_complete"
-                and not regex_allowed
-            ):
-                # ``in`` and ``of`` start a regex-eligible RHS only as the
-                # delimiters of this header.  Elsewhere they are IdentifierName
-                # tokens (or the ordinary ``in`` operator).
-                set_for_header_state(header_index, "rhs")
-                control_header_pending = None
-                regex_allowed = True
-                statement_start = False
-                label_candidate = False
-                restricted_statement = None
-            elif token in {"break", "continue"}:
-                control_header_pending = None
-                regex_allowed = False
-                statement_start = False
-                label_candidate = False
-                restricted_statement = "jump_label_allowed"
-            elif token == "debugger":
-                control_header_pending = None
-                regex_allowed = False
-                statement_start = False
-                label_candidate = False
-                restricted_statement = "statement_complete"
-            elif token in control_header_keywords:
-                control_header_pending = "for" if token == "for" else "control"
-                regex_allowed = False
-                statement_start = False
-                label_candidate = False
-                restricted_statement = None
-            elif control_header_pending == "for" and token == "await":
-                # ``for await (...)`` retains the pending control header.
-                regex_allowed = False
-                statement_start = False
-                label_candidate = False
-                restricted_statement = None
-            else:
-                control_header_pending = None
-                regex_allowed = token in regex_prefix_keywords
-                if token in statement_prefix_keywords:
-                    regex_allowed = True
-                    statement_start = True
-                    label_candidate = False
-                else:
-                    statement_start = False
-                    label_candidate = (
-                        token_at_statement_start and not regex_allowed
-                    )
-                restricted_statement = None
-                if header_index is not None:
-                    header_state = for_headers[header_index][2]
-                    if header_state == "lhs_start" and token in {"let", "const", "var"}:
-                        set_for_header_state(header_index, "binding")
-                    elif header_state in {"lhs_start", "binding"}:
-                        set_for_header_state(header_index, "lhs_complete")
-            block_brace_pending = token in statement_prefix_keywords
-            stack[-1] = (mode, depth, regex_allowed, False)
-            index = cursor
-        else:
-            control_header_pending = None
-            header_index = active_for_header()
-            if header_index is not None:
-                if char == ";":
-                    set_for_header_state(header_index, "classic")
-            if char == ":" and label_candidate:
-                regex_allowed = True
-                block_brace_pending = True
-                statement_start = True
-            else:
-                regex_allowed = char not in ").]" and char != "."
-                block_brace_pending = char == ";"
-                statement_start = char == ";"
-            label_candidate = False
-            restricted_statement = None
-            stack[-1] = (
-                mode,
-                depth,
-                regex_allowed,
-                False,
-            )
-            index += 1
-    return "".join(result)
-
-
 def _css_without_comments(source: str) -> str:
     result = list(source)
     index = 0
@@ -1983,241 +1567,6 @@ def _css_without_comments(source: str) -> str:
             index = end
         else:
             index += 1
-    return "".join(result)
-
-
-_MARKDOWN_MAX_CONTAINERS = 16
-_MARKDOWN_TAB_WIDTH = 4
-
-
-def _markdown_advance_column(column: int, char: str) -> int:
-    if char == "\t":
-        return column + (_MARKDOWN_TAB_WIDTH - column % _MARKDOWN_TAB_WIDTH)
-    return column + 1
-
-
-def _markdown_bounded_indent(
-    line: str,
-    cursor: int,
-    column: int,
-    limit: int,
-) -> tuple[int, int]:
-    """Consume leading whitespace only while its visual width stays bounded."""
-    start_column = column
-    while cursor < len(line) and line[cursor] in " \t":
-        next_column = _markdown_advance_column(column, line[cursor])
-        if next_column - start_column > limit:
-            break
-        cursor += 1
-        column = next_column
-    return cursor, column
-
-
-def _markdown_blockquote_at(
-    line: str,
-    cursor: int,
-    column: int,
-) -> tuple[int, int] | None:
-    indented_cursor, indented_column = _markdown_bounded_indent(
-        line, cursor, column, 3
-    )
-    if indented_cursor >= len(line) or line[indented_cursor] != ">":
-        return None
-    cursor = indented_cursor + 1
-    column = indented_column + 1
-    if cursor < len(line) and line[cursor] in " \t":
-        column = _markdown_advance_column(column, line[cursor])
-        cursor += 1
-    return cursor, column
-
-
-def _markdown_list_item_at(
-    line: str,
-    cursor: int,
-    column: int,
-) -> tuple[int, int, int] | None:
-    """Parse one CommonMark list marker and return its relative content indent."""
-    container_column = column
-    cursor, column = _markdown_bounded_indent(line, cursor, column, 3)
-    marker_start = cursor
-    if cursor < len(line) and line[cursor] in "-+*":
-        cursor += 1
-    elif cursor < len(line) and line[cursor].isdigit():
-        while cursor < len(line) and line[cursor].isdigit() and cursor - marker_start < 9:
-            cursor += 1
-        if cursor == marker_start or cursor >= len(line) or line[cursor] not in ".)":
-            return None
-        cursor += 1
-    else:
-        return None
-    marker_column = column + (cursor - marker_start)
-    if cursor < len(line) and line[cursor] not in " \t":
-        return None
-    if cursor == len(line):
-        return cursor, marker_column, marker_column + 1 - container_column
-
-    whitespace_start = cursor
-    whitespace_column = marker_column
-    while cursor < len(line) and line[cursor] in " \t":
-        whitespace_column = _markdown_advance_column(whitespace_column, line[cursor])
-        cursor += 1
-    padding = whitespace_column - marker_column
-    if cursor < len(line) and 1 <= padding <= 4:
-        return cursor, whitespace_column, whitespace_column - container_column
-
-    # Five or more columns after a marker use one column of list padding; the
-    # remainder belongs to the block itself.  A tab cannot land here unless its
-    # visual expansion exceeded four columns, which a four-column stop cannot.
-    cursor = whitespace_start + 1
-    content_column = _markdown_advance_column(marker_column, line[whitespace_start])
-    return cursor, content_column, marker_column + 1 - container_column
-
-
-def _markdown_normalize_leading_indent(line: str, column: int) -> str:
-    """Detab the leading prefix so fence indentation is measured in columns."""
-    cursor = 0
-    start_column = column
-    while cursor < len(line) and line[cursor] in " \t":
-        column = _markdown_advance_column(column, line[cursor])
-        cursor += 1
-    return " " * (column - start_column) + line[cursor:]
-
-
-def _markdown_opening_container_content(
-    line: str,
-) -> tuple[str, tuple[tuple[str, int], ...]]:
-    """Return fence content plus the bounded prefix needed by continuations."""
-    cursor = 0
-    column = 0
-    containers: list[tuple[str, int]] = []
-    while cursor < len(line) and len(containers) < _MARKDOWN_MAX_CONTAINERS:
-        blockquote = _markdown_blockquote_at(line, cursor, column)
-        if blockquote is not None:
-            containers.append(("blockquote", 0))
-            cursor, column = blockquote
-            continue
-        list_item = _markdown_list_item_at(line, cursor, column)
-        if list_item is not None:
-            cursor, column, indent = list_item
-            containers.append(("list", indent))
-            continue
-        break
-    return _markdown_normalize_leading_indent(line[cursor:], column), tuple(containers)
-
-
-def _markdown_consume_list_indent(
-    line: str,
-    cursor: int,
-    column: int,
-    required: int,
-) -> tuple[int, int, int] | None:
-    start_column = column
-    while cursor < len(line) and line[cursor] in " \t":
-        column = _markdown_advance_column(column, line[cursor])
-        cursor += 1
-        if column - start_column >= required:
-            return cursor, column, column - start_column - required
-    return None
-
-
-def _markdown_continuation_content(
-    line: str,
-    containers: tuple[tuple[str, int], ...],
-) -> str | None:
-    """Strip one opening container stack from a continuation without guessing."""
-    cursor = 0
-    column = 0
-    virtual_indent = 0
-    container_index = 0
-    while container_index < len(containers):
-        kind, width = containers[container_index]
-        if kind == "blockquote":
-            blockquote = _markdown_blockquote_at(line, cursor, column)
-            if blockquote is None:
-                return None
-            cursor, column = blockquote
-            virtual_indent = 0
-            container_index += 1
-            continue
-        required = 0
-        while container_index < len(containers) and containers[container_index][0] == "list":
-            required += containers[container_index][1]
-            container_index += 1
-        consumed = _markdown_consume_list_indent(
-            line, cursor, column, required
-        )
-        if consumed is None:
-            # CommonMark list items admit blank fence content without the
-            # ordinary continuation indent.  That blank does not stand in for
-            # a later blockquote marker, though: keep walking the container
-            # stack so every quote continuation is proved independently.
-            if line[cursor:].strip():
-                return None
-            virtual_indent = 0
-            continue
-        cursor, column, virtual_indent = consumed
-    return " " * virtual_indent + _markdown_normalize_leading_indent(
-        line[cursor:], column
-    )
-
-
-def _markdown_without_comments(source: str) -> str:
-    result = list(source)
-    fence: tuple[str, int, tuple[tuple[str, int], ...]] | None = None
-    inline_ticks = 0
-    html_comment_end = 0
-    offset = 0
-    for line in source.splitlines(keepends=True):
-        body = line.rstrip("\r\n")
-        if fence is not None:
-            marker, width, containers = fence
-            continuation = _markdown_continuation_content(body, containers)
-            if continuation is not None:
-                if re.fullmatch(
-                    rf" {{0,3}}{re.escape(marker)}{{{width},}}[ \t]*",
-                    continuation,
-                ):
-                    fence = None
-                offset += len(line)
-                continue
-            # The opening list/blockquote container ended.  Its child fence
-            # cannot hide this line, so close it implicitly and process the
-            # same line again at the outer Markdown level.
-            fence = None
-        container_content, containers = _markdown_opening_container_content(body)
-        fence_match = (
-            None
-            if html_comment_end > offset
-            else re.match(r" {0,3}(`{3,}|~{3,})(.*)$", container_content)
-        )
-        if fence_match:
-            run = fence_match.group(1)
-            if run[0] == "~" or "`" not in fence_match.group(2):
-                fence = (run[0], len(run), containers)
-                offset += len(line)
-                continue
-        index = min(len(body), max(0, html_comment_end - offset))
-        while index < len(body):
-            if body[index] == "`":
-                end = index
-                while end < len(body) and body[end] == "`":
-                    end += 1
-                count = end - index
-                if inline_ticks == 0:
-                    inline_ticks = count
-                elif count == inline_ticks:
-                    inline_ticks = 0
-                index = end
-            elif inline_ticks == 0 and body.startswith("<!--", index):
-                absolute = offset + index
-                end = source.find("-->", absolute + 4)
-                end = len(source) if end < 0 else end + 3
-                _blank(result, source, absolute, end)
-                html_comment_end = end
-                index = len(body)
-            else:
-                index += 1
-        offset += len(line)
     return "".join(result)
 
 
@@ -2528,12 +1877,8 @@ def _searchable_non_python(source: str, suffix: str) -> str:
         return _powershell_without_comments(source)
     if suffix in {".sh", ".bash"}:
         return _shell_without_comments(source)
-    if suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
-        return _typescript_without_comments(source)
     if suffix in {".css", ".scss", ".less"}:
         return _css_without_comments(source)
-    if suffix in {".md", ".markdown"}:
-        return _markdown_without_comments(source)
     return source
 
 
@@ -2555,6 +1900,8 @@ def _symbol_spans(
     spans = {symbol: [] for symbol in symbols}
     _validate_scannable_source(source, path)
     suffix = Path(path).suffix.lower()
+    if _parser_language(path) is not None:
+        raise ValueError("non-Python parser resolution is required")
     if suffix == ".py":
         try:
             tree = ast.parse(source)
@@ -2645,6 +1992,170 @@ def _changed_character_ranges(
     return old_ranges, new_ranges
 
 
+_WORD_DIFF_HUNK = re.compile(
+    rb"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
+)
+
+
+def _byte_line_boundaries(source: bytes) -> list[int]:
+    boundaries = [0]
+    for line in source.splitlines(keepends=True):
+        boundaries.append(boundaries[-1] + len(line))
+    return boundaries
+
+
+def _hunk_byte_bounds(
+    source: bytes, line_start: int, line_count: int
+) -> tuple[int, int]:
+    boundaries = _byte_line_boundaries(source)
+    line_total = len(boundaries) - 1
+    if line_count == 0:
+        if not 0 <= line_start <= line_total:
+            raise ValueError("malformed Git character diff")
+        offset = boundaries[line_start]
+        return offset, offset
+    if line_start < 1:
+        raise ValueError("malformed Git character diff")
+    first = line_start - 1
+    after = first + line_count
+    if first >= line_total or after > line_total:
+        raise ValueError("malformed Git character diff")
+    return boundaries[first], boundaries[after]
+
+
+def _coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[list[int]] = []
+    for start, end in sorted(ranges):
+        if start >= end:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def _git_changed_byte_ranges(
+    repo: Path,
+    left: str,
+    right: str,
+    path: str,
+    old_source: bytes,
+    new_source: bytes,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Return exact changed byte ranges from Git's bounded porcelain protocol."""
+    _validated_parser_source(old_source)
+    _validated_parser_source(new_source)
+    argv = [
+        "git",
+        "diff",
+        "--no-ext-diff",
+        "--no-color",
+        "--text",
+        "--unified=0",
+        "--word-diff=porcelain",
+        "--word-diff-regex=[[:space:]]|[^[:space:]]",
+        f"{left}..{right}",
+        "--",
+        path,
+    ]
+    try:
+        diff = _run_bounded_capture(
+            argv,
+            cwd=repo,
+            timeout_seconds=60,
+            output_limit_bytes=64 * 1024 * 1024,
+        )
+    except _BoundedCaptureFailure as exc:
+        raise ValueError(f"Git character diff {exc.code}") from exc
+    if diff.returncode != 0:
+        raise ValueError("Git character diff process failure")
+
+    old_ranges: list[tuple[int, int]] = []
+    new_ranges: list[tuple[int, int]] = []
+    old_cursor = new_cursor = 0
+    old_end = new_end = 0
+    in_hunk = False
+    newline_sides: set[str] = set()
+
+    def finish_hunk() -> None:
+        if in_hunk and (old_cursor != old_end or new_cursor != new_end):
+            raise ValueError("malformed Git character diff")
+
+    records = diff.stdout.split(b"\n")
+    if records and records[-1] == b"":
+        records.pop()
+    for record in records:
+        match = _WORD_DIFF_HUNK.fullmatch(record)
+        if match:
+            finish_hunk()
+            old_start = int(match.group(1))
+            old_count = int(match.group(2) or b"1")
+            new_start = int(match.group(3))
+            new_count = int(match.group(4) or b"1")
+            old_cursor, old_end = _hunk_byte_bounds(
+                old_source, old_start, old_count
+            )
+            new_cursor, new_end = _hunk_byte_bounds(
+                new_source, new_start, new_count
+            )
+            in_hunk = True
+            newline_sides.clear()
+            continue
+        if not in_hunk:
+            continue
+        if record == b"~":
+            if not newline_sides:
+                raise ValueError("malformed Git character diff")
+            advanced: set[str] = set()
+            if (
+                "old" in newline_sides
+                and old_cursor < old_end
+                and old_source[old_cursor:old_cursor + 1] == b"\n"
+            ):
+                advanced.add("old")
+            if (
+                "new" in newline_sides
+                and new_cursor < new_end
+                and new_source[new_cursor:new_cursor + 1] == b"\n"
+            ):
+                advanced.add("new")
+            if not advanced:
+                raise ValueError("malformed Git character diff")
+            if "old" in advanced:
+                old_cursor += 1
+            if "new" in advanced:
+                new_cursor += 1
+            if advanced == {"old"}:
+                old_ranges.append((old_cursor - 1, old_cursor))
+            elif advanced == {"new"}:
+                new_ranges.append((new_cursor - 1, new_cursor))
+            newline_sides.clear()
+            continue
+        marker = record[:1]
+        if marker not in {b" ", b"-", b"+"}:
+            raise ValueError("malformed Git character diff")
+        payload = record[1:]
+        if marker in {b" ", b"-"}:
+            newline_sides.add("old")
+            end = old_cursor + len(payload)
+            if end > old_end or old_source[old_cursor:end] != payload:
+                raise ValueError("malformed Git character diff")
+            if marker == b"-":
+                old_ranges.append((old_cursor, end))
+            old_cursor = end
+        if marker in {b" ", b"+"}:
+            newline_sides.add("new")
+            end = new_cursor + len(payload)
+            if end > new_end or new_source[new_cursor:end] != payload:
+                raise ValueError("malformed Git character diff")
+            if marker == b"+":
+                new_ranges.append((new_cursor, end))
+            new_cursor = end
+    finish_hunk()
+    return _coalesce_ranges(old_ranges), _coalesce_ranges(new_ranges)
+
+
 def _ranges_overlap(
     spans: list[tuple[int, int]],
     changed_ranges: list[tuple[int, int]],
@@ -2656,12 +2167,71 @@ def _ranges_overlap(
     )
 
 
+def _blob_bytes_or_empty(repo: Path, revision: str, path: str) -> tuple[str, bytes]:
+    if not _existed_at(repo, revision, path):
+        return f"absent:{revision}:{path}", b""
+    return _blob_bytes(repo, revision, path)
+
+
+def _collect_overlap_parser_requests(
+    entries: Sequence[dict[str, Any]],
+    repo: Path,
+    left: str,
+    right: str,
+    changed_paths: set[str],
+) -> tuple[list[_ParserRequest], dict[tuple[str, str], bytes]]:
+    symbols = tuple(sorted({
+        symbol
+        for entry in entries
+        for symbol in _strict_owned_symbols(entry)
+    }))
+    requests: list[_ParserRequest] = []
+    sources: dict[tuple[str, str], bytes] = {}
+    for path in sorted(changed_paths):
+        language = _parser_language(path)
+        if language is None:
+            continue
+        for revision in (left, right):
+            blob_oid, source = _blob_bytes_or_empty(repo, revision, path)
+            sources[(revision, path)] = source
+            requests.append(
+                _ParserRequest(
+                    request_id=f"{revision}:{path}",
+                    path=path,
+                    language=language,
+                    blob_oid=blob_oid,
+                    source=source,
+                    symbols=symbols,
+                )
+            )
+    return requests, sources
+
+
 def _owned_symbol_hits(
-    entry: dict[str, Any], repo: Path, left: str, right: str, paths: list[str]
+    entry: dict[str, Any],
+    repo: Path,
+    left: str,
+    right: str,
+    paths: list[str],
+    *,
+    parser_spans: dict[str, dict[str, list[tuple[int, int]]]],
+    parser_changed_ranges: dict[
+        str, tuple[list[tuple[int, int]], list[tuple[int, int]]]
+    ],
 ) -> list[str]:
     hits: set[str] = set()
     symbols = _strict_owned_symbols(entry)
     for path in paths:
+        if _parser_language(path) is not None:
+            old_ranges, new_ranges = parser_changed_ranges[path]
+            old_spans = parser_spans[f"{left}:{path}"]
+            new_spans = parser_spans[f"{right}:{path}"]
+            for symbol in symbols:
+                if _ranges_overlap(old_spans[symbol], old_ranges) or _ranges_overlap(
+                    new_spans[symbol], new_ranges
+                ):
+                    hits.add(symbol)
+            continue
         diff = _git(repo, "diff", "--unified=0", f"{left}..{right}", "--", path)
         old_changed, new_changed = _changed_line_numbers(diff)
         new_source = _blob_text(repo, right, path)
@@ -2701,61 +2271,110 @@ def _owned_symbol_hits(
     return sorted(hits)
 
 
-def classify_upstream_overlap(
-    entry: dict[str, Any], repo: Path, diff_range: str
-) -> dict[str, Any]:
+def classify_upstream_overlaps(
+    entries: Sequence[dict[str, Any]],
+    repo: Path,
+    diff_range: str,
+    *,
+    resolver: _NonPythonSymbolResolver | None = None,
+) -> list[dict[str, Any]]:
     left, right = _resolved_diff_endpoints(repo, diff_range)
     changes = _changed_paths(repo, f"{left}..{right}")
     changed = {path for _status, paths in changes for path in paths}
-    owned_files = set(entry["files"])
-    same_files = sorted(changed & owned_files)
-    symbols = _strict_owned_symbols(entry)
-    owned_hits = _owned_symbol_hits(entry, repo, left, right, same_files)
-    if owned_hits:
-        classification = "owned_symbol"
-        rationale = f"owned symbols changed: {', '.join(owned_hits)}"
-    elif same_files:
-        classification = "same_file"
-        rationale = f"same ledger-owned file changed: {', '.join(same_files)}"
-    else:
-        equivalent_hits = _owned_symbol_hits(
+    parser_requests, parser_sources = _collect_overlap_parser_requests(
+        entries, repo, left, right, changed
+    )
+    parser_spans = (resolver or _NonPythonSymbolResolver()).spans(parser_requests)
+    parser_changed_ranges = {
+        path: _git_changed_byte_ranges(
+            repo,
+            left,
+            right,
+            path,
+            parser_sources[(left, path)],
+            parser_sources[(right, path)],
+        )
+        for path in sorted(changed)
+        if _parser_language(path) is not None
+    }
+
+    overlaps: list[dict[str, Any]] = []
+    for entry in entries:
+        owned_files = set(entry["files"])
+        same_files = sorted(changed & owned_files)
+        symbols = _strict_owned_symbols(entry)
+        owned_hits = _owned_symbol_hits(
             entry,
             repo,
             left,
             right,
-            sorted(changed - owned_files),
+            same_files,
+            parser_spans=parser_spans,
+            parser_changed_ranges=parser_changed_ranges,
         )
-        if equivalent_hits:
-            classification = "possible_upstream_equivalent"
-            rationale = f"owned public names appeared elsewhere: {', '.join(equivalent_hits)}"
+        if owned_hits:
+            classification = "owned_symbol"
+            rationale = f"owned symbols changed: {', '.join(owned_hits)}"
+        elif same_files:
+            classification = "same_file"
+            rationale = f"same ledger-owned file changed: {', '.join(same_files)}"
         else:
-            classification = "none"
-            rationale = "no file, symbol, or public-contract overlap detected"
-    return {
-        "id": entry["id"],
-        "change_class": entry["change_class"],
-        "files": entry["files"],
-        "owned_symbols": symbols,
-        "owned_invariants": [
-            *entry.get("owned_invariants", []),
-            *[symbol for symbol in entry["owned_symbols"] if symbol not in symbols],
-        ],
-        "overlap_policy": entry.get("overlap_policy", "owned_symbol"),
-        "expected_commit_subject": entry["expected_commit_subject"],
-        "classification": classification,
-        "rationale": rationale,
-        "merge_guidance": entry["merge_guidance"],
-        "removal_condition": entry["removal_condition"],
-        "tests": entry["tests"],
-        "decision_required": bool(
-            classification in {"owned_symbol", "possible_upstream_equivalent"}
-            or (
-                classification == "same_file"
-                and entry.get("overlap_policy", "owned_symbol") == "any_owned_file"
+            equivalent_hits = _owned_symbol_hits(
+                entry,
+                repo,
+                left,
+                right,
+                sorted(changed - owned_files),
+                parser_spans=parser_spans,
+                parser_changed_ranges=parser_changed_ranges,
             )
-        ),
-        "acknowledged": False,
-    }
+            if equivalent_hits:
+                classification = "possible_upstream_equivalent"
+                rationale = (
+                    "owned public names appeared elsewhere: "
+                    + ", ".join(equivalent_hits)
+                )
+            else:
+                classification = "none"
+                rationale = "no file, symbol, or public-contract overlap detected"
+        overlaps.append({
+            "id": entry["id"],
+            "change_class": entry["change_class"],
+            "files": entry["files"],
+            "owned_symbols": symbols,
+            "owned_invariants": [
+                *entry.get("owned_invariants", []),
+                *[
+                    symbol
+                    for symbol in entry["owned_symbols"]
+                    if symbol not in symbols
+                ],
+            ],
+            "overlap_policy": entry.get("overlap_policy", "owned_symbol"),
+            "expected_commit_subject": entry["expected_commit_subject"],
+            "classification": classification,
+            "rationale": rationale,
+            "merge_guidance": entry["merge_guidance"],
+            "removal_condition": entry["removal_condition"],
+            "tests": entry["tests"],
+            "decision_required": bool(
+                classification
+                in {"owned_symbol", "possible_upstream_equivalent"}
+                or (
+                    classification == "same_file"
+                    and entry.get("overlap_policy", "owned_symbol")
+                    == "any_owned_file"
+                )
+            ),
+            "acknowledged": False,
+        })
+    return overlaps
+
+
+def classify_upstream_overlap(
+    entry: dict[str, Any], repo: Path, diff_range: str
+) -> dict[str, Any]:
+    return classify_upstream_overlaps([entry], repo, diff_range)[0]
 
 
 def _set_verified_upstream(path: Path, data: dict[str, Any], repo: Path, sha: str) -> None:
@@ -2768,6 +2387,21 @@ def _set_verified_upstream(path: Path, data: dict[str, Any], repo: Path, sha: st
     for entry in data["upstream_changes"]:
         entry["last_verified_upstream"] = sha
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
+def _write_json_atomically(path: Path, value: Any) -> None:
+    payload = (json.dumps(value, indent=2) + "\n").encode("utf-8")
+    descriptor, raw_temp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp_path = Path(raw_temp)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2821,15 +2455,14 @@ def main(argv: list[str] | None = None) -> int:
                 for item in previous.get("overlaps", [])
                 if isinstance(item, dict)
             }
-            overlaps = [
-                classify_upstream_overlap(entry, repo, args.upstream_diff)
-                for entry in data["upstream_changes"]
-            ]
+            overlaps = classify_upstream_overlaps(
+                data["upstream_changes"], repo, args.upstream_diff
+            )
             for item in overlaps:
                 item["acknowledged"] = old_ack.get(item["id"], False)
             report = {"schema_version": 1, "range": args.upstream_diff, "overlaps": overlaps}
             if args.report:
-                args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+                _write_json_atomically(args.report, report)
             else:
                 print(json.dumps(report, indent=2))
             if any(item["decision_required"] for item in overlaps):
