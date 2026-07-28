@@ -787,6 +787,13 @@ def _typescript_without_comments(source: str) -> str:
     control_parentheses: list[bool] = []
     expression_braces: list[bool] = []
     block_brace_pending = True
+    # These are deliberately lexical, bounded states rather than a partial
+    # JavaScript parser.  They cover the two grammar boundaries that affect a
+    # slash token here: restricted statements can end by ASI, and an identifier
+    # at the start of a statement can introduce a labeled block.
+    statement_start = True
+    label_candidate = False
+    restricted_statement: str | None = None
     index = 0
     while index < len(source):
         mode, depth, regex_allowed, property_name_pending = stack[-1]
@@ -818,12 +825,24 @@ def _typescript_without_comments(source: str) -> str:
             end = source.find("\n", index)
             end = len(source) if end < 0 else end
             _blank(result, source, index, end)
+            if restricted_statement is not None:
+                restricted_statement = None
+                statement_start = True
+                label_candidate = False
+                stack[-1] = (mode, depth, True, False)
             index = end
             continue
         if char == "/" and following == "*":
             end = source.find("*/", index + 2)
             end = len(source) if end < 0 else end + 2
             _blank(result, source, index, end)
+            if restricted_statement is not None and any(
+                delimiter in source[index:end] for delimiter in ("\r", "\n")
+            ):
+                restricted_statement = None
+                statement_start = True
+                label_candidate = False
+                stack[-1] = (mode, depth, True, False)
             index = end
             continue
         if char == "/" and regex_allowed:
@@ -853,24 +872,36 @@ def _typescript_without_comments(source: str) -> str:
             if closed:
                 stack[-1] = (mode, depth, False, False)
                 block_brace_pending = False
+                statement_start = False
+                label_candidate = False
+                restricted_statement = None
                 index = cursor
                 continue
         if char in {"'", '"'}:
             stack[-1] = (mode, depth, False, False)
             control_header_pending = False
             block_brace_pending = False
+            statement_start = False
+            label_candidate = False
+            restricted_statement = None
             stack.append(("single" if char == "'" else "double", 0, False, False))
             index += 1
         elif char == "`":
             stack[-1] = (mode, depth, False, False)
             control_header_pending = False
             block_brace_pending = False
+            statement_start = False
+            label_candidate = False
+            restricted_statement = None
             stack.append(("template", 0, False, False))
             index += 1
         elif char == "(":
             control_parentheses.append(control_header_pending)
             control_header_pending = False
             block_brace_pending = False
+            statement_start = False
+            label_candidate = False
+            restricted_statement = None
             stack[-1] = (mode, depth, True, False)
             index += 1
         elif char == ")":
@@ -880,11 +911,18 @@ def _typescript_without_comments(source: str) -> str:
             control_header_pending = False
             stack[-1] = (mode, depth, closes_control_header, False)
             block_brace_pending = closes_control_header
+            statement_start = False
+            label_candidate = False
+            restricted_statement = None
             index += 1
         elif char == "{":
             control_header_pending = False
-            expression_braces.append(regex_allowed and not block_brace_pending)
+            opens_expression = regex_allowed and not block_brace_pending
+            expression_braces.append(opens_expression)
             block_brace_pending = False
+            statement_start = not opens_expression
+            label_candidate = False
+            restricted_statement = None
             stack[-1] = (
                 mode,
                 depth + 1 if mode == "expression" else depth,
@@ -897,6 +935,7 @@ def _typescript_without_comments(source: str) -> str:
             if mode == "expression" and depth == 1:
                 stack.pop()
                 block_brace_pending = False
+                statement_start = False
             else:
                 closes_expression = expression_braces.pop() if expression_braces else False
                 stack[-1] = (
@@ -906,8 +945,16 @@ def _typescript_without_comments(source: str) -> str:
                     False,
                 )
                 block_brace_pending = not closes_expression
+                statement_start = not closes_expression
+            label_candidate = False
+            restricted_statement = None
             index += 1
         elif char.isspace():
+            if char in "\r\n" and restricted_statement is not None:
+                restricted_statement = None
+                statement_start = True
+                label_candidate = False
+                stack[-1] = (mode, depth, True, False)
             index += 1
         elif source.startswith(("++", "--"), index):
             # Prefix update retains expression-start eligibility; postfix update
@@ -916,21 +963,52 @@ def _typescript_without_comments(source: str) -> str:
             control_header_pending = False
             stack[-1] = (mode, depth, regex_allowed, False)
             block_brace_pending = False
+            statement_start = False
+            label_candidate = False
+            restricted_statement = None
             index += 2
         elif source.startswith("=>", index):
             control_header_pending = False
             stack[-1] = (mode, depth, True, False)
             block_brace_pending = True
+            statement_start = True
+            label_candidate = False
+            restricted_statement = None
             index += 2
         elif source.startswith("?.", index):
             control_header_pending = False
             stack[-1] = (mode, depth, False, True)
             block_brace_pending = False
+            statement_start = False
+            label_candidate = False
+            restricted_statement = None
             index += 2
         elif char == ".":
             control_header_pending = False
             stack[-1] = (mode, depth, False, True)
             block_brace_pending = False
+            statement_start = False
+            label_candidate = False
+            restricted_statement = None
+            index += 1
+        elif source.startswith(("!==", "!="), index):
+            control_header_pending = False
+            block_brace_pending = False
+            statement_start = False
+            label_candidate = False
+            restricted_statement = None
+            stack[-1] = (mode, depth, True, False)
+            index += 3 if source.startswith("!==", index) else 2
+        elif char == "!":
+            # ``!`` is unary at an expression start, but TypeScript's postfix
+            # non-null assertion after an expression must retain the division
+            # lexical goal for a following slash.
+            control_header_pending = False
+            block_brace_pending = False
+            statement_start = False
+            label_candidate = False
+            restricted_statement = None
+            stack[-1] = (mode, depth, regex_allowed, False)
             index += 1
         elif char.isalnum() or char in "_$":
             cursor = index + 1
@@ -939,32 +1017,77 @@ def _typescript_without_comments(source: str) -> str:
             ):
                 cursor += 1
             token = source[index:cursor]
+            token_at_statement_start = statement_start
             if property_name_pending:
                 control_header_pending = False
                 regex_allowed = False
+                statement_start = False
+                label_candidate = False
+                restricted_statement = None
+            elif restricted_statement == "jump":
+                # A break/continue label is permitted only before a line
+                # terminator; whitespace handling above already applies ASI.
+                control_header_pending = False
+                regex_allowed = False
+                statement_start = False
+                label_candidate = False
+                restricted_statement = None
+            elif token in {"break", "continue"}:
+                control_header_pending = False
+                regex_allowed = False
+                statement_start = False
+                label_candidate = False
+                restricted_statement = "jump"
+            elif token == "debugger":
+                control_header_pending = False
+                regex_allowed = False
+                statement_start = False
+                label_candidate = False
+                restricted_statement = "debugger"
             elif token in control_header_keywords:
                 control_header_pending = True
                 regex_allowed = False
+                statement_start = False
+                label_candidate = False
+                restricted_statement = None
             elif control_header_pending and token == "await":
                 # ``for await (...)`` retains the pending control header.
                 regex_allowed = False
+                statement_start = False
+                label_candidate = False
+                restricted_statement = None
             else:
                 control_header_pending = False
                 regex_allowed = token in regex_prefix_keywords
-            if not property_name_pending and token in statement_prefix_keywords:
-                regex_allowed = True
-            block_brace_pending = (
-                not property_name_pending and token in statement_prefix_keywords
-            )
+                if token in statement_prefix_keywords:
+                    regex_allowed = True
+                    statement_start = True
+                    label_candidate = False
+                else:
+                    statement_start = False
+                    label_candidate = (
+                        token_at_statement_start and not regex_allowed
+                    )
+                restricted_statement = None
+            block_brace_pending = token in statement_prefix_keywords
             stack[-1] = (mode, depth, regex_allowed, False)
             index = cursor
         else:
             control_header_pending = False
-            block_brace_pending = char == ";"
+            if char == ":" and label_candidate:
+                regex_allowed = True
+                block_brace_pending = True
+                statement_start = True
+            else:
+                regex_allowed = char not in ").]" and char != "."
+                block_brace_pending = char == ";"
+                statement_start = char == ";"
+            label_candidate = False
+            restricted_statement = None
             stack[-1] = (
                 mode,
                 depth,
-                char not in ").]" and char != ".",
+                regex_allowed,
                 False,
             )
             index += 1
@@ -1136,6 +1259,11 @@ def _markdown_continuation_content(
     containers: tuple[tuple[str, int], ...],
 ) -> str | None:
     """Strip one opening container stack from a continuation without guessing."""
+    # A blank line can remain inside a contained fenced block even without its
+    # list/blockquote markers.  It carries no fence closer, so preserve the
+    # child fence and let a later indented continuation decide the close.
+    if not line.strip():
+        return ""
     cursor = 0
     column = 0
     virtual_indent = 0
@@ -1176,13 +1304,18 @@ def _markdown_without_comments(source: str) -> str:
         if fence is not None:
             marker, width, containers = fence
             continuation = _markdown_continuation_content(body, containers)
-            if continuation is not None and re.fullmatch(
-                rf" {{0,3}}{re.escape(marker)}{{{width},}}[ \t]*",
-                continuation,
-            ):
-                fence = None
-            offset += len(line)
-            continue
+            if continuation is not None:
+                if re.fullmatch(
+                    rf" {{0,3}}{re.escape(marker)}{{{width},}}[ \t]*",
+                    continuation,
+                ):
+                    fence = None
+                offset += len(line)
+                continue
+            # The opening list/blockquote container ended.  Its child fence
+            # cannot hide this line, so close it implicitly and process the
+            # same line again at the outer Markdown level.
+            fence = None
         container_content, containers = _markdown_opening_container_content(body)
         fence_match = (
             None

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 
 import pytest
@@ -455,6 +456,39 @@ def _non_python_manifest(
     return repo, source_path, manifest
 
 
+def _assert_javascript_syntax(tmp_path: Path, source: str) -> None:
+    """Keep lexical-goal fixtures grammar-valid independently of the scanner."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to validate JavaScript scanner fixtures")
+    fixture = tmp_path / "scanner-syntax.mjs"
+    fixture.write_text(source, encoding="utf-8")
+    checked = subprocess.run(
+        [node, "--check", str(fixture)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert checked.returncode == 0, checked.stderr
+
+
+def _assert_typescript_syntax(tmp_path: Path, source: str) -> None:
+    """Validate the one TypeScript-only lexical-goal fixture with tsc."""
+    node = shutil.which("node")
+    tsc = Path(__file__).parents[2] / "node_modules/typescript/bin/tsc"
+    if node is None or not tsc.is_file():
+        pytest.skip("node and repository TypeScript are required for this fixture")
+    fixture = tmp_path / "scanner-syntax.ts"
+    fixture.write_text(source, encoding="utf-8")
+    checked = subprocess.run(
+        [node, str(tsc), "--noEmit", "--skipLibCheck", "--target", "ES2022", str(fixture)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert checked.returncode == 0, checked.stderr
+
+
 def test_powershell_backslash_does_not_escape_comment_boundary(tmp_path: Path) -> None:
     repo, _source, manifest = _non_python_manifest(
         tmp_path,
@@ -620,8 +654,8 @@ def test_typescript_keyword_regex_braces_stay_inside_template_expression(
             "/* ExactToken */ return 1; })()}`\n"
         ),
         (
-            "const value = `${(() => { for (;;) /}}/.test('}}'); "
-            "/* ExactToken */ break; })()}`\n"
+            "const value = `${(() => { for (;;) { /}}/.test('}}'); break; } "
+            "/* ExactToken */ return 1; })()}`\n"
         ),
         (
             "const value = `${(() => { do /}}/.test('}}'); while (false); "
@@ -642,6 +676,91 @@ def test_typescript_control_statement_regexes_do_not_expose_comments(
     source: str,
 ) -> None:
     """A regex statement body must not let its braces close ``${...}``."""
+    _assert_javascript_syntax(tmp_path, source)
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "const value = `${(() => { while (true) break\n"
+            "/}}/.test('}}')\n/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { while (true) break;\n"
+            "/}}/.test('}}')\n/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { let count = 0; while (count++ < 1) continue\n"
+            "/}}/.test('}}')\n/* ExactToken */ return count; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { let count = 0; while (count++ < 1) continue;\n"
+            "/}}/.test('}}')\n/* ExactToken */ return count; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { loop: while (true) break loop;\n"
+            "/}}/.test('}}')\n/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { loop: while (true) continue loop;\n"
+            "/}}/.test('}}')\n/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { debugger\n"
+            "/}}/.test('}}')\n/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { debugger;\n"
+            "/}}/.test('}}')\n/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { label: { }\n"
+            "/}}/.test('}}')\n/* ExactToken */ return 1; })()}`\n"
+        ),
+    ],
+)
+def test_typescript_statement_and_label_regex_goals_do_not_expose_comments(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    """ASI, labels, and statement closers all leave the next slash regex-eligible."""
+    _assert_javascript_syntax(tmp_path, source)
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_typescript_postfix_non_null_division_does_not_expose_comments(
+    tmp_path: Path,
+) -> None:
+    """TypeScript ``!`` after an expression must not turn division into regex."""
+    source = (
+        "const value: number = 4;\n"
+        "const rendered = `${(() => { const quotient = value! / 2; "
+        "/}}/.test('}}'); /* ExactToken */ return quotient; })()}`;\n"
+    )
+    _assert_typescript_syntax(tmp_path, source)
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_typescript_unary_not_keeps_regex_goal_and_hides_its_literal_comment(
+    tmp_path: Path,
+) -> None:
+    """Unary ``!`` still starts an expression, unlike postfix TypeScript ``!``."""
+    source = (
+        "const rendered = `${(() => { const matched = ! /}}/.test('}}'); "
+        "/* ExactToken */ return matched; })()}`;\n"
+    )
+    _assert_javascript_syntax(tmp_path, source)
     repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
 
     with pytest.raises(ValueError, match="ExactToken.*declared files"):
@@ -668,6 +787,7 @@ def test_typescript_division_lexical_goals_do_not_expose_comments(
     source: str,
 ) -> None:
     """Expression-ending tokens keep a following slash in division goal."""
+    _assert_javascript_syntax(tmp_path, source)
     repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
 
     with pytest.raises(ValueError, match="ExactToken.*declared files"):
@@ -832,6 +952,59 @@ def test_markdown_container_fence_uses_visual_tab_columns(
 
     assert report["classification"] == "same_file"
     assert report.get("owned_symbol_changes", []) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "- ```html\n<!-- ExactToken -->\n",
+        "> ```html\n<!-- ExactToken -->\n",
+        "> - ```html\n<!-- ExactToken -->\n",
+        "100. ```html\n<!-- ExactToken -->\n",
+        "-\t```html\n<!-- ExactToken -->\n",
+        "- ```html\n> <!-- ExactToken -->\n",
+        "- ```html\nlazy continuation <!-- ExactToken -->\n",
+    ],
+)
+def test_markdown_contained_fence_closes_and_reprocesses_outdented_line(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    """A list/quote fence cannot hide an ordinary comment after its container ends."""
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".md", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_markdown_contained_fence_keeps_blank_continuation_literal(
+    tmp_path: Path,
+) -> None:
+    """A blank line inside a list fence does not close it before its indented body."""
+    repo, _source, manifest = _non_python_manifest(
+        tmp_path,
+        ".md",
+        "- ```html\n\n  <!-- ExactToken -->\n  ```\n",
+    )
+
+    load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "```html\n<!-- ExactToken -->\n```\n",
+        "~~~html\n<!-- ExactToken -->\n",
+        "- ````html\n  <!-- ExactToken -->\n  ```\n  <!-- ExactToken -->\n  ````\n",
+    ],
+)
+def test_markdown_root_eof_and_width_controls_preserve_fence_literals(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".md", source)
+
+    load_and_validate_manifest(manifest, repo, check_git=False)
 
 
 def test_toml_multiline_string_preserves_hash_token_but_comment_does_not(
