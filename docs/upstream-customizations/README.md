@@ -15,12 +15,12 @@ documents fail validation. Traversal is alias-cycle safe, decoded escape values
 map back to their source spans, and block/multiline string spans stop before the
 following syntax. PowerShell, POSIX shell, and CSS use bounded lexical scanners.
 TypeScript/JavaScript and Markdown use the pinned parser helper: their broad
-symbol meaning includes semantic syntax while excluding comments and HTML; JS/TS
-literals and Markdown literals, code, and prose remain searchable. Parser
-requests use only exact committed Git revision blob bytes, never dirty worktree
-bytes, and encode those bytes as canonical base64. Returned symbol spans and
-Git-changed ranges are half-open UTF-8 byte offsets, so overlap checks are
-byte-exact. The root `package.json` and lockfile must provide the exactly
+symbol meaning includes semantic syntax while excluding comments. Non-comment
+HTML, JS/TS literals, and Markdown literals, code, and prose remain searchable.
+Parser requests use only exact committed Git revision blob bytes, never dirty
+worktree bytes, and encode those bytes as canonical base64. Returned symbol
+spans and Git-changed ranges are half-open UTF-8 byte offsets, so overlap
+checks are byte-exact. The root `package.json` and lockfile must provide the exactly
 attested TypeScript 6.0.3, unified 11.0.5, remark-parse 11.0.0, and micromark
 4.0.2 dependencies. Each parser request is at most 4 MiB, each sequential batch
 is at most 16 MiB, parser output is at most 16 MiB, and parser execution is

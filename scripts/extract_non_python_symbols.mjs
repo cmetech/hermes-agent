@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import readline from "node:readline";
+import { parse as micromarkParse, postprocess, preprocess } from "micromark";
 import ts from "typescript";
 import { unified } from "unified";
 import remarkParse from "remark-parse";
@@ -19,7 +20,9 @@ const EXPECTED_VERSIONS = Object.freeze({
 });
 const MAX_BLOB_BYTES = 4 * 1024 * 1024;
 const MAX_BATCH_BYTES = 16 * 1024 * 1024;
-const MAX_METADATA_BYTES = 256;
+const MAX_REQUEST_ID_BYTES = 128;
+const MAX_PATH_BYTES = 4096;
+const MAX_SYMBOL_BYTES = 256;
 const JAVASCRIPT_EXTENSIONS = new Set([".js", ".jsx", ".mjs", ".cjs"]);
 const TYPESCRIPT_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts"]);
 const MARKDOWN_EXTENSIONS = new Set([".md", ".markdown", ".mdown", ".mkdn"]);
@@ -91,8 +94,16 @@ function validateHello(record) {
 }
 
 function enforceMetadataLimits(record) {
-  for (const value of [record.id, record.path, ...(Array.isArray(record.symbols) ? record.symbols : [])]) {
-    if (typeof value === "string" && Buffer.byteLength(value, "utf8") > MAX_METADATA_BYTES) fail("metadata_limit");
+  if (typeof record.id === "string" && Buffer.byteLength(record.id, "utf8") > MAX_REQUEST_ID_BYTES) {
+    fail("metadata_limit");
+  }
+  if (typeof record.path === "string" && Buffer.byteLength(record.path, "utf8") > MAX_PATH_BYTES) {
+    fail("metadata_limit", typeof record.id === "string" ? record.id : null);
+  }
+  for (const symbol of Array.isArray(record.symbols) ? record.symbols : []) {
+    if (typeof symbol === "string" && Buffer.byteLength(symbol, "utf8") > MAX_SYMBOL_BYTES) {
+      fail("metadata_limit", typeof record.id === "string" ? record.id : null);
+    }
   }
 }
 
@@ -253,27 +264,120 @@ function nodeRange(node, offsets) {
   return [offsets[start], offsets[end]];
 }
 
+function htmlTagAt(sourceText, start, end) {
+  let cursor = start + 1;
+  let closing = false;
+  if (sourceText[cursor] === "/") {
+    closing = true;
+    cursor += 1;
+  }
+  const nameStart = cursor;
+  while (cursor < end && /[A-Za-z0-9-]/.test(sourceText[cursor])) cursor += 1;
+  if (cursor === nameStart || !/[A-Za-z]/.test(sourceText[nameStart])) return null;
+  const name = sourceText.slice(nameStart, cursor).toLowerCase();
+  let quote = null;
+  for (; cursor < end; cursor += 1) {
+    const character = sourceText[cursor];
+    if (quote !== null) {
+      if (character === quote) quote = null;
+    } else if (character === "\"" || character === "'") {
+      quote = character;
+    } else if (character === ">") {
+      const beforeClose = sourceText.slice(start, cursor).trimEnd();
+      return { closing, end: cursor + 1, name, selfClosing: beforeClose.endsWith("/") };
+    }
+  }
+  return { closing, end, name, selfClosing: false };
+}
+
+function findRawClosingTag(sourceText, start, end, name) {
+  for (let cursor = sourceText.indexOf("<", start); cursor >= 0 && cursor < end;
+       cursor = sourceText.indexOf("<", cursor + 1)) {
+    const candidate = sourceText.slice(cursor + 2, cursor + 2 + name.length);
+    const boundary = sourceText[cursor + 2 + name.length];
+    if (sourceText[cursor + 1] === "/" && candidate.toLowerCase() === name &&
+        (boundary === undefined || boundary === ">" || boundary === "/" || /\s/.test(boundary))) {
+      return cursor;
+    }
+  }
+  return end;
+}
+
+function htmlCommentCharacterRanges(sourceText, start, end) {
+  const ranges = [];
+  const rawTextElements = new Set([
+    "iframe", "noembed", "noframes", "plaintext", "script", "style", "textarea", "title", "xmp",
+  ]);
+  let cursor = start;
+  let rawElement = null;
+  while (cursor < end) {
+    if (rawElement !== null) {
+      cursor = findRawClosingTag(sourceText, cursor, end, rawElement);
+      rawElement = null;
+      continue;
+    }
+    if (sourceText.startsWith("<!--", cursor)) {
+      const close = sourceText.indexOf("-->", cursor + 4);
+      const commentEnd = close < 0 || close + 3 > end ? end : close + 3;
+      ranges.push([cursor, commentEnd]);
+      cursor = commentEnd;
+      continue;
+    }
+    if (sourceText[cursor] === "<") {
+      const tag = htmlTagAt(sourceText, cursor, end);
+      if (tag !== null) {
+        if (!tag.closing && !tag.selfClosing && rawTextElements.has(tag.name)) rawElement = tag.name;
+        cursor = tag.end;
+        continue;
+      }
+      let quote = null;
+      let markupEnd = cursor + 1;
+      for (; markupEnd < end; markupEnd += 1) {
+        const character = sourceText[markupEnd];
+        if (quote !== null) {
+          if (character === quote) quote = null;
+        } else if (character === "\"" || character === "'") {
+          quote = character;
+        } else if (character === ">") {
+          markupEnd += 1;
+          break;
+        }
+      }
+      cursor = markupEnd;
+      continue;
+    }
+    cursor += 1;
+  }
+  return ranges;
+}
+
+function markdownHtmlCommentRanges(sourceText, offsets) {
+  const events = postprocess(
+    micromarkParse().document().write(preprocess()(sourceText, undefined, true)),
+  );
+  const ranges = [];
+  for (const [eventType, token] of events) {
+    if (eventType !== "enter" || (token.type !== "htmlFlow" && token.type !== "htmlText")) continue;
+    const start = token?.start?.offset;
+    const end = token?.end?.offset;
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || start >= end || end >= offsets.length) {
+      fail("invalid_markdown_position");
+    }
+    for (const [commentStart, commentEnd] of htmlCommentCharacterRanges(sourceText, start, end)) {
+      ranges.push([offsets[commentStart], offsets[commentEnd]]);
+    }
+  }
+  return mergeRanges(ranges);
+}
+
 function extractMarkdownSpans(sourceText, sourceBytes, symbols) {
   const tree = unified().use(remarkParse).parse(sourceText);
   const offsets = utf8ByteOffsets(sourceText);
   const covered = [];
-  const excluded = [];
-  const htmlCommentRanges = node => {
-    const sourceStart = node?.position?.start?.offset;
-    if (typeof node.value !== "string" || !Number.isInteger(sourceStart)) fail("invalid_markdown_position");
-    const ranges = [];
-    for (const match of node.value.matchAll(/<!--[\s\S]*?-->/g)) {
-      const start = sourceStart + match.index;
-      const end = start + match[0].length;
-      if (start < 0 || end >= offsets.length) fail("invalid_markdown_position");
-      ranges.push([offsets[start], offsets[end]]);
-    }
-    return ranges;
-  };
+  const excluded = markdownHtmlCommentRanges(sourceText, offsets);
   const visit = node => {
     if (node.type === "html") {
       covered.push(nodeRange(node, offsets));
-      excluded.push(...htmlCommentRanges(node));
     } else if (SEARCHABLE_MARKDOWN.has(node.type)) covered.push(nodeRange(node, offsets));
     for (const child of node.children ?? []) visit(child);
   };
@@ -341,7 +445,14 @@ async function main() {
       fail("invalid_utf8", record.id);
     }
     if (sourceText.includes("\0")) fail("invalid_source", record.id);
-    emit({ type: "result", id: record.id, spans: extract(record, sourceText, sourceBytes) });
+    try {
+      emit({ type: "result", id: record.id, spans: extract(record, sourceText, sourceBytes) });
+    } catch (error) {
+      if (error instanceof HelperError && error.id === null) {
+        throw new HelperError(error.code, record.id);
+      }
+      throw error;
+    }
   }
   if (!helloSeen) fail("missing_hello");
 }
@@ -360,5 +471,6 @@ export {
   extractMarkdownSpans,
   extractQualifiedTypeScriptSpans,
   extractTypeScriptSpans,
+  markdownHtmlCommentRanges,
   utf8ByteOffsets,
 };

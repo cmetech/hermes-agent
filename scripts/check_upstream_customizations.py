@@ -29,8 +29,8 @@ import yaml
 
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _MAX_EVIDENCE_ID_LENGTH = 512
-_MAX_REPOSITORY_PATH_LENGTH = 4096
-_MAX_OWNED_SYMBOL_LENGTH = 256
+_MAX_REPOSITORY_PATH_BYTES = 4096
+_MAX_OWNED_SYMBOL_BYTES = 256
 _MAX_OWNED_INVARIANT_LENGTH = 512
 _MAX_OWNED_INVARIANTS = 128
 _MAX_SCANNED_SOURCE_BYTES = 4 * 1024 * 1024
@@ -38,6 +38,7 @@ _PARSER_PROTOCOL = 1
 _MAX_PARSER_BATCH_BYTES = 16 * 1024 * 1024
 _MAX_PARSER_OUTPUT_BYTES = 16 * 1024 * 1024
 _PARSER_TIMEOUT_SECONDS = 60.0
+_MAX_PARSER_REQUEST_ID_BYTES = 128
 _CAPTURE_CLEANUP_SECONDS = 1.0
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
@@ -64,6 +65,7 @@ _EXPECTED_PARSER_VERSIONS = {
     "micromark": "4.0.2",
 }
 _PARSER_VERSION_KEY = tuple(sorted(_EXPECTED_PARSER_VERSIONS.items()))
+_PARSER_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _OVERLAP_POLICIES = frozenset({"owned_symbol", "any_owned_file"})
 _MACHINE_SYMBOL = re.compile(r"^\S+$")
 _EPHEMERAL_COVERAGE_PATHS = frozenset({".superpowers/sdd/progress.md"})
@@ -223,14 +225,43 @@ class _BoundedCaptureFailure(Exception):
         self.code = code
 
 
-def _parser_error(code: str, request_id: str | None = None) -> ValueError:
-    del request_id
-    message = f"non-Python parser {code}"
+def _parser_error(code: str, path: str | None = None) -> ValueError:
+    safe_code = code if _PARSER_ERROR_CODE.fullmatch(code) else "internal_failure"
+    message = f"non-Python parser {safe_code}"
+    if path is not None:
+        portable = PurePosixPath(path)
+        if (
+            path
+            and not portable.is_absolute()
+            and ".." not in portable.parts
+            and portable.as_posix() == path
+        ):
+            display_path = path if len(path) <= 440 else f"{path[:437]}..."
+            message += f" at {json.dumps(display_path, ensure_ascii=True)}"
     return ValueError(message[:512])
 
 
 def _parser_language(path: str) -> str | None:
     return _PARSER_LANGUAGES.get(PurePosixPath(path).suffix.lower())
+
+
+def _validated_parser_metadata(request: _ParserRequest) -> None:
+    if (
+        not isinstance(request.request_id, str)
+        or not request.request_id
+        or len(request.request_id.encode("utf-8")) > _MAX_PARSER_REQUEST_ID_BYTES
+        or not isinstance(request.path, str)
+        or not request.path
+        or len(request.path.encode("utf-8")) > _MAX_REPOSITORY_PATH_BYTES
+        or not isinstance(request.symbols, tuple)
+        or not all(
+            isinstance(symbol, str)
+            and bool(symbol)
+            and len(symbol.encode("utf-8")) <= _MAX_OWNED_SYMBOL_BYTES
+            for symbol in request.symbols
+        )
+    ):
+        raise _parser_error("invalid_request", request.path if isinstance(request.path, str) else None)
 
 
 def _run_bounded_capture(
@@ -499,15 +530,15 @@ def _run_bounded_capture(
     )
 
 
-def _validated_parser_source(source: bytes) -> None:
+def _validated_parser_source(source: bytes, path: str | None = None) -> None:
     if len(source) > _MAX_SCANNED_SOURCE_BYTES:
-        raise _parser_error("input_limit")
+        raise _parser_error("input_limit", path)
     if b"\0" in source:
-        raise _parser_error("invalid_source")
+        raise _parser_error("invalid_source", path)
     try:
         source.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
-        raise _parser_error("invalid_utf8") from exc
+        raise _parser_error("invalid_utf8", path) from exc
 
 
 def _is_utf8_boundary(source: bytes, offset: int) -> bool:
@@ -541,6 +572,33 @@ def _ndjson_records(payload: bytes) -> list[dict[str, Any]]:
     return records
 
 
+def _parser_process_error(
+    stdout: bytes,
+    request_by_id: dict[str, _ParserRequest],
+) -> ValueError:
+    try:
+        records = _ndjson_records(stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return _parser_error("process_failure")
+    if not records:
+        return _parser_error("process_failure")
+    record = records[-1]
+    if (
+        set(record) != {"type", "id", "code", "detail"}
+        or record.get("type") != "error"
+        or not isinstance(record.get("code"), str)
+        or not _PARSER_ERROR_CODE.fullmatch(record["code"])
+        or not isinstance(record.get("detail"), str)
+    ):
+        return _parser_error("process_failure")
+    request_id = record.get("id")
+    if request_id is None:
+        return _parser_error(record["code"])
+    if not isinstance(request_id, str) or request_id not in request_by_id:
+        return _parser_error("invalid_response")
+    return _parser_error(record["code"], request_by_id[request_id].path)
+
+
 def _run_parser_batch(
     requests: Sequence[_ParserRequest],
 ) -> dict[str, dict[str, list[tuple[int, int]]]]:
@@ -557,7 +615,8 @@ def _run_parser_batch(
         ]
         decoded_bytes = 0
         for request in requests:
-            _validated_parser_source(request.source)
+            _validated_parser_metadata(request)
+            _validated_parser_source(request.source, request.path)
             if request.request_id in request_by_id:
                 raise _BoundedCaptureFailure("invalid_request")
             if _parser_language(request.path) != request.language:
@@ -587,7 +646,7 @@ def _run_parser_batch(
             output_limit_bytes=_MAX_PARSER_OUTPUT_BYTES,
         )
         if completed.returncode != 0:
-            raise _BoundedCaptureFailure("process_failure")
+            raise _parser_process_error(completed.stdout, request_by_id)
         try:
             records = _ndjson_records(completed.stdout)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
@@ -710,12 +769,11 @@ class _NonPythonSymbolResolver:
                 raise _parser_error("duplicate_request")
             request_ids.add(request.request_id)
             if (
-                not isinstance(request.symbols, tuple)
-                or not all(isinstance(symbol, str) and symbol for symbol in request.symbols)
-                or _parser_language(request.path) != request.language
+                _parser_language(request.path) != request.language
             ):
-                raise _parser_error("invalid_request")
-            _validated_parser_source(request.source)
+                raise _parser_error("invalid_request", request.path)
+            _validated_parser_metadata(request)
+            _validated_parser_source(request.source, request.path)
             canonical.append(
                 replace(request, symbols=tuple(sorted(set(request.symbols))))
             )
@@ -799,15 +857,6 @@ def _resolved_diff_endpoints(repo: Path, diff_range: str) -> tuple[str, str]:
 
 
 def _blob_bytes(repo: Path, revision: str, path: str) -> tuple[str, bytes]:
-    blob = subprocess.run(
-        ["git", "show", f"{revision}:{path}"],
-        cwd=repo,
-        text=False,
-        capture_output=True,
-        check=False,
-    )
-    if blob.returncode:
-        raise ValueError("cannot read committed Git blob")
     oid = subprocess.run(
         ["git", "rev-parse", "--verify", f"{revision}:{path}"],
         cwd=repo,
@@ -823,6 +872,39 @@ def _blob_bytes(repo: Path, revision: str, path: str) -> tuple[str, bytes]:
         raise ValueError("cannot resolve committed Git blob identity") from exc
     if not blob_oid:
         raise ValueError("cannot resolve committed Git blob identity")
+    object_type = subprocess.run(
+        ["git", "cat-file", "-t", blob_oid],
+        cwd=repo,
+        text=False,
+        capture_output=True,
+        check=False,
+    )
+    if object_type.returncode or object_type.stdout.strip() != b"blob":
+        raise ValueError("committed Git object is not a blob")
+    object_size = subprocess.run(
+        ["git", "cat-file", "-s", blob_oid],
+        cwd=repo,
+        text=False,
+        capture_output=True,
+        check=False,
+    )
+    try:
+        blob_size = int(object_size.stdout.strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cannot resolve committed Git blob size") from exc
+    if object_size.returncode or blob_size < 0:
+        raise ValueError("cannot resolve committed Git blob size")
+    if _parser_language(path) is not None and blob_size > _MAX_SCANNED_SOURCE_BYTES:
+        raise _parser_error("input_limit", path)
+    blob = subprocess.run(
+        ["git", "cat-file", "blob", blob_oid],
+        cwd=repo,
+        text=False,
+        capture_output=True,
+        check=False,
+    )
+    if blob.returncode or len(blob.stdout) != blob_size:
+        raise ValueError("cannot read committed Git blob")
     return blob_oid, blob.stdout
 
 
@@ -849,13 +931,13 @@ def _collect_manifest_parser_requests(
                     _strict_owned_symbols(entry)
                 )
     requests: list[_ParserRequest] = []
-    for path in sorted(symbols_by_path):
+    for request_index, path in enumerate(sorted(symbols_by_path)):
         blob_oid, source = _blob_bytes(repo, revision, path)
         language = _parser_language(path)
         assert language is not None
         requests.append(
             _ParserRequest(
-                request_id=f"{revision}:{path}",
+                request_id=f"request-{request_index:08x}",
                 path=path,
                 language=language,
                 blob_oid=blob_oid,
@@ -1077,10 +1159,10 @@ def load_and_validate_manifest(
             for raw in values:
                 if not isinstance(raw, str):
                     raise ValueError(f"{entry_id}.{field} paths must be strings")
-                if len(raw) > _MAX_REPOSITORY_PATH_LENGTH:
+                if len(raw.encode("utf-8")) > _MAX_REPOSITORY_PATH_BYTES:
                     raise ValueError(
                         f"{entry_id}.{field} path must be at most "
-                        f"{_MAX_REPOSITORY_PATH_LENGTH} characters"
+                        f"{_MAX_REPOSITORY_PATH_BYTES} bytes"
                     )
                 try:
                     _repository_relative_path(raw)
@@ -1976,7 +2058,7 @@ def _strict_owned_symbols(entry: dict[str, Any]) -> list[str]:
     return [
         symbol
         for symbol in entry["owned_symbols"]
-        if len(symbol) <= _MAX_OWNED_SYMBOL_LENGTH
+        if len(symbol.encode("utf-8")) <= _MAX_OWNED_SYMBOL_BYTES
         and bool(_MACHINE_SYMBOL.fullmatch(symbol))
     ]
 
@@ -2201,7 +2283,11 @@ def _collect_overlap_parser_requests(
     left: str,
     right: str,
     changed_paths: set[str],
-) -> tuple[list[_ParserRequest], dict[tuple[str, str], bytes]]:
+) -> tuple[
+    list[_ParserRequest],
+    dict[tuple[str, str], bytes],
+    dict[tuple[str, str], str],
+]:
     symbols = tuple(sorted({
         symbol
         for entry in entries
@@ -2209,6 +2295,8 @@ def _collect_overlap_parser_requests(
     }))
     requests: list[_ParserRequest] = []
     sources: dict[tuple[str, str], bytes] = {}
+    request_ids: dict[tuple[str, str], str] = {}
+    request_index = 0
     for path in sorted(changed_paths):
         language = _parser_language(path)
         if language is None:
@@ -2216,9 +2304,11 @@ def _collect_overlap_parser_requests(
         for revision in (left, right):
             blob_oid, source = _blob_bytes_or_empty(repo, revision, path)
             sources[(revision, path)] = source
+            request_id = f"request-{request_index:08x}"
+            request_ids[(revision, path)] = request_id
             requests.append(
                 _ParserRequest(
-                    request_id=f"{revision}:{path}",
+                    request_id=request_id,
                     path=path,
                     language=language,
                     blob_oid=blob_oid,
@@ -2226,7 +2316,8 @@ def _collect_overlap_parser_requests(
                     symbols=symbols,
                 )
             )
-    return requests, sources
+            request_index += 1
+    return requests, sources, request_ids
 
 
 def _owned_symbol_hits(
@@ -2303,10 +2394,14 @@ def classify_upstream_overlaps(
     left, right = _resolved_diff_endpoints(repo, diff_range)
     changes = _changed_paths(repo, f"{left}..{right}")
     changed = {path for _status, paths in changes for path in paths}
-    parser_requests, parser_sources = _collect_overlap_parser_requests(
+    parser_requests, parser_sources, parser_request_ids = _collect_overlap_parser_requests(
         entries, repo, left, right, changed
     )
-    parser_spans = (resolver or _NonPythonSymbolResolver()).spans(parser_requests)
+    parser_results = (resolver or _NonPythonSymbolResolver()).spans(parser_requests)
+    parser_spans = {
+        f"{revision}:{path}": parser_results[request_id]
+        for (revision, path), request_id in parser_request_ids.items()
+    }
     parser_changed_ranges = {
         path: _git_changed_byte_ranges(
             repo,
@@ -2417,7 +2512,11 @@ def _write_json_atomically(path: Path, value: Any) -> None:
     temp_path = Path(raw_temp)
     try:
         with os.fdopen(descriptor, "wb") as stream:
-            os.fchmod(stream.fileno(), 0o600)
+            descriptor_chmod = getattr(os, "fchmod", None)
+            if descriptor_chmod is not None:
+                descriptor_chmod(stream.fileno(), 0o600)
+            else:
+                os.chmod(temp_path, 0o600)
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())

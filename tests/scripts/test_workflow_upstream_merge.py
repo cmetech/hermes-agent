@@ -7,6 +7,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -2427,6 +2428,237 @@ def test_ledger_runner_reaps_resistant_group_after_leader_signal(
     assert result.returncode == 1
     assert [attempt["result"] for attempt in records[0]["attempts"]] == ["signaled"]
     _assert_resistant_descendant_was_reaped(tmp_path / "ledger-fixture")
+
+
+def _setsid_descendant_source(stem: str, outcome: str) -> str:
+    actions = {
+        "success": "    assert True\n",
+        "failure": "    raise AssertionError('retry me')\n",
+        "timeout": "    time.sleep(30)\n",
+        "cancellation": "    time.sleep(30)\n",
+    }
+    return (
+        "from pathlib import Path\n"
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n\n"
+        "def test_setsid_descendant():\n"
+        f"    counter = Path('.{stem}-attempt')\n"
+        "    attempt = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "    counter.write_text(str(attempt))\n"
+        f"    child_stem = f'{stem}-{{attempt}}'\n"
+        "    child = (\"import os, psutil, signal, time; from pathlib import Path; \"\n"
+        "        \"os.setsid(); signal.signal(signal.SIGTERM, signal.SIG_IGN); \"\n"
+        "        f\"Path('.{child_stem}.ready').write_text("
+        "f'{{os.getpid()}}:{{psutil.Process().create_time()}}'); \"\n"
+        "        f\"time.sleep(2); Path('.{child_stem}.marker').write_text('escaped'); \"\n"
+        "        \"time.sleep(30)\")\n"
+        "    subprocess.Popen([sys.executable, '-c', child], stdin=subprocess.DEVNULL, \n"
+        "        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "    ready = Path(f'.{child_stem}.ready')\n"
+        "    deadline = time.monotonic() + 2\n"
+        "    while not ready.exists() and time.monotonic() < deadline:\n"
+        "        time.sleep(0.01)\n"
+        "    assert ready.exists()\n"
+        "    time.sleep(0.15)\n"
+        + actions[outcome]
+    )
+
+
+def _assert_setsid_descendants_were_reaped(repo: Path, *stems: str) -> None:
+    ready_paths = [repo / f".{stem}.ready" for stem in stems]
+    marker_paths = [repo / f".{stem}.marker" for stem in stems]
+    assert all(path.is_file() for path in ready_paths)
+    child_identities = [
+        (int(pid), float(created_at))
+        for pid, created_at in (path.read_text().split(":", 1) for path in ready_paths)
+    ]
+    time.sleep(2.2)
+    escaped = [path.exists() for path in marker_paths]
+    alive = []
+    for child_pid, child_created_at in child_identities:
+        try:
+            candidate = ledger_runner.psutil.Process(child_pid)
+            original_identity_alive = (
+                candidate.create_time() == child_created_at
+                and candidate.status() != ledger_runner.psutil.STATUS_ZOMBIE
+            )
+        except (ledger_runner.psutil.NoSuchProcess, ledger_runner.psutil.ZombieProcess):
+            original_identity_alive = False
+        if not original_identity_alive:
+            alive.append(False)
+        else:
+            alive.append(True)
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os, psutil, signal, sys; "
+                        "candidate = psutil.Process(int(sys.argv[1])); "
+                        "candidate.create_time() == float(sys.argv[2]) and "
+                        "os.kill(candidate.pid, signal.SIGKILL)"
+                    ),
+                    str(child_pid),
+                    str(child_created_at),
+                ],
+                capture_output=True,
+                check=False,
+            )
+    assert escaped == [False] * len(stems)
+    assert alive == [False] * len(stems)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX setsid containment policy")
+def test_ledger_runner_reaps_setsid_descendant_after_success(tmp_path: Path) -> None:
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {"tests/test_setsid_success.py": _setsid_descendant_source("setsid-success", "success")},
+        timeout_seconds=3,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert [attempt["result"] for attempt in records[0]["attempts"]] == ["passed"]
+    _assert_setsid_descendants_were_reaped(
+        tmp_path / "ledger-fixture", "setsid-success-1"
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX setsid containment policy")
+def test_ledger_runner_reaps_setsid_descendants_after_ordinary_failures(
+    tmp_path: Path,
+) -> None:
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {"tests/test_setsid_failure.py": _setsid_descendant_source("setsid-failure", "failure")},
+        timeout_seconds=3,
+    )
+
+    assert result.returncode == 1
+    assert [attempt["result"] for attempt in records[0]["attempts"]] == [
+        "failed",
+        "failed",
+    ]
+    _assert_setsid_descendants_were_reaped(
+        tmp_path / "ledger-fixture", "setsid-failure-1", "setsid-failure-2"
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX setsid containment policy")
+def test_ledger_runner_reaps_setsid_descendant_after_timeout(tmp_path: Path) -> None:
+    result, records = _run_ledger_fixture(
+        tmp_path,
+        {"tests/test_setsid_timeout.py": _setsid_descendant_source("setsid-timeout", "timeout")},
+        timeout_seconds=0.5,
+    )
+
+    assert result.returncode == 1
+    assert [attempt["result"] for attempt in records[0]["attempts"]] == ["timed_out"]
+    _assert_setsid_descendants_were_reaped(
+        tmp_path / "ledger-fixture", "setsid-timeout-1"
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX setsid containment policy")
+@pytest.mark.live_system_guard_bypass
+def test_ledger_runner_reaps_setsid_descendant_after_cancellation(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "cancelled-ledger-fixture"
+    test_path = repo / "tests/test_setsid_cancellation.py"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(_setsid_descendant_source("setsid-cancellation", "cancellation"))
+    cancel_event = threading.Event()
+    ready = repo / ".setsid-cancellation-1.ready"
+
+    def cancel_when_ready() -> None:
+        deadline = time.monotonic() + 3
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        cancel_event.set()
+
+    canceller = threading.Thread(target=cancel_when_ready)
+    canceller.start()
+    with pytest.raises(ledger_runner.CancelledError):
+        ledger_runner._execute_attempt(
+            repo,
+            "tests/test_setsid_cancellation.py",
+            "python",
+            timeout_seconds=5,
+            output_limit_bytes=2048,
+            cancel_event=cancel_event,
+        )
+    canceller.join(timeout=3)
+    assert not canceller.is_alive()
+    _assert_setsid_descendants_were_reaped(repo, "setsid-cancellation-1")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process identity policy")
+def test_posix_cleanup_signals_verified_escaped_identity_but_not_reused_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader_pid = 43125
+    escaped_pid = 43126
+    reused_pid = 43127
+    created = {leader_pid: 1.0, escaped_pid: 2.0, reused_pid: 99.0}
+
+    class ExitedProcess:
+        pid = leader_pid
+        returncode = 0
+
+        def wait(self):
+            return 0
+
+    class Candidate:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def create_time(self) -> float:
+            return created[self.pid]
+
+        def status(self) -> str:
+            return "running"
+
+        def children(self, recursive: bool = False) -> list:
+            return []
+
+    group_signals: list[int] = []
+    identity_signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(ledger_runner.psutil, "Process", Candidate)
+    monkeypatch.setattr(
+        ledger_runner,
+        "_snapshot_process_group",
+        lambda _group: {leader_pid: 1.0},
+    )
+    monkeypatch.setattr(
+        ledger_runner.os,
+        "getpgid",
+        lambda pid: leader_pid if pid == leader_pid else pid,
+    )
+    monkeypatch.setattr(
+        ledger_runner.os,
+        "killpg",
+        lambda _group, sent_signal: group_signals.append(sent_signal),
+    )
+    monkeypatch.setattr(
+        ledger_runner.os,
+        "kill",
+        lambda pid, sent_signal: identity_signals.append((pid, sent_signal)),
+    )
+    monkeypatch.setattr(ledger_runner, "_TERMINATE_GRACE_SECONDS", 0)
+
+    ledger_runner._terminate_process_group(
+        ExitedProcess(),
+        leader_pid,
+        {leader_pid: 1.0, escaped_pid: 2.0, reused_pid: 3.0},
+    )
+
+    assert group_signals == [signal.SIGTERM, signal.SIGKILL]
+    assert identity_signals == [
+        (escaped_pid, signal.SIGTERM),
+        (escaped_pid, signal.SIGKILL),
+    ]
 
 
 def test_rehearsal_records_reconciled_conflict_files(tmp_path: Path) -> None:

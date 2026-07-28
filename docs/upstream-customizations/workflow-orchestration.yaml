@@ -4086,7 +4086,7 @@ upstream_changes:
   - exact JSON and TOML lexical-token ranges compare only changed character spans, with cycle-safe YAML traversal
   - strict manifest history, lexical paths, and Git-tree file types anchor to one resolved source revision
   - parser-derived broad JS, TS, and Markdown semantic syntax remains searchable
-  - parser-derived HTML and comments are excluded while literals, code, and prose remain searchable
+  - parser-derived comments are excluded while non-comment HTML, literals, code, and prose remain searchable
   - parser requests contain only exact committed Git blob bytes encoded as canonical base64
   - parser and changed ranges use exact half-open UTF-8 byte spans
   - parser protocol and dependency versions are explicitly attested

@@ -816,29 +816,29 @@ def _refresh_known_group_members(
     process_group: int,
     known_members: dict[int, float],
 ) -> None:
-    if not _known_group_member_alive(process_group, known_members):
-        return
-    known_members.update(_snapshot_process_group(process_group))
+    if _known_group_member_alive(process_group, known_members):
+        known_members.update(_snapshot_process_group(process_group))
+    _refresh_known_descendants(known_members)
+
+
+def _refresh_known_descendants(known_members: dict[int, float]) -> None:
+    """Retain descendants of exact process identities, even after they call setsid."""
     for pid, created_at in list(known_members.items()):
         try:
             parent = psutil.Process(pid)
-            if parent.create_time() != created_at or (
-                os.name == "posix" and os.getpgid(pid) != process_group
-            ):
+            if parent.create_time() != created_at:
                 continue
             descendants = parent.children(recursive=True)
         except (ProcessLookupError, PermissionError, psutil.Error):
             continue
         for descendant in descendants:
             try:
-                if os.name != "posix" or os.getpgid(descendant.pid) == process_group:
-                    known_members[descendant.pid] = descendant.create_time()
+                known_members[descendant.pid] = descendant.create_time()
             except (ProcessLookupError, PermissionError, psutil.Error):
                 continue
 
 
-def _known_group_member_running(
-    process_group: int,
+def _known_process_identity_running(
     known_members: dict[int, float],
 ) -> bool:
     for pid, created_at in known_members.items():
@@ -846,13 +846,34 @@ def _known_group_member_running(
             candidate = psutil.Process(pid)
             if (
                 candidate.create_time() == created_at
-                and os.getpgid(pid) == process_group
                 and candidate.status() != psutil.STATUS_ZOMBIE
             ):
                 return True
         except (ProcessLookupError, PermissionError, psutil.Error):
             continue
     return False
+
+
+def _signal_verified_escaped_descendants(
+    process_group: int,
+    known_members: dict[int, float],
+    sent_signal: int,
+) -> None:
+    """Signal tracked descendants only when their PID/create-time identity survives."""
+    for pid, created_at in known_members.items():
+        if pid == process_group:
+            continue
+        try:
+            candidate = psutil.Process(pid)
+            if candidate.create_time() != created_at:
+                continue
+            if os.getpgid(pid) == process_group:
+                continue
+            os.kill(pid, sent_signal)
+        except (ProcessLookupError, psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except (PermissionError, psutil.Error):
+            raise
 
 
 def _require_owned_process_group(
@@ -928,51 +949,67 @@ def _terminate_process_group(
     # completion.  Descendant discovery is not a safe prerequisite here: a
     # short-lived intermediate can exit before psutil observes its resistant
     # grandchild, while the kernel still retains the original group identity.
-    if not _require_owned_process_group(
+    group_owned = _require_owned_process_group(
         process_group,
         known_members,
         leader_identity_reserved=leader_identity_reserved,
-    ):
-        process.wait()
-        return
+    )
+    if group_owned:
+        known_members.update(_snapshot_process_group(process_group))
+    _refresh_known_descendants(known_members)
     leader_identity_reserved = leader_identity_reserved or getattr(
         process, "returncode", None
     ) is None
-    try:
-        os.killpg(process_group, signal.SIGTERM)
-    except ProcessLookupError:
-        process.wait()
-        return
-    except PermissionError:
-        # Darwin may report EPERM rather than ESRCH for an already-empty
-        # process group.  Confirm emptiness by identity before treating that as
-        # successful cleanup; a populated inaccessible group remains an error.
-        if _snapshot_process_group(process_group):
-            raise
-        process.wait()
-        return
+    if group_owned:
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except ProcessLookupError:
+            group_owned = False
+        except PermissionError:
+            # Darwin may report EPERM rather than ESRCH for an already-empty
+            # process group.  Confirm emptiness by identity before treating that as
+            # successful cleanup; a populated inaccessible group remains an error.
+            if _snapshot_process_group(process_group):
+                raise
+            group_owned = False
+    _signal_verified_escaped_descendants(
+        process_group, known_members, signal.SIGTERM
+    )
 
     deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
     while time.monotonic() < deadline:
-        _refresh_known_group_members(process_group, known_members)
-        if not _known_group_member_running(process_group, known_members):
+        _refresh_known_descendants(known_members)
+        if not _known_process_identity_running(known_members):
             break
         time.sleep(_POLL_SECONDS)
     else:
-        if not _require_owned_process_group(
-            process_group,
-            known_members,
-            leader_identity_reserved=leader_identity_reserved,
-        ):
-            process.wait()
-            return
-        try:
-            os.killpg(process_group, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            if _snapshot_process_group(process_group):
+        _refresh_known_descendants(known_members)
+        if group_owned:
+            try:
+                group_owned = _require_owned_process_group(
+                    process_group,
+                    known_members,
+                    leader_identity_reserved=leader_identity_reserved,
+                )
+            except Exception:
+                _signal_verified_escaped_descendants(
+                    process_group, known_members, signal.SIGKILL
+                )
                 raise
+        if group_owned:
+            known_members.update(_snapshot_process_group(process_group))
+            _refresh_known_descendants(known_members)
+        if group_owned:
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                if _snapshot_process_group(process_group):
+                    raise
+        _signal_verified_escaped_descendants(
+            process_group, known_members, signal.SIGKILL
+        )
     process.wait()
 
 

@@ -245,6 +245,78 @@ def test_parser_blob_loader_reads_requested_historical_revision_not_head(
     assert calls[0][0].source == b"export const ExactToken = true;\n"
 
 
+def test_parser_blob_loader_rejects_oversized_metadata_before_content_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The committed payload must not be acquired after its size is known unsafe."""
+    oid = "a" * 40
+    calls: list[tuple[str, ...]] = []
+
+    def metadata_only(argv, **kwargs):
+        command = tuple(argv)
+        calls.append(command)
+        if command[1:3] == ("rev-parse", "--verify"):
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=f"{oid}\n".encode(), stderr=b""
+            )
+        if command[1:3] == ("cat-file", "-t"):
+            return subprocess.CompletedProcess(argv, 0, stdout=b"blob\n", stderr=b"")
+        if command[1:3] == ("cat-file", "-s"):
+            size = (4 * 1024 * 1024) + 1
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=f"{size}\n".encode(), stderr=b""
+            )
+        pytest.fail(f"committed content capture ran after oversized metadata: {command}")
+
+    monkeypatch.setattr(customization_checker.subprocess, "run", metadata_only)
+
+    with pytest.raises(ValueError) as raised:
+        customization_checker._blob_bytes(tmp_path, "resolved", "nested/owned.ts")
+
+    assert str(raised.value).startswith("non-Python parser input_limit")
+    assert "nested/owned.ts" in str(raised.value)
+    assert [command[1:3] for command in calls] == [
+        ("rev-parse", "--verify"),
+        ("cat-file", "-t"),
+        ("cat-file", "-s"),
+    ]
+
+
+def test_blob_loader_preserves_oversized_non_parser_formats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    oid = "b" * 40
+    payload = b"x" * ((4 * 1024 * 1024) + 1)
+    captures = 0
+
+    def controlled_git(argv, **kwargs):
+        nonlocal captures
+        command = tuple(argv)
+        if command[1:3] == ("rev-parse", "--verify"):
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=f"{oid}\n".encode(), stderr=b""
+            )
+        if command[1:3] == ("cat-file", "-t"):
+            return subprocess.CompletedProcess(argv, 0, stdout=b"blob\n", stderr=b"")
+        if command[1:3] == ("cat-file", "-s"):
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=f"{len(payload)}\n".encode(), stderr=b""
+            )
+        if command[1:3] == ("cat-file", "blob"):
+            captures += 1
+            return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr=b"")
+        pytest.fail(f"unexpected Git invocation: {command}")
+
+    monkeypatch.setattr(customization_checker.subprocess, "run", controlled_git)
+
+    assert customization_checker._blob_bytes(
+        tmp_path, "resolved", "fixture.json"
+    ) == (oid, payload)
+    assert captures == 1
+
+
 def test_parser_resolver_batches_paths_and_deduplicates_identical_requests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -868,6 +940,58 @@ def test_parser_errors_are_bounded_and_do_not_echo_source(
     )
 
 
+def test_parser_originated_request_failure_names_repository_path_without_source() -> None:
+    secret = b"const DO_NOT_ECHO_SECRET_SOURCE = ;"
+    request = _parser_request(
+        "request-00000000",
+        source=secret,
+        path="nested/parser-owned.ts",
+    )
+
+    with pytest.raises(ValueError) as raised:
+        customization_checker._run_parser_batch([request])
+
+    message = str(raised.value)
+    assert message.startswith("non-Python parser parse_diagnostic")
+    assert "nested/parser-owned.ts" in message
+    assert "request-00000000" not in message
+    assert "DO_NOT_ECHO_SECRET_SOURCE" not in message
+    assert len(message) <= 512
+
+
+def test_parser_transport_accepts_valid_long_repository_path() -> None:
+    path = ("nested/" * 500) + "owned.ts"
+    request = _parser_request("request-00000000", path=path)
+
+    assert customization_checker._run_parser_batch([request]) == {
+        "request-00000000": {"ExactToken": [(6, 16)]}
+    }
+
+
+@pytest.mark.parametrize(
+    "parser_request",
+    [
+        _parser_request("r" * 129),
+        _parser_request("path-limit", path=("p" * 4094) + ".ts"),
+        _parser_request("symbol-limit", symbols=("é" * 129,)),
+    ],
+    ids=("request-id", "path", "symbol"),
+)
+def test_parser_transport_rejects_metadata_beyond_aligned_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    parser_request: customization_checker._ParserRequest,
+) -> None:
+    monkeypatch.setattr(
+        customization_checker,
+        "_run_bounded_capture",
+        lambda *args, **kwargs: pytest.fail("invalid metadata reached parser capture"),
+    )
+
+    _assert_bounded_parser_error(
+        lambda: customization_checker._run_parser_batch([parser_request])
+    )
+
+
 def test_manifest_rejects_non_hex_and_paths_outside_repository(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     manifest = _manifest(repo, "not-a-sha")
@@ -1074,6 +1198,49 @@ FencedToken
     )
 
 
+def test_markdown_html_attribute_comment_text_is_searchable_end_to_end(
+    tmp_path: Path,
+) -> None:
+    source = '<div title="<!-- ExactToken -->">visible</div>\n'
+    repo, source_path, manifest = _non_python_manifest(tmp_path, ".md", source)
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    left = _git(repo, "rev-parse", "HEAD")
+
+    source_path.write_text(source.replace("ExactToken", "ExactT0ken"))
+    _git(repo, "commit", "-am", "edit non-comment html attribute")
+
+    assert (
+        classify_upstream_overlap(entry, repo, f"{left}..HEAD")["classification"]
+        == "owned_symbol"
+    )
+
+
+def test_markdown_unclosed_html_comment_is_excluded_end_to_end(
+    tmp_path: Path,
+) -> None:
+    source = "ExactToken\n\n<!-- ExactToken\n"
+    repo, source_path, manifest = _non_python_manifest(tmp_path, ".md", source)
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    left = _git(repo, "rev-parse", "HEAD")
+
+    source_path.write_text(source.replace("<!-- ExactToken", "<!-- ExactT0ken"))
+    _git(repo, "commit", "-am", "edit unclosed html comment")
+
+    assert (
+        classify_upstream_overlap(entry, repo, f"{left}..HEAD")["classification"]
+        == "same_file"
+    )
+
+    source_path.write_text("<!-- ExactToken\n")
+    _git(repo, "commit", "-am", "leave only unclosed html comment")
+    with pytest.raises(ValueError, match="does not exist in declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
 def test_non_python_overlap_uses_utf8_byte_ranges_after_multibyte_prefix(
     tmp_path: Path,
 ) -> None:
@@ -1205,12 +1372,12 @@ def test_classify_all_entries_uses_one_shared_parser_resolution_pass(
 
     assert len(calls) == 1
     assert [request.request_id for request in calls[0]] == [
-        f"{left}:equivalent.js",
-        f"{right}:equivalent.js",
-        f"{left}:first.js",
-        f"{right}:first.js",
-        f"{left}:second.md",
-        f"{right}:second.md",
+        "request-00000000",
+        "request-00000001",
+        "request-00000002",
+        "request-00000003",
+        "request-00000004",
+        "request-00000005",
     ]
     assert [item["id"] for item in overlaps] == ["first", "second"]
     assert [item["classification"] for item in overlaps] == [
@@ -1278,8 +1445,8 @@ def test_manifest_uses_one_shared_parser_resolution_pass(
     ]
     assert len(calls) == 1
     assert [request.request_id for request in calls[0]] == [
-        f"{revision}:guide.md",
-        f"{revision}:shared.js",
+        "request-00000000",
+        "request-00000001",
     ]
     assert [request.symbols for request in calls[0]] == [
         ("FirstToken", "MarkdownToken"),
@@ -2275,7 +2442,10 @@ def test_typescript_malformed_syntax_fails_closed(
     """Malformed TypeScript cannot downgrade into best-effort token matching."""
     repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
 
-    with pytest.raises(ValueError, match="non-Python parser process_failure"):
+    with pytest.raises(
+        ValueError,
+        match='non-Python parser parse_diagnostic at "owned\\.ts"',
+    ):
         load_and_validate_manifest(manifest, repo, check_git=False)
 
 
@@ -3427,6 +3597,52 @@ def test_cli_report_publication_is_atomic_and_preserves_acknowledgements(
     published = json.loads(report_path.read_text())
     assert published["overlaps"][0]["acknowledged"] is True
     assert report_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_atomic_report_publication_replaces_without_fchmod_on_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = tmp_path / "report.json"
+    report.write_text("prior\n")
+    chmod_calls: list[tuple[Path, int]] = []
+    real_chmod = customization_checker.os.chmod
+
+    def recording_chmod(path, mode):
+        chmod_calls.append((Path(path), mode))
+        real_chmod(path, mode)
+
+    monkeypatch.delattr(customization_checker.os, "fchmod")
+    monkeypatch.setattr(customization_checker.os, "chmod", recording_chmod)
+    monkeypatch.setattr(customization_checker, "_is_windows", lambda: True)
+
+    customization_checker._write_json_atomically(report, {"status": "new"})
+
+    assert json.loads(report.read_text()) == {"status": "new"}
+    assert len(chmod_calls) == 1
+    assert chmod_calls[0][0].parent == tmp_path
+    assert chmod_calls[0][1] == 0o600
+    assert list(tmp_path.glob(".report.json.*")) == []
+
+
+def test_atomic_report_publication_cleans_temp_after_replace_failure_without_fchmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = tmp_path / "report.json"
+    report.write_bytes(b"prior evidence\n")
+    monkeypatch.delattr(customization_checker.os, "fchmod")
+
+    def fail_replace(_source, _destination):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(customization_checker.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failure"):
+        customization_checker._write_json_atomically(report, {"status": "new"})
+
+    assert report.read_bytes() == b"prior evidence\n"
+    assert list(tmp_path.glob(".report.json.*")) == []
 
 
 def test_strict_requested_revision_uses_its_committed_path_inventory(
