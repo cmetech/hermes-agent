@@ -784,6 +784,88 @@ def test_typescript_unlabeled_break_asi_does_not_capture_next_division(
         load_and_validate_manifest(manifest, repo, check_git=False)
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "let of = 8; loop: while (true) break loop\nof / 2; /* ExactToken */\n",
+        "let of = 8; loop: while (true) break loop;\nof / 2; /* ExactToken */\n",
+        (
+            "let of = 8; loop: while (true) { continue loop\n"
+            "of / 2; /* ExactToken */\n}\n"
+        ),
+        (
+            "let of = 8; loop: while (true) { continue loop;\n"
+            "of / 2; /* ExactToken */\n}\n"
+        ),
+        "let of = 8; debugger\nof / 2; /* ExactToken */\n",
+        "let of = 8; debugger;\nof / 2; /* ExactToken */\n",
+        (
+            "let of = 8; function divide() { return\n"
+            "of / 2; /* ExactToken */\n}\n"
+        ),
+        (
+            "let of = 8; function divide() { return;\n"
+            "of / 2; /* ExactToken */\n}\n"
+        ),
+        "let of = 8; const quotient = of / 2; /* ExactToken */\n",
+        "const of = () => 8; of() / 2; /* ExactToken */\n",
+        "const value = { of: 8 }; value.of / 2; /* ExactToken */\n",
+        "let of = 8; of++ / 2; /* ExactToken */\n",
+        "const values = [8]; let of = 0; values[of] / 2; /* ExactToken */\n",
+        "let of = 8; for (of / 2; of < 9; of++) {} /* ExactToken */\n",
+        "for (let of = 8; of < 9; of++) {} /* ExactToken */\n",
+    ],
+)
+def test_typescript_contextual_of_keeps_ordinary_division_goal(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    """Outside a for-of delimiter, ``of`` remains an ordinary identifier."""
+    _assert_javascript_syntax(tmp_path, source)
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "const value = `${(() => { for (const entry of /}}/.exec('}}') ?? []) {} "
+            "/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(async () => { for await (const entry of /}}/.exec('}}') ?? []) {} "
+            "/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { for (const outer of [1]) { "
+            "for (const entry of /}}/.exec('}}') ?? []) {} } "
+            "/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { for (const entry of ((/}}/.exec('}}') ?? []))) {} "
+            "/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { for (let of of /}}/.exec('}}') ?? []) {} "
+            "/* ExactToken */ return 1; })()}`\n"
+        ),
+    ],
+)
+def test_typescript_for_of_delimiter_keeps_regex_goal_inside_templates(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    """Only a real for-of delimiter may make its RHS slash a regex literal."""
+    _assert_javascript_syntax(tmp_path, source)
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
 def test_typescript_postfix_non_null_division_does_not_expose_comments(
     tmp_path: Path,
 ) -> None:

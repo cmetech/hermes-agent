@@ -766,7 +766,6 @@ def _typescript_without_comments(source: str) -> str:
             "in",
             "instanceof",
             "new",
-            "of",
             "return",
             "throw",
             "typeof",
@@ -783,8 +782,13 @@ def _typescript_without_comments(source: str) -> str:
     # keywords, but they still end an expression and therefore cannot put a
     # following slash into the regular-expression lexical goal.
     stack: list[tuple[str, int, bool, bool]] = [("code", 0, True, False)]
-    control_header_pending = False
+    control_header_pending: str | None = None
     control_parentheses: list[bool] = []
+    # A for-of delimiter is contextual: ``of`` remains an identifier everywhere
+    # except immediately after a completed left-hand side in its own for header.
+    # The header stack is bounded by the source length and tracks only the
+    # lexical states needed to choose the slash goal, not JavaScript semantics.
+    for_headers: list[tuple[int, str]] = []
     expression_braces: list[bool] = []
     block_brace_pending = True
     # These are deliberately lexical, bounded states rather than a partial
@@ -794,6 +798,15 @@ def _typescript_without_comments(source: str) -> str:
     statement_start = True
     label_candidate = False
     restricted_statement: str | None = None
+
+    def active_for_header() -> int | None:
+        if not for_headers:
+            return None
+        header_depth, _state = for_headers[-1]
+        if header_depth == len(control_parentheses):
+            return len(for_headers) - 1
+        return None
+
     index = 0
     while index < len(source):
         mode, depth, regex_allowed, property_name_pending = stack[-1]
@@ -879,7 +892,7 @@ def _typescript_without_comments(source: str) -> str:
                 continue
         if char in {"'", '"'}:
             stack[-1] = (mode, depth, False, False)
-            control_header_pending = False
+            control_header_pending = None
             block_brace_pending = False
             statement_start = False
             label_candidate = False
@@ -888,7 +901,7 @@ def _typescript_without_comments(source: str) -> str:
             index += 1
         elif char == "`":
             stack[-1] = (mode, depth, False, False)
-            control_header_pending = False
+            control_header_pending = None
             block_brace_pending = False
             statement_start = False
             label_candidate = False
@@ -896,8 +909,11 @@ def _typescript_without_comments(source: str) -> str:
             stack.append(("template", 0, False, False))
             index += 1
         elif char == "(":
-            control_parentheses.append(control_header_pending)
-            control_header_pending = False
+            opens_for_header = control_header_pending == "for"
+            control_parentheses.append(control_header_pending is not None)
+            if opens_for_header:
+                for_headers.append((len(control_parentheses), "lhs_start"))
+            control_header_pending = None
             block_brace_pending = False
             statement_start = False
             label_candidate = False
@@ -905,10 +921,16 @@ def _typescript_without_comments(source: str) -> str:
             stack[-1] = (mode, depth, True, False)
             index += 1
         elif char == ")":
+            closes_for_header = (
+                bool(for_headers)
+                and for_headers[-1][0] == len(control_parentheses)
+            )
             closes_control_header = (
                 control_parentheses.pop() if control_parentheses else False
             )
-            control_header_pending = False
+            if closes_for_header:
+                for_headers.pop()
+            control_header_pending = None
             stack[-1] = (mode, depth, closes_control_header, False)
             block_brace_pending = closes_control_header
             statement_start = False
@@ -916,7 +938,7 @@ def _typescript_without_comments(source: str) -> str:
             restricted_statement = None
             index += 1
         elif char == "{":
-            control_header_pending = False
+            control_header_pending = None
             opens_expression = regex_allowed and not block_brace_pending
             expression_braces.append(opens_expression)
             block_brace_pending = False
@@ -931,7 +953,7 @@ def _typescript_without_comments(source: str) -> str:
             )
             index += 1
         elif char == "}":
-            control_header_pending = False
+            control_header_pending = None
             if mode == "expression" and depth == 1:
                 stack.pop()
                 block_brace_pending = False
@@ -946,6 +968,11 @@ def _typescript_without_comments(source: str) -> str:
                 )
                 block_brace_pending = not closes_expression
                 statement_start = not closes_expression
+            header_index = active_for_header()
+            if header_index is not None:
+                header_depth, header_state = for_headers[header_index]
+                if header_state in {"lhs_start", "binding"}:
+                    for_headers[header_index] = (header_depth, "lhs_complete")
             label_candidate = False
             restricted_statement = None
             index += 1
@@ -960,7 +987,7 @@ def _typescript_without_comments(source: str) -> str:
             # Prefix update retains expression-start eligibility; postfix update
             # retains expression-end eligibility.  Looking at the prior lexical
             # goal distinguishes the two without parsing an AST.
-            control_header_pending = False
+            control_header_pending = None
             stack[-1] = (mode, depth, regex_allowed, False)
             block_brace_pending = False
             statement_start = False
@@ -968,7 +995,7 @@ def _typescript_without_comments(source: str) -> str:
             restricted_statement = None
             index += 2
         elif source.startswith("=>", index):
-            control_header_pending = False
+            control_header_pending = None
             stack[-1] = (mode, depth, True, False)
             block_brace_pending = True
             statement_start = True
@@ -976,7 +1003,7 @@ def _typescript_without_comments(source: str) -> str:
             restricted_statement = None
             index += 2
         elif source.startswith("?.", index):
-            control_header_pending = False
+            control_header_pending = None
             stack[-1] = (mode, depth, False, True)
             block_brace_pending = False
             statement_start = False
@@ -984,7 +1011,7 @@ def _typescript_without_comments(source: str) -> str:
             restricted_statement = None
             index += 2
         elif char == ".":
-            control_header_pending = False
+            control_header_pending = None
             stack[-1] = (mode, depth, False, True)
             block_brace_pending = False
             statement_start = False
@@ -992,7 +1019,7 @@ def _typescript_without_comments(source: str) -> str:
             restricted_statement = None
             index += 1
         elif source.startswith(("!==", "!="), index):
-            control_header_pending = False
+            control_header_pending = None
             block_brace_pending = False
             statement_start = False
             label_candidate = False
@@ -1003,7 +1030,7 @@ def _typescript_without_comments(source: str) -> str:
             # ``!`` is unary at an expression start, but TypeScript's postfix
             # non-null assertion after an expression must retain the division
             # lexical goal for a following slash.
-            control_header_pending = False
+            control_header_pending = None
             block_brace_pending = False
             statement_start = False
             label_candidate = False
@@ -1018,8 +1045,9 @@ def _typescript_without_comments(source: str) -> str:
                 cursor += 1
             token = source[index:cursor]
             token_at_statement_start = statement_start
+            header_index = active_for_header()
             if property_name_pending:
-                control_header_pending = False
+                control_header_pending = None
                 regex_allowed = False
                 statement_start = False
                 label_candidate = False
@@ -1029,37 +1057,52 @@ def _typescript_without_comments(source: str) -> str:
                 # terminator.  Consuming it does not finish the restricted
                 # statement: ASI or an explicit semicolon still owns the next
                 # lexical-goal transition.
-                control_header_pending = False
+                control_header_pending = None
                 regex_allowed = False
                 statement_start = False
                 label_candidate = False
                 restricted_statement = "jump_label_consumed"
+            elif (
+                token == "of"
+                and header_index is not None
+                and for_headers[header_index][1] == "lhs_complete"
+                and not regex_allowed
+            ):
+                # ``of`` starts a regex-eligible RHS only as the delimiter of
+                # this for header.  Elsewhere it is an IdentifierName.
+                header_depth, _header_state = for_headers[header_index]
+                for_headers[header_index] = (header_depth, "rhs")
+                control_header_pending = None
+                regex_allowed = True
+                statement_start = False
+                label_candidate = False
+                restricted_statement = None
             elif token in {"break", "continue"}:
-                control_header_pending = False
+                control_header_pending = None
                 regex_allowed = False
                 statement_start = False
                 label_candidate = False
                 restricted_statement = "jump_label_allowed"
             elif token == "debugger":
-                control_header_pending = False
+                control_header_pending = None
                 regex_allowed = False
                 statement_start = False
                 label_candidate = False
                 restricted_statement = "statement_complete"
             elif token in control_header_keywords:
-                control_header_pending = True
+                control_header_pending = "for" if token == "for" else "control"
                 regex_allowed = False
                 statement_start = False
                 label_candidate = False
                 restricted_statement = None
-            elif control_header_pending and token == "await":
+            elif control_header_pending == "for" and token == "await":
                 # ``for await (...)`` retains the pending control header.
                 regex_allowed = False
                 statement_start = False
                 label_candidate = False
                 restricted_statement = None
             else:
-                control_header_pending = False
+                control_header_pending = None
                 regex_allowed = token in regex_prefix_keywords
                 if token in statement_prefix_keywords:
                     regex_allowed = True
@@ -1071,11 +1114,24 @@ def _typescript_without_comments(source: str) -> str:
                         token_at_statement_start and not regex_allowed
                     )
                 restricted_statement = None
+                if header_index is not None:
+                    header_depth, header_state = for_headers[header_index]
+                    if header_state == "lhs_start" and token in {"let", "const", "var"}:
+                        for_headers[header_index] = (header_depth, "binding")
+                    elif header_state in {"lhs_start", "binding"}:
+                        for_headers[header_index] = (header_depth, "lhs_complete")
             block_brace_pending = token in statement_prefix_keywords
             stack[-1] = (mode, depth, regex_allowed, False)
             index = cursor
         else:
-            control_header_pending = False
+            control_header_pending = None
+            header_index = active_for_header()
+            if header_index is not None:
+                header_depth, header_state = for_headers[header_index]
+                if char == ";":
+                    for_headers[header_index] = (header_depth, "classic")
+                elif char == "]" and header_state in {"lhs_start", "binding"}:
+                    for_headers[header_index] = (header_depth, "lhs_complete")
             if char == ":" and label_candidate:
                 regex_allowed = True
                 block_brace_pending = True
