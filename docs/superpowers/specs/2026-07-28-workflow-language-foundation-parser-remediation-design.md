@@ -105,6 +105,12 @@ Python-side parsing remains in place for Python and structured data. Existing
 language-specific handling outside JS/TS and Markdown remains outside this
 change.
 
+Exact non-Python changed-byte ranges come from Git's character-token porcelain
+word diff, not Python's quadratic `SequenceMatcher(..., autojunk=False)` path.
+Python invokes Git directly with exact resolved revisions and paths, parses the
+old/new byte cursors itself, and fails closed if the diff subprocess exceeds 60
+seconds or 64 MiB of combined output.
+
 ### Python parser adapter
 
 A small adapter inside the checker owns batching, subprocess lifecycle,
@@ -161,6 +167,12 @@ the exact value inside another searchable semantic token. This preserves
 current routes, translation keys, fixtures, constants, types, and member
 contracts.
 
+When a qualified relationship is syntactically present but not contiguous in
+source, such as `Owner /* trivia */ . member` or a scoped declaration, the
+helper records the individual identifier-token spans for `Owner.member`.
+Whitespace and comment bytes between those components are never included, so
+trivia-only edits cannot become owned-symbol overlaps.
+
 Any TypeScript parse diagnostic is terminal. The checker must not derive
 ownership from a recovered partial tree that the parser reports as malformed.
 
@@ -207,6 +219,10 @@ The production bounds are:
 - 16 MiB maximum helper output per batch;
 - 60-second wall-clock limit per batch; and
 - sequential parsing inside one helper process.
+
+The separate Git character-diff subprocess has a 60-second wall-clock limit
+and a 64 MiB combined-output limit. This is not helper protocol output and does
+not weaken the helper's 16 MiB output bound.
 
 The current ledger contains 84 unique JS/TS/Markdown files totaling roughly
 1.9 MiB, with the largest below 400 KiB. These limits leave substantial growth

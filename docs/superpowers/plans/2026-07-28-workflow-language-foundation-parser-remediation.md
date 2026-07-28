@@ -18,6 +18,7 @@
 - JavaScript and TypeScript searchable syntax includes identifiers, private/property/declaration names, dotted or qualified names, strings, regular expressions, templates, JSX, and literals; comments are excluded and parse diagnostics are terminal.
 - Markdown searchable syntax includes prose, headings, links, inline code, fenced code, containers, autolinks, and non-comment HTML; HTML comments are excluded.
 - Enforce 4 MiB per decoded blob, 16 MiB decoded source per batch, 16 MiB combined stdout/stderr per batch, and 60 seconds per batch.
+- Enforce a separate 64 MiB combined-output and 60-second limit on the Git character-diff subprocess used for exact changed-byte ranges.
 - Run helper batches sequentially and cache results only for the current checker invocation.
 - Missing Node, missing helper or packages, wrong dependency versions, invalid UTF-8, parse diagnostics, timeout, oversized input/output, malformed protocol, and invalid spans are terminal sanitized checker errors.
 - Never fall back to the removed JavaScript/TypeScript or Markdown heuristic scanners.
@@ -52,7 +53,7 @@
 **Interfaces:**
 - Consumes: newline-delimited JSON with a first record `{"type":"hello","protocol":1}` followed by parse records `{"type":"parse","id":str,"path":str,"language":"javascript"|"typescript"|"markdown","source_base64":str,"symbols":list[str]}`.
 - Produces: first record `{"type":"hello","protocol":1,"versions":{"typescript":"6.0.3","unified":"11.0.5","remark-parse":"11.0.0","micromark":"4.0.2"}}`, then one `{"type":"result","id":str,"spans":{symbol:[[start_byte,end_byte],...]}}` per request.
-- Produces functions `extractTypeScriptSpans(sourceText, sourceBytes, symbols, scriptKind)`, `extractMarkdownSpans(sourceText, sourceBytes, symbols)`, `utf8ByteOffsets(sourceText)`, and `exactCoveredMatches(sourceBytes, coveredByteRanges, symbolBytes)` for direct unit reasoning and ledger ownership.
+- Produces functions `extractTypeScriptSpans(sourceText, sourceBytes, symbols, scriptKind)`, `extractQualifiedTypeScriptSpans(sourceFile, offsets, requestedSymbols)`, `extractMarkdownSpans(sourceText, sourceBytes, symbols)`, `utf8ByteOffsets(sourceText)`, and `exactCoveredMatches(sourceBytes, coveredByteRanges, symbolBytes)` for direct unit reasoning and ledger ownership.
 - On any request error, writes one bounded `{"type":"error","id":str|null,"code":str,"detail":str}` record to stdout, writes no source bytes to stderr, and exits nonzero.
 
 - [ ] **Step 1: Pin the exact direct parser dependencies**
@@ -135,7 +136,7 @@ def _expected_occurrences(source: bytes, token: bytes) -> list[list[int]]:
     return found
 ```
 
-Add `test_typescript_parser_finds_broad_syntax_but_not_comments`, `test_typescript_parser_accepts_as_and_satisfies_contexts`, `test_markdown_parser_finds_broad_nodes_but_not_html_comments`, `test_helper_returns_utf8_byte_offsets_for_multibyte_prefixes`, and `test_helper_rejects_invalid_base64_utf8_and_parse_diagnostics`. Use JS/TS fixtures containing `obj.ExactToken`, `#ExactToken`, `'ExactToken'`, `/ExactToken/`, `` `ExactToken` ``, `<ExactToken />`, `value as ExactToken`, and `value satisfies ExactToken`; put the same token in `//` and `/* */` comments and assert the result equals `_expected_occurrences` with the comment offsets removed. Use Markdown fixtures containing a heading, link destination, inline code, fenced code, blockquote/list content, autolink, non-comment HTML, and `<!-- ExactToken -->`; assert only the HTML-comment offset is removed. Prefix the Unicode fixture with `"é🙂"` and assert the returned start is `len("é🙂".encode("utf-8"))`, not the Python character count. For each invalid input, assert nonzero exit, one `error` record, a stable `code`, and absence of the source text in stdout/stderr.
+Add `test_typescript_parser_finds_broad_syntax_but_not_comments`, `test_typescript_parser_accepts_as_and_satisfies_contexts`, `test_typescript_parser_finds_qualified_relationships_without_owning_trivia`, `test_markdown_parser_finds_broad_nodes_but_not_html_comments`, `test_helper_returns_utf8_byte_offsets_for_multibyte_prefixes`, and `test_helper_rejects_invalid_base64_utf8_and_parse_diagnostics`. Use JS/TS fixtures containing `obj.ExactToken`, `#ExactToken`, `'ExactToken'`, `/ExactToken/`, `` `ExactToken` ``, `<ExactToken />`, `value as ExactToken`, and `value satisfies ExactToken`; put the same token in `//` and `/* */` comments and assert the result equals `_expected_occurrences` with the comment offsets removed. For qualified syntax, request `Owner.member` from both `Owner /* trivia */ . member` and `namespace Owner { export const member = 1 }`; assert the returned spans are exactly the `Owner` and `member` token byte ranges, never the intervening whitespace/comment bytes. Use Markdown fixtures containing a heading, link destination, inline code, fenced code, blockquote/list content, autolink, non-comment HTML, and `<!-- ExactToken -->`; assert only the HTML-comment offset is removed. Prefix the Unicode fixture with `"é🙂"` and assert the returned start is `len("é🙂".encode("utf-8"))`, not the Python character count. For each invalid input, assert nonzero exit, one `error` record, a stable `code`, and absence of the source text in stdout/stderr.
 
 - [ ] **Step 3: Run the new helper tests to verify RED**
 
@@ -277,12 +278,15 @@ function extractTypeScriptSpans(sourceText, sourceBytes, symbols, scriptKind) {
   for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
     covered.push([offsets[scanner.getTokenPos()], offsets[scanner.getTextPos()]]);
   }
-  return Object.fromEntries(symbols.map(symbol => [
-    symbol,
-    exactCoveredMatches(sourceBytes, covered, Buffer.from(symbol, "utf8")),
-  ]));
+  const qualified = extractQualifiedTypeScriptSpans(parsed, offsets, new Set(symbols));
+  return Object.fromEntries(symbols.map(symbol => [symbol, deduplicateSpans([
+    ...exactCoveredMatches(sourceBytes, covered, Buffer.from(symbol, "utf8")),
+    ...(qualified.get(symbol) ?? []),
+  ])]));
 }
 ```
+
+`extractQualifiedTypeScriptSpans` must walk parser relationships rather than normalize raw text. For `PropertyAccessExpression` and `QualifiedName`, recursively collect identifier/private-identifier components; when their dot-joined names equal a requested symbol, record each component token's own byte span. Maintain a syntax-only scope stack for module/namespace, class, interface, and enum declarations; when a named member or declaration makes a requested scoped name, record only the scope-name and member-name token spans. Never return an enclosing node range, because that would make edits to whitespace or comments between components look like owned-symbol changes. Exact contiguous occurrences in literals and other tokens continue through `exactCoveredMatches`.
 
 - [ ] **Step 6: Implement Markdown parser-backed coverage**
 
@@ -370,6 +374,7 @@ git commit -m "feat(workflow): add bounded symbol parser helper"
 - Produces `_NonPythonSymbolResolver.spans(requests: Sequence[_ParserRequest]) -> dict[str, dict[str, list[tuple[int, int]]]]`; it batches sequentially, validates every helper response, and caches by `(blob_oid, language, symbols, protocol, parser_versions)` for its own lifetime only.
 - Produces `_blob_bytes(repo: Path, revision: str, path: str) -> tuple[str, bytes]` returning the exact blob OID and bytes; retains `_blob_text(repo, revision, path) -> str` for parser-independent formats by strict UTF-8 decoding of those bytes.
 - Produces `_parser_language(path: str) -> str | None` for only the approved JS/TS/Markdown suffixes.
+- Produces `_run_bounded_capture(argv: Sequence[str], *, cwd: Path, input_bytes: bytes | None, timeout_seconds: float, output_limit_bytes: int) -> _CompletedCapture`, the sanitized bounded subprocess primitive reused by Task 3's Git character diff.
 
 - [ ] **Step 1: Write failing committed-byte and batching tests**
 
@@ -430,7 +435,7 @@ Add exact constants for protocol 1, 16 MiB decoded batch input, 16 MiB output, 6
 
 - [ ] **Step 5: Implement a bounded helper lifecycle**
 
-Implement `_run_parser_batch(requests)` with `subprocess.Popen(..., stdin=PIPE, stdout=PIPE, stderr=PIPE)` plus one bounded writer and two bounded drain threads. Serialize one hello and all requests with compact JSON. Start Node with the repository root as `cwd`, pass no source in argv/environment, cap the combined bytes retained from stdout/stderr at 16 MiB while the process is running, kill immediately when the shared counter crosses the limit, and kill/reap after 60 seconds.
+Implement `_run_bounded_capture` with `subprocess.Popen(..., stdin=PIPE, stdout=PIPE, stderr=PIPE)` plus one bounded writer and two bounded drain threads. It returns only `returncode`, bounded `stdout`, and bounded `stderr`; start, timeout, output-limit, and stream failures become stable internal categories without embedding argv, absolute paths, or captured text. `_run_parser_batch(requests)` serializes one hello and all requests with compact JSON, calls this primitive with Node at the repository root, a 16 MiB output cap, and 60-second timeout, then applies parser-specific error translation. Pass no source in argv/environment, kill immediately when the shared counter crosses the limit, and always reap.
 
 The drain function must enforce the bound before appending a chunk, so neither memory nor a temporary file can grow past the contract:
 
@@ -536,7 +541,7 @@ git commit -m "feat(workflow): add fail-closed parser transport"
 **Interfaces:**
 - Consumes: `_NonPythonSymbolResolver`, `_ParserRequest`, `_blob_bytes`, and `_parser_language` from Task 2.
 - Produces `_collect_manifest_parser_requests(entries, repo, revision) -> list[_ParserRequest]` and uses one resolver instance for all strict manifest lookups.
-- Produces `_changed_byte_ranges(old_source: bytes, new_source: bytes) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]` using `difflib.SequenceMatcher(..., autojunk=False)` over bytes.
+- Produces `_git_changed_byte_ranges(repo: Path, left: str, right: str, path: str, old_source: bytes, new_source: bytes) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]` by parsing a bounded character-token Git word diff.
 - Produces `classify_upstream_overlaps(entries: Sequence[dict[str, Any]], repo: Path, diff_range: str, *, resolver: _NonPythonSymbolResolver | None = None) -> list[dict[str, Any]]` for one shared resolution pass.
 - Retains `classify_upstream_overlap(entry, repo, diff_range)` as a compatibility wrapper around `classify_upstream_overlaps([entry], ...)`.
 
@@ -600,17 +605,25 @@ parser_spans = resolver.spans(requests)
 
 - [ ] **Step 4: Replace non-Python line overlap with exact byte overlap**
 
-For JS/TS/Markdown changed paths, load exact left and right blob bytes (empty bytes when the path does not exist at that endpoint), parse both existing endpoints, and compare returned half-open spans with `_changed_byte_ranges`. Use:
+For JS/TS/Markdown changed paths, load exact left and right blob bytes (empty bytes when the path does not exist at that endpoint), parse both existing endpoints, and compare returned half-open spans with `_git_changed_byte_ranges`. Do not use `difflib.SequenceMatcher(..., autojunk=False)`: it exceeds five seconds on 100 KiB of repetitive input and cannot honor the approved 4 MiB source bound.
+
+Run Git with argument-vector invocation, a 60-second timeout, and a 64 MiB combined-output cap:
 
 ```python
-matcher = difflib.SequenceMatcher(a=old_source, b=new_source, autojunk=False)
-for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
-    if tag != "equal":
-        old_ranges.append((old_start, old_end))
-        new_ranges.append((new_start, new_end))
+argv = [
+    "git", "diff", "--no-ext-diff", "--no-color", "--text", "--unified=0",
+    "--word-diff=porcelain",
+    "--word-diff-regex=[[:space:]]|[^[:space:]]",
+    f"{left}..{right}", "--", path,
+]
+diff = _run_bounded_capture(
+    argv, cwd=repo, timeout_seconds=60, output_limit_bytes=64 * 1024 * 1024,
+)
 ```
 
-An insertion or deletion has an empty range on one side and a non-empty range on the other; only the non-empty side can overlap. Retain the current JSON/TOML exact-offset path and line-based behavior for unrelated languages.
+Parse output as bytes. Ignore headers until an `@@ -old_line,old_count +new_line,new_count @@` record, then initialize old/new cursors from byte line-start tables derived independently from `old_source` and `new_source`. In porcelain mode a line beginning with one space advances both cursors by the payload byte length, `-` records that old half-open range and advances only old, and `+` records that new range and advances only new. A standalone `~` represents a source newline and advances the side selected by the preceding marker (` ` advances both); protocol newlines are not source bytes. Validate each hunk's final cursors against its declared old/new line counts, reject malformed/oversized/timed-out output, and coalesce adjacent changed ranges. Character-token word diff ensures unchanged bytes inside a source line remain outside changed ranges without the quadratic Python matcher.
+
+Add `test_git_character_diff_bounds_repetitive_input_and_fails_closed` using a 100 KiB repetitive fixture, plus malformed-hunk, timeout, and output-limit cases against `_run_bounded_capture`. An insertion or deletion has an empty range on one side and a non-empty range on the other; only the non-empty side can overlap. Retain the current JSON/TOML exact-offset path and line-based behavior for unrelated languages.
 
 - [ ] **Step 5: Share one parser pass across the full overlap report**
 
@@ -712,7 +725,7 @@ git commit -m "fix(workflow): use parser spans for ledger overlap"
 
 **Interfaces:**
 - Consumes: the parser-only JS/TS/Markdown routes and deleted scanner symbols from Task 3.
-- Produces ledger ownership for `_ParserRequest`, `_NonPythonSymbolResolver`, `_run_parser_batch`, `classify_upstream_overlaps`, `PROTOCOL_VERSION`, `extractTypeScriptSpans`, and `extractMarkdownSpans`.
+- Produces ledger ownership for `_ParserRequest`, `_NonPythonSymbolResolver`, `_run_parser_batch`, `_git_changed_byte_ranges`, `classify_upstream_overlaps`, `PROTOCOL_VERSION`, `extractTypeScriptSpans`, `extractQualifiedTypeScriptSpans`, and `extractMarkdownSpans`.
 
 - [ ] **Step 1: Run strict live-ledger validation to verify RED**
 
@@ -751,9 +764,11 @@ Add a separate `workflow-parser-backed-symbol-ownership` entry so `package-lock.
   owned_symbols:
   - PROTOCOL_VERSION
   - extractTypeScriptSpans
+  - extractQualifiedTypeScriptSpans
   - extractMarkdownSpans
   - _NonPythonSymbolResolver
   - _run_parser_batch
+  - _git_changed_byte_ranges
   - 6.0.3
   - 11.0.5
   - 11.0.0
@@ -761,6 +776,7 @@ Add a separate `workflow-parser-backed-symbol-ownership` entry so `package-lock.
   owned_invariants:
   - parser requests contain only exact committed Git blob bytes selected by Python authority
   - parser-derived broad syntax spans exclude comments and use half-open UTF-8 byte offsets
+  - exact character-level Git diffs are bounded independently and fail closed before overlap classification
   - exact parser versions and bounded sequential batches fail closed without a lexical fallback
   - overlap reports replace prior evidence atomically only after complete parser success
   tests:
@@ -789,6 +805,7 @@ Document:
 6. the 4 MiB/16 MiB/16 MiB/60-second bounds;
 7. fail-closed errors with no heuristic fallback;
 8. atomic report replacement only after complete successful classification.
+9. the separate 64 MiB/60-second bound for character-token Git diff output and execution.
 
 - [ ] **Step 4: Run parser, checker, and live-ledger validation**
 
