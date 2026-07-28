@@ -866,6 +866,113 @@ def test_typescript_for_of_delimiter_keeps_regex_goal_inside_templates(
         load_and_validate_manifest(manifest, repo, check_git=False)
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "const value = `${(() => { for ((entry) of /}}/.exec('}}') ?? []) {} "
+            "/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(async () => { for await ((entry) of /}}/.exec('}}') ?? []) {} "
+            "/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { for (const [entry = value => { return 1; }] "
+            "of /}}/.exec('}}') ?? []) {} /* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { for (const { entry = function nested() { return 1; } } "
+            "of /}}/.exec('}}') ?? []) {} /* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { for (const { entry = class { method() { return 1; } } } "
+            "of /}}/.exec('}}') ?? []) {} /* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { for (const [{ entry: [value = 1] }] "
+            "of /}}/.exec('}}') ?? []) {} /* ExactToken */ return 1; })()}`\n"
+        ),
+    ],
+)
+def test_typescript_nested_for_lhs_keeps_outer_delimiter_at_header_level(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    """Closed LHS groups complete the header without exposing its regex RHS."""
+    _assert_javascript_syntax(tmp_path, source)
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "for (const key in function divide() { return 1\n"
+            "of / /* ExactToken */ 2 / 3; }) {}\n"
+        ),
+        (
+            "for (const key in value => { return 1\n"
+            "of / /* ExactToken */ 2 / 3; }) {}\n"
+        ),
+        (
+            "for (const key in class Divider { method() { return 1\n"
+            "of / /* ExactToken */ 2 / 3; } }) {}\n"
+        ),
+    ],
+)
+def test_typescript_nested_for_rhs_bodies_do_not_claim_outer_of_delimiter(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    """An ``of`` in a nested RHS body remains an ordinary division operand."""
+    _assert_javascript_syntax(tmp_path, source)
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+def test_typescript_nested_for_headers_use_the_innermost_context(
+    tmp_path: Path,
+) -> None:
+    """An inner await header owns its LHS and regex RHS until its own close."""
+    source = (
+        "const value = `${(async () => { for (const outer of [1]) { for await "
+        "(const [entry = value => { return 1; }] of (/}}/.exec('}}') ?? [])) {} } "
+        "/* ExactToken */ return 1; })()}`\n"
+    )
+    _assert_javascript_syntax(tmp_path, source)
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "const value = `${(() => { for ((entry) of /}}/.exec('}}') /* ExactToken */",
+        (
+            "for (const key in function divide() { return 1\n"
+            "of / /* ExactToken */ 2 / 3;"
+        ),
+    ],
+)
+def test_typescript_malformed_for_header_context_stays_bounded(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    """Unclosed groups do not leak comment ownership or raise scanner errors."""
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
 def test_typescript_postfix_non_null_division_does_not_expose_comments(
     tmp_path: Path,
 ) -> None:

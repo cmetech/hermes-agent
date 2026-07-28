@@ -4083,7 +4083,7 @@ upstream_changes:
   - language-aware comment ownership without exposing literals or heredoc bodies
   - exact JSON and TOML lexical-token ranges compare only changed character spans, with cycle-safe YAML traversal
   - strict manifest history, lexical paths, and Git-tree file types anchor to one resolved source revision
-  - control, keyword, property, postfix, delimiter, operator, restricted-statement, and label regular-expression goals retain JavaScript lexical boundaries, including contextual for-of and for-await-of delimiters plus optional jump labels through ASI or semicolon termination
+  - control, keyword, property, postfix, delimiter, operator, restricted-statement, and label regular-expression goals retain JavaScript lexical boundaries, including contextual for-in/of and for-await-of delimiters at each bounded header's own grouping and body depth, closed nested LHS completion, innermost nested-header precedence, and optional jump labels through ASI or semicolon termination
   - CommonMark container fences use visual tab-stop columns, relative list indentation, exact closing-fence width, container-aware blank continuation, and outer-line reprocessing only when a required container ends
   - JSON and TOML ownership spans exclude numeric, boolean, null, date, and array scalar occurrences
   - process-tree containment across normal exit, timeout, interruption, and failure

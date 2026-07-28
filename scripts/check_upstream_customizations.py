@@ -786,9 +786,12 @@ def _typescript_without_comments(source: str) -> str:
     control_parentheses: list[bool] = []
     # A for-of delimiter is contextual: ``of`` remains an identifier everywhere
     # except immediately after a completed left-hand side in its own for header.
-    # The header stack is bounded by the source length and tracks only the
-    # lexical states needed to choose the slash goal, not JavaScript semantics.
-    for_headers: list[tuple[int, str]] = []
+    # Header entries retain their control-parenthesis and delimiter-stack
+    # baselines.  The latter isolates nested grouping and bodies without trying
+    # to parse JavaScript: only a token at a header's own lexical top level may
+    # advance its phase.
+    for_headers: list[tuple[int, int, str]] = []
+    header_delimiters: list[str] = []
     expression_braces: list[bool] = []
     block_brace_pending = True
     # These are deliberately lexical, bounded states rather than a partial
@@ -802,10 +805,38 @@ def _typescript_without_comments(source: str) -> str:
     def active_for_header() -> int | None:
         if not for_headers:
             return None
-        header_depth, _state = for_headers[-1]
-        if header_depth == len(control_parentheses):
+        header_parenthesis_depth, header_delimiter_depth, _state = for_headers[-1]
+        if (
+            header_parenthesis_depth == len(control_parentheses)
+            and header_delimiter_depth == len(header_delimiters)
+        ):
             return len(for_headers) - 1
         return None
+
+    def set_for_header_state(header_index: int, state: str) -> None:
+        header_parenthesis_depth, header_delimiter_depth, _previous = for_headers[
+            header_index
+        ]
+        for_headers[header_index] = (
+            header_parenthesis_depth,
+            header_delimiter_depth,
+            state,
+        )
+
+    def complete_closed_lhs_group() -> None:
+        header_index = active_for_header()
+        if header_index is None:
+            return
+        if for_headers[header_index][2] in {"lhs_start", "binding"}:
+            set_for_header_state(header_index, "lhs_complete")
+            mode, depth, _regex_allowed, _property_name_pending = stack[-1]
+            stack[-1] = (mode, depth, False, False)
+
+    def close_header_delimiter(kind: str) -> bool:
+        if not header_delimiters or header_delimiters[-1] != kind:
+            return False
+        header_delimiters.pop()
+        return True
 
     index = 0
     while index < len(source):
@@ -826,6 +857,7 @@ def _typescript_without_comments(source: str) -> str:
                 index += min(2, len(source) - index)
             elif source.startswith("${", index):
                 stack.append(("expression", 1, True, False))
+                header_delimiters.append("${")
                 index += 2
             elif char == "`":
                 stack.pop()
@@ -911,8 +943,15 @@ def _typescript_without_comments(source: str) -> str:
         elif char == "(":
             opens_for_header = control_header_pending == "for"
             control_parentheses.append(control_header_pending is not None)
+            header_delimiters.append("(")
             if opens_for_header:
-                for_headers.append((len(control_parentheses), "lhs_start"))
+                for_headers.append(
+                    (
+                        len(control_parentheses),
+                        len(header_delimiters),
+                        "lhs_start",
+                    )
+                )
             control_header_pending = None
             block_brace_pending = False
             statement_start = False
@@ -924,12 +963,18 @@ def _typescript_without_comments(source: str) -> str:
             closes_for_header = (
                 bool(for_headers)
                 and for_headers[-1][0] == len(control_parentheses)
+                and for_headers[-1][1] == len(header_delimiters)
+                and bool(header_delimiters)
+                and header_delimiters[-1] == "("
             )
             closes_control_header = (
                 control_parentheses.pop() if control_parentheses else False
             )
             if closes_for_header:
                 for_headers.pop()
+            closed_group = close_header_delimiter("(")
+            if closed_group and not closes_for_header:
+                complete_closed_lhs_group()
             control_header_pending = None
             stack[-1] = (mode, depth, closes_control_header, False)
             block_brace_pending = closes_control_header
@@ -941,6 +986,7 @@ def _typescript_without_comments(source: str) -> str:
             control_header_pending = None
             opens_expression = regex_allowed and not block_brace_pending
             expression_braces.append(opens_expression)
+            header_delimiters.append("{")
             block_brace_pending = False
             statement_start = not opens_expression
             label_candidate = False
@@ -956,10 +1002,12 @@ def _typescript_without_comments(source: str) -> str:
             control_header_pending = None
             if mode == "expression" and depth == 1:
                 stack.pop()
+                closed_group = close_header_delimiter("${")
                 block_brace_pending = False
                 statement_start = False
             else:
                 closes_expression = expression_braces.pop() if expression_braces else False
+                closed_group = close_header_delimiter("{")
                 stack[-1] = (
                     mode,
                     depth - 1 if mode == "expression" else depth,
@@ -968,13 +1016,30 @@ def _typescript_without_comments(source: str) -> str:
                 )
                 block_brace_pending = not closes_expression
                 statement_start = not closes_expression
-            header_index = active_for_header()
-            if header_index is not None:
-                header_depth, header_state = for_headers[header_index]
-                if header_state in {"lhs_start", "binding"}:
-                    for_headers[header_index] = (header_depth, "lhs_complete")
+            if closed_group:
+                complete_closed_lhs_group()
             label_candidate = False
             restricted_statement = None
+            index += 1
+        elif char == "[":
+            control_header_pending = None
+            header_delimiters.append("[")
+            block_brace_pending = False
+            statement_start = False
+            label_candidate = False
+            restricted_statement = None
+            stack[-1] = (mode, depth, True, False)
+            index += 1
+        elif char == "]":
+            control_header_pending = None
+            closed_group = close_header_delimiter("[")
+            if closed_group:
+                complete_closed_lhs_group()
+            block_brace_pending = False
+            statement_start = False
+            label_candidate = False
+            restricted_statement = None
+            stack[-1] = (mode, depth, False, False)
             index += 1
         elif char.isspace():
             if char in "\r\n" and restricted_statement is not None:
@@ -1063,15 +1128,15 @@ def _typescript_without_comments(source: str) -> str:
                 label_candidate = False
                 restricted_statement = "jump_label_consumed"
             elif (
-                token == "of"
+                token in {"in", "of"}
                 and header_index is not None
-                and for_headers[header_index][1] == "lhs_complete"
+                and for_headers[header_index][2] == "lhs_complete"
                 and not regex_allowed
             ):
-                # ``of`` starts a regex-eligible RHS only as the delimiter of
-                # this for header.  Elsewhere it is an IdentifierName.
-                header_depth, _header_state = for_headers[header_index]
-                for_headers[header_index] = (header_depth, "rhs")
+                # ``in`` and ``of`` start a regex-eligible RHS only as the
+                # delimiters of this header.  Elsewhere they are IdentifierName
+                # tokens (or the ordinary ``in`` operator).
+                set_for_header_state(header_index, "rhs")
                 control_header_pending = None
                 regex_allowed = True
                 statement_start = False
@@ -1115,11 +1180,11 @@ def _typescript_without_comments(source: str) -> str:
                     )
                 restricted_statement = None
                 if header_index is not None:
-                    header_depth, header_state = for_headers[header_index]
+                    header_state = for_headers[header_index][2]
                     if header_state == "lhs_start" and token in {"let", "const", "var"}:
-                        for_headers[header_index] = (header_depth, "binding")
+                        set_for_header_state(header_index, "binding")
                     elif header_state in {"lhs_start", "binding"}:
-                        for_headers[header_index] = (header_depth, "lhs_complete")
+                        set_for_header_state(header_index, "lhs_complete")
             block_brace_pending = token in statement_prefix_keywords
             stack[-1] = (mode, depth, regex_allowed, False)
             index = cursor
@@ -1127,11 +1192,8 @@ def _typescript_without_comments(source: str) -> str:
             control_header_pending = None
             header_index = active_for_header()
             if header_index is not None:
-                header_depth, header_state = for_headers[header_index]
                 if char == ";":
-                    for_headers[header_index] = (header_depth, "classic")
-                elif char == "]" and header_state in {"lhs_start", "binding"}:
-                    for_headers[header_index] = (header_depth, "lhs_complete")
+                    set_for_header_state(header_index, "classic")
             if char == ":" and label_candidate:
                 regex_allowed = True
                 block_brace_pending = True
