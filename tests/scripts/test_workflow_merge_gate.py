@@ -87,11 +87,17 @@ def _write_parser_dependencies(root: Path) -> None:
     for package, version in PARSER_VERSIONS.items():
         package_dir = root / "node_modules" / package
         package_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {"name": package, "version": version}
+        if package == "typescript":
+            manifest["main"] = "index.js"
+            entrypoint = "module.exports = {};\n"
+        else:
+            manifest.update({"type": "module", "exports": "./index.js"})
+            entrypoint = "export {};\n"
         (package_dir / "package.json").write_text(
-            json.dumps({"name": package, "version": version, "main": "index.js"}),
-            encoding="utf-8",
+            json.dumps(manifest), encoding="utf-8"
         )
-        (package_dir / "index.js").write_text("module.exports = {};\n", encoding="utf-8")
+        (package_dir / "index.js").write_text(entrypoint, encoding="utf-8")
 
 
 def _dependency_checker_source() -> str:
@@ -543,6 +549,47 @@ def test_gate_rejects_escaping_parser_package_paths_before_checker(
     assert not marker.exists()
 
 
+def test_gate_rejects_nearer_helper_dependency_before_checker(tmp_path: Path) -> None:
+    repo, _base = _brand_repo(tmp_path)
+    _write_parser_dependencies(repo / "scripts")
+    marker = tmp_path / "nearer-helper-dependency.marker"
+
+    result = _run_gate_with_marker(repo, marker, "--phase", "base")
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+    assert not marker.exists()
+
+
+def test_gate_rejects_esm_exports_entrypoint_escape_before_checker(
+    tmp_path: Path,
+) -> None:
+    repo, _base = _brand_repo(tmp_path)
+    package = repo / "node_modules/unified"
+    outside = tmp_path / "outside-entrypoint.js"
+    outside.write_text("export {};\n", encoding="utf-8")
+    (package / "esm-entrypoint.js").symlink_to(outside)
+    (package / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "unified",
+                "version": PARSER_VERSIONS["unified"],
+                "type": "module",
+                "main": "./index.js",
+                "exports": "./esm-entrypoint.js",
+            }
+        ),
+        encoding="utf-8",
+    )
+    marker = tmp_path / "esm-entrypoint-escape.marker"
+
+    result = _run_gate_with_marker(repo, marker, "--phase", "base")
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+    assert not marker.exists()
+
+
 def test_gate_rejects_dangling_local_dependency_link_before_checker(
     tmp_path: Path,
 ) -> None:
@@ -564,10 +611,9 @@ def test_gate_rejects_wrong_parser_dependency_version_before_checker(
 ) -> None:
     repo, _base = _brand_repo(tmp_path)
     manifest = repo / "node_modules/micromark/package.json"
-    manifest.write_text(
-        json.dumps({"name": "micromark", "version": "4.0.3", "main": "index.js"}),
-        encoding="utf-8",
-    )
+    package_data = json.loads(manifest.read_text(encoding="utf-8"))
+    package_data["version"] = "4.0.3"
+    manifest.write_text(json.dumps(package_data), encoding="utf-8")
     marker = tmp_path / "wrong-version-checker.marker"
 
     result = _run_gate_with_marker(repo, marker, "--phase", "base")

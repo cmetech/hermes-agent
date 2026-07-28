@@ -82,12 +82,16 @@ _require_root_dependencies() {
     echo "root parser dependencies require node before ledger validation" >&2
     return 1
   }
-  actual_versions="$("$node_bin" -e '
-    const fs = require("node:fs");
-    const path = require("node:path");
+  actual_versions="$(cd "$ROOT/scripts" && "$node_bin" --input-type=module -e '
+    import fs from "node:fs";
+    import path from "node:path";
+    import { createRequire } from "node:module";
+    import { fileURLToPath } from "node:url";
     const names = ["typescript", "unified", "remark-parse", "micromark"];
-    const dependencyView = fs.realpathSync(process.argv[1]);
-    const allowedRoots = process.argv.slice(2)
+    const directImports = new Set(["typescript", "unified", "remark-parse"]);
+    const helperUrl = new URL("./extract_non_python_symbols.mjs", import.meta.url);
+    const helperRequire = createRequire(helperUrl);
+    const allowedRoots = process.argv.slice(1)
       .filter(candidate => {
         try {
           return fs.statSync(candidate).isDirectory();
@@ -110,21 +114,48 @@ _require_root_dependencies() {
       }
       return resolved;
     };
+    const resolvedPackage = name => {
+      const requireEntrypoint = fs.realpathSync(helperRequire.resolve(name));
+      let directory = path.dirname(requireEntrypoint);
+      while (true) {
+        try {
+          const manifestPath = fs.realpathSync(path.join(directory, "package.json"));
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+          if (manifest.name === name) {
+            return {
+              packageRoot: fs.realpathSync(directory),
+              manifest,
+              manifestPath,
+              requireEntrypoint,
+            };
+          }
+        } catch {
+          // Match the helper: keep walking toward the package root.
+        }
+        const parent = path.dirname(directory);
+        if (parent === directory) {
+          throw new Error("dependency package manifest was not found");
+        }
+        directory = parent;
+      }
+    };
     const versions = names.map(name => {
-      const requestedRoot = path.join(dependencyView, name);
-      const packageRoot = fs.realpathSync(requestedRoot);
+      const {
+        packageRoot,
+        manifest,
+        manifestPath,
+        requireEntrypoint,
+      } = resolvedPackage(name);
       if (!fs.statSync(packageRoot).isDirectory() ||
           !allowedRoots.some(root => isStrictlyWithin(packageRoot, root))) {
         throw new Error("dependency package escapes the allowed roots");
       }
-      const manifestPath = requireContainedFile(
-        path.join(requestedRoot, "package.json"), packageRoot
-      );
-      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-      if (manifest.name !== name) {
-        throw new Error("dependency manifest names the wrong package");
+      requireContainedFile(manifestPath, packageRoot);
+      requireContainedFile(requireEntrypoint, packageRoot);
+      if (directImports.has(name)) {
+        const importEntrypoint = fileURLToPath(import.meta.resolve(name));
+        requireContainedFile(importEntrypoint, packageRoot);
       }
-      requireContainedFile(require.resolve(requestedRoot), packageRoot);
       return manifest.version;
     });
     process.stdout.write(versions.join(" "));
