@@ -4068,8 +4068,6 @@ upstream_changes:
   - _powershell_without_comments
   - _shell_without_comments
   - _typescript_without_comments
-  - _markdown_opening_container_content
-  - _markdown_continuation_content
   - _markdown_without_comments
   - _structured_spans
   - _walk_yaml_nodes
@@ -4077,8 +4075,6 @@ upstream_changes:
   - _POSIX_GROUP_BOOTSTRAP
   - _terminate_process_group
   - _execute_attempt
-  - _provision_external_node_modules
-  - _revalidate_node_dependency_roots
   owned_invariants:
   - isolated execution and actual duration for every executable ledger test
   - reference-only evidence type without pass or duration fields
