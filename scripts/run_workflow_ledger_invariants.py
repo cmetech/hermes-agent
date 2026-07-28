@@ -26,7 +26,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import psutil
 import yaml
@@ -266,6 +266,8 @@ class _NodeDependencyRoot:
     links: dict[Path, _NodeDependencyLink] = field(default_factory=dict)
     materialized_directories: set[Path] = field(default_factory=lambda: {Path()})
     provisioned_links: list[Path] = field(default_factory=list)
+    view_identity: _FileIdentity | None = None
+    view_entries: dict[Path, _FileIdentity] = field(default_factory=dict)
 
 
 def _file_identity(path: Path) -> _FileIdentity:
@@ -389,6 +391,50 @@ def _materialize_dependency_ancestors(root: _NodeDependencyRoot, path: Path) -> 
     while parent.parts:
         root.materialized_directories.add(parent)
         parent = parent.parent
+
+
+def _snapshot_dependency_entries(
+    root: _NodeDependencyRoot,
+    directory_root: Path,
+    deadline: float,
+    *,
+    ignore_cache_entries: bool,
+) -> dict[Path, _FileIdentity]:
+    """Return a bounded lstat snapshot without traversing dependency symlinks."""
+    entries_by_path: dict[Path, _FileIdentity] = {}
+    stack = [Path()]
+    entry_count = 0
+    while stack:
+        if time.monotonic() > deadline:
+            raise ValueError("--base-ref node_modules revalidation exceeded time bound")
+        relative_directory = stack.pop()
+        with os.scandir(directory_root / relative_directory) as entries:
+            for entry in entries:
+                entry_count += 1
+                if entry_count > _NODE_DEPENDENCY_MAX_ENTRIES:
+                    raise ValueError(
+                        "--base-ref node_modules revalidation exceeded entry bound"
+                    )
+                if time.monotonic() > deadline:
+                    raise ValueError(
+                        "--base-ref node_modules revalidation exceeded time bound"
+                    )
+                relative = relative_directory / entry.name
+                identity = _file_identity(directory_root / relative)
+                if relative in _NODE_DEPENDENCY_CACHE_PATHS:
+                    if not stat.S_ISDIR(identity[2]):
+                        raise ValueError(
+                            "--base-ref sealed dependency cache path changed before execution"
+                        )
+                    if ignore_cache_entries:
+                        continue
+                entries_by_path[relative] = identity
+                if (
+                    stat.S_ISDIR(identity[2])
+                    and relative not in _NODE_DEPENDENCY_CACHE_PATHS
+                ):
+                    stack.append(relative)
+    return entries_by_path
 
 
 def _audit_node_dependency_roots(
@@ -535,6 +581,17 @@ def _revalidate_node_dependency_roots(
                 raise ValueError(
                     f"--base-ref external {label_root} changed before execution"
                 )
+            if set(
+                _snapshot_dependency_entries(
+                    root,
+                    root.external,
+                    deadline,
+                    ignore_cache_entries=False,
+                )
+            ) != set(root.entries):
+                raise ValueError(
+                    f"--base-ref {label_root} dependency entries changed before execution"
+                )
             for relative, identity in root.entries.items():
                 if time.monotonic() > deadline:
                     raise ValueError(
@@ -554,6 +611,20 @@ def _revalidate_node_dependency_roots(
                     raise ValueError(
                         f"--base-ref {label_root} symlink changed before execution"
                     )
+            if (
+                root.view_identity is None
+                or _file_identity(root.destination) != root.view_identity
+                or _snapshot_dependency_entries(
+                    root,
+                    root.destination,
+                    deadline,
+                    ignore_cache_entries=True,
+                )
+                != root.view_entries
+            ):
+                raise ValueError(
+                    f"--base-ref sealed {label_root} dependency view changed before execution"
+                )
             for provisioned in root.provisioned_links:
                 if time.monotonic() > deadline:
                     raise ValueError(
@@ -612,6 +683,18 @@ def _provision_external_node_modules(
             sealed_repo,
             deadline,
         )
+        try:
+            root.view_identity = _file_identity(root.destination)
+            root.view_entries = _snapshot_dependency_entries(
+                root,
+                root.destination,
+                deadline,
+                ignore_cache_entries=True,
+            )
+        except OSError as exc:
+            raise ValueError(
+                f"--base-ref cannot snapshot {root.relative_path.as_posix()} dependency view"
+            ) from exc
     _revalidate_node_dependency_roots(roots, sealed_repo)
     return roots
 
@@ -1132,9 +1215,10 @@ def _execute(
     node_path: str | None = None,
     npx_path: str | None = None,
     source_repo: Path | None = None,
+    before_retry: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    attempts = [
-        _execute_attempt(
+    def execute_attempt() -> dict[str, Any]:
+        attempt = _execute_attempt(
             repo,
             path,
             kind,
@@ -1145,23 +1229,15 @@ def _execute(
             npx_path=npx_path,
             source_repo=source_repo,
         )
-    ]
+        if attempt["result"] == "failed" and before_retry is not None:
+            before_retry()
+        return attempt
+
+    attempts = [execute_attempt()]
     if attempts[0]["result"] == "failed":
         if cancel_event.is_set():
             raise CancelledError()
-        attempts.append(
-            _execute_attempt(
-                repo,
-                path,
-                kind,
-                timeout_seconds=timeout_seconds,
-                output_limit_bytes=output_limit_bytes,
-                cancel_event=cancel_event,
-                node_path=node_path,
-                npx_path=npx_path,
-                source_repo=source_repo,
-            )
-        )
+        attempts.append(execute_attempt())
     digest = hashlib.sha256(path.encode()).hexdigest()
     result = "passed" if attempts[-1]["result"] == "passed" else "failed"
     return {
@@ -1207,11 +1283,19 @@ def _run_group(
     node_path: str | None = None,
     npx_path: str | None = None,
     source_repo: Path | None = None,
+    before_retry: Callable[[], None] | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     if not paths:
         return results
     cancel_event = threading.Event()
+    before_retry_lock = threading.Lock()
+
+    def revalidate_before_retry() -> None:
+        if before_retry is not None:
+            with before_retry_lock:
+                before_retry()
+
     executor = ThreadPoolExecutor(max_workers=min(workers, len(paths)))
     futures: dict[Any, str] = {}
     try:
@@ -1228,6 +1312,7 @@ def _run_group(
                 node_path=node_path,
                 npx_path=npx_path,
                 source_repo=source_repo,
+                before_retry=revalidate_before_retry,
             ): path
             for path in paths
         }
@@ -1399,62 +1484,44 @@ def _execute_manifest_invariants(
         )
     results: list[dict[str, Any]] = []
     group_options = (timeout_seconds, output_limit_bytes)
-    results.extend(
-        _run_group(
-            repo,
-            by_kind["python"],
-            "python",
-            platform,
-            2,
-            *group_options,
-            node_path=node_path,
-            npx_path=npx_path,
-            source_repo=source_repo,
-        )
-    )
-    if dependency_roots and by_kind["desktop"]:
-        _revalidate_node_dependency_roots(dependency_roots, repo)
-    results.extend(
-        _run_group(
-            repo,
-            by_kind["desktop"],
-            "desktop",
-            platform,
-            2,
-            *group_options,
-            node_path=node_path,
-            npx_path=npx_path,
-            source_repo=source_repo,
-        )
-    )
-    if dependency_roots and by_kind["desktop-node"]:
-        _revalidate_node_dependency_roots(dependency_roots, repo)
-    results.extend(
-        _run_group(
-            repo,
-            by_kind["desktop-node"],
-            "desktop-node",
-            platform,
-            2,
-            *group_options,
-            node_path=node_path,
-            npx_path=npx_path,
-            source_repo=source_repo,
-        )
-    )
-    results.extend(
-        _run_group(
-            repo,
-            by_kind["node"],
-            "node",
-            platform,
-            2,
-            *group_options,
-            node_path=node_path,
-            npx_path=npx_path,
-            source_repo=source_repo,
-        )
-    )
+    def run_group_and_revalidate(kind: str) -> list[dict[str, Any]]:
+        group_raised = False
+        try:
+            return _run_group(
+                repo,
+                by_kind[kind],
+                kind,
+                platform,
+                2,
+                *group_options,
+                node_path=node_path,
+                npx_path=npx_path,
+                source_repo=source_repo,
+                before_retry=(
+                    lambda: _revalidate_node_dependency_roots(
+                        dependency_roots,
+                        repo,
+                    )
+                    if dependency_roots
+                    else None
+                ),
+            )
+        except BaseException:
+            group_raised = True
+            raise
+        finally:
+            if dependency_roots and group_raised:
+                try:
+                    _revalidate_node_dependency_roots(dependency_roots, repo)
+                except BaseException:
+                    # A process/control-flow failure is the primary outcome.
+                    # Do not replace it with a later audit error from cleanup.
+                    pass
+            elif dependency_roots:
+                _revalidate_node_dependency_roots(dependency_roots, repo)
+
+    for kind in ("python", "desktop", "desktop-node", "node"):
+        results.extend(run_group_and_revalidate(kind))
     executed = {item["path"] for item in results}
     for path in paths:
         if path in executed:

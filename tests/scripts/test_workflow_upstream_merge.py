@@ -1334,6 +1334,10 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
         "root_temporary_cache = sealed_repo / 'node_modules/.vite-temp/vitest-temporary'\n"
         "if root_temporary_cache.read_text() != 'sealed root temporary cache write\\n':\n"
         "    raise SystemExit(35)\n"
+        "final_cache = cwd / 'node_modules/.vite/tsx-final-cache'\n"
+        "final_cache.write_text('final cache write\\n')\n"
+        "final_root_cache = sealed_repo / 'node_modules/.vite/tsx-final-cache'\n"
+        "final_root_cache.write_text('final root cache write\\n')\n"
         "if sys.argv[1:] != ['--test', 'electron/toolchain.test.ts']:\n"
         "    raise SystemExit(32)\n"
         "Path(os.environ['OBSERVED_TSX']).write_text('tsx ran after revalidation')\n"
@@ -1422,10 +1426,35 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
 
 
 @pytest.mark.skipif(os.name == "nt", reason="external toolchain links use POSIX paths")
-def test_sealed_ledger_runner_rejects_dependency_mutation_between_node_groups(
+@pytest.mark.parametrize(
+    (
+        "mutating_tool",
+        "mutation_kind",
+        "tool_exit_code",
+        "tsx_should_run",
+        "expected_invocations",
+    ),
+    [
+        ("vitest", "external-replace", 0, False, ["vitest"]),
+        ("tsx", "external-replace", 0, True, ["vitest", "tsx"]),
+        ("tsx", "external-add", 0, True, ["vitest", "tsx"]),
+        ("tsx", "view-add", 0, True, ["vitest", "tsx"]),
+        ("tsx", "view-replace", 0, True, ["vitest", "tsx"]),
+        ("node", "external-replace", 0, True, ["vitest", "tsx", "node"]),
+        # Drift is infrastructure failure even when the test itself exits 1:
+        # detect it before the normal failed-test retry can run.
+        ("vitest", "external-replace", 1, False, ["vitest"]),
+    ],
+)
+def test_sealed_ledger_runner_rejects_dependency_mutation_after_every_node_group(
     tmp_path: Path,
+    mutating_tool: str,
+    mutation_kind: str,
+    tool_exit_code: int,
+    tsx_should_run: bool,
+    expected_invocations: list[str],
 ) -> None:
-    """A real dependency mutation stays terminal while cache writes are isolated."""
+    """A first or final successful Node group cannot leave dependency drift green."""
     repo = tmp_path / "runner-mutated-node-dependency"
     repo.mkdir()
     _git(repo, "init")
@@ -1438,6 +1467,9 @@ def test_sealed_ledger_runner_rejects_dependency_mutation_between_node_groups(
     electron_test = desktop / "electron/toolchain.test.ts"
     electron_test.parent.mkdir()
     electron_test.write_text("export const sealedElectronToolchain = true\n")
+    final_node_test = repo / "tests/final-toolchain.test.mjs"
+    final_node_test.parent.mkdir()
+    final_node_test.write_text("export const sealedFinalToolchain = true\n")
     manifest = repo / "ledger.yaml"
     manifest.write_text(
         yaml.safe_dump(
@@ -1447,6 +1479,7 @@ def test_sealed_ledger_runner_rejects_dependency_mutation_between_node_groups(
                         "tests": [
                             "apps/desktop/electron/toolchain.test.ts",
                             "apps/desktop/src/toolchain.test.ts",
+                            "tests/final-toolchain.test.mjs",
                         ]
                     }
                 ]
@@ -1474,10 +1507,20 @@ def test_sealed_ledger_runner_rejects_dependency_mutation_between_node_groups(
     )
 
     tsx_executed = tmp_path / "tsx-executed"
+    invocations = tmp_path / "tool-invocations"
     external_bin = tmp_path / "external-node-bin"
     external_bin.mkdir()
     node = external_bin / "node"
-    node.write_text("#!/bin/sh\nexit 0\n")
+    node.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "from pathlib import Path\n\n"
+        "if os.environ['MUTATING_TOOL'] == 'node':\n"
+        "    Path(os.environ['TOOL_INVOCATIONS']).write_text(\n"
+        "        Path(os.environ['TOOL_INVOCATIONS']).read_text() + 'node\\n'\n"
+        "    )\n"
+        "    Path(os.environ['MUTATED_DEPENDENCY']).write_text('mutated dependency\\n')\n"
+    )
     node.chmod(0o755)
     npx = external_bin / "npx"
     npx.write_text(
@@ -1485,10 +1528,26 @@ def test_sealed_ledger_runner_rejects_dependency_mutation_between_node_groups(
         "import os\n"
         "from pathlib import Path\n"
         "import sys\n\n"
-        "if sys.argv[1] == 'vitest':\n"
-        "    Path(os.environ['MUTATED_DEPENDENCY']).write_text('mutated dependency\\n')\n"
-        "elif sys.argv[1] == 'tsx':\n"
-        "    Path(os.environ['TSX_EXECUTED']).write_text('should not execute')\n"
+        "Path(os.environ['TOOL_INVOCATIONS']).write_text(\n"
+        "    Path(os.environ['TOOL_INVOCATIONS']).read_text() + sys.argv[1] + '\\n'\n"
+        "    if Path(os.environ['TOOL_INVOCATIONS']).exists() else sys.argv[1] + '\\n'\n"
+        ")\n"
+        "if sys.argv[1] == 'tsx':\n"
+        "    Path(os.environ['TSX_EXECUTED']).write_text('tsx executed')\n"
+        "if sys.argv[1] == os.environ['MUTATING_TOOL']:\n"
+        "    mutation = os.environ['MUTATION_KIND']\n"
+        "    if mutation == 'external-replace':\n"
+        "        Path(os.environ['MUTATED_DEPENDENCY']).write_text('mutated dependency\\n')\n"
+        "    elif mutation == 'external-add':\n"
+        "        Path(os.environ['ADDED_DEPENDENCY']).write_text('added dependency\\n')\n"
+        "    elif mutation == 'view-add':\n"
+        "        (Path.cwd() / 'node_modules/injected-authority').write_text('injected\\n')\n"
+        "    else:\n"
+        "        view = Path.cwd() / 'node_modules/dependency'\n"
+        "        view.unlink()\n"
+        "        view.symlink_to(Path.cwd(), target_is_directory=True)\n"
+        "    if os.environ['MUTATION_EXIT_CODE'] != '0':\n"
+        "        raise SystemExit(int(os.environ['MUTATION_EXIT_CODE']))\n"
     )
     npx.chmod(0o755)
     report = tmp_path / "mutated-dependency-report.json"
@@ -1499,7 +1558,12 @@ def test_sealed_ledger_runner_rejects_dependency_mutation_between_node_groups(
     env["PATH"] = f"{external_bin}{os.pathsep}{env['PATH']}"
     env["TMPDIR"] = str(temp_root)
     env["MUTATED_DEPENDENCY"] = str(dependency)
+    env["ADDED_DEPENDENCY"] = str(dependency.parent / "added-authority.js")
     env["TSX_EXECUTED"] = str(tsx_executed)
+    env["MUTATING_TOOL"] = mutating_tool
+    env["MUTATION_KIND"] = mutation_kind
+    env["MUTATION_EXIT_CODE"] = str(tool_exit_code)
+    env["TOOL_INVOCATIONS"] = str(invocations)
 
     result = subprocess.run(
         [
@@ -1523,12 +1587,21 @@ def test_sealed_ledger_runner_rejects_dependency_mutation_between_node_groups(
     )
 
     assert result.returncode == 2
-    assert (
-        "apps/desktop/node_modules/dependency/authority.js changed before execution"
-        in result.stderr
-    )
-    assert dependency.read_text() == "mutated dependency\n"
-    assert not tsx_executed.exists()
+    assert "before execution" in result.stderr
+    if mutation_kind == "external-replace":
+        assert (
+            "apps/desktop/node_modules/dependency/authority.js changed before execution"
+            in result.stderr
+        )
+        assert dependency.read_text() == "mutated dependency\n"
+    elif mutation_kind == "external-add":
+        assert Path(env["ADDED_DEPENDENCY"]).read_text() == "added dependency\n"
+    elif mutation_kind == "view-add":
+        assert "sealed apps/desktop/node_modules dependency view" in result.stderr
+    else:
+        assert "sealed apps/desktop/node_modules dependency view" in result.stderr
+    assert tsx_executed.exists() is tsx_should_run
+    assert invocations.read_text().splitlines() == expected_invocations
     assert not report.exists()
     assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
     assert list(temp_root.iterdir()) == []

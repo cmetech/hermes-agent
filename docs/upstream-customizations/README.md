@@ -79,7 +79,8 @@ remapped to their corresponding committed paths in the detached tested
 checkout. Vite's explicit `.vite` and `.vite-temp` cache directories are empty
 writable directories inside each disposable view, so result and temporary
 caching cannot mutate either external dependency root. Root identities,
-non-cache entry identities, link targets, and the constructed view are
-revalidated immediately before each Desktop test group. Setup failure is
-terminal, and the dependency view disappears with the detached worktree on
-every exit path.
+non-cache entry sets and identities, link targets, and the constructed view
+are revalidated after every invariant group, including the final group. A
+retryable failed attempt is also revalidated before its retry, so dependency
+drift is terminal rather than a flaky pass. Setup failure is terminal, and the
+dependency view disappears with the detached worktree on every exit path.

@@ -4083,13 +4083,13 @@ upstream_changes:
   - language-aware comment ownership without exposing literals or heredoc bodies
   - exact JSON and TOML lexical-token ranges compare only changed character spans, with cycle-safe YAML traversal
   - strict manifest history, lexical paths, and Git-tree file types anchor to one resolved source revision
-  - control, keyword, property, postfix, delimiter, and operator regular-expression goals retain JavaScript lexical boundaries
-  - CommonMark container fences use visual tab-stop columns, relative list indentation, and exact closing-fence width
+  - control, keyword, property, postfix, delimiter, operator, restricted-statement, and label regular-expression goals retain JavaScript lexical boundaries
+  - CommonMark container fences use visual tab-stop columns, relative list indentation, exact closing-fence width, and outer-line reprocessing when a contained fence loses its container
   - JSON and TOML ownership spans exclude numeric, boolean, null, date, and array scalar occurrences
   - process-tree containment across normal exit, timeout, interruption, and failure
   - detached committed-tree base-ref sealing excludes live untracked discovery and rejects dirty or symlinked tracked authority
-  - bounded root and Desktop dependency views remap workspace links to committed detached-checkout paths and reject broken or escaping links before execution
-  - writable Vitest cache state remains inside the disposable dependency view while real dependency mutations stay terminal
+  - bounded root and Desktop dependency views remap workspace links to committed detached-checkout paths and reject broken or escaping links before execution, after every invariant group, and before a retryable attempt can retry
+  - writable Vitest cache state remains inside the disposable dependency view while external or constructed-view additions, replacements, and real dependency mutations stay terminal
   - supervisor and Job Object bootstrap failures remain terminal infrastructure errors
   tests:
   - apps/desktop/src/lib/json-rpc-gateway-url-guard.test.ts
