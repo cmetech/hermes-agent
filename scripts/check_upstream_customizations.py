@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass, replace
 import difflib
 import json
@@ -36,6 +38,8 @@ _MAX_PARSER_BATCH_BYTES = 16 * 1024 * 1024
 _MAX_PARSER_OUTPUT_BYTES = 16 * 1024 * 1024
 _PARSER_TIMEOUT_SECONDS = 60.0
 _CAPTURE_CLEANUP_SECONDS = 1.0
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _NON_PYTHON_HELPER = _REPOSITORY_ROOT / "scripts" / "extract_non_python_symbols.mjs"
 _PARSER_LANGUAGES = {
@@ -67,6 +71,132 @@ _REQUIRED = {
     "expected_commit_subject", "upstream_candidate", "merge_guidance",
     "removal_condition", "last_verified_upstream",
 }
+
+_WINDOWS_JOB_BOOTSTRAP = (
+    "import subprocess, sys\n"
+    "if sys.stdin.buffer.read(1) != b'1':\n"
+    "    raise SystemExit(125)\n"
+    "try:\n"
+    "    child = subprocess.Popen(sys.argv[1:])\n"
+    "except OSError:\n"
+    "    raise SystemExit(125)\n"
+    "raise SystemExit(child.wait())\n"
+)
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class _JobObjectIoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+        ("IoInfo", _JobObjectIoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def _windows_job_error(operation: str) -> OSError:
+    code = getattr(ctypes, "get_last_error", lambda: 0)()
+    return OSError(code, f"Windows Job Object {operation} failed")
+
+
+def _configure_windows_job_api(kernel32: Any) -> None:
+    signatures = {
+        "CreateJobObjectW": ([ctypes.c_void_p, wintypes.LPCWSTR], ctypes.c_void_p),
+        "SetInformationJobObject": (
+            [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD],
+            wintypes.BOOL,
+        ),
+        "AssignProcessToJobObject": (
+            [ctypes.c_void_p, ctypes.c_void_p],
+            wintypes.BOOL,
+        ),
+        "TerminateJobObject": (
+            [ctypes.c_void_p, wintypes.UINT],
+            wintypes.BOOL,
+        ),
+        "CloseHandle": ([ctypes.c_void_p], wintypes.BOOL),
+    }
+    for name, (argtypes, restype) in signatures.items():
+        function = getattr(kernel32, name)
+        try:
+            function.argtypes = argtypes
+            function.restype = restype
+        except AttributeError:
+            continue
+
+
+class _WindowsJobContainment:
+    """Win32 process-tree ownership with kill-on-last-handle-close."""
+
+    def __init__(self, kernel32: Any | None = None) -> None:
+        if kernel32 is None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        _configure_windows_job_api(kernel32)
+        self._kernel32 = kernel32
+        self._handle = kernel32.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise _windows_job_error("creation")
+        limits = _JobObjectExtendedLimitInformation()
+        limits.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        if not kernel32.SetInformationJobObject(
+            self._handle,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            kernel32.CloseHandle(self._handle)
+            self._handle = None
+            raise _windows_job_error("configuration")
+
+    def assign(self, process_handle: int) -> None:
+        if self._handle is None or not self._kernel32.AssignProcessToJobObject(
+            self._handle, process_handle
+        ):
+            raise _windows_job_error("assignment")
+
+    def terminate(self) -> None:
+        if self._handle is not None and not self._kernel32.TerminateJobObject(
+            self._handle, 1
+        ):
+            raise _windows_job_error("termination")
+
+    def close(self) -> None:
+        if self._handle is not None:
+            handle, self._handle = self._handle, None
+            if not self._kernel32.CloseHandle(handle):
+                raise _windows_job_error("close")
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 @dataclass(frozen=True)
@@ -111,15 +241,26 @@ def _run_bounded_capture(
     output_limit_bytes: int,
 ) -> _CompletedCapture:
     """Run a child with bounded combined output and sanitized failure states."""
-    deadline = time.monotonic() + max(timeout_seconds, 0)
+    timeout_seconds = max(timeout_seconds, 0)
+    deadline = time.monotonic() + timeout_seconds
+    cleanup_budget = min(_CAPTURE_CLEANUP_SECONDS, timeout_seconds / 10)
+    work_deadline = deadline - cleanup_budget
+    windows_job: _WindowsJobContainment | None = None
+    command = list(argv)
+    payload = input_bytes or b""
     process_options: dict[str, Any] = {}
-    if os.name == "posix":
+    if _is_windows():
+        try:
+            windows_job = _WindowsJobContainment()
+        except Exception as exc:
+            raise _BoundedCaptureFailure("containment_failure") from exc
+        command = [sys.executable, "-c", _WINDOWS_JOB_BOOTSTRAP, *command]
+        payload = b"1" + payload
+    elif os.name == "posix":
         process_options["start_new_session"] = True
-    elif os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-        process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         process = subprocess.Popen(
-            list(argv),
+            command,
             cwd=cwd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -127,11 +268,49 @@ def _run_bounded_capture(
             **process_options,
         )
     except Exception as exc:
+        if windows_job is not None:
+            try:
+                windows_job.close()
+            except Exception:
+                pass
         raise _BoundedCaptureFailure("start_failure") from exc
+
+    if windows_job is not None:
+        try:
+            windows_job.assign(int(process._handle))
+        except Exception as exc:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            try:
+                process.wait(
+                    timeout=min(
+                        cleanup_budget, max(0, deadline - time.monotonic())
+                    )
+                )
+            except Exception:
+                pass
+            try:
+                windows_job.close()
+            except Exception:
+                pass
+            raise _BoundedCaptureFailure("containment_failure") from exc
+
+    def close_windows_containment() -> None:
+        nonlocal windows_job
+        if windows_job is not None:
+            containment, windows_job = windows_job, None
+            try:
+                containment.close()
+            except Exception as exc:
+                raise _BoundedCaptureFailure("containment_failure") from exc
 
     def terminate_process_group() -> None:
         try:
-            if os.name == "posix" and hasattr(process, "pid"):
+            if windows_job is not None:
+                windows_job.terminate()
+            elif os.name == "posix" and hasattr(process, "pid"):
                 os.killpg(process.pid, signal.SIGKILL)
             else:
                 process.kill()
@@ -148,7 +327,9 @@ def _run_bounded_capture(
         except _BoundedCaptureFailure as exc:
             failure = exc
         try:
-            reaped_returncode = process.wait(timeout=_CAPTURE_CLEANUP_SECONDS)
+            reaped_returncode = process.wait(
+                timeout=min(cleanup_budget, max(0, deadline - time.monotonic()))
+            )
         except subprocess.TimeoutExpired as exc:
             if failure is None:
                 failure = _BoundedCaptureFailure("wait_failure")
@@ -164,6 +345,10 @@ def _run_bounded_capture(
     if process.stdin is None or process.stdout is None or process.stderr is None:
         try:
             kill_and_reap()
+        except Exception:
+            pass
+        try:
+            close_windows_containment()
         except Exception:
             pass
         raise _BoundedCaptureFailure("stream_failure")
@@ -212,7 +397,7 @@ def _run_bounded_capture(
 
     writer = threading.Thread(
         target=write_and_close,
-        args=(process.stdin, input_bytes or b""),
+        args=(process.stdin, payload),
         daemon=True,
     )
     readers = [
@@ -230,18 +415,24 @@ def _run_bounded_capture(
             kill_and_reap()
         except Exception:
             pass
-        cleanup_deadline = time.monotonic() + _CAPTURE_CLEANUP_SECONDS
+        cleanup_deadline = min(
+            deadline, time.monotonic() + cleanup_budget
+        )
         for thread in started:
             try:
                 thread.join(timeout=max(0, cleanup_deadline - time.monotonic()))
             except Exception:
                 pass
+        try:
+            close_windows_containment()
+        except Exception:
+            pass
         raise _BoundedCaptureFailure("thread_failure") from exc
 
     failure: _BoundedCaptureFailure | None = None
     returncode = -1
     try:
-        returncode = process.wait(timeout=max(0, deadline - time.monotonic()))
+        returncode = process.wait(timeout=max(0, work_deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         try:
             returncode = kill_and_reap()
@@ -258,9 +449,9 @@ def _run_bounded_capture(
         failure.__cause__ = exc
 
     join_deadline = (
-        deadline
+        work_deadline
         if failure is None
-        else time.monotonic() + _CAPTURE_CLEANUP_SECONDS
+        else min(deadline, time.monotonic() + cleanup_budget)
     )
     for thread in threads:
         try:
@@ -277,7 +468,7 @@ def _run_bounded_capture(
         except _BoundedCaptureFailure as exc:
             if failure is None:
                 failure = exc
-        cleanup_deadline = time.monotonic() + _CAPTURE_CLEANUP_SECONDS
+        cleanup_deadline = min(deadline, time.monotonic() + cleanup_budget)
         for thread in unfinished:
             try:
                 thread.join(timeout=max(0, cleanup_deadline - time.monotonic()))
@@ -287,6 +478,12 @@ def _run_bounded_capture(
                     failure.__cause__ = exc
         if failure is None:
             failure = _BoundedCaptureFailure("timeout")
+
+    try:
+        close_windows_containment()
+    except _BoundedCaptureFailure as exc:
+        if failure is None:
+            failure = exc
 
     if failure is not None:
         raise failure

@@ -481,9 +481,11 @@ def test_parser_kills_a_batch_after_sixty_seconds(
     )
 
     assert instances[0].killed is True
-    assert instances[0].wait_timeouts[0] == pytest.approx(60, abs=0.1)
+    assert instances[0].wait_timeouts[0] is not None
+    assert 0 < instances[0].wait_timeouts[0] < 60
     assert instances[0].wait_timeouts[1] is not None
     assert 0 < instances[0].wait_timeouts[1] <= 1
+    assert sum(instances[0].wait_timeouts) <= 60
 
 
 def test_parser_batch_deadline_kills_pipe_retaining_descendants(
@@ -523,6 +525,210 @@ def test_parser_batch_deadline_kills_pipe_retaining_descendants(
     elapsed = time.monotonic() - started
 
     assert elapsed < 1
+
+
+def test_parser_windows_job_composes_kill_on_close_lifecycle() -> None:
+    """Omitting any Win32 containment operation must fail this test."""
+    calls: list[tuple[object, ...]] = []
+
+    class FakeKernel32:
+        def CreateJobObjectW(self, security, name):
+            calls.append(("create", security, name))
+            return 73
+
+        def SetInformationJobObject(self, handle, info_class, info, size):
+            calls.append((
+                "configure",
+                handle,
+                info_class,
+                info._obj.BasicLimitInformation.LimitFlags,
+                size,
+            ))
+            return 1
+
+        def AssignProcessToJobObject(self, handle, process_handle):
+            calls.append(("assign", handle, process_handle))
+            return 1
+
+        def TerminateJobObject(self, handle, exit_code):
+            calls.append(("terminate", handle, exit_code))
+            return 1
+
+        def CloseHandle(self, handle):
+            calls.append(("close", handle))
+            return 1
+
+    containment = customization_checker._WindowsJobContainment(FakeKernel32())
+    containment.assign(91)
+    containment.terminate()
+    containment.close()
+
+    assert [call[0] for call in calls] == [
+        "create",
+        "configure",
+        "assign",
+        "terminate",
+        "close",
+    ]
+    assert calls[1][1:4] == (73, 9, 0x00002000)
+    assert calls[2] == ("assign", 73, 91)
+
+
+def test_parser_windows_job_assignment_precedes_payload_and_closes_containment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Starting the bootstrap before Job assignment must fail this test."""
+    events: list[tuple[object, ...]] = []
+
+    class FakeJob:
+        def __init__(self) -> None:
+            events.append(("job_created",))
+
+        def assign(self, process_handle: int) -> None:
+            events.append(("assigned", process_handle))
+
+        def terminate(self) -> None:
+            events.append(("terminated",))
+
+        def close(self) -> None:
+            events.append(("job_closed",))
+
+    class Sink:
+        def write(self, data: bytes) -> int:
+            events.append(("payload", data))
+            return len(data)
+
+        def close(self) -> None:
+            events.append(("stdin_closed",))
+
+    class FakeProcess:
+        pid = 77
+        _handle = 88
+
+        def __init__(self, argv, **kwargs) -> None:
+            events.append(("process_started", tuple(argv), kwargs))
+            self.stdin = Sink()
+            self.stdout = io.BytesIO(b"bounded stdout")
+            self.stderr = io.BytesIO()
+            self.returncode = 0
+
+        def wait(self, timeout=None) -> int:
+            events.append(("waited", timeout))
+            return self.returncode
+
+        def kill(self) -> None:
+            events.append(("leader_killed",))
+
+    monkeypatch.setattr(
+        customization_checker, "_is_windows", lambda: True, raising=False
+    )
+    monkeypatch.setattr(
+        customization_checker,
+        "_WindowsJobContainment",
+        FakeJob,
+        raising=False,
+    )
+    monkeypatch.setattr(customization_checker.subprocess, "Popen", FakeProcess)
+
+    capture = customization_checker._run_bounded_capture(
+        ["node", "helper.mjs"],
+        cwd=Path.cwd(),
+        input_bytes=b"parser payload",
+        timeout_seconds=60,
+        output_limit_bytes=1024,
+    )
+
+    event_names = [event[0] for event in events]
+    assert event_names.index("job_created") < event_names.index("process_started")
+    assert event_names.index("process_started") < event_names.index("assigned")
+    assert event_names.index("assigned") < event_names.index("payload")
+    assert ("payload", b"1parser payload") in events
+    assert events[-1] == ("job_closed",)
+    assert capture == customization_checker._CompletedCapture(
+        returncode=0,
+        stdout=b"bounded stdout",
+        stderr=b"",
+    )
+
+
+@pytest.mark.parametrize("failure_stage", ["creation", "assignment"])
+def test_parser_windows_containment_setup_failure_is_terminal_and_sanitized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    """Continuing after Job setup failure must fail this test."""
+    secret = "DO_NOT_ECHO_SECRET_SOURCE"
+    events: list[str] = []
+
+    class FailingJob:
+        def __init__(self) -> None:
+            events.append("job_created")
+            if failure_stage == "creation":
+                raise OSError(secret)
+
+        def assign(self, _process_handle: int) -> None:
+            events.append("assign_attempted")
+            raise OSError(secret)
+
+        def terminate(self) -> None:
+            events.append("job_terminated")
+
+        def close(self) -> None:
+            events.append("job_closed")
+
+    class Sink:
+        def write(self, data: bytes) -> int:
+            return len(data)
+
+        def close(self) -> None:
+            return None
+
+    class FakeProcess:
+        pid = 77
+        _handle = 88
+
+        def __init__(self, *args, **kwargs) -> None:
+            events.append("process_started")
+            self.stdin = Sink()
+            self.stdout = io.BytesIO()
+            self.stderr = io.BytesIO()
+            self.returncode = -9
+
+        def wait(self, timeout=None) -> int:
+            events.append("leader_reaped")
+            return self.returncode
+
+        def kill(self) -> None:
+            events.append("leader_killed")
+
+    helper = tmp_path / "helper.mjs"
+    helper.write_text("// controlled test fixture\n", encoding="utf-8")
+    monkeypatch.setattr(
+        customization_checker, "_is_windows", lambda: True, raising=False
+    )
+    monkeypatch.setattr(
+        customization_checker, "_WindowsJobContainment", FailingJob, raising=False
+    )
+    monkeypatch.setattr(customization_checker.shutil, "which", lambda _name: "node")
+    monkeypatch.setattr(customization_checker, "_NON_PYTHON_HELPER", helper)
+    monkeypatch.setattr(customization_checker.subprocess, "Popen", FakeProcess)
+
+    _assert_bounded_parser_error(
+        lambda: customization_checker._run_parser_batch([_parser_request()])
+    )
+
+    if failure_stage == "creation":
+        assert events == ["job_created"]
+    else:
+        assert events == [
+            "job_created",
+            "process_started",
+            "assign_attempted",
+            "leader_killed",
+            "leader_reaped",
+            "job_closed",
+        ]
 
 
 @pytest.mark.parametrize(
