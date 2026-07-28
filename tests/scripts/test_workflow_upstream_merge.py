@@ -1231,6 +1231,11 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     root_third_party = external_root_modules / "third-party"
     root_third_party.mkdir()
     (root_third_party / "marker").write_text("external third party\n")
+    external_root_cache = external_root_modules / ".vite/vitest/cache-id/results.json"
+    external_root_cache.parent.mkdir(parents=True)
+    external_root_cache.write_text("external root cache remains immutable\n")
+    external_root_temporary_cache = external_root_modules / ".vite-temp"
+    external_root_temporary_cache.mkdir()
     root_workspace_scope = external_root_modules / "@hermes"
     root_workspace_scope.mkdir()
     (root_workspace_scope / "shared").symlink_to("../../apps/shared")
@@ -1252,6 +1257,8 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     external_cache = external_desktop_modules / ".vite/vitest/cache-id/results.json"
     external_cache.parent.mkdir(parents=True)
     external_cache.write_text("external cache remains immutable\n")
+    external_temporary_cache = external_desktop_modules / ".vite-temp"
+    external_temporary_cache.mkdir()
     vitest = desktop_vitest / "cli.py"
     vitest.write_text(
         "#!/usr/bin/env python3\n"
@@ -1293,6 +1300,15 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
         "cache = modules / '.vite/vitest/cache-id/results.json'\n"
         "cache.parent.mkdir(parents=True, exist_ok=True)\n"
         "cache.write_text('sealed cache write\\n')\n"
+        "temporary_cache = modules / '.vite-temp/vitest-temporary'\n"
+        "temporary_cache.parent.mkdir(parents=True, exist_ok=True)\n"
+        "temporary_cache.write_text('sealed temporary cache write\\n')\n"
+        "root_cache = root_modules / '.vite/vitest/cache-id/results.json'\n"
+        "root_cache.parent.mkdir(parents=True, exist_ok=True)\n"
+        "root_cache.write_text('sealed root cache write\\n')\n"
+        "root_temporary_cache = root_modules / '.vite-temp/vitest-temporary'\n"
+        "root_temporary_cache.parent.mkdir(parents=True, exist_ok=True)\n"
+        "root_temporary_cache.write_text('sealed root temporary cache write\\n')\n"
         "Path(os.environ['OBSERVED_NODE_CWD']).write_text(str(cwd))\n"
     )
     vitest.chmod(0o755)
@@ -1308,6 +1324,16 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
         "cache = cwd / 'node_modules/.vite/vitest/cache-id/results.json'\n"
         "if cache.read_text() != 'sealed cache write\\n':\n"
         "    raise SystemExit(31)\n"
+        "temporary_cache = cwd / 'node_modules/.vite-temp/vitest-temporary'\n"
+        "if temporary_cache.read_text() != 'sealed temporary cache write\\n':\n"
+        "    raise SystemExit(33)\n"
+        "sealed_repo = cwd.parent.parent\n"
+        "root_cache = sealed_repo / 'node_modules/.vite/vitest/cache-id/results.json'\n"
+        "if root_cache.read_text() != 'sealed root cache write\\n':\n"
+        "    raise SystemExit(34)\n"
+        "root_temporary_cache = sealed_repo / 'node_modules/.vite-temp/vitest-temporary'\n"
+        "if root_temporary_cache.read_text() != 'sealed root temporary cache write\\n':\n"
+        "    raise SystemExit(35)\n"
         "if sys.argv[1:] != ['--test', 'electron/toolchain.test.ts']:\n"
         "    raise SystemExit(32)\n"
         "Path(os.environ['OBSERVED_TSX']).write_text('tsx ran after revalidation')\n"
@@ -1387,6 +1413,9 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     assert observed_cwd.is_file()
     assert observed_tsx.is_file()
     assert external_cache.read_text() == "external cache remains immutable\n"
+    assert list(external_temporary_cache.iterdir()) == []
+    assert external_root_cache.read_text() == "external root cache remains immutable\n"
+    assert list(external_root_temporary_cache.iterdir()) == []
     assert Path(observed_cwd.read_text()).parent.name == "apps"
     assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
     assert list(temp_root.iterdir()) == []
@@ -1494,7 +1523,10 @@ def test_sealed_ledger_runner_rejects_dependency_mutation_between_node_groups(
     )
 
     assert result.returncode == 2
-    assert "node_modules changed before execution" in result.stderr
+    assert (
+        "apps/desktop/node_modules/dependency/authority.js changed before execution"
+        in result.stderr
+    )
     assert dependency.read_text() == "mutated dependency\n"
     assert not tsx_executed.exists()
     assert not report.exists()

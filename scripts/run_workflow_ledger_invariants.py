@@ -38,7 +38,7 @@ _POLL_SECONDS = 0.05
 _TERMINATE_GRACE_SECONDS = 1.0
 _NODE_DEPENDENCY_MAX_ENTRIES = 250_000
 _NODE_DEPENDENCY_AUDIT_SECONDS = 60.0
-_NODE_DEPENDENCY_CACHE_PATHS = frozenset({Path(".vite")})
+_NODE_DEPENDENCY_CACHE_PATHS = frozenset({Path(".vite"), Path(".vite-temp")})
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 
@@ -543,7 +543,7 @@ def _revalidate_node_dependency_roots(
                 path = root.external / relative
                 if _file_identity(path) != identity:
                     raise ValueError(
-                        f"--base-ref {label_root} changed before execution"
+                        f"--base-ref {label_root}/{relative.as_posix()} changed before execution"
                     )
             for relative, link in root.links.items():
                 if time.monotonic() > deadline:
