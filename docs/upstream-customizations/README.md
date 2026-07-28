@@ -13,12 +13,24 @@ stacked decorator lines. JSON, YAML, and TOML are syntax-validated with their
 native safe parsers and search only recursive string keys and values; malformed
 documents fail validation. Traversal is alias-cycle safe, decoded escape values
 map back to their source spans, and block/multiline string spans stop before the
-following syntax. PowerShell, POSIX shell, TypeScript/JavaScript, CSS, and
-Markdown use separate bounded lexical scanners so their real comments do not
-satisfy ownership while strings, template text and expressions, parameter
-trims, here-documents, and fenced code spans remain searchable. Behavioral prose
-belongs in the optional bounded `owned_invariants` list. New or migrated entries
-may select `overlap_policy: owned_symbol` (the compatibility default) or
+following syntax. PowerShell, POSIX shell, and CSS use bounded lexical scanners.
+TypeScript/JavaScript and Markdown use the pinned parser helper: their broad
+symbol meaning includes semantic syntax while excluding comments and HTML; JS/TS
+literals and Markdown literals, code, and prose remain searchable. Parser
+requests use only exact committed Git revision blob bytes, never dirty worktree
+bytes, and encode those bytes as canonical base64. Returned symbol spans and
+Git-changed ranges are half-open UTF-8 byte offsets, so overlap checks are
+byte-exact. The root `package.json` and lockfile must provide the exactly
+attested TypeScript 6.0.3, unified 11.0.5, remark-parse 11.0.0, and micromark
+4.0.2 dependencies. Each parser request is at most 4 MiB, each sequential batch
+is at most 16 MiB, parser output is at most 16 MiB, and parser execution is
+limited to 60 seconds. Parser transport, validation, and parse errors fail
+closed with no heuristic or lexical fallback. A report replaces prior evidence
+atomically only after complete successful parser classification. The separate
+character-token Git diff is likewise fail-closed and independently limited to
+64 MiB of output and 60 seconds of execution. Behavioral prose belongs in the
+optional bounded `owned_invariants` list. New or migrated entries may select
+`overlap_policy: owned_symbol` (the compatibility default) or
 `overlap_policy: any_owned_file`. The latter makes every change to a declared
 file decision-required even when no exact symbol span changed, and is required
 for security, admission, exact-byte authority, Desktop capability, schema, and

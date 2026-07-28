@@ -4067,8 +4067,10 @@ upstream_changes:
   - load_and_validate_manifest
   - _powershell_without_comments
   - _shell_without_comments
-  - _typescript_without_comments
-  - _markdown_without_comments
+  - _ParserRequest
+  - _NonPythonSymbolResolver
+  - _run_parser_batch
+  - classify_upstream_overlaps
   - _structured_spans
   - _walk_yaml_nodes
   - _WindowsJobContainment
@@ -4083,8 +4085,14 @@ upstream_changes:
   - language-aware comment ownership without exposing literals or heredoc bodies
   - exact JSON and TOML lexical-token ranges compare only changed character spans, with cycle-safe YAML traversal
   - strict manifest history, lexical paths, and Git-tree file types anchor to one resolved source revision
-  - control, keyword, property, postfix, delimiter, operator, restricted-statement, and label regular-expression goals retain JavaScript lexical boundaries, including contextual for-in/of and for-await-of delimiters at each bounded header's own grouping and body depth, closed nested LHS completion, innermost nested-header precedence, and optional jump labels through ASI or semicolon termination
-  - CommonMark container fences use visual tab-stop columns, relative list indentation, exact closing-fence width, container-aware blank continuation, and outer-line reprocessing only when a required container ends
+  - parser-derived broad JS, TS, and Markdown semantic syntax remains searchable
+  - parser-derived HTML and comments are excluded while literals, code, and prose remain searchable
+  - parser requests contain only exact committed Git blob bytes encoded as canonical base64
+  - parser and changed ranges use exact half-open UTF-8 byte spans
+  - parser protocol and dependency versions are explicitly attested
+  - parser batches execute sequentially within bounded input, output, and time limits
+  - parser transport, validation, and parse failures are terminal without lexical fallback
+  - overlap reports replace prior evidence atomically only after complete parser classification
   - JSON and TOML ownership spans exclude numeric, boolean, null, date, and array scalar occurrences
   - process-tree containment across normal exit, timeout, interruption, and failure
   - detached committed-tree base-ref sealing excludes live untracked discovery and rejects dirty or symlinked tracked authority
@@ -4107,6 +4115,45 @@ upstream_changes:
     Remove when upstream emits equivalent schema-validated evidence that
     distinguishes actual execution from references, records real outcomes,
     and retains exact bounded paths without unbounded labels.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-parser-backed-symbol-ownership
+  change_class: workflow-testing
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - package.json
+  - package-lock.json
+  - scripts/extract_non_python_symbols.mjs
+  - scripts/check_upstream_customizations.py
+  owned_symbols:
+  - PROTOCOL_VERSION
+  - extractTypeScriptSpans
+  - extractQualifiedTypeScriptSpans
+  - extractMarkdownSpans
+  - _NonPythonSymbolResolver
+  - _run_parser_batch
+  - _git_changed_byte_ranges
+  - 6.0.3
+  - 11.0.5
+  - 11.0.0
+  - 4.0.2
+  owned_invariants:
+  - parser requests contain only exact committed Git blob bytes selected by Python authority
+  - parser-derived broad syntax spans exclude comments and use half-open UTF-8 byte offsets
+  - exact character-level Git diffs are bounded independently and fail closed before overlap classification
+  - exact parser versions and bounded sequential batches fail closed without a lexical fallback
+  - overlap reports replace prior evidence atomically only after complete parser success
+  tests:
+  - tests/scripts/test_extract_non_python_symbols.py
+  - tests/scripts/test_check_upstream_customizations.py
+  expected_commit_subject: 'feat(workflow): add bounded symbol parser helper'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve Python authority over committed revisions and overlap policy while
+    using the exact pinned parser helper for broad JS, TS, and Markdown spans.
+  removal_condition: >-
+    Remove when upstream provides equivalent committed-byte parser extraction,
+    bounded fail-closed transport, exact byte overlap, and atomic reporting.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-ledger-subprocess-environment-isolation
   change_class: workflow-testing
