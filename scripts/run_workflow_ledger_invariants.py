@@ -38,6 +38,7 @@ _POLL_SECONDS = 0.05
 _TERMINATE_GRACE_SECONDS = 1.0
 _NODE_DEPENDENCY_MAX_ENTRIES = 250_000
 _NODE_DEPENDENCY_AUDIT_SECONDS = 60.0
+_NODE_DEPENDENCY_CACHE_PATHS = frozenset({Path(".vite")})
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 
@@ -429,7 +430,12 @@ def _audit_node_dependency_roots(
                             ) from exc
                         root.entries[relative] = identity
                         mode = identity[2]
-                        if stat.S_ISLNK(mode):
+                        if relative in _NODE_DEPENDENCY_CACHE_PATHS:
+                            if not stat.S_ISDIR(mode):
+                                raise ValueError(
+                                    f"--base-ref {label_root}/{relative.as_posix()} cache path must be a directory"
+                                )
+                        elif stat.S_ISLNK(mode):
                             label = f"{label_root}/{relative.as_posix()}"
                             root.links[relative] = _dependency_link_target(
                                 path,
@@ -486,7 +492,9 @@ def _build_node_dependency_directory(
                 destination_path = root.destination / relative
                 identity = root.entries[relative]
                 mode = identity[2]
-                if stat.S_ISLNK(mode):
+                if relative in _NODE_DEPENDENCY_CACHE_PATHS:
+                    destination_path.mkdir()
+                elif stat.S_ISLNK(mode):
                     link = root.links[relative]
                     destination_path.symlink_to(
                         _dependency_view_target(link, roots, sealed_repo),

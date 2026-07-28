@@ -4089,6 +4089,7 @@ upstream_changes:
   - process-tree containment across normal exit, timeout, interruption, and failure
   - detached committed-tree base-ref sealing excludes live untracked discovery and rejects dirty or symlinked tracked authority
   - bounded root and Desktop dependency views remap workspace links to committed detached-checkout paths and reject broken or escaping links before execution
+  - writable Vitest cache state remains inside the disposable dependency view while real dependency mutations stay terminal
   - supervisor and Job Object bootstrap failures remain terminal infrastructure errors
   tests:
   - apps/desktop/src/lib/json-rpc-gateway-url-guard.test.ts

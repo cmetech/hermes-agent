@@ -1192,13 +1192,25 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     test_path = desktop / "src/toolchain.test.ts"
     test_path.parent.mkdir(parents=True)
     test_path.write_text("export const sealedToolchain = true\n")
+    electron_test_path = desktop / "electron/toolchain.test.ts"
+    electron_test_path.parent.mkdir()
+    electron_test_path.write_text("export const sealedElectronToolchain = true\n")
     shared = repo / "apps/shared"
     shared.mkdir()
     (shared / "index.js").write_text("export const authority = 'committed';\n")
     manifest = repo / "ledger.yaml"
     manifest.write_text(
         yaml.safe_dump(
-            {"upstream_changes": [{"tests": ["apps/desktop/src/toolchain.test.ts"]}]},
+            {
+                "upstream_changes": [
+                    {
+                        "tests": [
+                            "apps/desktop/electron/toolchain.test.ts",
+                            "apps/desktop/src/toolchain.test.ts",
+                        ]
+                    }
+                ]
+            },
             sort_keys=False,
         )
     )
@@ -1237,6 +1249,9 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     )
     desktop_vitest = external_desktop_modules / "vitest"
     desktop_vitest.mkdir()
+    external_cache = external_desktop_modules / ".vite/vitest/cache-id/results.json"
+    external_cache.parent.mkdir(parents=True)
+    external_cache.write_text("external cache remains immutable\n")
     vitest = desktop_vitest / "cli.py"
     vitest.write_text(
         "#!/usr/bin/env python3\n"
@@ -1275,12 +1290,33 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
         "    raise SystemExit(29)\n"
         "if sys.argv[1:] != ['run', 'src/toolchain.test.ts']:\n"
         "    raise SystemExit(30)\n"
+        "cache = modules / '.vite/vitest/cache-id/results.json'\n"
+        "cache.parent.mkdir(parents=True, exist_ok=True)\n"
+        "cache.write_text('sealed cache write\\n')\n"
         "Path(os.environ['OBSERVED_NODE_CWD']).write_text(str(cwd))\n"
     )
     vitest.chmod(0o755)
+    desktop_tsx = external_desktop_modules / "tsx"
+    desktop_tsx.mkdir()
+    tsx = desktop_tsx / "cli.py"
+    tsx.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "import sys\n\n"
+        "cwd = Path.cwd()\n"
+        "cache = cwd / 'node_modules/.vite/vitest/cache-id/results.json'\n"
+        "if cache.read_text() != 'sealed cache write\\n':\n"
+        "    raise SystemExit(31)\n"
+        "if sys.argv[1:] != ['--test', 'electron/toolchain.test.ts']:\n"
+        "    raise SystemExit(32)\n"
+        "Path(os.environ['OBSERVED_TSX']).write_text('tsx ran after revalidation')\n"
+    )
+    tsx.chmod(0o755)
     desktop_bin = external_desktop_modules / ".bin"
     desktop_bin.mkdir()
     (desktop_bin / "vitest").symlink_to("../vitest/cli.py")
+    (desktop_bin / "tsx").symlink_to("../tsx/cli.py")
     (repo / "node_modules").symlink_to(external_root_modules, target_is_directory=True)
     (desktop / "node_modules").symlink_to(
         external_desktop_modules,
@@ -1291,6 +1327,7 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     external_bin = tmp_path / "external-node-bin"
     external_bin.mkdir()
     observed_cwd = tmp_path / "observed-node-cwd"
+    observed_tsx = tmp_path / "observed-tsx"
     node = external_bin / "node"
     node.write_text("#!/bin/sh\nexit 0\n")
     node.chmod(0o755)
@@ -1315,6 +1352,7 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     env["EXPECTED_EXTERNAL_ROOT_NODE_MODULES"] = str(external_root_modules)
     env["EXPECTED_LIVE_REPO"] = str(repo)
     env["OBSERVED_NODE_CWD"] = str(observed_cwd)
+    env["OBSERVED_TSX"] = str(observed_tsx)
     env["NODE_PATH"] = str(external_desktop_modules)
     env["PYTHONPATH"] = str(repo)
     env["INIT_CWD"] = str(repo)
@@ -1342,9 +1380,124 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     )
 
     assert result.returncode == 0, result.stderr
-    assert json.loads(report.read_text())[0]["result"] == "passed"
+    assert [record["result"] for record in json.loads(report.read_text())] == [
+        "passed",
+        "passed",
+    ]
     assert observed_cwd.is_file()
+    assert observed_tsx.is_file()
+    assert external_cache.read_text() == "external cache remains immutable\n"
     assert Path(observed_cwd.read_text()).parent.name == "apps"
+    assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
+    assert list(temp_root.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="external toolchain links use POSIX paths")
+def test_sealed_ledger_runner_rejects_dependency_mutation_between_node_groups(
+    tmp_path: Path,
+) -> None:
+    """A real dependency mutation stays terminal while cache writes are isolated."""
+    repo = tmp_path / "runner-mutated-node-dependency"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    desktop = repo / "apps/desktop"
+    source_test = desktop / "src/toolchain.test.ts"
+    source_test.parent.mkdir(parents=True)
+    source_test.write_text("export const sealedToolchain = true\n")
+    electron_test = desktop / "electron/toolchain.test.ts"
+    electron_test.parent.mkdir()
+    electron_test.write_text("export const sealedElectronToolchain = true\n")
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {
+                "upstream_changes": [
+                    {
+                        "tests": [
+                            "apps/desktop/electron/toolchain.test.ts",
+                            "apps/desktop/src/toolchain.test.ts",
+                        ]
+                    }
+                ]
+            },
+            sort_keys=False,
+        )
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit two sealed Node groups")
+
+    external_project = tmp_path / "external-project"
+    external_root_modules = external_project / "node_modules"
+    external_root_modules.mkdir(parents=True)
+    external_desktop_modules = external_project / "apps/desktop/node_modules"
+    dependency = external_desktop_modules / "dependency/authority.js"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("stable dependency\n")
+    (repo / "node_modules").symlink_to(
+        external_root_modules,
+        target_is_directory=True,
+    )
+    (desktop / "node_modules").symlink_to(
+        external_desktop_modules,
+        target_is_directory=True,
+    )
+
+    tsx_executed = tmp_path / "tsx-executed"
+    external_bin = tmp_path / "external-node-bin"
+    external_bin.mkdir()
+    node = external_bin / "node"
+    node.write_text("#!/bin/sh\nexit 0\n")
+    node.chmod(0o755)
+    npx = external_bin / "npx"
+    npx.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "import sys\n\n"
+        "if sys.argv[1] == 'vitest':\n"
+        "    Path(os.environ['MUTATED_DEPENDENCY']).write_text('mutated dependency\\n')\n"
+        "elif sys.argv[1] == 'tsx':\n"
+        "    Path(os.environ['TSX_EXECUTED']).write_text('should not execute')\n"
+    )
+    npx.chmod(0o755)
+    report = tmp_path / "mutated-dependency-report.json"
+    temp_root = tmp_path / "runner-temp"
+    temp_root.mkdir()
+    worktrees_before = _git(repo, "worktree", "list", "--porcelain")
+    env = os.environ.copy()
+    env["PATH"] = f"{external_bin}{os.pathsep}{env['PATH']}"
+    env["TMPDIR"] = str(temp_root)
+    env["MUTATED_DEPENDENCY"] = str(dependency)
+    env["TSX_EXECUTED"] = str(tsx_executed)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--report-path",
+            str(report),
+            "--platform",
+            "synthetic",
+            "--base-ref",
+            "HEAD",
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert "node_modules changed before execution" in result.stderr
+    assert dependency.read_text() == "mutated dependency\n"
+    assert not tsx_executed.exists()
+    assert not report.exists()
     assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
     assert list(temp_root.iterdir()) == []
 
