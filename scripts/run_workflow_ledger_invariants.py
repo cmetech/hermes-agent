@@ -214,40 +214,43 @@ def _external_executable(repo: Path, name: str) -> str:
     return str(executable)
 
 
-def _external_desktop_node_modules(repo: Path) -> Path | None:
-    """Accept only a live-worktree link to an external desktop dependency root."""
-    candidate = repo / "apps/desktop/node_modules"
+def _external_node_modules(repo: Path, relative_path: Path) -> Path | None:
+    """Accept only a live-worktree link to one external Node dependency root."""
+    candidate = repo / relative_path
+    label = relative_path.as_posix()
     if not candidate.is_symlink():
         if candidate.exists():
             raise ValueError(
-                "--base-ref desktop node_modules must be an external symlink"
+                f"--base-ref {label} must be an external symlink"
             )
         return None
     try:
         external = candidate.resolve(strict=True)
     except OSError as exc:
         raise ValueError(
-            "--base-ref desktop node_modules must resolve to an external directory"
+            f"--base-ref {label} must resolve to an external directory"
         ) from exc
     if not external.is_dir() or _is_within(external, repo.resolve()):
         raise ValueError(
-            "--base-ref desktop node_modules must resolve to an external directory"
+            f"--base-ref {label} must resolve to an external directory"
         )
     return external
 
 
-def _provision_external_desktop_node_modules(
+def _provision_external_node_modules(
     sealed_repo: Path,
+    relative_path: Path,
     external_node_modules: Path,
 ) -> None:
     """Mount one validated dependency root into the disposable sealed tree."""
-    destination = sealed_repo / "apps/desktop/node_modules"
+    destination = sealed_repo / relative_path
+    label = relative_path.as_posix()
     if destination.exists() or destination.is_symlink():
         raise ValueError(
-            "--base-ref sealed tree already contains desktop node_modules authority"
+            f"--base-ref sealed tree already contains {label} authority"
         )
     if not external_node_modules.is_dir():
-        raise ValueError("external desktop node_modules disappeared before execution")
+        raise ValueError(f"external {label} disappeared before execution")
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.symlink_to(external_node_modules, target_is_directory=True)
 
@@ -1005,12 +1008,32 @@ def _execute_manifest_invariants(
         node_path = _external_executable(source_repo, "node")
     if source_repo is not None and needs_desktop_toolchain:
         npx_path = _external_executable(source_repo, "npx")
-        external_node_modules = _external_desktop_node_modules(source_repo)
-        if external_node_modules is None:
+        external_root_node_modules = _external_node_modules(
+            source_repo,
+            Path("node_modules"),
+        )
+        if external_root_node_modules is None:
             raise ValueError(
-                "--base-ref desktop invariants require an external node_modules symlink"
+                "--base-ref desktop invariants require an external root node_modules symlink"
             )
-        _provision_external_desktop_node_modules(repo, external_node_modules)
+        external_desktop_node_modules = _external_node_modules(
+            source_repo,
+            Path("apps/desktop/node_modules"),
+        )
+        if external_desktop_node_modules is None:
+            raise ValueError(
+                "--base-ref desktop invariants require an external desktop node_modules symlink"
+            )
+        _provision_external_node_modules(
+            repo,
+            Path("node_modules"),
+            external_root_node_modules,
+        )
+        _provision_external_node_modules(
+            repo,
+            Path("apps/desktop/node_modules"),
+            external_desktop_node_modules,
+        )
     results: list[dict[str, Any]] = []
     group_options = (timeout_seconds, output_limit_bytes)
     results.extend(

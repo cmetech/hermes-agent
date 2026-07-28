@@ -1202,10 +1202,17 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "commit sealed desktop invariant")
 
-    external_modules = tmp_path / "external-node-modules"
-    external_modules.mkdir()
-    (external_modules / "toolchain-marker").write_text("external only\n")
-    (desktop / "node_modules").symlink_to(external_modules, target_is_directory=True)
+    external_desktop_modules = tmp_path / "external-desktop-node-modules"
+    external_desktop_modules.mkdir()
+    (external_desktop_modules / "toolchain-marker").write_text("external only\n")
+    external_root_modules = tmp_path / "external-root-node-modules"
+    external_root_modules.mkdir()
+    (external_root_modules / "root-toolchain-marker").write_text("root only\n")
+    (repo / "node_modules").symlink_to(external_root_modules, target_is_directory=True)
+    (desktop / "node_modules").symlink_to(
+        external_desktop_modules,
+        target_is_directory=True,
+    )
     live_sentinel = desktop / "live-discovery-sentinel"
     live_sentinel.write_text("must never enter the sealed test cwd\n")
     external_bin = tmp_path / "external-node-bin"
@@ -1221,7 +1228,9 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
         "from pathlib import Path\n\n"
         "cwd = Path.cwd()\n"
         "modules = cwd / 'node_modules'\n"
-        "expected_modules = Path(os.environ['EXPECTED_EXTERNAL_NODE_MODULES']).resolve()\n"
+        "root_modules = cwd.parent.parent / 'node_modules'\n"
+        "expected_modules = Path(os.environ['EXPECTED_EXTERNAL_DESKTOP_NODE_MODULES']).resolve()\n"
+        "expected_root_modules = Path(os.environ['EXPECTED_EXTERNAL_ROOT_NODE_MODULES']).resolve()\n"
         f"live_repo = Path({str(repo)!r}).resolve()\n"
         f"live_desktop = Path({str(desktop)!r}).resolve()\n"
         "if not modules.is_symlink() or modules.resolve() != expected_modules:\n"
@@ -1230,6 +1239,10 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
         "    raise SystemExit(22)\n"
         "if (modules / 'toolchain-marker').read_text() != 'external only\\n':\n"
         "    raise SystemExit(23)\n"
+        "if not root_modules.is_symlink() or root_modules.resolve() != expected_root_modules:\n"
+        "    raise SystemExit(27)\n"
+        "if (root_modules / 'root-toolchain-marker').read_text() != 'root only\\n':\n"
+        "    raise SystemExit(28)\n"
         "if any(\n"
         "    raw and Path(raw).resolve().is_relative_to(live_repo)\n"
         "    for raw in os.environ.get('PATH', '').split(os.pathsep)\n"
@@ -1248,9 +1261,10 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     worktrees_before = _git(repo, "worktree", "list", "--porcelain")
     env = os.environ.copy()
     env["PATH"] = f"{external_bin}{os.pathsep}{env['PATH']}"
-    env["EXPECTED_EXTERNAL_NODE_MODULES"] = str(external_modules)
+    env["EXPECTED_EXTERNAL_DESKTOP_NODE_MODULES"] = str(external_desktop_modules)
+    env["EXPECTED_EXTERNAL_ROOT_NODE_MODULES"] = str(external_root_modules)
     env["OBSERVED_NODE_CWD"] = str(observed_cwd)
-    env["NODE_PATH"] = str(external_modules)
+    env["NODE_PATH"] = str(external_desktop_modules)
     env["PYTHONPATH"] = str(repo)
     env["INIT_CWD"] = str(repo)
     env["TMPDIR"] = str(temp_root)
@@ -1285,13 +1299,22 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
 
 
 @pytest.mark.skipif(os.name == "nt", reason="external toolchain links use POSIX paths")
-@pytest.mark.parametrize("kind", ["regular", "inside-symlink"])
+@pytest.mark.parametrize(
+    ("scope", "kind"),
+    [
+        ("desktop", "regular"),
+        ("desktop", "inside-symlink"),
+        ("root", "regular"),
+        ("root", "inside-symlink"),
+    ],
+)
 def test_sealed_ledger_runner_rejects_nonexternal_node_modules_authority(
     tmp_path: Path,
+    scope: str,
     kind: str,
 ) -> None:
-    """A desktop dependency root must be an external directory symlink."""
-    repo = tmp_path / f"runner-node-modules-{kind}"
+    """Every mounted Node dependency root must be an external directory symlink."""
+    repo = tmp_path / f"runner-node-modules-{scope}-{kind}"
     repo.mkdir()
     _git(repo, "init")
     _git(repo, "config", "user.email", "test@example.com")
@@ -1310,11 +1333,15 @@ def test_sealed_ledger_runner_rejects_nonexternal_node_modules_authority(
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "commit desktop invariant")
 
-    node_modules = desktop / "node_modules"
+    external_modules = tmp_path / "external-node-modules"
+    external_modules.mkdir()
+    node_modules = desktop / "node_modules" if scope == "desktop" else repo / "node_modules"
+    other_node_modules = repo / "node_modules" if scope == "desktop" else desktop / "node_modules"
+    other_node_modules.symlink_to(external_modules, target_is_directory=True)
     if kind == "regular":
         node_modules.mkdir()
     else:
-        inside = repo / "toolchain-inside-source"
+        inside = repo / f"{scope}-toolchain-inside-source"
         inside.mkdir()
         node_modules.symlink_to(inside, target_is_directory=True)
     external_bin = tmp_path / "external-node-bin"
