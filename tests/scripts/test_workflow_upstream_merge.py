@@ -1178,6 +1178,189 @@ def test_sealed_ledger_runner_ignores_tracked_symlink_mutation_during_run(
     assert list(temp_root.iterdir()) == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="external toolchain links use POSIX paths")
+def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discovery(
+    tmp_path: Path,
+) -> None:
+    """Desktop invariants receive an explicit dependency root, never live source."""
+    repo = tmp_path / "runner-external-node-toolchain"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    desktop = repo / "apps/desktop"
+    test_path = desktop / "src/toolchain.test.ts"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text("export const sealedToolchain = true\n")
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"upstream_changes": [{"tests": ["apps/desktop/src/toolchain.test.ts"]}]},
+            sort_keys=False,
+        )
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit sealed desktop invariant")
+
+    external_modules = tmp_path / "external-node-modules"
+    external_modules.mkdir()
+    (external_modules / "toolchain-marker").write_text("external only\n")
+    (desktop / "node_modules").symlink_to(external_modules, target_is_directory=True)
+    live_sentinel = desktop / "live-discovery-sentinel"
+    live_sentinel.write_text("must never enter the sealed test cwd\n")
+    external_bin = tmp_path / "external-node-bin"
+    external_bin.mkdir()
+    observed_cwd = tmp_path / "observed-node-cwd"
+    node = external_bin / "node"
+    node.write_text("#!/bin/sh\nexit 0\n")
+    node.chmod(0o755)
+    npx = external_bin / "npx"
+    npx.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "from pathlib import Path\n\n"
+        "cwd = Path.cwd()\n"
+        "modules = cwd / 'node_modules'\n"
+        "expected_modules = Path(os.environ['EXPECTED_EXTERNAL_NODE_MODULES']).resolve()\n"
+        f"live_repo = Path({str(repo)!r}).resolve()\n"
+        f"live_desktop = Path({str(desktop)!r}).resolve()\n"
+        "if not modules.is_symlink() or modules.resolve() != expected_modules:\n"
+        "    raise SystemExit(21)\n"
+        "if cwd == live_desktop or (cwd / 'live-discovery-sentinel').exists():\n"
+        "    raise SystemExit(22)\n"
+        "if (modules / 'toolchain-marker').read_text() != 'external only\\n':\n"
+        "    raise SystemExit(23)\n"
+        "if any(\n"
+        "    raw and Path(raw).resolve().is_relative_to(live_repo)\n"
+        "    for raw in os.environ.get('PATH', '').split(os.pathsep)\n"
+        "):\n"
+        "    raise SystemExit(24)\n"
+        "if any(os.environ.get(name) for name in ('NODE_PATH', 'PYTHONPATH', 'INIT_CWD')):\n"
+        "    raise SystemExit(25)\n"
+        "if Path(os.environ['PWD']).resolve() != cwd.resolve():\n"
+        "    raise SystemExit(26)\n"
+        "Path(os.environ['OBSERVED_NODE_CWD']).write_text(str(cwd))\n"
+    )
+    npx.chmod(0o755)
+    report = tmp_path / "sealed-node-report.json"
+    temp_root = tmp_path / "runner-temp"
+    temp_root.mkdir()
+    worktrees_before = _git(repo, "worktree", "list", "--porcelain")
+    env = os.environ.copy()
+    env["PATH"] = f"{external_bin}{os.pathsep}{env['PATH']}"
+    env["EXPECTED_EXTERNAL_NODE_MODULES"] = str(external_modules)
+    env["OBSERVED_NODE_CWD"] = str(observed_cwd)
+    env["NODE_PATH"] = str(external_modules)
+    env["PYTHONPATH"] = str(repo)
+    env["INIT_CWD"] = str(repo)
+    env["TMPDIR"] = str(temp_root)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--report-path",
+            str(report),
+            "--platform",
+            "synthetic",
+            "--base-ref",
+            "HEAD",
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(report.read_text())[0]["result"] == "passed"
+    assert observed_cwd.is_file()
+    assert Path(observed_cwd.read_text()).parent.name == "apps"
+    assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
+    assert list(temp_root.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="external toolchain links use POSIX paths")
+@pytest.mark.parametrize("kind", ["regular", "inside-symlink"])
+def test_sealed_ledger_runner_rejects_nonexternal_node_modules_authority(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    """A desktop dependency root must be an external directory symlink."""
+    repo = tmp_path / f"runner-node-modules-{kind}"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    desktop = repo / "apps/desktop"
+    test_path = desktop / "src/toolchain.test.ts"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text("export const localToolchain = true\n")
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"upstream_changes": [{"tests": ["apps/desktop/src/toolchain.test.ts"]}]},
+            sort_keys=False,
+        )
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit desktop invariant")
+
+    node_modules = desktop / "node_modules"
+    if kind == "regular":
+        node_modules.mkdir()
+    else:
+        inside = repo / "toolchain-inside-source"
+        inside.mkdir()
+        node_modules.symlink_to(inside, target_is_directory=True)
+    external_bin = tmp_path / "external-node-bin"
+    external_bin.mkdir()
+    node = external_bin / "node"
+    node.write_text("#!/bin/sh\nexit 0\n")
+    node.chmod(0o755)
+    npx = external_bin / "npx"
+    npx.write_text("#!/bin/sh\nexit 0\n")
+    npx.chmod(0o755)
+    report = tmp_path / f"{kind}-node-report.json"
+    temp_root = tmp_path / "runner-temp"
+    temp_root.mkdir()
+    worktrees_before = _git(repo, "worktree", "list", "--porcelain")
+    env = os.environ.copy()
+    env["PATH"] = f"{external_bin}{os.pathsep}{env['PATH']}"
+    env["TMPDIR"] = str(temp_root)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--report-path",
+            str(report),
+            "--platform",
+            "synthetic",
+            "--base-ref",
+            "HEAD",
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert "external" in result.stderr
+    assert not report.exists()
+    assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
+    assert list(temp_root.iterdir()) == []
+
+
 def _run_ledger_fixture(
     tmp_path: Path,
     sources: dict[str, str],

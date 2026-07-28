@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -189,7 +190,107 @@ def _kind(path: str) -> str:
     return "reference"
 
 
-def _command(repo: Path, path: str, kind: str) -> tuple[list[str], Path]:
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _external_executable(repo: Path, name: str) -> str:
+    """Resolve one executable toolchain command outside the live repository."""
+    located = shutil.which(name)
+    if located is None:
+        raise ValueError(f"--base-ref requires an external {name} executable")
+    try:
+        executable = Path(located).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"cannot resolve external {name} executable") from exc
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise ValueError(f"--base-ref requires an executable external {name}")
+    if _is_within(executable, repo.resolve()):
+        raise ValueError(f"--base-ref refuses {name} executable inside --repo")
+    return str(executable)
+
+
+def _external_desktop_node_modules(repo: Path) -> Path | None:
+    """Accept only a live-worktree link to an external desktop dependency root."""
+    candidate = repo / "apps/desktop/node_modules"
+    if not candidate.is_symlink():
+        if candidate.exists():
+            raise ValueError(
+                "--base-ref desktop node_modules must be an external symlink"
+            )
+        return None
+    try:
+        external = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(
+            "--base-ref desktop node_modules must resolve to an external directory"
+        ) from exc
+    if not external.is_dir() or _is_within(external, repo.resolve()):
+        raise ValueError(
+            "--base-ref desktop node_modules must resolve to an external directory"
+        )
+    return external
+
+
+def _provision_external_desktop_node_modules(
+    sealed_repo: Path,
+    external_node_modules: Path,
+) -> None:
+    """Mount one validated dependency root into the disposable sealed tree."""
+    destination = sealed_repo / "apps/desktop/node_modules"
+    if destination.exists() or destination.is_symlink():
+        raise ValueError(
+            "--base-ref sealed tree already contains desktop node_modules authority"
+        )
+    if not external_node_modules.is_dir():
+        raise ValueError("external desktop node_modules disappeared before execution")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.symlink_to(external_node_modules, target_is_directory=True)
+
+
+def _configure_sealed_execution_environment(
+    env: dict[str, str],
+    repo: Path,
+    *,
+    node_path: str | None,
+    cwd: Path,
+) -> None:
+    """Remove live-worktree import authority from a sealed child process."""
+    repo_root = repo.resolve()
+    preserved: list[str] = []
+    for raw_path in env.get("PATH", "").split(os.pathsep):
+        if not raw_path:
+            continue
+        try:
+            resolved = Path(raw_path).resolve()
+        except OSError:
+            continue
+        if not _is_within(resolved, repo_root):
+            preserved.append(raw_path)
+    if node_path is not None:
+        preserved.insert(0, str(Path(node_path).parent))
+    env["PATH"] = os.pathsep.join(preserved)
+    # These variables can prepend live source or dependency paths ahead of
+    # the detached checkout.  The sealed tree is self-contained except for
+    # the one validated external dependency root we deliberately mount.
+    env.pop("NODE_PATH", None)
+    env.pop("PYTHONPATH", None)
+    env.pop("INIT_CWD", None)
+    env["PWD"] = str(cwd)
+
+
+def _command(
+    repo: Path,
+    path: str,
+    kind: str,
+    *,
+    node_path: str | None = None,
+    npx_path: str | None = None,
+) -> tuple[list[str], Path]:
     if kind == "python":
         # Keep the absolute virtualenv entry point.  Resolving the symlink to
         # uv's base interpreter would silently discard the venv/site-packages.
@@ -199,12 +300,12 @@ def _command(repo: Path, path: str, kind: str) -> tuple[list[str], Path]:
         return command, repo
     if kind == "desktop":
         relative = Path(path).relative_to("apps/desktop").as_posix()
-        return ["npx", "vitest", "run", relative], repo / "apps/desktop"
+        return [npx_path or "npx", "vitest", "run", relative], repo / "apps/desktop"
     if kind == "desktop-node":
         relative = Path(path).relative_to("apps/desktop").as_posix()
-        return ["npx", "tsx", "--test", relative], repo / "apps/desktop"
+        return [npx_path or "npx", "tsx", "--test", relative], repo / "apps/desktop"
     if kind == "node":
-        return ["node", "--test", path], repo
+        return [node_path or "node", "--test", path], repo
     raise AssertionError(f"unsupported executable invariant kind: {kind}")
 
 
@@ -436,8 +537,17 @@ def _execute_attempt(
     timeout_seconds: float,
     output_limit_bytes: int,
     cancel_event: threading.Event,
+    node_path: str | None = None,
+    npx_path: str | None = None,
+    source_repo: Path | None = None,
 ) -> dict[str, Any]:
-    command, cwd = _command(repo, path, kind)
+    command, cwd = _command(
+        repo,
+        path,
+        kind,
+        node_path=node_path,
+        npx_path=npx_path,
+    )
     env = os.environ.copy()
     for inherited in (
         "HERMES_PYTHON",
@@ -456,6 +566,13 @@ def _execute_attempt(
             "WORKFLOW_LEDGER_EXECUTION_ACTIVE": "1",
         }
     )
+    if source_repo is not None:
+        _configure_sealed_execution_environment(
+            env,
+            source_repo,
+            node_path=node_path,
+            cwd=cwd,
+        )
     started = time.monotonic_ns()
     windows_job: _WindowsJobContainment | None = None
     status_read_fd: int | None = None
@@ -647,6 +764,10 @@ def _execute(
     timeout_seconds: float,
     output_limit_bytes: int,
     cancel_event: threading.Event,
+    *,
+    node_path: str | None = None,
+    npx_path: str | None = None,
+    source_repo: Path | None = None,
 ) -> dict[str, Any]:
     attempts = [
         _execute_attempt(
@@ -656,6 +777,9 @@ def _execute(
             timeout_seconds=timeout_seconds,
             output_limit_bytes=output_limit_bytes,
             cancel_event=cancel_event,
+            node_path=node_path,
+            npx_path=npx_path,
+            source_repo=source_repo,
         )
     ]
     if attempts[0]["result"] == "failed":
@@ -669,6 +793,9 @@ def _execute(
                 timeout_seconds=timeout_seconds,
                 output_limit_bytes=output_limit_bytes,
                 cancel_event=cancel_event,
+                node_path=node_path,
+                npx_path=npx_path,
+                source_repo=source_repo,
             )
         )
     digest = hashlib.sha256(path.encode()).hexdigest()
@@ -712,6 +839,10 @@ def _run_group(
     workers: int,
     timeout_seconds: float,
     output_limit_bytes: int,
+    *,
+    node_path: str | None = None,
+    npx_path: str | None = None,
+    source_repo: Path | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     if not paths:
@@ -730,6 +861,9 @@ def _run_group(
                 timeout_seconds,
                 output_limit_bytes,
                 cancel_event,
+                node_path=node_path,
+                npx_path=npx_path,
+                source_repo=source_repo,
             ): path
             for path in paths
         }
@@ -847,6 +981,7 @@ def _execute_manifest_invariants(
     platform: str,
     timeout_seconds: float,
     output_limit_bytes: int,
+    source_repo: Path | None = None,
 ) -> list[dict[str, Any]]:
     manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
     paths = sorted(
@@ -860,13 +995,49 @@ def _execute_manifest_invariants(
         kind: [path for path in paths if _kind(path) == kind]
         for kind in ("python", "desktop", "desktop-node", "node")
     }
+    node_path: str | None = None
+    npx_path: str | None = None
+    needs_node = any(by_kind[kind] for kind in ("desktop", "desktop-node", "node"))
+    needs_desktop_toolchain = any(
+        by_kind[kind] for kind in ("desktop", "desktop-node")
+    )
+    if source_repo is not None and needs_node:
+        node_path = _external_executable(source_repo, "node")
+    if source_repo is not None and needs_desktop_toolchain:
+        npx_path = _external_executable(source_repo, "npx")
+        external_node_modules = _external_desktop_node_modules(source_repo)
+        if external_node_modules is None:
+            raise ValueError(
+                "--base-ref desktop invariants require an external node_modules symlink"
+            )
+        _provision_external_desktop_node_modules(repo, external_node_modules)
     results: list[dict[str, Any]] = []
     group_options = (timeout_seconds, output_limit_bytes)
     results.extend(
-        _run_group(repo, by_kind["python"], "python", platform, 2, *group_options)
+        _run_group(
+            repo,
+            by_kind["python"],
+            "python",
+            platform,
+            2,
+            *group_options,
+            node_path=node_path,
+            npx_path=npx_path,
+            source_repo=source_repo,
+        )
     )
     results.extend(
-        _run_group(repo, by_kind["desktop"], "desktop", platform, 2, *group_options)
+        _run_group(
+            repo,
+            by_kind["desktop"],
+            "desktop",
+            platform,
+            2,
+            *group_options,
+            node_path=node_path,
+            npx_path=npx_path,
+            source_repo=source_repo,
+        )
     )
     results.extend(
         _run_group(
@@ -876,10 +1047,23 @@ def _execute_manifest_invariants(
             platform,
             2,
             *group_options,
+            node_path=node_path,
+            npx_path=npx_path,
+            source_repo=source_repo,
         )
     )
     results.extend(
-        _run_group(repo, by_kind["node"], "node", platform, 2, *group_options)
+        _run_group(
+            repo,
+            by_kind["node"],
+            "node",
+            platform,
+            2,
+            *group_options,
+            node_path=node_path,
+            npx_path=npx_path,
+            source_repo=source_repo,
+        )
     )
     executed = {item["path"] for item in results}
     for path in paths:
@@ -989,6 +1173,7 @@ def main() -> int:
                     platform=args.platform,
                     timeout_seconds=args.timeout_seconds,
                     output_limit_bytes=args.output_limit_bytes,
+                    source_repo=repo,
                 )
     except ValueError as exc:
         parser.error(str(exc))
