@@ -3285,6 +3285,53 @@ def test_non_strict_manifest_loading_keeps_using_checkout_bytes(tmp_path: Path) 
         load_and_validate_manifest(manifest, repo, strict=False)
 
 
+def test_strict_cli_historical_manifest_ignores_invalid_checkout_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    _git(repo, "add", "ledger.yaml")
+    _git(repo, "commit", "-m", "add historical ledger")
+    requested = _git(repo, "rev-parse", "HEAD")
+    manifest.write_bytes(b"\xff checkout bytes are not UTF-8\n")
+    monkeypatch.chdir(repo)
+
+    assert customization_checker.main(
+        [
+            "--manifest",
+            str(manifest),
+            "--strict",
+            "--base-ref",
+            requested,
+        ]
+    ) == 0
+
+
+def test_cli_set_verified_upstream_still_updates_checkout_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    _git(repo, "commit", "--allow-empty", "-m", "new verification point")
+    verified = _git(repo, "rev-parse", "HEAD")
+    monkeypatch.chdir(repo)
+
+    assert customization_checker.main(
+        [
+            "--manifest",
+            str(manifest),
+            "--set-verified-upstream",
+            verified,
+        ]
+    ) == 0
+    updated = yaml.safe_load(manifest.read_text())
+    assert updated["upstream_changes"][0]["last_verified_upstream"] == verified
+
+
 def test_strict_cli_validates_owned_symbols_at_requested_base_ref(
     tmp_path: Path,
     monkeypatch,

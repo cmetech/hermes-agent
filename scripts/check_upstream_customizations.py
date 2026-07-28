@@ -2442,10 +2442,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--print-verified-upstream", action="store_true")
     args = parser.parse_args(argv)
     repo = Path(_git(Path.cwd(), "rev-parse", "--show-toplevel").strip())
-    data = yaml.safe_load(args.manifest.read_text(encoding="utf-8"))
     try:
         if args.set_verified_upstream:
-            _set_verified_upstream(args.manifest, data, repo, args.set_verified_upstream)
+            checkout_data = yaml.safe_load(
+                args.manifest.read_text(encoding="utf-8")
+            )
+            _set_verified_upstream(
+                args.manifest, checkout_data, repo, args.set_verified_upstream
+            )
         data = load_and_validate_manifest(
             args.manifest,
             repo,
