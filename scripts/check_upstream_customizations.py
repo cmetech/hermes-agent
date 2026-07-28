@@ -5,14 +5,18 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
+from dataclasses import dataclass, replace
 import difflib
 import json
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import tomllib
-from typing import Any
+from typing import Any, BinaryIO, Sequence
 
 import yaml
 
@@ -24,6 +28,33 @@ _MAX_OWNED_SYMBOL_LENGTH = 256
 _MAX_OWNED_INVARIANT_LENGTH = 512
 _MAX_OWNED_INVARIANTS = 128
 _MAX_SCANNED_SOURCE_BYTES = 4 * 1024 * 1024
+_PARSER_PROTOCOL = 1
+_MAX_PARSER_BATCH_BYTES = 16 * 1024 * 1024
+_MAX_PARSER_OUTPUT_BYTES = 16 * 1024 * 1024
+_PARSER_TIMEOUT_SECONDS = 60.0
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_NON_PYTHON_HELPER = _REPOSITORY_ROOT / "scripts" / "extract_non_python_symbols.mjs"
+_PARSER_LANGUAGES = {
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
+    ".md": "markdown",
+    ".markdown": "markdown",
+    ".mdown": "markdown",
+    ".mkdn": "markdown",
+}
+_EXPECTED_PARSER_VERSIONS = {
+    "typescript": "6.0.3",
+    "unified": "11.0.5",
+    "remark-parse": "11.0.0",
+    "micromark": "4.0.2",
+}
+_PARSER_VERSION_KEY = tuple(sorted(_EXPECTED_PARSER_VERSIONS.items()))
 _OVERLAP_POLICIES = frozenset({"owned_symbol", "any_owned_file"})
 _MACHINE_SYMBOL = re.compile(r"^\S+$")
 _EPHEMERAL_COVERAGE_PATHS = frozenset({".superpowers/sdd/progress.md"})
@@ -32,6 +63,426 @@ _REQUIRED = {
     "expected_commit_subject", "upstream_candidate", "merge_guidance",
     "removal_condition", "last_verified_upstream",
 }
+
+
+@dataclass(frozen=True)
+class _ParserRequest:
+    request_id: str
+    path: str
+    language: str
+    blob_oid: str
+    source: bytes
+    symbols: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _CompletedCapture:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+class _BoundedCaptureFailure(Exception):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _parser_error(code: str, request_id: str | None = None) -> ValueError:
+    del request_id
+    message = f"non-Python parser {code}"
+    return ValueError(message[:512])
+
+
+def _parser_language(path: str) -> str | None:
+    return _PARSER_LANGUAGES.get(PurePosixPath(path).suffix.lower())
+
+
+def _run_bounded_capture(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    input_bytes: bytes | None,
+    timeout_seconds: float,
+    output_limit_bytes: int,
+) -> _CompletedCapture:
+    """Run a child with bounded combined output and sanitized failure states."""
+    try:
+        process = subprocess.Popen(
+            list(argv),
+            cwd=cwd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except Exception as exc:
+        raise _BoundedCaptureFailure("start_failure") from exc
+
+    def kill_and_reap() -> int:
+        failure: _BoundedCaptureFailure | None = None
+        reaped_returncode = -1
+        try:
+            process.kill()
+        except Exception as exc:
+            failure = _BoundedCaptureFailure("kill_failure")
+            failure.__cause__ = exc
+        try:
+            reaped_returncode = process.wait()
+        except Exception as exc:
+            if failure is None:
+                failure = _BoundedCaptureFailure("wait_failure")
+                failure.__cause__ = exc
+        if failure is not None:
+            raise failure
+        return reaped_returncode
+
+    if process.stdin is None or process.stdout is None or process.stderr is None:
+        try:
+            kill_and_reap()
+        except Exception:
+            pass
+        raise _BoundedCaptureFailure("stream_failure")
+
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    captured_bytes = 0
+    capture_lock = threading.Lock()
+    output_exceeded = threading.Event()
+    stream_failed = threading.Event()
+
+    def kill_for_failure() -> None:
+        try:
+            process.kill()
+        except Exception:
+            stream_failed.set()
+
+    def write_and_close(stream: BinaryIO, payload: bytes) -> None:
+        try:
+            stream.write(payload)
+        except BrokenPipeError:
+            pass
+        except Exception:
+            stream_failed.set()
+            kill_for_failure()
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                stream_failed.set()
+                kill_for_failure()
+
+    def drain(name: str, stream: BinaryIO) -> None:
+        nonlocal captured_bytes
+        try:
+            while chunk := stream.read(64 * 1024):
+                with capture_lock:
+                    if captured_bytes + len(chunk) > output_limit_bytes:
+                        output_exceeded.set()
+                        kill_for_failure()
+                        return
+                    captured[name].extend(chunk)
+                    captured_bytes += len(chunk)
+        except Exception:
+            stream_failed.set()
+            kill_for_failure()
+
+    writer = threading.Thread(
+        target=write_and_close,
+        args=(process.stdin, input_bytes or b""),
+        daemon=True,
+    )
+    readers = [
+        threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+    ]
+    threads = [writer, *readers]
+    started: list[threading.Thread] = []
+    try:
+        for thread in threads:
+            thread.start()
+            started.append(thread)
+    except Exception as exc:
+        try:
+            kill_and_reap()
+        except Exception:
+            pass
+        for thread in started:
+            try:
+                thread.join()
+            except Exception:
+                pass
+        raise _BoundedCaptureFailure("thread_failure") from exc
+
+    failure: _BoundedCaptureFailure | None = None
+    returncode = -1
+    try:
+        returncode = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            returncode = kill_and_reap()
+        except _BoundedCaptureFailure as exc:
+            failure = exc
+        if failure is None:
+            failure = _BoundedCaptureFailure("timeout")
+    except Exception as exc:
+        try:
+            kill_and_reap()
+        except Exception:
+            pass
+        failure = _BoundedCaptureFailure("wait_failure")
+        failure.__cause__ = exc
+    finally:
+        for thread in threads:
+            try:
+                thread.join()
+            except Exception as exc:
+                if failure is None:
+                    failure = _BoundedCaptureFailure("thread_failure")
+                    failure.__cause__ = exc
+
+    if failure is not None:
+        raise failure
+    if output_exceeded.is_set():
+        raise _BoundedCaptureFailure("output_limit")
+    if stream_failed.is_set():
+        raise _BoundedCaptureFailure("stream_failure")
+    return _CompletedCapture(
+        returncode=returncode,
+        stdout=bytes(captured["stdout"]),
+        stderr=bytes(captured["stderr"]),
+    )
+
+
+def _validated_parser_source(source: bytes) -> None:
+    if len(source) > _MAX_SCANNED_SOURCE_BYTES:
+        raise _parser_error("input_limit")
+    if b"\0" in source:
+        raise _parser_error("invalid_source")
+    try:
+        source.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise _parser_error("invalid_utf8") from exc
+
+
+def _is_utf8_boundary(source: bytes, offset: int) -> bool:
+    return offset in {0, len(source)} or source[offset] & 0b1100_0000 != 0b1000_0000
+
+
+def _json_record(line: bytes) -> dict[str, Any]:
+    def exact_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate key")
+            value[key] = item
+        return value
+
+    value = json.loads(line.decode("utf-8", errors="strict"), object_pairs_hook=exact_object)
+    if not isinstance(value, dict):
+        raise ValueError("record is not an object")
+    return value
+
+
+def _run_parser_batch(
+    requests: Sequence[_ParserRequest],
+) -> dict[str, dict[str, list[tuple[int, int]]]]:
+    """Invoke and fully validate one attested non-Python parser batch."""
+    try:
+        node = shutil.which("node")
+        if node is None:
+            raise _BoundedCaptureFailure("unavailable")
+        if not _NON_PYTHON_HELPER.is_file():
+            raise _BoundedCaptureFailure("unavailable")
+        request_by_id: dict[str, _ParserRequest] = {}
+        payload_records: list[dict[str, Any]] = [
+            {"type": "hello", "protocol": _PARSER_PROTOCOL}
+        ]
+        decoded_bytes = 0
+        for request in requests:
+            _validated_parser_source(request.source)
+            if request.request_id in request_by_id:
+                raise _BoundedCaptureFailure("invalid_request")
+            if _parser_language(request.path) != request.language:
+                raise _BoundedCaptureFailure("invalid_request")
+            decoded_bytes += len(request.source)
+            if decoded_bytes > _MAX_PARSER_BATCH_BYTES:
+                raise _BoundedCaptureFailure("input_limit")
+            request_by_id[request.request_id] = request
+            payload_records.append({
+                "type": "parse",
+                "id": request.request_id,
+                "path": request.path,
+                "language": request.language,
+                "source_base64": base64.b64encode(request.source).decode("ascii"),
+                "symbols": list(request.symbols),
+            })
+        payload = b"".join(
+            json.dumps(record, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            + b"\n"
+            for record in payload_records
+        )
+        completed = _run_bounded_capture(
+            [node, str(_NON_PYTHON_HELPER)],
+            cwd=_REPOSITORY_ROOT,
+            input_bytes=payload,
+            timeout_seconds=_PARSER_TIMEOUT_SECONDS,
+            output_limit_bytes=_MAX_PARSER_OUTPUT_BYTES,
+        )
+        if completed.returncode != 0:
+            raise _BoundedCaptureFailure("process_failure")
+        try:
+            records = [_json_record(line) for line in completed.stdout.splitlines()]
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise _BoundedCaptureFailure("malformed_output") from exc
+        if len(records) != len(requests) + 1:
+            raise _BoundedCaptureFailure("response_count")
+        hello = records[0]
+        if (
+            set(hello) != {"type", "protocol", "versions"}
+            or hello.get("type") != "hello"
+            or hello.get("protocol") != _PARSER_PROTOCOL
+            or hello.get("versions") != _EXPECTED_PARSER_VERSIONS
+        ):
+            raise _BoundedCaptureFailure("attestation_failure")
+
+        results: dict[str, dict[str, list[tuple[int, int]]]] = {}
+        for record in records[1:]:
+            if set(record) != {"type", "id", "spans"} or record.get("type") != "result":
+                raise _BoundedCaptureFailure("invalid_response")
+            request_id = record.get("id")
+            if (
+                not isinstance(request_id, str)
+                or request_id not in request_by_id
+                or request_id in results
+            ):
+                raise _BoundedCaptureFailure("invalid_response")
+            request = request_by_id[request_id]
+            raw_spans = record.get("spans")
+            if not isinstance(raw_spans, dict) or set(raw_spans) != set(request.symbols):
+                raise _BoundedCaptureFailure("invalid_response")
+            validated: dict[str, list[tuple[int, int]]] = {}
+            for symbol in request.symbols:
+                raw_symbol_spans = raw_spans[symbol]
+                if not isinstance(raw_symbol_spans, list):
+                    raise _BoundedCaptureFailure("invalid_span")
+                symbol_spans: list[tuple[int, int]] = []
+                previous_end = -1
+                for raw_span in raw_symbol_spans:
+                    if not isinstance(raw_span, list) or len(raw_span) != 2:
+                        raise _BoundedCaptureFailure("invalid_span")
+                    start, end = raw_span
+                    if (
+                        isinstance(start, bool)
+                        or isinstance(end, bool)
+                        or not isinstance(start, int)
+                        or not isinstance(end, int)
+                        or not 0 <= start < end <= len(request.source)
+                        or not _is_utf8_boundary(request.source, start)
+                        or not _is_utf8_boundary(request.source, end)
+                        or start < previous_end
+                    ):
+                        raise _BoundedCaptureFailure("invalid_span")
+                    symbol_spans.append((start, end))
+                    previous_end = end
+                validated[symbol] = symbol_spans
+            results[request_id] = validated
+        if set(results) != set(request_by_id):
+            raise _BoundedCaptureFailure("invalid_response")
+        return results
+    except ValueError as exc:
+        if str(exc).startswith("non-Python parser"):
+            raise
+        raise _parser_error("invalid_response") from exc
+    except _BoundedCaptureFailure as exc:
+        raise _parser_error(exc.code) from exc
+    except Exception as exc:
+        raise _parser_error("internal_failure") from exc
+
+
+class _NonPythonSymbolResolver:
+    def __init__(self) -> None:
+        self._cache: dict[
+            tuple[str, str, tuple[str, ...], int, tuple[tuple[str, str], ...]],
+            dict[str, list[tuple[int, int]]],
+        ] = {}
+
+    @staticmethod
+    def _key(
+        request: _ParserRequest,
+    ) -> tuple[str, str, tuple[str, ...], int, tuple[tuple[str, str], ...]]:
+        return (
+            request.blob_oid,
+            request.language,
+            request.symbols,
+            _PARSER_PROTOCOL,
+            _PARSER_VERSION_KEY,
+        )
+
+    def _store(
+        self,
+        results: dict[str, dict[str, list[tuple[int, int]]]],
+        requests: Sequence[_ParserRequest],
+    ) -> None:
+        if set(results) != {request.request_id for request in requests}:
+            raise _parser_error("invalid_response")
+        for request in requests:
+            result = results[request.request_id]
+            if set(result) != set(request.symbols):
+                raise _parser_error("invalid_response")
+            self._cache[self._key(request)] = {
+                symbol: list(result[symbol]) for symbol in request.symbols
+            }
+
+    def _cached_result(
+        self, request: _ParserRequest
+    ) -> dict[str, list[tuple[int, int]]]:
+        return {
+            symbol: list(spans)
+            for symbol, spans in self._cache[self._key(request)].items()
+        }
+
+    def spans(
+        self, requests: Sequence[_ParserRequest]
+    ) -> dict[str, dict[str, list[tuple[int, int]]]]:
+        canonical: list[_ParserRequest] = []
+        request_ids: set[str] = set()
+        for request in requests:
+            if request.request_id in request_ids:
+                raise _parser_error("duplicate_request")
+            request_ids.add(request.request_id)
+            if (
+                not isinstance(request.symbols, tuple)
+                or not all(isinstance(symbol, str) and symbol for symbol in request.symbols)
+                or _parser_language(request.path) != request.language
+            ):
+                raise _parser_error("invalid_request")
+            _validated_parser_source(request.source)
+            canonical.append(
+                replace(request, symbols=tuple(sorted(set(request.symbols))))
+            )
+
+        uncached: list[_ParserRequest] = []
+        scheduled: set[
+            tuple[str, str, tuple[str, ...], int, tuple[tuple[str, str], ...]]
+        ] = set()
+        for request in canonical:
+            key = self._key(request)
+            if key not in self._cache and key not in scheduled:
+                uncached.append(request)
+                scheduled.add(key)
+
+        pending: list[_ParserRequest] = []
+        pending_bytes = 0
+        for request in uncached:
+            if pending and pending_bytes + len(request.source) > _MAX_PARSER_BATCH_BYTES:
+                self._store(_run_parser_batch(pending), pending)
+                pending, pending_bytes = [], 0
+            pending.append(request)
+            pending_bytes += len(request.source)
+        if pending:
+            self._store(_run_parser_batch(pending), pending)
+        return {
+            request.request_id: self._cached_result(request) for request in canonical
+        }
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> str:
@@ -87,8 +538,44 @@ def _resolved_diff_endpoints(repo: Path, diff_range: str) -> tuple[str, str]:
     return _resolve_commit(repo, f"{right}^", "range left"), right
 
 
+def _blob_bytes(repo: Path, revision: str, path: str) -> tuple[str, bytes]:
+    blob = subprocess.run(
+        ["git", "show", f"{revision}:{path}"],
+        cwd=repo,
+        text=False,
+        capture_output=True,
+        check=False,
+    )
+    if blob.returncode:
+        raise ValueError("cannot read committed Git blob")
+    oid = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{revision}:{path}"],
+        cwd=repo,
+        text=False,
+        capture_output=True,
+        check=False,
+    )
+    if oid.returncode:
+        raise ValueError("cannot resolve committed Git blob identity")
+    try:
+        blob_oid = oid.stdout.strip().decode("ascii", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("cannot resolve committed Git blob identity") from exc
+    if not blob_oid:
+        raise ValueError("cannot resolve committed Git blob identity")
+    return blob_oid, blob.stdout
+
+
 def _blob_text(repo: Path, revision: str, path: str) -> str:
-    return _git(repo, "show", f"{revision}:{path}", check=False)
+    try:
+        _blob_oid, source = _blob_bytes(repo, revision, path)
+    except ValueError:
+        # Existing diff callers model a path absent at one endpoint as empty
+        # source. The byte-authority API itself remains fail-closed.
+        if not _existed_at(repo, revision, path):
+            return ""
+        raise
+    return source.decode("utf-8", errors="strict")
 
 
 def _is_shallow_clone(repo: Path) -> bool:

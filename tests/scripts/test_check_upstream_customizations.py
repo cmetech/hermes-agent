@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 from pathlib import Path
 import re
@@ -56,6 +58,502 @@ def _manifest(repo: Path, baseline: str) -> Path:
         }],
     }, sort_keys=False))
     return path
+
+
+_EXPECTED_PARSER_VERSIONS = {
+    "typescript": "6.0.3",
+    "unified": "11.0.5",
+    "remark-parse": "11.0.0",
+    "micromark": "4.0.2",
+}
+
+
+def _parser_request(
+    request_id: str = "request",
+    *,
+    source: bytes = b"const ExactToken = true;",
+    symbols: tuple[str, ...] = ("ExactToken",),
+    blob_oid: str = "1" * 40,
+    path: str = "owned.ts",
+) -> customization_checker._ParserRequest:
+    return customization_checker._ParserRequest(
+        request_id=request_id,
+        path=path,
+        language="typescript",
+        blob_oid=blob_oid,
+        source=source,
+        symbols=symbols,
+    )
+
+
+def _parser_records(
+    *results: dict[str, object],
+    protocol: int = 1,
+    versions: dict[str, str] | None = None,
+) -> bytes:
+    records: list[dict[str, object]] = [{
+        "type": "hello",
+        "protocol": protocol,
+        "versions": versions or _EXPECTED_PARSER_VERSIONS,
+    }, *results]
+    return b"".join(
+        json.dumps(record, separators=(",", ":")).encode("utf-8") + b"\n"
+        for record in records
+    )
+
+
+def _parser_result(
+    request_id: str = "request",
+    spans: dict[str, list[list[int | bool]]] | None = None,
+) -> dict[str, object]:
+    return {
+        "type": "result",
+        "id": request_id,
+        "spans": spans if spans is not None else {"ExactToken": [[6, 16]]},
+    }
+
+
+def _install_fake_parser_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stdout: bytes,
+    stderr: bytes = b"",
+    returncode: int = 0,
+) -> None:
+    """Install a real short-lived executable at the process-launch boundary."""
+    executable = tmp_path / "fake-node"
+    encoded_stdout = base64.b64encode(stdout).decode("ascii")
+    encoded_stderr = base64.b64encode(stderr).decode("ascii")
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import base64\n"
+        "import sys\n"
+        "sys.stdin.buffer.read()\n"
+        f"sys.stdout.buffer.write(base64.b64decode({encoded_stdout!r}))\n"
+        f"sys.stderr.buffer.write(base64.b64decode({encoded_stderr!r}))\n"
+        f"raise SystemExit({returncode})\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    helper = tmp_path / "helper.mjs"
+    helper.write_text("// controlled test fixture\n", encoding="utf-8")
+    monkeypatch.setattr(customization_checker.shutil, "which", lambda _name: str(executable))
+    monkeypatch.setattr(customization_checker, "_NON_PYTHON_HELPER", helper)
+
+
+def _assert_bounded_parser_error(call) -> None:
+    with pytest.raises(ValueError) as raised:
+        call()
+    message = str(raised.value)
+    assert message.startswith("non-Python parser")
+    assert "DO_NOT_ECHO_SECRET_SOURCE" not in message
+    assert len(message) <= 512
+
+
+def test_parser_blob_loader_reads_resolved_commit_not_dirty_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reading the checkout instead of the resolved Git blob must fail this test."""
+    repo = _repo(tmp_path)
+    committed_source = b"export const ExactToken = true;\n"
+    (repo / "owned.ts").write_bytes(committed_source)
+    _git(repo, "add", "owned.ts")
+    _git(repo, "commit", "-m", "add committed TypeScript")
+    resolved_revision = _git(repo, "rev-parse", "HEAD")
+    dirty_source = b"// ExactToken only exists in this dirty comment\n"
+    (repo / "owned.ts").write_bytes(dirty_source)
+    calls: list[list[customization_checker._ParserRequest]] = []
+
+    def recording_batch(requests):
+        calls.append(list(requests))
+        return {
+            request.request_id: {
+                symbol: [
+                    (offset, offset + len(symbol.encode("utf-8")))
+                    for offset in [request.source.find(symbol.encode("utf-8"))]
+                    if offset >= 0
+                ]
+                for symbol in request.symbols
+            }
+            for request in requests
+        }
+
+    monkeypatch.setattr(customization_checker, "_run_parser_batch", recording_batch)
+    blob_oid, source = customization_checker._blob_bytes(
+        repo, resolved_revision, "owned.ts"
+    )
+    request = _parser_request(
+        source=source,
+        blob_oid=blob_oid,
+        request_id=f"{resolved_revision}:owned.ts",
+    )
+
+    customization_checker._NonPythonSymbolResolver().spans([request])
+
+    committed_git_bytes = subprocess.check_output(
+        ["git", "show", f"{resolved_revision}:owned.ts"], cwd=repo
+    )
+    assert calls[0][0].source == committed_git_bytes == committed_source
+    assert calls[0][0].source != dirty_source
+
+
+def test_parser_blob_loader_reads_requested_historical_revision_not_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolving HEAD instead of the requested historical commit must fail."""
+    repo = _repo(tmp_path)
+    (repo / "owned.ts").write_text("export const ExactToken = true;\n")
+    _git(repo, "add", "owned.ts")
+    _git(repo, "commit", "-m", "add historical token")
+    older = _git(repo, "rev-parse", "HEAD")
+    (repo / "owned.ts").write_text("export const Replacement = true;\n")
+    _git(repo, "commit", "-am", "remove historical token")
+    calls: list[list[customization_checker._ParserRequest]] = []
+
+    def recording_batch(requests):
+        calls.append(list(requests))
+        return {
+            request.request_id: {
+                symbol: [
+                    (offset, offset + len(symbol.encode("utf-8")))
+                    for offset in [request.source.find(symbol.encode("utf-8"))]
+                    if offset >= 0
+                ]
+                for symbol in request.symbols
+            }
+            for request in requests
+        }
+
+    monkeypatch.setattr(customization_checker, "_run_parser_batch", recording_batch)
+    resolved_older = _git(repo, "rev-parse", older)
+    blob_oid, source = customization_checker._blob_bytes(
+        repo, resolved_older, "owned.ts"
+    )
+    request = _parser_request(
+        source=source,
+        blob_oid=blob_oid,
+        request_id=f"{resolved_older}:owned.ts",
+    )
+
+    customization_checker._NonPythonSymbolResolver().spans([request])
+
+    assert calls[0][0].blob_oid == _git(repo, "rev-parse", f"{older}:owned.ts")
+    assert calls[0][0].source == b"export const ExactToken = true;\n"
+
+
+def test_parser_resolver_batches_paths_and_deduplicates_identical_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing the blob-keyed lifetime cache must make this test fail."""
+    calls: list[list[customization_checker._ParserRequest]] = []
+
+    def recording_batch(requests):
+        calls.append(list(requests))
+        return {
+            request.request_id: {
+                symbol: [
+                    (offset, offset + len(symbol.encode("utf-8")))
+                    for offset in [request.source.find(symbol.encode("utf-8"))]
+                    if offset >= 0
+                ]
+                for symbol in request.symbols
+            }
+            for request in requests
+        }
+
+    monkeypatch.setattr(customization_checker, "_run_parser_batch", recording_batch)
+    first = _parser_request("first", symbols=("Other", "ExactToken", "Other"))
+    alias = _parser_request("alias", symbols=("ExactToken", "Other"))
+    resolver = customization_checker._NonPythonSymbolResolver()
+
+    results = resolver.spans([first, alias])
+    again = resolver.spans([alias])
+
+    assert [[request.request_id for request in batch] for batch in calls] == [["first"]]
+    assert calls[0][0].symbols == ("ExactToken", "Other")
+    assert results["first"] == results["alias"] == again["alias"]
+
+
+def test_parser_batches_sequentially_at_sixteen_mibibytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A concurrent or over-limit batching rewrite must fail this test."""
+    calls: list[list[customization_checker._ParserRequest]] = []
+
+    def recording_batch(requests):
+        calls.append(list(requests))
+        return {
+            request.request_id: {symbol: [] for symbol in request.symbols}
+            for request in requests
+        }
+
+    monkeypatch.setattr(customization_checker, "_run_parser_batch", recording_batch)
+    source = b"a" * ((4 * 1024 * 1024) - 1)
+    requests = [
+        _parser_request(
+            f"request-{index}",
+            source=source,
+            blob_oid=f"{index + 1:040x}",
+        )
+        for index in range(5)
+    ]
+
+    results = customization_checker._NonPythonSymbolResolver().spans(requests)
+
+    assert [len(batch) for batch in calls] == [4, 1]
+    assert [request.request_id for batch in calls for request in batch] == list(results)
+    assert all(
+        sum(len(request.source) for request in batch) <= 16 * 1024 * 1024
+        for batch in calls
+    )
+
+
+def test_parser_fails_closed_when_node_or_helper_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _parser_request()
+    monkeypatch.setattr(customization_checker.shutil, "which", lambda _name: None)
+    _assert_bounded_parser_error(lambda: customization_checker._run_parser_batch([request]))
+
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        customization_checker, "_NON_PYTHON_HELPER", tmp_path / "missing-helper.mjs"
+    )
+    _assert_bounded_parser_error(lambda: customization_checker._run_parser_batch([request]))
+
+
+@pytest.mark.parametrize(
+    ("protocol", "versions"),
+    [
+        (2, _EXPECTED_PARSER_VERSIONS),
+        (1, {**_EXPECTED_PARSER_VERSIONS, "typescript": "0.0.0"}),
+    ],
+)
+def test_parser_rejects_wrong_protocol_or_dependency_versions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: int,
+    versions: dict[str, str],
+) -> None:
+    _install_fake_parser_process(
+        tmp_path,
+        monkeypatch,
+        stdout=_parser_records(
+            _parser_result(), protocol=protocol, versions=versions
+        ),
+    )
+
+    _assert_bounded_parser_error(
+        lambda: customization_checker._run_parser_batch([_parser_request()])
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        b"\xffDO_NOT_ECHO_SECRET_SOURCE",
+        b"prefix\0DO_NOT_ECHO_SECRET_SOURCE",
+        b"a" * ((4 * 1024 * 1024) + 1),
+    ],
+    ids=("invalid-utf8", "nul", "oversized"),
+)
+def test_parser_rejects_invalid_utf8_and_oversized_blob(
+    monkeypatch: pytest.MonkeyPatch,
+    source: bytes,
+) -> None:
+    monkeypatch.setattr(
+        customization_checker,
+        "_run_parser_batch",
+        lambda _requests: pytest.fail("invalid source reached the parser process"),
+    )
+
+    _assert_bounded_parser_error(
+        lambda: customization_checker._NonPythonSymbolResolver().spans(
+            [_parser_request(source=source)]
+        )
+    )
+
+
+def test_parser_kills_a_batch_after_sixty_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instances = []
+
+    class Sink:
+        def write(self, data: bytes) -> int:
+            return len(data)
+
+        def close(self) -> None:
+            return None
+
+    class TimedOutProcess:
+        def __init__(self, *args, **kwargs) -> None:
+            self.stdin = Sink()
+            self.stdout = io.BytesIO()
+            self.stderr = io.BytesIO()
+            self.returncode = -9
+            self.killed = False
+            self.wait_timeouts: list[float | None] = []
+            instances.append(self)
+
+        def wait(self, timeout=None) -> int:
+            self.wait_timeouts.append(timeout)
+            if not self.killed:
+                raise subprocess.TimeoutExpired("DO_NOT_ECHO_SECRET_SOURCE", timeout)
+            return self.returncode
+
+        def kill(self) -> None:
+            self.killed = True
+
+    monkeypatch.setattr(customization_checker.subprocess, "Popen", TimedOutProcess)
+
+    _assert_bounded_parser_error(
+        lambda: customization_checker._run_parser_batch([_parser_request()])
+    )
+
+    assert instances[0].killed is True
+    assert instances[0].wait_timeouts == [60, None]
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        b"x" * 65,
+        b"not-json\n",
+    ],
+)
+def test_parser_rejects_oversized_or_malformed_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: bytes,
+) -> None:
+    _install_fake_parser_process(tmp_path, monkeypatch, stdout=stdout)
+    if len(stdout) > 64:
+        monkeypatch.setattr(customization_checker, "_MAX_PARSER_OUTPUT_BYTES", 64)
+
+    _assert_bounded_parser_error(
+        lambda: customization_checker._run_parser_batch([_parser_request()])
+    )
+
+
+_RESPONSE_SHAPE_CASES = [
+    "missing_id",
+    "duplicate_id",
+    "extra_id",
+    "missing_symbol",
+    "negative_start",
+    "reversed_span",
+    "endpoint_beyond_source",
+    "duplicate_span",
+    "unsorted_span",
+    "overlapping_spans",
+    "boolean_endpoint",
+    "continuation_byte_endpoint",
+]
+
+
+@pytest.mark.parametrize("case", _RESPONSE_SHAPE_CASES)
+def test_parser_rejects_unknown_missing_duplicate_and_invalid_spans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    source = "éExactToken zz ExactToken Other".encode("utf-8")
+    exact_first = source.find(b"ExactToken")
+    exact_second = source.find(b"ExactToken", exact_first + 1)
+    other = source.find(b"Other")
+    valid = {
+        "ExactToken": [[exact_first, exact_first + 10]],
+        "Other": [[other, other + 5]],
+    }
+    requests = [_parser_request(source=source, symbols=("ExactToken", "Other"))]
+    results = [_parser_result(spans=valid)]
+    if case == "missing_id":
+        results = []
+    elif case == "duplicate_id":
+        requests.append(
+            _parser_request(
+                "second",
+                source=source,
+                symbols=("ExactToken", "Other"),
+                blob_oid="2" * 40,
+            )
+        )
+        results.append(_parser_result(spans=valid))
+    elif case == "extra_id":
+        requests.append(
+            _parser_request(
+                "second",
+                source=source,
+                symbols=("ExactToken", "Other"),
+                blob_oid="2" * 40,
+            )
+        )
+        results.append(_parser_result("unknown", valid))
+    elif case == "missing_symbol":
+        results[0] = _parser_result(spans={"ExactToken": valid["ExactToken"]})
+    elif case == "negative_start":
+        valid["ExactToken"] = [[-1, exact_first + 10]]
+    elif case == "reversed_span":
+        valid["ExactToken"] = [[exact_first + 10, exact_first]]
+    elif case == "endpoint_beyond_source":
+        valid["ExactToken"] = [[exact_first, len(source) + 1]]
+    elif case == "duplicate_span":
+        valid["ExactToken"] = [
+            [exact_first, exact_first + 10],
+            [exact_first, exact_first + 10],
+        ]
+    elif case == "unsorted_span":
+        valid["ExactToken"] = [
+            [exact_second, exact_second + 10],
+            [exact_first, exact_first + 10],
+        ]
+    elif case == "overlapping_spans":
+        valid["ExactToken"] = [
+            [exact_first, exact_first + 10],
+            [exact_first + 2, exact_first + 12],
+        ]
+    elif case == "boolean_endpoint":
+        valid["ExactToken"] = [[True, exact_first + 10]]
+    elif case == "continuation_byte_endpoint":
+        valid["ExactToken"] = [[1, exact_first + 10]]
+    _install_fake_parser_process(
+        tmp_path, monkeypatch, stdout=_parser_records(*results)
+    )
+
+    _assert_bounded_parser_error(
+        lambda: customization_checker._run_parser_batch(requests)
+    )
+
+
+def test_parser_errors_are_bounded_and_do_not_echo_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = b"DO_NOT_ECHO_SECRET_SOURCE"
+    echoed = secret * 1_000
+    _install_fake_parser_process(
+        tmp_path,
+        monkeypatch,
+        stdout=_parser_records({
+            "type": "error",
+            "id": "request",
+            "code": "internal_error",
+            "detail": echoed.decode("ascii"),
+        }),
+        stderr=echoed,
+        returncode=1,
+    )
+
+    _assert_bounded_parser_error(
+        lambda: customization_checker._run_parser_batch(
+            [_parser_request(source=secret)]
+        )
+    )
 
 
 def test_manifest_rejects_non_hex_and_paths_outside_repository(tmp_path: Path) -> None:
