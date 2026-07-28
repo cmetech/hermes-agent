@@ -611,6 +611,46 @@ def test_typescript_keyword_regex_braces_stay_inside_template_expression(
 @pytest.mark.parametrize(
     "source",
     [
+        (
+            "const value = `${(() => { if (true) /}}/.test('}}'); "
+            "/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { while (false) /}}/.test('}}'); "
+            "/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { for (;;) /}}/.test('}}'); "
+            "/* ExactToken */ break; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { do /}}/.test('}}'); while (false); "
+            "/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { if (false) 1; else /}}/.test('}}'); "
+            "/* ExactToken */ return 1; })()}`\n"
+        ),
+        (
+            "const value = `${(() => { const quotient = 8 / 2; "
+            "/* ExactToken */ return quotient; })()}`\n"
+        ),
+    ],
+)
+def test_typescript_control_statement_regexes_do_not_expose_comments(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    """A regex statement body must not let its braces close ``${...}``."""
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
         "const value = `prefix ExactToken`\n",
         "const value = `prefix ${ExactToken}`\n",
     ],
@@ -685,6 +725,46 @@ def test_markdown_container_fence_closes_only_at_sufficient_width(
     report = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
 
     assert report["classification"] == "same_file"
+
+
+@pytest.mark.parametrize(
+    ("opening_prefix", "continuation_prefix"),
+    [
+        ("1. ", "   "),
+        ("10. ", "    "),
+        ("100. ", "     "),
+        ("- ", "  "),
+        ("> 10. ", ">     "),
+        ("> - 10. ", ">       "),
+    ],
+)
+def test_markdown_container_fence_uses_relative_ordered_list_indent(
+    tmp_path: Path,
+    opening_prefix: str,
+    continuation_prefix: str,
+) -> None:
+    """A fenced list item's close is relative to its own container prefix."""
+    before = (
+        f"{opening_prefix}~~~~html\n"
+        f"{continuation_prefix}<!-- ExactToken -->\n"
+        f"{continuation_prefix}~~~\n"
+        f"{continuation_prefix}<!-- ExactToken -->\n"
+        f"{continuation_prefix}~~~~\n"
+        "<!-- ExactToken before -->\n"
+    )
+    after = before.replace("<!-- ExactToken before -->", "<!-- ExactToken after -->")
+    repo, source, manifest = _non_python_manifest(tmp_path, ".md", before)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    source.write_text(after)
+    _git(repo, "commit", "-am", "change comment after container fence")
+
+    report = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
+
+    assert report["classification"] == "same_file"
+    assert report.get("owned_symbol_changes", []) == []
 
 
 def test_toml_multiline_string_preserves_hash_token_but_comment_does_not(
@@ -826,6 +906,104 @@ def test_structured_non_string_scalar_does_not_inherit_string_span(
     report = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
 
     assert report["classification"] == "same_file"
+
+
+@pytest.mark.parametrize(
+    ("suffix", "before", "after", "expected"),
+    [
+        (
+            ".json",
+            (
+                '{"owned":"ExactToken","number":1,"boolean":true,'
+                '"null":null,"array":[1,2],"date":"2026-07-27"}\r\n'
+            ),
+            (
+                '{"owned":"ExactToken","number":2,"boolean":false,'
+                '"null":null,"array":[2,1],"date":"2026-07-28"}\r\n'
+            ),
+            "same_file",
+        ),
+        (
+            ".toml",
+            (
+                'values = { owned = "ExactToken", number = 1, enabled = true, '
+                'date = 2026-07-27, array = [1, 2] }\r\n'
+            ),
+            (
+                'values = { owned = "ExactToken", number = 2, enabled = false, '
+                'date = 2026-07-28, array = [2, 1] }\r\n'
+            ),
+            "same_file",
+        ),
+        (
+            ".json",
+            '{"owned":"ExactToken","number":1}\n',
+            '{"owned":"Other","number":1}\n',
+            "owned_symbol",
+        ),
+        (
+            ".toml",
+            'ExactToken = "stable"\nnumber = 1\n',
+            'Other = "stable"\nnumber = 1\n',
+            "owned_symbol",
+        ),
+        (
+            ".json",
+            '{"owned":"ExactToken","left":1,"right":2}\n',
+            '{"owned":"ExactToken","right":2,"left":1}\n',
+            "same_file",
+        ),
+        (
+            ".toml",
+            'values = { owned = "ExactToken", left = 1, right = 2 }\n',
+            'values = { owned = "ExactToken", right = 2, left = 1 }\n',
+            "same_file",
+        ),
+        (
+            ".json",
+            '{"owned":"ExactToken","count":1}\n',
+            '{"added":0,"owned":"ExactToken","count":1}\n',
+            "same_file",
+        ),
+        (
+            ".toml",
+            'values = { owned = "ExactToken", count = 1 }\n',
+            'values = { added = 0, owned = "ExactToken", count = 1 }\n',
+            "same_file",
+        ),
+        (
+            ".json",
+            '{"owned":"ExactToken","count":1,"drop":0}\n',
+            '{"owned":"ExactToken","count":1}\n',
+            "same_file",
+        ),
+        (
+            ".toml",
+            'values = { owned = "ExactToken", count = 1, drop = 0 }\n',
+            'values = { owned = "ExactToken", count = 1 }\n',
+            "same_file",
+        ),
+    ],
+)
+def test_structured_same_line_changes_only_match_owned_lexical_tokens(
+    tmp_path: Path,
+    suffix: str,
+    before: str,
+    after: str,
+    expected: str,
+) -> None:
+    """Adjacent scalar changes must not inherit an owned string's line span."""
+    repo, source, manifest = _non_python_manifest(tmp_path, suffix, before)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    source.write_text(after, newline="")
+    _git(repo, "commit", "-am", "change structured same-line neighbors")
+
+    report = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
+
+    assert report["classification"] == expected
 
 
 def test_toml_multiline_string_span_covers_each_owned_scalar_line(
@@ -1176,6 +1354,55 @@ def test_strict_requested_revision_uses_its_committed_path_inventory(
     manifest.write_text(yaml.safe_dump(data, sort_keys=False))
 
     with pytest.raises(ValueError, match="future.py.*source revision"):
+        load_and_validate_manifest(
+            manifest,
+            repo,
+            source_revision=requested,
+            strict=True,
+        )
+
+
+def test_strict_requested_revision_ignores_current_checkout_symlink(
+    tmp_path: Path,
+) -> None:
+    """A later checkout symlink must not redefine an older commit's path."""
+    repo = _repo(tmp_path)
+    requested = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, requested)
+    outside = tmp_path / "outside.py"
+    outside.write_text("class Owned:\n    pass\n")
+    (repo / "core.py").unlink()
+    (repo / "core.py").symlink_to(outside)
+    _git(repo, "add", "core.py")
+    _git(repo, "commit", "-m", "replace owned path with later symlink")
+
+    load_and_validate_manifest(
+        manifest,
+        repo,
+        source_revision=requested,
+        strict=True,
+    )
+
+
+def test_strict_requested_revision_rejects_committed_symlink_even_when_current_is_regular(
+    tmp_path: Path,
+) -> None:
+    """A symlink at the requested tree cannot borrow a later regular file."""
+    repo = _repo(tmp_path)
+    target = repo / "owned-target.py"
+    target.write_text("class Owned:\n    pass\n")
+    (repo / "core.py").unlink()
+    (repo / "core.py").symlink_to(target.name)
+    _git(repo, "add", "core.py", target.name)
+    _git(repo, "commit", "-m", "install historical symlink")
+    requested = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, requested)
+    (repo / "core.py").unlink()
+    (repo / "core.py").write_text("class Owned:\n    pass\n")
+    _git(repo, "add", "core.py")
+    _git(repo, "commit", "-m", "replace historical symlink with regular file")
+
+    with pytest.raises(ValueError, match="core.py.*regular file.*source revision"):
         load_and_validate_manifest(
             manifest,
             repo,

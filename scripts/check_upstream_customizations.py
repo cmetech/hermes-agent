@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import difflib
 import json
 from pathlib import Path, PurePosixPath
 import re
@@ -133,6 +134,55 @@ def _contained(repo: Path, raw: str) -> Path:
     return path
 
 
+def _repository_relative_path(raw: str) -> PurePosixPath:
+    """Validate a ledger path without consulting the checkout filesystem."""
+    portable = PurePosixPath(raw)
+    if (
+        portable.is_absolute()
+        or ".." in portable.parts
+        or portable.as_posix() != raw
+    ):
+        raise ValueError(f"path must be normalized repository-relative POSIX: {raw}")
+    return portable
+
+
+def _tree_entry(
+    repo: Path,
+    revision: str,
+    path: str,
+) -> tuple[str, str] | None:
+    """Return the exact Git-tree mode and object type for one lexical path."""
+    proc = subprocess.run(
+        ["git", "ls-tree", "-z", revision, "--", path],
+        cwd=repo,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode:
+        raise ValueError(f"cannot inspect {path} at source revision")
+    entries = [entry for entry in proc.stdout.split(b"\0") if entry]
+    if not entries:
+        return None
+    if len(entries) != 1:
+        raise ValueError(f"cannot determine exact tree entry for {path}")
+    header, separator, name = entries[0].partition(b"\t")
+    fields = header.split()
+    if separator != b"\t" or len(fields) != 3 or name.decode("utf-8") != path:
+        raise ValueError(f"cannot determine exact tree entry for {path}")
+    return fields[0].decode("ascii"), fields[1].decode("ascii")
+
+
+def _require_regular_file_at(repo: Path, revision: str, path: str) -> None:
+    entry = _tree_entry(repo, revision, path)
+    if entry is None:
+        raise ValueError(f"ledger path {path} does not exist at source revision")
+    mode, object_type = entry
+    if object_type != "blob" or mode not in {"100644", "100755"}:
+        raise ValueError(
+            f"ledger path {path} must be a regular file at source revision"
+        )
+
+
 def load_and_validate_manifest(
     manifest_path: Path,
     repo: Path,
@@ -233,24 +283,18 @@ def load_and_validate_manifest(
                         f"{entry_id}.{field} path must be at most "
                         f"{_MAX_REPOSITORY_PATH_LENGTH} characters"
                     )
-                portable = PurePosixPath(raw)
-                if (
-                    portable.is_absolute()
-                    or ".." in portable.parts
-                    or portable.as_posix() != raw
-                ):
+                try:
+                    _repository_relative_path(raw)
+                except ValueError as exc:
                     raise ValueError(
-                        f"{entry_id}.{field} path must be normalized "
-                        f"repository-relative POSIX: {raw}"
-                    )
-                path = _contained(repo, raw)
+                        f"{entry_id}.{field} {exc}"
+                    ) from exc
                 if strict:
-                    if not _existed_at(repo, resolved_source_revision, raw):
-                        raise ValueError(
-                            f"ledger path {raw} does not exist at source revision"
-                        )
-                elif not path.is_file():
-                    raise ValueError(f"ledger path does not exist: {raw}")
+                    _require_regular_file_at(repo, resolved_source_revision, raw)
+                else:
+                    path = _contained(repo, raw)
+                    if not path.is_file():
+                        raise ValueError(f"ledger path does not exist: {raw}")
         symbols = entry.get("owned_symbols")
         if not isinstance(symbols, list) or not symbols or not all(
             isinstance(value, str) and value for value in symbols
@@ -730,8 +774,14 @@ def _typescript_without_comments(source: str) -> str:
             "yield",
         }
     )
+    control_header_keywords = frozenset(
+        {"catch", "for", "if", "switch", "while", "with"}
+    )
+    statement_prefix_keywords = frozenset({"do", "else"})
     # Stack entries are mode, template-expression brace depth, regex eligibility.
     stack: list[tuple[str, int, bool]] = [("code", 0, True)]
+    control_header_pending = False
+    control_parentheses: list[bool] = []
     index = 0
     while index < len(source):
         mode, depth, regex_allowed = stack[-1]
@@ -799,15 +849,33 @@ def _typescript_without_comments(source: str) -> str:
                 index = cursor
                 continue
         if char in {"'", '"'}:
+            stack[-1] = (mode, depth, False)
+            control_header_pending = False
             stack.append(("single" if char == "'" else "double", 0, False))
             index += 1
         elif char == "`":
+            stack[-1] = (mode, depth, False)
+            control_header_pending = False
             stack.append(("template", 0, False))
             index += 1
+        elif char == "(":
+            control_parentheses.append(control_header_pending)
+            control_header_pending = False
+            stack[-1] = (mode, depth, True)
+            index += 1
+        elif char == ")":
+            closes_control_header = (
+                control_parentheses.pop() if control_parentheses else False
+            )
+            control_header_pending = False
+            stack[-1] = (mode, depth, closes_control_header)
+            index += 1
         elif mode == "expression" and char == "{":
+            control_header_pending = False
             stack[-1] = (mode, depth + 1, True)
             index += 1
         elif mode == "expression" and char == "}":
+            control_header_pending = False
             if depth == 1:
                 stack.pop()
             else:
@@ -822,9 +890,21 @@ def _typescript_without_comments(source: str) -> str:
             ):
                 cursor += 1
             token = source[index:cursor]
-            stack[-1] = (mode, depth, token in regex_prefix_keywords)
+            if token in control_header_keywords:
+                control_header_pending = True
+                regex_allowed = False
+            elif control_header_pending and token == "await":
+                # ``for await (...)`` retains the pending control header.
+                regex_allowed = False
+            else:
+                control_header_pending = False
+                regex_allowed = token in regex_prefix_keywords
+            if token in statement_prefix_keywords:
+                regex_allowed = True
+            stack[-1] = (mode, depth, regex_allowed)
             index = cursor
         else:
+            control_header_pending = False
             stack[-1] = (
                 mode,
                 depth,
@@ -860,52 +940,84 @@ def _css_without_comments(source: str) -> str:
     return "".join(result)
 
 
-def _markdown_container_content(line: str) -> str:
-    """Return a line relative to its bounded CommonMark container prefix."""
+_MARKDOWN_MAX_CONTAINERS = 16
+
+
+def _markdown_opening_container_content(
+    line: str,
+) -> tuple[str, tuple[tuple[str, int], ...]]:
+    """Return fence content plus the bounded prefix needed by continuations."""
     cursor = 0
-    while cursor < len(line):
+    containers: list[tuple[str, int]] = []
+    while cursor < len(line) and len(containers) < _MARKDOWN_MAX_CONTAINERS:
         remainder = line[cursor:]
         blockquote = re.match(r" {0,3}>[ \t]?", remainder)
         if blockquote:
+            containers.append(("blockquote", 0))
             cursor += blockquote.end()
             continue
         list_item = re.match(
             r" {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$)", remainder
         )
         if list_item:
+            # A continuation must consume the marker's full relative content
+            # indentation, not a global three-space prefix.  This distinguishes
+            # ``1.`` from ``10.`` and nested container continuations.
+            containers.append(("list", list_item.end()))
             cursor += list_item.end()
             continue
         break
+    return line[cursor:], tuple(containers)
+
+
+def _markdown_continuation_content(
+    line: str,
+    containers: tuple[tuple[str, int], ...],
+) -> str | None:
+    """Strip one opening container stack from a continuation without guessing."""
+    cursor = 0
+    for kind, width in containers:
+        remainder = line[cursor:]
+        if kind == "blockquote":
+            blockquote = re.match(r" {0,3}>[ \t]?", remainder)
+            if blockquote is None:
+                return None
+            cursor += blockquote.end()
+            continue
+        if len(remainder) < width or any(char not in " \t" for char in remainder[:width]):
+            return None
+        cursor += width
     return line[cursor:]
 
 
 def _markdown_without_comments(source: str) -> str:
     result = list(source)
-    fence: tuple[str, int] | None = None
+    fence: tuple[str, int, tuple[tuple[str, int], ...]] | None = None
     inline_ticks = 0
     html_comment_end = 0
     offset = 0
     for line in source.splitlines(keepends=True):
         body = line.rstrip("\r\n")
-        container_content = _markdown_container_content(body)
+        if fence is not None:
+            marker, width, containers = fence
+            continuation = _markdown_continuation_content(body, containers)
+            if continuation is not None and re.fullmatch(
+                rf" {{0,3}}{re.escape(marker)}{{{width},}}[ \t]*",
+                continuation,
+            ):
+                fence = None
+            offset += len(line)
+            continue
+        container_content, containers = _markdown_opening_container_content(body)
         fence_match = (
             None
             if html_comment_end > offset
             else re.match(r" {0,3}(`{3,}|~{3,})(.*)$", container_content)
         )
-        if fence is not None:
-            marker, width = fence
-            if re.fullmatch(
-                rf" {{0,3}}{re.escape(marker)}{{{width},}}[ \t]*",
-                container_content,
-            ):
-                fence = None
-            offset += len(line)
-            continue
         if fence_match:
             run = fence_match.group(1)
             if run[0] == "~" or "`" not in fence_match.group(2):
-                fence = (run[0], len(run))
+                fence = (run[0], len(run), containers)
                 offset += len(line)
                 continue
         index = min(len(body), max(0, html_comment_end - offset))
@@ -1015,7 +1127,14 @@ def _semantic_strings(value: Any) -> list[str]:
     return strings
 
 
-def _json_string_tokens(source: str) -> list[tuple[str, int, int]]:
+def _line_span_for_offsets(source: str, start: int, end: int) -> tuple[int, int]:
+    return (
+        source.count("\n", 0, start) + 1,
+        source.count("\n", 0, end) + 1,
+    )
+
+
+def _json_string_token_offsets(source: str) -> list[tuple[str, int, int]]:
     tokens: list[tuple[str, int, int]] = []
     index = 0
     while index < len(source):
@@ -1033,9 +1152,7 @@ def _json_string_tokens(source: str) -> list[tuple[str, int, int]]:
             else:
                 index += 1
         decoded = json.loads(source[start:index])
-        start_line = source.count("\n", 0, start) + 1
-        end_line = source.count("\n", 0, index) + 1
-        tokens.append((decoded, start_line, end_line))
+        tokens.append((decoded, start, index))
     return tokens
 
 
@@ -1057,7 +1174,7 @@ def _toml_string_end(source: str, start: int) -> int:
     return len(source)
 
 
-def _toml_string_tokens(source: str) -> list[tuple[str, int, int]]:
+def _toml_string_token_offsets(source: str) -> list[tuple[str, int, int]]:
     tokens: list[tuple[str, int, int]] = []
     index = 0
     while index < len(source):
@@ -1072,13 +1189,11 @@ def _toml_string_tokens(source: str) -> list[tuple[str, int, int]]:
         index = _toml_string_end(source, start)
         token = source[start:index]
         decoded = tomllib.loads(f"value = {token}\n")["value"]
-        start_line = source.count("\n", 0, start) + 1
-        end_line = source.count("\n", 0, index) + 1
-        tokens.append((decoded, start_line, end_line))
+        tokens.append((decoded, start, index))
     return tokens
 
 
-def _toml_bare_key_tokens(source: str) -> list[tuple[str, int, int]]:
+def _toml_bare_key_token_offsets(source: str) -> list[tuple[str, int, int]]:
     """Locate TOML bare keys without making scalar values searchable."""
     searchable = list(_toml_without_comments(source))
     index = 0
@@ -1110,8 +1225,7 @@ def _toml_bare_key_tokens(source: str) -> list[tuple[str, int, int]]:
         for start, end in regions:
             for token in re.finditer(r"[A-Za-z0-9_-]+", body[start:end]):
                 absolute = offset + start + token.start()
-                line_number = source.count("\n", 0, absolute) + 1
-                tokens.append((token.group(), line_number, line_number))
+                tokens.append((token.group(), absolute, absolute + len(token.group())))
         offset += len(line)
     return tokens
 
@@ -1123,6 +1237,44 @@ def _exact_pattern(symbol: str) -> re.Pattern[str]:
 def _parse_error(path: str, kind: str, exc: Exception) -> ValueError:
     detail = " ".join(str(exc).split())[:240]
     return ValueError(f"cannot parse {path} as {kind}: {detail}")
+
+
+def _structured_offset_spans(
+    source: str,
+    symbols: list[str],
+    *,
+    path: str,
+    suffix: str,
+) -> dict[str, list[tuple[int, int]]]:
+    """Find JSON/TOML owned scalar spans by exact source offsets."""
+    _validate_scannable_source(source, path)
+    spans = {symbol: [] for symbol in symbols}
+    if suffix == ".toml":
+        try:
+            parsed = tomllib.loads(source)
+        except tomllib.TOMLDecodeError as exc:
+            raise _parse_error(path, "TOML", exc) from exc
+        decoded_tokens = [
+            *_toml_string_token_offsets(source),
+            *_toml_bare_key_token_offsets(source),
+        ]
+    elif suffix == ".json":
+        try:
+            parsed = json.loads(source)
+        except json.JSONDecodeError as exc:
+            raise _parse_error(path, "JSON", exc) from exc
+        decoded_tokens = _json_string_token_offsets(source)
+    else:
+        raise AssertionError(f"unsupported structured suffix: {suffix}")
+    semantic = _semantic_strings(parsed)
+    for symbol in symbols:
+        pattern = _exact_pattern(symbol)
+        if not any(pattern.search(value) for value in semantic):
+            continue
+        for value, start, end in decoded_tokens:
+            if pattern.search(value):
+                spans[symbol].append((start, end))
+    return spans
 
 
 def _structured_spans(
@@ -1162,30 +1314,18 @@ def _structured_spans(
                             (node.start_mark.line + 1, end_line)
                         )
         return spans
-    if suffix == ".toml":
-        try:
-            parsed = tomllib.loads(source)
-        except tomllib.TOMLDecodeError as exc:
-            raise _parse_error(path, "TOML", exc) from exc
-        decoded_tokens = [
-            *_toml_string_tokens(source),
-            *_toml_bare_key_tokens(source),
+    return {
+        symbol: [
+            _line_span_for_offsets(source, start, end)
+            for start, end in offsets
         ]
-    else:
-        try:
-            parsed = json.loads(source)
-        except json.JSONDecodeError as exc:
-            raise _parse_error(path, "JSON", exc) from exc
-        decoded_tokens = _json_string_tokens(source)
-    semantic = _semantic_strings(parsed)
-    for symbol in symbols:
-        pattern = _exact_pattern(symbol)
-        if not any(pattern.search(value) for value in semantic):
-            continue
-        for value, start_line, end_line in decoded_tokens:
-            if pattern.search(value):
-                spans[symbol].append((start_line, end_line))
-    return spans
+        for symbol, offsets in _structured_offset_spans(
+            source,
+            symbols,
+            path=path,
+            suffix=suffix,
+        ).items()
+    }
 
 
 def _walk_yaml_nodes(node: yaml.nodes.Node) -> list[yaml.nodes.Node]:
@@ -1221,6 +1361,15 @@ def _searchable_non_python(source: str, suffix: str) -> str:
     return source
 
 
+def _validate_scannable_source(source: str, path: str) -> None:
+    if len(source) > _MAX_SCANNED_SOURCE_BYTES or len(
+        source.encode("utf-8", errors="replace")
+    ) > _MAX_SCANNED_SOURCE_BYTES:
+        raise ValueError(
+            f"cannot scan {path}: source exceeds {_MAX_SCANNED_SOURCE_BYTES} bytes"
+        )
+
+
 def _symbol_spans(
     source: str,
     symbols: list[str],
@@ -1228,12 +1377,7 @@ def _symbol_spans(
     path: str,
 ) -> dict[str, list[tuple[int, int]]]:
     spans = {symbol: [] for symbol in symbols}
-    if len(source) > _MAX_SCANNED_SOURCE_BYTES or len(
-        source.encode("utf-8", errors="replace")
-    ) > _MAX_SCANNED_SOURCE_BYTES:
-        raise ValueError(
-            f"cannot scan {path}: source exceeds {_MAX_SCANNED_SOURCE_BYTES} bytes"
-        )
+    _validate_scannable_source(source, path)
     suffix = Path(path).suffix.lower()
     if suffix == ".py":
         try:
@@ -1310,6 +1454,32 @@ def _changed_line_numbers(diff: str) -> tuple[set[int], set[int]]:
     return old_lines, new_lines
 
 
+def _changed_character_ranges(
+    old_source: str,
+    new_source: str,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Return bounded exact-source ranges changed on each side of a diff."""
+    matcher = difflib.SequenceMatcher(a=old_source, b=new_source)
+    old_ranges: list[tuple[int, int]] = []
+    new_ranges: list[tuple[int, int]] = []
+    for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if tag != "equal":
+            old_ranges.append((old_start, old_end))
+            new_ranges.append((new_start, new_end))
+    return old_ranges, new_ranges
+
+
+def _ranges_overlap(
+    spans: list[tuple[int, int]],
+    changed_ranges: list[tuple[int, int]],
+) -> bool:
+    return any(
+        start < changed_end and changed_start < end
+        for start, end in spans
+        for changed_start, changed_end in changed_ranges
+    )
+
+
 def _owned_symbol_hits(
     entry: dict[str, Any], repo: Path, left: str, right: str, paths: list[str]
 ) -> list[str]:
@@ -1320,6 +1490,32 @@ def _owned_symbol_hits(
         old_changed, new_changed = _changed_line_numbers(diff)
         new_source = _blob_text(repo, right, path)
         old_source = _blob_text(repo, left, path)
+        suffix = Path(path).suffix.lower()
+        if suffix in {".json", ".toml"}:
+            _validate_scannable_source(old_source, path)
+            _validate_scannable_source(new_source, path)
+            old_ranges, new_ranges = _changed_character_ranges(
+                old_source,
+                new_source,
+            )
+            old_spans = _structured_offset_spans(
+                old_source,
+                symbols,
+                path=path,
+                suffix=suffix,
+            )
+            new_spans = _structured_offset_spans(
+                new_source,
+                symbols,
+                path=path,
+                suffix=suffix,
+            )
+            for symbol in symbols:
+                if _ranges_overlap(old_spans[symbol], old_ranges) or _ranges_overlap(
+                    new_spans[symbol], new_ranges
+                ):
+                    hits.add(symbol)
+            continue
         for symbol, spans in _symbol_spans(new_source, symbols, path=path).items():
             if any(any(start <= line <= end for line in new_changed) for start, end in spans):
                 hits.add(symbol)

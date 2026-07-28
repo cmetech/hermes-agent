@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 import ctypes
 from ctypes import wintypes
 import hashlib
@@ -19,6 +20,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -744,6 +746,157 @@ def _run_group(
     return results
 
 
+def _manifest_relative_to_repo(repo: Path, manifest: Path) -> Path:
+    """Return a lexical repository-relative manifest path without resolving links."""
+    candidate = manifest if manifest.is_absolute() else Path.cwd() / manifest
+    candidate = Path(os.path.abspath(candidate))
+    repo = Path(os.path.abspath(repo))
+    try:
+        relative = candidate.relative_to(repo)
+    except ValueError as exc:
+        raise ValueError("--base-ref manifest must be inside --repo") from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("--base-ref manifest must be a normalized repository file")
+    return relative
+
+
+def _tracked_symlinks_at(repo: Path, revision: str) -> list[str]:
+    """Find symlink entries without traversing any checkout path."""
+    proc = subprocess.run(
+        ["git", "ls-tree", "-r", "-z", revision],
+        cwd=repo,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode:
+        raise ValueError("cannot inspect tracked tree for --base-ref")
+    paths: list[str] = []
+    for entry in proc.stdout.split(b"\0"):
+        if not entry:
+            continue
+        header, separator, path = entry.partition(b"\t")
+        if separator != b"\t":
+            raise ValueError("cannot inspect tracked tree for --base-ref")
+        if header.split(maxsplit=1)[0] == b"120000":
+            paths.append(path.decode("utf-8", errors="surrogateescape"))
+    return paths
+
+
+@contextmanager
+def _sealed_execution_tree(
+    repo: Path,
+    base_revision: str,
+    manifest: Path,
+):
+    """Yield a detached committed tree and unregister it on every exit path."""
+    manifest_relative = _manifest_relative_to_repo(repo, manifest)
+    symlinks = _tracked_symlinks_at(repo, base_revision)
+    if symlinks:
+        raise ValueError(
+            "--base-ref refuses tracked symlink authority: " + ", ".join(symlinks[:8])
+        )
+    temporary = tempfile.TemporaryDirectory(prefix="workflow-ledger-")
+    worktree = Path(temporary.name) / "base"
+    added = False
+    cleanup_error: str | None = None
+    try:
+        added_process = subprocess.run(
+            ["git", "worktree", "add", "--detach", str(worktree), base_revision],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if added_process.returncode:
+            raise ValueError(
+                "cannot create sealed ledger worktree: "
+                + (added_process.stderr.strip() or "git worktree add failed")
+            )
+        added = True
+        sealed_manifest = worktree / manifest_relative
+        if sealed_manifest.is_symlink() or not sealed_manifest.is_file():
+            raise ValueError(
+                "--base-ref manifest must be a committed regular file at the tested base"
+            )
+        yield worktree, sealed_manifest
+    finally:
+        if added:
+            removed_process = subprocess.run(
+                ["git", "worktree", "remove", "--force", str(worktree)],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if removed_process.returncode:
+                cleanup_error = (
+                    removed_process.stderr.strip() or "cannot unregister sealed ledger worktree"
+                )
+        try:
+            temporary.cleanup()
+        except OSError as exc:
+            cleanup_error = cleanup_error or str(exc)
+        if cleanup_error:
+            raise RuntimeError(f"sealed ledger worktree cleanup failed: {cleanup_error}")
+
+
+def _execute_manifest_invariants(
+    repo: Path,
+    manifest_path: Path,
+    *,
+    platform: str,
+    timeout_seconds: float,
+    output_limit_bytes: int,
+) -> list[dict[str, Any]]:
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    paths = sorted(
+        {
+            path
+            for entry in manifest["upstream_changes"]
+            for path in entry["tests"]
+        }
+    )
+    by_kind = {
+        kind: [path for path in paths if _kind(path) == kind]
+        for kind in ("python", "desktop", "desktop-node", "node")
+    }
+    results: list[dict[str, Any]] = []
+    group_options = (timeout_seconds, output_limit_bytes)
+    results.extend(
+        _run_group(repo, by_kind["python"], "python", platform, 2, *group_options)
+    )
+    results.extend(
+        _run_group(repo, by_kind["desktop"], "desktop", platform, 2, *group_options)
+    )
+    results.extend(
+        _run_group(
+            repo,
+            by_kind["desktop-node"],
+            "desktop-node",
+            platform,
+            2,
+            *group_options,
+        )
+    )
+    results.extend(
+        _run_group(repo, by_kind["node"], "node", platform, 2, *group_options)
+    )
+    executed = {item["path"] for item in results}
+    for path in paths:
+        if path in executed:
+            continue
+        digest = hashlib.sha256(path.encode()).hexdigest()
+        results.append(
+            {
+                "kind": "reference",
+                "name": f"ledger reference {digest}",
+                "path": path,
+                "reason": "non-executable invariant reference",
+            }
+        )
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path)
@@ -775,9 +928,10 @@ def main() -> int:
         )
         if resolved_root.returncode:
             parser.error("--repo is required outside a Git worktree")
-        repo = Path(resolved_root.stdout.strip()).resolve()
+        repo = Path(os.path.abspath(resolved_root.stdout.strip()))
     else:
-        repo = args.repo.resolve()
+        repo = Path(os.path.abspath(args.repo))
+    base_revision: str | None = None
     if args.base_ref is not None:
         base = subprocess.run(
             ["git", "rev-parse", "--verify", f"{args.base_ref}^{{commit}}"],
@@ -797,6 +951,7 @@ def main() -> int:
             parser.error("--base-ref must resolve to a local commit")
         if base.stdout.strip() != head.stdout.strip():
             parser.error("--base-ref must resolve to the tested checkout HEAD")
+        base_revision = base.stdout.strip()
         tracked_status = subprocess.run(
             ["git", "status", "--porcelain", "--untracked-files=no"],
             cwd=repo,
@@ -813,54 +968,33 @@ def main() -> int:
     manifest_path = args.manifest or (
         repo / "docs/upstream-customizations/workflow-orchestration.yaml"
     )
-    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
-    paths = sorted(
-        {
-            path
-            for entry in manifest["upstream_changes"]
-            for path in entry["tests"]
-        }
-    )
-    by_kind = {
-        kind: [path for path in paths if _kind(path) == kind]
-        for kind in ("python", "desktop", "desktop-node", "node")
-    }
-    results: list[dict[str, Any]] = []
-    group_options = (args.timeout_seconds, args.output_limit_bytes)
-    results.extend(
-        _run_group(repo, by_kind["python"], "python", args.platform, 2, *group_options)
-    )
-    results.extend(
-        _run_group(
-            repo, by_kind["desktop"], "desktop", args.platform, 2, *group_options
-        )
-    )
-    results.extend(
-        _run_group(
-            repo,
-            by_kind["desktop-node"],
-            "desktop-node",
-            args.platform,
-            2,
-            *group_options,
-        )
-    )
-    results.extend(
-        _run_group(repo, by_kind["node"], "node", args.platform, 2, *group_options)
-    )
-    executed = {item["path"] for item in results}
-    for path in paths:
-        if path in executed:
-            continue
-        digest = hashlib.sha256(path.encode()).hexdigest()
-        results.append(
-            {
-                "kind": "reference",
-                "name": f"ledger reference {digest}",
-                "path": path,
-                "reason": "non-executable invariant reference",
-            }
-        )
+    try:
+        if base_revision is None:
+            results = _execute_manifest_invariants(
+                repo,
+                manifest_path,
+                platform=args.platform,
+                timeout_seconds=args.timeout_seconds,
+                output_limit_bytes=args.output_limit_bytes,
+            )
+        else:
+            with _sealed_execution_tree(
+                repo,
+                base_revision,
+                manifest_path,
+            ) as (sealed_repo, sealed_manifest):
+                results = _execute_manifest_invariants(
+                    sealed_repo,
+                    sealed_manifest,
+                    platform=args.platform,
+                    timeout_seconds=args.timeout_seconds,
+                    output_limit_bytes=args.output_limit_bytes,
+                )
+    except ValueError as exc:
+        parser.error(str(exc))
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     results.sort(key=lambda item: item["path"])
     failed = [item for item in results if item.get("result") == "failed"]

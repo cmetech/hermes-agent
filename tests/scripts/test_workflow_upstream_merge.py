@@ -741,7 +741,13 @@ def test_ledger_runner_accepts_report_path_and_exact_base_ref(tmp_path: Path) ->
     _git(repo, "config", "user.name", "Test")
     test_path = repo / "tests/test_pass.py"
     test_path.parent.mkdir()
-    test_path.write_text("def test_pass():\n    assert True\n")
+    test_path.write_text(
+        "import os\n"
+        "from pathlib import Path\n\n"
+        "def test_pass():\n"
+        "    Path(os.environ['LEDGER_CACHE_OUTPUT']).write_text('cache output')\n"
+        "    assert True\n"
+    )
     manifest = repo / "ledger.yaml"
     manifest.write_text(
         yaml.safe_dump(
@@ -751,7 +757,14 @@ def test_ledger_runner_accepts_report_path_and_exact_base_ref(tmp_path: Path) ->
     )
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "runner fixture")
-    report = repo / "report.json"
+    report = tmp_path / "outside-report.json"
+    cache_output = tmp_path / "outside-cache.txt"
+    temp_root = tmp_path / "sealed-temp"
+    temp_root.mkdir()
+    worktrees_before = _git(repo, "worktree", "list", "--porcelain")
+    env = os.environ.copy()
+    env["LEDGER_CACHE_OUTPUT"] = str(cache_output)
+    env["TMPDIR"] = str(temp_root)
 
     result = subprocess.run(
         [
@@ -771,10 +784,14 @@ def test_ledger_runner_accepts_report_path_and_exact_base_ref(tmp_path: Path) ->
         cwd=repo,
         text=True,
         capture_output=True,
+        env=env,
     )
 
     assert result.returncode == 0, result.stderr
     assert json.loads(report.read_text())[0]["result"] == "passed"
+    assert cache_output.read_text() == "cache output"
+    assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
+    assert list(temp_root.iterdir()) == []
 
 
 @pytest.mark.parametrize("staged", [False, True], ids=["unstaged", "staged"])
@@ -853,6 +870,312 @@ def test_ledger_runner_refuses_dirty_tracked_executable_at_sealed_base(
         cwd=repo,
         text=True,
     ) == status_before
+
+
+@pytest.mark.parametrize("staged", [False, True], ids=["unstaged", "staged"])
+@pytest.mark.parametrize("target", ["manifest", "script", "test"])
+def test_ledger_runner_refuses_dirty_manifest_script_or_test_at_sealed_base(
+    tmp_path: Path,
+    staged: bool,
+    target: str,
+) -> None:
+    """Every input that can steer discovery must remain committed at the seal."""
+    repo = tmp_path / f"runner-dirty-{target}-{staged}"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    authority = repo / "scripts/authority.py"
+    authority.parent.mkdir()
+    authority.write_text("ALLOW = True\n")
+    test_path = repo / "tests/test_sealed.py"
+    test_path.parent.mkdir()
+    test_path.write_text(
+        "from scripts.authority import ALLOW\n\n"
+        "def test_committed_contract():\n"
+        "    assert ALLOW\n"
+    )
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"upstream_changes": [{"tests": ["tests/test_sealed.py"]}]},
+            sort_keys=False,
+        )
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit sealed inputs")
+    changed_path = {
+        "manifest": manifest,
+        "script": authority,
+        "test": test_path,
+    }[target]
+    changed_path.write_text(changed_path.read_text() + "# dirty authority input\n")
+    if staged:
+        _git(repo, "add", str(changed_path.relative_to(repo)))
+    status_before = _git(repo, "status", "--porcelain", "--untracked-files=no")
+    report = tmp_path / f"{target}-{staged}-report.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--report-path",
+            str(report),
+            "--platform",
+            "synthetic",
+            "--base-ref",
+            "HEAD",
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 2
+    assert "tracked changes" in result.stderr
+    assert not report.exists()
+    assert _git(repo, "status", "--porcelain", "--untracked-files=no") == status_before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlink ownership is POSIX-specific")
+def test_sealed_ledger_runner_rejects_tracked_symlink_tree_authority(
+    tmp_path: Path,
+) -> None:
+    """An undeclared committed symlink cannot import bytes outside the base tree."""
+    repo = tmp_path / "runner-tracked-symlink-repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    marker = tmp_path / "outside-authority-ran"
+    outside = tmp_path / "outside-authority.py"
+    outside.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('outside authority executed')\n"
+        "ALLOW = True\n"
+    )
+    authority = repo / "authority.py"
+    authority.symlink_to(outside)
+    test_path = repo / "tests/test_import_authority.py"
+    test_path.parent.mkdir()
+    test_path.write_text(
+        "from authority import ALLOW\n\n"
+        "def test_authority():\n"
+        "    assert ALLOW\n"
+    )
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"upstream_changes": [{"tests": ["tests/test_import_authority.py"]}]},
+            sort_keys=False,
+        )
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit external symlink authority")
+    report = tmp_path / "symlink-report.json"
+    temp_root = tmp_path / "sealed-temp"
+    temp_root.mkdir()
+    worktrees_before = _git(repo, "worktree", "list", "--porcelain")
+    env = os.environ.copy()
+    env["TMPDIR"] = str(temp_root)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--report-path",
+            str(report),
+            "--platform",
+            "synthetic",
+            "--base-ref",
+            "HEAD",
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert "symlink" in result.stderr
+    assert not marker.exists()
+    assert not report.exists()
+    assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
+    assert list(temp_root.iterdir()) == []
+
+
+def test_sealed_ledger_runner_ignores_untracked_pytest_discovery_inputs(
+    tmp_path: Path,
+) -> None:
+    """An untracked conftest cannot turn a committed failure into green evidence."""
+    repo = tmp_path / "runner-untracked-discovery-repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    test_path = repo / "tests/test_committed_failure.py"
+    test_path.parent.mkdir()
+    test_path.write_text(
+        "def test_committed_failure():\n"
+        "    raise AssertionError('committed invariant must fail')\n"
+    )
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"upstream_changes": [{"tests": ["tests/test_committed_failure.py"]}]},
+            sort_keys=False,
+        )
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit failing invariant")
+    (repo / "conftest.py").write_text(
+        "import pytest\n\n"
+        "def pytest_collection_modifyitems(items):\n"
+        "    for item in items:\n"
+        "        item.add_marker(pytest.mark.skip(reason='untracked bypass'))\n"
+    )
+    report = tmp_path / "sealed-untracked-report.json"
+    temp_root = tmp_path / "runner-temp"
+    temp_root.mkdir()
+    worktrees_before = _git(repo, "worktree", "list", "--porcelain")
+    env = os.environ.copy()
+    env["TMPDIR"] = str(temp_root)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--report-path",
+            str(report),
+            "--platform",
+            "synthetic",
+            "--base-ref",
+            "HEAD",
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    record = json.loads(report.read_text())[0]
+    assert record["result"] == "failed"
+    assert [attempt["result"] for attempt in record["attempts"]] == [
+        "failed",
+        "failed",
+    ]
+    assert (repo / "conftest.py").is_file()
+    assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
+    assert list(temp_root.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="FIFO mutation handshake requires POSIX")
+def test_sealed_ledger_runner_ignores_tracked_symlink_mutation_during_run(
+    tmp_path: Path,
+) -> None:
+    """Bytes changed after runner startup cannot replace committed authority."""
+    repo = tmp_path / "runner-toc-repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    test_path = repo / "tests/test_delayed_authority.py"
+    test_path.parent.mkdir()
+    test_path.write_text(
+        "import os\n"
+        "from pathlib import Path\n\n"
+        "def test_delayed_authority():\n"
+        "    handshake = Path(os.environ['LEDGER_MUTATION_HANDSHAKE'])\n"
+        "    first_attempt = handshake.with_suffix('.first')\n"
+        "    if not first_attempt.exists():\n"
+        "        first_attempt.write_text('started\\n')\n"
+        "        with handshake.with_suffix('.ready').open('wb', buffering=0) as ready:\n"
+        "            ready.write(b'1')\n"
+        "        with handshake.with_suffix('.go').open('rb', buffering=0) as go:\n"
+        "            assert go.read(1) == b'1'\n"
+        "    from authority import ALLOW\n"
+        "    assert ALLOW\n"
+    )
+    authority = repo / "authority.py"
+    authority.write_text("ALLOW = False\n")
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"upstream_changes": [{"tests": ["tests/test_delayed_authority.py"]}]},
+            sort_keys=False,
+        )
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit failing delayed authority")
+    outside = tmp_path / "outside-authority.py"
+    outside.write_text("ALLOW = True\n")
+    handshake = tmp_path / "mutation-handshake"
+    ready = handshake.with_suffix(".ready")
+    go = handshake.with_suffix(".go")
+    os.mkfifo(ready)
+    os.mkfifo(go)
+    report = tmp_path / "sealed-mutation-report.json"
+    temp_root = tmp_path / "runner-temp"
+    temp_root.mkdir()
+    env = os.environ.copy()
+    env["LEDGER_MUTATION_HANDSHAKE"] = str(handshake)
+    env["TMPDIR"] = str(temp_root)
+    worktrees_before = _git(repo, "worktree", "list", "--porcelain")
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--report-path",
+            str(report),
+            "--platform",
+            "synthetic",
+            "--base-ref",
+            "HEAD",
+            "--timeout-seconds",
+            "5",
+        ],
+        cwd=repo,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    with ready.open("rb", buffering=0) as stream:
+        assert stream.read(1) == b"1"
+    authority.unlink()
+    authority.symlink_to(outside)
+    with go.open("wb", buffering=0) as stream:
+        stream.write(b"1")
+    stdout, stderr = process.communicate(timeout=20)
+
+    assert process.returncode == 1, (stdout, stderr)
+    record = json.loads(report.read_text())[0]
+    assert record["result"] == "failed"
+    assert [attempt["result"] for attempt in record["attempts"]] == [
+        "failed",
+        "failed",
+    ]
+    assert authority.is_symlink()
+    assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
+    assert list(temp_root.iterdir()) == []
 
 
 def _run_ledger_fixture(
