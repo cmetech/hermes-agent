@@ -57,8 +57,15 @@ _require_root_dependencies() {
   local shared_git_dir shared_root resolved_modules node_bin actual_versions
   shared_git_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
   shared_root="$(cd "$(dirname "$shared_git_dir")" && pwd -P)"
+  if [[ -L "$ROOT/node_modules" && ! -e "$ROOT/node_modules" ]]; then
+    echo "root parser dependencies contain a dangling local dependency link" >&2
+    return 1
+  fi
   if [[ ! -e "$ROOT/node_modules" && -d "$shared_root/node_modules" ]]; then
-    ln -s "$shared_root/node_modules" "$ROOT/node_modules"
+    ln -s "$shared_root/node_modules" "$ROOT/node_modules" 2>/dev/null || {
+      echo "root parser dependencies could not create the bounded dependency view" >&2
+      return 1
+    }
   fi
   [[ -d "$ROOT/node_modules" ]] || {
     echo "root parser dependencies are required before ledger validation" >&2
@@ -79,15 +86,54 @@ _require_root_dependencies() {
     const fs = require("node:fs");
     const path = require("node:path");
     const names = ["typescript", "unified", "remark-parse", "micromark"];
-    process.stdout.write(names.map(name =>
-      JSON.parse(fs.readFileSync(path.join(process.argv[1], name, "package.json"), "utf8")).version
-    ).join(" "));
-  ' "$resolved_modules")" || {
-    echo "root parser dependencies are unreadable" >&2
+    const dependencyView = fs.realpathSync(process.argv[1]);
+    const allowedRoots = process.argv.slice(2)
+      .filter(candidate => {
+        try {
+          return fs.statSync(candidate).isDirectory();
+        } catch {
+          return false;
+        }
+      })
+      .map(candidate => fs.realpathSync(candidate));
+    const isStrictlyWithin = (candidate, root) => {
+      const relative = path.relative(root, candidate);
+      return relative !== "" && relative !== ".." &&
+        !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+    };
+    const requireContainedFile = (candidate, packageRoot) => {
+      const resolved = fs.realpathSync(candidate);
+      if (!fs.statSync(resolved).isFile() ||
+          !allowedRoots.some(root => isStrictlyWithin(resolved, root)) ||
+          !isStrictlyWithin(resolved, packageRoot)) {
+        throw new Error("dependency file escapes its package root");
+      }
+      return resolved;
+    };
+    const versions = names.map(name => {
+      const requestedRoot = path.join(dependencyView, name);
+      const packageRoot = fs.realpathSync(requestedRoot);
+      if (!fs.statSync(packageRoot).isDirectory() ||
+          !allowedRoots.some(root => isStrictlyWithin(packageRoot, root))) {
+        throw new Error("dependency package escapes the allowed roots");
+      }
+      const manifestPath = requireContainedFile(
+        path.join(requestedRoot, "package.json"), packageRoot
+      );
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      if (manifest.name !== name) {
+        throw new Error("dependency manifest names the wrong package");
+      }
+      requireContainedFile(require.resolve(requestedRoot), packageRoot);
+      return manifest.version;
+    });
+    process.stdout.write(versions.join(" "));
+  ' "$resolved_modules" "$ROOT/node_modules" "$shared_root/node_modules" 2>/dev/null)" || {
+    echo "root parser dependencies are unreadable or escape the allowed roots" >&2
     return 1
   }
   [[ "$actual_versions" == "6.0.3 11.0.5 11.0.0 4.0.2" ]] || {
-    echo "root parser dependency versions do not match the lockfile" >&2
+    echo "root parser dependencies do not match the lockfile versions" >&2
     return 1
   }
 }

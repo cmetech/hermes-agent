@@ -88,8 +88,10 @@ def _write_parser_dependencies(root: Path) -> None:
         package_dir = root / "node_modules" / package
         package_dir.mkdir(parents=True, exist_ok=True)
         (package_dir / "package.json").write_text(
-            json.dumps({"name": package, "version": version}), encoding="utf-8"
+            json.dumps({"name": package, "version": version, "main": "index.js"}),
+            encoding="utf-8",
         )
+        (package_dir / "index.js").write_text("module.exports = {};\n", encoding="utf-8")
 
 
 def _dependency_checker_source() -> str:
@@ -497,6 +499,77 @@ def test_gate_rejects_broken_or_escaping_root_dependency_link(
 
     (repo / "node_modules").unlink()
     (repo / "node_modules").symlink_to(tmp_path / "missing-node-modules")
+    result = _run_gate_with_marker(repo, marker, "--phase", "base")
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+    assert not marker.exists()
+
+
+def test_gate_rejects_escaping_parser_package_paths_before_checker(
+    tmp_path: Path,
+) -> None:
+    repo, _base = _brand_repo(tmp_path)
+    outside = tmp_path / "outside"
+    _write_parser_dependencies(outside)
+    marker = tmp_path / "package-escape-checker.marker"
+    package = repo / "node_modules/typescript"
+
+    package.rename(repo / "node_modules/typescript-local")
+    package.symlink_to(outside / "node_modules/typescript", target_is_directory=True)
+    result = _run_gate_with_marker(repo, marker, "--phase", "base")
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+    assert not marker.exists()
+
+    package.unlink()
+    (repo / "node_modules/typescript-local").rename(package)
+    manifest = package / "package.json"
+    manifest.rename(package / "package.local.json")
+    manifest.symlink_to(outside / "node_modules/typescript/package.json")
+    result = _run_gate_with_marker(repo, marker, "--phase", "base")
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+    assert not marker.exists()
+
+    manifest.unlink()
+    (package / "package.local.json").rename(manifest)
+    entrypoint = package / "index.js"
+    entrypoint.rename(package / "index.local.js")
+    entrypoint.symlink_to(outside / "node_modules/typescript/index.js")
+    result = _run_gate_with_marker(repo, marker, "--phase", "base")
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+    assert not marker.exists()
+
+
+def test_gate_rejects_dangling_local_dependency_link_before_checker(
+    tmp_path: Path,
+) -> None:
+    _shared_root, linked, _base = _linked_brand_checkout(tmp_path)
+    (linked / "node_modules").symlink_to(
+        tmp_path / "missing-node-modules", target_is_directory=True
+    )
+    marker = tmp_path / "dangling-checker.marker"
+
+    result = _run_gate_with_marker(linked, marker, "--phase", "base")
+
+    assert result.returncode == 1
+    assert "root parser dependencies" in result.stderr
+    assert not marker.exists()
+
+
+def test_gate_rejects_wrong_parser_dependency_version_before_checker(
+    tmp_path: Path,
+) -> None:
+    repo, _base = _brand_repo(tmp_path)
+    manifest = repo / "node_modules/micromark/package.json"
+    manifest.write_text(
+        json.dumps({"name": "micromark", "version": "4.0.3", "main": "index.js"}),
+        encoding="utf-8",
+    )
+    marker = tmp_path / "wrong-version-checker.marker"
+
     result = _run_gate_with_marker(repo, marker, "--phase", "base")
 
     assert result.returncode == 1
