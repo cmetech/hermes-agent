@@ -68,3 +68,15 @@ may launch the test command; cleanup terminates that kernel-owned job tree.
 Signal-resistant descendants therefore cannot escape on success, failure,
 retry, timeout, signal, or cancellation, and reused unrelated identities are
 never targeted.
+
+`--base-ref` execution also seals the Node dependency view before any invariant
+starts. The live checkout may supply root and Desktop `node_modules` only as
+links to external dependency roots. The runner audits at most 250,000 entries
+within 60 seconds, rejects broken or escaping links, and materializes only the
+directory ancestors needed to control symlinks. Audited third-party subtrees
+remain linked inside those external roots; workspace and project links are
+remapped to their corresponding committed paths in the detached tested
+checkout. Root identities, entry identities, link targets, and the constructed
+view are revalidated immediately before each Desktop test group. Setup failure
+is terminal, and the dependency view disappears with the detached worktree on
+every exit path.

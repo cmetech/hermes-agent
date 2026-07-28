@@ -13,12 +13,14 @@ from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import ctypes
 from ctypes import wintypes
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
 from pathlib import Path
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,6 +36,8 @@ _DEFAULT_TIMEOUT_SECONDS = 900.0
 _DEFAULT_OUTPUT_LIMIT_BYTES = 1_048_576
 _POLL_SECONDS = 0.05
 _TERMINATE_GRACE_SECONDS = 1.0
+_NODE_DEPENDENCY_MAX_ENTRIES = 250_000
+_NODE_DEPENDENCY_AUDIT_SECONDS = 60.0
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 
@@ -237,22 +241,371 @@ def _external_node_modules(repo: Path, relative_path: Path) -> Path | None:
     return external
 
 
-def _provision_external_node_modules(
+_FileIdentity = tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class _NodeDependencyLink:
+    identity: _FileIdentity
+    resolved: Path
+    external_root_index: int | None
+    external_relative: Path | None
+    project_relative: Path | None
+    target_is_directory: bool
+
+
+@dataclass
+class _NodeDependencyRoot:
+    relative_path: Path
+    external: Path
+    destination: Path
+    project_root: Path | None
+    identity: _FileIdentity
+    entries: dict[Path, _FileIdentity] = field(default_factory=dict)
+    links: dict[Path, _NodeDependencyLink] = field(default_factory=dict)
+    materialized_directories: set[Path] = field(default_factory=lambda: {Path()})
+    provisioned_links: list[Path] = field(default_factory=list)
+
+
+def _file_identity(path: Path) -> _FileIdentity:
+    details = path.lstat()
+    return (
+        details.st_dev,
+        details.st_ino,
+        stat.S_IFMT(details.st_mode),
+        details.st_size,
+        details.st_mtime_ns,
+    )
+
+
+def _dependency_project_root(external: Path, relative_path: Path) -> Path | None:
+    """Infer an alternate checkout root only from an exact dependency suffix."""
+    parts = relative_path.parts
+    if not parts or tuple(external.parts[-len(parts) :]) != parts:
+        return None
+    project_root = external
+    for _part in parts:
+        project_root = project_root.parent
+    return project_root
+
+
+def _committed_project_target(
     sealed_repo: Path,
     relative_path: Path,
-    external_node_modules: Path,
-) -> None:
-    """Mount one validated dependency root into the disposable sealed tree."""
-    destination = sealed_repo / relative_path
-    label = relative_path.as_posix()
-    if destination.exists() or destination.is_symlink():
+    label: str,
+) -> Path:
+    if (
+        not relative_path.parts
+        or ".git" in relative_path.parts
+        or any(part in {"", ".", ".."} for part in relative_path.parts)
+    ):
         raise ValueError(
-            f"--base-ref sealed tree already contains {label} authority"
+            f"--base-ref {label} project symlink has no committed target"
         )
-    if not external_node_modules.is_dir():
-        raise ValueError(f"external {label} disappeared before execution")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.symlink_to(external_node_modules, target_is_directory=True)
+    target = sealed_repo / relative_path
+    if target.is_symlink() or not target.exists():
+        raise ValueError(
+            f"--base-ref {label} project symlink target is not committed"
+        )
+    inspected = subprocess.run(
+        ["git", "cat-file", "-e", f"HEAD:{relative_path.as_posix()}"],
+        cwd=sealed_repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if inspected.returncode:
+        raise ValueError(
+            f"--base-ref {label} project symlink target is not committed"
+        )
+    return target
+
+
+def _dependency_link_target(
+    path: Path,
+    identity: _FileIdentity,
+    roots: list[_NodeDependencyRoot],
+    sealed_repo: Path,
+    source_repo: Path,
+    label: str,
+) -> _NodeDependencyLink:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"--base-ref {label} contains a broken symlink") from exc
+    try:
+        unchanged = _file_identity(path) == identity
+    except OSError as exc:
+        raise ValueError(f"--base-ref {label} symlink changed during audit") from exc
+    if not unchanged:
+        raise ValueError(f"--base-ref {label} symlink changed during audit")
+
+    external_matches = [
+        (len(root.external.parts), index, root)
+        for index, root in enumerate(roots)
+        if _is_within(resolved, root.external)
+    ]
+    if external_matches:
+        _depth, index, root = max(external_matches, key=lambda item: item[0])
+        return _NodeDependencyLink(
+            identity=identity,
+            resolved=resolved,
+            external_root_index=index,
+            external_relative=resolved.relative_to(root.external),
+            project_relative=None,
+            target_is_directory=resolved.is_dir(),
+        )
+
+    project_roots = {source_repo.resolve()}
+    project_roots.update(
+        root.project_root for root in roots if root.project_root is not None
+    )
+    project_matches = [
+        project_root
+        for project_root in project_roots
+        if _is_within(resolved, project_root)
+    ]
+    if project_matches:
+        project_root = max(project_matches, key=lambda item: len(item.parts))
+        relative = resolved.relative_to(project_root)
+        target = _committed_project_target(sealed_repo, relative, label)
+        return _NodeDependencyLink(
+            identity=identity,
+            resolved=resolved,
+            external_root_index=None,
+            external_relative=None,
+            project_relative=relative,
+            target_is_directory=target.is_dir(),
+        )
+    raise ValueError(
+        f"--base-ref {label} symlink escapes validated node_modules roots"
+    )
+
+
+def _materialize_dependency_ancestors(root: _NodeDependencyRoot, path: Path) -> None:
+    parent = path.parent
+    root.materialized_directories.add(Path())
+    while parent.parts:
+        root.materialized_directories.add(parent)
+        parent = parent.parent
+
+
+def _audit_node_dependency_roots(
+    roots: list[_NodeDependencyRoot],
+    sealed_repo: Path,
+    source_repo: Path,
+) -> None:
+    deadline = time.monotonic() + _NODE_DEPENDENCY_AUDIT_SECONDS
+    entry_count = 0
+    for root in roots:
+        stack = [Path()]
+        label_root = root.relative_path.as_posix()
+        while stack:
+            if time.monotonic() > deadline:
+                raise ValueError(
+                    f"--base-ref {label_root} dependency audit exceeded time bound"
+                )
+            relative_directory = stack.pop()
+            directory = root.external / relative_directory
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        entry_count += 1
+                        if entry_count > _NODE_DEPENDENCY_MAX_ENTRIES:
+                            raise ValueError(
+                                "--base-ref node_modules dependency audit exceeded entry bound"
+                            )
+                        if time.monotonic() > deadline:
+                            raise ValueError(
+                                f"--base-ref {label_root} dependency audit exceeded time bound"
+                            )
+                        relative = relative_directory / entry.name
+                        path = root.external / relative
+                        try:
+                            identity = _file_identity(path)
+                        except OSError as exc:
+                            raise ValueError(
+                                f"--base-ref {label_root} dependency changed during audit"
+                            ) from exc
+                        root.entries[relative] = identity
+                        mode = identity[2]
+                        if stat.S_ISLNK(mode):
+                            label = f"{label_root}/{relative.as_posix()}"
+                            root.links[relative] = _dependency_link_target(
+                                path,
+                                identity,
+                                roots,
+                                sealed_repo,
+                                source_repo,
+                                label,
+                            )
+                            _materialize_dependency_ancestors(root, relative)
+                        elif stat.S_ISDIR(mode):
+                            stack.append(relative)
+                        elif not stat.S_ISREG(mode):
+                            raise ValueError(
+                                f"--base-ref {label_root} contains a non-file dependency entry"
+                            )
+            except OSError as exc:
+                raise ValueError(
+                    f"--base-ref cannot audit {label_root} dependency directory"
+                ) from exc
+
+
+def _dependency_view_target(
+    link: _NodeDependencyLink,
+    roots: list[_NodeDependencyRoot],
+    sealed_repo: Path,
+) -> Path:
+    if link.project_relative is not None:
+        return sealed_repo / link.project_relative
+    if link.external_root_index is None or link.external_relative is None:
+        raise AssertionError("audited dependency link has no target")
+    return roots[link.external_root_index].destination / link.external_relative
+
+
+def _build_node_dependency_directory(
+    root: _NodeDependencyRoot,
+    relative_directory: Path,
+    roots: list[_NodeDependencyRoot],
+    sealed_repo: Path,
+    deadline: float,
+) -> None:
+    source = root.external / relative_directory
+    destination = root.destination / relative_directory
+    destination.mkdir()
+    try:
+        with os.scandir(source) as entries:
+            for entry in entries:
+                if time.monotonic() > deadline:
+                    raise ValueError(
+                        "--base-ref node_modules dependency view exceeded time bound"
+                    )
+                relative = relative_directory / entry.name
+                source_path = root.external / relative
+                destination_path = root.destination / relative
+                identity = root.entries[relative]
+                mode = identity[2]
+                if stat.S_ISLNK(mode):
+                    link = root.links[relative]
+                    destination_path.symlink_to(
+                        _dependency_view_target(link, roots, sealed_repo),
+                        target_is_directory=link.target_is_directory,
+                    )
+                    root.provisioned_links.append(destination_path)
+                elif stat.S_ISDIR(mode) and relative in root.materialized_directories:
+                    _build_node_dependency_directory(
+                        root,
+                        relative,
+                        roots,
+                        sealed_repo,
+                        deadline,
+                    )
+                else:
+                    destination_path.symlink_to(
+                        source_path,
+                        target_is_directory=stat.S_ISDIR(mode),
+                    )
+                    root.provisioned_links.append(destination_path)
+    except OSError as exc:
+        raise ValueError(
+            f"--base-ref cannot construct {root.relative_path.as_posix()} dependency view"
+        ) from exc
+
+
+def _revalidate_node_dependency_roots(
+    roots: list[_NodeDependencyRoot],
+    sealed_repo: Path,
+) -> None:
+    deadline = time.monotonic() + _NODE_DEPENDENCY_AUDIT_SECONDS
+    allowed_external_roots = [root.external for root in roots]
+    sealed_root = sealed_repo.resolve()
+    for root in roots:
+        label_root = root.relative_path.as_posix()
+        try:
+            if _file_identity(root.external) != root.identity:
+                raise ValueError(
+                    f"--base-ref external {label_root} changed before execution"
+                )
+            for relative, identity in root.entries.items():
+                if time.monotonic() > deadline:
+                    raise ValueError(
+                        "--base-ref node_modules revalidation exceeded time bound"
+                    )
+                path = root.external / relative
+                if _file_identity(path) != identity:
+                    raise ValueError(
+                        f"--base-ref {label_root} changed before execution"
+                    )
+            for relative, link in root.links.items():
+                if time.monotonic() > deadline:
+                    raise ValueError(
+                        "--base-ref node_modules revalidation exceeded time bound"
+                    )
+                if (root.external / relative).resolve(strict=True) != link.resolved:
+                    raise ValueError(
+                        f"--base-ref {label_root} symlink changed before execution"
+                    )
+            for provisioned in root.provisioned_links:
+                if time.monotonic() > deadline:
+                    raise ValueError(
+                        "--base-ref node_modules revalidation exceeded time bound"
+                    )
+                resolved = provisioned.resolve(strict=True)
+                if not _is_within(resolved, sealed_root) and not any(
+                    _is_within(resolved, external) for external in allowed_external_roots
+                ):
+                    raise ValueError(
+                        f"--base-ref sealed {label_root} dependency view escaped"
+                    )
+        except OSError as exc:
+            raise ValueError(
+                f"--base-ref external {label_root} disappeared before execution"
+            ) from exc
+
+
+def _provision_external_node_modules(
+    sealed_repo: Path,
+    source_repo: Path,
+    dependencies: list[tuple[Path, Path]],
+) -> list[_NodeDependencyRoot]:
+    """Build bounded dependency overlays with project links remapped to the seal."""
+    roots: list[_NodeDependencyRoot] = []
+    for relative_path, external in dependencies:
+        destination = sealed_repo / relative_path
+        label = relative_path.as_posix()
+        if destination.exists() or destination.is_symlink():
+            raise ValueError(
+                f"--base-ref sealed tree already contains {label} authority"
+            )
+        try:
+            identity = _file_identity(external)
+        except OSError as exc:
+            raise ValueError(f"external {label} disappeared before execution") from exc
+        if not stat.S_ISDIR(identity[2]):
+            raise ValueError(f"external {label} disappeared before execution")
+        roots.append(
+            _NodeDependencyRoot(
+                relative_path=relative_path,
+                external=external,
+                destination=destination,
+                project_root=_dependency_project_root(external, relative_path),
+                identity=identity,
+            )
+        )
+    _audit_node_dependency_roots(roots, sealed_repo, source_repo)
+    deadline = time.monotonic() + _NODE_DEPENDENCY_AUDIT_SECONDS
+    for root in roots:
+        root.destination.parent.mkdir(parents=True, exist_ok=True)
+        _build_node_dependency_directory(
+            root,
+            Path(),
+            roots,
+            sealed_repo,
+            deadline,
+        )
+    _revalidate_node_dependency_roots(roots, sealed_repo)
+    return roots
 
 
 def _configure_sealed_execution_environment(
@@ -1000,6 +1353,7 @@ def _execute_manifest_invariants(
     }
     node_path: str | None = None
     npx_path: str | None = None
+    dependency_roots: list[_NodeDependencyRoot] = []
     needs_node = any(by_kind[kind] for kind in ("desktop", "desktop-node", "node"))
     needs_desktop_toolchain = any(
         by_kind[kind] for kind in ("desktop", "desktop-node")
@@ -1024,15 +1378,16 @@ def _execute_manifest_invariants(
             raise ValueError(
                 "--base-ref desktop invariants require an external desktop node_modules symlink"
             )
-        _provision_external_node_modules(
+        dependency_roots = _provision_external_node_modules(
             repo,
-            Path("node_modules"),
-            external_root_node_modules,
-        )
-        _provision_external_node_modules(
-            repo,
-            Path("apps/desktop/node_modules"),
-            external_desktop_node_modules,
+            source_repo,
+            [
+                (Path("node_modules"), external_root_node_modules),
+                (
+                    Path("apps/desktop/node_modules"),
+                    external_desktop_node_modules,
+                ),
+            ],
         )
     results: list[dict[str, Any]] = []
     group_options = (timeout_seconds, output_limit_bytes)
@@ -1049,6 +1404,8 @@ def _execute_manifest_invariants(
             source_repo=source_repo,
         )
     )
+    if dependency_roots and by_kind["desktop"]:
+        _revalidate_node_dependency_roots(dependency_roots, repo)
     results.extend(
         _run_group(
             repo,
@@ -1062,6 +1419,8 @@ def _execute_manifest_invariants(
             source_repo=source_repo,
         )
     )
+    if dependency_roots and by_kind["desktop-node"]:
+        _revalidate_node_dependency_roots(dependency_roots, repo)
     results.extend(
         _run_group(
             repo,

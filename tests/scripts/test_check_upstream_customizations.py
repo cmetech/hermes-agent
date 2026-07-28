@@ -651,6 +651,32 @@ def test_typescript_control_statement_regexes_do_not_expose_comments(
 @pytest.mark.parametrize(
     "source",
     [
+        "let i = 4; i++ / 2; /* ExactToken */\n",
+        "let i = 4; i-- / 2; /* ExactToken */\n",
+        "const obj = { return: 4 }; obj.return / 2; /* ExactToken */\n",
+        "const obj = { return: 4 }; obj?.return / 2; /* ExactToken */\n",
+        "const items = [4]; items[0] / 2; /* ExactToken */\n",
+        "const quotient = (8) / 2; /* ExactToken */\n",
+        "const fn = () => 8; fn() / 2; /* ExactToken */\n",
+        "const quotient = ({ value: 8 } / 2); /* ExactToken */\n",
+        "const quotient = ({ value: 8 }).value / 2; /* ExactToken */\n",
+        "let quotient = 8; quotient /= 2; /* ExactToken */\n",
+    ],
+)
+def test_typescript_division_lexical_goals_do_not_expose_comments(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    """Expression-ending tokens keep a following slash in division goal."""
+    repo, _source, manifest = _non_python_manifest(tmp_path, ".ts", source)
+
+    with pytest.raises(ValueError, match="ExactToken.*declared files"):
+        load_and_validate_manifest(manifest, repo, check_git=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
         "const value = `prefix ExactToken`\n",
         "const value = `prefix ${ExactToken}`\n",
     ],
@@ -760,6 +786,47 @@ def test_markdown_container_fence_uses_relative_ordered_list_indent(
     ][0]
     source.write_text(after)
     _git(repo, "commit", "-am", "change comment after container fence")
+
+    report = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
+
+    assert report["classification"] == "same_file"
+    assert report.get("owned_symbol_changes", []) == []
+
+
+@pytest.mark.parametrize(
+    ("opening_prefix", "continuation_prefix"),
+    [
+        ("-\t", "\t"),
+        ("1.\t", "\t"),
+        ("10.\t", "\t"),
+        ("100.\t", "\t\t"),
+        ("- \t", " \t"),
+        (">\t-\t", ">\t\t"),
+        ("-\t10.\t", "\t\t"),
+    ],
+)
+def test_markdown_container_fence_uses_visual_tab_columns(
+    tmp_path: Path,
+    opening_prefix: str,
+    continuation_prefix: str,
+) -> None:
+    """Tabs advance to CommonMark tab stops in nested container prefixes."""
+    before = (
+        f"{opening_prefix}````html\n"
+        f"{continuation_prefix}<!-- ExactToken -->\n"
+        f"{continuation_prefix}```\n"
+        f"{continuation_prefix}<!-- ExactToken -->\n"
+        f"{continuation_prefix}````\n"
+        "<!-- ExactToken before -->\n"
+    )
+    after = before.replace("<!-- ExactToken before -->", "<!-- ExactToken after -->")
+    repo, source, manifest = _non_python_manifest(tmp_path, ".md", before)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    source.write_text(after)
+    _git(repo, "commit", "-am", "change comment after tab-indented fence")
 
     report = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
 

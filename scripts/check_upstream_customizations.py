@@ -778,13 +778,18 @@ def _typescript_without_comments(source: str) -> str:
         {"catch", "for", "if", "switch", "while", "with"}
     )
     statement_prefix_keywords = frozenset({"do", "else"})
-    # Stack entries are mode, template-expression brace depth, regex eligibility.
-    stack: list[tuple[str, int, bool]] = [("code", 0, True)]
+    # Stack entries are mode, template-expression brace depth, regex eligibility,
+    # and whether the next identifier is a property name.  Property names may be
+    # keywords, but they still end an expression and therefore cannot put a
+    # following slash into the regular-expression lexical goal.
+    stack: list[tuple[str, int, bool, bool]] = [("code", 0, True, False)]
     control_header_pending = False
     control_parentheses: list[bool] = []
+    expression_braces: list[bool] = []
+    block_brace_pending = True
     index = 0
     while index < len(source):
-        mode, depth, regex_allowed = stack[-1]
+        mode, depth, regex_allowed, property_name_pending = stack[-1]
         char = source[index]
         following = source[index + 1] if index + 1 < len(source) else ""
         if mode in {"single", "double"}:
@@ -800,10 +805,11 @@ def _typescript_without_comments(source: str) -> str:
             if char == "\\":
                 index += min(2, len(source) - index)
             elif source.startswith("${", index):
-                stack.append(("expression", 1, True))
+                stack.append(("expression", 1, True, False))
                 index += 2
             elif char == "`":
                 stack.pop()
+                block_brace_pending = False
                 index += 1
             else:
                 index += 1
@@ -845,43 +851,86 @@ def _typescript_without_comments(source: str) -> str:
                 else:
                     cursor += 1
             if closed:
-                stack[-1] = (mode, depth, False)
+                stack[-1] = (mode, depth, False, False)
+                block_brace_pending = False
                 index = cursor
                 continue
         if char in {"'", '"'}:
-            stack[-1] = (mode, depth, False)
+            stack[-1] = (mode, depth, False, False)
             control_header_pending = False
-            stack.append(("single" if char == "'" else "double", 0, False))
+            block_brace_pending = False
+            stack.append(("single" if char == "'" else "double", 0, False, False))
             index += 1
         elif char == "`":
-            stack[-1] = (mode, depth, False)
+            stack[-1] = (mode, depth, False, False)
             control_header_pending = False
-            stack.append(("template", 0, False))
+            block_brace_pending = False
+            stack.append(("template", 0, False, False))
             index += 1
         elif char == "(":
             control_parentheses.append(control_header_pending)
             control_header_pending = False
-            stack[-1] = (mode, depth, True)
+            block_brace_pending = False
+            stack[-1] = (mode, depth, True, False)
             index += 1
         elif char == ")":
             closes_control_header = (
                 control_parentheses.pop() if control_parentheses else False
             )
             control_header_pending = False
-            stack[-1] = (mode, depth, closes_control_header)
+            stack[-1] = (mode, depth, closes_control_header, False)
+            block_brace_pending = closes_control_header
             index += 1
-        elif mode == "expression" and char == "{":
+        elif char == "{":
             control_header_pending = False
-            stack[-1] = (mode, depth + 1, True)
+            expression_braces.append(regex_allowed and not block_brace_pending)
+            block_brace_pending = False
+            stack[-1] = (
+                mode,
+                depth + 1 if mode == "expression" else depth,
+                True,
+                False,
+            )
             index += 1
-        elif mode == "expression" and char == "}":
+        elif char == "}":
             control_header_pending = False
-            if depth == 1:
+            if mode == "expression" and depth == 1:
                 stack.pop()
+                block_brace_pending = False
             else:
-                stack[-1] = (mode, depth - 1, False)
+                closes_expression = expression_braces.pop() if expression_braces else False
+                stack[-1] = (
+                    mode,
+                    depth - 1 if mode == "expression" else depth,
+                    not closes_expression,
+                    False,
+                )
+                block_brace_pending = not closes_expression
             index += 1
         elif char.isspace():
+            index += 1
+        elif source.startswith(("++", "--"), index):
+            # Prefix update retains expression-start eligibility; postfix update
+            # retains expression-end eligibility.  Looking at the prior lexical
+            # goal distinguishes the two without parsing an AST.
+            control_header_pending = False
+            stack[-1] = (mode, depth, regex_allowed, False)
+            block_brace_pending = False
+            index += 2
+        elif source.startswith("=>", index):
+            control_header_pending = False
+            stack[-1] = (mode, depth, True, False)
+            block_brace_pending = True
+            index += 2
+        elif source.startswith("?.", index):
+            control_header_pending = False
+            stack[-1] = (mode, depth, False, True)
+            block_brace_pending = False
+            index += 2
+        elif char == ".":
+            control_header_pending = False
+            stack[-1] = (mode, depth, False, True)
+            block_brace_pending = False
             index += 1
         elif char.isalnum() or char in "_$":
             cursor = index + 1
@@ -890,7 +939,10 @@ def _typescript_without_comments(source: str) -> str:
             ):
                 cursor += 1
             token = source[index:cursor]
-            if token in control_header_keywords:
+            if property_name_pending:
+                control_header_pending = False
+                regex_allowed = False
+            elif token in control_header_keywords:
                 control_header_pending = True
                 regex_allowed = False
             elif control_header_pending and token == "await":
@@ -899,16 +951,21 @@ def _typescript_without_comments(source: str) -> str:
             else:
                 control_header_pending = False
                 regex_allowed = token in regex_prefix_keywords
-            if token in statement_prefix_keywords:
+            if not property_name_pending and token in statement_prefix_keywords:
                 regex_allowed = True
-            stack[-1] = (mode, depth, regex_allowed)
+            block_brace_pending = (
+                not property_name_pending and token in statement_prefix_keywords
+            )
+            stack[-1] = (mode, depth, regex_allowed, False)
             index = cursor
         else:
             control_header_pending = False
+            block_brace_pending = char == ";"
             stack[-1] = (
                 mode,
                 depth,
                 char not in ").]" and char != ".",
+                False,
             )
             index += 1
     return "".join(result)
@@ -941,6 +998,100 @@ def _css_without_comments(source: str) -> str:
 
 
 _MARKDOWN_MAX_CONTAINERS = 16
+_MARKDOWN_TAB_WIDTH = 4
+
+
+def _markdown_advance_column(column: int, char: str) -> int:
+    if char == "\t":
+        return column + (_MARKDOWN_TAB_WIDTH - column % _MARKDOWN_TAB_WIDTH)
+    return column + 1
+
+
+def _markdown_bounded_indent(
+    line: str,
+    cursor: int,
+    column: int,
+    limit: int,
+) -> tuple[int, int]:
+    """Consume leading whitespace only while its visual width stays bounded."""
+    start_column = column
+    while cursor < len(line) and line[cursor] in " \t":
+        next_column = _markdown_advance_column(column, line[cursor])
+        if next_column - start_column > limit:
+            break
+        cursor += 1
+        column = next_column
+    return cursor, column
+
+
+def _markdown_blockquote_at(
+    line: str,
+    cursor: int,
+    column: int,
+) -> tuple[int, int] | None:
+    indented_cursor, indented_column = _markdown_bounded_indent(
+        line, cursor, column, 3
+    )
+    if indented_cursor >= len(line) or line[indented_cursor] != ">":
+        return None
+    cursor = indented_cursor + 1
+    column = indented_column + 1
+    if cursor < len(line) and line[cursor] in " \t":
+        column = _markdown_advance_column(column, line[cursor])
+        cursor += 1
+    return cursor, column
+
+
+def _markdown_list_item_at(
+    line: str,
+    cursor: int,
+    column: int,
+) -> tuple[int, int, int] | None:
+    """Parse one CommonMark list marker and return its relative content indent."""
+    container_column = column
+    cursor, column = _markdown_bounded_indent(line, cursor, column, 3)
+    marker_start = cursor
+    if cursor < len(line) and line[cursor] in "-+*":
+        cursor += 1
+    elif cursor < len(line) and line[cursor].isdigit():
+        while cursor < len(line) and line[cursor].isdigit() and cursor - marker_start < 9:
+            cursor += 1
+        if cursor == marker_start or cursor >= len(line) or line[cursor] not in ".)":
+            return None
+        cursor += 1
+    else:
+        return None
+    marker_column = column + (cursor - marker_start)
+    if cursor < len(line) and line[cursor] not in " \t":
+        return None
+    if cursor == len(line):
+        return cursor, marker_column, marker_column + 1 - container_column
+
+    whitespace_start = cursor
+    whitespace_column = marker_column
+    while cursor < len(line) and line[cursor] in " \t":
+        whitespace_column = _markdown_advance_column(whitespace_column, line[cursor])
+        cursor += 1
+    padding = whitespace_column - marker_column
+    if cursor < len(line) and 1 <= padding <= 4:
+        return cursor, whitespace_column, whitespace_column - container_column
+
+    # Five or more columns after a marker use one column of list padding; the
+    # remainder belongs to the block itself.  A tab cannot land here unless its
+    # visual expansion exceeded four columns, which a four-column stop cannot.
+    cursor = whitespace_start + 1
+    content_column = _markdown_advance_column(marker_column, line[whitespace_start])
+    return cursor, content_column, marker_column + 1 - container_column
+
+
+def _markdown_normalize_leading_indent(line: str, column: int) -> str:
+    """Detab the leading prefix so fence indentation is measured in columns."""
+    cursor = 0
+    start_column = column
+    while cursor < len(line) and line[cursor] in " \t":
+        column = _markdown_advance_column(column, line[cursor])
+        cursor += 1
+    return " " * (column - start_column) + line[cursor:]
 
 
 def _markdown_opening_container_content(
@@ -948,26 +1099,36 @@ def _markdown_opening_container_content(
 ) -> tuple[str, tuple[tuple[str, int], ...]]:
     """Return fence content plus the bounded prefix needed by continuations."""
     cursor = 0
+    column = 0
     containers: list[tuple[str, int]] = []
     while cursor < len(line) and len(containers) < _MARKDOWN_MAX_CONTAINERS:
-        remainder = line[cursor:]
-        blockquote = re.match(r" {0,3}>[ \t]?", remainder)
-        if blockquote:
+        blockquote = _markdown_blockquote_at(line, cursor, column)
+        if blockquote is not None:
             containers.append(("blockquote", 0))
-            cursor += blockquote.end()
+            cursor, column = blockquote
             continue
-        list_item = re.match(
-            r" {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$)", remainder
-        )
-        if list_item:
-            # A continuation must consume the marker's full relative content
-            # indentation, not a global three-space prefix.  This distinguishes
-            # ``1.`` from ``10.`` and nested container continuations.
-            containers.append(("list", list_item.end()))
-            cursor += list_item.end()
+        list_item = _markdown_list_item_at(line, cursor, column)
+        if list_item is not None:
+            cursor, column, indent = list_item
+            containers.append(("list", indent))
             continue
         break
-    return line[cursor:], tuple(containers)
+    return _markdown_normalize_leading_indent(line[cursor:], column), tuple(containers)
+
+
+def _markdown_consume_list_indent(
+    line: str,
+    cursor: int,
+    column: int,
+    required: int,
+) -> tuple[int, int, int] | None:
+    start_column = column
+    while cursor < len(line) and line[cursor] in " \t":
+        column = _markdown_advance_column(column, line[cursor])
+        cursor += 1
+        if column - start_column >= required:
+            return cursor, column, column - start_column - required
+    return None
 
 
 def _markdown_continuation_content(
@@ -976,18 +1137,32 @@ def _markdown_continuation_content(
 ) -> str | None:
     """Strip one opening container stack from a continuation without guessing."""
     cursor = 0
-    for kind, width in containers:
-        remainder = line[cursor:]
+    column = 0
+    virtual_indent = 0
+    container_index = 0
+    while container_index < len(containers):
+        kind, width = containers[container_index]
         if kind == "blockquote":
-            blockquote = re.match(r" {0,3}>[ \t]?", remainder)
+            blockquote = _markdown_blockquote_at(line, cursor, column)
             if blockquote is None:
                 return None
-            cursor += blockquote.end()
+            cursor, column = blockquote
+            virtual_indent = 0
+            container_index += 1
             continue
-        if len(remainder) < width or any(char not in " \t" for char in remainder[:width]):
+        required = 0
+        while container_index < len(containers) and containers[container_index][0] == "list":
+            required += containers[container_index][1]
+            container_index += 1
+        consumed = _markdown_consume_list_indent(
+            line, cursor, column, required
+        )
+        if consumed is None:
             return None
-        cursor += width
-    return line[cursor:]
+        cursor, column, virtual_indent = consumed
+    return " " * virtual_indent + _markdown_normalize_leading_indent(
+        line[cursor:], column
+    )
 
 
 def _markdown_without_comments(source: str) -> str:

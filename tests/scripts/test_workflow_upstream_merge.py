@@ -1182,7 +1182,7 @@ def test_sealed_ledger_runner_ignores_tracked_symlink_mutation_during_run(
 def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discovery(
     tmp_path: Path,
 ) -> None:
-    """Desktop invariants receive an explicit dependency root, never live source."""
+    """Vitest resolves third-party bytes and committed workspace packages only."""
     repo = tmp_path / "runner-external-node-toolchain"
     repo.mkdir()
     _git(repo, "init")
@@ -1192,6 +1192,9 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     test_path = desktop / "src/toolchain.test.ts"
     test_path.parent.mkdir(parents=True)
     test_path.write_text("export const sealedToolchain = true\n")
+    shared = repo / "apps/shared"
+    shared.mkdir()
+    (shared / "index.js").write_text("export const authority = 'committed';\n")
     manifest = repo / "ledger.yaml"
     manifest.write_text(
         yaml.safe_dump(
@@ -1202,12 +1205,82 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "commit sealed desktop invariant")
 
-    external_desktop_modules = tmp_path / "external-desktop-node-modules"
-    external_desktop_modules.mkdir()
-    (external_desktop_modules / "toolchain-marker").write_text("external only\n")
-    external_root_modules = tmp_path / "external-root-node-modules"
+    external_project = tmp_path / "external-project"
+    external_desktop_modules = external_project / "apps/desktop/node_modules"
+    external_desktop_modules.mkdir(parents=True)
+    external_root_modules = external_project / "node_modules"
     external_root_modules.mkdir()
-    (external_root_modules / "root-toolchain-marker").write_text("root only\n")
+    alternate_shared = external_project / "apps/shared"
+    alternate_shared.mkdir()
+    (alternate_shared / "index.js").write_text(
+        "export const authority = 'live alternate checkout';\n"
+    )
+
+    root_third_party = external_root_modules / "third-party"
+    root_third_party.mkdir()
+    (root_third_party / "marker").write_text("external third party\n")
+    root_workspace_scope = external_root_modules / "@hermes"
+    root_workspace_scope.mkdir()
+    (root_workspace_scope / "shared").symlink_to("../../apps/shared")
+    root_third_party_scope = external_root_modules / "@scope"
+    root_third_party_scope.mkdir()
+    (root_third_party_scope / "tool").symlink_to("../third-party")
+
+    desktop_nested = external_desktop_modules / "nested"
+    desktop_nested.mkdir()
+    (desktop_nested / "workspace").symlink_to("../../../shared")
+    (desktop_nested / "workspace-hop").symlink_to("workspace")
+    desktop_third_party_scope = external_desktop_modules / "@scope"
+    desktop_third_party_scope.mkdir()
+    (desktop_third_party_scope / "tool").symlink_to(
+        "../../../../node_modules/third-party"
+    )
+    desktop_vitest = external_desktop_modules / "vitest"
+    desktop_vitest.mkdir()
+    vitest = desktop_vitest / "cli.py"
+    vitest.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "import sys\n\n"
+        "cwd = Path.cwd()\n"
+        "sealed_repo = cwd.parent.parent\n"
+        "modules = cwd / 'node_modules'\n"
+        "root_modules = sealed_repo / 'node_modules'\n"
+        "live_repo = Path(os.environ['EXPECTED_LIVE_REPO']).resolve()\n"
+        "external_root = Path(os.environ['EXPECTED_EXTERNAL_ROOT_NODE_MODULES']).resolve()\n"
+        "if modules.is_symlink() or root_modules.is_symlink():\n"
+        "    raise SystemExit(21)\n"
+        "if cwd == live_repo / 'apps/desktop' or (cwd / 'live-discovery-sentinel').exists():\n"
+        "    raise SystemExit(22)\n"
+        "expected_shared = (sealed_repo / 'apps/shared').resolve()\n"
+        "for workspace in (root_modules / '@hermes/shared', modules / 'nested/workspace-hop'):\n"
+        "    if workspace.resolve() != expected_shared:\n"
+        "        raise SystemExit(23)\n"
+        "    if (workspace / 'index.js').read_text() != \"export const authority = 'committed';\\n\":\n"
+        "        raise SystemExit(24)\n"
+        "for third_party in (root_modules / '@scope/tool', modules / '@scope/tool'):\n"
+        "    if not third_party.resolve().is_relative_to(external_root):\n"
+        "        raise SystemExit(25)\n"
+        "    if (third_party / 'marker').read_text() != 'external third party\\n':\n"
+        "        raise SystemExit(26)\n"
+        "if any(\n"
+        "    raw and Path(raw).resolve().is_relative_to(live_repo)\n"
+        "    for raw in os.environ.get('PATH', '').split(os.pathsep)\n"
+        "):\n"
+        "    raise SystemExit(27)\n"
+        "if any(os.environ.get(name) for name in ('NODE_PATH', 'PYTHONPATH', 'INIT_CWD')):\n"
+        "    raise SystemExit(28)\n"
+        "if Path(os.environ['PWD']).resolve() != cwd.resolve():\n"
+        "    raise SystemExit(29)\n"
+        "if sys.argv[1:] != ['run', 'src/toolchain.test.ts']:\n"
+        "    raise SystemExit(30)\n"
+        "Path(os.environ['OBSERVED_NODE_CWD']).write_text(str(cwd))\n"
+    )
+    vitest.chmod(0o755)
+    desktop_bin = external_desktop_modules / ".bin"
+    desktop_bin.mkdir()
+    (desktop_bin / "vitest").symlink_to("../vitest/cli.py")
     (repo / "node_modules").symlink_to(external_root_modules, target_is_directory=True)
     (desktop / "node_modules").symlink_to(
         external_desktop_modules,
@@ -1225,34 +1298,12 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     npx.write_text(
         "#!/usr/bin/env python3\n"
         "import os\n"
-        "from pathlib import Path\n\n"
-        "cwd = Path.cwd()\n"
-        "modules = cwd / 'node_modules'\n"
-        "root_modules = cwd.parent.parent / 'node_modules'\n"
-        "expected_modules = Path(os.environ['EXPECTED_EXTERNAL_DESKTOP_NODE_MODULES']).resolve()\n"
-        "expected_root_modules = Path(os.environ['EXPECTED_EXTERNAL_ROOT_NODE_MODULES']).resolve()\n"
-        f"live_repo = Path({str(repo)!r}).resolve()\n"
-        f"live_desktop = Path({str(desktop)!r}).resolve()\n"
-        "if not modules.is_symlink() or modules.resolve() != expected_modules:\n"
-        "    raise SystemExit(21)\n"
-        "if cwd == live_desktop or (cwd / 'live-discovery-sentinel').exists():\n"
-        "    raise SystemExit(22)\n"
-        "if (modules / 'toolchain-marker').read_text() != 'external only\\n':\n"
-        "    raise SystemExit(23)\n"
-        "if not root_modules.is_symlink() or root_modules.resolve() != expected_root_modules:\n"
-        "    raise SystemExit(27)\n"
-        "if (root_modules / 'root-toolchain-marker').read_text() != 'root only\\n':\n"
-        "    raise SystemExit(28)\n"
-        "if any(\n"
-        "    raw and Path(raw).resolve().is_relative_to(live_repo)\n"
-        "    for raw in os.environ.get('PATH', '').split(os.pathsep)\n"
-        "):\n"
-        "    raise SystemExit(24)\n"
-        "if any(os.environ.get(name) for name in ('NODE_PATH', 'PYTHONPATH', 'INIT_CWD')):\n"
-        "    raise SystemExit(25)\n"
-        "if Path(os.environ['PWD']).resolve() != cwd.resolve():\n"
-        "    raise SystemExit(26)\n"
-        "Path(os.environ['OBSERVED_NODE_CWD']).write_text(str(cwd))\n"
+        "from pathlib import Path\n"
+        "import sys\n\n"
+        "tool = Path.cwd() / 'node_modules/.bin' / sys.argv[1]\n"
+        "if not tool.exists():\n"
+        "    raise SystemExit(19)\n"
+        "os.execv(str(tool), [str(tool), *sys.argv[2:]])\n"
     )
     npx.chmod(0o755)
     report = tmp_path / "sealed-node-report.json"
@@ -1261,8 +1312,8 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     worktrees_before = _git(repo, "worktree", "list", "--porcelain")
     env = os.environ.copy()
     env["PATH"] = f"{external_bin}{os.pathsep}{env['PATH']}"
-    env["EXPECTED_EXTERNAL_DESKTOP_NODE_MODULES"] = str(external_desktop_modules)
     env["EXPECTED_EXTERNAL_ROOT_NODE_MODULES"] = str(external_root_modules)
+    env["EXPECTED_LIVE_REPO"] = str(repo)
     env["OBSERVED_NODE_CWD"] = str(observed_cwd)
     env["NODE_PATH"] = str(external_desktop_modules)
     env["PYTHONPATH"] = str(repo)
@@ -1294,6 +1345,123 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     assert json.loads(report.read_text())[0]["result"] == "passed"
     assert observed_cwd.is_file()
     assert Path(observed_cwd.read_text()).parent.name == "apps"
+    assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
+    assert list(temp_root.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="external toolchain links use POSIX paths")
+@pytest.mark.parametrize(
+    ("scope", "kind"),
+    [
+        ("root", "broken"),
+        ("desktop", "escape"),
+        ("root", "missing-workspace"),
+        ("desktop", "missing-workspace"),
+    ],
+)
+def test_sealed_ledger_runner_rejects_unsafe_dependency_symlinks_before_execution(
+    tmp_path: Path,
+    scope: str,
+    kind: str,
+) -> None:
+    """Broken, escaping, and uncommitted project links are terminal setup errors."""
+    repo = tmp_path / f"runner-unsafe-dependency-{scope}-{kind}"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    desktop = repo / "apps/desktop"
+    test_path = desktop / "src/toolchain.test.ts"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text("export const sealedToolchain = true\n")
+    manifest = repo / "ledger.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"upstream_changes": [{"tests": ["apps/desktop/src/toolchain.test.ts"]}]},
+            sort_keys=False,
+        )
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "commit sealed desktop invariant")
+
+    external_project = tmp_path / "external-project"
+    external_root_modules = external_project / "node_modules"
+    external_root_modules.mkdir(parents=True)
+    external_desktop_modules = external_project / "apps/desktop/node_modules"
+    external_desktop_modules.mkdir(parents=True)
+    selected_modules = (
+        external_desktop_modules if scope == "desktop" else external_root_modules
+    )
+    nested = selected_modules / "package/nested"
+    nested.mkdir(parents=True)
+    unsafe = nested / "unsafe"
+    if kind == "broken":
+        unsafe.symlink_to("missing-target")
+    elif kind == "escape":
+        outside = tmp_path / "outside-dependency-authority"
+        outside.mkdir()
+        unsafe.symlink_to(outside, target_is_directory=True)
+    else:
+        missing = external_project / "packages/missing"
+        missing.mkdir(parents=True)
+        unsafe.symlink_to(missing, target_is_directory=True)
+    (repo / "node_modules").symlink_to(
+        external_root_modules,
+        target_is_directory=True,
+    )
+    (desktop / "node_modules").symlink_to(
+        external_desktop_modules,
+        target_is_directory=True,
+    )
+
+    executed = tmp_path / "unsafe-toolchain-executed"
+    external_bin = tmp_path / "external-node-bin"
+    external_bin.mkdir()
+    node = external_bin / "node"
+    node.write_text("#!/bin/sh\nexit 0\n")
+    node.chmod(0o755)
+    npx = external_bin / "npx"
+    npx.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['UNSAFE_TOOLCHAIN_EXECUTED']).write_text('executed')\n"
+    )
+    npx.chmod(0o755)
+    report = tmp_path / "unsafe-node-report.json"
+    temp_root = tmp_path / "runner-temp"
+    temp_root.mkdir()
+    worktrees_before = _git(repo, "worktree", "list", "--porcelain")
+    env = os.environ.copy()
+    env["PATH"] = f"{external_bin}{os.pathsep}{env['PATH']}"
+    env["TMPDIR"] = str(temp_root)
+    env["UNSAFE_TOOLCHAIN_EXECUTED"] = str(executed)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(repo),
+            "--manifest",
+            str(manifest),
+            "--report-path",
+            str(report),
+            "--platform",
+            "synthetic",
+            "--base-ref",
+            "HEAD",
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert "node_modules" in result.stderr
+    assert not executed.exists()
+    assert not report.exists()
     assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
     assert list(temp_root.iterdir()) == []
 
