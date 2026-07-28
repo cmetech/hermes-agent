@@ -9,12 +9,15 @@ import base64
 from dataclasses import dataclass, replace
 import difflib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
+import time
 import tomllib
 from typing import Any, BinaryIO, Sequence
 
@@ -32,6 +35,7 @@ _PARSER_PROTOCOL = 1
 _MAX_PARSER_BATCH_BYTES = 16 * 1024 * 1024
 _MAX_PARSER_OUTPUT_BYTES = 16 * 1024 * 1024
 _PARSER_TIMEOUT_SECONDS = 60.0
+_CAPTURE_CLEANUP_SECONDS = 1.0
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _NON_PYTHON_HELPER = _REPOSITORY_ROOT / "scripts" / "extract_non_python_symbols.mjs"
 _PARSER_LANGUAGES = {
@@ -107,6 +111,12 @@ def _run_bounded_capture(
     output_limit_bytes: int,
 ) -> _CompletedCapture:
     """Run a child with bounded combined output and sanitized failure states."""
+    deadline = time.monotonic() + max(timeout_seconds, 0)
+    process_options: dict[str, Any] = {}
+    if os.name == "posix":
+        process_options["start_new_session"] = True
+    elif os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         process = subprocess.Popen(
             list(argv),
@@ -114,20 +124,35 @@ def _run_bounded_capture(
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            **process_options,
         )
     except Exception as exc:
         raise _BoundedCaptureFailure("start_failure") from exc
+
+    def terminate_process_group() -> None:
+        try:
+            if os.name == "posix" and hasattr(process, "pid"):
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            raise _BoundedCaptureFailure("kill_failure") from exc
 
     def kill_and_reap() -> int:
         failure: _BoundedCaptureFailure | None = None
         reaped_returncode = -1
         try:
-            process.kill()
-        except Exception as exc:
-            failure = _BoundedCaptureFailure("kill_failure")
-            failure.__cause__ = exc
+            terminate_process_group()
+        except _BoundedCaptureFailure as exc:
+            failure = exc
         try:
-            reaped_returncode = process.wait()
+            reaped_returncode = process.wait(timeout=_CAPTURE_CLEANUP_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            if failure is None:
+                failure = _BoundedCaptureFailure("wait_failure")
+                failure.__cause__ = exc
         except Exception as exc:
             if failure is None:
                 failure = _BoundedCaptureFailure("wait_failure")
@@ -151,8 +176,8 @@ def _run_bounded_capture(
 
     def kill_for_failure() -> None:
         try:
-            process.kill()
-        except Exception:
+            terminate_process_group()
+        except _BoundedCaptureFailure:
             stream_failed.set()
 
     def write_and_close(stream: BinaryIO, payload: bytes) -> None:
@@ -205,9 +230,10 @@ def _run_bounded_capture(
             kill_and_reap()
         except Exception:
             pass
+        cleanup_deadline = time.monotonic() + _CAPTURE_CLEANUP_SECONDS
         for thread in started:
             try:
-                thread.join()
+                thread.join(timeout=max(0, cleanup_deadline - time.monotonic()))
             except Exception:
                 pass
         raise _BoundedCaptureFailure("thread_failure") from exc
@@ -215,7 +241,7 @@ def _run_bounded_capture(
     failure: _BoundedCaptureFailure | None = None
     returncode = -1
     try:
-        returncode = process.wait(timeout=timeout_seconds)
+        returncode = process.wait(timeout=max(0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         try:
             returncode = kill_and_reap()
@@ -230,14 +256,37 @@ def _run_bounded_capture(
             pass
         failure = _BoundedCaptureFailure("wait_failure")
         failure.__cause__ = exc
-    finally:
-        for thread in threads:
+
+    join_deadline = (
+        deadline
+        if failure is None
+        else time.monotonic() + _CAPTURE_CLEANUP_SECONDS
+    )
+    for thread in threads:
+        try:
+            thread.join(timeout=max(0, join_deadline - time.monotonic()))
+        except Exception as exc:
+            if failure is None:
+                failure = _BoundedCaptureFailure("thread_failure")
+                failure.__cause__ = exc
+
+    unfinished = [thread for thread in threads if thread.is_alive()]
+    if unfinished:
+        try:
+            kill_and_reap()
+        except _BoundedCaptureFailure as exc:
+            if failure is None:
+                failure = exc
+        cleanup_deadline = time.monotonic() + _CAPTURE_CLEANUP_SECONDS
+        for thread in unfinished:
             try:
-                thread.join()
+                thread.join(timeout=max(0, cleanup_deadline - time.monotonic()))
             except Exception as exc:
                 if failure is None:
                     failure = _BoundedCaptureFailure("thread_failure")
                     failure.__cause__ = exc
+        if failure is None:
+            failure = _BoundedCaptureFailure("timeout")
 
     if failure is not None:
         raise failure
@@ -280,6 +329,18 @@ def _json_record(line: bytes) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("record is not an object")
     return value
+
+
+def _ndjson_records(payload: bytes) -> list[dict[str, Any]]:
+    if not payload.endswith(b"\n"):
+        raise ValueError("missing LF record terminator")
+    records: list[dict[str, Any]] = []
+    for framed_line in payload[:-1].split(b"\n"):
+        line = framed_line[:-1] if framed_line.endswith(b"\r") else framed_line
+        if b"\r" in line:
+            raise ValueError("invalid record separator")
+        records.append(_json_record(line))
+    return records
 
 
 def _run_parser_batch(
@@ -330,7 +391,7 @@ def _run_parser_batch(
         if completed.returncode != 0:
             raise _BoundedCaptureFailure("process_failure")
         try:
-            records = [_json_record(line) for line in completed.stdout.splitlines()]
+            records = _ndjson_records(completed.stdout)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise _BoundedCaptureFailure("malformed_output") from exc
         if len(records) != len(requests) + 1:
@@ -339,6 +400,7 @@ def _run_parser_batch(
         if (
             set(hello) != {"type", "protocol", "versions"}
             or hello.get("type") != "hello"
+            or type(hello.get("protocol")) is not int
             or hello.get("protocol") != _PARSER_PROTOCOL
             or hello.get("versions") != _EXPECTED_PARSER_VERSIONS
         ):

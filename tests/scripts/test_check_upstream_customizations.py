@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import time
 
 import pytest
 import yaml
@@ -88,7 +89,7 @@ def _parser_request(
 
 def _parser_records(
     *results: dict[str, object],
-    protocol: int = 1,
+    protocol: object = 1,
     versions: dict[str, str] | None = None,
 ) -> bytes:
     records: list[dict[str, object]] = [{
@@ -352,6 +353,70 @@ def test_parser_rejects_wrong_protocol_or_dependency_versions(
     )
 
 
+@pytest.mark.parametrize("protocol", [True, 1.0], ids=("boolean", "float"))
+def test_parser_rejects_non_integer_protocol_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: object,
+) -> None:
+    """Replacing exact integer typing with equality must fail this test."""
+    _install_fake_parser_process(
+        tmp_path,
+        monkeypatch,
+        stdout=_parser_records(_parser_result(), protocol=protocol),
+    )
+
+    _assert_bounded_parser_error(
+        lambda: customization_checker._run_parser_batch([_parser_request()])
+    )
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [b"\r", b"\v", b"\f"],
+    ids=("bare-cr", "vertical-tab", "form-feed"),
+)
+def test_parser_rejects_non_lf_ndjson_framing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    separator: bytes,
+) -> None:
+    """Restoring broad splitlines framing must fail this test."""
+    hello = json.dumps(
+        {
+            "type": "hello",
+            "protocol": 1,
+            "versions": _EXPECTED_PARSER_VERSIONS,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    result = json.dumps(_parser_result(), separators=(",", ":")).encode("utf-8")
+    _install_fake_parser_process(
+        tmp_path,
+        monkeypatch,
+        stdout=hello + separator + result + b"\n",
+    )
+
+    _assert_bounded_parser_error(
+        lambda: customization_checker._run_parser_batch([_parser_request()])
+    )
+
+
+def test_parser_accepts_crlf_ndjson_framing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_parser_process(
+        tmp_path,
+        monkeypatch,
+        stdout=_parser_records(_parser_result()).replace(b"\n", b"\r\n"),
+    )
+
+    assert customization_checker._run_parser_batch([_parser_request()]) == {
+        "request": {"ExactToken": [(6, 16)]}
+    }
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -416,7 +481,48 @@ def test_parser_kills_a_batch_after_sixty_seconds(
     )
 
     assert instances[0].killed is True
-    assert instances[0].wait_timeouts == [60, None]
+    assert instances[0].wait_timeouts[0] == pytest.approx(60, abs=0.1)
+    assert instances[0].wait_timeouts[1] is not None
+    assert 0 < instances[0].wait_timeouts[1] <= 1
+
+
+def test_parser_batch_deadline_kills_pipe_retaining_descendants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unbounded drain-thread joins after a leader exits must fail this test."""
+    executable = tmp_path / "pipe-retaining-node"
+    response = base64.b64encode(_parser_records(_parser_result())).decode("ascii")
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import base64\n"
+        "import subprocess\n"
+        "import sys\n"
+        "sys.stdin.buffer.read()\n"
+        f"sys.stdout.buffer.write(base64.b64decode({response!r}))\n"
+        "sys.stdout.buffer.flush()\n"
+        "subprocess.Popen(\n"
+        "    [sys.executable, '-c', 'import time; time.sleep(2)'],\n"
+        "    stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=sys.stderr,\n"
+        ")\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    helper = tmp_path / "helper.mjs"
+    helper.write_text("// controlled test fixture\n", encoding="utf-8")
+    monkeypatch.setattr(
+        customization_checker.shutil, "which", lambda _name: str(executable)
+    )
+    monkeypatch.setattr(customization_checker, "_NON_PYTHON_HELPER", helper)
+    monkeypatch.setattr(customization_checker, "_PARSER_TIMEOUT_SECONDS", 0.2)
+
+    started = time.monotonic()
+    _assert_bounded_parser_error(
+        lambda: customization_checker._run_parser_batch([_parser_request()])
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1
 
 
 @pytest.mark.parametrize(
