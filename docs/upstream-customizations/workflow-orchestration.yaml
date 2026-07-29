@@ -3609,7 +3609,7 @@ upstream_changes:
   - JavaScript-compatible canonical contract JSON and digest
   - editor status mapping preserves nonblocking runtime advisories
   - generated node-kind and complete field descriptor coverage
-  - generated DAG, condition grammar, and node-reference semantic rules
+  - generated DAG and ECMAScript Unicode-portable condition and node-reference rules
   - generated field documentation and schema-valid examples
   - contract reader, document-size, provenance, and file-pairing metadata
   - workflow schema CLI command
@@ -3654,7 +3654,11 @@ upstream_changes:
     legacy warning fields supported with their raw advisory status, severity,
     and migration retained in the compatibility catalog. Keep the full
     condition-expression pattern under expression_pattern so consumers do not
-    mistake it for the separate node-reference capture pattern. The bounded schema command must bypass
+    mistake it for the separate node-reference capture pattern. Publish both
+    patterns with explicit ECMAScript Unicode flags and Unicode property escapes
+    equivalent to the loader's Python Unicode word semantics without changing
+    the loader-owned patterns. Nested fields inherit deferred status only from
+    a blocking/deferred parent; warning parents remain supported. The bounded schema command must bypass
     logging, brand/capability startup, workflow/plugin discovery, and all
     filesystem mutation, model, MCP, or network calls while emitting
     deterministic compact JSON. Compose the bounded early parser from Hermes'

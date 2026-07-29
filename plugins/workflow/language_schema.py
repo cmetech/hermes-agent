@@ -32,6 +32,18 @@ WHEN_EXPRESSION_PATTERN = (
     rf"^\s*{WHEN_CLAUSE_PATTERN}"
     rf"(?:\s*(?:&&|\|\|)\s*{WHEN_CLAUSE_PATTERN})*\s*$"
 )
+ECMASCRIPT_WHEN_REFERENCE_PATTERN = (
+    r"\$([\p{L}\p{N}_.:-]+)\.output(?:\.[\p{L}\p{N}_.-]+)*"
+)
+ECMASCRIPT_WHEN_CLAUSE_PATTERN = (
+    r"\$[\p{L}\p{N}_.:-]+\.output(?:\.[\p{L}\p{N}_.-]+)*\s*"
+    r"(?:==|!=|<=|>=|<|>)\s*"
+    r'''(?:'[^']*'|"[^"]*"|-?(?:\d+(?:\.\d*)?|\.\d+))'''
+)
+ECMASCRIPT_WHEN_EXPRESSION_PATTERN = (
+    rf"^\s*{ECMASCRIPT_WHEN_CLAUSE_PATTERN}"
+    rf"(?:\s*(?:&&|\|\|)\s*{ECMASCRIPT_WHEN_CLAUSE_PATTERN})*\s*$"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1390,7 +1402,8 @@ def _field_descriptor(
     )
     editor_status = (
         "deferred"
-        if parent_status is not None and parent_status.status != "supported"
+        if parent_status is not None
+        and _editor_status(parent_status.status) == "deferred"
         else _editor_status(status.status)
     )
     return {
@@ -1537,11 +1550,13 @@ def semantic_rule_descriptors(
             "applicability": definition_applicability,
             "status": "supported",
             "parameters": {
-                "expression_pattern": WHEN_EXPRESSION_PATTERN,
+                "expression_pattern": ECMASCRIPT_WHEN_EXPRESSION_PATTERN,
+                "expression_flags": "u",
             },
             "examples": [
                 "$prepare.output.status == 'ready' && "
-                "$inspect.output.count >= 2"
+                "$inspect.output.count >= 2",
+                "$café.output.status == 'ready'",
             ],
         },
         {
@@ -1555,11 +1570,15 @@ def semantic_rule_descriptors(
             "status": "supported",
             "parameters": {
                 "syntax": "$ID.output(.path)*",
-                "pattern": r"\$([^\s/\\]+)\.output(?:\.[^\s=!<>|&]+)*",
+                "pattern": ECMASCRIPT_WHEN_REFERENCE_PATTERN,
+                "pattern_flags": "u",
                 "node_id_capture_group": 1,
                 "require_upstream": True,
             },
-            "examples": ["$prepare.output.status == 'ready'"],
+            "examples": [
+                "$prepare.output.status == 'ready'",
+                "$café.output.status == 'ready'",
+            ],
         },
         {
             "id": "companion-node-reference-list",

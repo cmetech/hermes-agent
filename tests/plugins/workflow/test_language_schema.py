@@ -196,6 +196,29 @@ def test_authoring_contract_publishes_live_dag_and_condition_reference_rules(pro
     assert isinstance(conditions["parameters"]["expression_pattern"], str)
 
 
+def test_condition_contract_publishes_ecmascript_unicode_grammar():
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.HERMES_LEGACY)
+    rules = {item["id"]: item for item in contract["semantic_rules"]}
+    conditions = rules["condition-expression"]
+    references = rules["condition-output-reference"]
+    unicode_condition = "$café.output.status == 'ready'"
+
+    expression_pattern = conditions["parameters"]["expression_pattern"]
+    assert conditions["parameters"]["expression_flags"] == "u"
+    assert r"\w" not in expression_pattern
+    assert r'\"' not in expression_pattern
+    assert r"[\p{L}\p{N}_.:-]+" in expression_pattern
+    assert r"[\p{L}\p{N}_.-]+" in expression_pattern
+    assert unicode_condition in conditions["examples"]
+
+    reference_pattern = references["parameters"]["pattern"]
+    assert references["parameters"]["pattern_flags"] == "u"
+    assert r"\w" not in reference_pattern
+    assert r"([\p{L}\p{N}_.:-]+)" in reference_pattern
+    assert r"[\p{L}\p{N}_.-]+" in reference_pattern
+    assert unicode_condition in references["examples"]
+
+
 @pytest.mark.parametrize(
     ("condition", "expected"),
     [
@@ -214,7 +237,8 @@ def test_condition_expression_descriptor_matches_the_real_loader(condition, expe
     rule = next(
         item for item in contract["semantic_rules"] if item["id"] == "condition-expression"
     )
-    pattern = re.compile(rule["parameters"]["expression_pattern"])
+    assert rule["parameters"]["expression_flags"] == "u"
+    pattern = re.compile(language_schema.WHEN_EXPRESSION_PATTERN)
     document = {
         "name": "condition-contract",
         "description": "contract and loader agree",
@@ -234,6 +258,24 @@ def test_condition_expression_descriptor_matches_the_real_loader(condition, expe
     schema_accepts, loader_accepts = _structural_outcomes(document)
     assert schema_accepts is True
     assert loader_accepts is expected
+
+
+def test_loader_keeps_python_unicode_condition_identifiers():
+    document = {
+        "name": "unicode-condition",
+        "description": "Unicode node and output identifiers remain loader-valid",
+        "nodes": [
+            {"id": "café", "bash": "true"},
+            {
+                "id": "target",
+                "bash": "true",
+                "depends_on": ["café"],
+                "when": "$café.output.résumé == 'ready'",
+            },
+        ],
+    }
+
+    assert _structural_outcomes(document) == (True, True)
 
 
 @pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
@@ -299,6 +341,35 @@ def test_nested_descriptors_never_upgrade_a_deferred_parent_field():
 
     assert retry_fields
     assert {field["status"] for field in retry_fields} == {"deferred"}
+
+
+def test_nested_descriptor_keeps_supported_child_under_warning_parent():
+    profile = WorkflowLanguageProfile.HERMES_LEGACY
+    parent = next(
+        spec
+        for spec in FIELD_INVENTORY
+        if spec.scope == "node" and spec.yaml_name == "retry"
+    )
+    child = next(spec for spec in FIELD_INVENTORY if spec.scope == "retry")
+    warning_parent = replace(
+        parent,
+        compatibility=tuple(
+            replace(item, status="warning", code="test_warning_parent")
+            if item.profile is profile
+            else item
+            for item in parent.compatibility
+        ),
+    )
+
+    descriptor = language_schema._field_descriptor(
+        child,
+        profile,
+        "command",
+        f"nodes[].retry.{child.yaml_name}",
+        parent_spec=warning_parent,
+    )
+
+    assert descriptor["status"] == "supported"
 
 
 def test_editor_status_distinguishes_legacy_advisories_from_archon_blockers():
