@@ -21,6 +21,7 @@ from plugins.workflow.language import (
     resolve_language_profile,
 )
 from plugins.workflow.language_schema import (
+    MAX_WORKFLOW_DOCUMENT_BYTES,
     NODE_TYPES,
     agent_field_names,
     approval_field_names,
@@ -80,7 +81,6 @@ _WHEN_EXPRESSION = re.compile(
     re.UNICODE,
 )
 _INLINE_SCRIPT_METACHAR = re.compile(r"[\s;(){}&|<>$`\"']")
-_MAX_YAML_BYTES = 2 * 1024 * 1024
 
 
 def _issue(
@@ -842,7 +842,7 @@ def _load_workflow_bytes(
     precedence: int,
     normalizer_version: int = WORKFLOW_NORMALIZER_VERSION,
 ) -> WorkflowPackage:
-    if len(data) > _MAX_YAML_BYTES:
+    if len(data) > MAX_WORKFLOW_DOCUMENT_BYTES:
         _fail(
             "path",
             "workflow_too_large",

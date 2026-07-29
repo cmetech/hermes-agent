@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from hashlib import sha256
+import json
+from types import MappingProxyType
 from typing import Any
 
 from plugins.workflow.language import (
@@ -14,6 +18,9 @@ from plugins.workflow.models import WorkflowLanguageProfile
 
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 _PROFILES = tuple(WorkflowLanguageProfile)
+MAX_WORKFLOW_DOCUMENT_BYTES = 2 * 1024 * 1024
+CONTRACT_READER_VERSION = 1
+_NO_DEFAULT = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +46,14 @@ class WorkflowFieldSpec:
     compatibility: tuple[FieldCompatibility, ...]
     required: bool
     required_node_types: frozenset[str]
+    title: str
+    description: str
+    widget: str
+    section: str
+    examples: tuple[object, ...]
+    value_role: str | None
+    default_value: object
+    pattern: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +88,233 @@ def _compatibility(
     )
 
 
+def _humanize(value: str) -> str:
+    return value.replace("_", " ").replace("-", " ").strip().capitalize()
+
+
+def _widget_for(scope: str, yaml_name: str, shape: str) -> str:
+    if yaml_name == "output_format":
+        return "json-schema"
+    if yaml_name in {"bash", "script", "command"}:
+        return "code"
+    if yaml_name in {
+        "description",
+        "prompt",
+        "systemPrompt",
+        "when",
+        "until",
+        "gate_message",
+        "systemMessage",
+        "stopReason",
+        "permissionDecisionReason",
+        "additionalContext",
+    }:
+        return "textarea"
+    if shape == "boolean":
+        return "boolean"
+    if shape in {
+        "positive_number",
+        "positive_integer",
+        "retry_attempts",
+        "retry_delay",
+        "loop_iterations",
+        "approval_attempts",
+    }:
+        return "number"
+    if shape in {
+        "effort",
+        "trigger_rule",
+        "context",
+        "runtime",
+        "retry_error",
+        "hook_decision",
+        "permission_decision",
+        "hook_action",
+        "hook_event_name",
+        "language_profile",
+        "execution_environment",
+        "overlap_policy",
+        "pause_lane_policy",
+    }:
+        return "enum"
+    if shape in {"string_list", "hook_entries"}:
+        return "array"
+    if shape == "mapping":
+        return "map"
+    if shape in {
+        "worktree",
+        "thinking",
+        "retry",
+        "hooks",
+        "hook_response",
+        "hook_specific",
+        "nullable_hook_specific",
+        "agents",
+        "loop_payload",
+        "approval_payload",
+        "approval_reject",
+    }:
+        return "object"
+    if shape == "any":
+        return "json-schema"
+    return "text"
+
+
+def _section_for(scope: str, yaml_name: str) -> str:
+    if scope == "definition" and yaml_name in {"name", "description", "tags"}:
+        return "General"
+    if scope == "node" and yaml_name in {"id", *NODE_TYPES}:
+        return "General"
+    if scope in {"retry", "loop", "approval", "approval_reject"} or yaml_name in {
+        "depends_on",
+        "when",
+        "trigger_rule",
+        "context",
+        "idle_timeout",
+        "retry",
+        "always_run",
+        "runtime",
+        "deps",
+        "timeout",
+    }:
+        return "Execution"
+    return "Advanced"
+
+
+def _value_role_for(yaml_name: str) -> str | None:
+    if yaml_name in {"bash", "script", "command"}:
+        return "code"
+    if yaml_name in {
+        "description",
+        "prompt",
+        "systemPrompt",
+        "when",
+        "until",
+        "gate_message",
+        "systemMessage",
+        "stopReason",
+        "permissionDecisionReason",
+        "additionalContext",
+    }:
+        return "multiline"
+    if yaml_name == "mcp":
+        return "resource-path"
+    if yaml_name in {"skills", "deps"}:
+        return "resource-reference"
+    if yaml_name == "required_secrets":
+        return "secret-reference"
+    return None
+
+
+def _description_for(scope: str, yaml_name: str) -> str:
+    subject = _humanize(yaml_name)
+    if scope == "definition":
+        return f"{subject} for the workflow definition."
+    if scope == "sidecar":
+        return f"{subject} metadata for the optional companion document."
+    if scope == "node":
+        return f"{subject} for this workflow node."
+    return f"{subject} within the node's {scope.replace('_', ' ')} settings."
+
+
+def _freeze_editor_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({
+            str(key): _freeze_editor_value(item) for key, item in value.items()
+        })
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_editor_value(item) for item in value)
+    return value
+
+
+def _thaw_editor_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _thaw_editor_value(item) for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return [_thaw_editor_value(item) for item in value]
+    return value
+
+
+def _example_for(yaml_name: str, shape: str) -> object:
+    named: dict[str, object] = {
+        "id": "node-id",
+        "name": "workflow-name",
+        "description": "Describe this workflow.",
+        "command": "/review",
+        "prompt": "Summarize the upstream result.",
+        "bash": "printf 'ok\\n'",
+        "script": "print('ok')",
+        "cancel": "Cancellation requested.",
+        "when": "$prepare.output.status == 'ready'",
+        "depends_on": ["prepare"],
+        "output_format": {"type": "object"},
+        "mcp": "mcp/server.yaml",
+        "required_secrets": ["SERVICE_API_KEY"],
+        "systemPrompt": "Follow the workflow instructions.",
+        "until": "done",
+        "gate_message": "Approve the next iteration.",
+        "hookEventName": "PreToolUse",
+    }
+    if yaml_name in named:
+        return named[yaml_name]
+    by_shape: dict[str, object] = {
+        "any": True,
+        "string": "value",
+        "nonempty_string": "value",
+        "boolean": True,
+        "positive_number": 1,
+        "positive_integer": 1,
+        "string_list": ["value"],
+        "mapping": {"key": "value"},
+        "worktree": {"enabled": True},
+        "effort": "medium",
+        "thinking": "adaptive",
+        "trigger_rule": "all_success",
+        "context": "fresh",
+        "runtime": "uv",
+        "retry_attempts": 2,
+        "retry_delay": 1000,
+        "retry_error": "transient",
+        "loop_iterations": 3,
+        "approval_attempts": 2,
+        "hook_decision": "approve",
+        "permission_decision": "allow",
+        "hook_action": "accept",
+        "hook_event_name": "PreToolUse",
+        "language_profile": "hermes-legacy",
+        "execution_environment": "trusted_local",
+        "overlap_policy": "queue",
+        "pause_lane_policy": "hold",
+        "retry": {"max_attempts": 2},
+        "hooks": {},
+        "hook_entries": [{"response": {"continue": True}}],
+        "hook_response": {"continue": True},
+        "hook_specific": {"hookEventName": "PreToolUse"},
+        "nullable_hook_specific": None,
+        "agents": {
+            "reviewer": {
+                "description": "Review the result.",
+                "prompt": "Check the output.",
+            }
+        },
+        "nodes": [{"id": "start", "bash": "true"}],
+        "loop_payload": {
+            "prompt": "Try again.",
+            "until": "done",
+            "max_iterations": 3,
+        },
+        "approval_payload": {"message": "Continue?"},
+        "approval_reject": {"prompt": "Try again."},
+    }
+    if shape in by_shape:
+        return by_shape[shape]
+    if shape.endswith("_payload"):
+        return "value"
+    raise ValueError(f"workflow field shape has no editor example: {shape}")
+
+
 def _field(
     scope: str,
     yaml_name: str,
@@ -88,6 +330,14 @@ def _field(
     legacy_code: str | None = None,
     archon_status: str = "supported",
     archon_code: str | None = None,
+    title: str | None = None,
+    description: str | None = None,
+    widget: str | None = None,
+    section: str | None = None,
+    examples: tuple[object, ...] | None = None,
+    value_role: str | None = None,
+    default_value: object = _NO_DEFAULT,
+    pattern: str | None = None,
 ) -> WorkflowFieldSpec:
     return WorkflowFieldSpec(
         scope=scope,
@@ -107,6 +357,17 @@ def _field(
         ),
         required=required,
         required_node_types=frozenset(required_node_types),
+        title=title or _humanize(yaml_name),
+        description=description or _description_for(scope, yaml_name),
+        widget=widget or _widget_for(scope, yaml_name, shape),
+        section=section or _section_for(scope, yaml_name),
+        examples=tuple(
+            _freeze_editor_value(example)
+            for example in (examples or (_example_for(yaml_name, shape),))
+        ),
+        value_role=value_role or _value_role_for(yaml_name),
+        default_value=default_value,
+        pattern=pattern,
     )
 
 
@@ -152,6 +413,7 @@ _NODE_FIELDS = (
         "nonempty_string",
         node_types=NODE_TYPES,
         required_node_types=NODE_TYPES,
+        pattern=r"^[^\s/\\]+$",
     ),
     *(
         _field(
@@ -164,9 +426,23 @@ _NODE_FIELDS = (
         )
         for node_type in NODE_TYPES
     ),
-    _field("node", "depends_on", "array", "string_list", node_types=NODE_TYPES),
+    _field(
+        "node",
+        "depends_on",
+        "array",
+        "string_list",
+        node_types=NODE_TYPES,
+        default_value=(),
+    ),
     _field("node", "when", "string", "nonempty_string", node_types=NODE_TYPES),
-    _field("node", "trigger_rule", "string", "trigger_rule", node_types=NODE_TYPES),
+    _field(
+        "node",
+        "trigger_rule",
+        "string",
+        "trigger_rule",
+        node_types=NODE_TYPES,
+        default_value="all_success",
+    ),
     _field("node", "context", "string", "context", node_types=NODE_TYPES),
     _field(
         "node",
@@ -637,6 +913,46 @@ def _field_status(
     return next(item for item in spec.compatibility if item.profile is profile)
 
 
+def _editor_status(status: str) -> str:
+    return "supported" if status == "supported" else "deferred"
+
+
+def _field_order(spec: WorkflowFieldSpec) -> int:
+    return FIELD_INVENTORY.index(spec) + 1
+
+
+def _field_unit(
+    spec: WorkflowFieldSpec, profile: WorkflowLanguageProfile
+) -> str | None:
+    if spec.yaml_name == "delay_ms":
+        return "milliseconds"
+    if spec.yaml_name in {"idle_timeout", "timeout"}:
+        return (
+            "seconds"
+            if profile is WorkflowLanguageProfile.HERMES_LEGACY
+            else None
+        )
+    if spec.yaml_name == "maxBudgetUsd":
+        return "USD"
+    if spec.yaml_name in {"max_iterations", "max_attempts", "maxTurns"}:
+        return "count"
+    return None
+
+
+def _compatibility_description(code: str, raw_status: str) -> str:
+    return (
+        f'Hermes reports compatibility code "{code}" as a {raw_status} '
+        "finding for the listed fields."
+    )
+
+
+def _compatibility_migration(code: str) -> str:
+    return (
+        f'Run "hermes workflow doctor" and resolve compatibility code "{code}" '
+        "before relying on this field in the selected profile."
+    )
+
+
 def _json_truthy_schema() -> dict[str, Any]:
     """Describe exactly the JSON values accepted by Python truth testing."""
     return {
@@ -791,10 +1107,38 @@ def _field_schema(
 ) -> dict[str, Any]:
     result = _schema_for_shape(spec.shape, profile, hook_event=hook_event)
     status = _field_status(spec, profile)
+    result.update({
+        "title": spec.title,
+        "description": spec.description,
+        "x-hermes-section": spec.section,
+        "x-hermes-order": _field_order(spec),
+        "x-hermes-widget": spec.widget,
+        "x-hermes-status": status.status,
+    })
+    if spec.examples:
+        result["examples"] = (
+            [hook_event]
+            if spec.shape == "hook_event_name" and hook_event is not None
+            else [_thaw_editor_value(example) for example in spec.examples]
+        )
+    if spec.default_value is not _NO_DEFAULT:
+        result["default"] = (
+            list(spec.default_value)
+            if isinstance(spec.default_value, tuple)
+            else spec.default_value
+        )
+    if spec.pattern is not None:
+        result["pattern"] = spec.pattern
+    unit = _field_unit(spec, profile)
+    if unit is not None:
+        result["x-hermes-unit"] = unit
+    if spec.value_role is not None:
+        result["x-hermes-value-role"] = spec.value_role
     if status.status != "supported":
-        result["x-hermes-status"] = status.status
         result["x-hermes-compatibility-code"] = status.code
         result["x-hermes-enforcement-phase"] = spec.enforcement_phase
+        if status.code is not None:
+            result["x-hermes-migration"] = _compatibility_migration(status.code)
     return result
 
 
@@ -850,7 +1194,7 @@ def _nodes_schema(profile: WorkflowLanguageProfile) -> dict[str, Any]:
     variants = []
     for node_type in NODE_TYPES:
         properties = {
-            spec.yaml_name: _field_schema(spec, profile)
+            spec.yaml_name: True
             for spec in specs
             if node_type in spec.structural_node_types
         }
@@ -937,7 +1281,12 @@ def compatibility_code_catalog(
         entry = grouped.setdefault(
             status.code,
             {
-                "status": status.status,
+                "status": _editor_status(status.status),
+                "description": _compatibility_description(
+                    status.code, status.status
+                ),
+                "migration": _compatibility_migration(status.code),
+                "runtime_status": status.status,
                 "severity": "error" if status.status == "blocking" else "warning",
                 "blocking": status.status == "blocking",
                 "enforcement_phase": spec.enforcement_phase,
@@ -951,7 +1300,10 @@ def compatibility_code_catalog(
         if selected not in spec.profiles:
             continue
         grouped[spec.code] = {
-            "status": spec.status,
+            "status": _editor_status(spec.status),
+            "description": _compatibility_description(spec.code, spec.status),
+            "migration": _compatibility_migration(spec.code),
+            "runtime_status": spec.status,
             "severity": "error" if spec.status == "blocking" else "warning",
             "blocking": spec.status == "blocking",
             "enforcement_phase": spec.enforcement_phase,
@@ -963,16 +1315,370 @@ def compatibility_code_catalog(
     }
 
 
+def _nested_specs_for_kind(
+    node_type: str,
+) -> tuple[tuple[WorkflowFieldSpec, str], ...]:
+    nested: list[tuple[WorkflowFieldSpec, str]] = []
+    if node_type != "loop":
+        nested.extend(
+            (spec, f"nodes[].retry.{spec.yaml_name}")
+            for spec in _specs("retry")
+        )
+    if node_type == "loop":
+        nested.extend(
+            (spec, f"nodes[].loop.{spec.yaml_name}") for spec in _specs("loop")
+        )
+    if node_type == "approval":
+        nested.extend(
+            (spec, f"nodes[].approval.{spec.yaml_name}")
+            for spec in _specs("approval")
+        )
+        nested.extend(
+            (spec, f"nodes[].approval.on_reject.{spec.yaml_name}")
+            for spec in _specs("approval_reject")
+        )
+    if node_type in _AI_NODE_TYPES:
+        nested.extend(
+            (spec, f"nodes[].agents.*.{spec.yaml_name}")
+            for spec in _specs("agent")
+        )
+        nested.extend(
+            (spec, f"nodes[].hooks.{spec.yaml_name}")
+            for spec in _specs("hook_event")
+        )
+        nested.extend(
+            (spec, f"nodes[].hooks.*[].{spec.yaml_name}")
+            for spec in _specs("hook_entry")
+        )
+        nested.extend(
+            (spec, f"nodes[].hooks.*[].response.{spec.yaml_name}")
+            for spec in _specs("hook_response")
+        )
+        nested.extend(
+            (
+                spec,
+                "nodes[].hooks.*[].response."
+                f"hookSpecificOutput.{spec.yaml_name}",
+            )
+            for spec in _specs("hook_specific")
+        )
+    return tuple(nested)
+
+
+def _field_descriptor(
+    spec: WorkflowFieldSpec,
+    profile: WorkflowLanguageProfile,
+    node_type: str,
+    field_path: str,
+    *,
+    parent_spec: WorkflowFieldSpec | None = None,
+) -> dict[str, object]:
+    status = _field_status(spec, profile)
+    parent_status = (
+        _field_status(parent_spec, profile) if parent_spec is not None else None
+    )
+    editor_status = (
+        "deferred"
+        if parent_status is not None and parent_status.status != "supported"
+        else _editor_status(status.status)
+    )
+    return {
+        "id": f"{node_type}.{spec.scope}.{spec.yaml_name}",
+        "label": spec.title,
+        "description": spec.description,
+        "field_path": field_path,
+        "applicability": {
+            "profiles": [profile.value],
+            "documents": ["definition"],
+            "node_kinds": [node_type],
+        },
+        "widget": spec.widget,
+        "section": spec.section,
+        "order": _field_order(spec),
+        "status": editor_status,
+        "examples": [_thaw_editor_value(example) for example in spec.examples],
+    }
+
+
+def _node_example(node_type: str) -> dict[str, object]:
+    payloads: dict[str, object] = {
+        "command": "/review",
+        "prompt": "Summarize the upstream result.",
+        "bash": "printf 'ok\\n'",
+        "script": "print('ok')",
+        "loop": {
+            "prompt": "Try again.",
+            "until": "done",
+            "max_iterations": 3,
+        },
+        "approval": {"message": "Continue?"},
+        "cancel": "Cancellation requested.",
+    }
+    example: dict[str, object] = {"id": f"{node_type}-node", node_type: payloads[node_type]}
+    if node_type == "script":
+        example["runtime"] = "uv"
+    return example
+
+
+def node_kind_descriptors(
+    profile: WorkflowLanguageProfile,
+) -> list[dict[str, object]]:
+    """Project the authoritative inventory into editor node-kind descriptors."""
+    selected = _profile(profile)
+    descriptors: list[dict[str, object]] = []
+    for kind_order, node_type in enumerate(NODE_TYPES, start=1):
+        payload = next(
+            spec
+            for spec in _specs("node")
+            if spec.yaml_name == node_type
+        )
+        fields = [
+            _field_descriptor(
+                spec,
+                selected,
+                node_type,
+                f"nodes[].{spec.yaml_name}",
+            )
+            for spec in _specs("node")
+            if node_type in spec.applicable_node_types
+        ]
+        fields.extend(
+            _field_descriptor(
+                spec,
+                selected,
+                node_type,
+                field_path,
+                parent_spec=next(
+                    parent
+                    for parent in _specs("node")
+                    if parent.yaml_name
+                    == {
+                        "retry": "retry",
+                        "loop": "loop",
+                        "approval": "approval",
+                        "approval_reject": "approval",
+                        "agent": "agents",
+                        "hook_event": "hooks",
+                        "hook_entry": "hooks",
+                        "hook_response": "hooks",
+                        "hook_specific": "hooks",
+                    }[spec.scope]
+                ),
+            )
+            for spec, field_path in _nested_specs_for_kind(node_type)
+        )
+        fields.sort(key=lambda item: (item["order"], item["field_path"]))
+        descriptors.append({
+            "id": node_type,
+            "label": _humanize(node_type),
+            "description": f"Author a Hermes {node_type} workflow node.",
+            "field_path": f"nodes[].{node_type}",
+            "applicability": {
+                "profiles": [selected.value],
+                "documents": ["definition"],
+                "node_kinds": [node_type],
+            },
+            "widget": payload.widget,
+            "section": "General",
+            "order": kind_order,
+            "status": _editor_status(_field_status(payload, selected).status),
+            "examples": [_node_example(node_type)],
+            "fields": fields,
+        })
+    return descriptors
+
+
+def semantic_rule_descriptors(
+    profile: WorkflowLanguageProfile,
+) -> list[dict[str, object]]:
+    """Publish only semantic rules enforced by the current workflow loader."""
+    selected = _profile(profile)
+    definition_applicability = {
+        "profiles": [selected.value],
+        "documents": ["definition"],
+    }
+    return [
+        {
+            "id": "dag-topology",
+            "label": "DAG topology",
+            "description": (
+                "Node identifiers and dependencies form one directed acyclic graph."
+            ),
+            "field_paths": ["nodes[].id", "nodes[].depends_on"],
+            "applicability": definition_applicability,
+            "status": "supported",
+            "parameters": {
+                "nodes_path": "nodes",
+                "id_field": "id",
+                "dependencies_field": "depends_on",
+                "acyclic": True,
+                "unique_ids": True,
+            },
+            "examples": [{"id": "build", "depends_on": ["prepare"]}],
+        },
+        {
+            "id": "condition-output-reference",
+            "label": "Condition output reference",
+            "description": (
+                "Conditions may reference only existing upstream node outputs."
+            ),
+            "field_paths": ["nodes[].when"],
+            "applicability": definition_applicability,
+            "status": "supported",
+            "parameters": {
+                "syntax": "$ID.output(.path)*",
+                "pattern": r"\$([^\s/\\]+)\.output(?:\.[^\s=!<>|&]+)*",
+                "node_id_capture_group": 1,
+                "require_upstream": True,
+            },
+            "examples": ["$prepare.output.status == 'ready'"],
+        },
+        {
+            "id": "companion-node-reference-list",
+            "label": "Companion node references",
+            "description": (
+                "Companion outward-action declarations reference existing node IDs."
+            ),
+            "field_paths": ["sidecar.outward_action_nodes"],
+            "applicability": {
+                "profiles": [selected.value],
+                "documents": ["sidecar"],
+            },
+            "status": "supported",
+            "parameters": {
+                "reference_kind": "node_id_list",
+                "pattern": r"^(.+)$",
+                "node_id_capture_group": 1,
+                "require_upstream": False,
+            },
+            "examples": [["publish"]],
+        },
+    ]
+
+
+def contract_documentation(
+    profile: WorkflowLanguageProfile,
+) -> dict[str, object]:
+    selected = _profile(profile)
+    applicability = {
+        "profiles": [selected.value],
+        "documents": ["definition"],
+    }
+    profile_sidecar = json.dumps(
+        {"language_compatibility": selected.value},
+        separators=(",", ":"),
+    )
+    definition = json.dumps(
+        {
+            "name": "example",
+            "description": "Minimal offline authoring example",
+            "nodes": [{"id": "start", "bash": "printf 'ok\\n'"}],
+        },
+        separators=(",", ":"),
+    )
+    return {
+        "topics": [
+            {
+                "id": "workflow-definition",
+                "title": "Workflow definition",
+                "description": "Definition fields and node authoring structure.",
+                "body": (
+                    "The definition YAML is the workflow graph authority. Each node "
+                    "declares exactly one node-kind field."
+                ),
+                "field_paths": [
+                    _contract_path(spec) for spec in _specs("definition")
+                ],
+                "applicability": applicability,
+                "examples": [definition],
+            },
+            {
+                "id": "dag-and-conditions",
+                "title": "DAG and conditions",
+                "description": "Dependency and condition-reference rules.",
+                "body": (
+                    "Dependencies must exist and remain acyclic. Conditions may "
+                    "reference only upstream node outputs."
+                ),
+                "field_paths": [
+                    "nodes[].id",
+                    "nodes[].depends_on",
+                    "nodes[].when",
+                ],
+                "applicability": applicability,
+                "examples": ["$start.output.status == 'ready'"],
+            },
+            {
+                "id": "companion-policy",
+                "title": "Companion policy",
+                "description": "Optional metadata and policy companion fields.",
+                "body": (
+                    "The optional companion YAML may declare metadata and policy but "
+                    "never graph topology or trust authority."
+                ),
+                "field_paths": [
+                    _contract_path(spec) for spec in _specs("sidecar")
+                ],
+                "applicability": {
+                    "profiles": [selected.value],
+                    "documents": ["sidecar"],
+                },
+                "examples": [profile_sidecar],
+            },
+        ],
+        "examples": [
+            {
+                "id": "minimal-workflow",
+                "title": "Minimal workflow",
+                "description": "A one-node workflow with its optional companion.",
+                "definition": definition,
+                "sidecar": profile_sidecar,
+            }
+        ],
+    }
+
+
+def _contract_digest(envelope: dict[str, object]) -> str:
+    canonical = json.dumps(
+        envelope,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+    return f"sha256:{sha256(canonical).hexdigest()}"
+
+
 def workflow_authoring_contract(
     profile: WorkflowLanguageProfile,
 ) -> dict[str, object]:
     """Return one bounded, side-effect-free workflow authoring contract."""
     selected = _profile(profile)
-    return {
+    envelope: dict[str, object] = {
         "schema_version": 1,
+        "contract_reader_version": CONTRACT_READER_VERSION,
         "profile": selected.value,
         "normalizer_version": WORKFLOW_NORMALIZER_VERSION,
         "definition_schema": definition_json_schema(selected),
         "sidecar_schema": sidecar_json_schema(selected),
+        "node_kinds": node_kind_descriptors(selected),
+        "semantic_rules": semantic_rule_descriptors(selected),
         "compatibility_codes": compatibility_code_catalog(selected),
+        "documentation": contract_documentation(selected),
+        "limits": {"max_document_bytes": MAX_WORKFLOW_DOCUMENT_BYTES},
+        "x-hermes-provenance": {
+            "producer": "hermes-agent",
+            "command": "hermes workflow schema",
+            "field_authority": "plugins.workflow.language_schema.FIELD_INVENTORY",
+        },
+        "x-hermes-filenames": {
+            "definition_extensions": [".yaml", ".yml"],
+            "reserved_definition_suffix": ".hermes.yaml",
+            "companion_suffix": ".hermes.yaml",
+        },
+        "x-hermes-pairing": {
+            "definition": "<name>.yaml or <name>.yml",
+            "companion": "<definition-stem>.hermes.yaml",
+            "companion_optional": True,
+        },
     }
+    return {**envelope, "contract_digest": _contract_digest(envelope)}

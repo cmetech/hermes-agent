@@ -25,6 +25,8 @@ from plugins.workflow.store import RunStore
 from plugins.workflow.trust import build_risk_summary, compute_package_digest
 from plugins.workflow.trust import WorkflowPackageDigest, WorkflowTrustStore
 from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.language_schema import workflow_authoring_contract
+from plugins.workflow.models import WorkflowLanguageProfile
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -632,6 +634,21 @@ def test_schema_json_selects_profile_without_workflow_discovery(
     assert contract["profile"] == expected_profile
     assert not workdir.exists()
     assert not profile.exists()
+
+
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+def test_schema_json_emits_the_complete_authoring_envelope_unchanged(
+    profile, capsys
+):
+    args = _parser().parse_args(["schema", "--profile", profile.value, "--json"])
+
+    assert args.func(args) == 0
+    emitted = json.loads(capsys.readouterr().out)
+
+    assert emitted == workflow_authoring_contract(profile)
+    assert emitted["contract_digest"].startswith("sha256:")
+    assert emitted["node_kinds"]
+    assert emitted["semantic_rules"]
 
 
 def test_schema_json_is_compact_and_byte_deterministic(capsys):

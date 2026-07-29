@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, replace
+from hashlib import sha256
 import json
 from pathlib import Path
 
@@ -36,7 +38,8 @@ from plugins.workflow.compat import assess_compatibility
 def _node_property(schema: dict[str, object], node_type: str, field: str) -> dict:
     variants = schema["properties"]["nodes"]["items"]["oneOf"]
     variant = next(item for item in variants if node_type in item["required"])
-    return variant["properties"][field]
+    assert field in variant["properties"]
+    return schema["properties"]["nodes"]["items"]["properties"][field]
 
 
 def test_archon_authoring_contract_is_bounded_and_versioned():
@@ -68,6 +71,187 @@ def test_authoring_contract_generation_is_byte_deterministic(profile):
     assert first == second
 
 
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+def test_authoring_contract_publishes_a_self_verifying_editor_envelope(profile):
+    contract = workflow_authoring_contract(profile)
+    digest_payload = {key: value for key, value in contract.items() if key != "contract_digest"}
+    expected_digest = sha256(
+        json.dumps(
+            digest_payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+    assert contract["contract_reader_version"] == 1
+    assert contract["contract_digest"] == f"sha256:{expected_digest}"
+    assert contract["limits"] == {"max_document_bytes": 2 * 1024 * 1024}
+    assert contract["x-hermes-provenance"]["field_authority"] == (
+        "plugins.workflow.language_schema.FIELD_INVENTORY"
+    )
+    assert contract["x-hermes-filenames"]["companion_suffix"] == (
+        ".hermes.yaml"
+    )
+
+
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+def test_node_kind_descriptors_cover_each_applicable_node_field_once(profile):
+    contract = workflow_authoring_contract(profile)
+    descriptors = {item["id"]: item for item in contract["node_kinds"]}
+
+    assert set(descriptors) == set(NODE_TYPES)
+    for node_type, descriptor in descriptors.items():
+        assert descriptor["field_path"] == f"nodes[].{node_type}"
+        assert descriptor["status"] == "supported"
+        fields = descriptor["fields"]
+        paths = [field["field_path"] for field in fields]
+        orders = [field["order"] for field in fields]
+        expected_direct_paths = {
+            f"nodes[].{spec.yaml_name}"
+            for spec in FIELD_INVENTORY
+            if spec.scope == "node" and node_type in spec.applicable_node_types
+        }
+
+        assert expected_direct_paths <= set(paths)
+        assert len(paths) == len(set(paths))
+        assert len(orders) == len(set(orders))
+        assert all(field["description"] for field in fields)
+        assert all(field["applicability"]["node_kinds"] == [node_type] for field in fields)
+
+    assert "nodes[].retry.max_attempts" in {
+        field["field_path"] for field in descriptors["command"]["fields"]
+    }
+    assert "nodes[].retry.max_attempts" not in {
+        field["field_path"] for field in descriptors["loop"]["fields"]
+    }
+    assert "nodes[].loop.max_iterations" in {
+        field["field_path"] for field in descriptors["loop"]["fields"]
+    }
+    assert "nodes[].approval.on_reject.prompt" in {
+        field["field_path"] for field in descriptors["approval"]["fields"]
+    }
+    assert "nodes[].agents.*.prompt" in {
+        field["field_path"] for field in descriptors["prompt"]["fields"]
+    }
+
+
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+def test_authoring_contract_publishes_live_dag_and_condition_reference_rules(profile):
+    rules = {
+        item["id"]: item
+        for item in workflow_authoring_contract(profile)["semantic_rules"]
+    }
+    topology = rules["dag-topology"]
+    references = rules["condition-output-reference"]
+
+    assert topology["status"] == "supported"
+    assert topology["parameters"] == {
+        "nodes_path": "nodes",
+        "id_field": "id",
+        "dependencies_field": "depends_on",
+        "acyclic": True,
+        "unique_ids": True,
+    }
+    assert references["status"] == "supported"
+    assert references["field_paths"] == ["nodes[].when"]
+    assert references["parameters"]["syntax"] == "$ID.output(.path)*"
+    assert references["parameters"]["node_id_capture_group"] == 1
+    assert references["parameters"]["require_upstream"] is True
+
+
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+def test_editor_descriptors_and_schema_annotations_share_inventory_metadata(profile):
+    contract = workflow_authoring_contract(profile)
+    node_descriptors = {item["id"]: item for item in contract["node_kinds"]}
+    schema = contract["definition_schema"]
+
+    for node_type, descriptor in node_descriptors.items():
+        direct = {
+            field["field_path"].removeprefix("nodes[]."): field
+            for field in descriptor["fields"]
+            if field["field_path"].count(".") == 1
+        }
+        variant = next(
+            item
+            for item in schema["properties"]["nodes"]["items"]["oneOf"]
+            if node_type in item["required"]
+        )
+        for field_name, field in direct.items():
+            assert field_name in variant["properties"]
+            annotation = schema["properties"]["nodes"]["items"]["properties"][field_name]
+            assert annotation["title"] == field["label"]
+            assert annotation["description"] == field["description"]
+            assert annotation["x-hermes-widget"] == field["widget"]
+            assert annotation["x-hermes-section"] == field["section"]
+
+
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+def test_editor_compatibility_and_documentation_are_complete(profile):
+    contract = workflow_authoring_contract(profile)
+
+    assert contract["documentation"]["topics"]
+    assert contract["documentation"]["examples"]
+    assert all(
+        descriptor["status"] in {"supported", "deferred", "deprecated"}
+        and descriptor["description"]
+        for descriptor in contract["compatibility_codes"].values()
+    )
+    assert all(
+        field["description"] and field["examples"]
+        for node_kind in contract["node_kinds"]
+        for field in node_kind["fields"]
+    )
+
+    prompt = next(item for item in contract["node_kinds"] if item["id"] == "prompt")
+    output_format = next(
+        field
+        for field in prompt["fields"]
+        if field["field_path"] == "nodes[].output_format"
+    )
+    assert output_format["widget"] == "json-schema"
+
+
+def test_nested_descriptors_never_upgrade_a_deferred_parent_field():
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    command = next(item for item in contract["node_kinds"] if item["id"] == "command")
+    retry_fields = [
+        field
+        for field in command["fields"]
+        if field["field_path"].startswith("nodes[].retry.")
+    ]
+
+    assert retry_fields
+    assert {field["status"] for field in retry_fields} == {"deferred"}
+
+
+def test_schema_publishes_loader_defaults_and_identifier_pattern():
+    schema = definition_json_schema(WorkflowLanguageProfile.HERMES_LEGACY)
+    node = schema["properties"]["nodes"]["items"]["properties"]
+
+    assert node["depends_on"]["default"] == []
+    assert node["trigger_rule"]["default"] == "all_success"
+    assert node["id"]["pattern"] == r"^[^\s/\\]+$"
+
+
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+def test_every_published_schema_example_validates_against_its_field(profile):
+    contract = workflow_authoring_contract(profile)
+
+    def validate_examples(value):
+        if isinstance(value, dict):
+            for example in value.get("examples", []):
+                Draft202012Validator(value).validate(example)
+            for child in value.values():
+                validate_examples(child)
+        elif isinstance(value, list):
+            for child in value:
+                validate_examples(child)
+
+    validate_examples(contract["definition_schema"])
+    validate_examples(contract["sidecar_schema"])
+
+
 def test_parser_field_sets_come_from_authoring_inventory():
     assert TOP_LEVEL_FIELDS == definition_field_names()
     assert COMMON_NODE_FIELDS == common_node_field_names()
@@ -78,6 +262,13 @@ def test_field_inventory_is_immutable():
     assert isinstance(FIELD_INVENTORY, tuple)
     with pytest.raises(FrozenInstanceError):
         FIELD_INVENTORY[0].yaml_name = "changed"
+    structured_example = next(
+        spec.examples[0]
+        for spec in FIELD_INVENTORY
+        if isinstance(spec.examples[0], Mapping)
+    )
+    with pytest.raises(TypeError):
+        structured_example["changed"] = True
 
 
 def test_node_payload_inventory_declares_truthful_json_types():
@@ -790,7 +981,11 @@ def test_language_schema_dependency_direction_stays_neutral():
 
     assert imported_modules <= {
         "__future__",
+        "collections.abc",
         "dataclasses",
+        "hashlib",
+        "json",
+        "types",
         "typing",
         "plugins.workflow.language",
         "plugins.workflow.models",
