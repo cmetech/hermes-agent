@@ -3606,6 +3606,12 @@ upstream_changes:
   owned_invariants:
   - JSON truthiness schema helper
   - nested parser field inventory accessors
+  - JavaScript-compatible canonical contract JSON and digest
+  - editor status mapping preserves nonblocking runtime advisories
+  - generated node-kind and complete field descriptor coverage
+  - generated DAG, condition grammar, and node-reference semantic rules
+  - generated field documentation and schema-valid examples
+  - contract reader, document-size, provenance, and file-pairing metadata
   - workflow schema CLI command
   - exact top-level workflow schema action resolution
   - parsed normal dispatch target precedence
@@ -3636,7 +3642,19 @@ upstream_changes:
     event-bound hook output (including loader-valid explicit null), retry,
     approval, and inline-agent shapes; keep graph references, resource paths, provider
     capabilities, and runtime compatibility with the loader rather than
-    encoding false JSON constraints. The bounded schema command must bypass
+    encoding false JSON constraints. Publish the complete editor envelope from
+    that same inventory: reader version, recursively sorted canonical digest,
+    node-kind and field descriptors, DAG and condition/reference semantic rules,
+    truthful compatibility advisories, schema-valid examples and documentation,
+    the loader-owned 2 MiB document limit, provenance, and canonical
+    definition/companion filename pairing. Canonical number spelling must match
+    JavaScript JSON.stringify semantics across integral floats, exponent/fixed
+    thresholds, and negative zero while rejecting non-finite or unsafe values.
+    Map runtime blocking findings to deferred editor fields, but keep executable
+    legacy warning fields supported with their raw advisory status, severity,
+    and migration retained in the compatibility catalog. Keep the full
+    condition-expression pattern under expression_pattern so consumers do not
+    mistake it for the separate node-reference capture pattern. The bounded schema command must bypass
     logging, brand/capability startup, workflow/plugin discovery, and all
     filesystem mutation, model, MCP, or network calls while emitting
     deterministic compact JSON. Compose the bounded early parser from Hermes'

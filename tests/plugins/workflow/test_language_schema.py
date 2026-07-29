@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError, replace
 from hashlib import sha256
 import json
 from pathlib import Path
+import re
 
 from jsonschema import Draft202012Validator
 import pytest
@@ -76,12 +77,7 @@ def test_authoring_contract_publishes_a_self_verifying_editor_envelope(profile):
     contract = workflow_authoring_contract(profile)
     digest_payload = {key: value for key, value in contract.items() if key != "contract_digest"}
     expected_digest = sha256(
-        json.dumps(
-            digest_payload,
-            sort_keys=True,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode()
+        language_schema.canonical_contract_json(digest_payload).encode()
     ).hexdigest()
 
     assert contract["contract_reader_version"] == 1
@@ -93,6 +89,40 @@ def test_authoring_contract_publishes_a_self_verifying_editor_envelope(profile):
     assert contract["x-hermes-filenames"]["companion_suffix"] == (
         ".hermes.yaml"
     )
+
+
+def test_contract_canonical_json_matches_javascript_number_and_sorting_rules():
+    payload = {
+        "z": [1.0, {"negative_zero": -0.0, "small": 1e-7, "threshold": 1e-6}],
+        "large_fixed": 1e20,
+        "large_exponent": 1e21,
+        "a": {"z": True, "a": None},
+    }
+
+    assert language_schema.canonical_contract_json(payload) == (
+        '{"a":{"a":null,"z":true},"large_exponent":1e+21,'
+        '"large_fixed":100000000000000000000,'
+        '"z":[1,{"negative_zero":0,"small":1e-7,"threshold":0.000001}]}'
+    )
+
+
+def test_contract_canonical_json_matches_javascript_unicode_rules():
+    payload = {
+        "\ue000": "private-use",
+        "😀": "snowman ☃",
+        "é": 'line one\nline "two"',
+    }
+
+    assert language_schema.canonical_contract_json(payload) == (
+        '{"é":"line one\\nline \\"two\\"","😀":"snowman ☃",'
+        '"\ue000":"private-use"}'
+    )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_contract_canonical_json_rejects_non_finite_numbers(value):
+    with pytest.raises(ValueError, match="finite"):
+        language_schema.canonical_contract_json({"value": value})
 
 
 @pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
@@ -158,6 +188,52 @@ def test_authoring_contract_publishes_live_dag_and_condition_reference_rules(pro
     assert references["parameters"]["syntax"] == "$ID.output(.path)*"
     assert references["parameters"]["node_id_capture_group"] == 1
     assert references["parameters"]["require_upstream"] is True
+    conditions = rules["condition-expression"]
+    assert conditions["status"] == "supported"
+    assert conditions["field_paths"] == ["nodes[].when"]
+    assert "pattern" not in conditions["parameters"]
+    assert "syntax" not in conditions["parameters"]
+    assert isinstance(conditions["parameters"]["expression_pattern"], str)
+
+
+@pytest.mark.parametrize(
+    ("condition", "expected"),
+    [
+        (
+            "$prepare.output.status == 'ready' && $inspect.output.count >= 2",
+            True,
+        ),
+        ("$prepare.output.status != \"blocked\"", True),
+        ("$prepare.output.status ==", False),
+        ("prepare.output.status == 'ready'", False),
+        ("$prepare.output.status == 'ready' &&", False),
+    ],
+)
+def test_condition_expression_descriptor_matches_the_real_loader(condition, expected):
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.HERMES_LEGACY)
+    rule = next(
+        item for item in contract["semantic_rules"] if item["id"] == "condition-expression"
+    )
+    pattern = re.compile(rule["parameters"]["expression_pattern"])
+    document = {
+        "name": "condition-contract",
+        "description": "contract and loader agree",
+        "nodes": [
+            {"id": "prepare", "bash": "true"},
+            {"id": "inspect", "bash": "true"},
+            {
+                "id": "target",
+                "bash": "true",
+                "depends_on": ["prepare", "inspect"],
+                "when": condition,
+            },
+        ],
+    }
+
+    assert (pattern.fullmatch(condition) is not None) is expected
+    schema_accepts, loader_accepts = _structural_outcomes(document)
+    assert schema_accepts is True
+    assert loader_accepts is expected
 
 
 @pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
@@ -223,6 +299,33 @@ def test_nested_descriptors_never_upgrade_a_deferred_parent_field():
 
     assert retry_fields
     assert {field["status"] for field in retry_fields} == {"deferred"}
+
+
+def test_editor_status_distinguishes_legacy_advisories_from_archon_blockers():
+    legacy = workflow_authoring_contract(WorkflowLanguageProfile.HERMES_LEGACY)
+    archon = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+
+    def command_field(contract, field_path):
+        command = next(item for item in contract["node_kinds"] if item["id"] == "command")
+        return next(field for field in command["fields"] if field["field_path"] == field_path)
+
+    assert command_field(legacy, "nodes[].idle_timeout")["status"] == "supported"
+    assert command_field(archon, "nodes[].idle_timeout")["status"] == "deferred"
+
+    legacy_code = legacy["compatibility_codes"]["legacy_idle_timeout_seconds"]
+    archon_code = archon["compatibility_codes"][
+        "archon_idle_timeout_semantics_unavailable"
+    ]
+    assert (legacy_code["status"], legacy_code["runtime_status"], legacy_code["blocking"]) == (
+        "supported",
+        "warning",
+        False,
+    )
+    assert (archon_code["status"], archon_code["runtime_status"], archon_code["blocking"]) == (
+        "deferred",
+        "blocking",
+        True,
+    )
 
 
 def test_schema_publishes_loader_defaults_and_identifier_pattern():

@@ -23,6 +23,8 @@ from plugins.workflow.language import (
 from plugins.workflow.language_schema import (
     MAX_WORKFLOW_DOCUMENT_BYTES,
     NODE_TYPES,
+    WHEN_EXPRESSION_PATTERN,
+    WHEN_REFERENCE_PATTERN,
     agent_field_names,
     approval_field_names,
     approval_reject_field_names,
@@ -70,16 +72,8 @@ AGENT_FIELDS = agent_field_names()
 SIDECAR_FIELDS = sidecar_field_names()
 _CONTROL_OR_ANSI = re.compile(r"[\x00-\x1f\x7f-\x9f]|\x1b\[")
 _SAFE_NAME = re.compile(r"^[^\s/\\]+$")
-_WHEN_REFERENCE = re.compile(r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*", re.UNICODE)
-_WHEN_CLAUSE = (
-    r"\$[\w.:-]+\.output(?:\.[\w.-]+)*\s*"
-    r"(?:==|!=|<=|>=|<|>)\s*"
-    r"(?:'[^']*'|\"[^\"]*\"|-?(?:\d+(?:\.\d*)?|\.\d+))"
-)
-_WHEN_EXPRESSION = re.compile(
-    rf"^\s*{_WHEN_CLAUSE}(?:\s*(?:&&|\|\|)\s*{_WHEN_CLAUSE})*\s*$",
-    re.UNICODE,
-)
+_WHEN_REFERENCE = re.compile(WHEN_REFERENCE_PATTERN, re.UNICODE)
+_WHEN_EXPRESSION = re.compile(WHEN_EXPRESSION_PATTERN, re.UNICODE)
 _INLINE_SCRIPT_METACHAR = re.compile(r"[\s;(){}&|<>$`\"']")
 
 

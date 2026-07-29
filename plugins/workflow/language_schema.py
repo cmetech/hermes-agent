@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 import json
+import math
 from types import MappingProxyType
 from typing import Any
 
@@ -21,6 +22,16 @@ _PROFILES = tuple(WorkflowLanguageProfile)
 MAX_WORKFLOW_DOCUMENT_BYTES = 2 * 1024 * 1024
 CONTRACT_READER_VERSION = 1
 _NO_DEFAULT = object()
+WHEN_REFERENCE_PATTERN = r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*"
+WHEN_CLAUSE_PATTERN = (
+    r"\$[\w.:-]+\.output(?:\.[\w.-]+)*\s*"
+    r"(?:==|!=|<=|>=|<|>)\s*"
+    r"(?:'[^']*'|\"[^\"]*\"|-?(?:\d+(?:\.\d*)?|\.\d+))"
+)
+WHEN_EXPRESSION_PATTERN = (
+    rf"^\s*{WHEN_CLAUSE_PATTERN}"
+    rf"(?:\s*(?:&&|\|\|)\s*{WHEN_CLAUSE_PATTERN})*\s*$"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -914,7 +925,7 @@ def _field_status(
 
 
 def _editor_status(status: str) -> str:
-    return "supported" if status == "supported" else "deferred"
+    return "deferred" if status == "blocking" else "supported"
 
 
 def _field_order(spec: WorkflowFieldSpec) -> int:
@@ -1517,6 +1528,23 @@ def semantic_rule_descriptors(
             "examples": [{"id": "build", "depends_on": ["prepare"]}],
         },
         {
+            "id": "condition-expression",
+            "label": "Condition expression",
+            "description": (
+                "Conditions are comparisons joined by optional AND or OR operators."
+            ),
+            "field_paths": ["nodes[].when"],
+            "applicability": definition_applicability,
+            "status": "supported",
+            "parameters": {
+                "expression_pattern": WHEN_EXPRESSION_PATTERN,
+            },
+            "examples": [
+                "$prepare.output.status == 'ready' && "
+                "$inspect.output.count >= 2"
+            ],
+        },
+        {
             "id": "condition-output-reference",
             "label": "Condition output reference",
             "description": (
@@ -1639,13 +1667,74 @@ def contract_documentation(
 
 
 def _contract_digest(envelope: dict[str, object]) -> str:
-    canonical = json.dumps(
-        envelope,
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode()
+    canonical = canonical_contract_json(envelope).encode()
     return f"sha256:{sha256(canonical).hexdigest()}"
+
+
+def _canonical_float(value: float) -> str:
+    if not math.isfinite(value):
+        raise ValueError("canonical contract JSON requires finite numbers")
+    if value == 0:
+        return "0"
+
+    text = repr(value).lower()
+    if "e" not in text:
+        return text.removesuffix(".0")
+
+    mantissa, raw_exponent = text.split("e", 1)
+    exponent = int(raw_exponent)
+    sign = ""
+    if mantissa.startswith("-"):
+        sign = "-"
+        mantissa = mantissa[1:]
+    whole, separator, fraction = mantissa.partition(".")
+    digits = whole + fraction
+    decimal_position = len(whole) + exponent
+    magnitude = abs(value)
+
+    if 1e-6 <= magnitude < 1e21:
+        if decimal_position <= 0:
+            return f"{sign}0.{('0' * -decimal_position)}{digits}"
+        if decimal_position >= len(digits):
+            return f"{sign}{digits}{'0' * (decimal_position - len(digits))}"
+        return f"{sign}{digits[:decimal_position]}.{digits[decimal_position:]}"
+
+    normalized_mantissa = whole
+    if separator and fraction.rstrip("0"):
+        normalized_mantissa += f".{fraction.rstrip('0')}"
+    exponent_text = f"+{exponent}" if exponent >= 0 else str(exponent)
+    return f"{sign}{normalized_mantissa}e{exponent_text}"
+
+
+def canonical_contract_json(value: object) -> str:
+    """Serialize JSON with recursive key sorting and JavaScript number spelling."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, int):
+        if abs(value) > 9_007_199_254_740_991:
+            raise ValueError("canonical contract JSON requires safe integers")
+        return str(value)
+    if isinstance(value, float):
+        return _canonical_float(value)
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise TypeError("canonical contract JSON object keys must be strings")
+        return "{" + ",".join(
+            f"{json.dumps(key, ensure_ascii=False)}:{canonical_contract_json(value[key])}"
+            for key in sorted(
+                value,
+                key=lambda item: item.encode("utf-16-be", "surrogatepass"),
+            )
+        ) + "}"
+    if isinstance(value, list | tuple):
+        return "[" + ",".join(canonical_contract_json(item) for item in value) + "]"
+    raise TypeError(
+        f"canonical contract JSON does not support {type(value).__name__} values"
+    )
 
 
 def workflow_authoring_contract(
