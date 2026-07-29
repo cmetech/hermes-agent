@@ -25,6 +25,9 @@
 - Publish overlap reports atomically so a failed parser run cannot truncate or replace the last usable report.
 - The base and brand merge-gate paths must provision and validate root `node_modules` before invoking the checker; Desktop dependencies remain required only where Desktop tests run.
 - Preserve the existing upstream-rehearsal runner, evidence schema, sealed dependency-view behavior, and all unrelated language handlers.
+- Treat the checker, merge gate, and invariant runner solely as developer, CI, upstream-merge, and release verification tooling. They do not validate or execute user workflow YAML, and executable ledger entries are trusted repository-controlled tests.
+- On Windows preserve kernel-enforced Job Object containment. On POSIX preserve the owned process group plus descendants observed and PID/create-time verified before reparenting; deliberately daemonizing children that create a new session and reparent before observation are outside the portable Darwin contract and must not be ledgered.
+- Treat only a successful exact zero-entry Git tree lookup as path absence; Git tree or present-object failures must remain terminal.
 - Final review covers `5f5596d21..HEAD`; Task 10 remains blocked until a fresh Task 9 review is clean.
 
 ## File Map
@@ -378,7 +381,7 @@ git commit -m "feat(workflow): add bounded symbol parser helper"
 
 - [ ] **Step 1: Write failing committed-byte and batching tests**
 
-Add `test_parser_blob_loader_reads_resolved_commit_not_dirty_worktree`, `test_parser_blob_loader_reads_requested_historical_revision_not_head`, `test_parser_resolver_batches_paths_and_deduplicates_identical_requests`, and `test_parser_batches_sequentially_at_sixteen_mibibytes`. These are direct transport-boundary tests: Task 3, not this task, owns wiring manifest validation and overlap classification to the resolver. Monkeypatch `customization_checker._run_parser_batch` with this shape rather than adding a test-only production switch:
+Add `test_parser_blob_loader_reads_resolved_commit_not_dirty_worktree`, `test_parser_blob_loader_reads_requested_historical_revision_not_head`, `test_exact_missing_tree_entry_is_absent`, terminal Git tree/object failure cases, `test_parser_resolver_batches_paths_and_deduplicates_identical_requests`, and `test_parser_batches_sequentially_at_sixteen_mibibytes`. Prove separately that exact zero-entry `ls-tree` output means absent and that tree lookup, non-blob, malformed type/size, unreadable object, and length-mismatch failures propagate instead of becoming empty content. These are direct transport-boundary tests: Task 3, not this task, owns wiring manifest validation and overlap classification to the resolver. Monkeypatch `customization_checker._run_parser_batch` with this shape rather than adding a test-only production switch:
 
 ```python
 calls: list[list[customization_checker._ParserRequest]] = []
@@ -806,6 +809,8 @@ Document:
 7. fail-closed errors with no heuristic fallback;
 8. atomic report replacement only after complete successful classification.
 9. the separate 64 MiB/60-second bound for character-token Git diff output and execution.
+10. exact zero-entry Git tree lookup as the only absent-path result, with Git/object failures terminal.
+11. the trusted verification-only runner scope and its Windows/POSIX containment boundaries, including the unsupported pre-observation POSIX daemon/session escape.
 
 - [ ] **Step 4: Run parser, checker, and live-ledger validation**
 
@@ -1013,7 +1018,7 @@ TASK9_ACCEPTANCE_DIR="$(mktemp -d)"
 .venv/bin/python -c 'import json,sys; rows=json.load(open(sys.argv[1], encoding="utf-8")); executed=[r for r in rows if r["kind"] == "executed"]; assert rows and executed; assert all(r["result"] == "passed" and not r["flaky_on_first_attempt"] and len(r["attempts"]) == 1 and not r["attempts"][0]["output_truncated"] for r in executed); print(len(rows), len(executed))' "$TASK9_ACCEPTANCE_DIR/ledger-report.json"
 ```
 
-Expected: runner exits 0; the report is valid, nonempty, has no failed/flaky/truncated record, and every executable record has exactly one successful attempt. After exit, `git worktree list --porcelain`, `ps -axo pid=,command=`, and the system temporary directory show no live-ledger detached worktree, `workflow-ledger-*` directory, parser helper, invariant runner, supervisor, watchdog, or test descendant left by this run.
+Expected: runner exits 0; the report is valid, nonempty, has no failed/flaky/truncated record, and every executable record has exactly one successful attempt. After exit, `git worktree list --porcelain`, `ps -axo pid=,command=`, and the system temporary directory show no live-ledger detached worktree, `workflow-ledger-*` directory, parser helper, invariant runner, supervisor, watchdog, or in-contract trusted-test descendant left by this run. This evidence does not claim portable Darwin containment of a deliberately daemonizing child that creates a new session and reparents before observation; such a program is forbidden from the trusted ledger.
 
 - [ ] **Step 10: Verify final branch scope and review boundary**
 

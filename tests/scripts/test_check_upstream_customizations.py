@@ -317,6 +317,123 @@ def test_blob_loader_preserves_oversized_non_parser_formats(
     assert captures == 1
 
 
+def test_blob_bytes_or_empty_returns_empty_for_exact_missing_tree_entry(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    revision = _git(repo, "rev-parse", "HEAD")
+
+    assert customization_checker._blob_bytes_or_empty(
+        repo, revision, "missing.ts"
+    ) == (f"absent:{revision}:missing.ts", b"")
+
+
+def test_blob_text_does_not_turn_git_tree_failure_into_empty_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def failing_git(argv, **kwargs):
+        command = tuple(argv)
+        calls.append(command)
+        if command[1:3] in {
+            ("rev-parse", "--verify"),
+            ("cat-file", "-e"),
+            ("ls-tree", "-z"),
+        }:
+            return subprocess.CompletedProcess(argv, 128, stdout=b"", stderr=b"broken")
+        pytest.fail(f"unexpected Git invocation: {command}")
+
+    monkeypatch.setattr(customization_checker.subprocess, "run", failing_git)
+
+    with pytest.raises(ValueError, match="cannot inspect"):
+        customization_checker._blob_text(tmp_path, "resolved", "owned.ts")
+
+    assert not any(command[1:3] == ("cat-file", "blob") for command in calls)
+
+
+def test_blob_bytes_or_empty_does_not_turn_git_tree_failure_into_absence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def failing_git(argv, **kwargs):
+        command = tuple(argv)
+        calls.append(command)
+        if command[1:3] in {("cat-file", "-e"), ("ls-tree", "-z")}:
+            return subprocess.CompletedProcess(argv, 128, stdout=b"", stderr=b"broken")
+        pytest.fail(f"unexpected Git invocation: {command}")
+
+    monkeypatch.setattr(customization_checker.subprocess, "run", failing_git)
+
+    with pytest.raises(ValueError, match="cannot inspect"):
+        customization_checker._blob_bytes_or_empty(
+            tmp_path, "resolved", "owned.ts"
+        )
+
+    assert not any(command[1:3] == ("cat-file", "blob") for command in calls)
+
+
+@pytest.mark.parametrize(
+    ("scenario", "tree_type", "object_type", "object_size", "payload"),
+    [
+        ("non-blob", b"tree", b"tree\n", b"3\n", b"abc"),
+        ("malformed-type", b"blob", b"blob extra\n", b"3\n", b"abc"),
+        ("unreadable-object", b"blob", None, b"3\n", b"abc"),
+        ("malformed-size", b"blob", b"blob\n", b"not-a-size\n", b"abc"),
+        ("length-mismatch", b"blob", b"blob\n", b"4\n", b"abc"),
+    ],
+)
+def test_blob_bytes_or_empty_fails_closed_for_present_invalid_objects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    tree_type: bytes,
+    object_type: bytes | None,
+    object_size: bytes,
+    payload: bytes,
+) -> None:
+    oid = b"c" * 40
+    calls: list[tuple[str, ...]] = []
+
+    def controlled_git(argv, **kwargs):
+        command = tuple(argv)
+        calls.append(command)
+        if command[1:3] == ("cat-file", "-e"):
+            return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+        if command[1:3] == ("ls-tree", "-z"):
+            entry = b"100644 " + tree_type + b" " + oid + b"\towned.ts\0"
+            return subprocess.CompletedProcess(argv, 0, stdout=entry, stderr=b"")
+        if command[1:3] == ("rev-parse", "--verify"):
+            return subprocess.CompletedProcess(argv, 0, stdout=oid + b"\n", stderr=b"")
+        if command[1:3] == ("cat-file", "-t"):
+            return subprocess.CompletedProcess(
+                argv,
+                128 if object_type is None else 0,
+                stdout=object_type or b"",
+                stderr=b"missing" if object_type is None else b"",
+            )
+        if command[1:3] == ("cat-file", "-s"):
+            return subprocess.CompletedProcess(argv, 0, stdout=object_size, stderr=b"")
+        if command[1:3] == ("cat-file", "blob"):
+            return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr=b"")
+        pytest.fail(f"unexpected Git invocation: {command}")
+
+    monkeypatch.setattr(customization_checker.subprocess, "run", controlled_git)
+
+    with pytest.raises(ValueError):
+        customization_checker._blob_bytes_or_empty(
+            tmp_path, "resolved", "owned.ts"
+        )
+
+    captured = [
+        command for command in calls if command[1:3] == ("cat-file", "blob")
+    ]
+    assert bool(captured) is (scenario == "length-mismatch")
+
+
 def test_parser_resolver_batches_paths_and_deduplicates_identical_requests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

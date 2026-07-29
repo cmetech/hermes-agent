@@ -20,16 +20,19 @@ HTML, JS/TS literals, and Markdown literals, code, and prose remain searchable.
 Parser requests use only exact committed Git revision blob bytes, never dirty
 worktree bytes, and encode those bytes as canonical base64. Returned symbol
 spans and Git-changed ranges are half-open UTF-8 byte offsets, so overlap
-checks are byte-exact. The root `package.json` and lockfile must provide the exactly
-attested TypeScript 6.0.3, unified 11.0.5, remark-parse 11.0.0, and micromark
-4.0.2 dependencies. Each parser request is at most 4 MiB, each sequential batch
-is at most 16 MiB, parser output is at most 16 MiB, and parser execution is
-limited to 60 seconds. Parser transport, validation, and parse errors fail
-closed with no heuristic or lexical fallback. A report replaces prior evidence
-atomically only after complete successful parser classification. The separate
-character-token Git diff is likewise fail-closed and independently limited to
-64 MiB of output and 60 seconds of execution. Behavioral prose belongs in the
-optional bounded `owned_invariants` list. New or migrated entries may select
+checks are byte-exact. A repository path is absent at a revision only when an
+exact Git tree lookup succeeds with zero entries; tree lookup and object-read
+failures are terminal rather than silently treated as empty content. The root
+`package.json` and lockfile must provide the exactly attested TypeScript 6.0.3,
+unified 11.0.5, remark-parse 11.0.0, and micromark 4.0.2 dependencies. Each
+parser request is at most 4 MiB, each sequential batch is at most 16 MiB,
+parser output is at most 16 MiB, and parser execution is limited to 60 seconds.
+Parser transport, validation, and parse errors fail closed with no heuristic or
+lexical fallback. A report replaces prior evidence atomically only after
+complete successful parser classification. The separate character-token Git
+diff is likewise fail-closed and independently limited to 64 MiB of output and
+60 seconds of execution. Behavioral prose belongs in the optional bounded
+`owned_invariants` list. New or migrated entries may select
 `overlap_policy: owned_symbol` (the compatibility default) or
 `overlap_policy: any_owned_file`. The latter makes every change to a declared
 file decision-required even when no exact symbol span changed, and is required
@@ -65,21 +68,32 @@ from `B` but not `A`, even when the tips diverge. Triple-dot ranges compare the
 merge base of `A` and `B` to `B`. Symbol overlap always reads the resolved left
 and right commit blobs, never the current checkout.
 
+The checker, merge gate, and invariant runner are developer, CI,
+upstream-merge, and release verification tools. They are not loaded by the
+normal Hermes agent runtime and do not validate or execute user workflow YAML.
+Executable ledger entries are trusted, repository-controlled tests; programs
+that deliberately daemonize or escape containment are not valid ledger tests.
+
 Executable ledger invariants run in fresh process groups with at most two files
 in flight per runtime. Each attempt has a bounded timeout and bounded stdout and
 stderr capture. Only an ordinary test failure is retried once; timeouts,
 signals, infrastructure failures, and cancellation are terminal. Evidence
 records the exact attempt sequence, output truncation, signal number when
-applicable, and whether a failed first attempt passed on retry. Teardown tracks
-the original process-group member identities and rechecks them before every
-POSIX group signal. A small per-attempt supervisor remains the unreaped group
-leader until cleanup, so a numeric process group cannot be reused and a
-grandchild from an already-exited intermediate remains contained. Windows
-attempts are assigned to a kill-on-close Job Object before a blocked bootstrap
-may launch the test command; cleanup terminates that kernel-owned job tree.
-Signal-resistant descendants therefore cannot escape on success, failure,
-retry, timeout, signal, or cancellation, and reused unrelated identities are
-never targeted.
+applicable, and whether a failed first attempt passed on retry. On POSIX,
+teardown owns and signals the original process group, observes descendants
+while their ancestry is visible, records their PID/create-time identities, and
+revalidates those identities before signaling descendants that later leave the
+group. A small per-attempt supervisor remains the unreaped group leader until
+cleanup, so the original numeric process group cannot be reused and a
+grandchild that stays in that group after an intermediate exits remains
+contained. Cleanup uncertainty detected inside this boundary is a terminal
+infrastructure error. Portable POSIX, including Darwin, cannot guarantee
+cleanup of a deliberately daemonizing child that creates a new session and
+reparents before it can be observed; that hostile pattern is outside the
+trusted ledger contract and must not be ledgered. Windows attempts are assigned
+to a kill-on-close Job Object before a blocked bootstrap may launch the test
+command, and cleanup terminates that kernel-owned job tree. Reused unrelated
+process identities are never intentionally targeted.
 
 `--base-ref` execution also seals the Node dependency view before any invariant
 starts. The live checkout may supply root and Desktop `node_modules` only as

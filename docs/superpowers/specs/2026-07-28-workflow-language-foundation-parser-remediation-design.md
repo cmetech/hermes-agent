@@ -24,7 +24,10 @@ The Task 9 checker compares an upstream change with that ledger. If upstream
 touches a protected symbol or a file governed by `any_owned_file`, the merge
 must receive an explicit preserve, adapt, or remove-as-upstream-equivalent
 decision. This checker is release infrastructure; it is not on the runtime path
-for a user's workflow.
+for a user's workflow. The checker, merge gate, and invariant runner are used
+only for developer, CI, upstream-merge, and release verification. They do not
+validate or execute user workflow YAML, and executable ledger entries are
+trusted repository-controlled tests.
 
 Task 9 successfully hardened Git revision authority, evidence schema truth,
 bounded invariant execution, retries, process containment, detached committed
@@ -52,6 +55,10 @@ It receives source bytes and requested symbols from Python and returns verified
 source spans. It never discovers files, reads checkout source, resolves Git
 revisions, interprets the ledger, or makes merge-policy decisions.
 
+An exact Git tree lookup that succeeds with zero entries is the only path-
+absence result. Git tree or object failures remain terminal; they are never
+converted to empty parser input.
+
 There is no fallback to the handwritten JS/TS or Markdown scanners. If the
 pinned parser boundary is unavailable or cannot prove a result, the checker
 fails closed.
@@ -69,6 +76,8 @@ fails closed.
 - Batch and deduplicate parser work without introducing persistent authority.
 - Produce bounded, sanitized, fail-closed diagnostics.
 - Retain the verified Task 9 runner, evidence, containment, and cleanup work.
+- Keep the runner scoped to trusted repository verification tests and describe
+  its platform containment boundary precisely.
 - Remove the JS/TS and Markdown grammar state from the Python checker.
 
 ### Non-goals
@@ -83,6 +92,8 @@ fails closed.
   task review.
 - Do not introduce a persistent parser cache, background service, or new core
   model tool.
+- Do not ledger deliberately daemonizing programs that create a new POSIX
+  session and reparent before the runner can observe them.
 
 ## 4. Components and responsibilities
 
@@ -273,7 +284,14 @@ download or auto-install dependencies. Missing dependencies produce the
 bounded fail-closed diagnostic.
 
 The invariant runner's sealed dependency overlay, revalidation, Vite cache
-isolation, process containment, retry semantics, and cleanup remain unchanged.
+isolation, retry semantics, and cleanup remain unchanged. Windows attempts use
+a kernel-enforced kill-on-close Job Object. POSIX attempts own a fresh process
+group and additionally track descendants observed through verified
+PID/create-time identities before they reparent. This covers supported
+success, failure, retry, timeout, signal, and cancellation cleanup, with
+detected uncertainty failing closed. Portable POSIX, including Darwin, cannot
+guarantee cleanup of a hostile child that creates a new session and reparents
+before observation; that pattern is outside the trusted ledger-test contract.
 The parser helper is part of the checker boundary and does not read through the
 invariant runner's detached source tree.
 
@@ -342,6 +360,8 @@ Synthetic repositories prove that:
 - both old and new parser inputs are exact committed blobs;
 - dirty checkout bytes cannot satisfy or alter ownership;
 - a historical requested revision controls path and symbol authority;
+- only an exact successful zero-entry tree lookup means absent, while tree and
+  present-object failures propagate;
 - identical old/new OIDs are parsed once;
 - non-ASCII content maps to correct changed byte ranges; and
 - a parser failure prevents report replacement and merge decisions.
@@ -356,7 +376,8 @@ Before Task 9 can be marked complete:
 4. the committed-byte live ledger passes without terminal or hidden flaky
    results;
 5. the parser runs successfully in the detached base merge-gate worktree;
-6. no parser, runner, supervisor, watchdog, or test descendant remains;
+6. no parser, runner, supervisor, watchdog, or in-contract trusted-test
+   descendant remains;
 7. the tracked worktree is clean after tests; and
 8. a fresh Task 9 reviewer reports both spec compliance and task quality
    approved.

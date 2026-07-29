@@ -4085,6 +4085,7 @@ upstream_changes:
   - language-aware comment ownership without exposing literals or heredoc bodies
   - exact JSON and TOML lexical-token ranges compare only changed character spans, with cycle-safe YAML traversal
   - strict manifest history, lexical paths, and Git-tree file types anchor to one resolved source revision
+  - only a successful exact zero-entry Git tree lookup means absent; tree and object failures remain terminal
   - parser-derived broad JS, TS, and Markdown semantic syntax remains searchable
   - parser-derived comments are excluded while non-comment HTML, literals, code, and prose remain searchable
   - parser requests contain only exact committed Git blob bytes encoded as canonical base64
@@ -4094,7 +4095,9 @@ upstream_changes:
   - parser transport, validation, and parse failures are terminal without lexical fallback
   - overlap reports replace prior evidence atomically only after complete parser classification
   - JSON and TOML ownership spans exclude numeric, boolean, null, date, and array scalar occurrences
-  - process-tree containment across normal exit, timeout, interruption, and failure
+  - verification-only execution of trusted repository-controlled ledger tests, never user workflow YAML
+  - POSIX containment of the owned process group and descendants observed and identity-verified before reparenting across normal exit, timeout, interruption, and failure
+  - deliberately daemonizing pre-observation POSIX session escapes are unsupported and must not be ledgered
   - detached committed-tree base-ref sealing excludes live untracked discovery and rejects dirty or symlinked tracked authority
   - bounded root and Desktop dependency views remap workspace links to committed detached-checkout paths and reject broken or escaping links before execution, after every invariant group, and before a retryable attempt can retry
   - writable Vitest cache state remains inside the disposable dependency view while external or constructed-view additions, replacements, and real dependency mutations stay terminal
@@ -4110,7 +4113,11 @@ upstream_changes:
     its actual result and duration. Keep fixtures and runner paths visibly
     reference-only so they cannot satisfy execution requirements. Preserve
     exact test paths in a dedicated bounded field and use stable digests for
-    evidence labels.
+    evidence labels. Keep this developer, CI, upstream-merge, and release
+    verification path limited to trusted repository tests; it is not a user
+    workflow executor. On POSIX preserve owned-group cleanup plus observed,
+    PID/create-time-verified descendants, without claiming portable control of
+    a hostile child that starts a new session and reparents before observation.
   removal_condition: >-
     Remove when upstream emits equivalent schema-validated evidence that
     distinguishes actual execution from references, records real outcomes,
@@ -4176,6 +4183,8 @@ upstream_changes:
   - scrubbed orchestration-only subprocess controls
   - preserved ordinary invariant-test environment
   - stable owned process-group identity until cleanup completes
+  - observed POSIX descendants retain PID/create-time identity checks before out-of-group signals
+  - deliberately daemonizing pre-observation POSIX session escapes are outside the trusted ledger-test contract
   - Windows Job Object assignment before the actual test command can spawn
   tests:
   - tests/scripts/test_workflow_upstream_merge.py
@@ -4186,7 +4195,9 @@ upstream_changes:
     Preserve the active virtualenv entry point without resolving it to a base
     interpreter, and remove only orchestration-specific Python and merge-gate
     controls from each invariant-test child. Ordinary environment values must
-    remain available to the test process.
+    remain available to the test process. Keep the runner scoped to trusted
+    repository verification tests rather than normal agent runtime or user
+    workflow YAML execution.
   removal_condition: >-
     Remove when upstream provides equivalent per-test evidence execution that
     cannot inherit orchestration-only interpreter or pytest controls and still

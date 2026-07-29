@@ -1267,11 +1267,9 @@ def _changed_paths(repo: Path, diff_range: str) -> list[tuple[str, list[str]]]:
 
 
 def _existed_at(repo: Path, revision: str, path: str) -> bool:
-    return subprocess.run(
-        ["git", "cat-file", "-e", f"{revision}:{path}"],
-        cwd=repo,
-        capture_output=True,
-    ).returncode == 0
+    # Only an exact zero-entry tree lookup means "absent".  Object corruption,
+    # unreadable repositories, and other Git execution failures remain errors.
+    return _tree_entry(repo, revision, path) is not None
 
 
 def _validate_coverage_commits(
