@@ -682,18 +682,23 @@ def test_evidence_accepts_consistent_attempt_state_machine(
 
 
 def test_ledger_runner_retries_once_and_marks_flaky(tmp_path: Path) -> None:
-    """A fail-then-pass executable invariant remains visible but non-terminal."""
+    """A fail-then-pass invariant keeps its failed-attempt diagnostics in logs."""
     repo = tmp_path / "runner-repo"
     repo.mkdir()
     _git(repo, "init")
     test_path = repo / "tests/test_flaky.py"
     test_path.parent.mkdir()
     test_path.write_text(
-        "from pathlib import Path\n\n"
+        "from pathlib import Path\n"
+        "import sys\n\n"
         "def test_passes_on_second_file_attempt():\n"
         "    marker = Path('first-attempt.marker')\n"
         "    if not marker.exists():\n"
         "        marker.write_text('failed once\\n')\n"
+        "        stdout_diagnostic = 'FIRST_ATTEMPT_' + 'STDOUT_DIAGNOSTIC'\n"
+        "        stderr_diagnostic = 'FIRST_ATTEMPT_' + 'STDERR_DIAGNOSTIC'\n"
+        "        print(stdout_diagnostic)\n"
+        "        print(stderr_diagnostic, file=sys.stderr)\n"
         "        raise AssertionError('synthetic first-attempt failure')\n"
     )
     manifest = repo / "ledger.yaml"
@@ -732,6 +737,15 @@ def test_ledger_runner_retries_once_and_marks_flaky(tmp_path: Path) -> None:
         "passed",
     ]
     assert all(attempt["output_truncated"] is False for attempt in record["attempts"])
+    assert result.stderr.count(
+        "ledger invariant nonpassing attempt: tests/test_flaky.py "
+        "(attempt 1: failed)"
+    ) == 1
+    assert result.stderr.count("FIRST_ATTEMPT_STDOUT_DIAGNOSTIC") == 1
+    assert result.stderr.count("FIRST_ATTEMPT_STDERR_DIAGNOSTIC") == 1
+    serialized = output.read_text()
+    assert "FIRST_ATTEMPT_STDOUT_DIAGNOSTIC" not in serialized
+    assert "FIRST_ATTEMPT_STDERR_DIAGNOSTIC" not in serialized
 
 
 def test_ledger_runner_accepts_report_path_and_exact_base_ref(tmp_path: Path) -> None:
@@ -1919,6 +1933,14 @@ def test_ledger_runner_caps_oversized_output_and_retries_test_failure(
         "failed",
     ]
     assert all(item["output_truncated"] for item in records[0]["attempts"])
+    assert result.stderr.count(
+        "ledger invariant failed: tests/test_output.py"
+    ) == 1
+    for attempt in (1, 2):
+        assert result.stderr.count(
+            "ledger invariant nonpassing attempt: tests/test_output.py "
+            f"(attempt {attempt}: failed)"
+        ) == 1
 
 
 @pytest.mark.parametrize(("signal_name", "signal_number"), [("SIGTERM", 15), ("SIGINT", 2)])

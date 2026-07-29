@@ -1303,8 +1303,16 @@ def _execute(
             and attempts[0]["result"] == "failed"
             and result == "passed"
         ),
-        "_stdout": "".join(str(attempt["_stdout"]) for attempt in attempts),
-        "_stderr": "".join(str(attempt["_stderr"]) for attempt in attempts),
+        "_nonpassing_attempt_diagnostics": [
+            {
+                "attempt": index,
+                "result": attempt["result"],
+                "stdout": attempt["_stdout"],
+                "stderr": attempt["_stderr"],
+            }
+            for index, attempt in enumerate(attempts, start=1)
+            if attempt["result"] != "passed"
+        ],
     }
 
 
@@ -1685,12 +1693,19 @@ def main() -> int:
         json.dumps(serializable, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    for item in failed:
-        print(f"ledger invariant failed: {item['path']}", file=sys.stderr)
-        if item["_stdout"]:
-            print(item["_stdout"], file=sys.stderr)
-        if item["_stderr"]:
-            print(item["_stderr"], file=sys.stderr)
+    for item in results:
+        if item.get("result") == "failed":
+            print(f"ledger invariant failed: {item['path']}", file=sys.stderr)
+        for diagnostic in item.get("_nonpassing_attempt_diagnostics", []):
+            print(
+                f"ledger invariant nonpassing attempt: {item['path']} "
+                f"(attempt {diagnostic['attempt']}: {diagnostic['result']})",
+                file=sys.stderr,
+            )
+            if diagnostic["stdout"]:
+                print(diagnostic["stdout"], file=sys.stderr)
+            if diagnostic["stderr"]:
+                print(diagnostic["stderr"], file=sys.stderr)
     return 1 if failed else 0
 
 
