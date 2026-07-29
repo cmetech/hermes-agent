@@ -1706,6 +1706,37 @@ def test_git_character_diff_handles_blank_line_insertion(tmp_path: Path) -> None
     assert new_ranges == [(4, 5)]
 
 
+def test_git_character_diff_skips_git_for_identical_endpoints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An rc=1 no-change stream must not override identical endpoint bytes."""
+    captures = 0
+
+    def no_change_capture(*_args, **_kwargs):
+        nonlocal captures
+        captures += 1
+        return customization_checker._CompletedCapture(
+            returncode=1,
+            stdout=b"@@ -1 +1 @@\n 61\n~\n",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(
+        customization_checker, "_run_bounded_capture", no_change_capture
+    )
+
+    assert customization_checker._git_changed_byte_ranges(
+        tmp_path,
+        "a" * 40,
+        "b" * 40,
+        "owned.ts",
+        b"a",
+        b"a",
+    ) == ([], [])
+    assert captures == 0
+
+
 def test_typescript_import_reflow_keeps_unchanged_owned_symbol_same_file(
     tmp_path: Path,
 ) -> None:
@@ -1814,7 +1845,7 @@ def test_git_character_diff_rejects_malformed_hunk(
             "b" * 40,
             "owned.ts",
             b"ExactToken\n",
-            b"ExactToken\n",
+            b"ExactT0ken\n",
         )
 
 
@@ -1956,7 +1987,7 @@ def test_git_character_diff_propagates_bounded_capture_failures(
             "b" * 40,
             "owned.ts",
             b"ExactToken\n",
-            b"ExactToken\n",
+            b"ExactT0ken\n",
         )
 
 

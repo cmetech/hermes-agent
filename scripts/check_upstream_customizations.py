@@ -2153,6 +2153,8 @@ def _git_changed_byte_ranges(
     """Return exact changed byte ranges from Git's bounded porcelain protocol."""
     _validated_parser_source(old_source)
     _validated_parser_source(new_source)
+    if old_source == new_source:
+        return [], []
     old_encoded = old_source.hex().encode("ascii") + b"\n"
     new_encoded = new_source.hex().encode("ascii") + b"\n"
     with tempfile.TemporaryDirectory(prefix="hermes-character-diff-") as temp_dir:
@@ -2199,6 +2201,7 @@ def _git_changed_byte_ranges(
     old_end = new_end = 0
     in_hunk = False
     saw_hunk = False
+    saw_changed_token_run = False
     newline_sides: set[str] = set()
 
     def finish_hunk() -> None:
@@ -2252,6 +2255,8 @@ def _git_changed_byte_ranges(
         payload = record[1:]
         if not _HEX_BYTE_RUN.fullmatch(payload):
             raise ValueError("malformed Git character diff")
+        if marker in {b"-", b"+"}:
+            saw_changed_token_run = True
         if marker in {b" ", b"-"}:
             newline_sides.add("old")
             end = old_cursor + len(payload)
@@ -2287,7 +2292,12 @@ def _git_changed_byte_ranges(
             for index, (start, end) in enumerate(new_hunks)
         )
     )
-    if not saw_hunk or not exact_old_coverage or not exact_new_coverage:
+    if (
+        not saw_hunk
+        or not saw_changed_token_run
+        or not exact_old_coverage
+        or not exact_new_coverage
+    ):
         raise ValueError("malformed Git character diff")
     return _coalesce_ranges(old_ranges), _coalesce_ranges(new_ranges)
 
