@@ -61,7 +61,7 @@ def test_synthetic_overlap_classes_cover_continue_and_stop_cases(tmp_path: Path)
     (repo / "replacement.py").write_text("class Owned:\n    pass\n")
     _git(repo, "add", "replacement.py")
     _git(repo, "commit", "-m", "upstream equivalent")
-    assert classify_upstream_overlap(entry, repo, f"{equivalent}..HEAD")["classification"] == "possible_upstream_equivalent"
+    assert classify_upstream_overlap(entry, repo, f"{equivalent}..HEAD")["classification"] == "none"
 
 
 def test_rehearsal_rejects_incomplete_args_without_mutating_refs() -> None:
@@ -528,6 +528,7 @@ def _evidence_document(entry: dict) -> dict:
     ("overlap_class", "overlap_policy", "decision_required", "decision"),
     [
         ("owned_symbol", "owned_symbol", False, "not-required"),
+        ("possible_upstream_equivalent", "owned_symbol", True, "adapt"),
         ("possible_upstream_equivalent", "owned_symbol", False, "not-required"),
         ("same_file", "any_owned_file", False, "not-required"),
         ("same_file", "owned_symbol", True, "preserve"),
@@ -560,7 +561,6 @@ def test_evidence_rejects_self_asserted_or_contradictory_decision_state(
     ("overlap_class", "overlap_policy", "decision_required", "decision"),
     [
         ("owned_symbol", "owned_symbol", True, "preserve"),
-        ("possible_upstream_equivalent", "any_owned_file", True, "adapt"),
         ("same_file", "any_owned_file", True, "remove-as-upstream-equivalent"),
         ("same_file", "owned_symbol", False, "not-required"),
         ("none", "any_owned_file", False, "not-required"),
@@ -2688,7 +2688,6 @@ def test_rehearsal_records_reconciled_conflict_files(tmp_path: Path) -> None:
     ("overlap", "any_owned_file"),
     [
         ("owned-symbol", False),
-        ("upstream-equivalent", False),
         ("same-file", True),
     ],
 )
@@ -2712,6 +2711,23 @@ def test_rehearsal_requires_explicit_decision_for_decision_required_overlap(
     assert result.returncode == 4
     assert "explicit preserve/adapt/remove-as-upstream-equivalent" in result.stderr
     assert _git(repo, "show-ref", "--heads") == refs_before
+
+
+def test_rehearsal_does_not_require_decision_for_unrelated_matching_symbol(
+    tmp_path: Path,
+) -> None:
+    repo = _synthetic_rehearsal_repo(tmp_path, "upstream-equivalent")
+    refs_before = _git(repo, "show-ref", "--heads")
+    report = tmp_path / "report-upstream-equivalent"
+
+    result = _run_synthetic(repo, report)
+
+    assert result.returncode == 0, result.stderr
+    assert _git(repo, "show-ref", "--heads") == refs_before
+    evidence = json.loads((report / "merge-evidence.json").read_text())
+    assert evidence["entries"][0]["overlap_class"] == "none"
+    assert evidence["entries"][0]["decision_required"] is False
+    assert evidence["entries"][0]["decision"] == "not-required"
 
 
 def test_failed_invariant_gate_never_advances_or_emits_verified_evidence(

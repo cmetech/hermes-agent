@@ -55,13 +55,18 @@ python3 scripts/check_upstream_customizations.py \
   --upstream-diff RANGE --report overlap-report.json
 ```
 
+For `--upstream-diff`, the checker first intersects upstream-changed paths
+with ledger-declared files. Parser requests contain only that intersection and
+the symbols owned by entries that declare each path. Compatibility outside
+those paths is verified by post-merge invariants.
+
 Every report row marked `decision_required` requires an explicit `preserve`,
 `adapt`, or `remove-as-upstream-equivalent` decision. This includes
-`owned_symbol` and `possible_upstream_equivalent` results plus `same_file`
-results governed by `any_owned_file`; a prior acknowledgement never substitutes
-for the current decision. Textual merge cleanliness is never proof that the
-recorded behavior survived. Baselines advance only through the controlled
-upstream-merge workflow after the named tests pass.
+`owned_symbol` results plus `same_file` results governed by `any_owned_file`; a
+prior acknowledgement never substitutes for the current decision. Textual
+merge cleanliness is never proof that the recorded behavior survived. Baselines
+advance only through the controlled upstream-merge workflow after the named
+tests pass.
 
 Two-dot ranges are literal Git revision sets: `A..B` examines commits reachable
 from `B` but not `A`, even when the tips diverge. Triple-dot ranges compare the

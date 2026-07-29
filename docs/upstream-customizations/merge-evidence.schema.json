@@ -285,7 +285,7 @@
         },
         "patch_sha256": {"$ref": "#/$defs/digest"},
         "overlap_class": {
-          "enum": ["none", "same_file", "owned_symbol", "possible_upstream_equivalent"]
+          "enum": ["none", "same_file", "owned_symbol"]
         },
         "overlap_policy": {"enum": ["owned_symbol", "any_owned_file"]},
         "decision_required": {"type": "boolean"},
@@ -318,9 +318,7 @@
       "oneOf": [
         {
           "properties": {
-            "overlap_class": {
-              "enum": ["owned_symbol", "possible_upstream_equivalent"]
-            },
+            "overlap_class": {"const": "owned_symbol"},
             "decision_required": {"const": true},
             "decision": {
               "enum": ["preserve", "adapt", "remove-as-upstream-equivalent"]

@@ -4116,6 +4116,9 @@ upstream_changes:
   - parser batches execute sequentially within bounded input, output, and time limits
   - parser transport, validation, and parse failures are terminal without lexical fallback
   - overlap reports replace prior evidence atomically only after complete parser classification
+  - upstream overlap parsing is limited to upstream-changed paths that intersect ledger-declared files
+  - each parser-backed overlap path receives only symbols owned by entries that declare that path
+  - compatibility outside directly intersecting files is established by post-merge invariants, not repository-wide matching-name inference
   - JSON and TOML ownership spans exclude numeric, boolean, null, date, and array scalar occurrences
   - verification-only execution of trusted repository-controlled ledger tests, never user workflow YAML
   - POSIX containment of the owned process group and descendants observed and identity-verified before reparenting across normal exit, timeout, interruption, and failure
