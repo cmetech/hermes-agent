@@ -1562,6 +1562,8 @@ def test_sealed_ledger_runner_rejects_dependency_mutation_after_every_node_group
         "        view.unlink()\n"
         "        view.symlink_to(Path.cwd(), target_is_directory=True)\n"
         "    if os.environ['MUTATION_EXIT_CODE'] != '0':\n"
+        "        print('DEPENDENCY_DRIFT_' + 'STDOUT_DIAGNOSTIC')\n"
+        "        print('DEPENDENCY_DRIFT_' + 'STDERR_DIAGNOSTIC', file=sys.stderr)\n"
         "        raise SystemExit(int(os.environ['MUTATION_EXIT_CODE']))\n"
     )
     npx.chmod(0o755)
@@ -1618,6 +1620,17 @@ def test_sealed_ledger_runner_rejects_dependency_mutation_after_every_node_group
     assert tsx_executed.exists() is tsx_should_run
     assert invocations.read_text().splitlines() == expected_invocations
     assert not report.exists()
+    if tool_exit_code == 1:
+        diagnostic_header = (
+            "ledger invariant nonpassing attempt: "
+            "apps/desktop/src/toolchain.test.ts (attempt 1: failed)"
+        )
+        assert result.stderr.count(diagnostic_header) == 1
+        assert result.stderr.count("DEPENDENCY_DRIFT_STDOUT_DIAGNOSTIC") == 1
+        assert result.stderr.count("DEPENDENCY_DRIFT_STDERR_DIAGNOSTIC") == 1
+        assert result.stderr.index(diagnostic_header) < result.stderr.index(
+            "changed before execution"
+        )
     assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
     assert list(temp_root.iterdir()) == []
 

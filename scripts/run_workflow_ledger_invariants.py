@@ -43,6 +43,26 @@ _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 
 
+@dataclass(frozen=True)
+class _AttemptDiagnostic:
+    attempt: int
+    result: str
+    stdout: str
+    stderr: str
+
+
+class _AttemptRevalidationError(ValueError):
+    def __init__(
+        self,
+        path: str,
+        diagnostics: tuple[_AttemptDiagnostic, ...],
+        cause: ValueError,
+    ) -> None:
+        super().__init__(str(cause))
+        self.path = path
+        self.diagnostics = diagnostics
+
+
 class _JobObjectBasicLimitInformation(ctypes.Structure):
     _fields_ = [
         ("PerProcessUserTimeLimit", ctypes.c_longlong),
@@ -1254,6 +1274,8 @@ def _execute(
     source_repo: Path | None = None,
     before_retry: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
+    attempts: list[dict[str, Any]] = []
+
     def execute_attempt() -> dict[str, Any]:
         attempt = _execute_attempt(
             repo,
@@ -1266,15 +1288,23 @@ def _execute(
             npx_path=npx_path,
             source_repo=source_repo,
         )
+        attempts.append(attempt)
         if attempt["result"] == "failed" and before_retry is not None:
-            before_retry()
+            try:
+                before_retry()
+            except ValueError as exc:
+                raise _AttemptRevalidationError(
+                    path,
+                    _nonpassing_attempt_diagnostics(attempts),
+                    exc,
+                ) from exc
         return attempt
 
-    attempts = [execute_attempt()]
+    execute_attempt()
     if attempts[0]["result"] == "failed":
         if cancel_event.is_set():
             raise CancelledError()
-        attempts.append(execute_attempt())
+        execute_attempt()
     digest = hashlib.sha256(path.encode()).hexdigest()
     result = "passed" if attempts[-1]["result"] == "passed" else "failed"
     return {
@@ -1303,17 +1333,41 @@ def _execute(
             and attempts[0]["result"] == "failed"
             and result == "passed"
         ),
-        "_nonpassing_attempt_diagnostics": [
-            {
-                "attempt": index,
-                "result": attempt["result"],
-                "stdout": attempt["_stdout"],
-                "stderr": attempt["_stderr"],
-            }
-            for index, attempt in enumerate(attempts, start=1)
-            if attempt["result"] != "passed"
-        ],
+        "_nonpassing_attempt_diagnostics": _nonpassing_attempt_diagnostics(
+            attempts
+        ),
     }
+
+
+def _nonpassing_attempt_diagnostics(
+    attempts: list[dict[str, Any]],
+) -> tuple[_AttemptDiagnostic, ...]:
+    return tuple(
+        _AttemptDiagnostic(
+            attempt=index,
+            result=str(attempt["result"]),
+            stdout=str(attempt["_stdout"]),
+            stderr=str(attempt["_stderr"]),
+        )
+        for index, attempt in enumerate(attempts, start=1)
+        if attempt["result"] != "passed"
+    )
+
+
+def _emit_nonpassing_attempt_diagnostics(
+    path: str,
+    diagnostics: tuple[_AttemptDiagnostic, ...],
+) -> None:
+    for diagnostic in diagnostics:
+        print(
+            f"ledger invariant nonpassing attempt: {path} "
+            f"(attempt {diagnostic.attempt}: {diagnostic.result})",
+            file=sys.stderr,
+        )
+        if diagnostic.stdout:
+            print(diagnostic.stdout, file=sys.stderr)
+        if diagnostic.stderr:
+            print(diagnostic.stderr, file=sys.stderr)
 
 
 def _run_group(
@@ -1677,6 +1731,9 @@ def main() -> int:
                     output_limit_bytes=args.output_limit_bytes,
                     source_repo=repo,
                 )
+    except _AttemptRevalidationError as exc:
+        _emit_nonpassing_attempt_diagnostics(exc.path, exc.diagnostics)
+        parser.error(str(exc))
     except ValueError as exc:
         parser.error(str(exc))
     except RuntimeError as exc:
@@ -1696,16 +1753,9 @@ def main() -> int:
     for item in results:
         if item.get("result") == "failed":
             print(f"ledger invariant failed: {item['path']}", file=sys.stderr)
-        for diagnostic in item.get("_nonpassing_attempt_diagnostics", []):
-            print(
-                f"ledger invariant nonpassing attempt: {item['path']} "
-                f"(attempt {diagnostic['attempt']}: {diagnostic['result']})",
-                file=sys.stderr,
-            )
-            if diagnostic["stdout"]:
-                print(diagnostic["stdout"], file=sys.stderr)
-            if diagnostic["stderr"]:
-                print(diagnostic["stderr"], file=sys.stderr)
+        _emit_nonpassing_attempt_diagnostics(
+            item["path"], item.get("_nonpassing_attempt_diagnostics", ())
+        )
     return 1 if failed else 0
 
 
