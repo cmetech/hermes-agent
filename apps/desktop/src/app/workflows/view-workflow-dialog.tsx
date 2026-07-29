@@ -22,7 +22,7 @@ import { WorkflowApiError } from '@/lib/hermes-api'
 import { Eye, Play } from '@/lib/icons'
 import type { WorkflowDefinition } from '@/types/hermes'
 
-import { workflowSupportsScheduledRun, workflowTrustAllowsRun } from './catalog-run-policy'
+import { desktopWorkflowLanguageLabel, desktopWorkflowRunDisabledReason } from './catalog-run-policy'
 import { useWorkflowDetailQuery } from './detail-query'
 
 const MermaidRenderer = lazy(() => import('@/components/assistant-ui/embeds/mermaid-embed'))
@@ -100,28 +100,11 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
     [copy.workflowViewDefinition, copy.workflowViewDiagram]
   )
 
-  const runSupportCopy = {
-    schedule_required: null,
-    showcase_cli_required: copy.workflowRunShowcaseFromCli,
-    supported: null,
-    unsupported_inputs: copy.workflowRunUnsupportedInputs
-  }
-
   const runDisabledReason = detail.isError
     ? copy.workflowViewRunError
     : !detail.data
       ? copy.workflowViewRunLoading
-      : !detail.data.run_support
-        ? copy.workflowRunSupportUnavailable
-        : !workflowSupportsScheduledRun(detail.data.run_support)
-          ? runSupportCopy[detail.data.run_support.reason]
-          : detail.data.compatibility.runnable !== true
-            ? copy.workflowRunIncompatible
-            : !workflowTrustAllowsRun(detail.data.trust_state)
-              ? copy.workflowRunUntrusted
-              : !detail.data.coordinator.healthy
-                ? copy.workflowRunCoordinatorUnavailable
-                : null
+      : desktopWorkflowRunDisabledReason(detail.data, copy, 'detail')
 
   const errorDescription =
     detail.error instanceof WorkflowApiError && detail.error.code === 'workflow_not_found'
@@ -153,9 +136,7 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
               <Alert variant={detail.data.language.legacy ? 'warning' : 'default'}>
                 <AlertDescription>
                   <Badge variant={detail.data.language.legacy ? 'muted' : 'default'}>
-                    {detail.data.language.legacy
-                      ? copy.workflowLanguageLegacy
-                      : copy.workflowLanguageArchon}
+                    {desktopWorkflowLanguageLabel(detail.data.language, copy)}
                   </Badge>
                   {detail.data.language.legacy ? <p>{copy.workflowLanguageLegacyDescription}</p> : null}
                   {detail.data.language.normalizer_version !== undefined ? (

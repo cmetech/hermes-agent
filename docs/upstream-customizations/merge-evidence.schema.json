@@ -76,16 +76,162 @@
     },
     "executedTest": {
       "type": "object",
-      "required": ["kind", "name", "path", "result", "duration_ms", "platform"],
+      "required": [
+        "kind",
+        "name",
+        "path",
+        "result",
+        "duration_ms",
+        "platform",
+        "attempts",
+        "flaky_on_first_attempt"
+      ],
       "properties": {
         "kind": {"const": "executed"},
         "name": {"$ref": "#/$defs/safeText"},
         "path": {"$ref": "#/$defs/repositoryPath"},
         "result": {"enum": ["passed", "failed"]},
         "duration_ms": {"type": "integer", "minimum": 0},
-        "platform": {"$ref": "#/$defs/safeText"}
+        "platform": {"$ref": "#/$defs/safeText"},
+        "attempts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {"$ref": "#/$defs/testAttempt"}
+        },
+        "flaky_on_first_attempt": {"type": "boolean"}
       },
+      "oneOf": [
+        {
+          "properties": {
+            "result": {"const": "passed"},
+            "flaky_on_first_attempt": {"const": false},
+            "attempts": {
+              "minItems": 1,
+              "maxItems": 1,
+              "prefixItems": [
+                {
+                  "properties": {
+                    "attempt": {"const": 1},
+                    "result": {"const": "passed"}
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "result": {"const": "passed"},
+            "flaky_on_first_attempt": {"const": true},
+            "attempts": {
+              "minItems": 2,
+              "maxItems": 2,
+              "prefixItems": [
+                {
+                  "properties": {
+                    "attempt": {"const": 1},
+                    "result": {"const": "failed"}
+                  }
+                },
+                {
+                  "properties": {
+                    "attempt": {"const": 2},
+                    "result": {"const": "passed"}
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "result": {"const": "failed"},
+            "flaky_on_first_attempt": {"const": false},
+            "attempts": {
+              "minItems": 2,
+              "maxItems": 2,
+              "prefixItems": [
+                {
+                  "properties": {
+                    "attempt": {"const": 1},
+                    "result": {"const": "failed"}
+                  }
+                },
+                {
+                  "properties": {
+                    "attempt": {"const": 2},
+                    "result": {
+                      "enum": [
+                        "failed",
+                        "timed_out",
+                        "signaled",
+                        "infrastructure_error"
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "result": {"const": "failed"},
+            "flaky_on_first_attempt": {"const": false},
+            "attempts": {
+              "minItems": 1,
+              "maxItems": 1,
+              "prefixItems": [
+                {
+                  "properties": {
+                    "attempt": {"const": 1},
+                    "result": {
+                      "enum": ["timed_out", "signaled", "infrastructure_error"]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ],
       "additionalProperties": false
+    },
+    "testAttempt": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["attempt", "result", "duration_ms", "output_truncated"],
+          "properties": {
+            "attempt": {"type": "integer", "minimum": 1, "maximum": 2},
+            "result": {
+              "enum": ["passed", "failed", "timed_out", "infrastructure_error"]
+            },
+            "duration_ms": {"type": "integer", "minimum": 0},
+            "output_truncated": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "attempt",
+            "result",
+            "duration_ms",
+            "output_truncated",
+            "termination_signal"
+          ],
+          "properties": {
+            "attempt": {"type": "integer", "minimum": 1, "maximum": 2},
+            "result": {"const": "signaled"},
+            "duration_ms": {"type": "integer", "minimum": 0},
+            "output_truncated": {"type": "boolean"},
+            "termination_signal": {"type": "integer", "minimum": 1, "maximum": 255}
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "referenceTest": {
       "type": "object",
@@ -121,6 +267,8 @@
         "files",
         "patch_sha256",
         "overlap_class",
+        "overlap_policy",
+        "decision_required",
         "decision",
         "conflict_files",
         "retained_commit_subjects",
@@ -139,12 +287,14 @@
         "overlap_class": {
           "enum": ["none", "same_file", "owned_symbol", "possible_upstream_equivalent"]
         },
+        "overlap_policy": {"enum": ["owned_symbol", "any_owned_file"]},
+        "decision_required": {"type": "boolean"},
         "decision": {
           "enum": ["not-required", "preserve", "adapt", "remove-as-upstream-equivalent"]
         },
         "conflict_files": {
           "type": "array",
-          "items": {"$ref": "#/$defs/safeText"}
+          "items": {"$ref": "#/$defs/repositoryPath"}
         },
         "retained_commit_subjects": {
           "type": "array",
@@ -165,6 +315,44 @@
           }
         }
       },
+      "oneOf": [
+        {
+          "properties": {
+            "overlap_class": {
+              "enum": ["owned_symbol", "possible_upstream_equivalent"]
+            },
+            "decision_required": {"const": true},
+            "decision": {
+              "enum": ["preserve", "adapt", "remove-as-upstream-equivalent"]
+            }
+          }
+        },
+        {
+          "properties": {
+            "overlap_class": {"const": "same_file"},
+            "overlap_policy": {"const": "any_owned_file"},
+            "decision_required": {"const": true},
+            "decision": {
+              "enum": ["preserve", "adapt", "remove-as-upstream-equivalent"]
+            }
+          }
+        },
+        {
+          "properties": {
+            "overlap_class": {"const": "same_file"},
+            "overlap_policy": {"const": "owned_symbol"},
+            "decision_required": {"const": false},
+            "decision": {"const": "not-required"}
+          }
+        },
+        {
+          "properties": {
+            "overlap_class": {"const": "none"},
+            "decision_required": {"const": false},
+            "decision": {"const": "not-required"}
+          }
+        }
+      ],
       "additionalProperties": false
     },
     "brand": {

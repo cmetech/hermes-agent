@@ -173,7 +173,7 @@ upstream_changes:
   - tests/scripts/test_workflow_merge_gate.py
   owned_symbols:
   - showcase schedule confirmation base-gate membership
-  - test_showcase_schedule_confirmation_suite_is_promoted_into_base_gate
+  - test_base_gate_executes_the_release_contract_through_fixture_commands
   tests:
   - tests/plugins/workflow/test_showcase_schedule_e2e.py
   - tests/scripts/test_workflow_merge_gate.py
@@ -798,7 +798,7 @@ upstream_changes:
   owned_symbols:
   - _EPHEMERAL_COVERAGE_PATHS
   - validate_diff_coverage
-  - _range_base
+  - _resolved_diff_endpoints
   - _existed_at
   tests:
   - tests/scripts/test_check_upstream_customizations.py
@@ -1473,7 +1473,7 @@ upstream_changes:
   - trusted package-to-immutable snapshot digest comparison
   - workflow_filename_components_are_distinct
   - test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary
-  - test_merge_gate_pins_workflow_catalog_desktop_e2e_contract
+  - test_base_gate_executes_the_release_contract_through_fixture_commands
   tests:
   - tests/plugins/workflow/test_desktop_api.py
   - tests/plugins/workflow/test_store.py
@@ -1870,6 +1870,8 @@ upstream_changes:
   - plugins/workflow/catalog_api.py
   - plugins/workflow/dashboard/plugin_api.py
   - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
   - tests/plugins/workflow/test_workflow_detail_api.py
   owned_symbols:
   - CatalogSource
@@ -2139,7 +2141,7 @@ upstream_changes:
   - tests/plugins/workflow/test_catalog_api.py
   - tests/plugins/workflow/test_showcase_catalog.py
   owned_symbols:
-  - VerifiedShowcasePackage.compatibility
+  - CatalogEntry.compatibility
   - _verified_distribution_assessment
   - scenario-local execution-environment compatibility projection
   tests:
@@ -3130,6 +3132,7 @@ upstream_changes:
 - id: workflow-language-contracts
   change_class: workflow-compatibility
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - plugins/workflow/language.py
   - plugins/workflow/models.py
@@ -3143,6 +3146,7 @@ upstream_changes:
   - normalize_workflow
   - bind_semantic_fingerprint
   - language_projection
+  owned_invariants:
   - YAML-native scalar canonicalization
   - strict non-finite JSON float canonicalization
   - collision-proof typed normalized value graph
@@ -3167,6 +3171,7 @@ upstream_changes:
 - id: workflow-language-profile-normalization
   change_class: workflow-compatibility
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - plugins/workflow/language.py
   - plugins/workflow/models.py
@@ -3174,6 +3179,8 @@ upstream_changes:
   - plugins/workflow/discovery.py
   - plugins/workflow/compat.py
   - plugins/workflow/cli.py
+  - plugins/workflow/gateway_command.py
+  - plugins/workflow/api_admission.py
   - plugins/workflow/runner_binding.py
   - plugins/workflow/showcase.py
   owned_symbols:
@@ -3183,6 +3190,13 @@ upstream_changes:
   - WorkflowPackage.language
   - WorkflowPackage.compatibility_findings
   - language_compatibility_findings
+  - DynamicCompatibilityCode
+  - DYNAMIC_LANGUAGE_COMPATIBILITY_CODES
+  - legacy_idle_timeout_seconds
+  - archon_idle_timeout_semantics_unavailable
+  - WorkflowCompatibilityBlockedError
+  - require_runnable
+  owned_invariants:
   - profile-aware unknown top-level field policy
   - explicit language declaration type enforcement
   - companion-aware discovery cache signature
@@ -3191,11 +3205,14 @@ upstream_changes:
   - assess_package_execution environment compatibility finding
   - _verified_distribution_assessment environment compatibility finding
   - validate and doctor language projections
+  - compatibility refusal before CLI trust/run, Gateway, and API persistence
   tests:
   - tests/plugins/workflow/test_schema.py
   - tests/plugins/workflow/test_discovery.py
   - tests/plugins/workflow/test_compat_matrix.py
   - tests/plugins/workflow/test_cli.py
+  - tests/plugins/workflow/test_notification_delivery.py
+  - tests/plugins/workflow/test_desktop_api.py
   - tests/plugins/workflow/test_catalog_api.py
   - tests/plugins/workflow/test_runner_binding.py
   - tests/plugins/workflow/test_showcase_catalog.py
@@ -3215,16 +3232,59 @@ upstream_changes:
     wrappers, and identical validate and doctor language projections. Workflows
     without a declaration and explicit hermes-legacy workflows must remain
     permissive with actionable warnings; declared archon-2026-07 workflows must
-    fail closed only for invalid or currently unenforceable semantics.
+    fail closed only for invalid or currently unenforceable semantics. Keep
+    idle_timeout seconds unchanged under legacy and block it under Archon until
+    Phase 3 provides millisecond normalization. Use the
+    dependency-neutral runnable guard at every authoring, trust, and start
+    boundary before any mutable admission state is created, while preserving
+    the existing stable API and Gateway refusal contracts. Keep dynamic
+    profile, normalizer, and top-level-field code metadata shared by the
+    emitting runtime and generated authoring catalog so neither can drift.
   removal_condition: >-
     Remove when upstream provides equivalent profile-before-policy loading,
     companion-aware cache invalidation, source and normalized package contracts,
     stable coded compatibility findings, and CLI language projections while
     preserving legacy behavior and Archon fail-closed semantics.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-machine-command-outcomes
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  files:
+  - hermes_cli/main.py
+  - plugins/workflow/cli.py
+  - tests/plugins/workflow/test_cli.py
+  owned_symbols:
+  - hermes_cli.main.main command-status return
+  - hermes_cli.main module SystemExit propagation
+  - workflow_command WorkflowLanguageCompatibilityError machine code projection
+  - workflow_command WorkflowValidationError primary issue code and bounded issues projection
+  - doctor text 200-finding ceiling and truncation notice
+  - doctor text cross-platform absolute marker-to-end path redaction
+  - doctor text sanitized code/path/migration diagnostics
+  - non-workflow None handler process-success regression
+  tests:
+  - tests/plugins/workflow/test_cli.py
+  - tests/hermes_cli/test_placeholder_usage.py
+  - tests/hermes_cli/test_plugins_cmd.py
+  expected_commit_subject: 'fix(workflow): honor machine command outcomes'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve the selected command handler's integer status at the terminal
+    entrypoint while treating None as success for legacy handlers. Keep module
+    execution as SystemExit(main()). Preserve stable workflow language and
+    validation issue codes in JSON envelopes, retain only a bounded safe issue
+    projection. Render at most 200 human doctor diagnostics from existing
+    findings, with a truncation notice and cross-platform absolute-marker-to-end
+    path redaction before emitting sanitized code, path, and migration values
+    only. A path redaction must consume whitespace-containing filename suffixes.
+  removal_condition: >-
+    Remove when upstream preserves plugin command exit statuses and provides
+    equivalent typed workflow diagnostic envelopes and safe doctor text.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-language-admission-pinning
   change_class: workflow-security
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - plugins/workflow/language.py
   - plugins/workflow/admission.py
@@ -3232,6 +3292,8 @@ upstream_changes:
   - plugins/workflow/store.py
   - plugins/workflow/scheduler.py
   - plugins/workflow/scheduled_revalidation.py
+  - plugins/workflow/cli.py
+  - plugins/workflow/dashboard/plugin_api.py
   - plugins/workflow/trust.py
   - plugins/workflow/catalog_api.py
   - plugins/workflow/resources.py
@@ -3242,6 +3304,8 @@ upstream_changes:
   - plugins/workflow/executors/script.py
   - plugins/workflow/executors/ai.py
   - tests/plugins/workflow/test_language_snapshot.py
+  - tests/plugins/workflow/test_cli.py
+  - tests/plugins/workflow/test_desktop_api.py
   - tests/plugins/workflow/test_schedule_revalidation.py
   - tests/plugins/workflow/test_script_executor.py
   - tests/plugins/workflow/test_node_mcp.py
@@ -3254,16 +3318,11 @@ upstream_changes:
   - make_language_snapshot
   - read_language_snapshot
   - verify_language_snapshot
+  - test_verified_load_rejects_normalizer_drift_for_authenticated_bytes
   - PreparedRunSnapshot.language
   - PreparedRunSnapshot.sealed_snapshot_digest
-  - run projection snapshot_format_version
-  - resources.json language metadata
-  - resources.json sealed_paths metadata
-  - run projection language metadata
-  - run projection sealed_snapshot_digest
-  - load_workflow_snapshot normalizer_version pin
-  - RunScheduler._load_verified_run_package atomic verification result
-  - RunScheduler._load_run_package sealed language verification
+  - RunScheduler.verified_always_run_nodes
+  - RunScheduler._legacy_package_with_valid_resource_precedence
   - RunScheduler._verify_legacy_journaled_seals
   - RunScheduler._legacy_raw_package_paths
   - RunScheduler._legacy_raw_package_bytes
@@ -3272,22 +3331,36 @@ upstream_changes:
   - RunScheduler._verify_legacy_postparse_identity
   - RunScheduler._legacy_package_digest_for_identity
   - read_sealed_snapshot_paths
-  - sealed_snapshot_digest admitted-path verification
-  - verify_sealed_snapshot language identity verification
   - NodeExecutionContext.sealed_resource_paths
   - NodeExecutionContext.sealed_resource_bytes
+  - WorkflowResourceReadBudget.from_authenticated
+  - test_production_authority_accepts_512_files_and_refuses_513_before_admission
+  - AuthenticatedExecutionMaterializer
+  owned_invariants:
+  - run projection snapshot_format_version
+  - resources.json language metadata
+  - resources.json sealed_paths metadata
+  - run projection language metadata
+  - run projection sealed_snapshot_digest
+  - load_workflow_snapshot normalizer_version pin
+  - RunScheduler._load_verified_run_package atomic verification result
+  - RunScheduler._load_run_package sealed language verification
+  - RunStore.resume_run always_run_nodes
+  - _cmd_resume authenticated resume policy
+  - mutate_run authenticated resume policy
+  - sealed_snapshot_digest admitted-path verification
+  - sealed_snapshot_digest allow_unsealed_regular_files
+  - verify_sealed_snapshot language identity verification
   - NodeExecutionContext positional constructor compatibility
   - ResourceResolver sealed-path candidate authorization
   - ResourceResolver authenticated-byte rebinding
   - ResourceResolver sealed-byte-exclusive resource reads
-  - WorkflowResourceReadBudget.from_authenticated
   - WorkflowResourceReadBudget canonical shared-run accounting
   - verify_sealed_snapshot shared fire-time read budget
   - revalidate_scheduled_run shared fire-time read budget
   - _ScheduledPromotionAuthorization resource read budget authority
   - RunScheduler scheduled promotion-to-package budget threading
   - authoritative workflow resource capacity limits
-  - AuthenticatedExecutionMaterializer
   - AuthenticatedExecutionMaterializer canonical closure materialization
   - AuthenticatedExecutionMaterializer compact private manifest capability
   - AuthenticatedExecutionMaterializer control/payload namespace separation
@@ -3311,6 +3384,8 @@ upstream_changes:
   - compute_package_digest cached transitive-resource traversal
   tests:
   - tests/plugins/workflow/test_language_snapshot.py
+  - tests/plugins/workflow/test_cli.py
+  - tests/plugins/workflow/test_desktop_api.py
   - tests/plugins/workflow/test_schedule_revalidation.py
   - tests/plugins/workflow/test_fault_injection.py
   - tests/plugins/workflow/test_performance_bounds.py
@@ -3331,10 +3406,14 @@ upstream_changes:
     whole-package sealed_snapshot_digest through the journal. Resume must verify
     raw policy and resources hashes, the exact admitted definition, policy,
     inputs, skills, and package-resource bytes, equality between projected and
-    sealed language metadata, and absence of every unsealed current-tree entry
-    before parsing execution semantics. Only the code-owned nodes/ and
-    artifacts/ output roots plus exact .lock, run.json, and events.jsonl files
-    are mutable exceptions; symlinks remain forbidden. Bind command, script,
+    sealed language metadata, and authenticated sealed-tree membership before
+    parsing execution semantics. For authenticated hermes-legacy snapshots
+    only, tolerate additional ordinary scratch/state files while excluding
+    them from the sealed paths and authenticated bytes returned to execution.
+    Continue rejecting symlinks, special files, missing or changed sealed
+    members, and every unsealed entry for Archon snapshots. The code-owned
+    nodes/ and artifacts/ output roots plus exact .lock, run.json, and
+    events.jsonl files remain mutable exceptions for every profile. Bind command, script,
     and MCP resolution to the journal-corroborated sealed path set so
     higher-precedence additions and resolver-visible mutable outputs cannot
     become executable resources. Return the verified package and its sealed
@@ -3364,7 +3443,11 @@ upstream_changes:
     raw definition.yaml and policy.yaml bytes back to the original workflow and
     companion identities, preserve every other resource-relative identity, and
     require exactly one old package-digest match unless direct seals cover the
-    complete executable set or a whole-tree seal authenticates it. After parsing,
+    complete executable set or a whole-tree seal authenticates it. Derive
+    resume always_run node IDs only from
+    RunScheduler._load_verified_run_package, pass the resulting immutable set
+    into RunStore.resume_run, and never let the store reopen definition.yaml
+    before a durable resume transition. After parsing,
     require the derived resource closure to equal the preauthenticated path set
     exactly and repeat the winning raw digest comparison before execution.
     Verify the full scheduler load, not only a digest helper, against the
@@ -3390,6 +3473,10 @@ upstream_changes:
     policy, resources, package resources, inputs, and skills for both current
     and historical runs; reject over-limit files from metadata before opening
     them and detect replacement even when a canonical read is deduplicated.
+    Retain mutation-resistant coverage that makes same-byte normalizer drift
+    fail at verified scheduler load and pins production admission to accepting
+    512 canonical package files while refusing 513 before snapshot preparation
+    is entered or any run state is persisted.
     Every later
     command, named script, MCP definition and transitive local server, prompt
     skill, inline-agent skill, and input/template consumer must either read the
@@ -3488,11 +3575,13 @@ upstream_changes:
 - id: workflow-language-schema-cli
   change_class: workflow-compatibility
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - hermes_cli/main.py
   - plugins/workflow/language_schema.py
   - plugins/workflow/schema_cli.py
   - plugins/workflow/schema.py
+  - plugins/workflow/compat.py
   - plugins/workflow/cli.py
   - tests/hermes_cli/test_apply_profile_override.py
   - tests/plugins/workflow/test_language_schema.py
@@ -3502,19 +3591,22 @@ upstream_changes:
   - FieldCompatibility
   - StructuralRequirement
   - STRUCTURAL_REQUIREMENTS
-  - JSON truthiness schema helper
   - FIELD_INVENTORY
   - definition_field_names
   - common_node_field_names
+  - structural_node_field_names
+  - inapplicable_node_fields
   - sidecar_field_names
-  - nested parser field inventory accessors
   - definition_json_schema
   - sidecar_json_schema
   - compatibility_code_catalog
   - workflow_authoring_contract
-  - workflow schema CLI command
   - configure_schema_parser
   - emit_schema
+  owned_invariants:
+  - JSON truthiness schema helper
+  - nested parser field inventory accessors
+  - workflow schema CLI command
   - exact top-level workflow schema action resolution
   - parsed normal dispatch target precedence
   - workflow schema local and global profile option routing
@@ -3531,7 +3623,14 @@ upstream_changes:
     in schema.py, legacy top-level unknown fields permissive with warnings,
     Archon unknown fields strict, companion fields strict under both profiles,
     and every deferred annotation aligned with the runtime's stable finding
-    code, blocking status, and enforcement phase. Derive nested structural
+    code, blocking status, and enforcement phase. Keep structural_node_types
+    distinct from compatibility applicability: the schema and loader consume
+    the former, while known AI/provider fields remain structurally loadable on
+    other nodes so doctor can issue field_not_applicable. Derive those
+    production compatibility findings from the inventory's
+    applicable_node_types rather than a duplicate field-name policy. Publish
+    the bounded stable profile, normalizer, and unknown-top-level loader codes alongside
+    inventory-derived codes. Derive nested structural
     requirements from immutable inventory metadata, including script runtime,
     interactive-loop gate (including exact loader-compatible JSON truthiness),
     event-bound hook output (including loader-valid explicit null), retry,
@@ -3560,6 +3659,7 @@ upstream_changes:
 - id: workflow-language-desktop-status
   change_class: workflow-compatibility
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - plugins/workflow/projection_limits.py
   - plugins/workflow/cli.py
@@ -3592,11 +3692,17 @@ upstream_changes:
   - WORKFLOW_LANGUAGE_FINDINGS_PER_NODE_MAX
   - WORKFLOW_LANGUAGE_PACKAGE_FINDINGS_MAX
   - derive_compatibility_report_state
-  - WORKFLOW_COMPATIBILITY_FINDINGS_PER_NODE_MAX
-  - WORKFLOW_COMPATIBILITY_PACKAGE_FINDINGS_MAX
   - WORKFLOW_COMPATIBILITY_FINDINGS_MAX
+  - WORKFLOW_COMPATIBILITY_PAYLOAD_MAX_BYTES
+  - _bounded_author_text
+  - _disambiguated_author_path
+  - _FindingAccumulator
+  - CompatibilityReport.findings_truncated
+  - CompatibilityReport.finding_count
   - WORKFLOW_COMPATIBILITY_UNKNOWN_PATH
   - _sanitize_compatibility_finding_projection
+  - _sanitize_full_compatibility_projection
+  - _sanitize_catalog_item_projection
   - _catalog_language_projection
   - _compatibility_summary
   - _compatibility_projection
@@ -3620,6 +3726,8 @@ upstream_changes:
   - workflowLanguageDigest
   tests:
   - tests/plugins/workflow/test_catalog_api.py
+  - tests/plugins/workflow/test_workflow_catalog_desktop_e2e.py
+  - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
   - tests/plugins/workflow/test_workflow_detail_api.py
   - tests/plugins/workflow/test_workflow_language_desktop_e2e.py
   - apps/desktop/src/app/workflows/index.test.tsx
@@ -3631,14 +3739,31 @@ upstream_changes:
   merge_guidance: >-
     Preserve backend authority for profile resolution, normalization,
     compatibility findings, and Run eligibility. Keep catalog language status
-    and user compatibility summaries bounded, derive the full-report finding
-    ceiling from the complete definition projection's node, byte, and
-    container limits plus producer field inventories, retain the existing
-    verified showcase compatibility payload, and expose expanded metadata and
-    findings only in detail without generic sanitizer truncation. Full compatibility
-    responses must contain only the five projected finding fields and their
-    level/runnable pair must be derived from the complete finding set using the
-    same authority rule as CompatibilityReport. Preserve API-specific finding
+    and user compatibility summaries bounded, cap compatibility production at
+    512 insertion-ordered findings with O(1) `(code, path)` deduplication, and
+    reserve the final slot for one bounded aggregate truncation sentinel that
+    preserves omitted blocker state through the authoritative report-state
+    rule. Bound author-controlled paths and messages by their conservative
+    serialized JSON byte size (including Unicode and escape amplification),
+    and retain distinct truncated paths with a deterministic digest suffix so
+    every compatibility payload remains below 1 MiB. Deduplicate source
+    `(code, path)` keys only in the initial assessment pass, then normalize
+    report batches solely from ordered public dataclass values without hidden
+    provenance or a second source-dedup pass. When an authored literal occupies
+    a generated digest form, resolve it through a bounded deterministic
+    collision sequence and check every candidate before use, including through
+    wrapper appends; emitted distinct public keys must be an idempotent fixed
+    point under later normalization. Accept a truncation
+    sentinel only with a positive canonical omitted count, exactly 512 retained
+    findings, a non-portable aggregate, and consistent blocker state; accept
+    legacy response shapes only when they are complete and non-truncated.
+    Retain the verified showcase full-report
+    payload for old clients without passing its findings through generic list
+    clipping. Full compatibility responses must contain only the five projected
+    finding fields plus level, runnable, findings_truncated, and finding_count;
+    level/runnable must be derived from retained findings and the authoritative
+    omitted-state sentinel using the same rule as CompatibilityReport. Keep
+    project/profile catalog rows summary-only. Preserve API-specific finding
     sanitization, including the stable nonempty unknown-path marker when ANSI
     and filesystem-path redaction leave no diagnostic path. Desktop language
     data must remain optional for old-backend skew and strictly presentational:
@@ -3653,6 +3778,62 @@ upstream_changes:
     language projection with skew-safe read-only Desktop presentation and
     backend-owned compatibility and Run gating.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-language-desktop-capability-skew
+  change_class: workflow-compatibility
+  owner: workflow-orchestration
+  overlap_policy: any_owned_file
+  files:
+  - apps/desktop/src/app/workflows/catalog-run-policy.ts
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  - apps/desktop/src/i18n/types.ts
+  - apps/desktop/src/i18n/en.ts
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/i18n/zh.ts
+  - apps/desktop/src/i18n/zh-hant.ts
+  owned_symbols:
+  - desktopWorkflowRunDisabledReason
+  - desktopWorkflowLanguageLabel
+  - workflowLanguage
+  owned_invariants:
+  - fail-closed unknown and incoherent Desktop run-support handling
+  - explicit catalog-versus-detail Desktop Run policy shape
+  - null-safe absent, undefined, and null workflow readiness projections
+  - future workflow-language profile presentation
+  tests:
+  - apps/desktop/src/app/workflows/catalog-run-policy.test.ts
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/app/workflows/review-run-dialog.test.tsx
+  expected_commit_subject: 'fix(desktop): fail closed on workflow capability skew'
+  upstream_candidate: true
+  merge_guidance: >-
+    Keep one pure Desktop Run-disabled-reason resolver shared by catalog,
+    detail, and review-run surfaces. Unknown, absent, or incoherent run-support
+    projections must return localized generic unavailable copy before
+    compatibility, trust, and coordinator gates are considered. Preserve the
+    established supported:false schedule_required projection as the one known
+    scheduling-capability exception, with immediate and scheduled button gates
+    remaining separate. Require callers to identify catalog versus detail
+    explicitly rather than inferring the shape from coordinator presence.
+    Compatibility must report runnable:true on both shapes; detail and review
+    must additionally report coordinator healthy:true. Missing, undefined, or
+    null readiness projections fail closed and review alerts remain null-safe.
+    Treat language profiles as additive server-authored values: known profiles
+    retain localized labels, future nonblank strings are shown byte-for-byte,
+    and malformed or blank values use localized generic workflow language copy
+    instead of being relabeled as the current Archon version. Desktop remains
+    read-only and backend admission remains mutation authority.
+  removal_condition: >-
+    Remove when upstream Desktop provides an equivalent centralized,
+    locale-complete, fail-closed capability-skew policy across all workflow Run
+    surfaces and future-safe server-authored workflow-language labels.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-language-authoring-reference
   change_class: workflow-compatibility
   owner: workflow-orchestration
@@ -3664,8 +3845,10 @@ upstream_changes:
   - skills/software-development/workflow-builder/references/authoring-checklist.md
   owned_symbols:
   - Workflow YAML reference Phase 1 field inventory
+  - Legacy HERMES_WORKFLOW_RUN_DIR scratch and ARTIFACTS_DIR guidance
   - workflow-builder generated-contract authoring recipe
   - workflow-builder deferred-field decision recipe
+  - workflow-builder idle_timeout profile-unit decision
   - workflow language backend-version floor guidance
   - OTTO V1 incompatible authoring-skill guidance
   tests:
@@ -3679,7 +3862,11 @@ upstream_changes:
     unversioned hermes-legacy behavior for bytes consumed by pre-Phase-1
     backends that reject unknown companion fields. Keep deferred Archon fields
     as explicit two-choice authoring stops rather than silent legacy
-    downgrades, retain validate/doctor and digest-bound trust gates, and keep
+    downgrades, including legacy idle_timeout seconds versus Phase 3-deferred
+    Archon millisecond normalization. Retain validate/doctor and digest-bound
+    trust gates, keep
+    legacy scratch/state compatibility explicit while recommending
+    ARTIFACTS_DIR and denying added run-root files any execution authority, and keep
     the global create-workflow skill's OTTO V1 steps, produces, context_from,
     verify, and iterate shapes explicitly outside the Hermes authoring
     contract. Documentation may summarize generated inventory but must be
@@ -3694,11 +3881,14 @@ upstream_changes:
 - id: workflow-language-regression-gates
   change_class: workflow-testing
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - scripts/test_workflow_merge_gate.sh
   - tests/scripts/test_workflow_merge_gate.py
   - .github/workflows/ci.yml
   owned_symbols:
+  - PYTHON_BIN
+  owned_invariants:
   - Phase 1 language base merge-gate suite selection
   - Phase 1 language native portability matrix suite selection
   - relative PYTHON_BIN canonicalization before repository switching
@@ -3754,8 +3944,10 @@ upstream_changes:
   merge_guidance: >-
     Preserve retry state for the resilience showcase inside the executor-owned
     mutable artifacts namespace using ARTIFACTS_DIR. Never restore the marker
-    at the sealed run root or weaken sealed-snapshot default-deny to allow a
-    showcase-specific unsealed file. Restamp the authenticated package digest
+    at the run root merely because authenticated legacy snapshots tolerate
+    ordinary scratch/state files there: showcase state still belongs in the
+    executor-owned artifacts namespace and never gains execution authority.
+    Restamp the authenticated package digest
     whenever the bundled script changes.
   removal_condition: >-
     Remove when upstream's resilience retry fixture stores its runtime marker
@@ -3863,6 +4055,7 @@ upstream_changes:
 - id: workflow-rehearsal-executed-invariant-evidence
   change_class: workflow-testing
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - scripts/test_workflow_upstream_merge.sh
   - scripts/run_workflow_ledger_invariants.py
@@ -3871,11 +4064,46 @@ upstream_changes:
   - tests/scripts/test_workflow_upstream_merge.py
   - tests/scripts/test_check_upstream_customizations.py
   owned_symbols:
+  - load_and_validate_manifest
+  - _powershell_without_comments
+  - _shell_without_comments
+  - _ParserRequest
+  - _NonPythonSymbolResolver
+  - _run_parser_batch
+  - classify_upstream_overlaps
+  - _structured_spans
+  - _walk_yaml_nodes
+  - _WindowsJobContainment
+  - _POSIX_GROUP_BOOTSTRAP
+  - _terminate_process_group
+  - _execute_attempt
+  owned_invariants:
   - isolated execution and actual duration for every executable ledger test
   - reference-only evidence type without pass or duration fields
   - digest-bounded evidence names with separate exact repository paths
   - manifest ID and repository-path construction bounds
+  - language-aware comment ownership without exposing literals or heredoc bodies
+  - exact JSON and TOML lexical-token ranges compare only changed character spans, with cycle-safe YAML traversal
+  - strict manifest history, lexical paths, and Git-tree file types anchor to one resolved source revision
+  - only a successful exact zero-entry Git tree lookup means absent; tree and object failures remain terminal
+  - parser-derived broad JS, TS, and Markdown semantic syntax remains searchable
+  - parser-derived comments are excluded while non-comment HTML, literals, code, and prose remain searchable
+  - parser requests contain only exact committed Git blob bytes encoded as canonical base64
+  - parser and changed ranges use exact half-open UTF-8 byte spans
+  - parser protocol and dependency versions are explicitly attested
+  - parser batches execute sequentially within bounded input, output, and time limits
+  - parser transport, validation, and parse failures are terminal without lexical fallback
+  - overlap reports replace prior evidence atomically only after complete parser classification
+  - JSON and TOML ownership spans exclude numeric, boolean, null, date, and array scalar occurrences
+  - verification-only execution of trusted repository-controlled ledger tests, never user workflow YAML
+  - POSIX containment of the owned process group and descendants observed and identity-verified before reparenting across normal exit, timeout, interruption, and failure
+  - deliberately daemonizing pre-observation POSIX session escapes are unsupported and must not be ledgered
+  - detached committed-tree base-ref sealing excludes live untracked discovery and rejects dirty or symlinked tracked authority
+  - bounded root and Desktop dependency views remap workspace links to committed detached-checkout paths and reject broken or escaping links before execution, after every invariant group, and before a retryable attempt can retry
+  - writable Vitest cache state remains inside the disposable dependency view while external or constructed-view additions, replacements, and real dependency mutations stay terminal
+  - supervisor and Job Object bootstrap failures remain terminal infrastructure errors
   tests:
+  - apps/desktop/src/lib/json-rpc-gateway-url-guard.test.ts
   - tests/scripts/test_workflow_upstream_merge.py
   - tests/scripts/test_check_upstream_customizations.py
   expected_commit_subject: 'fix(workflow): execute ledger evidence invariants'
@@ -3885,22 +4113,79 @@ upstream_changes:
     its actual result and duration. Keep fixtures and runner paths visibly
     reference-only so they cannot satisfy execution requirements. Preserve
     exact test paths in a dedicated bounded field and use stable digests for
-    evidence labels.
+    evidence labels. Keep this developer, CI, upstream-merge, and release
+    verification path limited to trusted repository tests; it is not a user
+    workflow executor. On POSIX preserve owned-group cleanup plus observed,
+    PID/create-time-verified descendants, without claiming portable control of
+    a hostile child that starts a new session and reparents before observation.
   removal_condition: >-
     Remove when upstream emits equivalent schema-validated evidence that
     distinguishes actual execution from references, records real outcomes,
     and retains exact bounded paths without unbounded labels.
   last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
+- id: workflow-parser-backed-symbol-ownership
+  change_class: workflow-testing
+  owner: workflow-orchestration
+  overlap_policy: owned_symbol
+  files:
+  - package.json
+  - package-lock.json
+  - scripts/extract_non_python_symbols.mjs
+  - scripts/check_upstream_customizations.py
+  - scripts/test_workflow_merge_gate.sh
+  owned_symbols:
+  - PROTOCOL_VERSION
+  - extractTypeScriptSpans
+  - extractQualifiedTypeScriptSpans
+  - extractMarkdownSpans
+  - _NonPythonSymbolResolver
+  - _run_parser_batch
+  - _git_changed_byte_ranges
+  - _require_root_dependencies
+  - 6.0.3
+  - 11.0.5
+  - 11.0.0
+  - 4.0.2
+  owned_invariants:
+  - parser requests contain only exact committed Git blob bytes selected by Python authority
+  - parser-derived broad syntax spans exclude comments and use half-open UTF-8 byte offsets
+  - exact character-level Git diffs are bounded independently and fail closed before overlap classification
+  - exact parser versions and bounded sequential batches fail closed without a lexical fallback
+  - overlap reports replace prior evidence atomically only after complete parser success
+  - detached base and brand gates validate the bounded root parser dependency view before checker execution
+  tests:
+  - tests/scripts/test_extract_non_python_symbols.py
+  - tests/scripts/test_check_upstream_customizations.py
+  - tests/scripts/test_workflow_merge_gate.py
+  expected_commit_subject: 'feat(workflow): add bounded symbol parser helper'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve Python authority over committed revisions and overlap policy while
+    using the exact pinned parser helper for broad JS, TS, and Markdown spans.
+  removal_condition: >-
+    Remove when upstream provides equivalent committed-byte parser extraction,
+    bounded fail-closed transport, exact byte overlap, and atomic reporting.
+  last_verified_upstream: aaf5691261f12601db845386d650dce1cdfa30f9
 - id: workflow-ledger-subprocess-environment-isolation
   change_class: workflow-testing
   owner: workflow-orchestration
+  overlap_policy: any_owned_file
   files:
   - scripts/run_workflow_ledger_invariants.py
   - tests/scripts/test_workflow_upstream_merge.py
   owned_symbols:
+  - _WindowsJobContainment
+  - _POSIX_GROUP_BOOTSTRAP
+  - _terminate_process_group
+  - _execute_attempt
+  owned_invariants:
   - absolute virtualenv-preserving Python test interpreter
   - scrubbed orchestration-only subprocess controls
   - preserved ordinary invariant-test environment
+  - stable owned process-group identity until cleanup completes
+  - observed POSIX descendants retain PID/create-time identity checks before out-of-group signals
+  - deliberately daemonizing pre-observation POSIX session escapes are outside the trusted ledger-test contract
+  - Windows Job Object assignment before the actual test command can spawn
   tests:
   - tests/scripts/test_workflow_upstream_merge.py
   - tests/scripts/test_workflow_merge_gate.py
@@ -3910,7 +4195,9 @@ upstream_changes:
     Preserve the active virtualenv entry point without resolving it to a base
     interpreter, and remove only orchestration-specific Python and merge-gate
     controls from each invariant-test child. Ordinary environment values must
-    remain available to the test process.
+    remain available to the test process. Keep the runner scoped to trusted
+    repository verification tests rather than normal agent runtime or user
+    workflow YAML execution.
   removal_condition: >-
     Remove when upstream provides equivalent per-test evidence execution that
     cannot inherit orchestration-only interpreter or pytest controls and still

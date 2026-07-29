@@ -94,15 +94,21 @@ support ships.
 
 | Profile | Code | Fields | Status | Enforcement phase |
 | --- | --- | --- | --- | ---: |
+| Both | `workflow_language_profile_unsupported` | `sidecar.language_compatibility` | Blocking | 1 |
+| Both | `workflow_normalizer_version_unsupported` | `normalizer_version` | Blocking | 1 |
+| Archon | `archon_unknown_top_level_field` | Any unknown top-level field | Blocking | 1 |
 | Archon | `archon_output_format_unavailable` | `nodes[].output_format` | Blocking | 2 |
 | Archon | `archon_output_type_unavailable` | `nodes[].output_type` | Blocking | 2 |
+| Archon | `archon_idle_timeout_semantics_unavailable` | `nodes[].idle_timeout` | Blocking | 3 |
 | Archon | `archon_retry_semantics_unavailable` | `nodes[].retry` | Blocking | 3 |
 | Archon | `archon_timeout_semantics_unavailable` | `nodes[].timeout` | Blocking | 3 |
 | Archon | `archon_budget_enforcement_unavailable` | `nodes[].maxBudgetUsd` | Blocking | 5 |
 | Archon | `archon_sandbox_enforcement_unavailable` | `sandbox`, `nodes[].sandbox` | Blocking | 5 |
 | Legacy | `legacy_language_profile` | `sidecar.language_compatibility` | Warning | 1 |
+| Legacy | `unknown_top_level_field` | Any unknown top-level field | Warning | 1 |
 | Legacy | `legacy_output_format_post_validation` | `nodes[].output_format` | Warning | 2 |
 | Legacy | `legacy_output_type_not_published` | `nodes[].output_type` | Warning | 2 |
+| Legacy | `legacy_idle_timeout_seconds` | `nodes[].idle_timeout` | Warning | 3 |
 | Legacy | `legacy_retry_total_attempts` | `nodes[].retry.max_attempts` | Warning | 3 |
 | Legacy | `legacy_timeout_seconds` | `nodes[].timeout` | Warning | 3 |
 
@@ -150,7 +156,7 @@ dependencies, and references are validated as one acyclic graph.
 | `when` | Nonempty condition over upstream `$node.output` values. | Enforced with current Phase 1 condition behavior |
 | `trigger_rule` | `all_success`, `one_success`, `none_failed_min_one_success`, or `all_done`. | Enforced |
 | `context` | `fresh` or `shared`; shared resumes only a cache-fingerprint-compatible predecessor. | Mapped and cache-enforced |
-| `idle_timeout` | Positive number of seconds for the node's current semantic-idle bound, capped by Hermes policy. | Enforced |
+| `idle_timeout` | Positive number. Hermes legacy executes the authored value as seconds; Archon millisecond normalization is deferred. | Legacy-only; blocked pending Phase 3 (`archon_idle_timeout_semantics_unavailable`) |
 | `retry` | Retry object documented below; unavailable as an Archon semantic block in Phase 1. | Legacy-only; blocked pending Phase 3 (`archon_retry_semantics_unavailable`) |
 | `always_run` | Boolean graph scheduling flag. | Enforced |
 | `output_type` | Nonempty type label. Legacy accepts it but does not publish a typed artifact. | Legacy-only; blocked pending Phase 2 (`archon_output_type_unavailable`) |
@@ -174,6 +180,12 @@ Phase 1, with enforcement-phase metadata 3
 companion `limits.subprocess_timeout_seconds` today when a package only needs a
 stricter Hermes process-policy ceiling; that is not an Archon `timeout`
 conversion.
+
+Node `idle_timeout` follows the same profile boundary: its current
+`hermes-legacy` runtime value remains seconds and emits
+`legacy_idle_timeout_seconds`. The `archon-2026-07` field blocks with
+`archon_idle_timeout_semantics_unavailable` until Phase 3 provides the reviewed
+millisecond normalization. Phase 1 does not reinterpret the authored value.
 
 ### Command and prompt fields
 
@@ -314,6 +326,21 @@ File and document sources are copied into the run's immutable `inputs/`
 snapshot before admission. Nodes must read that snapshot, not reopen the
 original mutable source path.
 
+### Runtime scratch state and artifacts
+
+Legacy workflows may keep ordinary scratch or state files under the directory
+advertised by `HERMES_WORKFLOW_RUN_DIR`. This preserves scripts that wrote
+beside run metadata before language profiles were introduced. Those added
+files are never added to the admitted sealed resource set and cannot become a
+command, script, skill, input, MCP definition, or other execution resource.
+Symlinks and special files remain invalid, and any missing or changed sealed
+member still stops verification.
+
+Use `ARTIFACTS_DIR` for durable node output whenever possible. It is the
+recommended executor-owned output location and avoids coupling a workflow to
+the layout of the run root. The legacy scratch allowance is compatibility
+behavior, not an authority or portability guarantee for the Archon profile.
+
 ### Lifecycle and resource units
 
 `limits` recognizes these current profile keys. A companion value can tighten,
@@ -424,15 +451,16 @@ Archon node `timeout` field.
 3. Convert units or semantics only when a later generated contract no longer
    blocks them. An enforcement-phase number alone is not evidence of
    availability. In Phase 1, do not convert `output_format`, `output_type`,
-   `timeout`, `retry`, `maxBudgetUsd`, or `sandbox` into Archon claims.
+   `idle_timeout`, `timeout`, `retry`, `maxBudgetUsd`, or `sandbox` into Archon
+   claims.
 4. Remove any blocker, then declare
    `language_compatibility: archon-2026-07` in the companion.
 5. Rerun validate and doctor. Review and trust the new exact digest before a
    run.
 
 Phase 1 explicitly blocks structured `output_format`, published `output_type`,
-Archon timeout and retry meanings, enforceable portable budget, and sandbox
-portability. It does not execute Phase 2+ semantics early.
+Archon idle-timeout/timeout and retry meanings, enforceable portable budget,
+and sandbox portability. It does not execute Phase 2+ semantics early.
 
 The legacy global `create-workflow` skill is not an authoring authority for
 Hermes. OTTO V1 `steps`, `produces`, `context_from`, `verify`, and `iterate`

@@ -60,7 +60,11 @@ def test_expired_lease_interrupts_and_stale_completion_cannot_win(
         admitted.run_id, now=old.lease_expires_at + timedelta(seconds=1)
     ) == ("start",)
     assert store.load_run(admitted.run_id)["status"] == "interrupted"
-    store.resume_run(admitted.run_id)
+    always_run_nodes = RunScheduler(store).verified_always_run_nodes(admitted.run_id)
+    store.resume_run(
+        admitted.run_id,
+        always_run_nodes=always_run_nodes,
+    )
     replacement = store.claim_node(admitted.run_id, "start", "replacement")
     assert replacement is not None
 
@@ -290,14 +294,21 @@ def test_live_replay_safe_attempt_cannot_resume_until_termination_is_proven(
     store.expire_stale_claims(
         admitted.run_id, now=claim.lease_expires_at + timedelta(seconds=1)
     )
+    always_run_nodes = RunScheduler(store).verified_always_run_nodes(admitted.run_id)
 
     with pytest.raises(RuntimeError, match="executor is still running"):
-        store.resume_run(admitted.run_id)
+        store.resume_run(
+            admitted.run_id,
+            always_run_nodes=always_run_nodes,
+        )
     with pytest.raises(ValueError, match="replay-safe"):
         store.retry_run(admitted.run_id, node_id="start")
 
     assert store.record_process_stopped(claim, identity, cleaned=True)
-    resumed = store.resume_run(admitted.run_id)
+    resumed = store.resume_run(
+        admitted.run_id,
+        always_run_nodes=always_run_nodes,
+    )
     assert resumed["status"] == "running"
     assert resumed["nodes"]["start"]["state"] == "ready"
 
@@ -647,10 +658,15 @@ def test_resume_reruns_only_always_run_nodes(tmp_path, workflow_writer):
         )
     )
     admitted = _run(store, package)
-    RunScheduler(store).advance(admitted.run_id)
+    scheduler = RunScheduler(store)
+    scheduler.advance(admitted.run_id)
     assert store.load_run(admitted.run_id)["status"] == "failed"
+    always_run_nodes = scheduler.verified_always_run_nodes(admitted.run_id)
 
-    resumed = store.resume_run(admitted.run_id)
+    resumed = store.resume_run(
+        admitted.run_id,
+        always_run_nodes=always_run_nodes,
+    )
 
     assert resumed["nodes"]["cached"]["state"] == "succeeded"
     assert resumed["nodes"]["refresh"]["state"] == "ready"

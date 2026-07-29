@@ -508,6 +508,8 @@ def _compatibility_projection(compatibility) -> dict[str, object]:
     return {
         "level": compatibility.level.value,
         "runnable": compatibility.runnable,
+        "findings_truncated": compatibility.findings_truncated,
+        "finding_count": compatibility.finding_count,
         "findings": [
             {
                 "path": finding.path,

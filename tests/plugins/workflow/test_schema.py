@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from plugins.workflow import schema as schema_module
-from plugins.workflow.models import WorkflowValidationError
+from plugins.workflow.models import WorkflowLanguageProfile, WorkflowValidationError
 from plugins.workflow.schema import load_workflow, validate_package
 
 
@@ -156,6 +156,24 @@ def test_companion_selects_archon_profile(workflow_writer, tmp_path):
 
     assert package.language.effective_profile.value == "archon-2026-07"
     assert package.source_definition == package.definition
+
+
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+def test_idle_timeout_loader_preserves_the_authored_runtime_value(
+    workflow_writer, tmp_path, profile
+):
+    path = workflow_writer(
+        tmp_path / profile.value,
+        nodes=[{"id": "agent", "prompt": "x", "idle_timeout": 1_234.5}],
+    )
+    if profile is WorkflowLanguageProfile.ARCHON_2026_07:
+        path.with_name(f"{path.stem}.hermes.yaml").write_text(
+            f"language_compatibility: {profile.value}\n", encoding="utf-8"
+        )
+
+    package = load_workflow(path)
+
+    assert package.definition.nodes[0].options["idle_timeout"] == 1_234.5
 
 
 @pytest.mark.parametrize(

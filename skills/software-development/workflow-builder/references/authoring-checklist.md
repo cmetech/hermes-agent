@@ -20,6 +20,10 @@ Before writing files:
   blocking contract evidence are shown.
 - Describe contract phase numbers only as enforcement-phase metadata, never as
   delivery dates, availability promises, or schedules.
+- Treat node `idle_timeout` as a blocking Archon field in Phase 1. Its current
+  `hermes-legacy` value is seconds (`legacy_idle_timeout_seconds`); Archon
+  millisecond normalization remains deferred to Phase 3, so never reinterpret
+  the authored value during profile conversion.
 - For shared package bytes, establish the oldest backend. Keep the companion
   unversioned while any consumer predates `language_compatibility` support.
 - Translate any legacy `create-workflow` request into `nodes`; do not adopt
@@ -45,7 +49,7 @@ Before offering execution or scheduling:
 - Resource ceilings cover workers, parallel nodes, lifecycle seconds, total
   attempts, descendants, CPU, memory, and admission capacity.
 - Hermes `limits` and `resource_limits` are described as execution policy, not
-  deferred Archon timeout, budget, retry, or sandbox semantics.
+  deferred Archon idle-timeout, timeout, budget, retry, or sandbox semantics.
 - Run `PRODUCT_CLI workflow validate PACKAGE --json`, then
   `PRODUCT_CLI workflow doctor PACKAGE --compat-report --json`. Doctor remains
   model-free, network-free, and MCP-connection-free.

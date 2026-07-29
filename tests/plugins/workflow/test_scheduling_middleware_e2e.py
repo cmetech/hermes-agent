@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import shutil
-import sys
 import threading
 import time
 
@@ -159,26 +159,16 @@ def _leader(
     return coordinator, identity, acquired.lease.epoch
 
 
-def _production_client(
-    monkeypatch: pytest.MonkeyPatch,
-    clocks: _Clocks,
-) -> tuple[TestClient, object]:
+@contextmanager
+def _production_client(monkeypatch: pytest.MonkeyPatch):
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    mounted_route = next(
-        route
-        for route in web_server.app.routes
-        if getattr(route, "path", None) == "/api/plugins/workflow/runs"
-    )
-    mounted_plugin = sys.modules[mounted_route.endpoint.__module__]
-    mounted_plugin._close_runtime()
-    monkeypatch.setattr(mounted_plugin, "_schedule_now_utc", clocks.utcnow)
-    client = TestClient(
+    with TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
-    )
-    return client, mounted_plugin
+    ) as client:
+        yield client
 
 
 def _schedule_showcase(
@@ -280,9 +270,10 @@ def _run_events(store: RunStore, run_id: str, event_type: str) -> list[dict]:
     ]
 
 
-def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
+def _run_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -295,7 +286,6 @@ def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
     coordinator, identity, epoch = _leader(store, clocks, "task-4-7-success")
     runner = _RecordingAIRunner()
     binding = _binding(runner)
-    client, mounted_plugin = _production_client(monkeypatch, clocks)
     service, scheduler = _service_and_scheduler(
         home, store, clocks, identity, epoch, binding
     )
@@ -303,13 +293,10 @@ def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
     try:
         from hermes_cli import web_server
 
-        unauthenticated_client = TestClient(web_server.app)
-        try:
+        with TestClient(web_server.app) as unauthenticated_client:
             unauthenticated = unauthenticated_client.get(
                 "/api/plugins/workflow/workflows"
             )
-        finally:
-            unauthenticated_client.close()
         assert unauthenticated.status_code == 401
         run_id, schedule_at = _schedule_showcase(
             client,
@@ -385,16 +372,15 @@ def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
         assert _ProviderTrap.requests == 0
     finally:
         scheduler.shutdown(deadline_seconds=5)
-        client.close()
-        mounted_plugin._close_runtime()
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
-def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
+def _run_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -406,7 +392,6 @@ def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
     store = RunStore(home, lease_clock=clocks.lease_sample)
     coordinator, identity, epoch = _leader(store, clocks, "task-4-7-cancel")
     runner = _RecordingAIRunner()
-    client, mounted_plugin = _production_client(monkeypatch, clocks)
 
     try:
         run_id, schedule_at = _schedule_showcase(
@@ -431,8 +416,6 @@ def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
             event["event_type"] == "run_cancelled" for event in events.json()["events"]
         )
 
-        client.close()
-        mounted_plugin._close_runtime()
         restarted = RunStore(home, lease_clock=clocks.lease_sample)
         clocks.wall = datetime.fromisoformat(schedule_at.replace("Z", "+00:00"))
         service, scheduler = _service_and_scheduler(
@@ -464,18 +447,39 @@ def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
         assert runner.requests == []
         assert _ProviderTrap.requests == 0
     finally:
-        client.close()
-        mounted_plugin._close_runtime()
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
-def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = tmp_path / "home"
+    with _production_client(monkeypatch) as client:
+        _run_authenticated_run_later_defers_real_wake_then_executes_checkpoint_once(
+            tmp_path, monkeypatch, client
+        )
+
+
+def test_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _production_client(monkeypatch) as client:
+        _run_authenticated_cancel_before_fire_retains_evidence_and_never_executes(
+            tmp_path, monkeypatch, client
+        )
+
+
+def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _run_restart_and_index_reconstruction_across_lifespans(tmp_path, monkeypatch)
+
+
+def _run_restart_and_index_reconstruction_across_lifespans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "lifespan-rebuild"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
     provider, base_url = _provider_trap()
@@ -483,75 +487,98 @@ def test_restart_and_index_reconstruction_preserve_schedule_and_exactly_once(
     showcase_module._clear_verified_showcase_cache_for_tests()
     clocks = _Clocks()
     store = RunStore(home, lease_clock=clocks.lease_sample)
-    coordinator, identity, epoch = _leader(store, clocks, "task-4-7-rebuild")
+    coordinator, identity, epoch = _leader(store, clocks, "task-7-lifespan-rebuild")
     runner = _RecordingAIRunner()
-    client, mounted_plugin = _production_client(monkeypatch, clocks)
-
+    sweep_results = []
     try:
-        run_id, schedule_at = _schedule_showcase(
-            client,
-            clocks,
-            workflow="scheduling",
-            key="task-4-7-scheduling-rebuild",
+        with _production_client(monkeypatch) as first_client:
+            run_id, schedule_at = _schedule_showcase(
+                first_client,
+                clocks,
+                workflow="scheduling",
+                key="task-7-lifespan-rebuild",
+            )
+            worker = first_client.get(
+                "/api/plugins/workflow/runs/not-a-real-run/events"
+            )
+            assert worker.status_code == 404
+        assert not any(
+            thread.name.startswith("workflow-store-io")
+            for thread in threading.enumerate()
         )
-        client.close()
-        mounted_plugin._close_runtime()
+
         store.database.unlink()
-
         rebuilt = RunStore(home, lease_clock=clocks.lease_sample)
-        with rebuilt._connect() as connection:
-            indexed = connection.execute(
-                "SELECT status, scheduled_at FROM runs WHERE run_id=?",
-                (run_id,),
-            ).fetchone()
-        assert tuple(indexed) == ("queued", schedule_at)
         assert rebuilt.load_run(run_id)["run_metadata"]["schedule_at"] == schedule_at
-
-        restarted_coordinator, restarted_identity, restarted_epoch = _leader(
-            rebuilt, clocks, "task-4-7-rebuilt-leader"
-        )
-        clocks.wall = datetime.fromisoformat(schedule_at.replace("Z", "+00:00"))
-        service, scheduler = _service_and_scheduler(
-            home,
-            rebuilt,
-            clocks,
-            restarted_identity,
-            restarted_epoch,
-            _binding(runner),
-        )
-        try:
-            service._sweep_once(
+        with _production_client(monkeypatch) as second_client:
+            detail = second_client.get(f"/api/plugins/workflow/runs/{run_id}")
+            assert detail.status_code == 200, detail.text
+            assert detail.json()["schedule_at"] == schedule_at
+            restarted, restarted_identity, restarted_epoch = _leader(
+                rebuilt, clocks, "task-7-rebuilt-leader"
+            )
+            clocks.wall = datetime.fromisoformat(schedule_at.replace("Z", "+00:00"))
+            service, scheduler = _service_and_scheduler(
+                home,
                 rebuilt,
-                restarted_coordinator,
+                clocks,
                 restarted_identity,
                 restarted_epoch,
-                scheduler,
+                _binding(runner),
             )
-            terminal = _wait_for_terminal(rebuilt, run_id)
-            service._sweep_once(
-                rebuilt,
-                restarted_coordinator,
-                restarted_identity,
-                restarted_epoch,
-                scheduler,
-            )
-            time.sleep(0.05)
-        finally:
-            scheduler.shutdown(deadline_seconds=5)
+            try:
+                sweep_results.append(
+                    service._sweep_once(
+                        rebuilt,
+                        restarted,
+                        restarted_identity,
+                        restarted_epoch,
+                        scheduler,
+                    )
+                )
+                terminal = _wait_for_terminal(rebuilt, run_id)
+                first_response = second_client.get(
+                    f"/api/plugins/workflow/runs/{run_id}"
+                )
+                assert first_response.status_code == 200, first_response.text
+                first_projection = first_response.json()
+                first_promoted = _run_events(rebuilt, run_id, "run_promoted")
+                first_node_succeeded = _run_events(
+                    rebuilt, run_id, "node_succeeded"
+                )
+                first_run_succeeded = _run_events(rebuilt, run_id, "run_succeeded")
 
-        # Surface last_error: a bare status comparison told us only
-        # "failed != succeeded" on Windows CI, with no way to tell whether
-        # the node crashed, the runtime was missing, or a lease expired.
+                sweep_results.append(
+                    service._sweep_once(
+                        rebuilt,
+                        restarted,
+                        restarted_identity,
+                        restarted_epoch,
+                        scheduler,
+                    )
+                )
+                second_response = second_client.get(
+                    f"/api/plugins/workflow/runs/{run_id}"
+                )
+                assert second_response.status_code == 200, second_response.text
+            finally:
+                scheduler.shutdown(deadline_seconds=5)
         assert terminal["status"] == "succeeded", terminal.get("last_error")
+        assert len(sweep_results) == 2
+        assert sweep_results[0][0] is True
+        assert sweep_results[1][0] is False
         assert terminal["run_metadata"]["schedule_at"] == schedule_at
-        assert len(_run_events(rebuilt, run_id, "run_promoted")) == 1
-        assert len(_run_events(rebuilt, run_id, "node_succeeded")) == 1
-        assert len(_run_events(rebuilt, run_id, "run_succeeded")) == 1
+        assert second_response.json() == first_projection
+        assert second_response.json()["state_version"] == terminal["state_version"]
+        assert len(first_promoted) == 1
+        assert _run_events(rebuilt, run_id, "run_promoted") == first_promoted
+        assert len(first_node_succeeded) == 1
+        assert _run_events(rebuilt, run_id, "node_succeeded") == first_node_succeeded
+        assert len(first_run_succeeded) == 1
+        assert _run_events(rebuilt, run_id, "run_succeeded") == first_run_succeeded
         assert runner.requests == []
         assert _ProviderTrap.requests == 0
     finally:
-        client.close()
-        mounted_plugin._close_runtime()
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
@@ -572,6 +599,20 @@ def test_scheduled_ai_revalidates_actual_runner_and_runtime_before_claim(
     expected_status: str,
     expected_requests: int,
 ) -> None:
+    with _production_client(monkeypatch) as client:
+        _run_scheduled_ai_revalidates_actual_runner_and_runtime_before_claim(
+            tmp_path, monkeypatch, context, expected_status, expected_requests, client
+        )
+
+
+def _run_scheduled_ai_revalidates_actual_runner_and_runtime_before_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    context: str,
+    expected_status: str,
+    expected_requests: int,
+    client: TestClient,
+) -> None:
     home = tmp_path / context
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
@@ -582,7 +623,6 @@ def test_scheduled_ai_revalidates_actual_runner_and_runtime_before_claim(
     store = RunStore(home, lease_clock=clocks.lease_sample)
     coordinator, identity, epoch = _leader(store, clocks, f"task-4-7-{context}")
     runner = _RecordingAIRunner()
-    client, mounted_plugin = _production_client(monkeypatch, clocks)
 
     try:
         run_id, schedule_at = _schedule_showcase(
@@ -622,8 +662,6 @@ def test_scheduled_ai_revalidates_actual_runner_and_runtime_before_claim(
         else:
             assert len(_run_events(store, run_id, "run_promoted")) == 1
     finally:
-        client.close()
-        mounted_plugin._close_runtime()
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()

@@ -1766,6 +1766,7 @@ export const ja = defineLocale({
     workflowUntrusted: '未信頼',
     workflowVerifiedBundle: '検証済みバンドル',
     workflowIncompatible: '非互換',
+    workflowLanguage: 'ワークフロー言語',
     workflowLanguageArchon: 'Archon 2026-07',
     workflowLanguageLegacy: 'レガシー動作',
     workflowLanguageLegacyDescription:

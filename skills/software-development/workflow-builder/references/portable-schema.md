@@ -50,6 +50,7 @@ Phase 1 intentionally blocks these Archon declarations:
 | --- | --- | ---: | --- |
 | AI `output_format` | `archon_output_format_unavailable` | 2 | Post-generation JSON Schema validation; `legacy_output_format_post_validation`. |
 | Any `output_type` | `archon_output_type_unavailable` | 2 | Accepted but no typed artifact is published; `legacy_output_type_not_published`. |
+| Node `idle_timeout` | `archon_idle_timeout_semantics_unavailable` | 3 | Positive seconds without reinterpretation; `legacy_idle_timeout_seconds`. Archon millisecond normalization is deferred to Phase 3. |
 | Bash/script `timeout` | `archon_timeout_semantics_unavailable` | 3 | Positive seconds; `legacy_timeout_seconds`. |
 | Node `retry` | `archon_retry_semantics_unavailable` | 3 | `max_attempts` counts total attempts and `delay_ms` is milliseconds; `legacy_retry_total_attempts`. |
 | `maxBudgetUsd` | `archon_budget_enforcement_unavailable` | 5 | Provider-capability mapping only; not a portable guarantee. |
@@ -65,6 +66,12 @@ Selecting effective or explicit legacy also produces the profile warning
 `legacy_language_profile`. Phase numbers above only report the generated
 contract's enforcement-phase metadata; they do not promise when support ships.
 
+The generated catalog also publishes loader/profile failures that are not tied
+to one declared inventory field: `workflow_language_profile_unsupported`,
+`workflow_normalizer_version_unsupported`, legacy `unknown_top_level_field`,
+and Archon `archon_unknown_top_level_field`. Preserve those codes when
+reporting validation failures; do not collapse them to a generic parse error.
+
 ## Portable YAML shape
 
 Required top-level fields are `name`, `description`, and a nonempty `nodes`
@@ -79,6 +86,12 @@ provider/model selection, `persist_session`, `allowed_tools`, `denied_tools`,
 fallbacks when doctor confirms the Hermes mapping. Tool aliases such as
 `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `WebFetch`, `WebSearch`, and
 `Agent` are resolved by doctor; unknown aliases block.
+
+Treat `idle_timeout` as profile-sensitive even though it is structurally valid
+on every node. Hermes legacy interprets the authored value as seconds and
+emits `legacy_idle_timeout_seconds`. Under `archon-2026-07`, it blocks with
+`archon_idle_timeout_semantics_unavailable`; do not convert or reinterpret the
+value until Phase 3 supplies Archon millisecond normalization.
 
 Script nodes require `runtime: uv` or `runtime: bun`; named scripts resolve
 below `scripts/`. Named command templates resolve below `commands/`. MCP names

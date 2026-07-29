@@ -9,11 +9,11 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
-import sys
 import threading
 import time
 
 from fastapi.testclient import TestClient
+import pytest
 
 from agent.plugin_agent import PluginAgentRunner
 from hermes_cli.plugin_services import BackgroundServiceContext
@@ -117,22 +117,16 @@ def _stop_service(
     assert not thread.is_alive()
 
 
-def _production_client(monkeypatch) -> tuple[TestClient, object]:
+@contextmanager
+def _production_client(monkeypatch):
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    mounted_route = next(
-        route
-        for route in web_server.app.routes
-        if getattr(route, "path", None) == "/api/plugins/workflow/runs"
-    )
-    mounted_plugin = sys.modules[mounted_route.endpoint.__module__]
-    mounted_plugin._close_runtime()
-    client = TestClient(
+    with TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
-    )
-    return client, mounted_plugin
+    ) as client:
+        yield client
 
 
 def _exact_start_material(status: dict[str, object]) -> dict[str, object]:
@@ -299,18 +293,20 @@ def _assert_canaries_absent_from_operator_material(
         assert all(encoded not in response for response in responses), canary
 
 
-def _exercise_laptop_branch(
+def _run_laptop_branch(
     tmp_path,
     monkeypatch,
     caplog,
     *,
     branch: str,
+    client: TestClient,
+    stop_service=_stop_service,
 ) -> tuple[dict[str, object], int]:
     home = tmp_path / "home"
-    copied = tmp_path / "showcases"
-    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_OFFLINE", "1")
+    copied = tmp_path / "showcases"
+    shutil.copytree(Path(showcase_module.__file__).with_name("showcases"), copied)
     monkeypatch.setattr(
         showcase_module,
         "_bundle_path",
@@ -379,7 +375,6 @@ def _exercise_laptop_branch(
 
         monkeypatch.setattr(PluginAgentRunner, "run", forbidden_real_run)
 
-    client, mounted_plugin = _production_client(monkeypatch)
     stop = None
     thread = None
     idempotency_key = f"laptop-diagnostic-task-2-6-{branch}"
@@ -498,9 +493,10 @@ def _exercise_laptop_branch(
             )
             assert outcome["nodes"]["review-plan"]["approval_rework_attempts"] == 1
 
-        _stop_service(store, stop, thread)
+        active_stop, active_thread = stop, thread
         stop = None
         thread = None
+        stop_service(store, active_stop, active_thread)
         final_status, start_material = _assert_exact_identity_and_limits(
             store,
             run_id,
@@ -536,10 +532,37 @@ def _exercise_laptop_branch(
         )
         return final_status, real_runner_calls
     finally:
-        _stop_service(store, stop, thread)
-        client.close()
-        mounted_plugin._close_runtime()
+        if stop is not None or thread is not None:
+            active_stop, active_thread = stop, thread
+            stop = None
+            thread = None
+            stop_service(store, active_stop, active_thread)
         showcase_module._clear_verified_showcase_cache_for_tests()
+
+
+def _exercise_laptop_branch(
+    tmp_path,
+    monkeypatch,
+    caplog,
+    *,
+    branch: str,
+    after_client_start=None,
+    stop_service=_stop_service,
+) -> tuple[dict[str, object], int]:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_OFFLINE", "1")
+    with _production_client(monkeypatch) as client:
+        if after_client_start is not None:
+            after_client_start(client)
+        return _run_laptop_branch(
+            tmp_path,
+            monkeypatch,
+            caplog,
+            branch=branch,
+            client=client,
+            stop_service=stop_service,
+        )
 
 
 def test_laptop_diagnostic_real_middleware_approves_to_succeeded(
@@ -576,3 +599,55 @@ def test_laptop_diagnostic_real_middleware_rejects_with_bounded_offline_rework(
     assert outcome["status"] == "cancelled"
     assert outcome["nodes"]["review-plan"]["approval_rework_attempts"] == 1
     assert real_runner_calls == 0
+
+
+def test_laptop_client_lifespan_exits_after_post_enter_setup_failure(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    def fail_after_worker_starts(client: TestClient) -> None:
+        response = client.get("/api/plugins/workflow/runs/not-a-real-run/events")
+        assert response.status_code == 404
+        raise RuntimeError("post-enter setup failure")
+
+    with pytest.raises(RuntimeError, match="post-enter setup failure"):
+        _exercise_laptop_branch(
+            tmp_path,
+            monkeypatch,
+            caplog,
+            branch="approve",
+            after_client_start=fail_after_worker_starts,
+        )
+    assert not any(
+        thread.name.startswith("workflow-store-io")
+        for thread in threading.enumerate()
+    )
+
+
+def test_laptop_client_lifespan_exits_when_service_cleanup_raises(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    cleanup_calls = []
+
+    def start_worker(client: TestClient) -> None:
+        response = client.get("/api/plugins/workflow/runs/not-a-real-run/events")
+        assert response.status_code == 404
+
+    def stop_then_raise(store, stop, thread) -> None:
+        cleanup_calls.append((stop, thread))
+        _stop_service(store, stop, thread)
+        raise RuntimeError("service cleanup failure #1")
+
+    with pytest.raises(RuntimeError, match="service cleanup failure #1"):
+        _exercise_laptop_branch(
+            tmp_path,
+            monkeypatch,
+            caplog,
+            branch="approve",
+            after_client_start=start_worker,
+            stop_service=stop_then_raise,
+        )
+    assert len(cleanup_calls) == 1
+    assert not any(
+        thread.name.startswith("workflow-store-io")
+        for thread in threading.enumerate()
+    )

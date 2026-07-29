@@ -12,6 +12,8 @@ from typing import Any
 import yaml
 
 from plugins.workflow.language import (
+    ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
+    UNKNOWN_TOP_LEVEL_FIELD_CODE,
     WORKFLOW_NORMALIZER_VERSION,
     WorkflowLanguageCompatibilityError,
     language_compatibility_findings,
@@ -32,6 +34,7 @@ from plugins.workflow.language_schema import (
     loop_field_names,
     retry_field_names,
     sidecar_field_names,
+    structural_node_field_names,
 )
 from plugins.workflow.models import (
     ValidationIssue,
@@ -195,9 +198,7 @@ def _source_lines(text: str) -> tuple[dict[str, int], list[dict[str, int]]]:
     return top, node_lines
 
 
-def _validate_retry(value: Any, path: str, *, node_type: str) -> None:
-    if node_type == "loop":
-        _fail(path, "loop_retry", f"{path} is not supported for loop nodes")
+def _validate_retry(value: Any, path: str) -> None:
     retry = _mapping(value, path)
     unknown = sorted(set(retry) - RETRY_FIELDS)
     if unknown:
@@ -376,9 +377,7 @@ def _validate_agents(value: Any, path: str) -> None:
                 )
 
 
-def _validate_declared_options(
-    node: Mapping[str, Any], node_type: str, path: str
-) -> None:
+def _validate_declared_options(node: Mapping[str, Any], path: str) -> None:
     for field in ("always_run", "persist_session"):
         if field in node:
             _boolean(node[field], f"{path}.{field}")
@@ -405,12 +404,6 @@ def _validate_declared_options(
     if "mcp" in node:
         mcp = _string(node["mcp"], f"{path}.mcp")
         _validate_relative_resource(mcp, f"{path}.mcp")
-    if "timeout" in node and node_type not in {"bash", "script"}:
-        _fail(
-            f"{path}.timeout",
-            "invalid_type_field",
-            f"{path}.timeout requires a bash or script node",
-        )
 
 
 def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> None:
@@ -438,12 +431,6 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
                 "invalid_deps",
                 f"{path}.deps must be a list of dependency strings",
             )
-    elif "runtime" in node or "deps" in node:
-        _fail(
-            path,
-            "invalid_type_field",
-            f"{path} runtime/deps fields require a script node",
-        )
     if node_type == "loop":
         loop = _mapping(value, f"{path}.loop")
         unknown = sorted(
@@ -535,8 +522,17 @@ def _normalize_node(raw: Any, index: int, lines: dict[str, int]) -> WorkflowNode
     if len(present_types) != 1:
         _fail(path, "node_type_one_of", f"{path} must define exactly one node type")
     node_type = present_types[0]
+    structurally_invalid = sorted(set(node) - structural_node_field_names(node_type))
+    if structurally_invalid:
+        field = structurally_invalid[0]
+        _fail(
+            f"{path}.{field}",
+            "invalid_type_field",
+            f"{path}.{field} is not structurally valid for {node_type} nodes",
+            line=lines.get(field),
+        )
     _validate_node_type(node, node_type, path)
-    _validate_declared_options(node, node_type, path)
+    _validate_declared_options(node, path)
     depends = node.get("depends_on", [])
     if not isinstance(depends, list) or any(
         not isinstance(item, str) or not item for item in depends
@@ -565,7 +561,7 @@ def _normalize_node(raw: Any, index: int, lines: dict[str, int]) -> WorkflowNode
         if timeout_name in node:
             _positive_number(node[timeout_name], f"{path}.{timeout_name}")
     if "retry" in node:
-        _validate_retry(node["retry"], f"{path}.retry", node_type=node_type)
+        _validate_retry(node["retry"], f"{path}.retry")
     if "hooks" in node:
         _validate_hook_fields(node["hooks"], f"{path}.hooks")
     if "when" in node:
@@ -896,7 +892,7 @@ def _load_workflow_bytes(
             tuple(
                 ValidationIssue(
                     path=field,
-                    code="archon_unknown_top_level_field",
+                    code=ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
                     message=f"Archon profile does not support top-level field: {field}",
                     source_line=top_lines.get(field),
                 )
@@ -906,7 +902,7 @@ def _load_workflow_bytes(
     issues = tuple(
         ValidationIssue(
             path=field,
-            code="unknown_top_level_field",
+            code=UNKNOWN_TOP_LEVEL_FIELD_CODE,
             message=f"unknown top-level field: {field}",
             severity="warning",
             blocking=False,

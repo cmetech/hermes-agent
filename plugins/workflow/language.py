@@ -25,12 +25,14 @@ from plugins.workflow.models import (
 WORKFLOW_NORMALIZER_VERSION = 1
 SUPPORTED_NORMALIZER_VERSIONS = frozenset({1})
 LEGACY_LANGUAGE_FINDING_FIELDS = frozenset({
+    "idle_timeout",
     "timeout",
     "retry.max_attempts",
     "output_format",
     "output_type",
 })
 ARCHON_LANGUAGE_FINDING_FIELDS = frozenset({
+    "idle_timeout",
     "timeout",
     "retry",
     "output_format",
@@ -44,6 +46,12 @@ WORKFLOW_LANGUAGE_FINDINGS_PER_NODE_MAX = max(
 )
 WORKFLOW_LANGUAGE_PACKAGE_FINDINGS_MAX = 1
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+WORKFLOW_LANGUAGE_PROFILE_UNSUPPORTED_CODE = "workflow_language_profile_unsupported"
+WORKFLOW_NORMALIZER_VERSION_UNSUPPORTED_CODE = (
+    "workflow_normalizer_version_unsupported"
+)
+UNKNOWN_TOP_LEVEL_FIELD_CODE = "unknown_top_level_field"
+ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE = "archon_unknown_top_level_field"
 
 
 class WorkflowLanguageCompatibilityError(ValueError):
@@ -52,6 +60,49 @@ class WorkflowLanguageCompatibilityError(ValueError):
     def __init__(self, code: str, message: str):
         self.code = code
         super().__init__(message)
+
+
+@dataclass(frozen=True, slots=True)
+class DynamicCompatibilityCode:
+    """One stable runtime language code not attached to an inventory field."""
+
+    code: str
+    profiles: frozenset[WorkflowLanguageProfile]
+    status: str
+    enforcement_phase: int
+    fields: tuple[str, ...]
+
+
+DYNAMIC_LANGUAGE_COMPATIBILITY_CODES = (
+    DynamicCompatibilityCode(
+        code=WORKFLOW_LANGUAGE_PROFILE_UNSUPPORTED_CODE,
+        profiles=frozenset(WorkflowLanguageProfile),
+        status="blocking",
+        enforcement_phase=1,
+        fields=("sidecar.language_compatibility",),
+    ),
+    DynamicCompatibilityCode(
+        code=WORKFLOW_NORMALIZER_VERSION_UNSUPPORTED_CODE,
+        profiles=frozenset(WorkflowLanguageProfile),
+        status="blocking",
+        enforcement_phase=1,
+        fields=("normalizer_version",),
+    ),
+    DynamicCompatibilityCode(
+        code=UNKNOWN_TOP_LEVEL_FIELD_CODE,
+        profiles=frozenset({WorkflowLanguageProfile.HERMES_LEGACY}),
+        status="warning",
+        enforcement_phase=1,
+        fields=("*",),
+    ),
+    DynamicCompatibilityCode(
+        code=ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
+        profiles=frozenset({WorkflowLanguageProfile.ARCHON_2026_07}),
+        status="blocking",
+        enforcement_phase=1,
+        fields=("*",),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -86,14 +137,14 @@ def resolve_language_profile(sidecar: Mapping[str, object]) -> WorkflowLanguageS
     declared = sidecar["language_compatibility"]
     if not isinstance(declared, str):
         raise WorkflowLanguageCompatibilityError(
-            "workflow_language_profile_unsupported",
+            WORKFLOW_LANGUAGE_PROFILE_UNSUPPORTED_CODE,
             "language_compatibility must be hermes-legacy or archon-2026-07",
         )
     try:
         profile = WorkflowLanguageProfile(declared)
     except (TypeError, ValueError) as exc:
         raise WorkflowLanguageCompatibilityError(
-            "workflow_language_profile_unsupported",
+            WORKFLOW_LANGUAGE_PROFILE_UNSUPPORTED_CODE,
             "language_compatibility must be hermes-legacy or archon-2026-07",
         ) from exc
     return WorkflowLanguageSelection(
@@ -115,7 +166,7 @@ def normalize_workflow(
         or normalizer_version not in SUPPORTED_NORMALIZER_VERSIONS
     ):
         raise WorkflowLanguageCompatibilityError(
-            "workflow_normalizer_version_unsupported",
+            WORKFLOW_NORMALIZER_VERSION_UNSUPPORTED_CODE,
             f"workflow normalizer version {normalizer_version!r} is unsupported",
         )
 
@@ -197,6 +248,14 @@ def language_compatibility_findings(
         options = node.options
         prefix = f"nodes[{index}]"
         if profile is WorkflowLanguageProfile.HERMES_LEGACY:
+            if "idle_timeout" in options:
+                add(
+                    f"{prefix}.idle_timeout",
+                    "legacy_idle_timeout_seconds",
+                    "legacy idle_timeout is interpreted in seconds",
+                    "Convert idle_timeout seconds to milliseconds only after Phase 3 Archon semantics are available.",
+                    blocking=False,
+                )
             if "timeout" in options:
                 add(
                     f"{prefix}.timeout",
@@ -232,6 +291,14 @@ def language_compatibility_findings(
                 )
             continue
 
+        if "idle_timeout" in options:
+            add(
+                f"{prefix}.idle_timeout",
+                "archon_idle_timeout_semantics_unavailable",
+                "Archon idle_timeout semantics are not enforceable in Phase 1",
+                "Remove idle_timeout or wait for Phase 3 millisecond normalization.",
+                blocking=True,
+            )
         if "timeout" in options:
             add(
                 f"{prefix}.timeout",
@@ -344,14 +411,14 @@ def read_language_snapshot(
     profile_value = value["effective_profile"]
     if not isinstance(profile_value, str):
         raise WorkflowLanguageCompatibilityError(
-            "workflow_language_profile_unsupported",
+            WORKFLOW_LANGUAGE_PROFILE_UNSUPPORTED_CODE,
             "workflow language snapshot profile is unsupported",
         )
     try:
         profile = WorkflowLanguageProfile(profile_value)
     except ValueError as exc:
         raise WorkflowLanguageCompatibilityError(
-            "workflow_language_profile_unsupported",
+            WORKFLOW_LANGUAGE_PROFILE_UNSUPPORTED_CODE,
             "workflow language snapshot profile is unsupported",
         ) from exc
 
@@ -362,7 +429,7 @@ def read_language_snapshot(
         or normalizer_version not in SUPPORTED_NORMALIZER_VERSIONS
     ):
         raise WorkflowLanguageCompatibilityError(
-            "workflow_normalizer_version_unsupported",
+            WORKFLOW_NORMALIZER_VERSION_UNSUPPORTED_CODE,
             f"workflow normalizer version {normalizer_version!r} is unsupported",
         )
 

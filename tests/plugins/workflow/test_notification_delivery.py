@@ -626,3 +626,51 @@ def test_authenticated_gateway_command_starts_real_background_run(
     assert run["provenance"]["assurance"] == "verified_adapter"
     assert run["provenance"]["actor_id"] == invocation.principal
     assert run["provenance"]["return_route"] == "opaque-capability"
+
+
+def test_gateway_run_refuses_declared_archon_incompatibility_before_persistence(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workflow_path = workflow_writer(
+        tmp_path / "package",
+        name="gateway-archon-blocked",
+        nodes=[{"id": "start", "bash": "true", "timeout": 1000}],
+    )
+    workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    store = RunStore(home)
+    assert CoordinatorStore(store.database).try_acquire(
+        CoordinatorIdentity(
+            owner_id="gateway-test",
+            host_kind="gateway",
+            host_instance_id="gateway-test",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=datetime.now(timezone.utc),
+        lease_seconds=60,
+    ).is_leader
+    invocation = PluginInvocationContext(
+        boundary="gateway",
+        principal="gateway:telegram:user-1",
+        operator_scope="gateway:default:telegram:chat-1:user-1",
+        assurance="verified_adapter",
+        return_route_capability="opaque-capability",
+    )
+
+    response = json.loads(
+        workflow_gateway_command(
+            f"run {shlex.quote(str(workflow_path))} "
+            "--idempotency-key archon-refusal",
+            invocation,
+            hermes_home=home,
+            workdir=tmp_path,
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["error"] == "workflow_compatibility_blocked"
+    assert list(store.runs_root.rglob("run.json")) == []
+    assert list(store.staging_root.iterdir()) == []

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import json
 from pathlib import Path
 
@@ -9,8 +9,12 @@ from jsonschema import Draft202012Validator
 import pytest
 import yaml
 
+import plugins.workflow.language as workflow_language
+import plugins.workflow.language_schema as language_schema
 from plugins.workflow.language_schema import (
     FIELD_INVENTORY,
+    NODE_TYPES,
+    compatibility_code_catalog,
     common_node_field_names,
     definition_field_names,
     definition_json_schema,
@@ -26,6 +30,7 @@ from plugins.workflow.schema import (
     TOP_LEVEL_FIELDS,
     load_workflow_snapshot,
 )
+from plugins.workflow.compat import assess_compatibility
 
 
 def _node_property(schema: dict[str, object], node_type: str, field: str) -> dict:
@@ -45,6 +50,22 @@ def test_archon_authoring_contract_is_bounded_and_versioned():
         == "https://json-schema.org/draft/2020-12/schema"
     )
     assert len(json.dumps(contract).encode()) < 256_000
+
+
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+def test_authoring_contract_generation_is_byte_deterministic(profile):
+    first = json.dumps(
+        workflow_authoring_contract(profile),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    second = json.dumps(
+        workflow_authoring_contract(profile),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+    assert first == second
 
 
 def test_parser_field_sets_come_from_authoring_inventory():
@@ -100,14 +121,21 @@ def test_structural_requirements_are_inventory_metadata():
     assert ("hook_specific", "hookEventName", ()) in required
 
 
-def _structural_outcomes(document: dict[str, object]) -> tuple[bool, bool]:
-    schema = definition_json_schema(WorkflowLanguageProfile.HERMES_LEGACY)
+def _structural_outcomes(
+    document: dict[str, object],
+    profile: WorkflowLanguageProfile = WorkflowLanguageProfile.HERMES_LEGACY,
+) -> tuple[bool, bool]:
+    schema = definition_json_schema(profile)
     schema_valid = not list(Draft202012Validator(schema).iter_errors(document))
     try:
         load_workflow_snapshot(
             "structural-parity.yaml",
             workflow_bytes=yaml.safe_dump(document, sort_keys=False).encode(),
-            sidecar_bytes=None,
+            sidecar_bytes=(
+                f"language_compatibility: {profile.value}\n".encode()
+                if profile is WorkflowLanguageProfile.ARCHON_2026_07
+                else None
+            ),
         )
     except WorkflowValidationError:
         loader_valid = False
@@ -122,6 +150,174 @@ def _workflow(node: dict[str, object]) -> dict[str, object]:
         "description": "schema and loader agree",
         "nodes": [node],
     }
+
+
+_NODE_FIELD_VALUES = {
+    "id": "n",
+    "command": "build",
+    "prompt": "do it",
+    "bash": "true",
+    "script": "print('ok')",
+    "loop": {"prompt": "again", "until": "done", "max_iterations": 2},
+    "approval": {"message": "continue?"},
+    "cancel": "stop",
+    "depends_on": [],
+    "when": "$source.output == 'ok'",
+    "trigger_rule": "all_done",
+    "context": "fresh",
+    "idle_timeout": 1,
+    "retry": {"max_attempts": 2, "delay_ms": 1000, "on_error": "all"},
+    "always_run": True,
+    "output_type": "text",
+    "persist_session": True,
+    "provider": "claude",
+    "model": "sonnet",
+    "output_format": {"type": "object"},
+    "allowed_tools": ["Read"],
+    "denied_tools": ["Bash"],
+    "hooks": {},
+    "mcp": "mcp/server.yaml",
+    "skills": ["review"],
+    "agents": {"reviewer": {"description": "review", "prompt": "check"}},
+    "effort": "high",
+    "thinking": "adaptive",
+    "maxBudgetUsd": 1,
+    "systemPrompt": "be careful",
+    "fallbackModel": "fallback",
+    "betas": ["feature"],
+    "sandbox": {"enabled": True},
+    "runtime": "uv",
+    "deps": ["pydantic>=2"],
+    "timeout": 1,
+}
+_NODE_FIELD_SPECS = {
+    spec.yaml_name: spec for spec in FIELD_INVENTORY if spec.scope == "node"
+}
+
+
+def _node_with_field(node_type: str, field: str) -> dict[str, object]:
+    payload = _NODE_FIELD_VALUES[node_type]
+    node = {"id": "n", node_type: payload}
+    if node_type == "script":
+        node["runtime"] = "uv"
+    node[field] = _NODE_FIELD_VALUES[field]
+    if field == "when":
+        node["depends_on"] = ["source"]
+    return node
+
+
+def _document_with_field(node_type: str, field: str) -> dict[str, object]:
+    node = _node_with_field(node_type, field)
+    nodes: list[dict[str, object]] = []
+    if field == "when":
+        nodes.append({"id": "source", "bash": "true"})
+    nodes.append(node)
+    return {
+        "name": "structural-parity",
+        "description": "schema and loader agree",
+        "nodes": nodes,
+    }
+
+
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+@pytest.mark.parametrize("node_type", NODE_TYPES)
+@pytest.mark.parametrize("field", tuple(_NODE_FIELD_SPECS))
+def test_every_node_field_has_schema_loader_and_compatibility_parity(
+    profile, node_type, field
+):
+    document = _document_with_field(node_type, field)
+    schema_accepts, loader_accepts = _structural_outcomes(document, profile)
+
+    assert schema_accepts is loader_accepts
+    if not loader_accepts:
+        return
+
+    package = load_workflow_snapshot(
+        "structural-parity.yaml",
+        workflow_bytes=yaml.safe_dump(document, sort_keys=False).encode(),
+        sidecar_bytes=(
+            f"language_compatibility: {profile.value}\n".encode()
+            if profile is WorkflowLanguageProfile.ARCHON_2026_07
+            else None
+        ),
+    )
+    path = f"nodes[{len(document['nodes']) - 1}].{field}"
+    field_not_applicable = any(
+        finding.code == "field_not_applicable" and finding.path == path
+        for finding in assess_compatibility(package).findings
+    )
+    expected_not_applicable = (
+        field in package.definition.nodes[-1].options
+        and node_type not in _NODE_FIELD_SPECS[field].applicable_node_types
+    )
+
+    assert field_not_applicable is expected_not_applicable
+
+
+def test_node_field_structural_and_compatibility_sets_are_distinct_and_exact():
+    payload_fields = set(NODE_TYPES)
+    ai_fields = {
+        "persist_session",
+        "provider",
+        "model",
+        "output_format",
+        "allowed_tools",
+        "denied_tools",
+        "hooks",
+        "mcp",
+        "skills",
+        "agents",
+        "effort",
+        "thinking",
+        "maxBudgetUsd",
+        "systemPrompt",
+        "fallbackModel",
+        "betas",
+        "sandbox",
+    }
+
+    for field in payload_fields:
+        assert _NODE_FIELD_SPECS[field].structural_node_types == {field}
+    assert _NODE_FIELD_SPECS["timeout"].structural_node_types == {
+        "bash",
+        "script",
+    }
+    assert _NODE_FIELD_SPECS["retry"].structural_node_types == set(NODE_TYPES) - {
+        "loop"
+    }
+    for field in ai_fields:
+        spec = _NODE_FIELD_SPECS[field]
+        assert spec.structural_node_types == set(NODE_TYPES)
+        assert spec.applicable_node_types == {"command", "prompt"}
+
+
+def test_compatibility_applicability_consumes_the_live_field_inventory(monkeypatch):
+    revised_inventory = tuple(
+        replace(
+            spec,
+            applicable_node_types=spec.applicable_node_types - {"bash"},
+        )
+        if spec.scope == "node" and spec.yaml_name == "always_run"
+        else spec
+        for spec in FIELD_INVENTORY
+    )
+    monkeypatch.setattr(language_schema, "FIELD_INVENTORY", revised_inventory)
+    package = load_workflow_snapshot(
+        "inventory-authority.yaml",
+        workflow_bytes=yaml.safe_dump(
+            _workflow({"id": "n", "bash": "true", "always_run": True}),
+            sort_keys=False,
+        ).encode(),
+        sidecar_bytes=None,
+    )
+
+    findings = assess_compatibility(package).findings
+
+    assert any(
+        finding.code == "field_not_applicable"
+        and finding.path == "nodes[0].always_run"
+        for finding in findings
+    )
 
 
 @pytest.mark.parametrize(
@@ -366,6 +562,12 @@ def test_interactive_gate_message_json_truthiness_matches_loader(
 @pytest.mark.parametrize(
     ("node_type", "field", "code", "phase"),
     [
+        (
+            "bash",
+            "idle_timeout",
+            "archon_idle_timeout_semantics_unavailable",
+            3,
+        ),
         ("bash", "timeout", "archon_timeout_semantics_unavailable", 3),
         ("bash", "retry", "archon_retry_semantics_unavailable", 3),
         ("prompt", "output_format", "archon_output_format_unavailable", 2),
@@ -388,6 +590,11 @@ def test_archon_deferred_fields_publish_blocking_codes(node_type, field, code, p
 @pytest.mark.parametrize(
     ("node_type", "field_path", "code"),
     [
+        (
+            "bash",
+            ("idle_timeout",),
+            "legacy_idle_timeout_seconds",
+        ),
         ("bash", ("timeout",), "legacy_timeout_seconds"),
         (
             "bash",
@@ -423,6 +630,134 @@ def test_companion_schema_has_strict_profile_enum_and_field_parity():
             "hermes-legacy",
             "archon-2026-07",
         ]
+
+
+@pytest.mark.parametrize(
+    ("profile", "profile_specific_codes"),
+    [
+        (
+            WorkflowLanguageProfile.HERMES_LEGACY,
+            {
+                "legacy_language_profile",
+                "legacy_idle_timeout_seconds",
+                "unknown_top_level_field",
+            },
+        ),
+        (
+            WorkflowLanguageProfile.ARCHON_2026_07,
+            {
+                "archon_idle_timeout_semantics_unavailable",
+                "archon_unknown_top_level_field",
+            },
+        ),
+    ],
+)
+def test_compatibility_code_catalog_covers_inventory_and_dynamic_loader_codes(
+    profile, profile_specific_codes
+):
+    catalog = compatibility_code_catalog(profile)
+    inventory_codes = {
+        item.code
+        for spec in FIELD_INVENTORY
+        for item in spec.compatibility
+        if item.profile is profile and item.status != "supported" and item.code
+    }
+
+    assert inventory_codes <= set(catalog)
+    assert profile_specific_codes <= set(catalog)
+    assert {
+        "workflow_language_profile_unsupported",
+        "workflow_normalizer_version_unsupported",
+    } <= set(catalog)
+    assert len(json.dumps(catalog, sort_keys=True).encode()) < 32_000
+
+
+def test_dynamic_catalog_codes_are_emitted_by_real_runtime_paths():
+    workflow_bytes = yaml.safe_dump(
+        {
+            "name": "runtime-codes",
+            "description": "exercise real dynamic language code paths",
+            "nodes": [{"id": "n", "bash": "true"}],
+        },
+        sort_keys=False,
+    ).encode()
+    with pytest.raises(WorkflowValidationError) as unsupported_profile:
+        load_workflow_snapshot(
+            "unsupported-profile.yaml",
+            workflow_bytes=workflow_bytes,
+            sidecar_bytes=b"language_compatibility: future-profile\n",
+        )
+    with pytest.raises(
+        workflow_language.WorkflowLanguageCompatibilityError
+    ) as unsupported_normalizer:
+        load_workflow_snapshot(
+            "unsupported-normalizer.yaml",
+            workflow_bytes=workflow_bytes,
+            sidecar_bytes=None,
+            normalizer_version=99,
+        )
+
+    legacy = load_workflow_snapshot(
+        "legacy-unknown.yaml",
+        workflow_bytes=workflow_bytes + b"future_field: true\n",
+        sidecar_bytes=None,
+    )
+    with pytest.raises(WorkflowValidationError) as archon_unknown:
+        load_workflow_snapshot(
+            "archon-unknown.yaml",
+            workflow_bytes=workflow_bytes + b"future_field: true\n",
+            sidecar_bytes=b"language_compatibility: archon-2026-07\n",
+        )
+
+    common_runtime_codes = {
+        unsupported_profile.value.issues[0].code,
+        unsupported_normalizer.value.code,
+    }
+    runtime_codes = {
+        WorkflowLanguageProfile.HERMES_LEGACY: common_runtime_codes
+        | {legacy.validation_issues[0].code},
+        WorkflowLanguageProfile.ARCHON_2026_07: common_runtime_codes
+        | {archon_unknown.value.issues[0].code},
+    }
+    expected_codes = {
+        profile: {
+            spec.code
+            for spec in workflow_language.DYNAMIC_LANGUAGE_COMPATIBILITY_CODES
+            if profile in spec.profiles
+        }
+        for profile in WorkflowLanguageProfile
+    }
+    root = Path(__file__).parents[3]
+    references = (
+        root / "website/docs/user-guide/features/workflow-yaml-reference.md",
+        root
+        / "skills/software-development/workflow-builder/references/portable-schema.md",
+    )
+
+    assert runtime_codes == expected_codes
+    for profile, emitted_codes in runtime_codes.items():
+        assert emitted_codes <= set(compatibility_code_catalog(profile))
+        for reference in references:
+            documented = reference.read_text(encoding="utf-8")
+            assert not {
+                code for code in emitted_codes if f"`{code}`" not in documented
+            }
+
+
+def test_generated_language_codes_are_covered_by_authoring_references():
+    generated_codes = set().union(
+        *(compatibility_code_catalog(profile) for profile in WorkflowLanguageProfile)
+    )
+    root = Path(__file__).parents[3]
+    references = (
+        root / "website/docs/user-guide/features/workflow-yaml-reference.md",
+        root
+        / "skills/software-development/workflow-builder/references/portable-schema.md",
+    )
+
+    for reference in references:
+        documented = reference.read_text(encoding="utf-8")
+        assert not {code for code in generated_codes if f"`{code}`" not in documented}
 
 
 def test_authoring_contract_excludes_secret_values_and_runtime_data(

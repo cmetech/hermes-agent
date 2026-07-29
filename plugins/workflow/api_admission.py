@@ -20,6 +20,10 @@ from plugins.workflow.input_contract import (
     workflow_input_declarations,
 )
 from plugins.workflow.models import WorkflowPackage, WorkflowValidationError
+from plugins.workflow.compat import (
+    WorkflowCompatibilityBlockedError,
+    require_runnable,
+)
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.runner_binding import (
     WorkflowRunnerBinding,
@@ -371,11 +375,13 @@ def start_api_run(
         trusted = True
     if not trusted:
         raise ApiAdmissionError("workflow_trust_required", status_code=403)
-    if not compatibility.runnable:
+    try:
+        require_runnable(compatibility)
+    except WorkflowCompatibilityBlockedError as exc:
         raise ApiAdmissionError(
-            "workflow_compatibility_blocked",
+            exc.code,
             status_code=409,
-        )
+        ) from exc
     try:
         preflight_execution(risk, trusted=True)
     except WorkflowTrustError as exc:
