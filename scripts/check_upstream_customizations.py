@@ -2099,6 +2099,7 @@ def _changed_character_ranges(
 _WORD_DIFF_HUNK = re.compile(
     rb"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
 )
+_HEX_BYTE_RUN = re.compile(rb"(?:[0-9a-f]{2})+")
 
 
 def _byte_line_boundaries(source: bytes) -> list[int]:
@@ -2152,38 +2153,50 @@ def _git_changed_byte_ranges(
     """Return exact changed byte ranges from Git's bounded porcelain protocol."""
     _validated_parser_source(old_source)
     _validated_parser_source(new_source)
-    argv = [
-        "git",
-        "diff",
-        "--no-ext-diff",
-        "--no-color",
-        "--text",
-        "--unified=0",
-        "--word-diff=porcelain",
-        "--word-diff-regex=[[:space:]]|[^[:space:]]",
-        f"{left}..{right}",
-        "--",
-        path,
-    ]
-    try:
-        diff = _run_bounded_capture(
-            argv,
-            cwd=repo,
-            timeout_seconds=60,
-            output_limit_bytes=64 * 1024 * 1024,
-        )
-    except _BoundedCaptureFailure as exc:
-        raise ValueError(f"Git character diff {exc.code}") from exc
-    if diff.returncode != 0:
+    old_encoded = old_source.hex().encode("ascii") + b"\n"
+    new_encoded = new_source.hex().encode("ascii") + b"\n"
+    with tempfile.TemporaryDirectory(prefix="hermes-character-diff-") as temp_dir:
+        old_path = Path(temp_dir) / "old.hex"
+        new_path = Path(temp_dir) / "new.hex"
+        old_path.write_bytes(old_encoded)
+        new_path.write_bytes(new_encoded)
+        argv = [
+            "git",
+            "diff",
+            "--no-index",
+            "--no-ext-diff",
+            "--no-color",
+            "--text",
+            "--unified=0",
+            "--word-diff=porcelain",
+            "--word-diff-regex=[0-9a-f]{2}",
+            str(old_path),
+            str(new_path),
+        ]
+        try:
+            diff = _run_bounded_capture(
+                argv,
+                cwd=repo,
+                timeout_seconds=60,
+                output_limit_bytes=64 * 1024 * 1024,
+            )
+        except _BoundedCaptureFailure as exc:
+            raise ValueError(f"Git character diff {exc.code}") from exc
+    if diff.returncode not in {0, 1}:
         raise ValueError("Git character diff process failure")
-    old_boundaries = _byte_line_boundaries(old_source)
-    new_boundaries = _byte_line_boundaries(new_source)
+    if diff.returncode == 0:
+        if old_source != new_source or diff.stdout:
+            raise ValueError("malformed Git character diff")
+        return [], []
+    old_boundaries = _byte_line_boundaries(old_encoded)
+    new_boundaries = _byte_line_boundaries(new_encoded)
 
     old_ranges: list[tuple[int, int]] = []
     new_ranges: list[tuple[int, int]] = []
     old_cursor = new_cursor = 0
     old_end = new_end = 0
     in_hunk = False
+    saw_hunk = False
     newline_sides: set[str] = set()
 
     def finish_hunk() -> None:
@@ -2208,6 +2221,7 @@ def _git_changed_byte_ranges(
                 new_boundaries, new_start, new_count
             )
             in_hunk = True
+            saw_hunk = True
             newline_sides.clear()
             continue
         if not in_hunk:
@@ -2216,45 +2230,43 @@ def _git_changed_byte_ranges(
             if not newline_sides:
                 raise ValueError("malformed Git character diff")
             advanced: set[str] = set()
-            if "old" in newline_sides and old_cursor < old_end:
-                if old_source[old_cursor:old_cursor + 1] != b"\n":
-                    raise ValueError("malformed Git character diff")
+            if old_cursor < old_end and old_encoded[old_cursor:old_cursor + 1] == b"\n":
                 advanced.add("old")
-            if "new" in newline_sides and new_cursor < new_end:
-                if new_source[new_cursor:new_cursor + 1] != b"\n":
-                    raise ValueError("malformed Git character diff")
+            if new_cursor < new_end and new_encoded[new_cursor:new_cursor + 1] == b"\n":
                 advanced.add("new")
+            if not advanced:
+                raise ValueError("malformed Git character diff")
             if "old" in advanced:
                 old_cursor += 1
             if "new" in advanced:
                 new_cursor += 1
-            if advanced == {"old"}:
-                old_ranges.append((old_cursor - 1, old_cursor))
-            elif advanced == {"new"}:
-                new_ranges.append((new_cursor - 1, new_cursor))
             newline_sides.clear()
             continue
         marker = record[:1]
         if marker not in {b" ", b"-", b"+"}:
             raise ValueError("malformed Git character diff")
         payload = record[1:]
+        if not _HEX_BYTE_RUN.fullmatch(payload):
+            raise ValueError("malformed Git character diff")
         if marker in {b" ", b"-"}:
             newline_sides.add("old")
             end = old_cursor + len(payload)
-            if end > old_end or old_source[old_cursor:end] != payload:
+            if end > old_end or old_encoded[old_cursor:end] != payload:
                 raise ValueError("malformed Git character diff")
             if marker == b"-":
-                old_ranges.append((old_cursor, end))
+                old_ranges.append((old_cursor // 2, end // 2))
             old_cursor = end
         if marker in {b" ", b"+"}:
             newline_sides.add("new")
             end = new_cursor + len(payload)
-            if end > new_end or new_source[new_cursor:end] != payload:
+            if end > new_end or new_encoded[new_cursor:end] != payload:
                 raise ValueError("malformed Git character diff")
             if marker == b"+":
-                new_ranges.append((new_cursor, end))
+                new_ranges.append((new_cursor // 2, end // 2))
             new_cursor = end
     finish_hunk()
+    if not saw_hunk:
+        raise ValueError("malformed Git character diff")
     return _coalesce_ranges(old_ranges), _coalesce_ranges(new_ranges)
 
 

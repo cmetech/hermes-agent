@@ -1685,6 +1685,66 @@ def test_git_character_diff_bounds_repetitive_input_and_fails_closed(
     assert new_ranges == [(len(prefix) + 6, len(prefix) + 7)]
 
 
+def test_git_character_diff_handles_blank_line_insertion(tmp_path: Path) -> None:
+    """A porcelain newline record must not make valid source fail closed."""
+    repo = _repo(tmp_path)
+    source_path = repo / "blank-line.ts"
+    before = b"abc\n\ndef\n"
+    after = b"abc\nX\ndef\n"
+    source_path.write_bytes(before)
+    _git(repo, "add", source_path.name)
+    _git(repo, "commit", "-m", "add blank-line fixture")
+    left = _git(repo, "rev-parse", "HEAD")
+    source_path.write_bytes(after)
+    _git(repo, "commit", "-am", "fill blank line")
+
+    old_ranges, new_ranges = customization_checker._git_changed_byte_ranges(
+        repo, left, "HEAD", source_path.name, before, after
+    )
+
+    assert old_ranges == []
+    assert new_ranges == [(4, 5)]
+
+
+def test_typescript_import_reflow_keeps_unchanged_owned_symbol_same_file(
+    tmp_path: Path,
+) -> None:
+    """Line reflow around an unchanged import must not report an owned hit."""
+    before = (
+        "import { addWorktree, listWorktrees } from './git-worktree-ops'\n"
+        "void addWorktree\n"
+    )
+    after = (
+        "import {\n"
+        "  addWorktree,\n"
+        "  listWorktrees,\n"
+        "} from './git-worktree-ops'\n"
+        "void addWorktree\n"
+    )
+    repo = _repo(tmp_path)
+    source_path = repo / "owned.ts"
+    source_path.write_text(before)
+    _git(repo, "add", source_path.name)
+    _git(repo, "commit", "-m", "add single-line import")
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    raw = yaml.safe_load(manifest.read_text())
+    entry = raw["upstream_changes"][0]
+    entry["files"] = [source_path.name]
+    entry["owned_symbols"] = ["addWorktree"]
+    entry["overlap_policy"] = "owned_symbol"
+    manifest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    entry = load_and_validate_manifest(manifest, repo, check_git=False)[
+        "upstream_changes"
+    ][0]
+    source_path.write_text(after)
+    _git(repo, "commit", "-am", "reflow import")
+
+    overlap = classify_upstream_overlap(entry, repo, f"{baseline}..HEAD")
+
+    assert overlap["classification"] == "same_file"
+
+
 def test_git_character_diff_builds_each_endpoint_line_table_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1726,7 +1786,10 @@ def test_git_character_diff_builds_each_endpoint_line_table_once(
     assert len(new_ranges) == 64
     assert all(end - start == 1 for start, end in old_ranges)
     assert all(end - start == 1 for start, end in new_ranges)
-    assert constructed_for == [before, after]
+    assert constructed_for == [
+        before.hex().encode("ascii") + b"\n",
+        after.hex().encode("ascii") + b"\n",
+    ]
 
 
 def test_git_character_diff_rejects_malformed_hunk(
