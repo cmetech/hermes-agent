@@ -2286,19 +2286,19 @@ def _collect_overlap_parser_requests(
     dict[tuple[str, str], bytes],
     dict[tuple[str, str], str],
 ]:
-    symbols = tuple(sorted({
-        symbol
-        for entry in entries
-        for symbol in _strict_owned_symbols(entry)
-    }))
+    symbols_by_path: dict[str, set[str]] = {}
+    for entry in entries:
+        entry_symbols = _strict_owned_symbols(entry)
+        for path in sorted(set(entry["files"]) & changed_paths):
+            if _parser_language(path) is not None:
+                symbols_by_path.setdefault(path, set()).update(entry_symbols)
     requests: list[_ParserRequest] = []
     sources: dict[tuple[str, str], bytes] = {}
     request_ids: dict[tuple[str, str], str] = {}
     request_index = 0
-    for path in sorted(changed_paths):
+    for path in sorted(symbols_by_path):
         language = _parser_language(path)
-        if language is None:
-            continue
+        assert language is not None
         for revision in (left, right):
             blob_oid, source = _blob_bytes_or_empty(repo, revision, path)
             sources[(revision, path)] = source
@@ -2311,7 +2311,7 @@ def _collect_overlap_parser_requests(
                     language=language,
                     blob_oid=blob_oid,
                     source=source,
-                    symbols=symbols,
+                    symbols=tuple(sorted(symbols_by_path[path])),
                 )
             )
             request_index += 1
@@ -2392,8 +2392,14 @@ def classify_upstream_overlaps(
     left, right = _resolved_diff_endpoints(repo, diff_range)
     changes = _changed_paths(repo, f"{left}..{right}")
     changed = {path for _status, paths in changes for path in paths}
+    ledger_owned_paths = {
+        path
+        for entry in entries
+        for path in entry["files"]
+    }
+    candidate_paths = changed & ledger_owned_paths
     parser_requests, parser_sources, parser_request_ids = _collect_overlap_parser_requests(
-        entries, repo, left, right, changed
+        entries, repo, left, right, candidate_paths
     )
     parser_results = (resolver or _NonPythonSymbolResolver()).spans(parser_requests)
     parser_spans = {
@@ -2409,7 +2415,7 @@ def classify_upstream_overlaps(
             parser_sources[(left, path)],
             parser_sources[(right, path)],
         )
-        for path in sorted(changed)
+        for path in sorted(candidate_paths)
         if _parser_language(path) is not None
     }
 
@@ -2434,24 +2440,8 @@ def classify_upstream_overlaps(
             classification = "same_file"
             rationale = f"same ledger-owned file changed: {', '.join(same_files)}"
         else:
-            equivalent_hits = _owned_symbol_hits(
-                entry,
-                repo,
-                left,
-                right,
-                sorted(changed - owned_files),
-                parser_spans=parser_spans,
-                parser_changed_ranges=parser_changed_ranges,
-            )
-            if equivalent_hits:
-                classification = "possible_upstream_equivalent"
-                rationale = (
-                    "owned public names appeared elsewhere: "
-                    + ", ".join(equivalent_hits)
-                )
-            else:
-                classification = "none"
-                rationale = "no file, symbol, or public-contract overlap detected"
+            classification = "none"
+            rationale = "no ledger-owned file overlap detected"
         overlaps.append({
             "id": entry["id"],
             "change_class": entry["change_class"],
@@ -2473,8 +2463,7 @@ def classify_upstream_overlaps(
             "removal_condition": entry["removal_condition"],
             "tests": entry["tests"],
             "decision_required": bool(
-                classification
-                in {"owned_symbol", "possible_upstream_equivalent"}
+                classification == "owned_symbol"
                 or (
                     classification == "same_file"
                     and entry.get("overlap_policy", "owned_symbol")

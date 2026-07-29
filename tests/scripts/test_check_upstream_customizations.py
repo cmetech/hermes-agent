@@ -1214,7 +1214,7 @@ def test_diff_coverage_ignores_new_additive_plugin_directory(tmp_path: Path) -> 
     validate_diff_coverage(data, repo, f"{baseline}..HEAD")
 
 
-def test_overlap_classification_distinguishes_file_symbol_and_equivalent(
+def test_overlap_classification_distinguishes_file_symbol_and_unrelated_path(
     tmp_path: Path,
 ) -> None:
     repo = _repo(tmp_path)
@@ -1234,8 +1234,10 @@ def test_overlap_classification_distinguishes_file_symbol_and_equivalent(
     third = _git(repo, "rev-parse", "HEAD")
     (repo / "replacement.py").write_text("class Owned:\n    pass\n")
     _git(repo, "add", ".")
-    _git(repo, "commit", "-m", "equivalent public contract")
-    assert classify_upstream_overlap(entry, repo, f"{third}..HEAD")["classification"] == "possible_upstream_equivalent"
+    _git(repo, "commit", "-m", "unrelated matching public name")
+    result = classify_upstream_overlap(entry, repo, f"{third}..HEAD")
+    assert result["classification"] == "none"
+    assert result["decision_required"] is False
 
 
 def test_typescript_broad_symbols_include_as_satisfies_jsx_and_qualified_names(
@@ -1492,19 +1494,101 @@ def test_classify_all_entries_uses_one_shared_parser_resolution_pass(
     )
 
     assert len(calls) == 1
+    assert [(request.path, request.symbols) for request in calls[0]] == [
+        ("first.js", ("FirstToken",)),
+        ("first.js", ("FirstToken",)),
+        ("second.md", ("SecondToken",)),
+        ("second.md", ("SecondToken",)),
+    ]
     assert [request.request_id for request in calls[0]] == [
         "request-00000000",
         "request-00000001",
         "request-00000002",
         "request-00000003",
-        "request-00000004",
-        "request-00000005",
     ]
     assert [item["id"] for item in overlaps] == ["first", "second"]
     assert [item["classification"] for item in overlaps] == [
         "owned_symbol",
         "same_file",
     ]
+
+
+def test_overlap_parser_requests_ignore_many_unrelated_upstream_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unrelated parser files must not consume overlap-parser capacity."""
+    repo = _repo(tmp_path)
+    owned = repo / "owned.ts"
+    owned.write_text("const OwnedToken = false;\n")
+    unrelated = [repo / f"unrelated-{index}.ts" for index in range(64)]
+    for path in unrelated:
+        path.write_text("const OwnedToken = false;\n")
+    _git(repo, "add", owned.name, *(path.name for path in unrelated))
+    _git(repo, "commit", "-m", "add overlap parser fixtures")
+    left = _git(repo, "rev-parse", "HEAD")
+    owned.write_text("const OwnedT0ken = false;\n")
+    for path in unrelated:
+        path.write_text("const OwnedT0ken = false;\n")
+    _git(repo, "commit", "-am", "change owned and unrelated parser files")
+
+    template = yaml.safe_load(_manifest(repo, left).read_text())["upstream_changes"][0]
+    entry = {
+        **template,
+        "files": [owned.name],
+        "owned_symbols": ["OwnedToken"],
+    }
+    calls: list[list[customization_checker._ParserRequest]] = []
+
+    def recording_batch(
+        requests: list[customization_checker._ParserRequest],
+    ) -> dict[str, dict[str, list[tuple[int, int]]]]:
+        calls.append(list(requests))
+        return {
+            request.request_id: {
+                symbol: [
+                    (offset, offset + len(symbol.encode("utf-8")))
+                    for offset in [request.source.find(symbol.encode("utf-8"))]
+                    if offset >= 0
+                ]
+                for symbol in request.symbols
+            }
+            for request in requests
+        }
+
+    monkeypatch.setattr(customization_checker, "_run_parser_batch", recording_batch)
+
+    result = classify_upstream_overlap(entry, repo, f"{left}..HEAD")
+
+    assert result["classification"] == "owned_symbol"
+    assert len(calls) == 1
+    assert [(request.path, request.symbols) for request in calls[0]] == [
+        ("owned.ts", ("OwnedToken",)),
+        ("owned.ts", ("OwnedToken",)),
+    ]
+    assert not any(request.path.startswith("unrelated-") for request in calls[0])
+
+
+def test_overlap_checks_upstream_addition_at_declared_custom_path(
+    tmp_path: Path,
+) -> None:
+    """A ledger path added by upstream is still a candidate overlap."""
+    repo = _repo(tmp_path)
+    left = _git(repo, "rev-parse", "HEAD")
+    template = yaml.safe_load(_manifest(repo, left).read_text())["upstream_changes"][0]
+    entry = {
+        **template,
+        "files": ["custom.ts"],
+        "owned_symbols": ["OwnedToken"],
+    }
+    (repo / "custom.ts").write_text("const OwnedToken = true;\n")
+    _git(repo, "add", "custom.ts")
+    _git(repo, "commit", "-m", "add declared custom path")
+
+    result = classify_upstream_overlap(entry, repo, f"{left}..HEAD")
+
+    assert result["classification"] == "owned_symbol"
+    assert result["decision_required"] is True
 
 
 def test_manifest_uses_one_shared_parser_resolution_pass(
