@@ -1801,7 +1801,7 @@ def test_git_character_diff_rejects_malformed_hunk(
         customization_checker,
         "_run_bounded_capture",
         lambda *_args, **_kwargs: customization_checker._CompletedCapture(
-            returncode=0,
+            returncode=1,
             stdout=b"@@ -1 +1 @@\n-not-the-source\n+ExactToken\n~\n",
             stderr=b"",
         ),
@@ -1816,6 +1816,65 @@ def test_git_character_diff_rejects_malformed_hunk(
             b"ExactToken\n",
             b"ExactToken\n",
         )
+
+
+def test_git_character_diff_rejects_hunk_that_omits_changed_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-sided hunk must not hide changed bytes on the omitted endpoint."""
+    monkeypatch.setattr(
+        customization_checker,
+        "_run_bounded_capture",
+        lambda *_args, **_kwargs: customization_checker._CompletedCapture(
+            returncode=1,
+            stdout=b"@@ -1 +0,0 @@\n-61\n~\n",
+            stderr=b"",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="malformed Git character diff"):
+        customization_checker._git_changed_byte_ranges(
+            tmp_path,
+            "a" * 40,
+            "b" * 40,
+            "owned.ts",
+            b"a",
+            b"ExactToken",
+        )
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "expected_old", "expected_new"),
+    [
+        (b"", b"a", [], [(0, 1)]),
+        (b"a", b"", [(0, 1)], []),
+    ],
+    ids=("insert-into-empty", "delete-to-empty"),
+)
+def test_git_character_diff_preserves_empty_endpoint_changes(
+    tmp_path: Path,
+    before: bytes,
+    after: bytes,
+    expected_old: list[tuple[int, int]],
+    expected_new: list[tuple[int, int]],
+) -> None:
+    """Exact endpoint coverage must still accept real insertions and deletions."""
+    repo = _repo(tmp_path)
+    source_path = repo / "empty-endpoint.ts"
+    source_path.write_bytes(before)
+    _git(repo, "add", source_path.name)
+    _git(repo, "commit", "-m", "add endpoint fixture")
+    left = _git(repo, "rev-parse", "HEAD")
+    source_path.write_bytes(after)
+    _git(repo, "commit", "-am", "change endpoint fixture")
+
+    old_ranges, new_ranges = customization_checker._git_changed_byte_ranges(
+        repo, left, "HEAD", source_path.name, before, after
+    )
+
+    assert old_ranges == expected_old
+    assert new_ranges == expected_new
 
 
 def test_git_character_diff_uses_lf_only_for_source_line_boundaries(

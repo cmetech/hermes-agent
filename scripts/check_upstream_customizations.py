@@ -2193,6 +2193,8 @@ def _git_changed_byte_ranges(
 
     old_ranges: list[tuple[int, int]] = []
     new_ranges: list[tuple[int, int]] = []
+    old_hunks: list[tuple[int, int]] = []
+    new_hunks: list[tuple[int, int]] = []
     old_cursor = new_cursor = 0
     old_end = new_end = 0
     in_hunk = False
@@ -2220,6 +2222,8 @@ def _git_changed_byte_ranges(
             new_cursor, new_end = _hunk_byte_bounds(
                 new_boundaries, new_start, new_count
             )
+            old_hunks.append((old_cursor, old_end))
+            new_hunks.append((new_cursor, new_end))
             in_hunk = True
             saw_hunk = True
             newline_sides.clear()
@@ -2265,7 +2269,25 @@ def _git_changed_byte_ranges(
                 new_ranges.append((new_cursor // 2, end // 2))
             new_cursor = end
     finish_hunk()
-    if not saw_hunk:
+    exact_old_coverage = (
+        bool(old_hunks)
+        and old_hunks[0][0] == 0
+        and old_hunks[-1][1] == len(old_encoded)
+        and all(
+            start < end and (index == 0 or old_hunks[index - 1][1] == start)
+            for index, (start, end) in enumerate(old_hunks)
+        )
+    )
+    exact_new_coverage = (
+        bool(new_hunks)
+        and new_hunks[0][0] == 0
+        and new_hunks[-1][1] == len(new_encoded)
+        and all(
+            start < end and (index == 0 or new_hunks[index - 1][1] == start)
+            for index, (start, end) in enumerate(new_hunks)
+        )
+    )
+    if not saw_hunk or not exact_old_coverage or not exact_new_coverage:
         raise ValueError("malformed Git character diff")
     return _coalesce_ranges(old_ranges), _coalesce_ranges(new_ranges)
 
