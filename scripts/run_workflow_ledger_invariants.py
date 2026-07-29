@@ -63,6 +63,23 @@ class _AttemptRevalidationError(ValueError):
         self.diagnostics = diagnostics
 
 
+@dataclass(frozen=True)
+class _InvariantDiagnostics:
+    path: str
+    diagnostics: tuple[_AttemptDiagnostic, ...]
+
+
+class _GroupAttemptRevalidationError(ValueError):
+    def __init__(
+        self,
+        diagnostics: tuple[_InvariantDiagnostics, ...],
+        errors: tuple[_AttemptRevalidationError, ...],
+    ) -> None:
+        ordered_errors = tuple(sorted(errors, key=lambda error: error.path))
+        super().__init__(str(ordered_errors[0]))
+        self.diagnostics = diagnostics
+
+
 class _JobObjectBasicLimitInformation(ctypes.Structure):
     _fields_ = [
         ("PerProcessUserTimeLimit", ctypes.c_longlong),
@@ -1417,6 +1434,44 @@ def _run_group(
         }
         for future in as_completed(futures):
             results.append(future.result())
+    except _AttemptRevalidationError as primary_error:
+        cancel_event.set()
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        results_by_path = {str(item["path"]): item for item in results}
+        errors_by_path = {primary_error.path: primary_error}
+        for future, path in futures.items():
+            if future.cancelled():
+                continue
+            try:
+                result = future.result()
+            except _AttemptRevalidationError as exc:
+                errors_by_path[exc.path] = exc
+            except CancelledError:
+                continue
+            else:
+                results_by_path[path] = result
+        diagnostic_sets = {
+            path: _InvariantDiagnostics(
+                path=path,
+                diagnostics=item.get("_nonpassing_attempt_diagnostics", ()),
+            )
+            for path, item in results_by_path.items()
+            if item.get("_nonpassing_attempt_diagnostics")
+        }
+        for path, error in errors_by_path.items():
+            diagnostic_sets[path] = _InvariantDiagnostics(
+                path=path,
+                diagnostics=error.diagnostics,
+            )
+        raise _GroupAttemptRevalidationError(
+            tuple(
+                diagnostic_sets[path]
+                for path in sorted(diagnostic_sets)
+            ),
+            tuple(errors_by_path.values()),
+        ) from primary_error
     except BaseException:
         cancel_event.set()
         for future in futures:
@@ -1731,6 +1786,13 @@ def main() -> int:
                     output_limit_bytes=args.output_limit_bytes,
                     source_repo=repo,
                 )
+    except _GroupAttemptRevalidationError as exc:
+        for item in exc.diagnostics:
+            _emit_nonpassing_attempt_diagnostics(
+                item.path,
+                tuple(sorted(item.diagnostics, key=lambda attempt: attempt.attempt)),
+            )
+        parser.error(str(exc))
     except _AttemptRevalidationError as exc:
         _emit_nonpassing_attempt_diagnostics(exc.path, exc.diagnostics)
         parser.error(str(exc))

@@ -2120,6 +2120,123 @@ def test_ledger_runner_never_exceeds_two_concurrent_python_files(tmp_path: Path)
     assert (tmp_path / "ledger-fixture/.maximum-count").read_text() == "2"
 
 
+def test_ledger_runner_retains_all_worker_diagnostics_when_revalidation_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A sibling drift error cannot discard a completed worker's diagnostics."""
+    paths = ["tests/test_a_retry.py", "tests/test_b_drift.py"]
+    first_attempts_ready = threading.Barrier(2)
+    retry_passed = threading.Event()
+    attempt_lock = threading.Lock()
+    attempt_counts = {path: 0 for path in paths}
+    worker = threading.local()
+
+    def fake_execute_attempt(
+        repo: Path,
+        path: str,
+        kind: str,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        del repo, kind, kwargs
+        worker.path = path
+        with attempt_lock:
+            attempt_counts[path] += 1
+            attempt = attempt_counts[path]
+        if attempt == 1:
+            first_attempts_ready.wait(timeout=5)
+            if path == paths[1]:
+                assert retry_passed.wait(timeout=5)
+            stem = "A_RETRY" if path == paths[0] else "B_DRIFT"
+            return {
+                "result": "failed",
+                "duration_ms": 1,
+                "output_truncated": False,
+                "_stdout": f"{stem}_STDOUT_DIAGNOSTIC\n",
+                "_stderr": f"{stem}_STDERR_DIAGNOSTIC\n",
+            }
+        assert path == paths[0]
+        retry_passed.set()
+        return {
+            "result": "passed",
+            "duration_ms": 1,
+            "output_truncated": False,
+            "_stdout": "PASSING_RETRY_OUTPUT_MUST_NOT_EMIT\n",
+            "_stderr": "",
+        }
+
+    def revalidate_before_retry() -> None:
+        if worker.path == paths[1]:
+            raise ValueError("dependency drift")
+
+    def execute_fixture(
+        repo: Path,
+        manifest_path: Path,
+        *,
+        platform: str,
+        timeout_seconds: float,
+        output_limit_bytes: int,
+        source_repo: Path | None = None,
+    ) -> list[dict[str, object]]:
+        del manifest_path, source_repo
+        return ledger_runner._run_group(
+            repo,
+            paths,
+            "python",
+            platform,
+            2,
+            timeout_seconds,
+            output_limit_bytes,
+            before_retry=revalidate_before_retry,
+        )
+
+    monkeypatch.setattr(ledger_runner, "_execute_attempt", fake_execute_attempt)
+    monkeypatch.setattr(
+        ledger_runner,
+        "_execute_manifest_invariants",
+        execute_fixture,
+    )
+    output = tmp_path / "must-not-exist.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(LEDGER_RUNNER),
+            "--repo",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--platform",
+            "synthetic",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        ledger_runner.main()
+
+    assert raised.value.code == 2
+    assert attempt_counts == {paths[0]: 2, paths[1]: 1}
+    assert not output.exists()
+    stderr = capsys.readouterr().err
+    headers = [
+        f"ledger invariant nonpassing attempt: {path} (attempt 1: failed)"
+        for path in paths
+    ]
+    for header in headers:
+        assert stderr.count(header) == 1
+    for marker in (
+        "A_RETRY_STDOUT_DIAGNOSTIC",
+        "A_RETRY_STDERR_DIAGNOSTIC",
+        "B_DRIFT_STDOUT_DIAGNOSTIC",
+        "B_DRIFT_STDERR_DIAGNOSTIC",
+    ):
+        assert stderr.count(marker) == 1
+    assert "PASSING_RETRY_OUTPUT_MUST_NOT_EMIT" not in stderr
+    drift_index = stderr.index("dependency drift")
+    assert stderr.index(headers[0]) < stderr.index(headers[1]) < drift_index
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group policy")
 def test_posix_cleanup_refuses_reused_group_before_term(monkeypatch) -> None:
     class _ExitedProcess:
