@@ -9,8 +9,9 @@ boundary alignment in `eda27235c` (`fix(workflow): preserve open output types`).
 Authoring is aligned to that boundary in `4d42af019`
 (`fix(workflow): bound output type metadata`). Cache, read, and completion
 hardening is in `cd520e993`
-(`fix(workflow): harden resolved output caching`). Archon downstream consumers
-now resolve the successful attempt's canonical
+(`fix(workflow): harden resolved output caching`), with boundary validation in
+`59306c605` (`fix(workflow): validate resolved output boundaries`). Archon
+downstream consumers now resolve the successful attempt's canonical
 `output.*` descriptor once into a frozen `ResolvedNodeOutput`. The resolver
 verifies containment,
 regular-file identity, byte size, SHA-256, UTF-8, candidate/descriptor agreement,
@@ -183,6 +184,31 @@ Five focused regressions were written before the cache/read hardening:
 
 The focused scheduler/resource/AI E2E suite passed 51/51 after these changes.
 
+### Quality fix round 2 RED/GREEN
+
+Three additional boundary regressions were driven from RED to GREEN:
+
+- A completed descriptor whose file was initially absent resolved successfully
+  after the file was later created. Read failures now use a narrow retryable
+  host-error allow-list: `EIO`, `EMFILE`, `ENFILE`, `EAGAIN`, `ESTALE`, and
+  exposed `EINTR` remain retryable, while namespace/path failures such as
+  `ENOENT`, `ENAMETOOLONG`, `ELOOP`, `ENOTDIR`, and `EISDIR` are stable
+  integrity failures and negative-cache for the immutable descriptor identity.
+  The existing first-`EIO`-then-success control remains retryable.
+- NUL and normalized-equivalent candidate paths were accepted, while a NUL
+  descriptor escaped as `ValueError` and crashed scheduler resolution. Candidate
+  and descriptor validation now share one canonical relative-path validator;
+  pathname `ValueError` is converted to a stable integrity failure.
+- A 6 KiB JSON body containing 2,048 empty objects demonstrated the same
+  proxy/backing-dict undercount as the bounded 500 KiB adversarial shape without
+  a large test allocation. Deep accounting now uses actual object sizes,
+  includes each mapping proxy and an equivalent backing-dict table/capacity,
+  traverses keys, values, and containers with shared-ID/cycle protection, and
+  charges retained cache/LRU/key/object overhead. A single overweight entry is
+  immediately evicted; ordinary weighted LRU behavior remains unchanged.
+
+The focused scheduler/resource/AI E2E suite passed 60/60 after these changes.
+
 ## Consumer invariants
 
 - Successful-attempt identity wins; failed/losing attempts cannot supply a
@@ -221,7 +247,7 @@ Exact required suite:
 scripts/run_tests.sh tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_language.py tests/plugins/workflow/test_bash_e2e.py tests/plugins/workflow/test_script_executor.py
 ```
 
-Fresh result after quality fix round 1: 5 files, 82 passed, 0 failed.
+Fresh result after quality fix round 2: 5 files, 91 passed, 0 failed.
 
 Focused cache/read/completion suite:
 
@@ -229,7 +255,7 @@ Focused cache/read/completion suite:
 scripts/run_tests.sh tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_ai_e2e.py -q
 ```
 
-Result: 3 files, 51 passed, 0 failed.
+Result: 3 files, 60 passed, 0 failed.
 
 Adjacent Archon/condition/shared-context suite:
 
@@ -242,7 +268,7 @@ Result: 3 files, 116 passed, 0 failed.
 Static verification:
 
 ```text
-.venv/bin/ruff check plugins/workflow/output_resolution.py plugins/workflow/scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_ai_e2e.py
+.venv/bin/ruff check plugins/workflow/output_resolution.py plugins/workflow/scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_scheduler.py
 git diff --check
 ```
 
