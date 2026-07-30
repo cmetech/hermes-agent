@@ -2417,6 +2417,7 @@ class RunScheduler:
                     and retained_candidate.output_type is not None
                     and retained_candidate.media_type == "text/plain"
                 ):
+                    source_media_type = retained_candidate.media_type
                     canonical_media_type = "text/markdown; charset=utf-8"
                     retained_candidate = replace(
                         retained_candidate,
@@ -2427,6 +2428,7 @@ class RunScheduler:
                         if (
                             artifact.relative_path
                             == retained_candidate.attempt_relative_path
+                            and artifact.media_type == source_media_type
                             and artifact.size_bytes == retained_candidate.size_bytes
                             and artifact.sha256 == retained_candidate.sha256
                         )

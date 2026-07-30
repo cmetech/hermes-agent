@@ -76,10 +76,18 @@ def _start_archon(
 
 
 class _OutputExecutor:
-    def __init__(self, data: bytes, media_type: str, *, status: str = "succeeded"):
+    def __init__(
+        self,
+        data: bytes,
+        media_type: str,
+        *,
+        status: str = "succeeded",
+        artifact_media_type: str | None = None,
+    ):
         self.data = data
         self.media_type = media_type
         self.status = status
+        self.artifact_media_type = artifact_media_type or media_type
 
     def execute(self, context):
         suffix = "json" if self.media_type == "application/json" else "md"
@@ -94,7 +102,12 @@ class _OutputExecutor:
         path.write_bytes(self.data)
         relative = path.relative_to(context.run_directory).as_posix()
         digest = hashlib.sha256(self.data).hexdigest()
-        artifact = ArtifactRef(relative, self.media_type, len(self.data), digest)
+        artifact = ArtifactRef(
+            relative,
+            self.artifact_media_type,
+            len(self.data),
+            digest,
+        )
         return NodeExecutionResult(
             self.status,
             (artifact,),
@@ -281,6 +294,32 @@ def test_hermes_legacy_primary_output_completes_without_publication(
     assert artifact["relative_path"].endswith("/output.md")
     assert artifact["sha256"] == hashlib.sha256(b"legacy output").hexdigest()
     assert artifact["size_bytes"] == len(b"legacy output")
+
+
+def test_typed_publication_rejects_candidate_artifact_media_disagreement(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_archon(
+        store,
+        workflow_writer,
+        tmp_path / "media-disagreement",
+        _node("bash", output_type="Report"),
+    )
+    scheduler = RunScheduler(store)
+    scheduler.executors["bash"] = _OutputExecutor(
+        b"report",
+        "text/plain",
+        artifact_media_type="application/json",
+    )
+
+    with pytest.raises(
+        ArchonOutputIntegrityError,
+        match="does not match one executor artifact",
+    ):
+        scheduler.advance(admitted.run_id)
+
+    assert not (store.run_directory(admitted.run_id) / "publications").exists()
 
 
 def _attempt_publication(

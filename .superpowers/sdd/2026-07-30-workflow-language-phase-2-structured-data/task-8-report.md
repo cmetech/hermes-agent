@@ -264,3 +264,77 @@ Result: Ruff passed and the diff whitespace check was clean.
 None within Task 8 scope. Scheduler normalization intentionally covers the
 known legacy executor contract (`text/plain`); all other noncanonical media
 types are rejected by the store instead of being guessed or silently coerced.
+
+## Fix Round 2 — preserve executor artifact corroboration
+
+Addressed the one new Important finding in
+`task-8-spec-rereview-1.md` with a single RED/GREEN cycle.
+
+### RED evidence
+
+Exact command:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py -k candidate_artifact_media_disagreement
+```
+
+Result: 1 file, 0 passed, 1 failed. The regression failed with `DID NOT
+RAISE ArchonOutputIntegrityError`, proving that a `text/plain` primary-output
+candidate sharing path, size, and digest with an `application/json` artifact
+was rewritten into manufactured Markdown corroboration and published.
+
+### Change
+
+- Captured the candidate's pre-normalization media type before canonicalizing
+  it.
+- Required each artifact's original media type to equal that source media type
+  before rewriting the matching artifact descriptor to canonical Markdown.
+- Added
+  `test_typed_publication_rejects_candidate_artifact_media_disagreement`, an
+  end-to-end scheduler regression that uses the same path, size, and digest but
+  conflicting candidate/artifact media types, expects the existing store
+  integrity error, and verifies that no publication directory is created.
+
+### GREEN evidence
+
+Focused regression:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py -k candidate_artifact_media_disagreement
+```
+
+Result: 1 file, 1 passed, 0 failed.
+
+Complete typed-publication file:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py
+```
+
+Result: 1 file, 15 passed, 0 failed.
+
+Static verification:
+
+```text
+.venv/bin/ruff check plugins/workflow/scheduler.py tests/plugins/workflow/test_typed_publication.py
+git diff --check
+```
+
+Result: Ruff passed and the diff whitespace check was clean.
+
+### Fix-round self-review
+
+- Confirmed normalization now requires agreement across all four executor
+  artifact identity fields: relative path, original media type, size, and
+  digest.
+- Confirmed an inconsistent artifact remains unmodified, so the store's exact
+  corroboration check rejects it before publication staging.
+- Confirmed valid `text/plain` candidate/artifact pairs still normalize
+  together and retain the canonical Markdown contract introduced in Fix Round
+  1.
+- Confirmed the store enforcement boundary and Task 9 recovery behavior are
+  unchanged.
+
+### Fix-round concerns
+
+None within Task 8 scope.
