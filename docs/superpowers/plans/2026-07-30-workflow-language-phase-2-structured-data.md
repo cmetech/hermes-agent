@@ -208,7 +208,7 @@
 - Modify: `tests/plugins/workflow/test_admission.py`
 - Modify: `tests/plugins/workflow/test_doctor.py`
 
-- [ ] Add failing matrix tests for direct OpenAI Responses, direct OpenAI Chat Completions, direct Anthropic Messages, custom endpoints, OpenRouter/aggregators, unknown Hermes-managed loops, and delegated runtimes.
+- [x] Add failing matrix tests for direct OpenAI Responses, direct OpenAI Chat Completions, direct Anthropic Messages, custom endpoints, OpenRouter/aggregators, unknown Hermes-managed loops, and delegated runtimes.
 
   Assert only explicit direct declarations resolve native; custom and aggregator routes resolve `prompt_json_schema`; unknown Hermes-managed routes resolve `prompt_json_schema`; delegated routes resolve `unsupported`; community `structured_output: true` metadata cannot promote a route.
 
@@ -216,7 +216,7 @@
 
   Expected: FAIL because runtime capabilities currently contain only API mode and managed-loop status.
 
-- [ ] Add the provider declaration and central resolver.
+- [x] Add the provider declaration and central resolver.
 
   Extend `ProviderProfile` with `structured_output_strategy: str | None = None`, where `None` means undeclared and an explicit `"unsupported"` means the provider forbids adaptation. Extend `ExecutionRuntimeCapabilities` with provider identity, normalized base URL trust class, and declared structured-output strategy. Implement:
 
@@ -235,19 +235,19 @@
 
   `resolve_structured_output_capability(...)` must cap rationale length and apply the authority/default rules from the approved design. Declare native Anthropic support in `plugins/model-providers/anthropic/__init__.py`; declare the trusted direct OpenAI API-key route in the built-in runtime classifier. Do not declare the ChatGPT subscription `openai-codex` profile native unless its backend contract is separately proved by a transport test.
 
-- [ ] Seal the decision into workflow admission and scheduled revalidation identity.
+- [x] Seal the decision into workflow admission and scheduled revalidation identity.
 
   Add the decision to `ExecutionCapabilityContext.identity_digest`, pass it into `assess_compatibility`, emit `structured_output_strategy_unsupported` when required, and store the complete immutable decision in run metadata for Archon AI nodes. Catalog summaries expose only strategy/provider/api-mode/adapter-version, not schemas.
 
   Extend workflow doctor coverage so a missing validator emits the existing structured-output extra-install guidance and a schemaless workflow does not require the validator.
 
-- [ ] Add admission drift tests.
+- [x] Add admission drift tests.
 
   Change provider config between admission and execution and assert the worker-facing sealed decision stays fixed, scheduled revalidation detects the identity change, and no provider request occurs when the resolved runtime cannot honor it.
 
   Run: `scripts/run_tests.sh tests/plugins/workflow/test_admission.py tests/plugins/workflow/test_schedule_revalidation.py tests/plugins/workflow/test_runner_binding.py`
 
-- [ ] Run the capability suites and commit.
+- [x] Run the capability suites and commit.
 
   Run: `scripts/run_tests.sh tests/providers/test_provider_profiles.py tests/plugins/workflow/test_runner_binding.py tests/plugins/workflow/test_provider_compat.py tests/plugins/workflow/test_compat_matrix.py tests/plugins/workflow/test_admission.py tests/plugins/workflow/test_schedule_revalidation.py tests/plugins/workflow/test_doctor.py`
 
