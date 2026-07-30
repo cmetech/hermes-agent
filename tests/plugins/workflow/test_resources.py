@@ -248,10 +248,12 @@ def test_prompt_and_bash_render_from_one_resolved_value_without_reparsing(
     variables = VariableContext(node_outputs={"collect": resolved})
 
     prompt = variables.render_prompt(
-        "$collect.output|$collect.output.items.0.count|$collect.output.ok"
+        "$collect.output|$collect.output.items.0|$collect.output.items|"
+        "$collect.output.items.0.count|$collect.output.ok"
     )
     bash = variables.render_bash(
-        "printf '%s|%s|%s' $collect.output "
+        "printf '%s|%s|%s|%s|%s' $collect.output "
+        "$collect.output.items.0 $collect.output.items "
         "$collect.output.items.0.count $collect.output.ok",
         spill_directory=tmp_path / "spill",
     )
@@ -262,7 +264,7 @@ def test_prompt_and_bash_render_from_one_resolved_value_without_reparsing(
         text=True,
     )
 
-    expected = f"{resolved.text}|3|true"
+    expected = f'{resolved.text}|{{"count":3}}|[{{"count":3}}]|3|true'
     assert prompt == expected
     assert completed.stdout == expected
     assert variables.node_outputs["collect"] is resolved

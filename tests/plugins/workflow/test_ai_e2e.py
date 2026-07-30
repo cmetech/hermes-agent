@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 
@@ -9,6 +10,7 @@ from agent.plugin_agent import PluginAgentRunResult
 from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.entitlement import AIEntitlementResolution
+from plugins.workflow import output_resolution
 from plugins.workflow.runner_binding import (
     RunnerCapabilities,
     execution_capability_context,
@@ -234,7 +236,7 @@ def test_scheduler_sidecar_caps_normal_ai_request_fields_exactly(
 
 
 def test_archon_scheduler_binds_sealed_structured_request_and_canonical_output(
-    tmp_path, workflow_writer
+    tmp_path, workflow_writer, monkeypatch
 ):
     workflow = workflow_writer(
         tmp_path / "package",
@@ -293,7 +295,8 @@ def test_archon_scheduler_binds_sealed_structured_request_and_canonical_output(
         api_mode=decision.api_mode,
     )
 
-    result = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+    scheduler = RunScheduler(store, agent_runner=runner)
+    result = scheduler.advance(admitted.run_id)
 
     assert result["last_error"] is None, result["last_error"]
     assert result["status"] == "succeeded", result
@@ -305,6 +308,33 @@ def test_archon_scheduler_binds_sealed_structured_request_and_canonical_output(
         "relative_path"
     ]
     assert output.read_bytes() == b'{"a":1,"b":true}'
+    candidate = result["nodes"]["work"]["attempts"][-1]["metadata"][
+        "primary_output_candidate"
+    ]
+    assert candidate == {
+        "attempt_relative_path": result["artifacts"][0]["relative_path"],
+        "media_type": "application/json",
+        "size_bytes": len(b'{"a":1,"b":true}'),
+        "sha256": hashlib.sha256(b'{"a":1,"b":true}').hexdigest(),
+        "schema_fingerprint": (
+            package.language.structured_outputs["work"].schema_fingerprint
+        ),
+        "canonicalization_version": 1,
+        "output_type": None,
+    }
+    monkeypatch.setattr(
+        output_resolution.json,
+        "loads",
+        lambda _value: pytest.fail("canonical output was reparsed"),
+    )
+    resolved = scheduler._output_values(
+        result, store.run_directory(admitted.run_id)
+    )["work"]
+    assert resolved.value == {"a": 1, "b": True}
+    live_candidate = scheduler._primary_output_candidates[
+        (admitted.run_id, "work", result["nodes"]["work"]["attempts"][-1]["attempt_id"])
+    ]
+    assert resolved.value is live_candidate.structured_value
 
 
 @pytest.mark.parametrize(

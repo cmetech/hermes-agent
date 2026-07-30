@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Callable, Mapping
 
@@ -17,6 +18,17 @@ _HAS_DESCRIPTOR_RELATIVE_IO = (
     and os.mkdir in os.supports_dir_fd
     and os.unlink in os.supports_dir_fd
 )
+PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY = "primary_output_candidate"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_PRIMARY_OUTPUT_CANDIDATE_FIELDS = frozenset({
+    "attempt_relative_path",
+    "media_type",
+    "size_bytes",
+    "sha256",
+    "schema_fingerprint",
+    "canonicalization_version",
+    "output_type",
+})
 
 
 class ArchonOutputIntegrityError(RuntimeError):
@@ -148,6 +160,8 @@ def write_archon_output_exclusive(
 
 
 def _freeze_json(value: object) -> object:
+    if _is_frozen_json(value):
+        return value
     if isinstance(value, Mapping):
         return MappingProxyType({
             str(key): _freeze_json(item) for key, item in value.items()
@@ -155,6 +169,17 @@ def _freeze_json(value: object) -> object:
     if isinstance(value, tuple | list):
         return tuple(_freeze_json(item) for item in value)
     return value
+
+
+def _is_frozen_json(value: object) -> bool:
+    if type(value) is MappingProxyType:
+        return all(
+            isinstance(key, str) and _is_frozen_json(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, tuple):
+        return all(_is_frozen_json(item) for item in value)
+    return not isinstance(value, Mapping | list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +200,84 @@ class PrimaryOutputCandidate:
             object.__setattr__(
                 self, "structured_value", _freeze_json(self.structured_value)
             )
+
+
+def primary_output_candidate_identity(
+    candidate: PrimaryOutputCandidate,
+) -> dict[str, object]:
+    """Return the bounded, body-free identity safe to retain at completion."""
+    return {
+        "attempt_relative_path": candidate.attempt_relative_path,
+        "media_type": candidate.media_type,
+        "size_bytes": candidate.size_bytes,
+        "sha256": candidate.sha256,
+        "schema_fingerprint": candidate.schema_fingerprint,
+        "canonicalization_version": candidate.canonicalization_version,
+        "output_type": candidate.output_type,
+    }
+
+
+def primary_output_candidate_from_identity(
+    value: object,
+    *,
+    structured_value: object | None = None,
+) -> PrimaryOutputCandidate:
+    """Validate and restore a retained winning-candidate identity."""
+    if not isinstance(value, Mapping) or set(value) != _PRIMARY_OUTPUT_CANDIDATE_FIELDS:
+        raise ArchonOutputIntegrityError("Archon output candidate identity is invalid")
+    relative_path = value["attempt_relative_path"]
+    media_type = value["media_type"]
+    size_bytes = value["size_bytes"]
+    digest = value["sha256"]
+    schema_fingerprint = value["schema_fingerprint"]
+    canonicalization_version = value["canonicalization_version"]
+    output_type = value["output_type"]
+    relative = PurePosixPath(relative_path) if isinstance(relative_path, str) else None
+    if (
+        relative is None
+        or not relative_path
+        or len(relative_path) > 1024
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or "\\" in relative_path
+        or not isinstance(media_type, str)
+        or not media_type
+        or len(media_type) > 128
+        or isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or not 0 <= size_bytes <= 500_000
+        or not isinstance(digest, str)
+        or _SHA256.fullmatch(digest) is None
+        or (
+            schema_fingerprint is not None
+            and (
+                not isinstance(schema_fingerprint, str)
+                or _SHA256.fullmatch(schema_fingerprint) is None
+            )
+        )
+        or isinstance(canonicalization_version, bool)
+        or not isinstance(canonicalization_version, int)
+        or canonicalization_version != 1
+        or (
+            output_type is not None
+            and (
+                not isinstance(output_type, str)
+                or not output_type
+                or len(output_type) > 256
+            )
+        )
+    ):
+        raise ArchonOutputIntegrityError("Archon output candidate identity is invalid")
+    return PrimaryOutputCandidate(
+        attempt_relative_path=relative_path,
+        media_type=media_type,
+        size_bytes=size_bytes,
+        sha256=digest,
+        structured_value=structured_value,
+        schema_fingerprint=schema_fingerprint,
+        canonicalization_version=canonicalization_version,
+        output_type=output_type,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,8 +412,11 @@ def resolve_legacy_output_values(
 
 __all__ = [
     "ArchonOutputIntegrityError",
+    "PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY",
     "PrimaryOutputCandidate",
     "ResolvedNodeOutput",
+    "primary_output_candidate_from_identity",
+    "primary_output_candidate_identity",
     "resolve_legacy_output_values",
     "resolve_node_output",
     "write_archon_output_exclusive",

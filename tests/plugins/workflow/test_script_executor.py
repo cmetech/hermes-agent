@@ -13,6 +13,7 @@ from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.models import WorkflowNode, freeze_value
+from plugins.workflow.output_resolution import ResolvedNodeOutput
 from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
@@ -315,6 +316,48 @@ def test_uv_dependencies_are_distinct_argv_without_shell_interpolation(
         "print('never')\n",
     ]
     assert not marker.exists()
+
+
+def test_inline_script_renders_frozen_nested_objects_and_arrays(tmp_path: Path) -> None:
+    wrapper = tmp_path / "fake-uv"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    canonical = b'{"items":[{"count":3}]}'
+    context = _context(
+        tmp_path,
+        runtime="uv",
+        script=(
+            "print('$collect.output.items.0', "
+            "'$collect.output.items')\n"
+        ),
+        variable_context=VariableContext(
+            node_outputs={
+                "collect": ResolvedNodeOutput(
+                    canonical_bytes=canonical,
+                    value={"items": [{"count": 3}]},
+                    text=canonical.decode("utf-8"),
+                    media_type="application/json",
+                    sha256="1" * 64,
+                    node_id="collect",
+                    attempt_id="attempt-winner",
+                    publication_id=None,
+                )
+            }
+        ),
+    )
+
+    result = ScriptExecutor(runtime_locator=lambda _runtime: str(wrapper)).execute(
+        context
+    )
+
+    assert result.status == "succeeded"
+    output = context.run_directory / result.artifacts[0].relative_path
+    assert json.loads(output.read_text())[-1] == (
+        'print(\'{"count":3}\', \'[{"count":3}]\')\n'
+    )
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")

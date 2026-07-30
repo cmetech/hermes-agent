@@ -50,7 +50,11 @@ from plugins.workflow.models import (
 )
 from plugins.workflow.output_resolution import (
     ArchonOutputIntegrityError,
+    PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY,
+    PrimaryOutputCandidate,
     ResolvedNodeOutput,
+    primary_output_candidate_from_identity,
+    primary_output_candidate_identity,
     resolve_legacy_output_values,
     resolve_node_output,
 )
@@ -78,6 +82,7 @@ _CLAUSE = re.compile(
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LEGACY_PACKAGE_PATHS = 4096
 _LEGACY_PACKAGE_PATH_CHARS = 512
+_OUTPUT_RESOLUTION_CACHE_LIMIT = 4096
 _LEGACY_NON_PACKAGE_FILES = frozenset(
     {
         ".lock",
@@ -440,6 +445,11 @@ class RunScheduler:
         self._active_runs: set[str] = set()
         self._submitted_runs: set[str] = set()
         self._active_executions = 0
+        self._output_resolution_lock = threading.RLock()
+        self._resolved_output_cache: dict[tuple[object, ...], ResolvedNodeOutput | None] = {}
+        self._primary_output_candidates: dict[
+            tuple[str, str, str], PrimaryOutputCandidate
+        ] = {}
         self._submission_pool = ThreadPoolExecutor(
             max_workers=self.max_parallel_nodes,
             thread_name_prefix="workflow-run",
@@ -546,14 +556,19 @@ class RunScheduler:
         nodes = projection.get("nodes", {})
         if not isinstance(artifacts, list) or not isinstance(nodes, Mapping):
             return {}
+        self._ensure_output_resolution_state()
+        run_id = str(projection.get("run_id", ""))
+        root_identity = str(run_directory.resolve())
+        active_resolution_keys: set[tuple[object, ...]] = set()
+        active_candidate_keys: set[tuple[str, str, str]] = set()
         outputs: dict[str, object] = {}
         for node_id, node_state in nodes.items():
             if not isinstance(node_id, str) or not isinstance(node_state, Mapping):
                 continue
             attempts = node_state.get("attempts", [])
-            winning_attempt = next(
+            winning_attempt_state = next(
                 (
-                    attempt.get("attempt_id")
+                    attempt
                     for attempt in reversed(attempts)
                     if isinstance(attempt, Mapping)
                     and attempt.get("state") == "succeeded"
@@ -561,7 +576,38 @@ class RunScheduler:
                 ),
                 None,
             )
-            if winning_attempt is None:
+            if winning_attempt_state is None:
+                continue
+            winning_attempt = str(winning_attempt_state["attempt_id"])
+            candidate_key = (run_id, node_id, winning_attempt)
+            active_candidate_keys.add(candidate_key)
+            node_type = str(node_state.get("type", ""))
+            requires_candidate = node_type in {"command", "prompt"}
+            raw_metadata = winning_attempt_state.get("metadata")
+            raw_candidate = (
+                raw_metadata.get(PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY)
+                if isinstance(raw_metadata, Mapping)
+                else None
+            )
+            candidate: PrimaryOutputCandidate | None = None
+            if raw_candidate is not None:
+                try:
+                    retained_candidate = primary_output_candidate_from_identity(
+                        raw_candidate
+                    )
+                except ArchonOutputIntegrityError:
+                    continue
+                with self._output_resolution_lock:
+                    live_candidate = self._primary_output_candidates.get(candidate_key)
+                if live_candidate is not None:
+                    if primary_output_candidate_identity(live_candidate) != dict(
+                        raw_candidate
+                    ):
+                        continue
+                    candidate = live_candidate
+                else:
+                    candidate = retained_candidate
+            elif requires_candidate:
                 continue
             candidates = [
                 artifact
@@ -580,25 +626,109 @@ class RunScheduler:
                     "output."
                 )
             ]
-            descriptor = (canonical or candidates)[-1] if candidates else None
+            if requires_candidate:
+                canonical = [
+                    artifact
+                    for artifact in canonical
+                    if candidate is not None
+                    and artifact.get("relative_path")
+                    == candidate.attempt_relative_path
+                ]
+                descriptor = canonical[-1] if canonical else None
+            elif node_type in {"bash", "script"}:
+                descriptor = (canonical or candidates)[-1] if candidates else None
+            else:
+                descriptor = canonical[-1] if canonical else None
             if descriptor is None:
                 continue
             publication_id = descriptor.get("publication_id")
-            try:
-                outputs[node_id] = resolve_node_output(
-                    run_directory=run_directory,
-                    node_id=node_id,
-                    attempt_id=winning_attempt,
-                    descriptor=descriptor,
-                    publication_id=(
-                        publication_id if isinstance(publication_id, str) else None
-                    ),
-                )
-            except ArchonOutputIntegrityError:
-                # Preserve Phase 2 missing-output outcomes. Phase 3 makes
-                # integrity and missing references strict at the consumer.
-                continue
+            resolution_key = (
+                root_identity,
+                run_id,
+                node_id,
+                winning_attempt,
+                descriptor.get("relative_path"),
+                descriptor.get("media_type"),
+                descriptor.get("size_bytes"),
+                descriptor.get("sha256"),
+                publication_id if isinstance(publication_id, str) else None,
+                *(
+                    (
+                        candidate.attempt_relative_path,
+                        candidate.media_type,
+                        candidate.size_bytes,
+                        candidate.sha256,
+                        candidate.schema_fingerprint,
+                        candidate.canonicalization_version,
+                        candidate.output_type,
+                    )
+                    if candidate is not None
+                    else (None,) * 7
+                ),
+            )
+            active_resolution_keys.add(resolution_key)
+            with self._output_resolution_lock:
+                if resolution_key not in self._resolved_output_cache:
+                    try:
+                        resolved = resolve_node_output(
+                            run_directory=run_directory,
+                            node_id=node_id,
+                            attempt_id=winning_attempt,
+                            descriptor=descriptor,
+                            candidate=candidate,
+                            publication_id=(
+                                publication_id
+                                if isinstance(publication_id, str)
+                                else None
+                            ),
+                        )
+                    except ArchonOutputIntegrityError:
+                        # Preserve Phase 2 missing-output outcomes. Phase 3
+                        # makes integrity and missing references strict.
+                        resolved = None
+                    self._resolved_output_cache[resolution_key] = resolved
+                    self._bound_output_resolution_caches()
+                resolved = self._resolved_output_cache[resolution_key]
+            if resolved is not None:
+                outputs[node_id] = resolved
+        with self._output_resolution_lock:
+            for key in tuple(self._resolved_output_cache):
+                if (
+                    key[:2] == (root_identity, run_id)
+                    and key not in active_resolution_keys
+                ):
+                    self._resolved_output_cache.pop(key, None)
+            for key in tuple(self._primary_output_candidates):
+                if key[0] == run_id and key not in active_candidate_keys:
+                    self._primary_output_candidates.pop(key, None)
         return outputs
+
+    def _ensure_output_resolution_state(self) -> None:
+        if hasattr(self, "_output_resolution_lock"):
+            return
+        self._output_resolution_lock = threading.RLock()
+        self._resolved_output_cache = {}
+        self._primary_output_candidates = {}
+
+    def _bound_output_resolution_caches(self) -> None:
+        for cache in (
+            self._resolved_output_cache,
+            self._primary_output_candidates,
+        ):
+            while len(cache) > _OUTPUT_RESOLUTION_CACHE_LIMIT:
+                cache.pop(next(iter(cache)))
+
+    def _remember_primary_output_candidate(
+        self,
+        claim: NodeClaim,
+        candidate: PrimaryOutputCandidate,
+    ) -> None:
+        self._ensure_output_resolution_state()
+        with self._output_resolution_lock:
+            self._primary_output_candidates[
+                (claim.run_id, claim.node_id, claim.attempt_id)
+            ] = candidate
+            self._bound_output_resolution_caches()
 
     def _variables(
         self,
@@ -2088,14 +2218,27 @@ class RunScheduler:
             )
             return
         if result.status != "failed":
+            completion_metadata = dict(result.metadata)
+            retained_candidate = None
+            if result.status == "succeeded" and result.primary_output is not None:
+                candidate_identity = primary_output_candidate_identity(
+                    result.primary_output
+                )
+                primary_output_candidate_from_identity(candidate_identity)
+                completion_metadata[PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY] = (
+                    candidate_identity
+                )
+                retained_candidate = result.primary_output
             self.store.complete_node(
                 claim,
                 status=result.status,
                 artifacts=result.artifacts,
                 error_code=result.error_code,
                 error_message=result.error_message,
-                metadata=result.metadata,
+                metadata=completion_metadata,
             )
+            if retained_candidate is not None:
+                self._remember_primary_output_candidate(claim, retained_candidate)
             return
         policy = self._effective_retry_policy(node, execution_limits)
         projection = self.store.load_run(claim.run_id)

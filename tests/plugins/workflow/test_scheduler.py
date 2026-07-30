@@ -173,9 +173,26 @@ def test_archon_consumers_select_winning_canonical_output_once(tmp_path):
         },
         "nodes": {
             "collect": {
+                "type": "prompt",
                 "attempts": [
                     {"attempt_id": "attempt-loser", "state": "failed"},
-                    {"attempt_id": "attempt-winner", "state": "succeeded"},
+                    {
+                        "attempt_id": "attempt-winner",
+                        "state": "succeeded",
+                        "metadata": {
+                            "primary_output_candidate": {
+                                "attempt_relative_path": (
+                                    paths["winner"].relative_to(tmp_path).as_posix()
+                                ),
+                                "media_type": "application/json",
+                                "size_bytes": len(canonical),
+                                "sha256": hashlib.sha256(canonical).hexdigest(),
+                                "schema_fingerprint": "3" * 64,
+                                "canonicalization_version": 1,
+                                "output_type": None,
+                            }
+                        },
+                    },
                 ]
             }
         },
@@ -195,6 +212,7 @@ def test_archon_consumers_select_winning_canonical_output_once(tmp_path):
 
     outputs = scheduler._output_values(projection, tmp_path)
     resolved = outputs["collect"]
+    paths["winner"].write_bytes(b'{"summary":{"count":999}}')
     variables = scheduler._variables(projection, tmp_path)
 
     assert isinstance(resolved, ResolvedNodeOutput)
@@ -209,7 +227,7 @@ def test_archon_consumers_select_winning_canonical_output_once(tmp_path):
     assert evaluate_condition("$collect.output.summary.count == 3", outputs)
     assert variables.render_prompt("$collect.output") == resolved.text
     assert variables.render_prompt("$collect.output.summary.count") == "3"
-    assert variables.node_outputs["collect"] == resolved
+    assert variables.node_outputs["collect"] is resolved
     evidence = scheduler._predecessor_results(projection, ("collect",), outputs)
     assert evidence["collect"]["output_evidence"] == {
         "media_type": resolved.media_type,
@@ -219,6 +237,210 @@ def test_archon_consumers_select_winning_canonical_output_once(tmp_path):
         "attempt_id": resolved.attempt_id,
         "publication_id": resolved.publication_id,
     }
+    replacement = b'{"summary":{"count":4},"ok":true}'
+    paths["winner"].write_bytes(replacement)
+    replacement_digest = hashlib.sha256(replacement).hexdigest()
+    winner_descriptor = projection["artifacts"][1]
+    winner_descriptor["size_bytes"] = len(replacement)
+    winner_descriptor["sha256"] = replacement_digest
+    winner_candidate = projection["nodes"]["collect"]["attempts"][-1]["metadata"][
+        "primary_output_candidate"
+    ]
+    winner_candidate["size_bytes"] = len(replacement)
+    winner_candidate["sha256"] = replacement_digest
+
+    replacement_resolved = scheduler._output_values(projection, tmp_path)["collect"]
+
+    assert replacement_resolved is not resolved
+    assert replacement_resolved.value["summary"]["count"] == 4
+    assert len(scheduler._resolved_output_cache) == 1
+
+
+@pytest.mark.parametrize("candidate_state", ("missing", "disagrees"))
+def test_archon_ai_requires_correlated_primary_candidate(
+    tmp_path, candidate_state
+):
+    canonical = b'{"ok":true}'
+    output = tmp_path / "output.json"
+    output.write_bytes(canonical)
+    metadata = {}
+    if candidate_state == "disagrees":
+        metadata["primary_output_candidate"] = {
+            "attempt_relative_path": "output.json",
+            "media_type": "application/json",
+            "size_bytes": len(canonical),
+            "sha256": "0" * 64,
+            "schema_fingerprint": "3" * 64,
+            "canonicalization_version": 1,
+            "output_type": None,
+        }
+    projection = {
+        "run_id": "run-1",
+        "language": {
+            "effective_profile": "archon-2026-07",
+            "normalizer_version": 2,
+            "normalized_definition_digest": "1" * 64,
+            "semantic_fingerprint": "2" * 64,
+            "structured_outputs": {},
+        },
+        "nodes": {
+            "collect": {
+                "type": "prompt",
+                "attempts": [{
+                    "attempt_id": "attempt-winner",
+                    "state": "succeeded",
+                    "metadata": metadata,
+                }],
+            }
+        },
+        "artifacts": [{
+            "node_id": "collect",
+            "attempt_id": "attempt-winner",
+            "relative_path": "output.json",
+            "media_type": "application/json",
+            "size_bytes": len(canonical),
+            "sha256": hashlib.sha256(canonical).hexdigest(),
+        }],
+    }
+    scheduler = RunScheduler.__new__(RunScheduler)
+
+    assert scheduler._output_values(projection, tmp_path) == {}
+
+
+def test_archon_ai_never_falls_back_to_stdout_when_canonical_output_is_missing(
+    tmp_path,
+):
+    stdout = tmp_path / "stdout.txt"
+    stdout.write_text("provider response", encoding="utf-8")
+    projection = {
+        "run_id": "run-1",
+        "language": {
+            "effective_profile": "archon-2026-07",
+            "normalizer_version": 2,
+            "normalized_definition_digest": "1" * 64,
+            "semantic_fingerprint": "2" * 64,
+            "structured_outputs": {},
+        },
+        "nodes": {
+            "collect": {
+                "type": "prompt",
+                "attempts": [{
+                    "attempt_id": "attempt-winner",
+                    "state": "succeeded",
+                    "metadata": {
+                        "primary_output_candidate": {
+                            "attempt_relative_path": "output.json",
+                            "media_type": "text/plain",
+                            "size_bytes": 17,
+                            "sha256": "3" * 64,
+                            "schema_fingerprint": None,
+                            "canonicalization_version": 1,
+                            "output_type": None,
+                        }
+                    },
+                }],
+            }
+        },
+        "artifacts": [{
+            "node_id": "collect",
+            "attempt_id": "attempt-winner",
+            "relative_path": "stdout.txt",
+            "media_type": "text/plain",
+            "size_bytes": len(stdout.read_bytes()),
+            "sha256": hashlib.sha256(stdout.read_bytes()).hexdigest(),
+        }],
+    }
+    scheduler = RunScheduler.__new__(RunScheduler)
+
+    assert scheduler._output_values(projection, tmp_path) == {}
+
+
+def test_archon_shell_output_retains_stdout_compatibility(tmp_path):
+    stdout = tmp_path / "stdout.txt"
+    stdout.write_text('{"ok":true}', encoding="utf-8")
+    projection = {
+        "run_id": "run-1",
+        "language": {
+            "effective_profile": "archon-2026-07",
+            "normalizer_version": 2,
+            "normalized_definition_digest": "1" * 64,
+            "semantic_fingerprint": "2" * 64,
+            "structured_outputs": {},
+        },
+        "nodes": {
+            "collect": {
+                "type": "bash",
+                "attempts": [{
+                    "attempt_id": "attempt-winner",
+                    "state": "succeeded",
+                }],
+            }
+        },
+        "artifacts": [{
+            "node_id": "collect",
+            "attempt_id": "attempt-winner",
+            "relative_path": "stdout.txt",
+            "media_type": "text/plain",
+            "size_bytes": len(stdout.read_bytes()),
+            "sha256": hashlib.sha256(stdout.read_bytes()).hexdigest(),
+        }],
+    }
+    scheduler = RunScheduler.__new__(RunScheduler)
+
+    resolved = scheduler._output_values(projection, tmp_path)["collect"]
+
+    assert resolved.value["ok"] is True
+
+
+def test_archon_resolution_failure_is_stable_for_one_descriptor_identity(tmp_path):
+    canonical = b'{"ok":true}'
+    output = tmp_path / "output.json"
+    output.write_bytes(b'{"no":true}')
+    digest = hashlib.sha256(canonical).hexdigest()
+    candidate = {
+        "attempt_relative_path": "output.json",
+        "media_type": "application/json",
+        "size_bytes": len(canonical),
+        "sha256": digest,
+        "schema_fingerprint": "3" * 64,
+        "canonicalization_version": 1,
+        "output_type": None,
+    }
+    projection = {
+        "run_id": "run-1",
+        "language": {
+            "effective_profile": "archon-2026-07",
+            "normalizer_version": 2,
+            "normalized_definition_digest": "1" * 64,
+            "semantic_fingerprint": "2" * 64,
+            "structured_outputs": {},
+        },
+        "nodes": {
+            "collect": {
+                "type": "prompt",
+                "attempts": [{
+                    "attempt_id": "attempt-winner",
+                    "state": "succeeded",
+                    "metadata": {"primary_output_candidate": candidate},
+                }],
+            }
+        },
+        "artifacts": [{
+            "node_id": "collect",
+            "attempt_id": "attempt-winner",
+            "relative_path": "output.json",
+            "media_type": "application/json",
+            "size_bytes": len(canonical),
+            "sha256": digest,
+        }],
+    }
+    scheduler = RunScheduler.__new__(RunScheduler)
+
+    first = scheduler._output_values(projection, tmp_path)
+    output.write_bytes(canonical)
+    second = scheduler._output_values(projection, tmp_path)
+
+    assert first == second == {}
 
 
 def test_legacy_output_scanning_and_parsing_order_remains_unchanged(tmp_path):

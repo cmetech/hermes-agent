@@ -71,6 +71,17 @@ def _quote_shell_value(value: str, quote: str | None) -> str:
     return shlex.quote(value)
 
 
+def _render_json_value(value: object) -> str:
+    def thaw(item: object) -> object:
+        if isinstance(item, Mapping):
+            return {str(key): thaw(child) for key, child in item.items()}
+        if isinstance(item, tuple | list):
+            return [thaw(child) for child in item]
+        return item
+
+    return json.dumps(thaw(value), sort_keys=True, separators=(",", ":"))
+
+
 @dataclass(frozen=True)
 class CommandResource:
     path: Path
@@ -606,7 +617,7 @@ class VariableContext:
                 return "null"
             if isinstance(value, bool):
                 return "true" if value else "false"
-            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+            return _render_json_value(value)
         values = {
             "ARGUMENTS": self.arguments,
             "USER_MESSAGE": self.user_message,
