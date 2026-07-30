@@ -417,7 +417,7 @@
 - Modify: `tests/plugins/workflow/test_resources.py`
 - Modify: `tests/plugins/workflow/test_language.py`
 
-- [ ] Add failing tests showing every Archon downstream consumer uses the same immutable output value.
+- [x] Add failing tests showing every Archon downstream consumer uses the same immutable output value.
 
   Cover condition lookup, prompt rendering, shell/script variable rendering, evidence projection, and nested field access. Assert all consumers see identical canonical bytes, parsed value, deterministic text, media type, digest, producer node, and winning attempt.
 
@@ -425,7 +425,7 @@
 
   Expected: FAIL because `_output_values`, `_variables`, and evidence independently inspect artifacts and parse text.
 
-- [ ] Implement `ResolvedNodeOutput` and `resolve_node_output(...)`.
+- [x] Implement `ResolvedNodeOutput` and `resolve_node_output(...)`.
 
   ```python
   @dataclass(frozen=True, slots=True)
@@ -442,11 +442,11 @@
 
   The Archon resolver trusts the winner descriptor and candidate/publication digest; it never reparses raw provider output. The legacy resolver delegates to the exact current scanning/parsing implementation.
 
-- [ ] Route scheduler/resource consumers through the shared resolver.
+- [x] Route scheduler/resource consumers through the shared resolver.
 
   Keep Phase 2 compatibility adapters for missing fields, condition coercion, comparison precedence, Bash quoting, and large values. Add explicit comments and tests showing those outcomes stay unchanged until Phase 3.
 
-- [ ] Run scheduler/resource regression suites and commit.
+- [x] Run scheduler/resource regression suites and commit.
 
   Run: `scripts/run_tests.sh tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_language.py tests/plugins/workflow/test_bash_e2e.py tests/plugins/workflow/test_script_executor.py`
 
