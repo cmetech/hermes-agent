@@ -14,6 +14,8 @@ from pathlib import Path
 
 from tools.environments.base import (
     BaseEnvironment,
+    _CLEAN_ENV_BASH,
+    _CLEAN_OUTER_SHELL_PRELUDE,
     _ThreadedProcessHandle,
 )
 from tools.environments.file_sync import (
@@ -233,8 +235,9 @@ class DaytonaEnvironment(BaseEnvironment):
 
         if clean:
             shell_cmd = (
-                "command env BASH_ENV=/dev/null ENV=/dev/null SHELLOPTS= "
-                "bash --noprofile --norc +x -c "
+                f"{_CLEAN_OUTER_SHELL_PRELUDE}"
+                f"{_CLEAN_ENV_BASH}"
+                "--noprofile --norc +x -c "
                 f"{shlex.quote(cmd_string)}"
             )
         elif login:

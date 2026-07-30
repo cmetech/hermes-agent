@@ -53,6 +53,35 @@ _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 _SNAPSHOT_GUARD_FAILURE_EXIT = 125
 _SNAPSHOT_GUARD_PASSED_SENTINEL_PREFIX = "__HERMES_SNAPSHOT_GUARD_PASSED_"
 
+# A token-free first stage for command-string transports whose account shell
+# may inherit xtrace. The wrapper is supplied only after this prelude disables
+# tracing. POSIX mode gives special builtins precedence over shell functions;
+# protected unset then removes functions that could intercept the external
+# hygienic launch. The AND-list fails closed before any sentinel-bearing step.
+_CLEAN_OUTER_SHELL_PRELUDE = (
+    "POSIXLY_CORRECT=1 &&\n"
+    "\\set +x &&\n"
+    "{ \\unset -f command 2>/dev/null || "
+    "! \\export -f command >/dev/null 2>&1; } &&\n"
+    "{ \\unset -f env 2>/dev/null || "
+    "! \\export -f env >/dev/null 2>&1; } &&\n"
+    "{ \\unset -f bash 2>/dev/null || "
+    "! \\export -f bash >/dev/null 2>&1; } &&\n"
+    "{ \\unset -f set 2>/dev/null || "
+    "! \\export -f set >/dev/null 2>&1; } &&\n"
+    "{ \\unset -f unset 2>/dev/null || "
+    "! \\export -f unset >/dev/null 2>&1; } &&\n"
+    "{ \\unset -f printf 2>/dev/null || "
+    "! \\export -f printf >/dev/null 2>&1; } &&\n"
+    "{ \\unset -f base64 2>/dev/null || "
+    "! \\export -f base64 >/dev/null 2>&1; } &&\n"
+    "{ \\unset -f export 2>/dev/null || "
+    "! \\export -f export >/dev/null 2>&1; } &&\n"
+)
+_CLEAN_ENV_BASH = (
+    "\\command env BASH_ENV=/dev/null ENV=/dev/null SHELLOPTS= bash "
+)
+
 
 # Bash resolves a function named ``builtin`` before ``\builtin``, including on
 # macOS's Bash 3.2.  Enter POSIX mode using assignment syntax (which cannot be

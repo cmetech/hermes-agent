@@ -1,5 +1,6 @@
 """SSH remote execution environment with ControlMaster connection persistence."""
 
+import base64
 import hashlib
 import logging
 import os
@@ -9,7 +10,12 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from tools.environments.base import BaseEnvironment, _popen_bash
+from tools.environments.base import (
+    BaseEnvironment,
+    _CLEAN_ENV_BASH,
+    _CLEAN_OUTER_SHELL_PRELUDE,
+    _popen_bash,
+)
 from tools.environments.file_sync import (
     FileSyncManager,
     iter_sync_files,
@@ -347,10 +353,15 @@ class SSHEnvironment(BaseEnvironment):
         """Spawn an SSH process that runs bash on the remote host."""
         cmd = self._build_ssh_command()
         if clean:
+            encoded_script = base64.b64encode(cmd_string.encode("utf-8")).decode(
+                "ascii"
+            )
             bash_command = (
-                "command env BASH_ENV=/dev/null ENV=/dev/null SHELLOPTS= "
-                "bash --noprofile --norc +x -c "
-                f"{shlex.quote(cmd_string)}"
+                f"{_CLEAN_OUTER_SHELL_PRELUDE}"
+                "__hermes_outer_script=$(\\printf '%s' "
+                f"{shlex.quote(encoded_script)} | \\command base64 -d) &&\n"
+                f"{_CLEAN_ENV_BASH}"
+                "--noprofile --norc +x -c \"$__hermes_outer_script\""
             )
         elif login:
             bash_command = f"bash -l -c {shlex.quote(cmd_string)}"
