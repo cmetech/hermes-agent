@@ -11,6 +11,7 @@ import pytest
 from agent.plugin_agent import PluginAgentRunResult
 from agent.structured_output import StructuredOutputStrategy, normalize_schema
 from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
+from plugins.workflow import output_resolution
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.models import (
@@ -316,6 +317,77 @@ def test_archon_output_rejects_symlinked_nodes_directory(tmp_path):
     assert result.status == "failed"
     assert result.error_code == "structured_output_integrity"
     assert result.metadata["archon_terminal_failure"] is True
+    assert not tuple(outside.iterdir())
+
+
+@pytest.mark.parametrize("raced_component", ["node", "attempt"])
+def test_archon_output_fallback_fails_closed_before_raced_path_replacement(
+    tmp_path, monkeypatch, raced_component
+):
+    runner = FakeAgentRunner("{}")
+    node = _node("fallback-race", "Produce data", output_format={"type": "object"})
+    context = _archon_context(tmp_path, node)
+    node_path = (
+        context.run_directory / "nodes" / _safe_output_component("node", node.id)
+    )
+    attempt_path = node_path / _safe_output_component("attempt", context.attempt_id)
+    raced_path = node_path if raced_component == "node" else attempt_path
+    if raced_component == "node":
+        node_path.mkdir(parents=True)
+    outside = tmp_path / f"outside-{raced_component}"
+    outside.mkdir()
+    original_is_dir = Path.is_dir
+    replacement_injected = False
+
+    def replace_after_check(path):
+        nonlocal replacement_injected
+        observed = original_is_dir(path)
+        if path == raced_path and observed and not replacement_injected:
+            path.rmdir()
+            path.symlink_to(outside, target_is_directory=True)
+            replacement_injected = True
+        return observed
+
+    monkeypatch.setattr(output_resolution, "_HAS_DESCRIPTOR_RELATIVE_IO", False)
+    monkeypatch.setattr(Path, "is_dir", replace_after_check)
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert not tuple(outside.iterdir())
+    assert replacement_injected is False
+    assert not attempt_path.joinpath("output.json").exists()
+    if raced_component == "node":
+        assert original_is_dir(node_path)
+        assert not node_path.is_symlink()
+    else:
+        assert not node_path.exists()
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_integrity"
+    assert result.error_message == "Archon output could not be sealed"
+    assert result.metadata["archon_terminal_failure"] is True
+    assert result.primary_output is None
+    assert not result.artifacts
+
+
+def test_archon_output_fallback_rejects_symlink_collision_without_partial_output(
+    tmp_path, monkeypatch
+):
+    runner = FakeAgentRunner("{}")
+    node = _node("fallback-collision", "Produce data", output_format={"type": "object"})
+    context = _archon_context(tmp_path, node)
+    outside = tmp_path / "outside-collision"
+    outside.mkdir()
+    (context.run_directory / "nodes").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(output_resolution, "_HAS_DESCRIPTOR_RELATIVE_IO", False)
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_integrity"
+    assert result.error_message == "Archon output could not be sealed"
+    assert result.metadata["archon_terminal_failure"] is True
+    assert result.primary_output is None
+    assert not result.artifacts
     assert not tuple(outside.iterdir())
 
 

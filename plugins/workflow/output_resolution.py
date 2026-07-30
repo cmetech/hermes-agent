@@ -118,66 +118,6 @@ def _write_descriptor_relative(
     return run_directory / "nodes" / node_component / attempt_component / filename
 
 
-def _write_portable(
-    run_directory: Path,
-    node_component: str,
-    attempt_component: str,
-    filename: str,
-    data: bytes,
-) -> Path:
-    """Conservative fallback for platforms without descriptor-relative opens."""
-    nodes = run_directory / "nodes"
-    node = nodes / node_component
-    attempt = node / attempt_component
-    output: Path | None = None
-    descriptor: int | None = None
-    remove_output = False
-    try:
-        for directory in (run_directory, nodes, node):
-            directory.mkdir(mode=0o700, exist_ok=True)
-            if directory.is_symlink() or not directory.is_dir():
-                raise ArchonOutputIntegrityError(
-                    "Archon output directory is not regular"
-                )
-        attempt.mkdir(mode=0o700, exist_ok=False)
-        if attempt.is_symlink() or not attempt.is_dir():
-            raise ArchonOutputIntegrityError("Archon output attempt is not regular")
-        output = attempt / filename
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(output, flags, 0o600)
-        remove_output = True
-        observed = os.fstat(descriptor)
-        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-            raise ArchonOutputIntegrityError("Archon output target is not regular")
-        view = memoryview(data)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError("short Archon output write")
-            view = view[written:]
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
-        remove_output = False
-        return output
-    except ArchonOutputIntegrityError:
-        raise
-    except (OSError, ValueError) as exc:
-        raise ArchonOutputIntegrityError("Archon output creation failed") from exc
-    finally:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        if remove_output and output is not None:
-            try:
-                output.unlink()
-            except OSError:
-                pass
-
-
 def write_archon_output_exclusive(
     run_directory: Path,
     *,
@@ -189,17 +129,15 @@ def write_archon_output_exclusive(
     """Create one contained output without following attacker-controlled links."""
     if filename not in {"output.json", "output.md"}:
         raise ArchonOutputIntegrityError("Archon output filename is invalid")
+    # Path checks cannot make a later pathname-based create race-free. Hosts
+    # without handle-relative creation must fail before touching the tree.
+    if not _HAS_DESCRIPTOR_RELATIVE_IO:
+        raise ArchonOutputIntegrityError(
+            "Secure descriptor-relative Archon output creation is unavailable"
+        )
     node_component = _safe_component("node", node_id)
     attempt_component = _safe_component("attempt", attempt_id)
-    if _HAS_DESCRIPTOR_RELATIVE_IO:
-        return _write_descriptor_relative(
-            run_directory,
-            node_component,
-            attempt_component,
-            filename,
-            data,
-        )
-    return _write_portable(
+    return _write_descriptor_relative(
         run_directory,
         node_component,
         attempt_component,
