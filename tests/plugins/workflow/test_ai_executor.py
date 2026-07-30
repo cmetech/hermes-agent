@@ -109,6 +109,9 @@ def _archon_context(
     *,
     strategy: StructuredOutputStrategy = StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
     outward_action: bool = False,
+    decision_provider: str = "fake-provider",
+    decision_model: str = "fake-model",
+    decision_api_mode: str = "chat_completions",
     **kwargs,
 ) -> NodeExecutionContext:
     def thaw(value):
@@ -129,9 +132,9 @@ def _archon_context(
         ),
         structured_output_decision=StructuredOutputCapabilityDecision(
             strategy=strategy,
-            effective_provider="fake-provider",
-            model="fake-model",
-            api_mode="chat_completions",
+            effective_provider=decision_provider,
+            model=decision_model,
+            api_mode=decision_api_mode,
             declaration_source="test",
             adapter_version=1,
             schema_fingerprint=normalized.schema_fingerprint,
@@ -390,6 +393,89 @@ def test_prompt_adapter_repairs_once_in_a_fresh_action_free_request(tmp_path):
     assert result.metadata["repair_disposition"] == "succeeded"
     output = tmp_path / "run" / result.primary_output.attempt_relative_path
     assert output.read_bytes() == b'{"answer":"fixed"}'
+
+
+@pytest.mark.parametrize(
+    ("requested_provider", "canonical_provider"),
+    [
+        ("openai-api", "openai"),
+        ("custom:corp-route", "custom"),
+    ],
+    ids=("openai-api", "named-custom"),
+)
+def test_archon_initial_and_repair_keep_immutable_routable_provider_selector(
+    tmp_path, requested_provider, canonical_provider
+):
+    class CanonicalRouteRunner:
+        def __init__(self):
+            self.requests = []
+            self.responses = ["not json", "{}"]
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            evidence = {
+                "provider_attempts": 1,
+                "model_calls": 1,
+                "strategy": request.structured_output.strategy.value,
+                "adapter_version": request.structured_output.adapter_version,
+                "schema_fingerprint": (
+                    request.structured_output.schema.schema_fingerprint
+                ),
+                "declaration_source": "test",
+            }
+            return PluginAgentRunResult(
+                final_response=self.responses.pop(0),
+                session_id="session",
+                provider=canonical_provider,
+                model="route-model",
+                status="completed",
+                pending_interaction=None,
+                usage={"input_tokens": 1, "output_tokens": 1},
+                audit={**evidence, "api_calls": 1, "api_mode": "chat_completions"},
+                structured_output=evidence,
+            )
+
+    runner = CanonicalRouteRunner()
+    node = _node(
+        "routable-selector",
+        "work",
+        provider=requested_provider,
+        model="route-model",
+        output_format={"type": "object"},
+    )
+
+    result = AgentNodeExecutor(runner).execute(
+        _archon_context(
+            tmp_path,
+            node,
+            decision_provider=canonical_provider,
+            decision_model="route-model",
+            max_provider_attempts=2,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert result.metadata["repair_disposition"] == "succeeded"
+    assert [request.provider for request in runner.requests] == [
+        requested_provider,
+        requested_provider,
+    ]
+    assert result.metadata["provider"] == canonical_provider
+    assert result.metadata["audit"]["effective_provider"] == canonical_provider
+
+
+def test_legacy_initial_request_keeps_declared_provider_selector(tmp_path):
+    runner = FakeAgentRunner("done")
+    node = _node(
+        "legacy-selector",
+        "work",
+        provider="custom:legacy-route",
+    )
+
+    result = AgentNodeExecutor(runner).execute(_context(tmp_path, node))
+
+    assert result.status == "succeeded"
+    assert runner.requests[0].provider == "custom:legacy-route"
 
 
 @pytest.mark.parametrize(

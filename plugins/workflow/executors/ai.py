@@ -151,6 +151,14 @@ class AgentNodeExecutor:
         return NodeExecutionResult("failed", (), code, message)
 
     @staticmethod
+    def _requested_provider(context: NodeExecutionContext) -> str | None:
+        """Return the routable selector from the immutable package snapshot."""
+        provider = context.node.options.get("provider") or context.workflow_options.get(
+            "provider"
+        )
+        return provider if isinstance(provider, str) and provider else None
+
+    @staticmethod
     def _structured_request(
         context: NodeExecutionContext,
     ) -> StructuredOutputRequest | None:
@@ -416,7 +424,7 @@ class AgentNodeExecutor:
         assert decision is not None
         repair_template = PluginAgentRunRequest(
             prompt="",
-            provider=decision.effective_provider,
+            provider=initial_request.provider,
             model=decision.model,
             context_mode="fresh",
             session_id=None,
@@ -797,7 +805,7 @@ class AgentNodeExecutor:
             request = PluginAgentRunRequest(
                 prompt=self._prompt(context),
                 provider=(
-                    context.structured_output_decision.effective_provider
+                    self._requested_provider(context)
                     if structured_request is not None
                     else node.options.get("provider")
                     or context.workflow_options.get("provider")
