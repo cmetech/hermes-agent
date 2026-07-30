@@ -431,7 +431,7 @@ class TestResourceConversion:
 # ---------------------------------------------------------------------------
 
 class TestInterrupt:
-    def test_unattested_interrupt_stops_sandbox_and_fails_closed(
+    def test_external_interrupt_stops_sandbox_and_preserves_ready_snapshot(
         self, make_env, monkeypatch
     ):
         sb = _make_sandbox()
@@ -458,8 +458,12 @@ class TestInterrupt:
         )
         try:
             result = env.execute("sleep 10")
-            assert result["returncode"] == 125
-            assert env._session_mode == "degraded_nonlogin"
+
+            assert result["returncode"] == 130
+            assert "[Command interrupted]" in result["output"]
+            assert set(result) == {"output", "returncode"}
+            assert env._session_mode == "snapshot"
+            assert env._snapshot_ready is True
             sb.stop.assert_called()
         finally:
             event.set()
