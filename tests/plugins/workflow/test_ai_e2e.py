@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -23,10 +24,12 @@ class RecordingRunner:
         response="investigated",
         *,
         declaration_source="default_prompt_adapter",
+        api_mode="chat_completions",
     ):
         self.requests = []
         self.response = response
         self.declaration_source = declaration_source
+        self.api_mode = api_mode
 
     def run(self, request, **_kwargs):
         self.requests.append(request)
@@ -44,6 +47,8 @@ class RecordingRunner:
                 "declaration_source": self.declaration_source,
             }
             audit.update(evidence)
+            audit["api_calls"] = 1
+            audit["api_mode"] = self.api_mode
         return PluginAgentRunResult(
             final_response=self.response,
             session_id="ai-session",
@@ -285,6 +290,7 @@ def test_archon_scheduler_binds_sealed_structured_request_and_canonical_output(
     runner = RecordingRunner(
         ' { "b": true, "a": 1 }\n',
         declaration_source=decision.declaration_source,
+        api_mode=decision.api_mode,
     )
 
     result = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
@@ -299,3 +305,86 @@ def test_archon_scheduler_binds_sealed_structured_request_and_canonical_output(
         "relative_path"
     ]
     assert output.read_bytes() == b'{"a":1,"b":true}'
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "malformed", "extra", "contradictory"],
+)
+def test_archon_malformed_sealed_decision_is_terminal_under_on_error_all(
+    tmp_path, workflow_writer, mutation
+):
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name=f"archon-sealed-{mutation}",
+        provider="fake-provider",
+        model="fake-model",
+        nodes=[{
+            "id": "work",
+            "prompt": "produce",
+            "output_format": {"type": "object"},
+            "retry": {"max_attempts": 3, "on_error": "all"},
+        }],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    execution_context = execution_capability_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+        runner_capabilities=RunnerCapabilities(starts_request_mcp=True),
+        runtime_capabilities=ExecutionRuntimeCapabilities(
+            api_mode="chat_completions",
+            hermes_managed_tool_loop=True,
+            effective_provider="fake-provider",
+            model="fake-model",
+        ),
+    )
+    store = RunStore(tmp_path / "home")
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=f"sealed-{mutation}",
+            concurrency_key=package.definition.name,
+            run_metadata=execution_context.structured_output_run_metadata(package),
+        ),
+        immutable_snapshot=prepared,
+    )
+    projection = store.load_run(admitted.run_id)
+    metadata = dict(projection["run_metadata"])
+    decision_key = next(
+        key for key in metadata if key.startswith("structured_output_decision.")
+    )
+    if mutation == "missing":
+        metadata.pop(decision_key)
+    elif mutation == "malformed":
+        metadata[decision_key] = "{"
+    else:
+        decision = json.loads(metadata[decision_key])
+        if mutation == "extra":
+            decision["unexpected"] = True
+        else:
+            decision["schema_fingerprint"] = "0" * 64
+        metadata[decision_key] = json.dumps(
+            decision, sort_keys=True, separators=(",", ":")
+        )
+    store.append_event(
+        admitted.run_id,
+        "test_corrupt_sealed_decision",
+        projection_updates={"run_metadata": metadata},
+    )
+    runner = RecordingRunner("{}")
+
+    result = RunScheduler(store, agent_runner=runner).advance(admitted.run_id)
+
+    assert result["status"] == "failed"
+    assert result["last_error"]["code"] == "structured_output_capability_drift"
+    assert result["nodes"]["work"]["state"] == "failed"
+    assert len(result["nodes"]["work"]["attempts"]) == 1
+    assert runner.requests == []

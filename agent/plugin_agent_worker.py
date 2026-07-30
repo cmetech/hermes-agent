@@ -1172,6 +1172,7 @@ def _structured_output_failure(
         "audit": {
             "plugin_id": plugin_id,
             "failure_kind": failure_kind,
+            "api_mode": _sanitize(decision.api_mode, 64),
             **evidence,
         },
         "structured_output": evidence,
@@ -1619,6 +1620,7 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                         "failure_kind": failure_kind,
                         "error": _sanitize(exc),
                         "tool_names": sorted(agent.valid_tool_names),
+                        "api_mode": _sanitize(runtime.get("api_mode"), 64),
                         **structured_evidence,
                     },
                     "structured_output": structured_evidence,
@@ -1669,6 +1671,11 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     "hook_events": hook_events,
                     "max_budget_usd": request.max_budget_usd,
                     "sandbox_policy_declared": request.sandbox_policy is not None,
+                    **(
+                        {"api_mode": _sanitize(runtime.get("api_mode"), 64)}
+                        if structured_evidence is not None
+                        else {}
+                    ),
                     **(structured_evidence or {}),
                 },
                 "structured_output": structured_evidence,

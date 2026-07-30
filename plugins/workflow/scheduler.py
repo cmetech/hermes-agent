@@ -102,6 +102,10 @@ class ConditionEvaluationError(ValueError):
     """A validated condition could not be evaluated against typed output."""
 
 
+class SealedStructuredOutputDecisionError(ValueError):
+    """An admitted Archon structured-output decision lost integrity."""
+
+
 class FailureClass(Enum):
     TRANSIENT = "transient"
     FATAL = "fatal"
@@ -178,13 +182,19 @@ def _sealed_structured_output_decision(
     )
     raw = metadata.get(key) if isinstance(metadata, Mapping) else None
     if not isinstance(raw, str):
-        raise ValueError("sealed structured-output decision is missing")
+        raise SealedStructuredOutputDecisionError(
+            "sealed structured-output decision is missing"
+        )
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise ValueError("sealed structured-output decision is malformed") from exc
+        raise SealedStructuredOutputDecisionError(
+            "sealed structured-output decision is malformed"
+        ) from exc
     if not isinstance(value, Mapping) or set(value) != _SEALED_STRUCTURED_DECISION_FIELDS:
-        raise ValueError("sealed structured-output decision is malformed")
+        raise SealedStructuredOutputDecisionError(
+            "sealed structured-output decision is malformed"
+        )
     try:
         decision = StructuredOutputCapabilityDecision(
             strategy=StructuredOutputStrategy(value["strategy"]),
@@ -197,7 +207,9 @@ def _sealed_structured_output_decision(
             rationale=value["rationale"],
         )
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("sealed structured-output decision is malformed") from exc
+        raise SealedStructuredOutputDecisionError(
+            "sealed structured-output decision is malformed"
+        ) from exc
     if (
         decision.schema_fingerprint != schema_fingerprint
         or type(decision.adapter_version) is not int
@@ -213,7 +225,9 @@ def _sealed_structured_output_decision(
             )
         )
     ):
-        raise ValueError("sealed structured-output decision is contradictory")
+        raise SealedStructuredOutputDecisionError(
+            "sealed structured-output decision is contradictory"
+        )
     return decision
 
 
@@ -1936,6 +1950,13 @@ class RunScheduler:
                                 ),
                             ),
                         )
+                    )
+                except SealedStructuredOutputDecisionError as exc:
+                    result = NodeExecutionResult(
+                        "failed",
+                        error_code="structured_output_capability_drift",
+                        error_message=str(exc),
+                        metadata={"archon_terminal_failure": True},
                     )
                 except Exception as exc:
                     result = NodeExecutionResult(

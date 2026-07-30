@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Mapping
 
@@ -40,6 +41,8 @@ from plugins.workflow.store import ArtifactRef
 
 
 _MAX_REPAIR_RESPONSE_BYTES = 256_000
+_MAX_REPAIR_PROMPT_CHARS = 500_000
+_MAX_REPAIR_REQUEST_WIRE_BYTES = 900_000
 
 
 def _thaw(value: object) -> object:
@@ -124,7 +127,6 @@ class AgentNodeExecutor:
             "denied_tools": list(node.options.get("denied_tools", ())),
             "mcp": node.options.get("mcp"),
             "profile": self.profile_name,
-            "structured_output": structured_identity,
             "reasoning": {
                 key: node.options.get(key, workflow.get(key))
                 for key in (
@@ -137,6 +139,8 @@ class AgentNodeExecutor:
                 )
             },
         }
+        if structured_identity is not None:
+            material["structured_output"] = structured_identity
         encoded = json.dumps(
             material, sort_keys=True, separators=(",", ":"), default=str
         )
@@ -179,16 +183,21 @@ class AgentNodeExecutor:
     def _structured_counts(
         result,
         request: StructuredOutputRequest,
+        decision,
         *,
         declaration_source: str,
         provider_limit: int,
         model_limit: int,
+        require_positive: bool,
     ) -> tuple[int, int]:
         evidence = result.structured_output
         if not isinstance(evidence, Mapping):
             raise ValueError("structured output evidence is missing")
         if (
-            evidence.get("strategy") != request.strategy.value
+            result.provider != decision.effective_provider
+            or result.model != decision.model
+            or result.audit.get("api_mode") != decision.api_mode
+            or evidence.get("strategy") != request.strategy.value
             or evidence.get("adapter_version") != request.adapter_version
             or evidence.get("schema_fingerprint")
             != request.schema.schema_fingerprint
@@ -200,10 +209,12 @@ class AgentNodeExecutor:
         if (
             isinstance(provider_attempts, bool)
             or not isinstance(provider_attempts, int)
-            or not 0 <= provider_attempts <= provider_limit
+            or not (1 if require_positive else 0)
+            <= provider_attempts
+            <= provider_limit
             or isinstance(model_calls, bool)
             or not isinstance(model_calls, int)
-            or not 0 <= model_calls <= model_limit
+            or not (1 if require_positive else 0) <= model_calls <= model_limit
         ):
             raise ValueError("structured output accounting is invalid")
         return provider_attempts, model_calls
@@ -237,6 +248,49 @@ class AgentNodeExecutor:
             sort_keys=True,
             separators=(",", ":"),
         )
+
+    @classmethod
+    def _bounded_repair_request(
+        cls,
+        template: PluginAgentRunRequest,
+        structured_request: StructuredOutputRequest,
+        invalid_response: str,
+        diagnostics: str,
+    ) -> PluginAgentRunRequest | None:
+        def candidate(excerpt_length: int) -> PluginAgentRunRequest | None:
+            prompt = cls._repair_prompt(
+                structured_request,
+                invalid_response[:excerpt_length],
+                diagnostics,
+            )
+            if len(prompt) > _MAX_REPAIR_PROMPT_CHARS:
+                return None
+            request = replace(template, prompt=prompt)
+            encoded_wire = json.dumps(
+                request.to_wire(), ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            if len(encoded_wire) > _MAX_REPAIR_REQUEST_WIRE_BYTES:
+                return None
+            return request
+
+        complete = candidate(len(invalid_response))
+        if complete is not None:
+            return complete
+        empty = candidate(0)
+        if empty is None:
+            return None
+        low = 0
+        high = len(invalid_response)
+        best = empty
+        while low + 1 < high:
+            middle = (low + high) // 2
+            bounded = candidate(middle)
+            if bounded is None:
+                high = middle
+            else:
+                low = middle
+                best = bounded
+        return best
 
     @staticmethod
     def _write_archon_output(
@@ -358,14 +412,12 @@ class AgentNodeExecutor:
         if len(response_bytes) > _MAX_REPAIR_RESPONSE_BYTES:
             return failed("ineligible_response_too_large")
 
-        repair_request = PluginAgentRunRequest(
-            prompt=self._repair_prompt(
-                structured_request,
-                response,
-                diagnostics,
-            ),
-            provider=initial_result.provider,
-            model=initial_result.model,
+        decision = context.structured_output_decision
+        assert decision is not None
+        repair_template = PluginAgentRunRequest(
+            prompt="",
+            provider=decision.effective_provider,
+            model=decision.model,
             context_mode="fresh",
             session_id=None,
             enabled_toolsets=(),
@@ -403,6 +455,14 @@ class AgentNodeExecutor:
             term_grace_seconds=initial_request.term_grace_seconds,
             kill_reap_grace_seconds=initial_request.kill_reap_grace_seconds,
         )
+        repair_request = self._bounded_repair_request(
+            repair_template,
+            structured_request,
+            response,
+            diagnostics,
+        )
+        if repair_request is None:
+            return failed("ineligible_repair_prompt_too_large")
         try:
             repair_result = agent_runner.run(
                 repair_request,
@@ -421,11 +481,13 @@ class AgentNodeExecutor:
                 repair_counts = self._structured_counts(
                     repair_result,
                     structured_request,
+                    decision,
                     declaration_source=(
-                        context.structured_output_decision.declaration_source
+                        decision.declaration_source
                     ),
                     provider_limit=remaining_provider_attempts,
                     model_limit=1,
+                    require_positive=repair_result.status == "completed",
                 )
             except ValueError:
                 return failed("repair_evidence_invalid")
@@ -442,6 +504,10 @@ class AgentNodeExecutor:
         aggregate_audit.update({
             "provider_attempts": total_provider_attempts,
             "model_calls": total_model_calls,
+            "api_calls": total_model_calls,
+            "effective_provider": decision.effective_provider,
+            "model": decision.model,
+            "api_mode": decision.api_mode,
         })
         metadata["audit"] = aggregate_audit
         metadata["provider_attempts"] = max(0, total_provider_attempts - 1)
@@ -730,10 +796,18 @@ class AgentNodeExecutor:
                 request_overrides["web_search_mode"] = web_mode
             request = PluginAgentRunRequest(
                 prompt=self._prompt(context),
-                provider=node.options.get("provider")
-                or context.workflow_options.get("provider"),
-                model=node.options.get("model")
-                or context.workflow_options.get("model"),
+                provider=(
+                    context.structured_output_decision.effective_provider
+                    if structured_request is not None
+                    else node.options.get("provider")
+                    or context.workflow_options.get("provider")
+                ),
+                model=(
+                    context.structured_output_decision.model
+                    if structured_request is not None
+                    else node.options.get("model")
+                    or context.workflow_options.get("model")
+                ),
                 context_mode=context_mode,
                 session_id=session_id,
                 allowed_tools=allowed_tools,
@@ -859,11 +933,13 @@ class AgentNodeExecutor:
                 structured_counts = self._structured_counts(
                     result,
                     structured_request,
+                    context.structured_output_decision,
                     declaration_source=(
                         context.structured_output_decision.declaration_source
                     ),
                     provider_limit=granted_provider_attempts,
                     model_limit=request.max_iterations,
+                    require_positive=result.status == "completed",
                 )
             except ValueError as exc:
                 metadata["archon_terminal_failure"] = True

@@ -1009,6 +1009,7 @@ def test_prompt_structured_output_adapts_only_initial_user_message(
     }
     assert result["audit"]["provider_attempts"] == 1
     assert result["audit"]["model_calls"] == 1
+    assert result["audit"]["api_mode"] == "chat_completions"
 
 
 def test_structured_capability_drift_returns_zero_attempt_evidence_before_agent(
@@ -1049,6 +1050,7 @@ def test_structured_capability_drift_returns_zero_attempt_evidence_before_agent(
     assert result["audit"]["failure_kind"] == "structured_output_capability_drift"
     assert result["audit"]["provider_attempts"] == 0
     assert result["audit"]["model_calls"] == 0
+    assert result["audit"]["api_mode"] == "chat_completions"
     assert result["structured_output"] == {
         "provider_attempts": 0,
         "model_calls": 0,
