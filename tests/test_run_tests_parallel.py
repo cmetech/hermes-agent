@@ -290,6 +290,31 @@ def test_parallel_files_receive_disjoint_pytest_temp_roots(tmp_path: Path) -> No
     )
 
 
+def test_runner_basetemp_does_not_trigger_live_process_guard() -> None:
+    """Runner-owned argv paths must not look like live Hermes targets.
+
+    The real search regression invokes ``rg`` with the exact shlex token
+    ``skill``.  The test-suite live-system guard correctly treats that token
+    as a process-killer only when some argv text also targets Hermes/gateway.
+    Running the test through the per-file runner proves its private basetemp
+    path does not supply that otherwise-absent target term.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    search_test = repo_root / "tests" / "tools" / "test_search_hidden_dirs.py"
+
+    proc = _run_runner(
+        search_test,
+        "--file-retries",
+        "0",
+        "-q",
+        "-k",
+        "test_rg_finds_visible_content",
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    assert "live-system guard" not in proc.stdout, proc.stdout
+
+
 @pytest.mark.parametrize(
     ("env_workers", "cli_args", "expected_jobs"),
     [

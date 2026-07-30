@@ -583,7 +583,7 @@ def _run_one_file_once(
     # there at exit, which lets one per-file process prune another process's
     # still-live ``tmp_path`` tree.  Give each attempt an owned basetemp and
     # remove only that owned parent after its complete process tree is gone.
-    attempt_temp_root = Path(tempfile.mkdtemp(prefix="hermes-pytest-file-"))
+    attempt_temp_root = Path(tempfile.mkdtemp(prefix="pytest-file-"))
     basetemp = attempt_temp_root / "basetemp"
     cmd = [
         sys.executable,
