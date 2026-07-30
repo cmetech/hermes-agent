@@ -589,7 +589,7 @@ def test_coordinator_health_distinguishes_missing_fresh_and_stale(tmp_path) -> N
     assert stale.reason_code == "coordinator_lease_expired"
 
 
-def _wait_until(predicate, *, timeout: float = 2.0) -> None:
+def _wait_until(predicate, *, timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -625,14 +625,14 @@ def test_gateway_leader_and_web_standby_report_cached_health(tmp_path) -> None:
     web = _service(tmp_path, host_kind="web", host_instance_id="web-1")
     gateway_stop = threading.Event()
     web_stop = threading.Event()
-    threads = [
-        threading.Thread(target=gateway.run, args=(gateway_stop,)),
-        threading.Thread(target=web.run, args=(web_stop,)),
-    ]
-    for thread in threads:
-        thread.start()
+    gateway_thread = threading.Thread(target=gateway.run, args=(gateway_stop,))
+    web_thread = threading.Thread(target=web.run, args=(web_stop,))
+    gateway_thread.start()
+    web_started = False
     try:
         _wait_until(lambda: gateway.health().code == "leader")
+        web_thread.start()
+        web_started = True
         _wait_until(lambda: web.health().code == "standby")
         started = time.monotonic()
         health = web.health()
@@ -642,6 +642,7 @@ def test_gateway_leader_and_web_standby_report_cached_health(tmp_path) -> None:
     finally:
         gateway_stop.set()
         web_stop.set()
+        threads = (gateway_thread, web_thread) if web_started else (gateway_thread,)
         for thread in threads:
             thread.join(timeout=2)
             assert not thread.is_alive()

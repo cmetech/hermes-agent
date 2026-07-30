@@ -2168,6 +2168,16 @@ def cleanup_task_resources(agent, task_id: str) -> None:
     visible between turns. The inactivity reaper in
     ``browser_tool._cleanup_inactive_browser_sessions`` still handles
     idle sessions.
+
+    OTTO: passes ``keep_enrolled=True``. This hook runs EVERY turn, and its
+    headed-mode skip reads the GLOBAL ``browser.headed`` -- the seeded enrolled
+    profile sets ``headed`` at PROFILE level, so the skip never fires for it.
+    Reaping the enrolled sidecar per turn dropped its memo, handle and registry
+    binding while the real browser stayed alive, so the next turn's first
+    trusted navigation re-acquired, and ``acquire()`` runs process-wide
+    ``close --all`` daemon hygiene -- one conversation's re-acquire could tear
+    down another's in-flight session (review finding H-2). End-of-task cleanup
+    (``run_agent``) still passes no flag and still reaps it.
     """
     try:
         if is_persistent_env(task_id):
@@ -2195,7 +2205,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
                     f"idle reaper will handle it."
                 )
         else:
-            _ra().cleanup_browser(task_id)
+            _ra().cleanup_browser(task_id, keep_enrolled=True)
     except Exception as e:
         if agent.verbose_logging:
             logger.warning(f"Failed to cleanup browser for task {task_id}: {e}")

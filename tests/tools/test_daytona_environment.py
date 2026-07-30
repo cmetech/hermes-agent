@@ -1,15 +1,25 @@
 """Unit tests for the Daytona cloud sandbox environment backend."""
 
+import re
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+try:
+    from daytona._sync.process import Process as _InstalledDaytonaProcess
+except ImportError:  # Optional SDK is lazy-installed in production.
+    _InstalledDaytonaProcess = None
+
 
 # ---------------------------------------------------------------------------
 # Helpers to build mock Daytona SDK objects
 # ---------------------------------------------------------------------------
+
+def _normalize_daytona_output(raw_output: str) -> str:
+    """Faithfully model Daytona 0.155's splitlines/join output normalization."""
+    return "\n".join(raw_output.splitlines())
 
 def _make_exec_response(result="", exit_code=0):
     return SimpleNamespace(result=result, exit_code=exit_code)
@@ -75,6 +85,36 @@ def make_env(daytona_sdk, monkeypatch):
         **kwargs,
     ):
         sandbox = sandbox or _make_sandbox()
+        sdk_side_effect = sandbox.process.exec.side_effect
+        if sdk_side_effect is not None:
+            if isinstance(sdk_side_effect, BaseException):
+                def invoke_side_effect(*_args, **_kwargs):
+                    raise sdk_side_effect
+            elif callable(sdk_side_effect):
+                invoke_side_effect = sdk_side_effect
+            else:
+                response_iter = iter(sdk_side_effect)
+
+                def invoke_side_effect(*_args, **_kwargs):
+                    return next(response_iter)
+
+            def bash_aware_side_effect(cmd, *args, **kwargs):
+                response = invoke_side_effect(cmd, *args, **kwargs)
+                if isinstance(response, BaseException):
+                    raise response
+                sentinel = re.search(
+                    r"__HERMES_SNAPSHOT_GUARD_PASSED_[0-9a-f]{32}__", cmd
+                )
+                if sentinel and hasattr(response, "result"):
+                    raw_result = (
+                        f"\n{sentinel.group(0)}\n{response.result or ''}"
+                    )
+                    response.result = _normalize_daytona_output(raw_result)
+                return response
+
+            # The SDK fake stands in for Bash here, so reproduce the wrapper's
+            # guard-passed stdout attestation before returning command output.
+            sandbox.process.exec.side_effect = bash_aware_side_effect
         # Mock the $HOME detection
         sandbox.process.exec.return_value = _make_exec_response(result=home_dir)
 
@@ -107,6 +147,20 @@ def make_env(daytona_sdk, monkeypatch):
         return env
 
     return _factory
+
+
+@pytest.mark.skipif(
+    _InstalledDaytonaProcess is None,
+    reason="Daytona SDK is not installed",
+)
+def test_output_normalizer_matches_installed_daytona_sdk():
+    raw_output = "\n__HERMES_GUARD__\n"
+
+    installed = _InstalledDaytonaProcess._parse_output(
+        raw_output.splitlines()
+    ).stdout
+
+    assert _normalize_daytona_output(raw_output) == installed
 
 
 # ---------------------------------------------------------------------------
@@ -221,10 +275,12 @@ class TestCleanup:
 class TestExecute:
     def test_basic_command(self, make_env):
         sb = _make_sandbox()
-        # Calls: (1) $HOME detection, (2) init_session bootstrap, (3) actual command
+        # Calls: HOME, snapshot preclean/capture/validation, actual command.
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),       # $HOME
-            _make_exec_response(result="", exit_code=0),  # init_session
+            _make_exec_response(result="", exit_code=0),  # preclean
+            _make_exec_response(result="", exit_code=0),  # capture
+            _make_exec_response(result="", exit_code=0),  # validation
             _make_exec_response(result="hello", exit_code=0),  # actual cmd
         ]
         sb.state = "started"
@@ -234,12 +290,34 @@ class TestExecute:
         assert "hello" in result["output"]
         assert result["returncode"] == 0
 
+    @pytest.mark.parametrize("exit_code", [0, 125])
+    def test_no_output_command_survives_sdk_newline_normalization(
+        self, make_env, exit_code
+    ):
+        sb = _make_sandbox()
+        sb.process.exec.side_effect = [
+            _make_exec_response(result="/root"),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=exit_code),
+        ]
+        sb.state = "started"
+        env = make_env(sandbox=sb)
+
+        result = env.execute("true")
+
+        assert result == {"output": "", "returncode": exit_code}
+        assert env._session_mode == "snapshot"
+
     def test_sdk_timeout_passed_to_exec(self, make_env):
         """SDK native timeout is passed to sandbox.process.exec()."""
         sb = _make_sandbox()
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),
-            _make_exec_response(result="", exit_code=0),  # init_session
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
             _make_exec_response(result="ok", exit_code=0),
         ]
         sb.state = "started"
@@ -258,7 +336,9 @@ class TestExecute:
         sb = _make_sandbox()
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),
-            _make_exec_response(result="", exit_code=0),  # init_session
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
             _make_exec_response(result="", exit_code=124),  # actual cmd
         ]
         sb.state = "started"
@@ -271,7 +351,9 @@ class TestExecute:
         sb = _make_sandbox()
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),
-            _make_exec_response(result="", exit_code=0),  # init_session
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
             _make_exec_response(result="not found", exit_code=127),
         ]
         sb.state = "started"
@@ -284,7 +366,9 @@ class TestExecute:
         sb = _make_sandbox()
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),
-            _make_exec_response(result="", exit_code=0),  # init_session
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
             _make_exec_response(result="ok", exit_code=0),
         ]
         sb.state = "started"
@@ -305,16 +389,18 @@ class TestExecute:
         sb.state = "started"
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),  # $HOME
-            _make_exec_response(result="", exit_code=0),  # init_session
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
             daytona_sdk.DaytonaError("transient"),  # first attempt fails
             _make_exec_response(result="ok", exit_code=0),  # retry succeeds
         ]
         env = make_env(sandbox=sb)
 
         result = env.execute("echo retry")
-        # DaytonaError now surfaces directly through _ThreadedProcessHandle
-        # (no retry logic) — the error becomes returncode=1
-        assert result["returncode"] == 1
+        # No remote stdout was observed, so READY cannot prove user code began.
+        assert result["returncode"] == 125
+        assert env._session_mode == "degraded_nonlogin"
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +431,9 @@ class TestResourceConversion:
 # ---------------------------------------------------------------------------
 
 class TestInterrupt:
-    def test_interrupt_stops_sandbox_and_returns_130(self, make_env, monkeypatch):
+    def test_external_interrupt_stops_sandbox_and_preserves_ready_snapshot(
+        self, make_env, monkeypatch
+    ):
         sb = _make_sandbox()
         sb.state = "started"
         event = threading.Event()
@@ -370,7 +458,12 @@ class TestInterrupt:
         )
         try:
             result = env.execute("sleep 10")
+
             assert result["returncode"] == 130
+            assert "[Command interrupted]" in result["output"]
+            assert set(result) == {"output", "returncode"}
+            assert env._session_mode == "snapshot"
+            assert env._snapshot_ready is True
             sb.stop.assert_called()
         finally:
             event.set()
@@ -387,14 +480,17 @@ class TestRetryExhausted:
         sb.state = "started"
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),       # $HOME
-            _make_exec_response(result="", exit_code=0),  # init_session
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
             daytona_sdk.DaytonaError("fail1"),         # actual command fails
         ]
         env = make_env(sandbox=sb)
 
         result = env.execute("echo x")
-        # Error surfaces directly through _ThreadedProcessHandle (rc=1)
-        assert result["returncode"] == 1
+        # Error has no observable remote stdout attestation, so it fails closed.
+        assert result["returncode"] == 125
+        assert env._session_mode == "degraded_nonlogin"
 
 
 # ---------------------------------------------------------------------------

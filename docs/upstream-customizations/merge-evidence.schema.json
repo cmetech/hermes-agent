@@ -57,6 +57,12 @@
       "maxLength": 512,
       "not": {"pattern": "(?i)(token|secret|password|prompt|workflow_input)\\s*[=:]"}
     },
+    "repositoryPath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\u0000-\\u001f\\u007f]+$"
+    },
     "command": {
       "type": "object",
       "required": ["name", "result", "duration_ms", "platform"],
@@ -65,6 +71,176 @@
         "result": {"enum": ["passed", "failed"]},
         "duration_ms": {"type": "integer", "minimum": 0},
         "platform": {"$ref": "#/$defs/safeText"}
+      },
+      "additionalProperties": false
+    },
+    "executedTest": {
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "path",
+        "result",
+        "duration_ms",
+        "platform",
+        "attempts",
+        "flaky_on_first_attempt"
+      ],
+      "properties": {
+        "kind": {"const": "executed"},
+        "name": {"$ref": "#/$defs/safeText"},
+        "path": {"$ref": "#/$defs/repositoryPath"},
+        "result": {"enum": ["passed", "failed"]},
+        "duration_ms": {"type": "integer", "minimum": 0},
+        "platform": {"$ref": "#/$defs/safeText"},
+        "attempts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {"$ref": "#/$defs/testAttempt"}
+        },
+        "flaky_on_first_attempt": {"type": "boolean"}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "result": {"const": "passed"},
+            "flaky_on_first_attempt": {"const": false},
+            "attempts": {
+              "minItems": 1,
+              "maxItems": 1,
+              "prefixItems": [
+                {
+                  "properties": {
+                    "attempt": {"const": 1},
+                    "result": {"const": "passed"}
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "result": {"const": "passed"},
+            "flaky_on_first_attempt": {"const": true},
+            "attempts": {
+              "minItems": 2,
+              "maxItems": 2,
+              "prefixItems": [
+                {
+                  "properties": {
+                    "attempt": {"const": 1},
+                    "result": {"const": "failed"}
+                  }
+                },
+                {
+                  "properties": {
+                    "attempt": {"const": 2},
+                    "result": {"const": "passed"}
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "result": {"const": "failed"},
+            "flaky_on_first_attempt": {"const": false},
+            "attempts": {
+              "minItems": 2,
+              "maxItems": 2,
+              "prefixItems": [
+                {
+                  "properties": {
+                    "attempt": {"const": 1},
+                    "result": {"const": "failed"}
+                  }
+                },
+                {
+                  "properties": {
+                    "attempt": {"const": 2},
+                    "result": {
+                      "enum": [
+                        "failed",
+                        "timed_out",
+                        "signaled",
+                        "infrastructure_error"
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "result": {"const": "failed"},
+            "flaky_on_first_attempt": {"const": false},
+            "attempts": {
+              "minItems": 1,
+              "maxItems": 1,
+              "prefixItems": [
+                {
+                  "properties": {
+                    "attempt": {"const": 1},
+                    "result": {
+                      "enum": ["timed_out", "signaled", "infrastructure_error"]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "testAttempt": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["attempt", "result", "duration_ms", "output_truncated"],
+          "properties": {
+            "attempt": {"type": "integer", "minimum": 1, "maximum": 2},
+            "result": {
+              "enum": ["passed", "failed", "timed_out", "infrastructure_error"]
+            },
+            "duration_ms": {"type": "integer", "minimum": 0},
+            "output_truncated": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "attempt",
+            "result",
+            "duration_ms",
+            "output_truncated",
+            "termination_signal"
+          ],
+          "properties": {
+            "attempt": {"type": "integer", "minimum": 1, "maximum": 2},
+            "result": {"const": "signaled"},
+            "duration_ms": {"type": "integer", "minimum": 0},
+            "output_truncated": {"type": "boolean"},
+            "termination_signal": {"type": "integer", "minimum": 1, "maximum": 255}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "referenceTest": {
+      "type": "object",
+      "required": ["kind", "name", "path", "reason"],
+      "properties": {
+        "kind": {"const": "reference"},
+        "name": {"$ref": "#/$defs/safeText"},
+        "path": {"$ref": "#/$defs/repositoryPath"},
+        "reason": {"const": "non-executable invariant reference"}
       },
       "additionalProperties": false
     },
@@ -91,6 +267,8 @@
         "files",
         "patch_sha256",
         "overlap_class",
+        "overlap_policy",
+        "decision_required",
         "decision",
         "conflict_files",
         "retained_commit_subjects",
@@ -103,18 +281,20 @@
         "files": {
           "type": "array",
           "minItems": 1,
-          "items": {"$ref": "#/$defs/safeText"}
+          "items": {"$ref": "#/$defs/repositoryPath"}
         },
         "patch_sha256": {"$ref": "#/$defs/digest"},
         "overlap_class": {
-          "enum": ["none", "same_file", "owned_symbol", "possible_upstream_equivalent"]
+          "enum": ["none", "same_file", "owned_symbol"]
         },
+        "overlap_policy": {"enum": ["owned_symbol", "any_owned_file"]},
+        "decision_required": {"type": "boolean"},
         "decision": {
           "enum": ["not-required", "preserve", "adapt", "remove-as-upstream-equivalent"]
         },
         "conflict_files": {
           "type": "array",
-          "items": {"$ref": "#/$defs/safeText"}
+          "items": {"$ref": "#/$defs/repositoryPath"}
         },
         "retained_commit_subjects": {
           "type": "array",
@@ -127,9 +307,50 @@
         "tests": {
           "type": "array",
           "minItems": 1,
-          "items": {"$ref": "#/$defs/command"}
+          "items": {
+            "oneOf": [
+              {"$ref": "#/$defs/executedTest"},
+              {"$ref": "#/$defs/referenceTest"}
+            ]
+          }
         }
       },
+      "oneOf": [
+        {
+          "properties": {
+            "overlap_class": {"const": "owned_symbol"},
+            "decision_required": {"const": true},
+            "decision": {
+              "enum": ["preserve", "adapt", "remove-as-upstream-equivalent"]
+            }
+          }
+        },
+        {
+          "properties": {
+            "overlap_class": {"const": "same_file"},
+            "overlap_policy": {"const": "any_owned_file"},
+            "decision_required": {"const": true},
+            "decision": {
+              "enum": ["preserve", "adapt", "remove-as-upstream-equivalent"]
+            }
+          }
+        },
+        {
+          "properties": {
+            "overlap_class": {"const": "same_file"},
+            "overlap_policy": {"const": "owned_symbol"},
+            "decision_required": {"const": false},
+            "decision": {"const": "not-required"}
+          }
+        },
+        {
+          "properties": {
+            "overlap_class": {"const": "none"},
+            "decision_required": {"const": false},
+            "decision": {"const": "not-required"}
+          }
+        }
+      ],
       "additionalProperties": false
     },
     "brand": {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
@@ -9,20 +10,20 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
-import sys
 import threading
 import time
 
 from fastapi.testclient import TestClient
+import pytest
 import yaml
 
 from agent.plugin_agent import PluginAgentRunResult, PluginAgentRunner
+from agent.plugin_agent_worker import _finalize_authenticated_mcp_config
 from hermes_cli.plugin_services import BackgroundServiceContext
 from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
-from plugins.workflow.dashboard.plugin_api import StartRunRequest
 from plugins.workflow.entitlement import DeterministicAgentRunner
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.provenance import TriggerProvenance
@@ -38,6 +39,7 @@ import plugins.workflow.api_admission as api_admission_module
 import plugins.workflow.catalog_api as catalog_api_module
 import plugins.workflow.runner_binding as runner_binding_module
 import plugins.workflow.showcase as showcase_module
+from tools.mcp_tool import _interpolate_env_vars
 from plugins.workflow.trust import (
     WorkflowResourceReadBudget,
     WorkflowTrustStore,
@@ -54,6 +56,46 @@ EXPECTED_MCP_SERVERS = {
 }
 
 
+def _assert_authenticated_mcp_servers(
+    servers,
+    *,
+    require_live_authority: bool = True,
+) -> Path:
+    assert set(servers) == {"echo"}
+    server = servers["echo"]
+    assert server["command"] == "python"
+    assert server["env"] == {}
+    assert server["args"] == ["mcp/echo-server.py"]
+    authority = server["__hermes_authenticated_local_mcp"]
+    assert authority["version"] == 2
+    assert authority["file_count"] > 0
+    assert authority["total_bytes"] > 0
+    assert "entry" not in authority
+    assert "files" not in authority
+    authority_root = Path(authority["root"])
+    payload_root = authority_root / authority["payload"]
+    assert authority_root.is_absolute()
+    assert "hermes-workflow-authority-" in authority_root.as_posix()
+    if not require_live_authority:
+        return authority_root
+    assert authority_root.is_dir()
+
+    # Match the real worker boundary exactly: JSON-carried config first resolves
+    # environment placeholders, then validates and finalizes the private launch.
+    interpolated = {
+        name: _interpolate_env_vars(dict(config)) for name, config in servers.items()
+    }
+    finalized = _finalize_authenticated_mcp_config(interpolated)["echo"]
+    assert finalized["args"][0:2] == ["-I", "-c"]
+    assert "runpy.run_path" in finalized["args"][2]
+    assert finalized["args"][3:5] == [
+        str(payload_root),
+        "mcp/echo-server.py",
+    ]
+    assert finalized["__hermes_private_mcp_cwd"] == str(payload_root)
+    return authority_root
+
+
 class CapabilityDeclaringRecordingRunner:
     """Record sealed requests without claiming to start their MCP servers."""
 
@@ -62,7 +104,7 @@ class CapabilityDeclaringRecordingRunner:
 
     def run(self, request, *, is_cancelled=None) -> PluginAgentRunResult:
         assert is_cancelled is None or not is_cancelled()
-        assert request.mcp_servers == EXPECTED_MCP_SERVERS
+        _assert_authenticated_mcp_servers(request.mcp_servers)
         assert request.allowed_tools is None
         self.requests.append(request)
         return PluginAgentRunResult(
@@ -152,22 +194,16 @@ def _healthy_admission_lease(store: RunStore, label: str):
     return identity, acquired.lease
 
 
-def _production_client(monkeypatch) -> tuple[TestClient, object]:
+@contextmanager
+def _production_client(monkeypatch):
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    mounted_route = next(
-        route
-        for route in web_server.app.routes
-        if getattr(route, "path", None) == "/api/plugins/workflow/runs"
-    )
-    mounted_plugin = sys.modules[mounted_route.endpoint.__module__]
-    mounted_plugin._close_runtime()
-    client = TestClient(
+    with TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
-    )
-    return client, mounted_plugin
+    ) as client:
+        yield client
 
 
 def _capable_test_binding(runner) -> WorkflowRunnerBinding:
@@ -350,9 +386,12 @@ def _start_provider_trap() -> tuple[ThreadingHTTPServer, str]:
     return server, f"http://{host}:{port}/v1"
 
 
-def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
+def _run_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
     tmp_path,
     monkeypatch,
+    client: TestClient,
+    *,
+    stop_service=_stop_service,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -369,7 +408,6 @@ def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
         Path(showcase_module.__file__).with_name("showcases")
     )
     recording_runner = CapabilityDeclaringRecordingRunner()
-    client, mounted_plugin = _production_client(monkeypatch)
     stop = None
     thread = None
     request_body = {
@@ -484,33 +522,39 @@ def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
         )
         succeeded = _wait_for_status(client, run_id, "succeeded")
 
-        _stop_service(store, stop, thread)
+        active_stop, active_thread = stop, thread
         stop = None
         thread = None
+        stop_service(store, active_stop, active_thread)
         assert succeeded["status"] == "succeeded"
         assert [request.context_mode for request in recording_runner.requests] == [
             "fresh",
             "shared",
         ]
         assert len(recording_runner.requests) == 2
-        assert all(
-            request.mcp_servers == EXPECTED_MCP_SERVERS
-            for request in recording_runner.requests
-        )
+        for request in recording_runner.requests:
+            authority_root = _assert_authenticated_mcp_servers(
+                request.mcp_servers,
+                require_live_authority=False,
+            )
+            assert not authority_root.exists()
         assert trust_store.path.read_bytes() == trust_before
         assert _persisted_start_digest(store, run_id) == (
             RunStore._start_digest_from_projection(store.get_run_status(run_id))
         )
     finally:
-        _stop_service(store, stop, thread)
-        client.close()
-        mounted_plugin._close_runtime()
+        if stop is not None or thread is not None:
+            active_stop, active_thread = stop, thread
+            stop = None
+            thread = None
+            stop_service(store, active_stop, active_thread)
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
-def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
+def _run_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
     tmp_path,
     monkeypatch,
+    client: TestClient,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -526,7 +570,6 @@ def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
     trust_store = WorkflowTrustStore(home)
     trust_store.trust("a" * 64, actor="existing-operator", risk_digest="b" * 64)
     trust_before = trust_store.path.read_bytes()
-    client, mounted_plugin = _production_client(monkeypatch)
 
     try:
         catalog_response = client.get("/api/plugins/workflow/workflows")
@@ -572,16 +615,15 @@ def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
         assert list(store.staging_root.iterdir()) == []
         assert _ProviderCallTrap.requests == 0
     finally:
-        client.close()
-        mounted_plugin._close_runtime()
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
-def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
+def _run_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
     tmp_path,
     monkeypatch,
+    client: TestClient,
 ) -> None:
     home = tmp_path / "non-ai"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -610,7 +652,6 @@ def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
         "verified_showcase_run_metadata",
         explicit_real_non_ai_metadata,
     )
-    client, mounted_plugin = _production_client(monkeypatch)
     stop = None
     thread = None
 
@@ -656,9 +697,10 @@ def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
         assert rejected.status_code == 200, rejected.text
         failed = _wait_for_status(client, run_id, "failed")
 
-        _stop_service(store, stop, thread)
+        active_stop, active_thread = stop, thread
         stop = None
         thread = None
+        _stop_service(store, active_stop, active_thread)
         assert runner.requests == []
         assert failed["nodes"]["review-plan"]["state"] == "failed"
         assert (
@@ -666,15 +708,18 @@ def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
             == "execution_integrity"
         )
     finally:
-        _stop_service(store, stop, thread)
-        client.close()
-        mounted_plugin._close_runtime()
+        if stop is not None or thread is not None:
+            active_stop, active_thread = stop, thread
+            stop = None
+            thread = None
+            _stop_service(store, active_stop, active_thread)
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
-def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
+def _run_explicit_real_digest_mismatch_fails_before_coordinator_runner(
     tmp_path,
     monkeypatch,
+    client: TestClient,
 ) -> None:
     home = tmp_path / "digest-mismatch"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -700,7 +745,6 @@ def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
         epoch=lease.epoch,
         now=datetime.now(timezone.utc),
     )
-    client, mounted_plugin = _production_client(monkeypatch)
     stop = None
     thread = None
 
@@ -708,9 +752,10 @@ def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
         _service, stop, thread = _start_service(home, binding)
         failed = _wait_for_status(client, run_id, "failed")
 
-        _stop_service(store, stop, thread)
+        active_stop, active_thread = stop, thread
         stop = None
         thread = None
+        _stop_service(store, active_stop, active_thread)
         assert runner.requests == []
         assert failed["status"] == "failed"
         assert failed["nodes"]["inspect"]["state"] == "failed"
@@ -718,15 +763,18 @@ def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
             "execution_integrity"
         )
     finally:
-        _stop_service(store, stop, thread)
-        client.close()
-        mounted_plugin._close_runtime()
+        if stop is not None or thread is not None:
+            active_stop, active_thread = stop, thread
+            stop = None
+            thread = None
+            _stop_service(store, active_stop, active_thread)
         showcase_module._clear_verified_showcase_cache_for_tests()
 
 
-def test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
+def _run_capable_admission_then_actual_app_server_runtime_fails_before_provider(
     tmp_path,
     monkeypatch,
+    client: TestClient,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -736,7 +784,6 @@ def test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
     showcase_module._clear_verified_showcase_cache_for_tests()
     store = RunStore(home)
     identity, lease = _healthy_admission_lease(store, "task-3-4-runtime-change")
-    client, mounted_plugin = _production_client(monkeypatch)
     stop = None
     thread = None
 
@@ -771,9 +818,10 @@ def test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
         _service, stop, thread = _start_service(home, capable_binding)
         failed = _wait_for_status(client, run_id, "failed")
 
-        _stop_service(store, stop, thread)
+        active_stop, active_thread = stop, thread
         stop = None
         thread = None
+        _stop_service(store, active_stop, active_thread)
         assert failed["status"] == "failed"
         assert failed.get("terminal_code") is None
         assert failed["nodes"]["inspect"]["attempts"][-1]["error_code"] == (
@@ -781,12 +829,85 @@ def test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
         )
         assert _ProviderCallTrap.requests == 0
     finally:
-        _stop_service(store, stop, thread)
-        client.close()
-        mounted_plugin._close_runtime()
+        if stop is not None or thread is not None:
+            active_stop, active_thread = stop, thread
+            stop = None
+            thread = None
+            _stop_service(store, active_stop, active_thread)
         provider.shutdown()
         provider.server_close()
         showcase_module._clear_verified_showcase_cache_for_tests()
+
+
+def test_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
+    tmp_path, monkeypatch
+) -> None:
+    with _production_client(monkeypatch) as client:
+        _run_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
+            tmp_path, monkeypatch, client
+        )
+
+
+def test_ai_service_cleanup_failure_runs_once_and_preserves_lifespan_exit(
+    tmp_path, monkeypatch
+) -> None:
+    cleanup_calls = []
+
+    def stop_then_raise(store, stop, thread) -> None:
+        cleanup_calls.append((stop, thread))
+        _stop_service(store, stop, thread)
+        raise RuntimeError(f"AI service cleanup failure #{len(cleanup_calls)}")
+
+    with pytest.raises(RuntimeError, match="AI service cleanup failure #1"):
+        with _production_client(monkeypatch) as client:
+            _run_ai_extensions_real_middleware_admits_joins_and_coordinator_succeeds(
+                tmp_path,
+                monkeypatch,
+                client,
+                stop_service=stop_then_raise,
+            )
+
+    assert len(cleanup_calls) == 1
+    assert not any(
+        thread.name.startswith("workflow-store-io")
+        for thread in threading.enumerate()
+    )
+
+
+def test_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
+    tmp_path, monkeypatch
+) -> None:
+    with _production_client(monkeypatch) as client:
+        _run_ai_extensions_incapable_runtime_is_typed_and_zero_residue(
+            tmp_path, monkeypatch, client
+        )
+
+
+def test_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
+    tmp_path, monkeypatch
+) -> None:
+    with _production_client(monkeypatch) as client:
+        _run_explicit_real_non_ai_rework_fails_typed_integrity_without_runner(
+            tmp_path, monkeypatch, client
+        )
+
+
+def test_explicit_real_digest_mismatch_fails_before_coordinator_runner(
+    tmp_path, monkeypatch
+) -> None:
+    with _production_client(monkeypatch) as client:
+        _run_explicit_real_digest_mismatch_fails_before_coordinator_runner(
+            tmp_path, monkeypatch, client
+        )
+
+
+def test_capable_admission_then_actual_app_server_runtime_fails_before_provider(
+    tmp_path, monkeypatch
+) -> None:
+    with _production_client(monkeypatch) as client:
+        _run_capable_admission_then_actual_app_server_runtime_fails_before_provider(
+            tmp_path, monkeypatch, client
+        )
 
 
 def test_production_api_and_coordinator_share_binding_declaration_and_no_request_seam(
@@ -833,14 +954,25 @@ def test_production_api_and_coordinator_share_binding_declaration_and_no_request
     finally:
         scheduler.shutdown()
 
-    forbidden = {
-        "runner",
-        "runner_binding",
-        "runner_capabilities",
-        "runtime_capabilities",
-        "mcp_available",
-        "ai_entitlement",
-        "consent",
-        "confirmation_token",
-    }
-    assert forbidden.isdisjoint(StartRunRequest.model_fields)
+    from hermes_cli import web_server
+
+    with TestClient(
+        web_server.app,
+        headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
+    ) as client:
+        rejected = client.post(
+            "/api/plugins/workflow/runs",
+            json={
+                "workflow": "unreachable",
+                "values": {},
+                "idempotency_key": "task-7-request-contract",
+                "concurrency_policy": "queue",
+                "runner_binding": "test-only-seam",
+            },
+        )
+    assert rejected.status_code == 422
+    assert any(
+        issue["loc"] == ["body", "runner_binding"]
+        and issue["type"] == "extra_forbidden"
+        for issue in rejected.json()["detail"]
+    )

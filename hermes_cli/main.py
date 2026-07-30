@@ -495,6 +495,96 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # The flag is stripped from sys.argv so argparse never sees it.
 # Falls back to ~/.hermes/active_profile for sticky default.
 # ---------------------------------------------------------------------------
+_PROFILE_VALUE_FLAGS = frozenset({
+    "-z", "--oneshot", "-m", "--model", "--provider", "-t", "--toolsets",
+    "-r", "--resume", "-s", "--skills", "--usage-file",
+})
+_PROFILE_OPTIONAL_VALUE_FLAGS = frozenset({"-c", "--continue"})
+_WORKFLOW_ROOT_VALUE_FLAGS = frozenset({"--workdir", "--hermes-home"})
+
+
+def _workflow_schema_action_index(argv: list[str]) -> int | None:
+    """Resolve the exact top-level ``workflow schema`` action dependency-free."""
+    command_index = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            return None
+        if arg in {"--profile", "-p"} or arg in _PROFILE_VALUE_FLAGS:
+            i += 2
+            continue
+        if arg.startswith("--profile=") or (arg.startswith("--") and "=" in arg):
+            i += 1
+            continue
+        if arg in _PROFILE_OPTIONAL_VALUE_FLAGS:
+            i += 1
+            if i < len(argv) and not argv[i].startswith("-"):
+                i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        command_index = i
+        break
+    if command_index is None or argv[command_index] != "workflow":
+        return None
+
+    i = command_index + 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg in _WORKFLOW_ROOT_VALUE_FLAGS or arg in {"--profile", "-p"}:
+            i += 2
+            continue
+        if any(arg.startswith(f"{flag}=") for flag in _WORKFLOW_ROOT_VALUE_FLAGS):
+            i += 1
+            continue
+        if arg.startswith("--profile="):
+            i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        return i if arg == "schema" else None
+    return None
+
+
+def _parse_workflow_schema_candidate(argv: list[str]):
+    """Parse one candidate with the same bounded authorities as normal dispatch."""
+    if _workflow_schema_action_index(argv) is None:
+        return None
+
+    from hermes_cli._parser import build_top_level_parser
+    from plugins.workflow.schema_cli import configure_schema_parser
+
+    parser, subparsers, _chat_parser = build_top_level_parser()
+    workflow_parser = subparsers.add_parser("workflow")
+    workflow_parser.add_argument("--workdir", help=argparse.SUPPRESS)
+    workflow_parser.add_argument("--hermes-home", help=argparse.SUPPRESS)
+    actions = workflow_parser.add_subparsers(dest="workflow_action")
+    schema_parser = actions.add_parser(
+        "schema", help="Print the workflow authoring contract"
+    )
+    configure_schema_parser(schema_parser)
+    return parser.parse_args(argv)
+
+
+def _normal_dispatch_target(args) -> str | None:
+    """Resolve the command selected by main's established dispatch precedence."""
+    if args is None:
+        return None
+    if getattr(args, "version", False):
+        return "version"
+    if getattr(args, "oneshot", None):
+        return "oneshot"
+    command = getattr(args, "command", None)
+    if command is None:
+        return "chat"
+    if command == "workflow" and getattr(args, "workflow_action", None) == "schema":
+        return "workflow-schema"
+    return command
+
+
 def _apply_profile_override() -> None:
     """Pre-parse --profile/-p and set HERMES_HOME before imports."""
     argv = sys.argv[1:]
@@ -550,16 +640,7 @@ def _apply_profile_override() -> None:
     # 1. Check for explicit -p / --profile flag. Historically this worked even
     # after the subcommand (`hermes chat -p coder`), so keep scanning broadly.
     # The exception is command-argv passthrough regions such as `mcp add --args`.
-    value_flags = {
-        "-z", "--oneshot",
-        "-m", "--model",
-        "--provider",
-        "-t", "--toolsets",
-        "-r", "--resume",
-        "-s", "--skills",
-        "--usage-file",
-    }
-    optional_value_flags = {"-c", "--continue"}
+    workflow_schema_index = _workflow_schema_action_index(argv)
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -567,6 +648,20 @@ def _apply_profile_override() -> None:
             break
         if arg == "--args" and _inside_mcp_add_args(i):
             break
+        if (
+            arg == "--profile"
+            and workflow_schema_index is not None
+            and i > workflow_schema_index
+        ):
+            i += 2
+            continue
+        if (
+            arg.startswith("--profile=")
+            and workflow_schema_index is not None
+            and i > workflow_schema_index
+        ):
+            i += 1
+            continue
         if arg in {"--profile", "-p"} and i + 1 < len(argv):
             profile_name = argv[i + 1]
             consume = 2
@@ -577,11 +672,11 @@ def _apply_profile_override() -> None:
             consume = 1
             profile_index = i
             break
-        if "=" not in arg and arg in value_flags and i + 1 < len(argv):
+        if "=" not in arg and arg in _PROFILE_VALUE_FLAGS and i + 1 < len(argv):
             i += 2
         elif (
             "=" not in arg
-            and arg in optional_value_flags
+            and arg in _PROFILE_OPTIONAL_VALUE_FLAGS
             and i + 1 < len(argv)
             and not argv[i + 1].startswith("-")
         ):
@@ -669,6 +764,11 @@ def _apply_profile_override() -> None:
 
 
 _apply_profile_override()
+_WORKFLOW_SCHEMA_EARLY_ARGV = tuple(sys.argv[1:])
+_WORKFLOW_SCHEMA_EARLY_ARGS = _parse_workflow_schema_candidate(sys.argv[1:])
+_WORKFLOW_SCHEMA_READONLY_STARTUP = (
+    _normal_dispatch_target(_WORKFLOW_SCHEMA_EARLY_ARGS) == "workflow-schema"
+)
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -724,19 +824,20 @@ except Exception:
 # (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
 # during GUI testing, including pre-dispatch startup failures.
-try:
-    from hermes_logging import setup_logging as _setup_logging
+if not _WORKFLOW_SCHEMA_READONLY_STARTUP:
+    try:
+        from hermes_logging import setup_logging as _setup_logging
 
-    _setup_logging(
-        mode=(
-            "gui"
-            if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
-            in {"dashboard", "serve", "gui", "desktop"}
-            else "cli"
+        _setup_logging(
+            mode=(
+                "gui"
+                if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
+                in {"dashboard", "serve", "gui", "desktop"}
+                else "cli"
+            )
         )
-    )
-except Exception:
-    pass  # best-effort — don't crash the CLI if logging setup fails
+    except Exception:
+        pass  # best-effort — don't crash the CLI if logging setup fails
 
 # Apply IPv4 preference early, before any HTTP clients are created.
 # We already determined whether to force IPv4 from the raw yaml read above —
@@ -14460,8 +14561,28 @@ def cmd_claw(args):
     claw_command(args)
 
 
-def main():
+def _try_workflow_schema_readonly() -> bool:
+    """Serve exact schema introspection before any mutating CLI startup seam."""
+    current_argv = tuple(sys.argv[1:])
+    args = (
+        _WORKFLOW_SCHEMA_EARLY_ARGS
+        if current_argv == _WORKFLOW_SCHEMA_EARLY_ARGV
+        else _parse_workflow_schema_candidate(list(current_argv))
+    )
+    if _normal_dispatch_target(args) != "workflow-schema":
+        return False
+
+    from plugins.workflow.schema_cli import emit_schema
+
+    emit_schema(args)
+    return True
+
+
+def main() -> int:
     """Main entry point for hermes CLI."""
+    if _try_workflow_schema_readonly():
+        return 0
+
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()
@@ -14498,9 +14619,9 @@ def main():
         pass
 
     if _try_termux_fast_tui_launch():
-        return
+        return 0
     if _try_termux_fast_cli_launch():
-        return
+        return 0
 
     # Brand runtime: write the discoverable $HERMES_HOME/brand.json (for external tooling
     # like the tray) and run the capability-staging seam (no-op today — empty sets). Both
@@ -16495,7 +16616,7 @@ def main():
     # Handle --version flag
     if args.version:
         cmd_version(args)
-        return
+        return 0
 
     # --yolo: set HERMES_YOLO_MODE *before* plugin discovery.  The call to
     # _prepare_agent_startup() below triggers discover_plugins() → tool
@@ -16538,7 +16659,7 @@ def main():
             if not hasattr(args, attr):
                 setattr(args, attr, default)
         cmd_chat(args)
-        return
+        return 0
 
     # Default to chat if no command specified
     if args.command is None:
@@ -16555,14 +16676,14 @@ def main():
             if not hasattr(args, attr):
                 setattr(args, attr, default)
         cmd_chat(args)
-        return
+        return 0
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
-    else:
-        parser.print_help()
+        return int(args.func(args) or 0)
+    parser.print_help()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

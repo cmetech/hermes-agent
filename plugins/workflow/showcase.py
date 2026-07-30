@@ -724,6 +724,7 @@ def _verified_distribution_assessment(
                     message="workflow requires a configured isolated backend",
                     blocking=True,
                     code="execution_environment_unavailable",
+                    effective_profile=package.language.effective_profile,
                 ),
             ),
             runnable=False,

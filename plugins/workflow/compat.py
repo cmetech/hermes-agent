@@ -2,29 +2,29 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from enum import StrEnum
-from typing import TYPE_CHECKING, AbstractSet, Literal, Mapping
+import hashlib
+from dataclasses import asdict, dataclass, replace
+from typing import TYPE_CHECKING, AbstractSet, Iterable, Literal, Mapping, Protocol
 
-from plugins.workflow.models import WorkflowPackage
+from plugins.workflow.language_schema import NODE_TYPES, inapplicable_node_fields
+from plugins.workflow.models import (
+    CompatibilityFinding,
+    CompatibilityLevel,
+    WorkflowPackage,
+)
 
 if TYPE_CHECKING:
     from plugins.workflow.trust import WorkflowRiskSummary
 
 
-class CompatibilityLevel(StrEnum):
-    PORTABLE = "portable"
-    MAPPED = "mapped"
-    UNSUPPORTED = "unsupported"
-
-
-@dataclass(frozen=True)
-class CompatibilityFinding:
-    path: str
-    level: CompatibilityLevel
-    message: str
-    blocking: bool
-    code: str = "compatibility"
+WORKFLOW_COMPATIBILITY_FINDINGS_MAX = 512
+WORKFLOW_COMPATIBILITY_PAYLOAD_MAX_BYTES = 1024 * 1024
+_WORKFLOW_COMPATIBILITY_PATH_JSON_MAX_BYTES = 256
+_WORKFLOW_COMPATIBILITY_MESSAGE_JSON_MAX_BYTES = 512
+_WORKFLOW_COMPATIBILITY_TRUNCATION_CODE = "compatibility_findings_truncated"
+_WORKFLOW_COMPATIBILITY_TRUNCATION_PATH = "compatibility.findings"
+_WORKFLOW_COMPATIBILITY_TRUNCATION_PREFIX = "Compatibility findings truncated: "
+_WORKFLOW_COMPATIBILITY_TEXT_SUFFIX = "…[TRUNCATED]"
 
 
 @dataclass(frozen=True)
@@ -33,9 +33,66 @@ class CompatibilityReport:
     findings: tuple[CompatibilityFinding, ...]
     runnable: bool
 
+    def __post_init__(self) -> None:
+        bounded = _bounded_compatibility_findings(self.findings)
+        if bounded != self.findings:
+            object.__setattr__(self, "findings", bounded)
+
+    @property
+    def findings_truncated(self) -> bool:
+        return bool(
+            self.findings and _truncation_omitted_count(self.findings[-1]) is not None
+        )
+
+    @property
+    def finding_count(self) -> int:
+        if not self.findings_truncated:
+            return len(self.findings)
+        omitted = _truncation_omitted_count(self.findings[-1])
+        return len(self.findings) - 1 + (omitted or 0)
+
     @property
     def blocking_findings(self) -> tuple[CompatibilityFinding, ...]:
         return tuple(finding for finding in self.findings if finding.blocking)
+
+
+class WorkflowCompatibilityBlockedError(RuntimeError):
+    """Raised when a compatibility assessment cannot be admitted to run."""
+
+    code = "workflow_compatibility_blocked"
+
+    def __init__(self, report: CompatibilityReport) -> None:
+        self.report = report
+        super().__init__("workflow compatibility has blocking findings")
+
+
+def require_runnable(report: CompatibilityReport) -> CompatibilityReport:
+    """Return a runnable report or refuse admission with its authoritative state."""
+    if not report.runnable:
+        raise WorkflowCompatibilityBlockedError(report)
+    return report
+
+
+class _CompatibilityStateFinding(Protocol):
+    level: CompatibilityLevel | str
+    blocking: bool
+
+
+def derive_compatibility_report_state(
+    findings: Iterable[_CompatibilityStateFinding],
+) -> tuple[CompatibilityLevel, bool]:
+    """Derive the authoritative report level and runnable bit from findings."""
+    materialized = tuple(findings)
+    blocking = any(finding.blocking for finding in materialized)
+    if blocking or any(
+        finding.level == CompatibilityLevel.UNSUPPORTED for finding in materialized
+    ):
+        level = CompatibilityLevel.UNSUPPORTED
+    elif materialized:
+        level = CompatibilityLevel.MAPPED
+    else:
+        level = CompatibilityLevel.PORTABLE
+    return level, not blocking
 
 
 @dataclass(frozen=True)
@@ -94,26 +151,6 @@ def resolve_tool_name(name: str) -> str:
     return normalized
 
 
-_AI_ONLY_FIELDS = frozenset({
-    "persist_session",
-    "provider",
-    "model",
-    "output_format",
-    "allowed_tools",
-    "denied_tools",
-    "hooks",
-    "mcp",
-    "skills",
-    "agents",
-    "effort",
-    "thinking",
-    "maxBudgetUsd",
-    "systemPrompt",
-    "fallbackModel",
-    "betas",
-    "sandbox",
-})
-
 MAPPED_HOOK_EVENTS = frozenset({
     "PreToolUse",
     "PostToolUse",
@@ -151,15 +188,235 @@ _PROVIDER_FIELDS = {
 }
 
 
+def _json_string_character_bytes(character: str) -> int:
+    """Return the bytes used by one character in an ensure-ASCII JSON string."""
+    codepoint = ord(character)
+    if character in {'"', "\\"}:
+        return 2
+    if codepoint < 0x20:
+        return 6
+    if codepoint < 0x80:
+        return 1
+    if codepoint <= 0xFFFF:
+        return 6
+    return 12
+
+
+def _json_string_bytes(value: str) -> int:
+    return 2 + sum(_json_string_character_bytes(character) for character in value)
+
+
+def _author_text_with_suffix(
+    value: str,
+    *,
+    max_json_bytes: int,
+    suffix: str,
+) -> str:
+    remaining = max_json_bytes - _json_string_bytes(suffix)
+    retained: list[str] = []
+    for character in value:
+        encoded_bytes = _json_string_character_bytes(character)
+        if encoded_bytes > remaining:
+            break
+        retained.append(character)
+        remaining -= encoded_bytes
+    return "".join(retained) + suffix
+
+
+def _bounded_author_text(
+    value: str,
+    *,
+    max_json_bytes: int,
+    collision_safe: bool = False,
+) -> str:
+    """Bound one author string by its conservative serialized JSON byte size."""
+    if _json_string_bytes(value) <= max_json_bytes:
+        return value
+
+    suffix = _WORKFLOW_COMPATIBILITY_TEXT_SUFFIX
+    if collision_safe:
+        digest = hashlib.sha256(
+            value.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+        suffix = f"…[TRUNCATED:{digest}]"
+    return _author_text_with_suffix(
+        value,
+        max_json_bytes=max_json_bytes,
+        suffix=suffix,
+    )
+
+
+def _disambiguated_author_path(value: str, collision_index: int) -> str:
+    digest = hashlib.sha256(
+        f"{collision_index}\0{value}".encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+    return _author_text_with_suffix(
+        value,
+        max_json_bytes=_WORKFLOW_COMPATIBILITY_PATH_JSON_MAX_BYTES,
+        suffix=f"…[COLLISION:{collision_index}:{digest}]",
+    )
+
+
+@dataclass(frozen=True)
+class _OmittedCompatibilityState:
+    level: CompatibilityLevel
+    blocking: bool
+
+
+def _truncation_omitted_count(finding: CompatibilityFinding) -> int | None:
+    if (
+        finding.code != _WORKFLOW_COMPATIBILITY_TRUNCATION_CODE
+        or finding.path != _WORKFLOW_COMPATIBILITY_TRUNCATION_PATH
+        or not finding.message.startswith(_WORKFLOW_COMPATIBILITY_TRUNCATION_PREFIX)
+    ):
+        return None
+    count, separator, _remainder = finding.message[
+        len(_WORKFLOW_COMPATIBILITY_TRUNCATION_PREFIX) :
+    ].partition(" ")
+    if not separator or not count.isascii() or not count.isdigit():
+        return None
+    return int(count)
+
+
+class _FindingAccumulator:
+    """Retain first occurrences in order while bounding the public report."""
+
+    def __init__(
+        self,
+        initial: Iterable[CompatibilityFinding] = (),
+        *,
+        deduplicate_sources: bool = True,
+    ) -> None:
+        self._findings: list[CompatibilityFinding] = []
+        self._seen: set[tuple[str, str]] = set()
+        self._public_keys: set[tuple[str, str]] = set()
+        self._deduplicate_sources = deduplicate_sources
+        self._omitted = 0
+        self._omitted_blocking = False
+        self._omitted_level = CompatibilityLevel.PORTABLE
+        self._sentinel_effective_profile = None
+        for finding in initial:
+            self.add(finding)
+
+    def _merge_omitted_state(
+        self, *, count: int, level: CompatibilityLevel, blocking: bool
+    ) -> None:
+        states: list[_OmittedCompatibilityState] = []
+        if self._omitted:
+            states.append(
+                _OmittedCompatibilityState(
+                    level=self._omitted_level,
+                    blocking=self._omitted_blocking,
+                )
+            )
+        states.append(_OmittedCompatibilityState(level=level, blocking=blocking))
+        self._omitted_level, _runnable = derive_compatibility_report_state(states)
+        self._omitted += count
+        self._omitted_blocking |= blocking
+
+    def add(self, finding: CompatibilityFinding) -> None:
+        omitted = _truncation_omitted_count(finding)
+        if omitted is not None:
+            self._merge_omitted_state(
+                count=omitted,
+                level=finding.level,
+                blocking=finding.blocking,
+            )
+            self._sentinel_effective_profile = finding.effective_profile
+            return
+
+        source_key = (finding.code, finding.path)
+        if self._deduplicate_sources:
+            if source_key in self._seen:
+                return
+            self._seen.add(source_key)
+        if len(self._findings) >= WORKFLOW_COMPATIBILITY_FINDINGS_MAX - 1:
+            self._merge_omitted_state(
+                count=1,
+                level=finding.level,
+                blocking=finding.blocking,
+            )
+            return
+        public_path = _bounded_author_text(
+            finding.path,
+            max_json_bytes=_WORKFLOW_COMPATIBILITY_PATH_JSON_MAX_BYTES,
+            collision_safe=True,
+        )
+        public_key = (finding.code, public_path)
+        if public_key in self._public_keys:
+            for collision_index in range(1, WORKFLOW_COMPATIBILITY_FINDINGS_MAX + 1):
+                candidate = _disambiguated_author_path(finding.path, collision_index)
+                public_key = (finding.code, candidate)
+                if public_key not in self._public_keys:
+                    public_path = candidate
+                    break
+            else:  # pragma: no cover - retained rows are bounded below candidates
+                raise RuntimeError("compatibility public path space exhausted")
+        bounded = replace(
+            finding,
+            path=public_path,
+            message=_bounded_author_text(
+                finding.message,
+                max_json_bytes=_WORKFLOW_COMPATIBILITY_MESSAGE_JSON_MAX_BYTES,
+            ),
+        )
+        self._findings.append(bounded)
+        self._public_keys.add(public_key)
+
+    def finish(self, *, effective_profile=None) -> tuple[CompatibilityFinding, ...]:
+        findings = list(self._findings)
+        if self._omitted:
+            omitted = min(self._omitted, 999_999_999)
+            findings.append(
+                CompatibilityFinding(
+                    path=_WORKFLOW_COMPATIBILITY_TRUNCATION_PATH,
+                    level=self._omitted_level,
+                    message=(
+                        f"{_WORKFLOW_COMPATIBILITY_TRUNCATION_PREFIX}{omitted} "
+                        f"omitted; aggregate level {self._omitted_level.value}"
+                    ),
+                    blocking=self._omitted_blocking,
+                    code=_WORKFLOW_COMPATIBILITY_TRUNCATION_CODE,
+                    severity="error" if self._omitted_blocking else "warning",
+                    effective_profile=(
+                        effective_profile or self._sentinel_effective_profile
+                    ),
+                )
+            )
+        if effective_profile is not None:
+            findings = [
+                replace(finding, effective_profile=effective_profile)
+                for finding in findings
+            ]
+        return tuple(findings)
+
+
+def _bounded_compatibility_findings(
+    findings: Iterable[CompatibilityFinding],
+) -> tuple[CompatibilityFinding, ...]:
+    return _FindingAccumulator(findings, deduplicate_sources=False).finish()
+
+
 def _finding(
-    findings: list[CompatibilityFinding],
+    findings: _FindingAccumulator,
     path: str,
     level: CompatibilityLevel,
     message: str,
     *,
+    code: str,
     blocking: bool = False,
+    severity: str | None = None,
 ) -> None:
-    findings.append(CompatibilityFinding(path, level, message, blocking))
+    findings.add(
+        CompatibilityFinding(
+            path=path,
+            level=level,
+            message=message,
+            blocking=blocking,
+            code=code,
+            severity=severity or ("error" if blocking else "info"),
+        )
+    )
 
 
 def _provider_for(package: WorkflowPackage, node_index: int | None = None) -> str:
@@ -172,7 +429,7 @@ def _provider_for(package: WorkflowPackage, node_index: int | None = None) -> st
 
 
 def _check_provider_field(
-    findings: list[CompatibilityFinding],
+    findings: _FindingAccumulator,
     *,
     path: str,
     field: str,
@@ -187,6 +444,7 @@ def _check_provider_field(
             path,
             CompatibilityLevel.MAPPED,
             f"{field} maps through {provider} capability {required}",
+            code="provider_field_mapped",
         )
     else:
         _finding(
@@ -194,6 +452,7 @@ def _check_provider_field(
             path,
             CompatibilityLevel.UNSUPPORTED,
             f"provider {provider} does not advertise {required} required by {field}",
+            code="provider_field_unsupported",
             blocking=True,
         )
 
@@ -211,7 +470,7 @@ def assess_compatibility(
     tools = available_tools
     services = available_services
     capabilities = provider_capabilities or {}
-    findings: list[CompatibilityFinding] = []
+    findings = _FindingAccumulator(package.compatibility_findings)
     options = package.definition.options
 
     for issue in package.validation_issues:
@@ -220,7 +479,9 @@ def assess_compatibility(
             issue.path,
             CompatibilityLevel.UNSUPPORTED,
             issue.message,
+            code=issue.code,
             blocking=issue.blocking,
+            severity=issue.severity,
         )
 
     for field in ("provider", "model"):
@@ -230,6 +491,7 @@ def assess_compatibility(
                 field,
                 CompatibilityLevel.MAPPED,
                 f"{field} resolves through Hermes provider profiles",
+                code="provider_profile_resolution",
             )
     if "persist_sessions" in options:
         _finding(
@@ -237,6 +499,7 @@ def assess_compatibility(
             "persist_sessions",
             CompatibilityLevel.MAPPED,
             "persist_sessions maps to the workflow node-session registry",
+            code="persistent_session_fingerprint",
         )
     for field in ("interactive", "tags"):
         if field in options:
@@ -245,6 +508,7 @@ def assess_compatibility(
                 field,
                 CompatibilityLevel.MAPPED,
                 f"{field} maps to Hermes invocation metadata",
+                code="invocation_metadata",
             )
     if "requires" in options:
         for index, service in enumerate(options["requires"]):
@@ -256,6 +520,7 @@ def assess_compatibility(
                 if missing
                 else CompatibilityLevel.MAPPED,
                 f"required service {service} {'is not configured' if missing else 'will be checked during preflight'}",
+                code="required_service",
                 blocking=missing,
             )
     if "worktree" in options:
@@ -266,6 +531,7 @@ def assess_compatibility(
                 "worktree.enabled",
                 CompatibilityLevel.UNSUPPORTED,
                 "workflow requires an explicitly supplied isolated workdir",
+                code="worktree_requirement",
                 blocking=True,
             )
         else:
@@ -274,6 +540,7 @@ def assess_compatibility(
                 "worktree",
                 CompatibilityLevel.MAPPED,
                 "caller-supplied workdir preserves worktree isolation",
+                code="worktree_requirement",
             )
     for field in _PROVIDER_FIELDS:
         if field in options:
@@ -294,16 +561,24 @@ def assess_compatibility(
                 f"{prefix}.context",
                 CompatibilityLevel.MAPPED,
                 "shared context resumes only a cache-fingerprint-compatible predecessor",
+                code="shared_context_fingerprint",
+            )
+        inapplicable = inapplicable_node_fields(node.node_type)
+        for field in sorted(inapplicable.keys() & node_options.keys()):
+            applicable_types = " and ".join(
+                candidate
+                for candidate in NODE_TYPES
+                if candidate in inapplicable[field]
+            )
+            _finding(
+                findings,
+                f"{prefix}.{field}",
+                CompatibilityLevel.UNSUPPORTED,
+                f"{field} applies only to {applicable_types} nodes",
+                code="field_not_applicable",
+                blocking=True,
             )
         if node.node_type not in {"command", "prompt"}:
-            for field in sorted(_AI_ONLY_FIELDS.intersection(node_options)):
-                _finding(
-                    findings,
-                    f"{prefix}.{field}",
-                    CompatibilityLevel.UNSUPPORTED,
-                    f"{field} applies only to command and prompt nodes",
-                    blocking=True,
-                )
             continue
         if "persist_session" in node_options:
             _finding(
@@ -311,6 +586,7 @@ def assess_compatibility(
                 f"{prefix}.persist_session",
                 CompatibilityLevel.MAPPED,
                 "persist_session maps to the profile-scoped node-session registry",
+                code="persistent_session_fingerprint",
             )
         for list_field in ("allowed_tools", "denied_tools"):
             for tool_index, requested in enumerate(node_options.get(list_field, ())):
@@ -323,6 +599,7 @@ def assess_compatibility(
                         path,
                         CompatibilityLevel.UNSUPPORTED,
                         f"unknown Archon tool alias: {requested}",
+                        code="unknown_tool_alias",
                         blocking=True,
                     )
                     continue
@@ -332,6 +609,7 @@ def assess_compatibility(
                         path,
                         CompatibilityLevel.UNSUPPORTED,
                         f"mapped Hermes tool is unavailable: {requested} -> {target}",
+                        code="unavailable_tool",
                         blocking=True,
                     )
                 else:
@@ -340,6 +618,7 @@ def assess_compatibility(
                         path,
                         CompatibilityLevel.MAPPED,
                         f"tool alias maps {requested} -> {target}",
+                        code="tool_alias_mapped",
                     )
         if "skills" in node_options:
             _finding(
@@ -347,6 +626,7 @@ def assess_compatibility(
                 f"{prefix}.skills",
                 CompatibilityLevel.MAPPED,
                 "skills are snapshotted into the node user message",
+                code="skill_snapshot",
             )
         if "mcp" in node_options:
             _finding(
@@ -358,6 +638,7 @@ def assess_compatibility(
                 "MCP servers start only inside the isolated node worker"
                 if mcp_available
                 else "Hermes MCP support is not available",
+                code="mcp_isolation",
                 blocking=not mcp_available,
             )
         if "agents" in node_options:
@@ -366,6 +647,7 @@ def assess_compatibility(
                 f"{prefix}.agents",
                 CompatibilityLevel.MAPPED,
                 "inline agents map to bounded workflow_agent child workers",
+                code="inline_agent_bounds",
             )
         for field in ("provider", "model"):
             if field in node_options:
@@ -374,6 +656,7 @@ def assess_compatibility(
                     f"{prefix}.{field}",
                     CompatibilityLevel.MAPPED,
                     f"{field} resolves through Hermes provider profiles",
+                    code="provider_profile_resolution",
                 )
         for field in (
             "effort",
@@ -400,6 +683,7 @@ def assess_compatibility(
                 "systemPrompt cannot change inside a shared cached session"
                 if shared
                 else "systemPrompt is fixed at fresh worker creation",
+                code="system_prompt_context",
                 blocking=shared,
             )
         for event in node_options.get("hooks", {}):
@@ -411,6 +695,7 @@ def assess_compatibility(
                         path,
                         CompatibilityLevel.UNSUPPORTED,
                         f"{event} requires MCP support",
+                        code="hook_unsupported",
                         blocking=True,
                     )
                 else:
@@ -419,6 +704,7 @@ def assess_compatibility(
                         path,
                         CompatibilityLevel.MAPPED,
                         f"{event} maps to isolated Hermes worker lifecycle",
+                        code="hook_mapped",
                     )
             elif event in UNSUPPORTED_HOOK_EVENTS:
                 _finding(
@@ -426,18 +712,14 @@ def assess_compatibility(
                     path,
                     CompatibilityLevel.UNSUPPORTED,
                     f"{event} has no equivalent Hermes node-worker contract",
+                    code="hook_unsupported",
                     blocking=True,
                 )
 
-    blocking = any(finding.blocking for finding in findings)
-    if blocking or any(
-        finding.level is CompatibilityLevel.UNSUPPORTED for finding in findings
-    ):
-        level = CompatibilityLevel.UNSUPPORTED
-    elif findings:
-        level = CompatibilityLevel.MAPPED
-    else:
-        level = CompatibilityLevel.PORTABLE
+    bounded_findings = findings.finish(
+        effective_profile=package.language.effective_profile
+    )
+    level, runnable = derive_compatibility_report_state(bounded_findings)
     return CompatibilityReport(
-        level=level, findings=tuple(findings), runnable=not blocking
+        level=level, findings=bounded_findings, runnable=runnable
     )

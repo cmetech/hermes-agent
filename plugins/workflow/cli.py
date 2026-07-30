@@ -13,7 +13,7 @@ import shutil
 import sys
 import time
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MethodType
@@ -22,6 +22,10 @@ from typing import AbstractSet, Callable, Iterable, Mapping
 import yaml
 
 from hermes_constants import get_hermes_home
+from plugins.workflow.language import (
+    WorkflowLanguageCompatibilityError,
+    language_projection,
+)
 from plugins.workflow.compat import (
     ARCHON_TOOL_ALIASES,
     CompatibilityFinding,
@@ -29,12 +33,15 @@ from plugins.workflow.compat import (
     CompatibilityReport,
     DoctorReport,
     InputRequirement,
+    WorkflowCompatibilityBlockedError,
     assess_compatibility,
+    require_runnable,
 )
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.discovery import discover_workflows
 from plugins.workflow.models import (
     ValidationIssue,
+    WorkflowLanguageProfile,
     WorkflowPackage,
     WorkflowRuntimeConfig,
     WorkflowValidationError,
@@ -58,12 +65,19 @@ from plugins.workflow.machine_contract import (
     success_envelope,
 )
 from plugins.workflow.provenance import TriggerProvenance
+from plugins.workflow.projection_limits import (
+    WORKFLOW_DEFINITION_MAX_BYTES,
+    WORKFLOW_DEFINITION_MAX_CONTAINER_ITEMS,
+    WORKFLOW_DEFINITION_MAX_EDGES,
+    WORKFLOW_DEFINITION_MAX_NODES,
+)
 from plugins.workflow.schema import load_workflow, validate_package
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.sanitize import (
     projection_key_is_secret,
     sanitize_projection,
 )
+from plugins.workflow.schema_cli import configure_schema_parser, emit_schema
 from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.store import (
     ForegroundExecutionConflict,
@@ -84,11 +98,11 @@ from tools.managed_process import ProcessResourceLimits
 _MACHINE_COMMAND: ContextVar[str] = ContextVar(
     "workflow_machine_command", default="workflow"
 )
-_DEFINITION_MAX_NODES = 512
-_DEFINITION_MAX_EDGES = 4_096
-_DEFINITION_MAX_BYTES = 512 * 1024
-_DEFINITION_MAX_CONTAINER_ITEMS = 512
 _BENIGN_POLICY_FIELDS = frozenset({"modelReasoningEffort"})
+_DOCTOR_TEXT_FINDINGS_MAX = 200
+_DOCTOR_ABSOLUTE_PATH_START = re.compile(
+    r"(?:[A-Za-z]:[\\/]|\\\\|(?<![A-Za-z0-9_:/-])/)"
+)
 
 
 class WorkflowDefinitionProjectionCapacityError(ValueError):
@@ -285,7 +299,7 @@ def _complete_projection(
     if projection_key_is_secret(key):
         return "[REDACTED]"
     if isinstance(value, Mapping):
-        if len(value) > _DEFINITION_MAX_CONTAINER_ITEMS:
+        if len(value) > WORKFLOW_DEFINITION_MAX_CONTAINER_ITEMS:
             raise WorkflowDefinitionProjectionCapacityError(
                 "workflow definition mapping limit exceeded"
             )
@@ -300,7 +314,7 @@ def _complete_projection(
             not in {"operator_scope_digest", "idempotency_key_digest"}
         }
     if isinstance(value, (list, tuple)):
-        if len(value) > _DEFINITION_MAX_CONTAINER_ITEMS:
+        if len(value) > WORKFLOW_DEFINITION_MAX_CONTAINER_ITEMS:
             raise WorkflowDefinitionProjectionCapacityError(
                 "workflow definition sequence limit exceeded"
             )
@@ -387,12 +401,12 @@ def _options_projection(options: Mapping[str, object]) -> dict[str, object]:
 def _definition_projection(package: WorkflowPackage) -> dict[str, object]:
     """Return the bounded, body-free normalized definition used by show APIs."""
     definition = package.definition
-    if len(definition.nodes) > _DEFINITION_MAX_NODES:
+    if len(definition.nodes) > WORKFLOW_DEFINITION_MAX_NODES:
         raise WorkflowDefinitionProjectionCapacityError(
             "workflow definition node limit exceeded"
         )
     edge_count = sum(len(node.depends_on) for node in definition.nodes)
-    if edge_count > _DEFINITION_MAX_EDGES:
+    if edge_count > WORKFLOW_DEFINITION_MAX_EDGES:
         raise WorkflowDefinitionProjectionCapacityError(
             "workflow definition edge limit exceeded"
         )
@@ -472,7 +486,7 @@ def _definition_projection(package: WorkflowPackage) -> dict[str, object]:
     encoded = json.dumps(
         projection, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
-    if len(encoded) > _DEFINITION_MAX_BYTES:
+    if len(encoded) > WORKFLOW_DEFINITION_MAX_BYTES:
         raise WorkflowDefinitionProjectionCapacityError(
             "workflow definition byte limit exceeded"
         )
@@ -597,6 +611,11 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     actions = subparser.add_subparsers(
         dest="workflow_action", parser_class=_WorkflowArgumentParser
     )
+
+    schema_parser = actions.add_parser(
+        "schema", help="Print the workflow authoring contract"
+    )
+    configure_schema_parser(schema_parser)
 
     list_parser = actions.add_parser(
         "list", aliases=["ls"], help="List discovered workflows"
@@ -849,6 +868,10 @@ def _emit(payload: object, *, as_json: bool) -> None:
         print(payload)
 
 
+def _cmd_schema(args: argparse.Namespace) -> int:
+    return emit_schema(args)
+
+
 def _cmd_list(args: argparse.Namespace) -> int:
     entries = build_catalog(_discover(args))
     if args.json:
@@ -898,13 +921,33 @@ def _cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _language_payload(package: WorkflowPackage) -> dict[str, object]:
+    metadata = package.language
+    payload = language_projection(metadata)
+    payload["legacy"] = (
+        metadata.effective_profile is WorkflowLanguageProfile.HERMES_LEGACY
+    )
+    return payload
+
+
 def _cmd_validate(args: argparse.Namespace) -> int:
     package = _resolve(args, args.name)
     issues = validate_package(package)
-    payload = {
-        "name": package.definition.name,
-        "valid": not any(issue.blocking for issue in issues),
-        "issues": [
+    compatibility = assess_compatibility(package)
+    if any(issue.blocking for issue in issues) and compatibility.runnable:
+        compatibility = replace(
+            compatibility,
+            level=CompatibilityLevel.UNSUPPORTED,
+            runnable=False,
+        )
+    issue_entries = []
+    seen_issues = set()
+    for issue in issues:
+        identity = (issue.code, issue.path)
+        if identity in seen_issues:
+            continue
+        seen_issues.add(identity)
+        issue_entries.append(
             {
                 "path": issue.path,
                 "code": issue.code,
@@ -913,22 +956,45 @@ def _cmd_validate(args: argparse.Namespace) -> int:
                 "blocking": issue.blocking,
                 "source_line": issue.source_line,
             }
-            for issue in issues
-        ],
-    }
-    if args.json and not payload["valid"]:
-        raise WorkflowCommandError(
-            "validation_failed",
-            "workflow validation found blocking issues",
-            exit_code=EXIT_BLOCKING_FINDING,
-            result=payload,
         )
+    for finding in compatibility.findings:
+        identity = (finding.code, finding.path)
+        if identity in seen_issues:
+            continue
+        seen_issues.add(identity)
+        issue_entries.append(
+            {
+                "path": finding.path,
+                "code": finding.code,
+                "message": finding.message,
+                "severity": finding.severity,
+                "blocking": finding.blocking,
+                "source_line": None,
+            }
+        )
+    payload = {
+        "name": package.definition.name,
+        "valid": compatibility.runnable,
+        "language": _language_payload(package),
+        "issues": issue_entries,
+    }
+    try:
+        require_runnable(compatibility)
+    except WorkflowCompatibilityBlockedError as exc:
+        if args.json:
+            raise WorkflowCommandError(
+                "validation_failed",
+                "workflow validation found blocking issues",
+                exit_code=EXIT_BLOCKING_FINDING,
+                result=payload,
+            ) from exc
     if args.json:
         _emit(payload, as_json=True)
     else:
         print(
             f"{package.definition.name}: {'valid' if payload['valid'] else 'invalid'}"
         )
+        print(f"Language: {payload['language']['effective_profile']}")
         for issue in payload["issues"]:
             print(f"- {issue['severity']}: {issue['path']}: {issue['message']}")
     return 0 if payload["valid"] else EXIT_BLOCKING_FINDING
@@ -955,49 +1021,8 @@ def _doctor_finding(
         message=message,
         blocking=blocking,
         code=code,
+        severity="error" if blocking else "info",
     )
-
-
-def _compatibility_code(finding: CompatibilityFinding) -> str:
-    message = finding.message.lower()
-    if "unknown archon tool alias" in message:
-        return "unknown_tool_alias"
-    if "mapped hermes tool is unavailable" in message:
-        return "unavailable_tool"
-    if ".hooks." in finding.path:
-        return "hook_unsupported" if finding.blocking else "hook_mapped"
-    if "provider" in message and "does not advertise" in message:
-        return "provider_field_unsupported"
-    if finding.path.endswith("persist_session") or finding.path == "persist_sessions":
-        return "persistent_session_fingerprint"
-    if finding.path.endswith(".mcp"):
-        return "mcp_isolation"
-    if finding.path.endswith(".skills"):
-        return "skill_snapshot"
-    if finding.path.endswith(".agents"):
-        return "inline_agent_bounds"
-    if finding.path.endswith("output_format"):
-        return "output_schema_enforcement"
-    if finding.path.startswith("requires["):
-        return "required_service"
-    if finding.path.startswith("worktree"):
-        return "worktree_requirement"
-    return finding.code
-
-
-def _coded_compatibility_findings(
-    report: CompatibilityReport,
-) -> list[CompatibilityFinding]:
-    return [
-        CompatibilityFinding(
-            path=finding.path,
-            level=finding.level,
-            message=finding.message,
-            blocking=finding.blocking,
-            code=_compatibility_code(finding),
-        )
-        for finding in report.findings
-    ]
 
 
 def _input_requirements(
@@ -1188,7 +1213,7 @@ def doctor_package(
         isolated_workdir=isolated_workdir,
         mcp_available=mcp_available,
     )
-    findings = _coded_compatibility_findings(compatibility)
+    findings = list(compatibility.findings)
     findings.extend(
         _provider_override_findings(package, hermes_home=hermes_home)
     )
@@ -1390,6 +1415,15 @@ def doctor_package(
         )
     )
 
+    findings = [
+        replace(
+            finding,
+            effective_profile=package.language.effective_profile,
+        )
+        for finding in {
+            (finding.code, finding.path): finding for finding in findings
+        }.values()
+    ]
     trust_state = WorkflowTrustStore(hermes_home).check(
         package_digest.sha256, risk_digest=risk.risk_digest
     )
@@ -1421,6 +1455,7 @@ def _doctor_payload(
     payload = report.to_dict()
     payload.update({
         "name": package.definition.name,
+        "language": _language_payload(package),
         "compatibility": _doctor_compatibility_level(report.findings).value,
         "remediation": (
             "Resolve blocking compatibility findings, then rerun doctor and trust the current digest."
@@ -1449,6 +1484,7 @@ def _doctor_payload(
         ),
     }
     mode_findings = []
+    effective_profile = package.language.effective_profile.value
     if (
         mode == "foreground"
         and payload["risk_summary"]["execution_environment"]
@@ -1460,6 +1496,7 @@ def _doctor_payload(
             "message": "foreground mode cannot satisfy isolated backend containment",
             "blocking": True,
             "code": "foreground_isolation_unavailable",
+            "effective_profile": effective_profile,
         })
     if mode == "background" and coordinator.status != "healthy":
         mode_findings.append({
@@ -1468,6 +1505,7 @@ def _doctor_payload(
             "message": "background mode requires a healthy workflow coordinator",
             "blocking": True,
             "code": "coordinator_unavailable",
+            "effective_profile": effective_profile,
         })
     if mode_findings:
         payload["findings"] = [*payload.get("findings", []), *mode_findings]
@@ -1477,17 +1515,18 @@ def _doctor_payload(
             "Resolve blocking findings for the requested mode, then rerun doctor."
         )
     if compat_report:
-        payload["compatibility_findings"] = [
-            {
-                "path": finding.path,
-                "level": finding.level.value,
-                "message": finding.message,
-                "blocking": finding.blocking,
-                "code": finding.code,
-            }
-            for finding in report.findings
-        ]
+        payload["compatibility_findings"] = list(payload.get("findings", []))
     return payload
+
+
+def _doctor_text_value(value: object, *, path: bool = False) -> object:
+    """Return one bounded diagnostic value without host-specific path leaks."""
+    sanitized = sanitize_projection(value)
+    if isinstance(sanitized, str) and path:
+        match = _DOCTOR_ABSOLUTE_PATH_START.search(sanitized)
+        if match is not None:
+            return sanitized[:match.start()] + "[REDACTED_PATH]"
+    return sanitized
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
@@ -1513,13 +1552,33 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     else:
         print(f"Workflow: {payload['name']}")
         print(f"Package digest: {payload['package_digest']}")
-        print(f"Risk digest: {payload['risk_digest']}")
+        print(f"Risk digest: {payload['risk_summary']['risk_digest']}")
         print(f"Compatibility: {payload['compatibility']}")
+        print(f"Language: {payload['language']['effective_profile']}")
         print(
             "Execution environment: "
             f"{payload['risk_summary']['execution_environment']}"
         )
         print(f"Remediation: {payload['remediation']}")
+        findings = payload.get("findings", ())
+        if not isinstance(findings, list | tuple):
+            findings = ()
+        for index, finding in enumerate(findings):
+            if index >= _DOCTOR_TEXT_FINDINGS_MAX:
+                print(
+                    "- diagnostics truncated after "
+                    f"{_DOCTOR_TEXT_FINDINGS_MAX} findings"
+                )
+                break
+            if not isinstance(finding, Mapping):
+                continue
+            code = _doctor_text_value(finding.get("code"))
+            path = _doctor_text_value(finding.get("path"), path=True)
+            migration = _doctor_text_value(finding.get("migration"))
+            print(f"- code: {code}")
+            print(f"  path: {path}")
+            if migration is not None:
+                print(f"  migration: {migration}")
     return EXIT_BLOCKING_FINDING if blocking else 0
 
 
@@ -1533,13 +1592,16 @@ def _cmd_trust(args: argparse.Namespace) -> int:
             exit_code=EXIT_INVOCATION,
         )
     compatibility = assess_compatibility(package)
+    require_runnable(compatibility)
     risk = build_risk_summary(package, compatibility)
     fresh_package = load_workflow(
         package.workflow_path,
         source=package.source,
         precedence=package.precedence,
     )
-    fresh_risk = build_risk_summary(fresh_package, assess_compatibility(fresh_package))
+    fresh_compatibility = assess_compatibility(fresh_package)
+    require_runnable(fresh_compatibility)
+    fresh_risk = build_risk_summary(fresh_package, fresh_compatibility)
     after = compute_package_digest(fresh_package)
     if (
         before != after
@@ -1686,7 +1748,9 @@ def _cmd_run(
     package = _resolve(args, args.name)
     runtime = _runtime_config(args.hermes_home, sidecar=package.sidecar)
     digest = compute_package_digest(package)
-    risk = build_risk_summary(package, assess_compatibility(package))
+    compatibility = assess_compatibility(package)
+    require_runnable(compatibility)
+    risk = build_risk_summary(package, compatibility)
     if (
         WorkflowTrustStore(args.hermes_home).check(
             digest.sha256, risk_digest=risk.risk_digest
@@ -1938,8 +2002,18 @@ def _cmd_resume(
     store = _store(args, runtime)
     before = _require_run(store, args.run_id)
     foreground_conflict = False
+    resume_scheduler = _scheduler(
+        store,
+        runtime,
+        agent_runner=agent_runner,
+        profile_name=profile_name,
+    )
+    always_run_nodes = resume_scheduler.verified_always_run_nodes(args.run_id)
     try:
-        store.resume_run(args.run_id)
+        store.resume_run(
+            args.run_id,
+            always_run_nodes=always_run_nodes,
+        )
     except ForegroundExecutionConflict:
         foreground_conflict = True
     _continue_foreground_if_owned(
@@ -2252,7 +2326,7 @@ def workflow_command(
     action = getattr(args, "workflow_action", None)
     if not action:
         print(
-            "Usage: hermes workflow {list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|archive|restore|cleanup|reset-sessions|showcase}",
+            "Usage: hermes workflow {schema|list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|archive|restore|cleanup|reset-sessions|showcase}",
             file=sys.stderr,
         )
         return 2
@@ -2261,6 +2335,8 @@ def workflow_command(
         command += f" {args.showcase_action}"
     _MACHINE_COMMAND.set(command)
     try:
+        if action == "schema":
+            return _cmd_schema(args)
         if action in {"list", "ls"}:
             return _cmd_list(args)
         if action == "show":
@@ -2340,6 +2416,24 @@ def workflow_command(
         else:
             print(str(exc), file=sys.stderr)
         return exc.exit_code
+    except WorkflowCompatibilityBlockedError as exc:
+        error = WorkflowCommandError(
+            exc.code,
+            str(exc),
+            exit_code=EXIT_BLOCKING_FINDING,
+        )
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    error_envelope(command, error.error),
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(str(error), file=sys.stderr)
+        return error.exit_code
     except WorkflowTrustError as exc:
         error = MachineError("trust_required", str(exc))
         if getattr(args, "json", False):
@@ -2347,7 +2441,35 @@ def workflow_command(
         else:
             print(str(exc), file=sys.stderr)
         return EXIT_AUTHORIZATION
-    except (ValueError, WorkflowValidationError) as exc:
+    except WorkflowLanguageCompatibilityError as exc:
+        error = MachineError(exc.code, str(exc))
+        if getattr(args, "json", False):
+            print(json.dumps(error_envelope(command, error), sort_keys=True, indent=2))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_INVOCATION
+    except WorkflowValidationError as exc:
+        issues = [
+            {
+                "code": issue.code,
+                "path": issue.path,
+                "severity": issue.severity,
+                "blocking": issue.blocking,
+            }
+            for issue in exc.issues[:200]
+        ]
+        primary_code = issues[0]["code"] if issues else "workflow_validation_failed"
+        error = MachineError(
+            primary_code,
+            str(exc),
+            details={"issues": issues},
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(error_envelope(command, error), sort_keys=True, indent=2))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_INVOCATION
+    except ValueError as exc:
         error = MachineError("invalid_request", str(exc))
         if getattr(args, "json", False):
             print(json.dumps(error_envelope(command, error), sort_keys=True, indent=2))

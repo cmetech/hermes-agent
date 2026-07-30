@@ -78,6 +78,34 @@ class TestLoadProfiles:
         assert browser_profiles.get_profile("default").trusted_origins == ()
 
 
+class TestPortCollision:
+    def test_duplicate_enrolled_ports_are_rejected(self, monkeypatch, caplog):
+        """Two profiles on one port bind one profile's trust to another's browser."""
+        monkeypatch.setattr(
+            browser_profiles, "_read_config",
+            lambda: {"browser": {"profiles": {
+                "a": {"kind": "enrolled", "cdp_port": 9222},
+                "b": {"kind": "enrolled", "cdp_port": 9222},
+            }}},
+        )
+        with caplog.at_level("WARNING"):
+            profiles = browser_profiles.load_profiles()
+        assert "a" in profiles
+        assert "b" not in profiles
+        assert any("cdp_port" in r.message for r in caplog.records)
+
+    def test_distinct_ports_both_load(self, monkeypatch):
+        monkeypatch.setattr(
+            browser_profiles, "_read_config",
+            lambda: {"browser": {"profiles": {
+                "a": {"kind": "enrolled", "cdp_port": 9222},
+                "b": {"kind": "enrolled", "cdp_port": 9333},
+            }}},
+        )
+        profiles = browser_profiles.load_profiles()
+        assert {"a", "b"} <= set(profiles)
+
+
 class TestMisconfiguredTrustedOrigins:
     """A string instead of a list must warn, not silently trust nothing.
 
@@ -199,6 +227,7 @@ class TestResolveExecutable:
     def test_explicit_path_is_used_when_it_exists(self, monkeypatch, tmp_path):
         exe = tmp_path / "msedge"
         exe.write_text("")
+        exe.chmod(0o755)
         p = browser_profiles.BrowserProfile(
             name="enrolled", kind=browser_profiles.KIND_ENROLLED, executable=str(exe)
         )
@@ -215,6 +244,7 @@ class TestResolveExecutable:
     def test_auto_probes_platform_candidates(self, monkeypatch, tmp_path):
         found = tmp_path / "Microsoft Edge"
         found.write_text("")
+        found.chmod(0o755)
         monkeypatch.setattr(
             browser_profiles, "_enrolled_candidates", lambda: [str(tmp_path / "nope"), str(found)]
         )
@@ -240,3 +270,115 @@ class TestResolveExecutable:
         assert any("Edge" in c for c in browser_profiles._enrolled_candidates())
         monkeypatch.setattr(browser_profiles.sys, "platform", "darwin")
         assert any("Microsoft Edge" in c for c in browser_profiles._enrolled_candidates())
+
+
+class TestCandidateOrder:
+    """Chrome first, Edge fallback — confirmed against the target fleet 2026-07-26.
+
+    Chrome reaches internal sites there, so it is policy-managed. The bundled
+    Chrome for Testing stays excluded on every platform: it is a different
+    binary, and the one browser that cannot present machine certificates.
+    """
+
+    PLATFORMS = ("win32", "darwin", "linux")
+
+    def _candidates(self, monkeypatch, platform):
+        monkeypatch.setattr(browser_profiles.sys, "platform", platform)
+        return browser_profiles._enrolled_candidates()
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_chrome_is_preferred_over_edge(self, monkeypatch, platform):
+        candidates = self._candidates(monkeypatch, platform)
+        first_chrome = next(i for i, c in enumerate(candidates) if "hrome" in c)
+        first_edge = next(i for i, c in enumerate(candidates) if "dge" in c)
+        assert first_chrome < first_edge
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_both_browsers_are_offered(self, monkeypatch, platform):
+        candidates = self._candidates(monkeypatch, platform)
+        assert any("hrome" in c for c in candidates)
+        assert any("dge" in c for c in candidates)
+
+    def test_windows_lists_real_chrome_paths(self, monkeypatch):
+        candidates = self._candidates(monkeypatch, "win32")
+        assert any(c.lower().endswith("chrome.exe") for c in candidates)
+        assert any(
+            "Google" in c and "Chrome" in c and "Application" in c for c in candidates
+        )
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_chrome_for_testing_is_never_a_candidate(self, monkeypatch, platform):
+        """The bundled throwaway browser is precisely what this list excludes."""
+        for candidate in self._candidates(monkeypatch, platform):
+            lowered = candidate.lower().replace(" ", "-")
+            assert "chrome-for-testing" not in lowered
+            assert "chrome-headless-shell" not in lowered
+            assert "agent-browser" not in lowered
+            assert "ms-playwright" not in lowered
+
+
+class TestResolveUserDataDir:
+    """M-3: ``${HERMES_HOME}`` never reached ``expandvars`` with a value.
+
+    HERMES_HOME is only exported to ``os.environ`` on the ``--profile`` override
+    path. On the plain CLI and on ``hermes serve`` it is unset, so the old
+    ``os.path.expandvars`` returned the LITERAL and ``os.makedirs`` created
+    ``./${HERMES_HOME}/browser-profiles/enrolled`` relative to the CWD -- the
+    persistent SSO profile the whole feature exists for did not survive a
+    directory change.
+    """
+
+    @staticmethod
+    def _profile(user_data_dir, name="enrolled"):
+        return browser_profiles.BrowserProfile(
+            name=name,
+            kind=browser_profiles.KIND_ENROLLED,
+            user_data_dir=user_data_dir,
+        )
+
+    @pytest.fixture()
+    def _home(self, tmp_path, monkeypatch):
+        import hermes_constants
+
+        home = tmp_path / "brandhome"
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: home)
+        return home
+
+    def test_unset_hermes_home_still_yields_an_absolute_path(self, _home):
+        resolved = browser_profiles.resolve_user_data_dir(
+            self._profile("${HERMES_HOME}/browser-profiles/enrolled")
+        )
+        import os
+
+        assert os.path.isabs(resolved)
+        assert resolved == str(_home / "browser-profiles" / "enrolled")
+
+    def test_the_literal_token_never_survives(self, _home):
+        for raw in ("${HERMES_HOME}/p", "$HERMES_HOME/p", "%HERMES_HOME%/p"):
+            resolved = browser_profiles.resolve_user_data_dir(self._profile(raw))
+            assert "HERMES_HOME" not in resolved, raw
+            assert resolved == str(_home / "p")
+
+    def test_env_var_path_still_works(self, tmp_path, monkeypatch):
+        """Where HERMES_HOME IS exported, the resolver agrees with it."""
+        import hermes_constants
+
+        home = tmp_path / "envhome"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        # get_hermes_home() reads HERMES_HOME; assert against the real resolver.
+        assert str(hermes_constants.get_hermes_home()) == str(home)
+        resolved = browser_profiles.resolve_user_data_dir(
+            self._profile("${HERMES_HOME}/browser-profiles/enrolled")
+        )
+        assert resolved == str(home / "browser-profiles" / "enrolled")
+
+    def test_a_relative_path_is_made_absolute(self, _home):
+        import os
+
+        resolved = browser_profiles.resolve_user_data_dir(self._profile("rel/dir"))
+        assert os.path.isabs(resolved)
+
+    def test_empty_user_data_dir_falls_back_under_the_home(self, _home):
+        resolved = browser_profiles.resolve_user_data_dir(self._profile("", name="corp"))
+        assert resolved == str(_home / "browser-profiles" / "corp")

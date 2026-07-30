@@ -30,7 +30,11 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-CDP_PORT = int(os.environ.get("CONFLUENCE_CDP_PORT", "9222"))
+# 9333, not 9222: 9222 is `/browser connect`'s default port and the
+# conventional ad-hoc remote-debugging port. An enrolled corporate browser
+# parked there is discoverable by anything that probes the default, which
+# would hand untrusted pages this browser's live SSO session.
+CDP_PORT = int(os.environ.get("CONFLUENCE_CDP_PORT", "9333"))
 CDP_URL = f"http://localhost:{CDP_PORT}"
 
 # Chromium-family browsers, in preference order per platform. Edge first: on a

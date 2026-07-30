@@ -58,6 +58,7 @@ interface StructuredRequest {
 
 function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
   return {
+    compatibility: { level: 'supported', runnable: true },
     description: 'Checks a release before deployment.',
     inputs: [],
     name: WORKFLOW_NAME,
@@ -69,6 +70,22 @@ function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefini
     version: '1.0.0',
     ...overrides
   }
+}
+
+function detailWithoutProjection(
+  projection: 'compatibility' | 'coordinator',
+  representation: 'absent' | 'null' | 'undefined',
+  overrides: Partial<WorkflowDetail> = {}
+): WorkflowDetail {
+  const payload = detail(overrides) as unknown as Record<string, unknown>
+
+  if (representation === 'absent') {
+    Reflect.deleteProperty(payload, projection)
+  } else {
+    payload[projection] = representation === 'null' ? null : undefined
+  }
+
+  return payload as unknown as WorkflowDetail
 }
 
 function detail(overrides: Partial<WorkflowDetail> = {}): WorkflowDetail {
@@ -219,6 +236,41 @@ describe('workflow View dialog', () => {
     expect(dialog.querySelector('[data-workflow-view-scroll]')).toBeTruthy()
   })
 
+  it('explains server-authored legacy semantics without inventing a profile', async () => {
+    currentDetail = detail({
+      language: {
+        declared_profile: null,
+        effective_profile: 'hermes-legacy',
+        legacy: true,
+        normalized_definition_digest: 'a'.repeat(64),
+        normalizer_version: 1
+      }
+    })
+    renderView()
+    const dialog = await openView()
+
+    expect(await within(dialog).findByText('Legacy semantics')).toBeTruthy()
+    expect(
+      within(dialog).getByText(
+        'Existing Hermes behavior is preserved. Review compatibility findings before migrating to Archon 2026-07.'
+      )
+    ).toBeTruthy()
+    expect(within(dialog).getByText('Normalizer 1')).toBeTruthy()
+    const digest = within(dialog).getByText('aaaaaaaaaaaa…')
+    expect(digest.getAttribute('title')).toBe('a'.repeat(64))
+  })
+
+  it('shows a future server-authored workflow language profile instead of Archon copy', async () => {
+    currentDetail = detail({
+      language: { effective_profile: 'future-workflow-language' as never, legacy: false }
+    })
+    renderView()
+    const dialog = await openView()
+
+    expect(await within(dialog).findByText('future-workflow-language')).toBeTruthy()
+    expect(within(dialog).queryByText('Archon 2026-07')).toBeNull()
+  })
+
   it('preserves the shared dialog vertical scroll while clipping horizontal overflow', async () => {
     renderView()
     const dialog = await openView()
@@ -350,6 +402,42 @@ describe('workflow View dialog', () => {
     expectDisabledRunReason(dialog, reason)
   })
 
+  it.each(['absent', 'undefined', 'null'] as const)(
+    'fails closed without throwing when detail compatibility is %s',
+    async representation => {
+      currentDetail = detailWithoutProjection('compatibility', representation)
+      renderView()
+      const dialog = await openView()
+
+      await within(dialog).findByTestId('shared-mermaid-renderer')
+      expectDisabledRunReason(
+        dialog,
+        'This workflow is not compatible with the current Hermes runtime and cannot start.'
+      )
+    }
+  )
+
+  it.each(['absent', 'undefined', 'null'] as const)(
+    'fails closed without throwing when detail coordinator is %s',
+    async representation => {
+      currentDetail = detailWithoutProjection('coordinator', representation)
+      renderView()
+      const dialog = await openView()
+
+      await within(dialog).findByTestId('shared-mermaid-renderer')
+      expectDisabledRunReason(dialog, "The background coordinator isn't running — try again shortly.")
+    }
+  )
+
+  it('keeps compatibility failure ahead of missing trust in detail skew', async () => {
+    currentDetail = detailWithoutProjection('compatibility', 'absent', { trust_state: undefined as never })
+    renderView()
+    const dialog = await openView()
+
+    await within(dialog).findByTestId('shared-mermaid-renderer')
+    expectDisabledRunReason(dialog, 'This workflow is not compatible with the current Hermes runtime and cannot start.')
+  })
+
   it('enables Run when fetched detail is runnable despite a stale untrusted catalog row', async () => {
     currentCatalogDefinition = definition({ trust_state: 'untrusted' })
     currentDetail = detail({ trust_state: 'trusted' })
@@ -386,6 +474,22 @@ describe('workflow View dialog', () => {
 
   it('fails closed without crashing when an older backend omits detail run support', async () => {
     currentDetail = detail({ run_support: undefined as never })
+    renderView()
+    const dialog = await openView()
+
+    await within(dialog).findByTestId('shared-mermaid-renderer')
+    expectDisabledRunReason(
+      dialog,
+      'Run is unavailable until the Hermes backend supports this workflow catalog version.'
+    )
+  })
+
+  it('keeps Run disabled for an unknown backend run-support reason', async () => {
+    currentDetail = detail({
+      compatibility: { findings: [], level: 'unsupported', runnable: false },
+      run_support: { reason: 'future_backend_rule' as never, supported: false },
+      trust_state: 'trusted'
+    })
     renderView()
     const dialog = await openView()
 

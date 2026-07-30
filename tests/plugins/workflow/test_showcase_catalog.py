@@ -542,6 +542,49 @@ def test_bundled_approval_gate_is_verified_parameterless_and_portable() -> None:
     assert preflight["input_requirements"] == []
 
 
+def test_showcase_isolation_finding_carries_effective_language_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copied = tmp_path / "showcases"
+    shutil.copytree(REPO_ROOT / "plugins/workflow/showcases", copied)
+    sidecar = (
+        copied
+        / "packages/approval-gate/workflows/approval-gate.hermes.yaml"
+    )
+    sidecar.write_text(
+        sidecar.read_text(encoding="utf-8").replace(
+            "execution_environment: trusted_local",
+            "execution_environment: isolated_backend_required\n"
+            "language_compatibility: archon-2026-07",
+        ),
+        encoding="utf-8",
+    )
+    _restamp_showcase_copy(copied, "approval-gate")
+    showcase_module._clear_verified_showcase_cache_for_tests()
+
+    @contextmanager
+    def installed_bundle(_explicit=None):
+        yield copied
+
+    monkeypatch.setattr(showcase_module, "_bundle_path", installed_bundle)
+    scenario = load_showcase_catalog()["approval-gate"]
+    package = showcase_module._scenario_package(scenario)
+
+    _risk, compatibility = showcase_module._verified_distribution_assessment(
+        scenario,
+        package,
+        enforce_runnable=False,
+    )
+
+    finding = next(
+        item
+        for item in compatibility.findings
+        if item.code == "execution_environment_unavailable"
+    )
+    assert finding.effective_profile is package.language.effective_profile
+
+
 def test_explicit_catalog_copy_is_not_authenticated_as_bundled_distribution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -15,7 +15,11 @@ import { listWorkflowDefinitions } from '@/lib/hermes-api'
 import { Eye, Play } from '@/lib/icons'
 import type { WorkflowDefinition, WorkflowDefinitionError } from '@/types/hermes'
 
-import { workflowSupportsScheduledRun, workflowTrustAllowsRun } from './catalog-run-policy'
+import {
+  desktopWorkflowLanguageLabel,
+  desktopWorkflowRunDisabledReason,
+  workflowTrustAllowsRun
+} from './catalog-run-policy'
 
 const WORKFLOW_DOCS_URL =
   'https://github.com/cmetech/hermes-agent/blob/base/website/docs/user-guide/features/workflows.md'
@@ -59,22 +63,7 @@ function CatalogRow({
   const { t } = useI18n()
   const runReasonId = useId()
 
-  const runSupportCopy = {
-    schedule_required: null,
-    showcase_cli_required: t.operations.workflowRunShowcaseFromCli,
-    supported: null,
-    unsupported_inputs: t.operations.workflowRunUnsupportedInputs
-  }
-
-  const runDisabledReason = !item.run_support
-    ? t.operations.workflowRunSupportUnavailable
-    : !workflowSupportsScheduledRun(item.run_support)
-      ? runSupportCopy[item.run_support.reason]
-      : item.compatibility?.runnable === false
-        ? t.operations.workflowRunIncompatible
-        : !workflowTrustAllowsRun(item.trust_state)
-          ? t.operations.workflowRunUntrusted
-          : null
+  const runDisabledReason = desktopWorkflowRunDisabledReason(item, t.operations, 'catalog')
 
   const inputCount = item.inputs.length
 
@@ -115,6 +104,11 @@ function CatalogRow({
                 ? t.operations.workflowSourceProfile
                 : t.operations.workflowSourceProject}
           </span>
+          {item.language ? (
+            <Badge variant={item.language.legacy ? 'muted' : 'default'}>
+              {desktopWorkflowLanguageLabel(item.language, t.operations)}
+            </Badge>
+          ) : null}
           {item.compatibility?.runnable === false ? (
             <Badge variant="warn">{t.operations.workflowIncompatible}</Badge>
           ) : null}

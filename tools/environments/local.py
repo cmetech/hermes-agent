@@ -1358,7 +1358,8 @@ class LocalEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
-                  stdin_data: str | None = None) -> subprocess.Popen:
+                  stdin_data: str | None = None,
+                  clean: bool = False) -> subprocess.Popen:
         bash = _find_bash()
         # For login-shell invocations (used by init_session to build the
         # environment snapshot), prepend sources for the user's bashrc /
@@ -1370,8 +1371,17 @@ class LocalEnvironment(BaseEnvironment):
             init_files = _resolve_shell_init_files()
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
-        args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        if clean:
+            args = [bash, "--noprofile", "--norc", "+x", "-c", cmd_string]
+        else:
+            args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
+        if clean:
+            run_env["BASH_ENV"] = "/dev/null"
+            run_env["ENV"] = "/dev/null"
+            # Bash imports exported SHELLOPTS after processing invocation
+            # flags, so +x alone cannot defeat a parent xtrace setting.
+            run_env["SHELLOPTS"] = ""
 
         # Recover when the cwd has been deleted out from under us — usually by
         # a previous tool call that ran ``rm -rf`` on its own working dir
@@ -1383,22 +1393,23 @@ class LocalEnvironment(BaseEnvironment):
         # POSIX paths (``/c/Users/...``) to native form so a perfectly valid
         # ``pwd -P`` result from bash isn't mistakenly treated as "missing"
         # and spammed as a warning on every command.
-        safe_cwd = _resolve_safe_cwd(self.cwd)
-        if safe_cwd != self.cwd:
+        requested_cwd = self.cwd
+        safe_cwd = _resolve_safe_cwd(requested_cwd)
+        if safe_cwd != requested_cwd:
             # MSYS → Windows translation alone shouldn't surface as a warning
             # (it's a benign normalization, not a recovery). Only warn when
             # the directory really doesn't exist on disk.
-            normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
+            normalized = _msys_to_windows_path(requested_cwd) if _IS_WINDOWS else requested_cwd
             if safe_cwd != normalized:
                 logger.warning(
                     "LocalEnvironment cwd %r is missing on disk; "
                     "falling back to %r so terminal commands keep working.",
-                    self.cwd,
+                    requested_cwd,
                     safe_cwd,
                 )
             self.cwd = safe_cwd
 
-        _popen_cwd = self.cwd
+        _popen_cwd = safe_cwd
 
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 

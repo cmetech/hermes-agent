@@ -15,12 +15,14 @@ Tests cover:
 import asyncio
 import json
 import os
+import sqlite3
 import stat
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -687,14 +689,39 @@ class _FakeGoogleChatAdapter:
         return {"ok": True}
 
 
-@pytest.fixture
-def adapter():
-    return _make_adapter()
+@pytest_asyncio.fixture
+async def adapter():
+    instance = _make_adapter()
+    try:
+        yield instance
+    finally:
+        await instance.disconnect()
 
 
-@pytest.fixture
-def auth_adapter():
-    return _make_adapter(api_key="sk-secret")
+@pytest_asyncio.fixture
+async def auth_adapter():
+    instance = _make_adapter(api_key="sk-secret")
+    try:
+        yield instance
+    finally:
+        await instance.disconnect()
+
+
+_previous_fixture_stores = {}
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["adapter", "adapter", "auth_adapter", "auth_adapter"],
+)
+def test_adapter_fixtures_close_response_store_between_uses(request, fixture_name):
+    """Each fixture tears down its adapter before the next test starts."""
+    current = request.getfixturevalue(fixture_name)
+    previous = _previous_fixture_stores.get(fixture_name)
+    if previous is not None:
+        with pytest.raises(sqlite3.ProgrammingError):
+            previous.get("fixture-cleanup-probe")
+    _previous_fixture_stores[fixture_name] = current._response_store
 
 
 # ---------------------------------------------------------------------------

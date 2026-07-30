@@ -52,7 +52,7 @@ _eval_ssrf_guard_active = (not _is_local_backend()
 
 and `_is_local_backend()` **returns False on any CDP override** — deliberately,
 so a model-driven navigate cannot reach internal services via an off-host
-Chrome. This design attaches enrolled Edge over CDP (`cdp_port: 9222`), so an
+Chrome. This design attaches enrolled Edge over CDP (`cdp_port: 9333`), so an
 internal Confluence host that resolves to a private IP would be **blocked**, for
 eval-fetch *and* navigate/snapshot. The design's central technique does not work
 as written on v0.19.0.
@@ -165,7 +165,7 @@ browser:
       kind: enrolled
       executable: auto             # resolve enrolled Edge (OS cert store)
       user_data_dir: "${HERMES_HOME}/browser-profiles/enrolled"
-      cdp_port: 9222
+      cdp_port: 9333            # NOT 9222 -- /browser connect owns that port
       trusted_origins:             # per-profile eval allowlist (see §5)
         - "https://eteamspace.internal.ericsson.com"
         - "https://*.internal.ericsson.com"

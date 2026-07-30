@@ -2411,6 +2411,7 @@ class MCPServerTask:
             command=command,
             args=args,
             env=safe_env if safe_env else None,
+            cwd=config.get("__hermes_private_mcp_cwd"),
         )
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}

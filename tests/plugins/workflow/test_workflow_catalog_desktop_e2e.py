@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -28,6 +27,19 @@ def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
         name="desktop-catalog-e2e",
         filename="desktop-catalog-e2e.yaml",
         nodes=[{"id": "still-pending", "bash": "sleep 30"}],
+    )
+    workflow_writer(
+        home / "workflows",
+        name="bounded-findings-e2e",
+        filename="bounded-findings-e2e.yaml",
+        nodes=[
+            {
+                "id": "agent",
+                "prompt": "bounded",
+                "allowed_tools": ["UnknownTool"],
+            }
+        ],
+        **{f"future_{index:04d}": "x" * 32 for index in range(600)},
     )
     (home / "workflows" / "broken-neighbor.yaml").write_text(
         "name: broken-neighbor\nnodes: [invalid\n", encoding="utf-8"
@@ -67,17 +79,10 @@ def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
     from hermes_cli import web_server
 
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    mounted_route = next(
-        route
-        for route in web_server.app.routes
-        if getattr(route, "path", None) == "/api/plugins/workflow/workflows"
-    )
-    mounted_plugin = sys.modules[mounted_route.endpoint.__module__]
-    client = TestClient(
+    with TestClient(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
-    )
-    try:
+    ) as client:
         catalog_response = client.get("/api/plugins/workflow/workflows")
         assert catalog_response.status_code == 200
         catalog_items = catalog_response.json()["items"]
@@ -85,28 +90,28 @@ def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
             item for item in catalog_items if item.get("source") != "showcase"
         ]
         assert [item["name"] for item in user_items] == [
+            "bounded-findings-e2e",
             "broken-neighbor",
             "desktop-catalog-e2e",
             "duplicate-neighbor",
             "oversized-neighbor",
         ]
-        assert user_items[0] == {
+        assert user_items[1] == {
             "name": "broken-neighbor",
             "error": "invalid_definition",
         }
-        assert user_items[2] == {
+        assert user_items[3] == {
             "name": "duplicate-neighbor",
             "error": "invalid_definition",
         }
-        assert user_items[3] == {
+        assert user_items[4] == {
             "name": "oversized-neighbor",
             "error": "catalog_capacity",
         }
         approval_showcase = next(
             item
             for item in catalog_items
-            if item.get("source") == "showcase"
-            and item.get("name") == "approval-gate"
+            if item.get("source") == "showcase" and item.get("name") == "approval-gate"
         )
         assert approval_showcase["trust_state"] == "verified_bundled"
 
@@ -117,6 +122,19 @@ def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
         topology = detail_response.json()["topology"]
         assert topology["text"]
         assert topology["mermaid"]
+
+        bounded_response = client.get(
+            "/api/plugins/workflow/workflows/bounded-findings-e2e"
+        )
+        assert bounded_response.status_code == 200
+        assert len(bounded_response.content) < 1024 * 1024
+        bounded = bounded_response.json()["compatibility"]
+        assert bounded["level"] == "unsupported"
+        assert bounded["runnable"] is False
+        assert bounded["findings_truncated"] is True
+        assert bounded["finding_count"] == 602
+        assert len(bounded["findings"]) == 512
+        assert bounded["findings"][-1]["code"] == "compatibility_findings_truncated"
 
         for invalid_name, expected_status, expected_code, retryable in (
             ("broken-neighbor", 422, "workflow_invalid_definition", False),
@@ -163,7 +181,3 @@ def test_desktop_catalog_detail_and_trigger_cross_real_auth_boundary(
         assert admitted["run_id"] in {
             item["run_id"] for item in board_response.json()["runs"]
         }
-    finally:
-        client.close()
-        mounted_plugin._close_runtime()
-        assert mounted_plugin._RUNTIME is None

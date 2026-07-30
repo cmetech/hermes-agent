@@ -4,7 +4,9 @@
 The minimum-viable replacement for pytest-xdist + a subprocess-isolation
 plugin. Discovers test files under ``tests/`` (excluding integration/e2e
 unless explicitly requested), then runs one ``python -m pytest <file>``
-subprocess per file, with bounded parallelism (default: ``os.cpu_count()``).
+subprocess per file, with bounded parallelism (default: half the process-usable
+CPU budget from affinity, cgroup quota, and machine count, rounded down and
+clamped to one; one worker if capacity is unknown).
 
 Why per-file rather than per-test?
     Per-test spawn overhead (~250ms × 17k tests = 70min CPU minimum)
@@ -31,7 +33,8 @@ Usage:
     a literal ``--`` is also passed through, and stacks with bare flags.
 
 Environment:
-    HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
+    HERMES_TEST_WORKERS  Override worker count (default: half the process-usable
+                         CPUs, minimum 1; unknown capacity defaults to 1)
     HERMES_TEST_PATHS    Override discovery roots (colon-sep, default: 'tests')
 
 Exit code: 0 if every file's pytest exited 0; 1 otherwise.
@@ -42,17 +45,287 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
-from pathlib import Path
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from pathlib import Path, PurePosixPath
 from typing import Dict, List, Tuple
 
 
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
+
+
+def _cpu_quota_count(quota_raw: str, period_raw: str) -> int | None:
+    """Convert a finite cgroup CPU quota to conservative whole-CPU capacity."""
+    try:
+        quota = int(quota_raw)
+        period = int(period_raw)
+    except ValueError:
+        return None
+    if quota <= 0 or period <= 0:
+        return None
+    return max(1, quota // period)
+
+
+def _parse_cgroup_v2_cpu_max(raw: str) -> int | None:
+    """Parse ``cpu.max``; ``max`` or malformed values mean no usable limit."""
+    fields = raw.split()
+    if len(fields) != 2 or fields[0] == "max":
+        return None
+    return _cpu_quota_count(fields[0], fields[1])
+
+
+def _parse_cgroup_v1_cpu_quota(
+    quota_raw: str,
+    period_raw: str,
+) -> int | None:
+    """Parse cgroup v1 CPU quota/period; negative quota means unlimited."""
+    return _cpu_quota_count(quota_raw.strip(), period_raw.strip())
+
+
+def _read_cgroup_root_cpu_count(cgroup_root: Path) -> int | None:
+    """Best-effort fallback for namespaced cgroup roots without proc metadata."""
+    v2_path = cgroup_root / "cpu.max"
+    try:
+        v2_raw = v2_path.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    else:
+        # A present cpu.max identifies a v2 hierarchy. ``max`` is unlimited;
+        # do not reinterpret unrelated/stale v1-looking files below it.
+        return _parse_cgroup_v2_cpu_max(v2_raw)
+
+    for controller_dir in (
+        cgroup_root / "cpu",
+        cgroup_root / "cpu,cpuacct",
+        cgroup_root,
+    ):
+        try:
+            quota_raw = (controller_dir / "cpu.cfs_quota_us").read_text(
+                encoding="utf-8"
+            )
+            period_raw = (controller_dir / "cpu.cfs_period_us").read_text(
+                encoding="utf-8"
+            )
+        except OSError:
+            continue
+        return _parse_cgroup_v1_cpu_quota(quota_raw, period_raw)
+    return None
+
+
+def _read_optional_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+
+
+def _parse_cgroup_memberships(raw: str) -> tuple[str | None, str | None]:
+    """Return unified-v2 and v1-CPU membership paths from proc cgroup text."""
+    v2_membership: str | None = None
+    v1_cpu_membership: str | None = None
+    for line in raw.splitlines():
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            continue
+        hierarchy_id, controllers_raw, membership = fields
+        membership = membership.strip()
+        if not membership.startswith("/"):
+            continue
+        controllers = set(filter(None, controllers_raw.split(",")))
+        if hierarchy_id == "0" and not controllers:
+            v2_membership = membership
+        elif "cpu" in controllers:
+            v1_cpu_membership = membership
+    return v2_membership, v1_cpu_membership
+
+
+def _unescape_mountinfo_path(raw: str) -> str:
+    """Decode the octal escapes used for mountinfo root/mountpoint fields."""
+    for escaped, value in (
+        (r"\040", " "),
+        (r"\011", "\t"),
+        (r"\012", "\n"),
+        (r"\134", "\\"),
+    ):
+        raw = raw.replace(escaped, value)
+    return raw
+
+
+def _parse_cgroup_mounts(
+    raw: str,
+) -> list[tuple[str, PurePosixPath, Path]]:
+    """Return applicable ``(version, hierarchy_root, mountpoint)`` entries."""
+    mounts: list[tuple[str, PurePosixPath, Path]] = []
+    for line in raw.splitlines():
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+        except ValueError:
+            continue
+        if len(fields) < 6 or len(fields) <= separator + 3:
+            continue
+        fs_type = fields[separator + 1]
+        mount_options = set(fields[5].split(","))
+        super_options = set(fields[separator + 3].split(","))
+        if fs_type == "cgroup2":
+            version = "v2"
+        elif fs_type == "cgroup" and "cpu" in mount_options | super_options:
+            version = "v1"
+        else:
+            continue
+        hierarchy_root = PurePosixPath(_unescape_mountinfo_path(fields[3]))
+        mountpoint = Path(_unescape_mountinfo_path(fields[4]))
+        if not hierarchy_root.is_absolute() or not mountpoint.is_absolute():
+            continue
+        mounts.append((version, hierarchy_root, mountpoint))
+    return mounts
+
+
+def _map_cgroup_membership(
+    membership: str,
+    hierarchy_root: PurePosixPath,
+    mountpoint: Path,
+) -> Path | None:
+    """Map a proc membership path through a mount's hierarchy root."""
+    member_path = PurePosixPath(membership)
+    try:
+        relative = member_path.relative_to(hierarchy_root)
+    except ValueError:
+        return None
+    if ".." in relative.parts:
+        return None
+    return mountpoint.joinpath(*relative.parts)
+
+
+def _cgroup_nodes_to_mountpoint(leaf: Path, mountpoint: Path) -> list[Path]:
+    """Return leaf and ancestors through the visible hierarchy mountpoint."""
+    if leaf != mountpoint and mountpoint not in leaf.parents:
+        return []
+    nodes: list[Path] = []
+    current = leaf
+    while True:
+        nodes.append(current)
+        if current == mountpoint:
+            return nodes
+        current = current.parent
+
+
+def _read_process_cgroup_cpu_limits(
+    proc_cgroup_path: Path,
+    mountinfo_path: Path,
+) -> tuple[bool, list[int]]:
+    """Resolve applicable cgroup nodes and collect every finite CPU quota."""
+    cgroup_raw = _read_optional_text(proc_cgroup_path)
+    mountinfo_raw = _read_optional_text(mountinfo_path)
+    if cgroup_raw is None or mountinfo_raw is None:
+        return False, []
+
+    v2_membership, v1_cpu_membership = _parse_cgroup_memberships(cgroup_raw)
+    memberships = {"v2": v2_membership, "v1": v1_cpu_membership}
+    found_hierarchy = False
+    limits: list[int] = []
+    for version, hierarchy_root, mountpoint in _parse_cgroup_mounts(mountinfo_raw):
+        membership = memberships[version]
+        if membership is None:
+            continue
+        leaf = _map_cgroup_membership(membership, hierarchy_root, mountpoint)
+        if leaf is None:
+            continue
+        found_hierarchy = True
+        for node in _cgroup_nodes_to_mountpoint(leaf, mountpoint):
+            if version == "v2":
+                raw = _read_optional_text(node / "cpu.max")
+                limit = (
+                    _parse_cgroup_v2_cpu_max(raw) if raw is not None else None
+                )
+            else:
+                quota_raw = _read_optional_text(node / "cpu.cfs_quota_us")
+                period_raw = _read_optional_text(node / "cpu.cfs_period_us")
+                limit = (
+                    _parse_cgroup_v1_cpu_quota(quota_raw, period_raw)
+                    if quota_raw is not None and period_raw is not None
+                    else None
+                )
+            if limit is not None:
+                limits.append(limit)
+    return found_hierarchy, limits
+
+
+def _read_cgroup_cpu_count(
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    *,
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+    mountinfo_path: Path = Path("/proc/self/mountinfo"),
+) -> int | None:
+    """Return the tightest CPU quota applying to this process's cgroups."""
+    found_hierarchy, limits = _read_process_cgroup_cpu_limits(
+        proc_cgroup_path,
+        mountinfo_path,
+    )
+    if found_hierarchy:
+        return min(limits) if limits else None
+    return _read_cgroup_root_cpu_count(cgroup_root)
+
+
+def _affinity_cpu_count() -> int | None:
+    """Return CPUs in this process's scheduler affinity, when supported."""
+    try:
+        affinity = os.sched_getaffinity(0)  # type: ignore[attr-defined]
+    except (AttributeError, NotImplementedError, OSError):
+        return None
+    return len(affinity) or None
+
+
+def _process_usable_cpu_count(
+    machine_cpu_count: int | None,
+    affinity_cpu_count: int | None,
+    cgroup_cpu_count: int | None,
+) -> int | None:
+    """Return affinity (or machine fallback), bounded by cgroup quota."""
+    scheduler_count = (
+        affinity_cpu_count
+        if affinity_cpu_count is not None and affinity_cpu_count > 0
+        else machine_cpu_count
+    )
+    limits = [
+        count
+        for count in (scheduler_count, cgroup_cpu_count)
+        if count is not None and count > 0
+    ]
+    return min(limits) if limits else None
+
+
+def _detect_process_usable_cpu_count() -> int | None:
+    """Detect machine, scheduler-affinity, and cgroup CPU limits."""
+    return _process_usable_cpu_count(
+        os.cpu_count(),
+        _affinity_cpu_count(),
+        _read_cgroup_cpu_count(),
+    )
+
+
+def _default_worker_count(cpu_count: int | None) -> int:
+    """Reserve half of known CPUs for test-owned concurrency.
+
+    Unknown capacity fails safe at one worker. Known counts use floor division
+    and clamp to one, so one and two-CPU hosts both remain usable.
+    """
+    if cpu_count is None:
+        return 1
+    return max(1, cpu_count // 2)
+
+
+# A file subprocess is not a single execution context: many test files spawn
+# their own threads and child processes. Reserve half the process-usable CPU
+# budget for that test-owned concurrency. Explicit -j / HERMES_TEST_WORKERS
+# values remain exact overrides for callers that know their workload.
+_DEFAULT_WORKERS = _default_worker_count(_detect_process_usable_cpu_count())
 
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
@@ -228,12 +501,49 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
         pass
 
 
+class _ActiveProcessRegistry:
+    """Coordinate outer-runner cancellation with per-file process ownership."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._processes: dict[int, tuple[subprocess.Popen, int | None]] = {}
+
+    @property
+    def cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+    def register(self, proc: subprocess.Popen, pgid: int | None) -> None:
+        with self._lock:
+            cancelled = self._cancelled
+            if not cancelled:
+                self._processes[id(proc)] = (proc, pgid)
+        if cancelled:
+            # Cancellation may race the small window between Popen and
+            # registration. A late child must observe the cancellation too.
+            _kill_tree(proc, pgid=pgid)
+
+    def unregister(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self._processes.pop(id(proc), None)
+
+    def cancel_all(self) -> int:
+        with self._lock:
+            self._cancelled = True
+            active = tuple(self._processes.values())
+        for proc, pgid in active:
+            _kill_tree(proc, pgid=pgid)
+        return len(active)
+
+
 def _run_one_file(
     file: Path,
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
     retries: int = 0,
+    process_registry: _ActiveProcessRegistry | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -268,15 +578,19 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
+        file, pytest_args, repo_root, file_timeout, process_registry
     )
+    if process_registry is not None and process_registry.cancelled:
+        raise CancelledError
     attempt = 0
     while rc != 0 and attempt < retries:
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
+            file, pytest_args, repo_root, file_timeout, process_registry
         )
+        if process_registry is not None and process_registry.cancelled:
+            raise CancelledError
         subproc_wall += subproc_wall2
         if rc == 0:
             output = (
@@ -303,25 +617,46 @@ def _run_one_file_once(
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    process_registry: _ActiveProcessRegistry | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    if process_registry is not None and process_registry.cancelled:
+        raise CancelledError
+    # Pytest's implicit temp root is a shared ``pytest-of-<user>`` numbered
+    # namespace.  Every independent pytest process performs retention cleanup
+    # there at exit, which lets one per-file process prune another process's
+    # still-live ``tmp_path`` tree.  Give each attempt an owned basetemp and
+    # remove only that owned parent after its complete process tree is gone.
+    attempt_temp_root = Path(tempfile.mkdtemp(prefix="pytest-file-"))
+    basetemp = attempt_temp_root / "basetemp"
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        str(file),
+        *pytest_args,
+        f"--basetemp={basetemp}",
+    ]
     
     subproc_start = time.monotonic()
     # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=os.environ,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=os.environ,
+            # POSIX: place the child at the head of its own process group so
+            # _kill_tree can SIGKILL the group atomically.
+            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+            # _kill_tree handles the Windows path via taskkill /F /T.
+            start_new_session=True,
+        )
+    except BaseException:
+        shutil.rmtree(attempt_temp_root, ignore_errors=True)
+        raise
 
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
     # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
@@ -334,31 +669,41 @@ def _run_one_file_once(
         except (ProcessLookupError, PermissionError):
             pgid = None
 
-    try:
-        output, _ = proc.communicate(timeout=file_timeout)
-        rc = proc.returncode
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc, pgid=pgid)
-        try:
-            output, _ = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            output = "(file timeout exceeded; output unavailable)"
-        rc = 124  # de facto convention for "killed by timeout".
-        output = (
-            f"({file_timeout:.0f}s exceeded; "
-            f"process tree SIGKILL'd)\n{output}"
-        )
-    except BaseException:
-        # KeyboardInterrupt / runner crash — make sure no zombie
-        # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
-        raise
-    else:
-        # Happy path: pytest exited on its own. Kill the group anyway in
-        # case it left grandchildren behind; already-dead is a no-op.
-        _kill_tree(proc, pgid=pgid)
+    if process_registry is not None:
+        process_registry.register(proc, pgid)
 
-        output +=  "\n"
+    try:
+        try:
+            output, _ = proc.communicate(timeout=file_timeout)
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc, pgid=pgid)
+            try:
+                output, _ = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                output = "(file timeout exceeded; output unavailable)"
+            rc = 124  # de facto convention for "killed by timeout".
+            output = (
+                f"({file_timeout:.0f}s exceeded; "
+                f"process tree SIGKILL'd)\n{output}"
+            )
+        except BaseException:
+            # KeyboardInterrupt / runner crash — make sure no zombie
+            # grandchildren outlive us.
+            _kill_tree(proc, pgid=pgid)
+            raise
+        else:
+            # Happy path: pytest exited on its own. Kill the group anyway in
+            # case it left grandchildren behind; already-dead is a no-op.
+            _kill_tree(proc, pgid=pgid)
+
+            output += "\n"
+    finally:
+        # Cleanup happens only after the process-group boundary above, so no
+        # test child can still be using its runner-owned tmp_path tree.
+        if process_registry is not None:
+            process_registry.unregister(proc)
+        shutil.rmtree(attempt_temp_root, ignore_errors=True)
 
     if rc == 5:
         # No tests collected — every test in the file was filtered out.
@@ -654,8 +999,11 @@ def main() -> int:
         "-j",
         "--jobs",
         type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
+        default=int(os.environ.get("HERMES_TEST_WORKERS") or _DEFAULT_WORKERS),
+        help=(
+            "Parallel worker count (default: $HERMES_TEST_WORKERS or half "
+            "the process-usable CPUs, minimum 1; unknown CPU capacity uses 1)"
+        ),
     )
     parser.add_argument(
         "--paths",
@@ -751,7 +1099,7 @@ def main() -> int:
     # it never reaches our positional ``paths``. ``=``-joined forms
     # (``-k=expr``, ``--tb=long``) are self-contained and need no lookahead.
     OUR_FLAGS = {
-        "-j", "--jobs", "--paths", "--include-integration",
+        "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
     }
     # pytest short flags that consume the NEXT token as their value.
@@ -895,12 +1243,15 @@ def main() -> int:
     tests_passed = 0
     tests_failed = 0
     lock = threading.Lock()
+    process_registry = _ActiveProcessRegistry()
 
     def _on_done(file: Path, started_at: float, fut: "Future[Tuple[Path, int, str, dict[str, int], float]]") -> None:
         nonlocal files_done, tests_done, pass_count, fail_count, tests_passed, tests_failed
         n_tests = test_counts.get(file, 0)
         try:
             fpath, rc, output, summary, subproc_wall = fut.result()
+        except CancelledError:
+            return
         except Exception as exc:  # noqa: BLE001 — must always advance counter
             with lock:
                 files_done += 1
@@ -938,21 +1289,46 @@ def main() -> int:
             if rc != 0:
                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures: List[Future] = []
+    pool = ThreadPoolExecutor(max_workers=args.jobs)
+    futures: List[Future] = []
+    interrupted = False
+    try:
         for file in files:
             t0 = time.monotonic()
             fut = pool.submit(
                 _run_one_file, file, pytest_passthrough, repo_root,
-                args.file_timeout, args.file_retries,
+                args.file_timeout, args.file_retries, process_registry,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
-        # Block until everything's done. ThreadPoolExecutor.__exit__ waits
-        # for all submitted work, but doing it explicitly here makes the
-        # control flow obvious.
+        # Block until everything's done. Keep this wait inside the explicit
+        # interrupt boundary: ThreadPoolExecutor.__exit__ waits for workers
+        # before control can reach an outer KeyboardInterrupt handler.
         for fut in futures:
-            fut.result() if fut.exception() is None else None
+            try:
+                fut.result()
+            except Exception:
+                # The completion callback records ordinary worker failures.
+                pass
+    except KeyboardInterrupt:
+        interrupted = True
+        active_count = process_registry.cancel_all()
+        for fut in futures:
+            fut.cancel()
+        # Workers reap their killed process groups and remove their private
+        # temp roots before this returns. Pending files never start.
+        pool.shutdown(wait=True, cancel_futures=True)
+        print(
+            f"\nInterrupted: terminated {active_count} active test file "
+            f"process tree{'s' if active_count != 1 else ''}; "
+            f"{files_done}/{len(files)} files completed, {fail_count} failed.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 130
+    finally:
+        if not interrupted:
+            pool.shutdown(wait=True)
 
     elapsed = time.monotonic() - started
     print()

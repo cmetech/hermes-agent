@@ -28,6 +28,32 @@ def test_local_command_precedes_global_and_preserves_frontmatter(tmp_path: Path)
     assert command.path == (local / "commands" / "investigate.md").resolve()
 
 
+@pytest.mark.parametrize("mutation", ["delete", "rename", "replace"])
+def test_command_uses_authenticated_bytes_without_reopening_source(
+    tmp_path: Path, mutation: str
+):
+    root = tmp_path / "run"
+    command = root / "commands" / "investigate.md"
+    command.parent.mkdir(parents=True)
+    authenticated = b"authenticated instructions\n"
+    command.write_bytes(authenticated)
+    resolver = ResourceResolver(
+        root,
+        sealed_paths={"commands/investigate.md"},
+        sealed_bytes={"commands/investigate.md": authenticated},
+    )
+    if mutation == "delete":
+        command.unlink()
+    elif mutation == "rename":
+        command.rename(command.with_suffix(".gone"))
+    else:
+        command.write_text("forged instructions\n", encoding="utf-8")
+
+    resolved = resolver.command("investigate")
+
+    assert resolved.body == "authenticated instructions\n"
+
+
 @pytest.mark.parametrize(
     "name", ("../secret", "nested/secret", "/tmp/secret", "~/.secret")
 )

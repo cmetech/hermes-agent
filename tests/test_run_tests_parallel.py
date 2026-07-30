@@ -22,13 +22,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import signal
 import subprocess
 import sys
 import textwrap
 import time
+import uuid
 from pathlib import Path
 
 import pytest
+
+from scripts import run_tests_parallel
 
 
 # Both tests share the same handoff file: the leaker writes here, the
@@ -187,6 +192,125 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
+@pytest.mark.live_system_guard_bypass
+def test_sigint_kills_active_file_tree_before_runner_exits(tmp_path: Path) -> None:
+    """Interrupting the outer runner must promptly reap its active file tree."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "interrupt-probes"
+    probe_dir.mkdir()
+    failure_handoff = tmp_path / "failure-finished"
+    process_handoff = tmp_path / "active-process.json"
+
+    (probe_dir / "test_00_completed_failure.py").write_text(
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+
+            def test_completed_failure_is_visible():
+                Path({str(failure_handoff)!r}).write_text("finished")
+                assert False, "intentional completed failure"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (probe_dir / "test_10_hanging_tree.py").write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            import os
+            import subprocess
+            import sys
+            import time
+            from pathlib import Path
+
+            HANDOFF = Path({str(process_handoff)!r})
+
+            def test_hanging_tree(tmp_path):
+                child = subprocess.Popen([
+                    sys.executable,
+                    "-c",
+                    "import signal, time; "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    "time.sleep(600)",
+                ])
+                HANDOFF.write_text(json.dumps({{
+                    "test_pid": os.getpid(),
+                    "test_pgid": os.getpgid(0),
+                    "grandchild_pid": child.pid,
+                    "attempt_temp_root": str(tmp_path.parents[1]),
+                }}))
+                time.sleep(600)
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "1",
+            "--file-retries",
+            "0",
+            "--file-timeout",
+            "30",
+            "-q",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    handoff_data = None
+    output = ""
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if failure_handoff.exists() and process_handoff.exists():
+                handoff_data = json.loads(process_handoff.read_text())
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert handoff_data is not None, "runner never reached hanging probe"
+
+        interrupted_at = time.monotonic()
+        proc.send_signal(signal.SIGINT)
+        output, _ = proc.communicate(timeout=5)
+        elapsed = time.monotonic() - interrupted_at
+
+        assert proc.returncode == 130, output
+        assert elapsed < 5
+        assert "intentional completed failure" in output
+
+        for pid_key in ("test_pid", "grandchild_pid"):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if not _pid_alive(handoff_data[pid_key]):
+                    break
+                time.sleep(0.05)
+            else:
+                pytest.fail(f"{pid_key} survived runner SIGINT; output:\n{output}")
+        assert not Path(handoff_data["attempt_temp_root"]).exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+        if handoff_data is not None:
+            try:
+                os.killpg(handoff_data["test_pgid"], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
 # ── Bare pytest-flag passthrough ─────────────────────────────────────────────
 #
 # The runner routes any token starting with ``-`` that isn't one of its own
@@ -223,6 +347,544 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
         text=True,
         timeout=60,
     )
+
+
+def test_parallel_files_receive_disjoint_pytest_temp_roots(tmp_path: Path) -> None:
+    """Per-file pytest processes must not share a cleanup namespace.
+
+    Pytest's default ``pytest-of-<user>`` root is process-global.  Independent
+    pytest processes perform retention cleanup there at exit, so sharing that
+    root defeats this runner's per-file isolation and can remove another live
+    process's ``tmp_path`` tree.  Each runner attempt must instead receive its
+    own pytest temp root.
+    """
+    probe_dir = tmp_path / "temp-root-probes"
+    probe_dir.mkdir()
+    nonce = uuid.uuid4().hex
+    handoffs = [tmp_path / f"pytest-temp-root-{index}.txt" for index in range(2)]
+    for index in range(2):
+        probe_source = textwrap.dedent(
+            f"""
+            from pathlib import Path
+
+            HANDOFF = Path({str(handoffs[index])!r})
+
+            def test_records_pytest_temp_namespace(tmp_path):
+                HANDOFF.write_text(str(tmp_path.parents[1]), encoding="utf-8")
+            """
+        ).strip()
+        (probe_dir / f"test_temp_root_{nonce}_{index}.py").write_text(
+            probe_source + "\n",
+            encoding="utf-8",
+        )
+
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "2",
+            "--file-retries",
+            "0",
+            "--file-timeout",
+            "30",
+            "-q",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    namespaces = [path.read_text(encoding="utf-8") for path in handoffs]
+    assert len(namespaces) == 2, (namespaces, proc.stdout)
+    assert len(set(namespaces)) == 2, (
+        "parallel pytest files shared one temp cleanup namespace: "
+        f"{namespaces!r}\n{proc.stdout}"
+    )
+
+
+def test_runner_basetemp_does_not_trigger_live_process_guard() -> None:
+    """Runner-owned argv paths must not look like live Hermes targets.
+
+    The real search regression invokes ``rg`` with the exact shlex token
+    ``skill``.  The test-suite live-system guard correctly treats that token
+    as a process-killer only when some argv text also targets Hermes/gateway.
+    Running the test through the per-file runner proves its private basetemp
+    path does not supply that otherwise-absent target term.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    search_test = repo_root / "tests" / "tools" / "test_search_hidden_dirs.py"
+
+    proc = _run_runner(
+        search_test,
+        "--file-retries",
+        "0",
+        "-q",
+        "-k",
+        "test_rg_finds_visible_content",
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    assert "live-system guard" not in proc.stdout, proc.stdout
+
+
+@pytest.mark.parametrize(
+    ("env_workers", "cli_args", "expected_jobs"),
+    [
+        pytest.param("3", (), 3, id="environment-override"),
+        pytest.param("3", ("-j", "2"), 2, id="cli-override"),
+    ],
+)
+def test_worker_selection_policy(
+    tmp_path: Path,
+    env_workers: str | None,
+    cli_args: tuple[str, ...],
+    expected_jobs: int,
+) -> None:
+    """Preserve exact opt-in worker overrides through the canonical wrapper."""
+    probe_dir = _make_probe_dir(tmp_path)
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests.sh"
+    env = os.environ.copy()
+    if env_workers is None:
+        env.pop("HERMES_TEST_WORKERS", None)
+    else:
+        env["HERMES_TEST_WORKERS"] = env_workers
+
+    proc = subprocess.run(
+        [
+            str(runner),
+            str(probe_dir),
+            "--file-retries",
+            "0",
+            *cli_args,
+            "-q",
+        ],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    announced = re.search(r"running with -j (?P<jobs>\d+)(?:\s|$)", proc.stdout)
+    assert announced is not None, proc.stdout
+    assert int(announced.group("jobs")) == expected_jobs, proc.stdout
+
+
+@pytest.mark.parametrize("help_flag", ["-h", "--help"])
+def test_canonical_wrapper_help_exits_without_running_tests(
+    tmp_path: Path,
+    help_flag: str,
+) -> None:
+    """Runner help remains reachable through the canonical clean wrapper."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests.sh"
+    nonexistent = tmp_path / "does-not-exist"
+
+    started = time.monotonic()
+    proc = subprocess.run(
+        [str(runner), str(nonexistent), help_flag],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=10,
+    )
+    elapsed = time.monotonic() - started
+
+    normalized_output = " ".join(proc.stdout.split())
+    expected_default = (
+        "Parallel worker count (default: $HERMES_TEST_WORKERS or half the "
+        "process-usable CPUs, minimum 1; unknown CPU capacity uses 1)"
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert expected_default in normalized_output, proc.stdout
+    assert elapsed < 5, proc.stdout
+    assert "No test files found" not in proc.stdout, proc.stdout
+    assert "No test files to run" not in proc.stdout, proc.stdout
+    assert "Discovered " not in proc.stdout, proc.stdout
+    assert "=== Summary" not in proc.stdout, proc.stdout
+
+
+@pytest.mark.parametrize(
+    ("cpu_count", "expected_jobs"),
+    [
+        pytest.param(None, 1, id="unknown-is-conservative"),
+        pytest.param(1, 1, id="single-cpu-clamps-to-one"),
+        pytest.param(2, 1, id="two-cpus-reserve-one"),
+        pytest.param(3, 1, id="odd-count-rounds-down"),
+        pytest.param(4, 2, id="even-count-halves"),
+        pytest.param(5, 2, id="larger-odd-count-rounds-down"),
+        pytest.param(28, 14, id="measured-host-halves"),
+    ],
+)
+def test_default_worker_count_policy(
+    cpu_count: int | None,
+    expected_jobs: int,
+) -> None:
+    """Unknown/low CPU counts fail safe; known hosts reserve half their CPUs."""
+    assert run_tests_parallel._default_worker_count(cpu_count) == expected_jobs
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_cpus"),
+    [
+        pytest.param("max 100000", None, id="unlimited"),
+        pytest.param("100000 100000", 1, id="one-cpu"),
+        pytest.param("250000 100000", 2, id="fractional-quota-floors"),
+        pytest.param("50000 100000", 1, id="sub-cpu-quota-clamps"),
+        pytest.param("0 100000", None, id="zero-quota-invalid"),
+        pytest.param("100000 0", None, id="zero-period-invalid"),
+        pytest.param("garbage", None, id="malformed"),
+    ],
+)
+def test_parse_cgroup_v2_cpu_max(
+    raw: str,
+    expected_cpus: int | None,
+) -> None:
+    """Parse cgroup v2 quota boundaries without consulting the host cgroup."""
+    assert run_tests_parallel._parse_cgroup_v2_cpu_max(raw) == expected_cpus
+
+
+@pytest.mark.parametrize(
+    ("quota_raw", "period_raw", "expected_cpus"),
+    [
+        pytest.param("-1", "100000", None, id="unlimited"),
+        pytest.param("100000", "100000", 1, id="one-cpu"),
+        pytest.param("250000", "100000", 2, id="fractional-quota-floors"),
+        pytest.param("50000", "100000", 1, id="sub-cpu-quota-clamps"),
+        pytest.param("0", "100000", None, id="zero-quota-invalid"),
+        pytest.param("100000", "0", None, id="zero-period-invalid"),
+        pytest.param("garbage", "100000", None, id="malformed"),
+    ],
+)
+def test_parse_cgroup_v1_cpu_quota(
+    quota_raw: str,
+    period_raw: str,
+    expected_cpus: int | None,
+) -> None:
+    """Parse cgroup v1 quota boundaries without consulting the host cgroup."""
+    assert (
+        run_tests_parallel._parse_cgroup_v1_cpu_quota(quota_raw, period_raw)
+        == expected_cpus
+    )
+
+
+def test_read_cgroup_cpu_count_prefers_v2_hierarchy(tmp_path: Path) -> None:
+    """A present v2 cpu.max defines the hierarchy even when it is unlimited."""
+    (tmp_path / "cpu.max").write_text("max 100000\n")
+    v1_dir = tmp_path / "cpu"
+    v1_dir.mkdir()
+    (v1_dir / "cpu.cfs_quota_us").write_text("200000\n")
+    (v1_dir / "cpu.cfs_period_us").write_text("100000\n")
+
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path,
+            proc_cgroup_path=tmp_path / "missing-cgroup",
+            mountinfo_path=tmp_path / "missing-mountinfo",
+        )
+        is None
+    )
+
+
+def test_read_cgroup_cpu_count_falls_back_to_v1(tmp_path: Path) -> None:
+    """Read the v1 cpu controller when the v2 interface does not exist."""
+    v1_dir = tmp_path / "cpu"
+    v1_dir.mkdir()
+    (v1_dir / "cpu.cfs_quota_us").write_text("200000\n")
+    (v1_dir / "cpu.cfs_period_us").write_text("100000\n")
+
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path,
+            proc_cgroup_path=tmp_path / "missing-cgroup",
+            mountinfo_path=tmp_path / "missing-mountinfo",
+        )
+        == 2
+    )
+
+
+def _write_v2_quota(node: Path, raw: str) -> None:
+    node.mkdir(parents=True, exist_ok=True)
+    (node / "cpu.max").write_text(raw)
+
+
+def _write_v1_quota(node: Path, quota: str, period: str = "100000") -> None:
+    node.mkdir(parents=True, exist_ok=True)
+    (node / "cpu.cfs_quota_us").write_text(quota)
+    (node / "cpu.cfs_period_us").write_text(period)
+
+
+def _mountinfo_line(
+    mount_root: str,
+    mountpoint: Path,
+    fs_type: str,
+    super_options: str,
+) -> str:
+    return (
+        f"31 24 0:27 {mount_root} {mountpoint} rw,nosuid,nodev,noexec "
+        f"- {fs_type} cgroup {super_options}\n"
+    )
+
+
+def test_read_nested_cgroup_v2_uses_tightest_leaf_or_ancestor_quota(
+    tmp_path: Path,
+) -> None:
+    """Unlimited v2 root cannot hide finite intermediate and leaf quotas."""
+    mountpoint = tmp_path / "unified"
+    _write_v2_quota(mountpoint, "max 100000")
+    _write_v2_quota(mountpoint / "tenant", "max 100000")
+    _write_v2_quota(mountpoint / "tenant/team", "400000 100000")
+    _write_v2_quota(mountpoint / "tenant/team/job", "200000 100000")
+    proc_cgroup = tmp_path / "proc-cgroup"
+    proc_cgroup.write_text("0::/tenant/team/job\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(_mountinfo_line("/", mountpoint, "cgroup2", "rw"))
+
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path / "fallback",
+            proc_cgroup_path=proc_cgroup,
+            mountinfo_path=mountinfo,
+        )
+        == 2
+    )
+
+
+def test_read_nested_cgroup_v2_translates_non_root_mount(
+    tmp_path: Path,
+) -> None:
+    """Strip the mount root from v2 membership before joining the mountpoint."""
+    mountpoint = tmp_path / "delegated-unified"
+    _write_v2_quota(mountpoint, "max 100000")
+    _write_v2_quota(mountpoint / "team", "300000 100000")
+    _write_v2_quota(mountpoint / "team/job", "max 100000")
+    proc_cgroup = tmp_path / "proc-cgroup"
+    proc_cgroup.write_text("0::/docker/parent/team/job\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        _mountinfo_line(
+            "/docker/parent",
+            mountpoint,
+            "cgroup2",
+            "rw",
+        )
+    )
+
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path / "fallback",
+            proc_cgroup_path=proc_cgroup,
+            mountinfo_path=mountinfo,
+        )
+        == 3
+    )
+
+
+def test_read_nested_cgroup_v1_uses_tightest_leaf_or_ancestor_quota(
+    tmp_path: Path,
+) -> None:
+    """Walk the process's v1 CPU hierarchy rather than controller root only."""
+    mountpoint = tmp_path / "cpu-controller"
+    _write_v1_quota(mountpoint, "-1")
+    _write_v1_quota(mountpoint / "docker", "-1")
+    _write_v1_quota(mountpoint / "docker/abc", "400000")
+    _write_v1_quota(mountpoint / "docker/abc/job", "200000")
+    proc_cgroup = tmp_path / "proc-cgroup"
+    proc_cgroup.write_text("2:cpu,cpuacct:/docker/abc/job\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        _mountinfo_line("/", mountpoint, "cgroup", "rw,cpu,cpuacct")
+    )
+
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path / "fallback",
+            proc_cgroup_path=proc_cgroup,
+            mountinfo_path=mountinfo,
+        )
+        == 2
+    )
+
+
+def test_read_nested_cgroup_v1_translates_non_root_mount(
+    tmp_path: Path,
+) -> None:
+    """Map v1 membership relative to a delegated controller mount root."""
+    mountpoint = tmp_path / "delegated-cpu"
+    _write_v1_quota(mountpoint, "300000")
+    _write_v1_quota(mountpoint / "job", "-1")
+    proc_cgroup = tmp_path / "proc-cgroup"
+    proc_cgroup.write_text("5:cpu,cpuacct:/docker/parent/job\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        _mountinfo_line(
+            "/docker/parent",
+            mountpoint,
+            "cgroup",
+            "rw,cpu,cpuacct",
+        )
+    )
+
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path / "fallback",
+            proc_cgroup_path=proc_cgroup,
+            mountinfo_path=mountinfo,
+        )
+        == 3
+    )
+
+
+def test_read_hybrid_cgroup_layout_applies_cpu_controller_quota(
+    tmp_path: Path,
+) -> None:
+    """A hybrid v2 membership must not hide the finite v1 CPU controller."""
+    unified = tmp_path / "unified"
+    cpu = tmp_path / "cpu-controller"
+    _write_v2_quota(unified, "max 100000")
+    _write_v2_quota(unified / "scope", "max 100000")
+    _write_v1_quota(cpu, "-1")
+    _write_v1_quota(cpu / "legacy/scope", "200000")
+    proc_cgroup = tmp_path / "proc-cgroup"
+    proc_cgroup.write_text("0::/scope\n4:cpu,cpuacct:/legacy/scope\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        _mountinfo_line("/", unified, "cgroup2", "rw")
+        + _mountinfo_line("/", cpu, "cgroup", "rw,cpu,cpuacct")
+    )
+
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path / "fallback",
+            proc_cgroup_path=proc_cgroup,
+            mountinfo_path=mountinfo,
+        )
+        == 2
+    )
+
+
+def test_read_nested_cgroup_skips_missing_and_malformed_nodes(
+    tmp_path: Path,
+) -> None:
+    """Continue to a finite ancestor past a missing leaf and malformed node."""
+    mountpoint = tmp_path / "unified"
+    _write_v2_quota(mountpoint, "500000 100000")
+    _write_v2_quota(mountpoint / "team", "not-a-quota")
+    (mountpoint / "team/job").mkdir(parents=True)
+    proc_cgroup = tmp_path / "proc-cgroup"
+    proc_cgroup.write_text("0::/team/job\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(_mountinfo_line("/", mountpoint, "cgroup2", "rw"))
+
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path / "fallback",
+            proc_cgroup_path=proc_cgroup,
+            mountinfo_path=mountinfo,
+        )
+        == 5
+    )
+
+
+@pytest.mark.parametrize(
+    ("machine_cpus", "affinity_cpus", "quota_cpus", "expected_cpus"),
+    [
+        pytest.param(64, 2, None, 2, id="affinity-restricts-large-host"),
+        pytest.param(64, None, 2, 2, id="quota-restricts-large-host"),
+        pytest.param(64, 8, 2, 2, id="tightest-process-limit-wins"),
+        pytest.param(8, 16, None, 16, id="affinity-precedes-machine-fallback"),
+        pytest.param(8, None, None, 8, id="machine-count-fallback"),
+        pytest.param(None, None, 2, 2, id="quota-without-machine-count"),
+        pytest.param(None, None, None, None, id="unknown-remains-unknown"),
+    ],
+)
+def test_process_usable_cpu_count(
+    machine_cpus: int | None,
+    affinity_cpus: int | None,
+    quota_cpus: int | None,
+    expected_cpus: int | None,
+) -> None:
+    """Use affinity or machine fallback, capped by any cgroup quota."""
+    assert (
+        run_tests_parallel._process_usable_cpu_count(
+            machine_cpus,
+            affinity_cpus,
+            quota_cpus,
+        )
+        == expected_cpus
+    )
+
+
+def test_detect_process_usable_cpu_count_combines_all_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime detection feeds machine, affinity, and quota into one budget."""
+    monkeypatch.setattr(run_tests_parallel.os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(run_tests_parallel, "_affinity_cpu_count", lambda: 8)
+    monkeypatch.setattr(run_tests_parallel, "_read_cgroup_cpu_count", lambda: 2)
+
+    assert run_tests_parallel._detect_process_usable_cpu_count() == 2
+
+
+def test_runner_default_honors_linux_process_affinity(tmp_path: Path) -> None:
+    """A real affinity-restricted runner process selects from its usable CPUs."""
+    if sys.platform != "linux" or not all(
+        hasattr(os, name) for name in ("sched_getaffinity", "sched_setaffinity")
+    ):
+        pytest.skip("Linux sched_getaffinity/sched_setaffinity are unavailable")
+
+    allowed_cpus = sorted(os.sched_getaffinity(0))
+    assert allowed_cpus, "the current process has no schedulable CPUs"
+    restricted_cpu = allowed_cpus[0]
+    probe_dir = _make_probe_dir(tmp_path)
+    repo_root = Path(__file__).resolve().parent.parent
+    wrapper = repo_root / "scripts" / "run_tests.sh"
+    launcher = textwrap.dedent(
+        f"""
+        import os
+
+        os.sched_setaffinity(0, {{{restricted_cpu}}})
+        os.execv(
+            {str(wrapper)!r},
+            [
+                {str(wrapper)!r},
+                {str(probe_dir)!r},
+                "--file-retries",
+                "0",
+                "-q",
+            ],
+        )
+        """
+    )
+    env = os.environ.copy()
+    env.pop("HERMES_TEST_WORKERS", None)
+
+    proc = subprocess.run(
+        [sys.executable, "-c", launcher],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=30,
+    )
+
+    announced = re.search(r"running with -j (?P<jobs>\d+)(?:\s|$)", proc.stdout)
+    assert proc.returncode == 0, proc.stdout
+    assert announced is not None, proc.stdout
+    assert int(announced.group("jobs")) == 1, proc.stdout
 
 
 def test_bare_q_flag_passes_through(tmp_path: Path) -> None:

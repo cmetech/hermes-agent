@@ -51,6 +51,7 @@ let startHandler: (request: StructuredRequest) => Promise<unknown>
 
 function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
   return {
+    compatibility: { level: 'supported', runnable: true },
     description: 'Checks a release before deployment.',
     inputs: [],
     name: WORKFLOW_NAME,
@@ -62,6 +63,22 @@ function definition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefini
     version: '1.0.0',
     ...overrides
   }
+}
+
+function detailWithoutProjection(
+  projection: 'compatibility' | 'coordinator',
+  representation: 'absent' | 'null' | 'undefined',
+  overrides: Partial<WorkflowDetail> = {}
+): WorkflowDetail {
+  const payload = detail(overrides) as unknown as Record<string, unknown>
+
+  if (representation === 'absent') {
+    Reflect.deleteProperty(payload, projection)
+  } else {
+    payload[projection] = representation === 'null' ? null : undefined
+  }
+
+  return payload as unknown as WorkflowDetail
 }
 
 function detail(overrides: Partial<WorkflowDetail> = {}): WorkflowDetail {
@@ -263,6 +280,51 @@ describe('Review & Run workflow dialog', () => {
     expect($notifications.get()[0]?.message).toBe('Started')
   })
 
+  it('reviews the server-authored language profile beside digest-bound trust and risk', async () => {
+    catalogDefinition = definition({
+      language: { effective_profile: 'hermes-legacy', legacy: true }
+    })
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        language: {
+          declared_profile: 'archon-2026-07',
+          effective_profile: 'archon-2026-07',
+          legacy: false,
+          normalized_definition_digest: 'd'.repeat(64),
+          normalizer_version: 1
+        },
+        risk_summary: { package_digest: 'p'.repeat(64), risk_level: 'low' }
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(within(dialog).getByText('Archon 2026-07')).toBeTruthy()
+    expect(within(dialog).getByText('Normalizer 1')).toBeTruthy()
+    const digest = within(dialog).getByText('dddddddddddd…')
+    expect(digest.getAttribute('title')).toBe('d'.repeat(64))
+    expect(within(dialog).queryByText('Legacy semantics')).toBeNull()
+    expect(within(dialog).getByText('p'.repeat(64))).toBeTruthy()
+  })
+
+  it('reviews a future server-authored workflow language profile without Archon relabeling', async () => {
+    catalogDefinition = definition({
+      language: { effective_profile: 'future-workflow-language' as never, legacy: false }
+    })
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        language: { effective_profile: 'future-workflow-language' as never, legacy: false }
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(within(dialog).getByText('future-workflow-language')).toBeTruthy()
+    expect(within(dialog).queryByText('Archon 2026-07')).toBeNull()
+  })
+
   it('derives schedule eligibility from run support and normalizes the local picker instant', async () => {
     catalogDefinition = definition({
       run_support: { reason: 'schedule_required', supported: false },
@@ -316,7 +378,9 @@ describe('Review & Run workflow dialog', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Run later' }))
 
     expect((await within(dialog).findByRole('alert')).textContent).toContain(message)
-    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(0)
+    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
+      0
+    )
   })
 
   it('uses typed controls, serializes flat values as strings, and binds preflight plus start to the opening profile', async () => {
@@ -831,6 +895,58 @@ describe('Review & Run workflow dialog', () => {
     expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
+  it.each(['absent', 'undefined', 'null'] as const)(
+    'fails closed without throwing or posting when review compatibility is %s',
+    async representation => {
+      preflightHandler = async () => ({
+        ok: true,
+        value: detailWithoutProjection('compatibility', representation)
+      })
+      renderView()
+
+      const dialog = await openReviewDialog()
+      expect(
+        within(dialog).getByText('This workflow is not compatible with the current Hermes runtime and cannot start.')
+      ).toBeTruthy()
+      expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+      expect(
+        apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')
+      ).toHaveLength(0)
+    }
+  )
+
+  it.each(['absent', 'undefined', 'null'] as const)(
+    'fails closed without throwing or posting when review coordinator is %s',
+    async representation => {
+      preflightHandler = async () => ({
+        ok: true,
+        value: detailWithoutProjection('coordinator', representation)
+      })
+      renderView()
+
+      const dialog = await openReviewDialog()
+      expect(within(dialog).getByText("The background coordinator isn't running — try again shortly.")).toBeTruthy()
+      expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+      expect(
+        apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')
+      ).toHaveLength(0)
+    }
+  )
+
+  it('keeps compatibility failure ahead of missing trust in review skew', async () => {
+    preflightHandler = async () => ({
+      ok: true,
+      value: detailWithoutProjection('compatibility', 'absent', { trust_state: undefined as never })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(
+      within(dialog).getByText('This workflow is not compatible with the current Hermes runtime and cannot start.')
+    ).toBeTruthy()
+    expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
   it('trusts verified bundles but blocks a showcase when authoritative detail requires the CLI', async () => {
     catalogDefinition = definition({ source: 'showcase', trust_state: 'verified_bundled' })
     preflightHandler = async () => ({
@@ -866,6 +982,43 @@ describe('Review & Run workflow dialog', () => {
     )
   })
 
+  it('keeps Run disabled for an unknown backend run-support reason', async () => {
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        compatibility: { findings: [], level: 'unsupported', runnable: false },
+        run_support: { reason: 'future_backend_rule' as never, supported: false },
+        trust_state: 'trusted'
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(
+      within(dialog).getByText('Run is unavailable until the Hermes backend supports this workflow catalog version.')
+    ).toBeTruthy()
+    expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
+      0
+    )
+  })
+
+  it('shows generic support copy for an incoherent supported unknown reason', async () => {
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        run_support: { reason: 'future_backend_rule' as never, supported: true }
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect(
+      within(dialog).getByText('Run is unavailable until the Hermes backend supports this workflow catalog version.')
+    ).toBeTruthy()
+    expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
   it('shows blocking compatibility findings and refuses to POST a non-runnable workflow', async () => {
     preflightHandler = async () => ({
       ok: true,
@@ -896,6 +1049,33 @@ describe('Review & Run workflow dialog', () => {
     expect(apiStructured.mock.calls.filter(([request]) => request.path === '/api/plugins/workflow/runs')).toHaveLength(
       0
     )
+  })
+
+  it('does not derive Run eligibility from definition fields or finding codes', async () => {
+    preflightHandler = async () => ({
+      ok: true,
+      value: detail({
+        compatibility: {
+          findings: [
+            {
+              blocking: true,
+              code: 'server-only-finding',
+              level: 'unsupported',
+              message: 'Server-authored advisory',
+              path: 'nodes[0].timeout'
+            }
+          ],
+          level: 'unsupported',
+          runnable: true
+        },
+        definition: { name: WORKFLOW_NAME, nodes: [{ id: 'start', timeout: 5 }] }
+      })
+    })
+    renderView()
+
+    const dialog = await openReviewDialog()
+    expect((within(dialog).getByRole('button', { name: 'Start workflow' }) as HTMLButtonElement).disabled).toBe(false)
+    expect(within(dialog).queryByText('Server-authored advisory')).toBeNull()
   })
 
   it('shows a global validation message when the rejected field is not rendered', async () => {

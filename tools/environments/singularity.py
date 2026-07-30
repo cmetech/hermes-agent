@@ -231,14 +231,22 @@ class SingularityEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
-                  stdin_data: str | None = None) -> subprocess.Popen:
+                  stdin_data: str | None = None,
+                  clean: bool = False) -> subprocess.Popen:
         """Spawn a bash process inside the Singularity instance."""
         if not self._instance_started:
             raise RuntimeError("Singularity instance not started")
 
-        cmd = [self.executable, "exec",
-               f"instance://{self.instance_id}"]
-        if login:
+        cmd = [self.executable, "exec"]
+        cmd.append(f"instance://{self.instance_id}")
+        if clean:
+            cmd.extend(
+                [
+                    "env", "BASH_ENV=/dev/null", "ENV=/dev/null", "SHELLOPTS=",
+                    "bash", "--noprofile", "--norc", "+x", "-c", cmd_string,
+                ]
+            )
+        elif login:
             cmd.extend(["bash", "-l", "-c", cmd_string])
         else:
             cmd.extend(["bash", "-c", cmd_string])

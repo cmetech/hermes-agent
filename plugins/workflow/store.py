@@ -17,10 +17,10 @@ import threading
 import time
 import uuid
 from contextlib import ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Iterable, Mapping
+from typing import AbstractSet, Callable, Iterable, Mapping
 
 import yaml
 
@@ -31,6 +31,7 @@ from plugins.workflow.admission import (
     RunAdmissionResult,
 )
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
+from plugins.workflow.language import make_language_snapshot
 from plugins.workflow.input_contract import (
     WorkflowInputContractError,
     workflow_input_declarations,
@@ -92,17 +93,25 @@ class ForegroundExecutionConflict(RuntimeError):
 class _ScheduledPromotionAuthorization:
     """Store-instance-owned, one-use fire-time verifier."""
 
-    __slots__ = ("_consumed", "_run_id", "_store_identity", "_verify")
+    __slots__ = (
+        "_consumed",
+        "_resource_read_budget",
+        "_run_id",
+        "_store_identity",
+        "_verify",
+    )
 
     def __init__(
         self,
         store_identity: object,
         run_id: str,
         verify: Callable[[Mapping[str, object]], None],
+        resource_read_budget: WorkflowResourceReadBudget | None,
     ) -> None:
         self._store_identity = store_identity
         self._run_id = run_id
         self._verify = verify
+        self._resource_read_budget = resource_read_budget
         self._consumed = False
 
 
@@ -2843,6 +2852,7 @@ class RunStore:
             package_digest = trusted_package_digest or compute_package_digest(
                 package, read_budget=resource_read_budget
             )
+            language = make_language_snapshot(package, package_digest.sha256).to_dict()
 
             def read_package_file(path: Path) -> bytes:
                 if resource_read_budget is None:
@@ -3036,16 +3046,35 @@ class RunStore:
                 input_manifest, sort_keys=True, separators=(",", ":")
             ).encode()
             (staging / "inputs.json").write_bytes(manifest_data)
+            sealed_paths = sorted(
+                {
+                    path.relative_to(staging).as_posix()
+                    for path in staging.rglob("*")
+                    if path.is_file()
+                    and path.relative_to(staging).as_posix()
+                    != ".snapshot-owner.json"
+                }
+                | {"resources.json"}
+            )
             snapshot_manifest = json.dumps(
                 {
                     "inputs_sha256": _sha256(manifest_data),
                     "node_skills": node_skill_digests,
                     "node_agent_skills": node_agent_skill_digests,
+                    "language": language,
+                    "sealed_paths": sealed_paths,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode()
             (staging / "resources.json").write_bytes(snapshot_manifest)
+            from plugins.workflow.scheduled_revalidation import (
+                sealed_snapshot_digest,
+            )
+
+            snapshot_digest = sealed_snapshot_digest(
+                staging, relative_paths=sealed_paths
+            )
             nodes = tuple(
                 {
                     "id": node.id,
@@ -3076,6 +3105,8 @@ class RunStore:
                     str(node_id)
                     for node_id in package.sidecar.get("outward_action_nodes", ())
                 ),
+                language=language,
+                sealed_snapshot_digest=snapshot_digest,
             )
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
@@ -3278,6 +3309,8 @@ class RunStore:
             snapshot.nodes,
             dict(snapshot.input_digests),
             snapshot.outward_action_nodes,
+            dict(snapshot.language) if snapshot.language is not None else None,
+            snapshot.sealed_snapshot_digest,
         )
 
     @staticmethod
@@ -3394,6 +3427,38 @@ class RunStore:
         ).encode()
         return _sha256(material)
 
+    @staticmethod
+    def _pre_language_input_manifest_digest(
+        snapshot: PreparedRunSnapshot,
+    ) -> str | None:
+        """Reconstruct the pre-language resources digest for legacy retries.
+
+        ``input_manifest_digest`` historically covered the complete
+        ``resources.json`` object.  Language pinning and sealed-path metadata
+        extended that object without changing legacy workflow semantics.  A
+        retry of a pre-language idempotency key must therefore compare against
+        the exact old serialization, while all new admissions continue to use
+        the complete current digest.
+        """
+        try:
+            resources = json.loads(
+                (snapshot.staging_directory / "resources.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(resources, dict):
+            return None
+        legacy_keys = ("inputs_sha256", "node_skills", "node_agent_skills")
+        if any(key not in resources for key in legacy_keys):
+            return None
+        legacy_resources = {key: resources[key] for key in legacy_keys}
+        material = json.dumps(
+            legacy_resources, sort_keys=True, separators=(",", ":")
+        ).encode()
+        return _sha256(material)
+
     def close_admission(self) -> None:
         """Atomically prevent this coordinator from publishing another run."""
         with self._admission_gate:
@@ -3486,9 +3551,18 @@ class RunStore:
             ).fetchone()
             if existing:
                 connection.commit()
+                legacy_inputs = self._pre_language_input_manifest_digest(
+                    immutable_snapshot
+                )
                 shutil.rmtree(immutable_snapshot.staging_directory, ignore_errors=True)
                 if existing["start_digest"] == start_digest:
                     return RunAdmissionResult(existing["run_id"], "existing")
+                if legacy_inputs is not None:
+                    legacy_request = replace(
+                        request, input_manifest_digest=legacy_inputs
+                    )
+                    if existing["start_digest"] == self._start_digest(legacy_request):
+                        return RunAdmissionResult(existing["run_id"], "existing")
                 return RunAdmissionResult(None, "rejected", "idempotency_conflict")
             if request.execution_mode not in {"foreground", "background"}:
                 raise ValueError("execution_mode must be foreground or background")
@@ -3745,6 +3819,7 @@ class RunStore:
             "run_id": run_id,
             "workflow": request.workflow_name,
             "workflow_version": snapshot.workflow_version,
+            "snapshot_format_version": 1,
             "definition_digest": request.definition_digest,
             "policy_digest": request.policy_digest,
             "input_manifest_digest": request.input_manifest_digest,
@@ -3764,6 +3839,10 @@ class RunStore:
             "foreground_heartbeat_monotonic": foreground_heartbeat_monotonic,
             "foreground_lease_seconds": foreground_lease_seconds,
             "outward_action_nodes": list(snapshot.outward_action_nodes),
+            "language": (
+                dict(snapshot.language) if snapshot.language is not None else None
+            ),
+            "sealed_snapshot_digest": snapshot.sealed_snapshot_digest,
             "admission_disposition": disposition,
             "queue_position": queue_position,
             "queue_sequence": queue_sequence,
@@ -4352,6 +4431,8 @@ class RunStore:
         self,
         run_id: str,
         verify: Callable[[Mapping[str, object]], None],
+        *,
+        resource_read_budget: WorkflowResourceReadBudget | None = None,
     ) -> _ScheduledPromotionAuthorization:
         if not isinstance(run_id, str) or not run_id or not callable(verify):
             raise ValueError("scheduled authorization requires a run and verifier")
@@ -4359,7 +4440,19 @@ class RunStore:
             self._scheduled_authorization_identity,
             run_id,
             verify,
+            resource_read_budget,
         )
+
+    def _scheduled_promotion_read_budget(
+        self,
+        authorization: object,
+        run_id: str,
+    ) -> WorkflowResourceReadBudget | None:
+        verified = self._validate_scheduled_promotion_authorization(
+            authorization,
+            run_id,
+        )
+        return verified._resource_read_budget
 
     def _validate_scheduled_promotion_authorization(
         self,
@@ -8756,18 +8849,12 @@ class RunStore:
         self,
         run_id: str,
         *,
+        always_run_nodes: AbstractSet[str],
         expected_state_version: int | None = None,
         operator_scope: str | None = None,
     ) -> dict[str, object]:
         directory = self.run_directory(run_id, operator_scope=operator_scope)
-        from plugins.workflow.schema import load_workflow
-
-        package = load_workflow(directory / "definition.yaml")
-        always_run = {
-            node.id
-            for node in package.definition.nodes
-            if node.options.get("always_run")
-        }
+        always_run = frozenset(always_run_nodes)
         with (
             workflow_lock(self.admission_lock),
             workflow_lock(self._run_lock_path(run_id)),

@@ -438,12 +438,18 @@ def test_s6_manager_kind_and_supports_registration() -> None:
 
 def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     """Verifies the dirs + FIFO + modes the helper lays down."""
+    import os
     import stat
 
     from hermes_cli.service_manager import _seed_supervise_skeleton
 
     svc_dir = tmp_path / "gateway-foo"
     svc_dir.mkdir()
+    # The canonical runner's clean environment uses /tmp, which is owned
+    # by a group the test user does not belong to on macOS. Give this test
+    # service dir our group so its children can retain the required setgid
+    # bit, just as the container's hermes-owned service dirs do.
+    os.chown(svc_dir, -1, os.getgid())
 
     _seed_supervise_skeleton(svc_dir)
 
@@ -480,12 +486,14 @@ def test_seed_supervise_skeleton_handles_log_subservice(tmp_path) -> None:
     on the logger's root-owned supervise dir even after the parent
     slot's supervise/ was hermes-owned.
     """
+    import os
     import stat
 
     from hermes_cli.service_manager import _seed_supervise_skeleton
 
     svc_dir = tmp_path / "gateway-foo"
     svc_dir.mkdir()
+    os.chown(svc_dir, -1, os.getgid())
     (svc_dir / "log").mkdir()  # logger subdir present
 
     _seed_supervise_skeleton(svc_dir)
@@ -501,6 +509,40 @@ def test_seed_supervise_skeleton_handles_log_subservice(tmp_path) -> None:
     assert log_supervise.is_dir()
     assert log_supervise_event.is_dir()
     assert log_control.exists() and stat.S_ISFIFO(log_control.stat().st_mode)
+
+
+def test_seed_supervise_skeleton_reapplies_setgid_after_chown(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ownership changes must not leave event directories without setgid.
+
+    POSIX ownership changes may clear setgid. Model that privileged container
+    boundary explicitly so the test verifies the final mode rather than
+    depending on the host temp directory's group membership.
+    """
+    import os
+    import stat
+
+    from hermes_cli import service_manager as sm
+
+    svc_dir = tmp_path / "gateway-foo"
+    svc_dir.mkdir()
+    os.chown(svc_dir, -1, os.getgid())
+
+    chown_calls: list[tuple[str, int, int]] = []
+
+    def _chown_clearing_setgid(path, uid: int, gid: int) -> None:
+        chown_calls.append((str(path), uid, gid))
+        current_mode = stat.S_IMODE(os.stat(path).st_mode)
+        os.chmod(path, current_mode & ~stat.S_ISGID)
+
+    monkeypatch.setattr(os, "chown", _chown_clearing_setgid)
+
+    sm._seed_supervise_skeleton(svc_dir)
+
+    event = svc_dir / "event"
+    assert (str(event), sm._HERMES_UID, sm._HERMES_GID) in chown_calls
+    assert stat.S_IMODE(event.stat().st_mode) == 0o3730
 
 
 def test_seed_supervise_skeleton_skips_when_no_log_subservice(tmp_path) -> None:

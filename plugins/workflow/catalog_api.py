@@ -22,6 +22,7 @@ from plugins.workflow.input_contract import (
     WorkflowInputContractError,
     workflow_input_declarations,
 )
+from plugins.workflow.language import language_projection
 from plugins.workflow.models import WorkflowPackage, WorkflowValidationError
 from plugins.workflow.runner_binding import (
     ExecutionCapabilityContext,
@@ -38,6 +39,9 @@ from plugins.workflow.sanitize import (
     workflow_input_names_are_portable,
 )
 from plugins.workflow.trust import (
+    WORKFLOW_RESOURCE_MAX_FILE_BYTES,
+    WORKFLOW_RESOURCE_MAX_FILES,
+    WORKFLOW_RESOURCE_MAX_TOTAL_BYTES,
     WorkflowResourceCapacityError,
     WorkflowResourceReadBudget,
     WorkflowTrustError,
@@ -56,9 +60,9 @@ CATALOG_LIMIT = 500
 CATALOG_MAX_SCAN_ENTRIES = 4096
 CATALOG_MAX_DEFINITION_FILE_BYTES = 2 * 1024 * 1024
 CATALOG_MAX_DEFINITION_TOTAL_BYTES = 16 * 1024 * 1024
-CATALOG_MAX_RESOURCE_FILE_BYTES = 1024 * 1024
-CATALOG_MAX_RESOURCE_TOTAL_BYTES = 8 * 1024 * 1024
-CATALOG_MAX_RESOURCE_FILES = 512
+CATALOG_MAX_RESOURCE_FILE_BYTES = WORKFLOW_RESOURCE_MAX_FILE_BYTES
+CATALOG_MAX_RESOURCE_TOTAL_BYTES = WORKFLOW_RESOURCE_MAX_TOTAL_BYTES
+CATALOG_MAX_RESOURCE_FILES = WORKFLOW_RESOURCE_MAX_FILES
 CATALOG_MAX_RESOURCE_REQUEST_BYTES = 2 * CATALOG_MAX_RESOURCE_TOTAL_BYTES
 CATALOG_MAX_TRUST_STORE_BYTES = 4 * 1024 * 1024
 _PROFILE_STATE_DIRECTORIES = frozenset({"runs", ".staging", ".quarantine", ".locks"})
@@ -111,6 +115,7 @@ class CatalogEntry(TypedDict):
     inputs: list[CatalogInput]
     supported_inputs: SupportedInputs
     run_support: CatalogRunSupport
+    language: dict[str, object]
     compatibility: NotRequired[dict[str, object]]
 
 
@@ -503,6 +508,8 @@ def _compatibility_projection(compatibility) -> dict[str, object]:
     return {
         "level": compatibility.level.value,
         "runnable": compatibility.runnable,
+        "findings_truncated": compatibility.findings_truncated,
+        "finding_count": compatibility.finding_count,
         "findings": [
             {
                 "path": finding.path,
@@ -514,6 +521,28 @@ def _compatibility_projection(compatibility) -> dict[str, object]:
             for finding in compatibility.findings
         ],
     }
+
+
+def _compatibility_summary(compatibility) -> dict[str, object]:
+    return {
+        "level": compatibility.level.value,
+        "runnable": compatibility.runnable,
+    }
+
+
+def _catalog_language_projection(
+    package: WorkflowPackage, *, detail: bool = False
+) -> dict[str, object]:
+    language = package.language
+    status: dict[str, object] = {
+        "effective_profile": language.effective_profile.value,
+        "legacy": language.effective_profile.value == "hermes-legacy",
+    }
+    if detail:
+        expanded = language_projection(language)
+        expanded["legacy"] = status["legacy"]
+        return expanded
+    return status
 
 
 def qualify_workflow_catalog_package(
@@ -635,9 +664,12 @@ def _catalog_entry(
             showcase_scenario=showcase_scenario,
             input_support=supported_inputs,
         ),
+        "language": _catalog_language_projection(package),
     }
     if verified_showcase is not None:
         entry["compatibility"] = _compatibility_projection(compatibility)
+    else:
+        entry["compatibility"] = _compatibility_summary(compatibility)
     return entry
 
 
@@ -968,6 +1000,7 @@ def build_workflow_detail(
             showcase_scenario=showcase_scenario,
             input_support=supported_inputs,
         ),
+        "language": _catalog_language_projection(package, detail=True),
         "risk_summary": risk.to_dict(),
         "compatibility": _compatibility_projection(compatibility),
         "coordinator": _coordinator_projection(home),
