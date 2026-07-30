@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from dataclasses import dataclass
 import logging
 import os
 import re
+from types import MappingProxyType
 from urllib.parse import urlparse
 from typing import Any, Callable, Dict, Optional
 
@@ -393,6 +395,24 @@ class StructuredOutputCapabilityDecision:
     rationale: str
 
 
+@dataclass(frozen=True, slots=True)
+class ConfiguredExecutionRoute:
+    """Credential-free immutable provider record used by admission."""
+
+    requested_provider: str
+    effective_provider: str
+    model_config: Mapping[str, object]
+    provider_config: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "model_config", MappingProxyType(dict(self.model_config))
+        )
+        object.__setattr__(
+            self, "provider_config", MappingProxyType(dict(self.provider_config))
+        )
+
+
 _STRUCTURED_OUTPUT_ADAPTER_VERSION = 1
 _STRUCTURED_OUTPUT_RATIONALE_MAX_CHARS = 256
 _STRUCTURED_OUTPUT_TRUST_CLASSES = frozenset(
@@ -565,6 +585,115 @@ def classify_execution_runtime(
         provider=provider,
         model=_execution_model(model_config, provider_config, target_model),
         base_url=_execution_base_url(model_config, provider_config),
+    )
+
+
+def snapshot_configured_execution_routes(
+    config: Mapping[str, object] | object,
+) -> Mapping[str, ConfiguredExecutionRoute]:
+    """Freeze credential-free route records using runtime resolver precedence."""
+    if not isinstance(config, Mapping):
+        return MappingProxyType({})
+
+    routes: dict[str, ConfiguredExecutionRoute] = {}
+    for entry in get_compatible_custom_providers(copy.deepcopy(dict(config))):
+        if not isinstance(entry, Mapping):
+            continue
+        name = str(entry.get("name") or "").strip()
+        provider_key = str(entry.get("provider_key") or "").strip()
+        base_url = str(entry.get("base_url") or "").strip().rstrip("/")
+        if not base_url or not (name or provider_key):
+            continue
+        model = str(entry.get("model") or "").strip()
+        api_mode = str(entry.get("api_mode") or "").strip().lower()
+        route = ConfiguredExecutionRoute(
+            requested_provider=provider_key or name,
+            effective_provider="custom",
+            model_config={"provider": "custom", "default": model},
+            provider_config={
+                "base_url": base_url,
+                **({"api_mode": api_mode} if api_mode else {}),
+                **({"model": model} if model else {}),
+            },
+        )
+        aliases: set[str] = set()
+        for candidate in (name, provider_key):
+            normalized = _normalize_custom_provider_name(candidate)
+            if not normalized:
+                continue
+            if normalized.startswith("custom:"):
+                aliases.add(normalized)
+                continue
+            aliases.add(f"custom:{normalized}")
+            try:
+                canonical = auth_mod.resolve_provider(normalized)
+            except AuthError:
+                canonical = ""
+            # Named custom records cannot shadow a canonical built-in. This
+            # mirrors _get_named_custom_provider(); an explicit custom:<name>
+            # request remains routable.
+            if normalized == "custom" or canonical != normalized:
+                aliases.add(normalized)
+        for alias in aliases:
+            routes.setdefault(alias, route)
+
+    model_config = config.get("model")
+    if isinstance(model_config, Mapping):
+        requested = str(model_config.get("provider") or "").strip().lower()
+        if requested and requested not in routes:
+            try:
+                effective_provider = auth_mod.resolve_provider(requested)
+            except AuthError:
+                effective_provider = ""
+            safe_keys = (
+                "provider", "default", "model", "default_model", "base_url",
+                "api", "url", "api_mode", "transport", "openai_runtime",
+            )
+            safe_model_config = {
+                key: model_config[key]
+                for key in safe_keys
+                if key in model_config
+            }
+            if effective_provider == "anthropic":
+                configured_base_url = _execution_base_url(
+                    safe_model_config, safe_model_config
+                )
+                if configured_base_url and not _anthropic_base_url_override_ok(
+                    configured_base_url
+                ):
+                    for key in ("base_url", "api", "url"):
+                        safe_model_config.pop(key, None)
+            route_keys = (
+                "base_url", "api", "url", "api_mode", "transport",
+                "openai_runtime",
+            )
+            has_route_evidence = any(
+                isinstance(safe_model_config.get(key), str)
+                and bool(str(safe_model_config.get(key)).strip())
+                for key in route_keys
+            )
+            if effective_provider and has_route_evidence:
+                routes[requested] = ConfiguredExecutionRoute(
+                    requested_provider=requested,
+                    effective_provider=effective_provider,
+                    model_config=safe_model_config,
+                    provider_config=safe_model_config,
+                )
+
+    return MappingProxyType(routes)
+
+
+def classify_configured_execution_route(
+    route: ConfiguredExecutionRoute,
+    *,
+    target_model: str | None = None,
+) -> ExecutionRuntimeCapabilities:
+    """Classify one frozen configured record without credentials or live config."""
+    return classify_execution_runtime(
+        provider=route.effective_provider,
+        model_config=route.model_config,
+        provider_config=route.provider_config,
+        target_model=target_model,
     )
 
 

@@ -227,6 +227,25 @@ def _structured_package(home: Path, workflow_writer, *, name: str):
     return load_workflow(path)
 
 
+def _structured_route_package(
+    home: Path,
+    workflow_writer,
+    *,
+    name: str,
+    nodes: list[dict[str, object]],
+):
+    path = workflow_writer(
+        home / "workflows",
+        name=name,
+        filename=f"{name}.yaml",
+        nodes=nodes,
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    return load_workflow(path)
+
+
 def _runtime_binding(runtime, *, runtime_provider=None):
     return WorkflowRunnerBinding(
         real_runner=object(),
@@ -759,6 +778,240 @@ def test_production_binding_refreshes_runtime_capabilities_per_context(
             hermes_managed_tool_loop=True,
         )
     )
+
+
+def test_anthropic_override_uses_frozen_configured_proxy_route(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_source = {
+        "current": {
+            "model": {
+                "provider": "anthropic",
+                "default": "claude-sonnet-4-6",
+                "base_url": "https://proxy.example.test/anthropic",
+                "api_mode": "anthropic_messages",
+            }
+        }
+    }
+    monkeypatch.setattr(
+        runner_binding_module,
+        "read_raw_config",
+        lambda: config_source["current"],
+    )
+    package = _structured_route_package(
+        tmp_path,
+        workflow_writer,
+        name="anthropic-proxy-route",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Return JSON",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "output_format": {"type": "object"},
+            }
+        ],
+    )
+    binding = runner_binding_module.production_workflow_runner_binding()
+    context = binding.execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+
+    decision = context.structured_output_decisions(package)["producer"]
+    identity = context.identity_digest_for(package)
+
+    assert decision.strategy is StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+    assert decision.effective_provider == "anthropic"
+    assert decision.api_mode == "anthropic_messages"
+
+    config_source["current"] = {
+        "model": {
+            "provider": "anthropic",
+            "default": "claude-sonnet-4-6",
+        }
+    }
+    assert context.structured_output_decisions(package)["producer"] == decision
+    assert context.identity_digest_for(package) == identity
+
+
+def test_configured_custom_override_uses_actual_managed_route(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner_binding_module,
+        "read_raw_config",
+        lambda: {
+            "model": {"provider": "openrouter", "default": "openai/gpt-5.4"},
+            "providers": {
+                "community": {
+                    "api": "https://community.example.test/v1",
+                    "transport": "chat_completions",
+                    "default_model": "community/model-v1",
+                }
+            },
+        },
+    )
+    package = _structured_route_package(
+        tmp_path,
+        workflow_writer,
+        name="configured-community-route",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Return JSON",
+                "provider": "community",
+                "model": "community/model-v1",
+                "output_format": {"type": "object"},
+            }
+        ],
+    )
+    context = runner_binding_module.production_workflow_runner_binding().execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+
+    decision = context.structured_output_decisions(package)["producer"]
+    compatibility, _risk = runner_binding_module.assess_package_execution(
+        package, context
+    )
+    metadata = json.loads(
+        next(iter(context.structured_output_run_metadata(package).values()))
+    )
+
+    assert decision.strategy is StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+    assert decision.effective_provider == "custom"
+    assert decision.api_mode == "chat_completions"
+    assert decision.declaration_source == "managed_loop_default"
+    assert compatibility.runnable is True
+    assert metadata["strategy"] == "prompt_json_schema"
+    assert metadata["effective_provider"] == "custom"
+    assert metadata["api_mode"] == "chat_completions"
+
+
+def test_official_direct_anthropic_override_remains_native(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner_binding_module,
+        "read_raw_config",
+        lambda: {
+            "model": {
+                "provider": "anthropic",
+                "default": "claude-sonnet-4-6",
+                "base_url": "https://openrouter.ai/api/v1",
+            },
+            "providers": {
+                "anthropic": {
+                    "api": "https://proxy-that-cannot-shadow.example.test/v1",
+                    "transport": "anthropic_messages",
+                }
+            },
+        },
+    )
+    package = _structured_route_package(
+        tmp_path,
+        workflow_writer,
+        name="official-anthropic-route",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Return JSON",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "output_format": {"type": "object"},
+            }
+        ],
+    )
+    context = runner_binding_module.production_workflow_runner_binding().execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+
+    decision = context.structured_output_decisions(package)["producer"]
+
+    assert decision.strategy is StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+    assert decision.effective_provider == "anthropic"
+    assert decision.api_mode == "anthropic_messages"
+
+
+def test_two_configured_routes_seal_distinct_decisions_and_route_identity(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_source = {
+        "current": {
+            "model": {"provider": "openrouter", "default": "openai/gpt-5.4"},
+            "providers": {
+                "community": {
+                    "api": "https://community-one.example.test/v1",
+                    "transport": "chat_completions",
+                    "default_model": "community/model-v1",
+                }
+            },
+        }
+    }
+    monkeypatch.setattr(
+        runner_binding_module,
+        "read_raw_config",
+        lambda: config_source["current"],
+    )
+    package = _structured_route_package(
+        tmp_path,
+        workflow_writer,
+        name="two-configured-routes",
+        nodes=[
+            {
+                "id": "direct",
+                "prompt": "Return direct JSON",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "output_format": {"type": "object"},
+            },
+            {
+                "id": "community",
+                "prompt": "Return community JSON",
+                "provider": "community",
+                "model": "community/model-v1",
+                "output_format": {"type": "object"},
+            },
+        ],
+    )
+    binding = runner_binding_module.production_workflow_runner_binding()
+    first_context = binding.execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+    first_decisions = first_context.structured_output_decisions(package)
+    first_identity = first_context.identity_digest_for(package)
+
+    assert first_decisions["direct"].strategy is (
+        StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+    )
+    assert first_decisions["community"].strategy is (
+        StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+    )
+    assert first_decisions["direct"].effective_provider == "anthropic"
+    assert first_decisions["community"].effective_provider == "custom"
+
+    config_source["current"]["providers"]["community"]["api"] = (
+        "https://community-two.example.test/v1"
+    )
+    second_context = binding.execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+
+    assert first_context.identity_digest_for(package) == first_identity
+    assert second_context.structured_output_decisions(package) == first_decisions
+    assert second_context.identity_digest_for(package) != first_identity
 
 
 def _binding(*, runtime_managed: bool, runner_capable: bool = True):
