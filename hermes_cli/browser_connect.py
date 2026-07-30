@@ -75,6 +75,75 @@ _LINUX_BIN_NAMES = tuple(name for names, _ in _LINUX_BROWSER_GROUPS for name in 
 _LINUX_INSTALL_PATHS = tuple(path for _, paths in _LINUX_BROWSER_GROUPS for path in paths)
 
 
+def enrolled_port_refusal(port: int, host: str | None = None) -> str | None:
+    """Return a refusal message when ``port`` on ``host`` is an enrolled browser.
+
+    ``/browser connect`` sets the PROCESS-GLOBAL ``BROWSER_CDP_URL``. Once it is
+    set, ``_navigation_session_key`` returns the bare task key for every URL and
+    ``_session_cdp_url`` falls through to the override -- so every navigation,
+    including attacker-controlled public pages, is driven by whatever browser is
+    on the other end. Pointing it at an enrolled profile's port hands untrusted
+    pages the user's live SSO cookies and machine client certificate: exactly the
+    process-global leak the per-navigation routing was built to remove.
+
+    The reserved set is ``browser_profiles.enrolled_cdp_ports()`` -- every
+    configured enrolled profile's ``cdp_port`` plus the reserved default -- so a
+    user who hand-sets the enrolled profile onto ``/browser connect``'s own
+    default port is protected too.
+
+    ``host`` scopes the refusal to endpoints that can actually BE the local
+    enrolled listener. A remote service such as
+    ``wss://cdp.vendor.example:9333/devtools/browser/...`` cannot collide with a
+    browser bound on loopback, so refusing it was pure false-positive breakage
+    (review finding MED-006). ``None`` means "the caller is talking about a
+    local bind" (the free-port search) and stays refused.
+
+    Returns ``None`` when the endpoint is free to connect to. Fails OPEN
+    (returns ``None``) if the profile registry cannot be read: a broken config
+    must not make ``/browser connect`` unusable.
+    """
+    try:
+        from tools.browser_profiles import enrolled_cdp_ports, is_local_host
+
+        owners = enrolled_cdp_ports()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("enrolled port check skipped: %s", exc)
+        return None
+    if port not in owners:
+        return None
+    try:
+        if not is_local_host(host):
+            return None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("enrolled host check failed (treating as local): %s", exc)
+    owner = owners[port]
+    if owner:
+        who = f"the enrolled browser profile {owner!r}"
+        remedy = (
+            "     Use a different port (e.g. /browser connect "
+            "http://127.0.0.1:9222), or change "
+            f"browser.profiles.{owner}.cdp_port."
+        )
+    else:
+        # No enrolled profile exists yet; the port is reserved by construction,
+        # so pointing the user at "browser.profiles.<name>.cdp_port" would name
+        # a profile they do not have.
+        who = "reserved for the enrolled browser"
+        remedy = (
+            "     Use a different port (e.g. /browser connect "
+            "http://127.0.0.1:9222). A debug browser parked here would later be "
+            "adopted -- and origin-trusted -- by the enrolled profile."
+        )
+    return (
+        f"Refusing to connect: port {port} is {who}.\n"
+        "     /browser connect makes ONE browser drive every page in this "
+        "session, including untrusted public sites.\n"
+        "     Connecting to the enrolled browser would hand those pages your "
+        "live SSO session and client certificate.\n"
+        f"{remedy}"
+    )
+
+
 def get_chrome_debug_candidates(system: str) -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()
@@ -217,30 +286,77 @@ def local_port_in_use(port: int, timeout: float = 0.5) -> bool:
     return False
 
 
-def find_free_debug_port(preferred: int = DEFAULT_BROWSER_CDP_PORT, attempts: int = 10) -> int:
-    """Return the first port after ``preferred`` bindable on both loopbacks.
-
-    Used when ``preferred`` is occupied by a non-CDP application: rather
-    than launching a browser into a bind conflict, pick a nearby free
-    port. Falls back to ``preferred + 1`` if nothing binds (the launch
-    will then fail with a clear browser-side error instead of silently
-    doing nothing).
-    """
+def _dual_stack_bindable(port: int) -> bool:
+    """Return True when ``port`` binds on both loopback families."""
     import socket
 
+    for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+def _ephemeral_loopback_port() -> int | None:
+    """Ask the kernel for a free loopback port, or None."""
+    import socket
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+    except OSError:
+        return None
+
+
+def find_free_debug_port(preferred: int = DEFAULT_BROWSER_CDP_PORT, attempts: int = 10) -> int:
+    """Return a loopback port bindable on both families and NOT enrolled-reserved.
+
+    Used when ``preferred`` is occupied by a non-CDP application: rather
+    than launching a browser into a bind conflict, pick a nearby free port.
+
+    On exhaustion this used to return ``preferred + 1`` UNCHECKED, which could
+    hand back the very port the loop had just refused for being an enrolled
+    profile's. ``launch_chrome_debug``/readiness discovery would then find the
+    already-running corporate browser on it and both connect surfaces would
+    publish it as the process-global ``BROWSER_CDP_URL`` -- reopening BP-1 from
+    the other end (review finding CRIT-002). The fallback now asks the kernel
+    for an ephemeral port and still validates it; only if THAT fails do we
+    raise, because there is no safe integer left to return.
+
+    Port selection is inherently racy, so this result is a preference, not a
+    guarantee: the launch/readiness identity check in
+    ``browser_session_manager`` remains the final authority.
+    """
+    def _usable(port: int) -> bool:
+        # Never park a throwaway debug browser on an enrolled profile's port:
+        # the enrolled launcher reuses whatever already listens there, which
+        # would bind corporate origin trust to a browser with no SSO.
+        return enrolled_port_refusal(port) is None and _dual_stack_bindable(port)
+
     for port in range(preferred + 1, preferred + 1 + attempts):
-        bindable = True
-        for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
-            try:
-                with socket.socket(family, socket.SOCK_STREAM) as sock:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    sock.bind((host, port))
-            except OSError:
-                bindable = False
-                break
-        if bindable:
+        if _usable(port):
             return port
-    return preferred + 1
+
+    for _ in range(20):
+        candidate = _ephemeral_loopback_port()
+        if candidate is None:
+            break
+        if _usable(candidate):
+            logger.debug(
+                "no free debug port near %d; using ephemeral port %d",
+                preferred, candidate,
+            )
+            return candidate
+
+    raise RuntimeError(
+        f"could not find a free debug port near {preferred}: every candidate is "
+        "either in use or reserved for an enrolled browser profile. Free a port, "
+        "or set browser.profiles.<name>.cdp_port to move the enrolled browser."
+    )
 
 
 def manual_chrome_debug_command(port: int = DEFAULT_BROWSER_CDP_PORT, system: str | None = None) -> str | None:

@@ -1766,6 +1766,13 @@ export const ja = defineLocale({
     workflowUntrusted: '未信頼',
     workflowVerifiedBundle: '検証済みバンドル',
     workflowIncompatible: '非互換',
+    workflowLanguage: 'ワークフロー言語',
+    workflowLanguageArchon: 'Archon 2026-07',
+    workflowLanguageLegacy: 'レガシー動作',
+    workflowLanguageLegacyDescription:
+      '既存の Hermes の動作は維持されます。Archon 2026-07 に移行する前に互換性の所見を確認してください。',
+    workflowLanguageNormalizer: '正規化バージョン',
+    workflowLanguageDigest: '正規化ダイジェスト',
     workflowRequiresAi: '設定済みのモデルプロバイダーを通じて AI 推論を実行します',
     workflowNoInputs: '入力なし',
     workflowInputCount: count => `${count} 件の入力`,

@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -60,9 +62,9 @@ class ScriptExecutor:
     ) -> None:
         self._runtime_locator = runtime_locator
 
-    def _argv(
+    def _execution_plan(
         self, context: NodeExecutionContext, runtime_path: str
-    ) -> tuple[list[str], tuple[str, ...]]:
+    ) -> tuple[list[str], tuple[str, ...], bytes | None]:
         node = context.node
         runtime = str(node.options["runtime"])
         dependencies = tuple(str(dep) for dep in node.options.get("deps", ()))
@@ -80,21 +82,51 @@ class ScriptExecutor:
                     "--no-env-file",
                     "-e",
                     variables.render_prompt(str(node.value)),
-                ], warnings
-            resource = ResourceResolver(context.run_directory).script(
+                ], warnings, None
+            resource = ResourceResolver(
+                context.run_directory,
+                sealed_paths=context.sealed_resource_paths,
+                sealed_bytes=context.sealed_resource_bytes,
+            ).script(
                 str(node.value), runtime=runtime
             )
-            return [runtime_path, "--no-env-file", "run", str(resource.path)], warnings
+            if resource.authenticated_bytes is not None:
+                return (
+                    [runtime_path, "--no-env-file", "run", "-"],
+                    warnings,
+                    resource.authenticated_bytes,
+                )
+            return (
+                [runtime_path, "--no-env-file", "run", str(resource.path)],
+                warnings,
+                None,
+            )
         argv = [runtime_path, "run", "--no-project"]
         for dependency in dependencies:
             argv.extend(("--with", dependency))
         if inline:
             argv.extend(("python", "-c", variables.render_prompt(str(node.value))))
+            source_bytes = None
         else:
-            resource = ResourceResolver(context.run_directory).script(
+            resource = ResourceResolver(
+                context.run_directory,
+                sealed_paths=context.sealed_resource_paths,
+                sealed_bytes=context.sealed_resource_bytes,
+            ).script(
                 str(node.value), runtime=runtime
             )
-            argv.extend(("python", str(resource.path)))
+            if resource.authenticated_bytes is not None:
+                argv.extend(("python", "-"))
+                source_bytes = resource.authenticated_bytes
+            else:
+                argv.extend(("python", str(resource.path)))
+                source_bytes = None
+        return argv, warnings, source_bytes
+
+    def _argv(
+        self, context: NodeExecutionContext, runtime_path: str
+    ) -> tuple[list[str], tuple[str, ...]]:
+        argv, warnings, _source_bytes = self._execution_plan(context, runtime_path)
         return argv, warnings
 
     def execute(self, context: NodeExecutionContext) -> NodeExecutionResult:
@@ -120,7 +152,9 @@ class ScriptExecutor:
         artifacts_dir.mkdir(exist_ok=True)
         artifacts_before = _artifact_snapshot(artifacts_dir)
         try:
-            argv, warnings = self._argv(context, runtime_path)
+            argv, warnings, source_bytes = self._execution_plan(
+                context, runtime_path
+            )
         except (FileNotFoundError, OSError, ValueError) as exc:
             return NodeExecutionResult(
                 "failed", error_code="validation", error_message=str(exc)
@@ -147,7 +181,13 @@ class ScriptExecutor:
         if context.spawn_intent is not None and not context.spawn_intent(executor_nonce):
             output.close()
             raise RuntimeError("executor spawn intent was rejected")
+        source_stream = None
         try:
+            if source_bytes is not None:
+                source_stream = tempfile.TemporaryFile(mode="w+b")
+                source_stream.write(source_bytes)
+                source_stream.flush()
+                source_stream.seek(0)
             tree = ManagedProcessTree.spawn(
                 argv,
                 policy=context.termination_policy,
@@ -155,6 +195,7 @@ class ScriptExecutor:
                 env=allowed_env,
                 stdout=output.stdout,
                 stderr=output.stderr,
+                stdin=(source_stream if source_stream is not None else subprocess.DEVNULL),
             )
         except OSError as exc:
             output.close()
@@ -163,6 +204,9 @@ class ScriptExecutor:
             return NodeExecutionResult(
                 "failed", error_code="runtime_missing", error_message=str(exc)
             )
+        finally:
+            if source_stream is not None:
+                source_stream.close()
         cancelled = False
         if context.process_started is not None and not context.process_started(
             tree.identity

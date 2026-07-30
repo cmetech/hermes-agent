@@ -229,6 +229,7 @@ def assess_package_execution(
                     message="workflow requires a configured isolated backend",
                     blocking=True,
                     code="execution_environment_unavailable",
+                    effective_profile=package.language.effective_profile,
                 ),
             ),
             runnable=False,

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+INVOCATION_ROOT="$(pwd -P)"
 ROOT="$(git rev-parse --show-toplevel)"
 UPSTREAM_REF=""
 BASE_REF=""
@@ -27,12 +28,38 @@ done
 REPORT_DIR="${REPORT_DIR:-$(mktemp -d)/workflow-merge-evidence}"
 mkdir -p "$REPORT_DIR"
 REPORT_DIR="$(cd "$REPORT_DIR" && pwd)"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  :
+elif [[ -x "$ROOT/.venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT/.venv/bin/python"
+elif [[ -x "$ROOT/venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT/venv/bin/python"
+else
+  SHARED_GIT_DIR="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)"
+  SHARED_ROOT="$(dirname "$SHARED_GIT_DIR")"
+  if [[ -x "$SHARED_ROOT/.venv/bin/python" ]]; then
+    PYTHON_BIN="$SHARED_ROOT/.venv/bin/python"
+  elif [[ -x "$SHARED_ROOT/venv/bin/python" ]]; then
+    PYTHON_BIN="$SHARED_ROOT/venv/bin/python"
+  else
+    PYTHON_BIN="python3"
+  fi
+fi
+case "$PYTHON_BIN" in
+  /*) ;;
+  */*) PYTHON_BIN="$INVOCATION_ROOT/$PYTHON_BIN" ;;
+  *) PYTHON_BIN="$(command -v "$PYTHON_BIN")" ;;
+esac
+[[ -x "$PYTHON_BIN" ]] || {
+  echo "python interpreter is not executable: $PYTHON_BIN" >&2
+  exit 1
+}
 CHECKER="$ROOT/scripts/check_upstream_customizations.py"
 MANIFEST="$ROOT/docs/upstream-customizations/workflow-orchestration.yaml"
 GATE="$ROOT/scripts/test_workflow_merge_gate.sh"
 SCHEMA="$ROOT/docs/upstream-customizations/merge-evidence.schema.json"
-for required in "$CHECKER" "$MANIFEST" "$GATE" "$SCHEMA"; do
+LEDGER_RUNNER="$ROOT/scripts/run_workflow_ledger_invariants.py"
+for required in "$CHECKER" "$MANIFEST" "$GATE" "$SCHEMA" "$LEDGER_RUNNER"; do
   [[ -f "$required" ]] || { echo "partial workflow merge gate: missing $required" >&2; exit 1; }
 done
 
@@ -48,7 +75,7 @@ set +e
   --upstream-diff "$BASELINE..$UPSTREAM_SHA" --report "$OVERLAP"
 OVERLAP_STATUS=$?
 set -e
-if [[ $OVERLAP_STATUS -eq 2 ]]; then
+if [[ $OVERLAP_STATUS -eq 0 || $OVERLAP_STATUS -eq 2 ]]; then
   while IFS= read -r required_id; do
     [[ -n "$required_id" ]] || continue
     matched=0
@@ -66,7 +93,7 @@ if [[ $OVERLAP_STATUS -eq 2 ]]; then
       echo "explicit preserve/adapt/remove-as-upstream-equivalent decision required for $required_id" >&2
       exit 4
     }
-  done < <("$PYTHON_BIN" -c 'import json,sys; d=json.load(open(sys.argv[1])); print("\n".join(x["id"] for x in d["overlaps"] if x["classification"] in {"owned_symbol","possible_upstream_equivalent"}))' "$OVERLAP")
+  done < <("$PYTHON_BIN" -c 'import json,sys; d=json.load(open(sys.argv[1])); print("\n".join(x["id"] for x in d["overlaps"] if x["decision_required"]))' "$OVERLAP")
 elif [[ $OVERLAP_STATUS -ne 0 ]]; then
   exit "$OVERLAP_STATUS"
 fi
@@ -122,8 +149,35 @@ if [[ $GATE_STATUS -ne 0 ]]; then
 fi
 record_command "base-invariant-gate" "passed" "$started"
 
+LEDGER_RESULTS="$REPORT_DIR/ledger-invariants.json"
+started="$(now_ms)"
+set +e
+"$PYTHON_BIN" "$BASE_WT/scripts/run_workflow_ledger_invariants.py" \
+  --repo "$BASE_WT" \
+  --manifest "$BASE_WT/docs/upstream-customizations/workflow-orchestration.yaml" \
+  --output "$LEDGER_RESULTS" \
+  --platform "$PLATFORM" \
+  --base-ref "$TESTED_BASE_SHA" >"$REPORT_DIR/ledger-invariants.log" 2>&1
+LEDGER_STATUS=$?
+set -e
+if [[ $LEDGER_STATUS -ne 0 ]]; then
+  record_command "ledger-declared-invariants" "failed" "$started"
+  tail -n 80 "$REPORT_DIR/ledger-invariants.log" >&2 || true
+  echo "declared ledger invariant failed; no refs were advanced" >&2
+  exit 9
+fi
+record_command "ledger-declared-invariants" "passed" "$started"
+
 BRANDS_TSV="$REPORT_DIR/brands.tsv"
 : >"$BRANDS_TSV"
+RECONCILED_CONFLICTS_TSV="$REPORT_DIR/reconciled-conflicts.tsv"
+: >"$RECONCILED_CONFLICTS_TSV"
+GENERIC_PATHS=(
+  tools/managed_process.py tools/process_registry.py
+  agent/plugin_agent.py agent/plugin_agent_worker.py
+  hermes_cli/kanban_db.py plugins/kanban/dashboard/plugin_api.py
+  plugins/workflow
+)
 for ref in "${BRAND_REFS[@]}"; do
   slug="${ref##*/}"
   worktree="$TMP/brand-$slug"
@@ -147,6 +201,7 @@ for ref in "${BRAND_REFS[@]}"; do
           # authoritative brand generator restamp its narrow identity fields.
           git -C "$worktree" checkout "$TESTED_BASE_SHA" -- "$conflict"
           git -C "$worktree" add "$conflict"
+          printf '%s\t%s\n' "$slug" "$conflict" >>"$RECONCILED_CONFLICTS_TSV"
           ;;
         *) unexpected_conflict="$conflict" ;;
       esac
@@ -204,7 +259,17 @@ for ref in "${BRAND_REFS[@]}"; do
   brand_sha="$(git -C "$worktree" rev-parse HEAD)"
   brand_tree="$(git -C "$worktree" rev-parse HEAD^{tree})"
   descriptor_sha="$($PYTHON_BIN -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$worktree/brands/$slug.json")"
-  printf '%s\t%s\t%s\t%s\n' "$ref" "$brand_sha" "$brand_tree" "$descriptor_sha" >>"$BRANDS_TSV"
+  contains_tested_base=false
+  if git -C "$worktree" merge-base --is-ancestor "$TESTED_BASE_SHA" HEAD; then
+    contains_tested_base=true
+  fi
+  generic_runtime_matches_base=false
+  if git -C "$worktree" diff --quiet "$TESTED_BASE_SHA" HEAD -- "${GENERIC_PATHS[@]}"; then
+    generic_runtime_matches_base=true
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$ref" "$brand_sha" "$brand_tree" "$descriptor_sha" \
+    "$contains_tested_base" "$generic_runtime_matches_base" >>"$BRANDS_TSV"
 done
 
 PATCH_SHA="$($PYTHON_BIN -c 'import hashlib,subprocess,sys; d=subprocess.check_output(["git","-C",sys.argv[1],"diff","--binary",sys.argv[2],sys.argv[3]]); print(hashlib.sha256(d).hexdigest())' "$ROOT" "$BASE_SHA" "$TESTED_BASE_SHA")"
@@ -219,7 +284,9 @@ else
   MERGE_SKILL_SHA="$($PYTHON_BIN -c 'import hashlib; print(hashlib.sha256(b"").hexdigest())')"
 fi
 
-"$PYTHON_BIN" - "$MANIFEST" "$OVERLAP" "$COMMANDS_TSV" "$BRANDS_TSV" \
+"$PYTHON_BIN" - "$BASE_WT/docs/upstream-customizations/workflow-orchestration.yaml" \
+  "$OVERLAP" "$COMMANDS_TSV" "$LEDGER_RESULTS" "$BRANDS_TSV" \
+  "$RECONCILED_CONFLICTS_TSV" \
   "$DECISIONS_FILE" "$ROOT" "$BASE_SHA" "$TESTED_BASE_SHA" "$REPORT_DIR/merge-evidence.json" \
   "$BASELINE" "$UPSTREAM_SHA" "$BASE_TREE" "$PATCH_SHA" "$PLATFORM" \
   "$MERGE_SKILL_LABEL" "$MERGE_SKILL_SHA" <<'PY'
@@ -232,7 +299,8 @@ import sys
 import yaml
 
 (
-    manifest_path, overlap_path, commands_path, brands_path, decisions_path,
+    manifest_path, overlap_path, commands_path, ledger_results_path, brands_path,
+    reconciled_conflicts_path, decisions_path,
     repo, base_sha, tested_base_sha, output_path, baseline, upstream_sha,
     base_tree, patch_sha, platform, merge_skill_path, merge_skill_sha,
 ) = sys.argv[1:]
@@ -259,7 +327,18 @@ for line in Path(commands_path).read_text(encoding="utf-8").splitlines():
         "duration_ms": int(duration),
         "platform": command_platform,
     })
-base_gate = next(item for item in commands if item["name"] == "base-invariant-gate")
+ledger_results = {
+    item["path"]: item
+    for item in json.loads(Path(ledger_results_path).read_text(encoding="utf-8"))
+}
+reconciled_conflicts = {
+    path
+    for line in Path(reconciled_conflicts_path).read_text(
+        encoding="utf-8"
+    ).splitlines()
+    if line
+    for _slug, path in [line.split("\t", 1)]
+}
 
 def git(*args: str) -> str:
     return subprocess.check_output(["git", "-C", repo, *args], text=True).strip()
@@ -281,24 +360,46 @@ for entry in manifest["upstream_changes"]:
         "files": entry["files"],
         "patch_sha256": hashlib.sha256(patch).hexdigest(),
         "overlap_class": overlap["classification"],
+        "overlap_policy": overlap["overlap_policy"],
+        "decision_required": overlap["decision_required"],
         "decision": decisions.get(entry["id"], "not-required"),
-        "conflict_files": [],
+        "conflict_files": sorted(reconciled_conflicts & set(entry["files"])),
         "retained_commit_subjects": retained,
         "removed_commit_subjects": removed,
-        "tests": [{**base_gate, "name": "entry invariants: " + ", ".join(entry["tests"])}],
+        "tests": [ledger_results[test_path] for test_path in entry["tests"]],
     })
 
 brands = []
 for line in Path(brands_path).read_text(encoding="utf-8").splitlines():
-    ref, commit, tree, descriptor = line.split("\t")
+    ref, commit, tree, descriptor, contains_base, generic_matches = line.split("\t")
     brands.append({
         "ref": ref,
         "commit": commit,
         "tree": tree,
         "descriptor_sha256": descriptor,
-        "contains_tested_base": True,
-        "generic_runtime_matches_base": True,
+        "contains_tested_base": contains_base == "true",
+        "generic_runtime_matches_base": generic_matches == "true",
     })
+
+final_ancestry = (
+    subprocess.run(
+        ["git", "-C", repo, "merge-base", "--is-ancestor", base_sha, tested_base_sha]
+    ).returncode
+    == 0
+    and subprocess.run(
+        [
+            "git",
+            "-C",
+            repo,
+            "merge-base",
+            "--is-ancestor",
+            upstream_sha,
+            tested_base_sha,
+        ]
+    ).returncode
+    == 0
+    and all(item["contains_tested_base"] for item in brands)
+)
 
 evidence = {
     "schema_version": 1,
@@ -319,7 +420,7 @@ evidence = {
     "commands": commands,
     "platform": platform,
     "brands": brands,
-    "final_ancestry": True,
+    "final_ancestry": final_ancestry,
 }
 Path(output_path).write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY

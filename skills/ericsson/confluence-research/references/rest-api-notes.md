@@ -47,13 +47,15 @@ is theme-rendered, wrapper-heavy and lossy. `storage_to_md.py` converts storage.
 
 ## Engines
 
-Both drive the enrolled corporate browser over CDP (port 9222 by default,
+Both drive the enrolled corporate browser over CDP (port 9333 by default,
 `CONFLUENCE_CDP_PORT` to change). The skill launches Edge itself, or reuses an
-Edge you already started with `--remote-debugging-port=9222`.
+Edge you already started with `--remote-debugging-port=9333`. It is deliberately
+NOT 9222: that is `/browser connect`'s default port, and an enrolled browser
+sitting there can be adopted as the process-global CDP endpoint for every page.
 
 - **playwright** — `connect_over_cdp` once, hold `page`, `page.evaluate(fn)`
   (auto-invokes the `async () => {}` string). No daemon. Default.
-- **agent-browser** — `agent-browser --cdp 9222 eval -b <base64>`; the JS is
+- **agent-browser** — `agent-browser --cdp 9333 eval -b <base64>`; the JS is
   wrapped as `(fn)()` and base64-encoded. **Never `--stdin`** — PowerShell
   stdin piping to the CLI hangs. The backend runs `close --all` on start to
   clear a wedged daemon (the Windows failure mode observed in testing).

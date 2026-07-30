@@ -41,16 +41,23 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Probe local venvs first; fall back to the Nix devShell's editable venv
 # (HERMES_PYTHON is exported by the devShell hook and ships [dev] extras:
 # pytest, pytest-asyncio, pytest-timeout, ruff, ty).
-VENV=""
+PYTHON=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
-    VENV="$candidate"
+  if [ -x "$candidate/bin/python" ]; then
+    PYTHON="$candidate/bin/python"
+    break
+  fi
+  # uv creates the standard ``Scripts`` layout on native Windows.  The
+  # portability matrix invokes this script through Git Bash, so probe the
+  # interpreter itself instead of assuming a POSIX ``bin/activate`` file.
+  if [ -x "$candidate/Scripts/python.exe" ]; then
+    PYTHON="$candidate/Scripts/python.exe"
     break
   fi
 done
 
-if [ -n "$VENV" ]; then
-  PYTHON="$VENV/bin/python"
+if [ -n "$PYTHON" ]; then
+  :
 elif [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
     && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then
   # Guard with an import check: HERMES_PYTHON may point at the RELEASE
@@ -132,8 +139,10 @@ exec env -i \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
+  PYTHONUTF8="${PYTHONUTF8:-1}" \
   PYTHONHASHSEED=0 \
   PYTHONPYCACHEPREFIX="$PYCACHE_PREFIX" \
+  ${HERMES_TEST_WORKERS:+HERMES_TEST_WORKERS="$HERMES_TEST_WORKERS"} \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \

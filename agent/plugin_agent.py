@@ -349,8 +349,18 @@ def _exchange_worker(
     if len(encoded.encode("utf-8")) > _MAX_REQUEST_BYTES:
         raise ValueError("plugin-agent request frame is too large")
 
+    package_root = Path(__file__).resolve().parent.parent
+    default_worker_argv = [
+        sys.executable,
+        "-c",
+        (
+            "import runpy,sys;sys.path.insert(0,sys.argv[1]);"
+            "runpy.run_module('agent.plugin_agent_worker',run_name='__main__')"
+        ),
+        str(package_root),
+    ]
     tree = ManagedProcessTree.spawn(
-        worker_argv or [sys.executable, "-m", "agent.plugin_agent_worker"],
+        worker_argv or default_worker_argv,
         policy=termination_policy
         or TerminationPolicy(
             cooperative_grace_seconds=5.0,

@@ -18,11 +18,25 @@ from pathlib import Path
 from typing import Iterator, Literal, Mapping
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from hermes_constants import get_hermes_home
 from plugins.workflow.actions import MUTATION_ACTIONS, mutation_is_valid
+from plugins.workflow.compat import (
+    WORKFLOW_COMPATIBILITY_FINDINGS_MAX,
+    WORKFLOW_COMPATIBILITY_PAYLOAD_MAX_BYTES,
+    derive_compatibility_report_state,
+)
 from plugins.workflow.evidence import EVIDENCE_KINDS, EvidenceReader
+from plugins.workflow.language import WorkflowLanguageCompatibilityError
 from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.runtime import (
     StoreRegistryCapacityError,
@@ -37,6 +51,12 @@ from plugins.workflow.store import JournalRecoveryError, RunStore
 _CURSOR_SECRET = secrets.token_bytes(32)
 _RUNTIME: WorkflowApiRuntime | None = None
 _RUNTIME_LOCK = threading.Lock()
+_WORKFLOW_RESPONSE_TEXT_MAX = 16_384
+WORKFLOW_COMPATIBILITY_UNKNOWN_PATH = "<unknown-path>"
+_WORKFLOW_COMPATIBILITY_SENTINEL_MESSAGE = re.compile(
+    r"^Compatibility findings truncated: ([1-9][0-9]{0,8}) omitted; "
+    r"aggregate level (portable|mapped|unsupported)$"
+)
 
 
 def _runtime() -> WorkflowApiRuntime:
@@ -230,6 +250,207 @@ class WorkflowCatalogRunSupport(BaseModel):
     ]
 
 
+WorkflowLanguageProfile = Literal["hermes-legacy", "archon-2026-07"]
+WorkflowCompatibilityLevel = Literal["portable", "mapped", "unsupported"]
+
+
+class WorkflowCatalogLanguageStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    effective_profile: WorkflowLanguageProfile
+    legacy: StrictBool
+
+    @model_validator(mode="after")
+    def require_consistent_legacy_status(self):
+        if self.legacy != (self.effective_profile == "hermes-legacy"):
+            raise ValueError("legacy must match effective_profile")
+        return self
+
+
+class WorkflowDetailLanguageStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    declared_profile: WorkflowLanguageProfile | None
+    effective_profile: WorkflowLanguageProfile
+    legacy: StrictBool
+    normalizer_version: StrictInt = Field(..., ge=1, le=1)
+    normalized_definition_digest: str = Field(
+        ..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+
+    @model_validator(mode="after")
+    def require_consistent_profile_status(self):
+        if self.legacy != (self.effective_profile == "hermes-legacy"):
+            raise ValueError("legacy must match effective_profile")
+        if self.declared_profile is None:
+            if self.effective_profile != "hermes-legacy":
+                raise ValueError("an undeclared profile must resolve to hermes-legacy")
+        elif self.declared_profile != self.effective_profile:
+            raise ValueError("declared_profile must match effective_profile")
+        return self
+
+
+class WorkflowCompatibilitySummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    level: WorkflowCompatibilityLevel
+    runnable: StrictBool
+
+
+class WorkflowCompatibilityFinding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(..., min_length=1, max_length=_WORKFLOW_RESPONSE_TEXT_MAX)
+    level: WorkflowCompatibilityLevel
+    message: str = Field(..., min_length=1, max_length=_WORKFLOW_RESPONSE_TEXT_MAX)
+    blocking: StrictBool
+    code: str = Field(..., min_length=1, max_length=_WORKFLOW_RESPONSE_TEXT_MAX)
+
+
+class WorkflowCompatibilityFull(WorkflowCompatibilitySummary):
+    model_config = ConfigDict(extra="forbid")
+
+    findings_truncated: StrictBool
+    finding_count: StrictInt = Field(..., ge=0, le=1_000_000_510)
+    findings: list[WorkflowCompatibilityFinding] = Field(
+        ..., max_length=WORKFLOW_COMPATIBILITY_FINDINGS_MAX
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_complete_legacy_projection(cls, value):
+        if not isinstance(value, Mapping):
+            return value
+        if "findings_truncated" in value or "finding_count" in value:
+            return value
+        findings = value.get("findings")
+        if not isinstance(findings, list):
+            return value
+        if any(
+            isinstance(finding, Mapping)
+            and finding.get("code") == "compatibility_findings_truncated"
+            and finding.get("path") == "compatibility.findings"
+            for finding in findings
+        ):
+            return value
+        projected = dict(value)
+        projected["findings_truncated"] = False
+        projected["finding_count"] = len(findings)
+        return projected
+
+    @model_validator(mode="after")
+    def require_authoritative_report_state(self):
+        sentinel_indexes = [
+            index
+            for index, finding in enumerate(self.findings)
+            if (
+                finding.code == "compatibility_findings_truncated"
+                and finding.path == "compatibility.findings"
+            )
+        ]
+        expected_truncated = sentinel_indexes == [len(self.findings) - 1]
+        if self.findings_truncated != expected_truncated:
+            raise ValueError(
+                "findings_truncated must match one final truncation sentinel"
+            )
+        if self.findings_truncated:
+            if len(self.findings) != WORKFLOW_COMPATIBILITY_FINDINGS_MAX:
+                raise ValueError(
+                    "truncated compatibility must retain exactly the fixed bound"
+                )
+            sentinel = self.findings[-1]
+            match = _WORKFLOW_COMPATIBILITY_SENTINEL_MESSAGE.fullmatch(sentinel.message)
+            if (
+                match is None
+                or match.group(2) != sentinel.level
+                or sentinel.level == "portable"
+                or (sentinel.blocking and sentinel.level != "unsupported")
+            ):
+                raise ValueError(
+                    "truncation sentinel must carry bounded aggregate state"
+                )
+            omitted = int(match.group(1))
+            if self.finding_count != len(self.findings) - 1 + omitted:
+                raise ValueError("finding_count must include exactly omitted findings")
+        elif self.finding_count != len(self.findings):
+            raise ValueError("finding_count must match complete findings")
+        expected_level, expected_runnable = derive_compatibility_report_state(
+            self.findings
+        )
+        if self.level != expected_level or self.runnable != expected_runnable:
+            raise ValueError("compatibility level and runnable must match findings")
+        serialized = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(serialized) >= WORKFLOW_COMPATIBILITY_PAYLOAD_MAX_BYTES:
+            raise ValueError("compatibility payload must remain below 1 MiB")
+        return self
+
+
+def _sanitize_compatibility_finding_projection(
+    finding: Mapping[str, object],
+) -> dict[str, object]:
+    """Sanitize one closed finding while preserving its nonempty API path."""
+    raw_path = finding.get("path")
+    candidate = dict(finding)
+    if isinstance(raw_path, str):
+        sanitized_path = sanitize_projection(raw_path, key="path")
+        if sanitized_path == "":
+            raw_message = candidate.get("message")
+            if isinstance(raw_message, str):
+                if raw_path:
+                    candidate["message"] = raw_message.replace(
+                        raw_path, WORKFLOW_COMPATIBILITY_UNKNOWN_PATH
+                    )
+                elif raw_message.endswith(": "):
+                    candidate["message"] = (
+                        raw_message + WORKFLOW_COMPATIBILITY_UNKNOWN_PATH
+                    )
+            candidate["path"] = WORKFLOW_COMPATIBILITY_UNKNOWN_PATH
+    projected = sanitize_projection(candidate)
+    assert isinstance(projected, dict)
+    return projected
+
+
+def _sanitize_full_compatibility_projection(
+    compatibility: Mapping[str, object],
+) -> dict[str, object]:
+    """Preserve one complete producer-bounded report across generic clipping."""
+    findings = compatibility.get("findings")
+    if not isinstance(findings, list):
+        raise TypeError("full compatibility findings must be a list")
+    projected_findings: list[dict[str, object]] = []
+    for finding in findings:
+        if not isinstance(finding, Mapping):
+            raise TypeError("full compatibility findings must contain mappings")
+        projected_findings.append(_sanitize_compatibility_finding_projection(finding))
+    return {
+        "level": compatibility["level"],
+        "runnable": compatibility["runnable"],
+        "findings_truncated": compatibility["findings_truncated"],
+        "finding_count": compatibility["finding_count"],
+        "findings": projected_findings,
+    }
+
+
+def _sanitize_catalog_item_projection(
+    item: Mapping[str, object],
+) -> dict[str, object]:
+    compatibility = item.get("compatibility")
+    full_compatibility = None
+    if isinstance(compatibility, Mapping) and isinstance(
+        compatibility.get("findings"), list
+    ):
+        full_compatibility = _sanitize_full_compatibility_projection(compatibility)
+    projected = sanitize_projection(item)
+    assert isinstance(projected, dict)
+    if full_compatibility is not None:
+        projected["compatibility"] = full_compatibility
+    return projected
+
+
 class WorkflowCatalogEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -243,7 +464,21 @@ class WorkflowCatalogEntry(BaseModel):
     inputs: list[WorkflowCatalogInput] = Field(..., max_length=64)
     supported_inputs: WorkflowCatalogInputSupport
     run_support: WorkflowCatalogRunSupport
-    compatibility: dict[str, object] | None = None
+    language: WorkflowCatalogLanguageStatus
+    compatibility: WorkflowCompatibilitySummary | WorkflowCompatibilityFull | None = (
+        None
+    )
+
+    @model_validator(mode="after")
+    def require_source_compatibility_projection(self):
+        if self.compatibility is None:
+            return self
+        if self.source == "showcase":
+            if not isinstance(self.compatibility, WorkflowCompatibilityFull):
+                raise ValueError("showcase compatibility must include findings")
+        elif isinstance(self.compatibility, WorkflowCompatibilityFull):
+            raise ValueError("project and profile compatibility must be summary-only")
+        return self
 
 
 class WorkflowCatalogErrorEntry(BaseModel):
@@ -292,8 +527,9 @@ class WorkflowDetailResponse(BaseModel):
     inputs: list[WorkflowCatalogInput] = Field(..., max_length=64)
     supported_inputs: WorkflowCatalogInputSupport
     run_support: WorkflowCatalogRunSupport
+    language: WorkflowDetailLanguageStatus
     risk_summary: dict[str, object]
-    compatibility: dict[str, object]
+    compatibility: WorkflowCompatibilityFull
     coordinator: WorkflowCoordinatorResponse
     topology: WorkflowTopologyResponse
     definition: dict[str, object]
@@ -337,7 +573,7 @@ def list_workflows(
             detail={"code": "workflow_trust_unavailable", "retryable": True},
         ) from exc
     return {
-        "items": [sanitize_projection(item) for item in items],
+        "items": [_sanitize_catalog_item_projection(item) for item in items],
         "truncated": truncated,
     }
 
@@ -403,11 +639,18 @@ def workflow_detail(
                 "retryable": False,
             },
         ) from exc
+    compatibility = detail["compatibility"]
+    assert isinstance(compatibility, Mapping)
+    full_compatibility = _sanitize_full_compatibility_projection(compatibility)
     sanitized = sanitize_projection(detail)
     assert isinstance(sanitized, dict)
     # build_workflow_detail already supplies the shared semantically redacted,
     # byte-bounded definition; generic list limits must not silently clip it.
     sanitized["definition"] = detail["definition"]
+    # Preserve the complete producer report instead of applying the generic
+    # sanitizer's unrelated 200-item list limit. Sanitize each closed finding
+    # independently so path/text redaction remains in force.
+    sanitized["compatibility"] = full_compatibility
     return sanitized
 
 
@@ -1486,8 +1729,20 @@ def mutate_run(
                     operator_scope=scope,
                 )
             elif action == "resume":
+                from hermes_cli.profiles import get_active_profile_name
+                from plugins.workflow.cli import _runtime_config, _scheduler
+
+                resume_scheduler = _scheduler(
+                    store,
+                    _runtime_config(store.hermes_home),
+                    profile_name=get_active_profile_name(),
+                )
+                always_run_nodes = resume_scheduler.verified_always_run_nodes(
+                    run_id
+                )
                 store.resume_run(
                     run_id,
+                    always_run_nodes=always_run_nodes,
                     expected_state_version=request.expected_version,
                     operator_scope=scope,
                 )
@@ -1530,6 +1785,11 @@ def mutate_run(
                     expected_state_version=request.expected_version,
                     operator_scope=scope,
                 )
+        except WorkflowLanguageCompatibilityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code},
+            ) from exc
         except RuntimeError as exc:
             raise HTTPException(
                 status_code=409,

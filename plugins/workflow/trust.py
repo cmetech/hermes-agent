@@ -11,7 +11,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable, Literal, Mapping
 
 import yaml
@@ -31,6 +31,9 @@ _ISOLATION_CAPABILITIES = (
     "workdir_containment",
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+WORKFLOW_RESOURCE_MAX_FILE_BYTES = 1024 * 1024
+WORKFLOW_RESOURCE_MAX_TOTAL_BYTES = 8 * 1024 * 1024
+WORKFLOW_RESOURCE_MAX_FILES = 512
 
 
 class WorkflowTrustError(RuntimeError):
@@ -53,6 +56,9 @@ class WorkflowResourceReadBudget:
     bytes_read: int = 0
     files_read: int = 0
     _contents: dict[Path, bytes] = field(default_factory=dict, init=False, repr=False)
+    _identities: dict[Path, tuple[int, int, int, int]] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _aliases: dict[Path, Path] = field(default_factory=dict, init=False, repr=False)
     _sealed: bool = field(default=False, init=False, repr=False)
 
@@ -62,25 +68,65 @@ class WorkflowResourceReadBudget:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
 
-    def read(self, path: Path) -> bytes:
+    def read(self, path: Path, *, verify_cached_identity: bool = False) -> bytes:
         if self._sealed:
             return self.read_cached(path)
-        cached = self._contents.get(path)
+        canonical = self._logical_key(path)
+        cached = self._contents.get(canonical)
         if cached is not None:
+            identity = self._identities.get(canonical)
+            if verify_cached_identity and identity is not None:
+                current = path.stat()
+                if path.is_symlink() or not path.is_file() or identity != (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_size,
+                    current.st_mtime_ns,
+                ):
+                    raise OSError("package resource changed after shared read")
             return cached
         if self.files_read >= self.max_files:
             raise WorkflowResourceCapacityError("package resource file limit exceeded")
+        before = path.stat()
+        if path.is_symlink() or not path.is_file():
+            raise OSError("package resource is not a regular file")
+        if before.st_size > self.max_file_bytes:
+            raise WorkflowResourceCapacityError(
+                "package resource per-file limit exceeded"
+            )
         remaining = self.max_total_bytes - self.bytes_read
-        if remaining <= 0:
+        if before.st_size > remaining:
             raise WorkflowResourceCapacityError("package resource byte limit exceeded")
-        read_limit = min(self.max_file_bytes, remaining)
         with path.open("rb") as stream:
-            data = stream.read(read_limit + 1)
+            data = stream.read(before.st_size + 1)
+        after = path.stat()
+        if (
+            (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            )
+            or len(data) != before.st_size
+        ):
+            raise OSError("package resource changed during read")
+        if len(data) > self.max_file_bytes or len(data) > remaining:
+            raise WorkflowResourceCapacityError("package resource byte limit exceeded")
         self.files_read += 1
         self.bytes_read += len(data)
-        if len(data) > read_limit:
-            raise WorkflowResourceCapacityError("package resource byte limit exceeded")
-        self._contents[path] = data
+        self._contents[canonical] = data
+        self._identities[canonical] = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
         return data
 
     @staticmethod
@@ -89,6 +135,8 @@ class WorkflowResourceReadBudget:
 
     def remember_alias(self, logical_path: Path, canonical_path: Path) -> None:
         if self._sealed:
+            if self._aliases.get(self._logical_key(logical_path)) == canonical_path:
+                return
             raise WorkflowResourceCacheMissError(
                 "package resource cache aliases are sealed"
             )
@@ -106,6 +154,46 @@ class WorkflowResourceReadBudget:
             raise WorkflowResourceCacheMissError(
                 "sealed package resource is unavailable"
             ) from exc
+
+    def has_cached(self, logical_path: Path) -> bool:
+        key = self._logical_key(logical_path)
+        canonical = self._aliases.get(key, key)
+        return canonical in self._contents
+
+    @classmethod
+    def from_authenticated(
+        cls,
+        root: Path,
+        contents: Mapping[str, bytes],
+    ) -> WorkflowResourceReadBudget:
+        """Build a sealed read authority from already authenticated package bytes."""
+        total = sum(len(data) for data in contents.values())
+        authority = cls(
+            max_file_bytes=max((len(data) for data in contents.values()), default=1),
+            max_total_bytes=max(total, 1),
+            max_files=max(len(contents), 1),
+        )
+        canonical_root = root.resolve(strict=True)
+        for relative, data in contents.items():
+            logical_relative = PurePosixPath(relative)
+            if (
+                not relative
+                or "\\" in relative
+                or "\0" in relative
+                or logical_relative.is_absolute()
+                or logical_relative.as_posix() != relative
+                or any(part in {"", ".", ".."} for part in logical_relative.parts)
+                or not isinstance(data, bytes)
+            ):
+                raise ValueError("authenticated resource path or bytes are invalid")
+            logical = canonical_root / relative
+            canonical = authority._logical_key(logical)
+            authority._contents[canonical] = bytes(data)
+            authority._aliases[canonical] = canonical
+        authority.bytes_read = total
+        authority.files_read = len(contents)
+        authority.seal()
+        return authority
 
 
 @dataclass(frozen=True)
@@ -149,6 +237,16 @@ def _contained_resource(
     *,
     read_budget: WorkflowResourceReadBudget | None = None,
 ) -> tuple[str, bytes]:
+    if read_budget is not None and read_budget.has_cached(path):
+        try:
+            relative = path.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise _validation_error(
+                str(path),
+                "resource_escape",
+                f"workflow resource escapes package root: {path}",
+            ) from exc
+        return relative, read_budget.read(path)
     try:
         if path.is_symlink():
             raise _validation_error(
@@ -187,7 +285,12 @@ def _contained_resource(
     return resolved.relative_to(root).as_posix(), data
 
 
-def _named_script_path(package: WorkflowPackage, name: str, runtime: str) -> Path:
+def _named_script_path(
+    package: WorkflowPackage,
+    name: str,
+    runtime: str,
+    read_budget: WorkflowResourceReadBudget | None = None,
+) -> Path:
     extension = ".py" if runtime == "uv" else ".ts"
     base = package.root / "scripts" / name
     candidates = (
@@ -196,25 +299,37 @@ def _named_script_path(package: WorkflowPackage, name: str, runtime: str) -> Pat
         else (base, base.with_suffix(extension))
     )
     for candidate in candidates:
-        if candidate.exists() or candidate.is_symlink():
+        if (read_budget is not None and read_budget.has_cached(candidate)) or (
+            candidate.exists() or candidate.is_symlink()
+        ):
             return candidate
     raise _validation_error(
         name, "missing_script", f"named script resource is missing: {name}"
     )
 
 
-def _command_path(package: WorkflowPackage, name: str) -> Path:
+def _command_path(
+    package: WorkflowPackage,
+    name: str,
+    read_budget: WorkflowResourceReadBudget | None = None,
+) -> Path:
     base = package.root / "commands" / name
     candidates = (base, base.with_suffix(".md"))
     for candidate in candidates:
-        if candidate.exists() or candidate.is_symlink():
+        if (read_budget is not None and read_budget.has_cached(candidate)) or (
+            candidate.exists() or candidate.is_symlink()
+        ):
             return candidate
     raise _validation_error(
         name, "missing_command", f"command resource is missing: {name}"
     )
 
 
-def _mcp_path(package: WorkflowPackage, reference: str) -> Path:
+def _mcp_path(
+    package: WorkflowPackage,
+    reference: str,
+    read_budget: WorkflowResourceReadBudget | None = None,
+) -> Path:
     direct = package.root / reference
     candidates = (
         direct,
@@ -222,7 +337,9 @@ def _mcp_path(package: WorkflowPackage, reference: str) -> Path:
         (package.root / "mcp" / reference).with_suffix(".yaml"),
     )
     for candidate in candidates:
-        if candidate.exists() or candidate.is_symlink():
+        if (read_budget is not None and read_budget.has_cached(candidate)) or (
+            candidate.exists() or candidate.is_symlink()
+        ):
             return candidate
     raise _validation_error(
         reference, "missing_mcp", f"MCP definition is missing: {reference}"
@@ -262,12 +379,15 @@ def compute_package_digest(
         add(package.sidecar_path or expected_sidecar)
     for node in package.definition.nodes:
         if node.node_type == "command":
-            add(_command_path(package, str(node.value)))
+            add(_command_path(package, str(node.value), read_budget))
         elif node.node_type == "script" and isinstance(node.value, str):
             if not is_inline_script(node.value):
                 add(
                     _named_script_path(
-                        package, node.value, str(node.options["runtime"])
+                        package,
+                        node.value,
+                        str(node.options["runtime"]),
+                        read_budget,
                     )
                 )
         mcp_value = node.options.get("mcp")
@@ -281,7 +401,7 @@ def compute_package_digest(
         for reference in references:
             if not isinstance(reference, str):
                 continue
-            _, mcp_bytes = add(_mcp_path(package, reference))
+            _, mcp_bytes = add(_mcp_path(package, reference, read_budget))
             try:
                 mcp_document = yaml.safe_load(mcp_bytes) or {}
             except yaml.YAMLError as exc:
@@ -290,12 +410,19 @@ def compute_package_digest(
                     "invalid_mcp",
                     f"invalid MCP definition: {reference}: {exc}",
                 ) from exc
-            for candidate in _walk_strings(mcp_document):
-                if not candidate or candidate.startswith(("$", "-")):
-                    continue
-                resource = package.root / candidate
-                if resource.exists() or resource.is_symlink():
-                    add(resource)
+            for raw_candidate in _walk_strings(mcp_document):
+                candidates = [raw_candidate]
+                if raw_candidate.startswith("-") and "=" in raw_candidate:
+                    candidates.append(raw_candidate.split("=", 1)[1])
+                for candidate in candidates:
+                    if not candidate or candidate.startswith(("$", "-")):
+                        continue
+                    resource = package.root / candidate
+                    if (
+                        read_budget is not None
+                        and read_budget.has_cached(resource)
+                    ) or resource.exists() or resource.is_symlink():
+                        add(resource)
 
     digest = hashlib.sha256()
     for relative in sorted(resources):

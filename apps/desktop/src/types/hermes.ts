@@ -144,10 +144,19 @@ export interface WorkflowRunSupport {
   supported: boolean
 }
 
+export interface WorkflowLanguageStatus {
+  declared_profile?: null | string
+  effective_profile: 'archon-2026-07' | 'hermes-legacy'
+  legacy: boolean
+  normalized_definition_digest?: string
+  normalizer_version?: number
+}
+
 export interface WorkflowDefinition {
   compatibility?: { level: string; runnable?: boolean }
   description: string
   inputs: WorkflowDefinitionInput[]
+  language?: WorkflowLanguageStatus
   name: string
   precedence: 1 | 2 | 3
   requires_ai?: boolean

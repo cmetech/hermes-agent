@@ -148,6 +148,7 @@ def test_ready_layers_are_replenished_fairly_across_active_runs(
     first_wave = []
     active = 0
     maximum = 0
+    first_wave_barrier = threading.Barrier(2)
 
     class RecordingExecutor:
         def execute(self, context):
@@ -156,7 +157,8 @@ def test_ready_layers_are_replenished_fairly_across_active_runs(
                 active += 1
                 maximum = max(maximum, active)
                 first_wave.append(context.workflow_name)
-            time.sleep(0.05)
+            if len(first_wave) <= 2:
+                first_wave_barrier.wait(timeout=10)
             with lock:
                 active -= 1
             return NodeExecutionResult("succeeded")
@@ -193,12 +195,22 @@ def test_mixed_run_limits_share_profile_pool_without_leaking(
     maximum = defaultdict(int)
     maximum_total = 0
     observed_limits = defaultdict(set)
+    run_b_starts = 0
+    first_run_b_wave = threading.Barrier(4, timeout=10)
 
     class MixedLimitExecutor:
         def execute(self, context):
-            nonlocal maximum_total
+            nonlocal maximum_total, run_b_starts
+            # Model one lazy pool worker entering after its peers can finish.
+            if context.workflow_name == "run-b" and context.node.id == "n3":
+                time.sleep(0.2)
             with lock:
                 active[context.workflow_name] += 1
+                if context.workflow_name == "run-b":
+                    run_b_starts += 1
+                    wait_for_first_wave = run_b_starts <= 4
+                else:
+                    wait_for_first_wave = False
                 maximum[context.workflow_name] = max(
                     maximum[context.workflow_name], active[context.workflow_name]
                 )
@@ -207,6 +219,8 @@ def test_mixed_run_limits_share_profile_pool_without_leaking(
                     context.execution_limits.max_parallel_nodes,
                     context.execution_limits.max_total_workers,
                 ))
+            if wait_for_first_wave:
+                first_run_b_wave.wait()
             time.sleep(0.06)
             with lock:
                 active[context.workflow_name] -= 1
@@ -333,8 +347,12 @@ def test_runnable_request_does_not_jump_an_older_fifo_waiter(
     assert RunScheduler(setup_store).advance(blocker.run_id)["status"] == "succeeded"
 
     store = RunStore(home, max_executing_runs=1)
+    always_run_nodes = RunScheduler(store).verified_always_run_nodes(
+        resumable.run_id
+    )
     resumed = store.resume_run(
         resumable.run_id,
+        always_run_nodes=always_run_nodes,
         expected_state_version=resume_state["state_version"],
     )
 

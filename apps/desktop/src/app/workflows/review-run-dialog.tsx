@@ -24,6 +24,8 @@ import { Play } from '@/lib/icons'
 import type { WorkflowDefinition, WorkflowDefinitionInput, WorkflowDetail } from '@/types/hermes'
 
 import {
+  desktopWorkflowLanguageLabel,
+  desktopWorkflowRunDisabledReason,
   workflowSupportsImmediateRun,
   workflowSupportsScheduledRun,
   workflowTrustAllowsRun
@@ -138,9 +140,7 @@ function initialValues(inputs: readonly WorkflowDefinitionInput[]): Record<strin
 
 export function canonicalWorkflowScheduleAt(value: string, now = new Date()): string | null {
   const matched =
-    /^(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})T(?<hour>\d{2}):(?<minute>\d{2})(?::(?<second>\d{2}))?$/.exec(
-      value
-    )
+    /^(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})T(?<hour>\d{2}):(?<minute>\d{2})(?::(?<second>\d{2}))?$/.exec(value)
 
   if (!matched?.groups) {
     return null
@@ -575,28 +575,12 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
 
   const runSupport = detail?.run_support
 
-  const runSupportCopy = {
-    schedule_required: null,
-    showcase_cli_required: copy.workflowRunShowcaseFromCli,
-    supported: null,
-    unsupported_inputs: copy.workflowRunUnsupportedInputs
-  }
-
-  const runDisabledReason =
-    detail && !runSupport
-      ? copy.workflowRunSupportUnavailable
-      : detail && runSupport && !workflowSupportsScheduledRun(runSupport)
-        ? runSupportCopy[runSupport.reason]
-        : detail && detail.compatibility.runnable !== true
-          ? copy.workflowRunIncompatible
-          : detail && !workflowTrustAllowsRun(detail.trust_state)
-            ? copy.workflowRunUntrusted
-            : detail && !detail.coordinator.healthy
-              ? copy.workflowRunCoordinatorUnavailable
-              : null
+  const runDisabledReason = detail ? desktopWorkflowRunDisabledReason(detail, copy, 'detail') : null
 
   const runSupportMessage =
-    (runSupport?.supported === false && runSupport.reason !== 'schedule_required') || !runSupport
+    runDisabledReason === copy.workflowRunSupportUnavailable ||
+    runDisabledReason === copy.workflowRunUnsupportedInputs ||
+    runDisabledReason === copy.workflowRunShowcaseFromCli
       ? runDisabledReason
       : null
 
@@ -610,6 +594,7 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
         new TextEncoder().encode(String(values[input.name] ?? '')).byteLength > input.max_bytes
     ) ||
     detail.inputs.some(input => input.type === 'enum' && enumValues(detail, input.name).length === 0)
+
   const immediateBlocked = commonBlocked || !workflowSupportsImmediateRun(runSupport)
   const scheduledBlocked = commonBlocked || !workflowSupportsScheduledRun(runSupport)
 
@@ -666,6 +651,26 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
                     ? copy.workflowTrusted
                     : copy.workflowUntrusted}
               </Badge>
+              {detail.language ? (
+                <div className="flex flex-wrap items-center gap-2 text-xs text-(--ui-text-secondary)">
+                  <Badge variant={detail.language.legacy ? 'muted' : 'default'}>
+                    {desktopWorkflowLanguageLabel(detail.language, copy)}
+                  </Badge>
+                  {detail.language.normalizer_version !== undefined ? (
+                    <span>
+                      {copy.workflowLanguageNormalizer} {detail.language.normalizer_version}
+                    </span>
+                  ) : null}
+                  {detail.language.normalized_definition_digest ? (
+                    <span className="flex items-center gap-1">
+                      <span>{copy.workflowLanguageDigest}</span>
+                      <span className="font-mono" title={detail.language.normalized_definition_digest}>
+                        {detail.language.normalized_definition_digest.slice(0, 12)}…
+                      </span>
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
             </section>
             <section className="grid gap-2 border-t border-(--ui-stroke-tertiary) pt-3">
               <h2 className="text-xs font-medium text-(--ui-text-primary)">{copy.workflowRunRisk}</h2>
@@ -725,18 +730,18 @@ export function ReviewRunDialog({ onClose, onRunLocated, profile, returnFocusTo,
                 <AlertDescription>{runSupportMessage}</AlertDescription>
               </Alert>
             ) : null}
-            {!detail.coordinator.healthy ? (
+            {detail.coordinator?.healthy !== true ? (
               <Alert variant="warning">
                 <AlertDescription>{copy.workflowRunCoordinatorUnavailable}</AlertDescription>
               </Alert>
             ) : null}
-            {detail.compatibility.runnable !== true ? (
+            {detail.compatibility?.runnable !== true ? (
               <Alert variant="warning">
                 <AlertDescription>
                   <p>{copy.workflowRunIncompatible}</p>
-                  {(detail.compatibility.findings ?? []).some(finding => finding.blocking) ? (
+                  {(detail.compatibility?.findings ?? []).some(finding => finding.blocking) ? (
                     <ul className="list-disc pl-4">
-                      {(detail.compatibility.findings ?? [])
+                      {(detail.compatibility?.findings ?? [])
                         .filter(finding => finding.blocking)
                         .map(finding => (
                           <li key={`${finding.path}:${finding.code}`}>{finding.message}</li>

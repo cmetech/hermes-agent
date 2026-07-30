@@ -78,34 +78,6 @@ def _synthetic_worker_script() -> str:
     )
 
 
-def _is_alive_like_dispatcher(pid: int) -> bool:
-    """Mirrors hermes_cli/kanban_db.py:_pid_alive on Linux.
-
-    A zombie is treated as dead — the dispatcher's _pid_alive checks
-    /proc/<pid>/status for State: Z. We replicate that here so a clean
-    os._exit followed by zombie-state is correctly counted as dead.
-    """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    if sys.platform == "linux":
-        try:
-            with open(f"/proc/{pid}/status") as f:
-                for line in f:
-                    if line.startswith("State:"):
-                        if "Z" in line.split(":", 1)[1]:
-                            return False
-                        break
-        except (FileNotFoundError, PermissionError, OSError):
-            pass
-    return True
-
-
 def _spawn_synthetic(env_overrides: dict) -> subprocess.Popen:
     env = dict(os.environ)
     env.update(env_overrides)
@@ -145,6 +117,8 @@ def _cleanup(proc: subprocess.Popen) -> None:
 def test_sigterm_with_kanban_task_env_terminates_quickly():
     """With HERMES_KANBAN_TASK set, SIGTERM should kill the process in <2s
     even when a non-daemon thread is still alive."""
+    from hermes_cli.kanban_db import _pid_alive
+
     proc = _spawn_synthetic({"HERMES_KANBAN_TASK": "t_test_28181"})
     try:
         t0 = time.time()
@@ -154,9 +128,10 @@ def test_sigterm_with_kanban_task_env_terminates_quickly():
         # is immediate. Give generous headroom for slow CI runners.
         deadline = t0 + 2.0
         while time.time() < deadline:
-            if not _is_alive_like_dispatcher(proc.pid):
+            if not _pid_alive(proc.pid):
                 elapsed = time.time() - t0
                 assert elapsed < 2.0
+                assert proc.wait(timeout=0) == 0
                 return
             time.sleep(0.02)
         pytest.fail(

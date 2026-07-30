@@ -11,7 +11,11 @@ import shlex
 
 from hermes_cli.plugin_invocation import PluginInvocationContext
 from plugins.workflow.admission import RunAdmissionRequest
-from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.compat import (
+    WorkflowCompatibilityBlockedError,
+    assess_compatibility,
+    require_runnable,
+)
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.trust import (
     WorkflowTrustStore,
@@ -99,7 +103,9 @@ def _start_gateway_run(args, invocation, *, hermes_home: Path, workdir: Path):
     package = _resolve(command_args, args.name)
     runtime = _runtime_config(hermes_home, sidecar=package.sidecar)
     digest = compute_package_digest(package)
-    risk = build_risk_summary(package, assess_compatibility(package))
+    compatibility = assess_compatibility(package)
+    require_runnable(compatibility)
+    risk = build_risk_summary(package, compatibility)
     if WorkflowTrustStore(hermes_home).check(
         digest.sha256, risk_digest=risk.risk_digest
     ) != "trusted":
@@ -189,6 +195,15 @@ def workflow_gateway_command(
             )
             result = {"action": args.action, **asdict(decision)}
         return json.dumps({"ok": True, "result": result}, sort_keys=True)
+    except WorkflowCompatibilityBlockedError as exc:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": exc.code,
+                "message": str(exc),
+            },
+            sort_keys=True,
+        )
     except (SystemExit, Exception) as exc:
         return json.dumps(
             {

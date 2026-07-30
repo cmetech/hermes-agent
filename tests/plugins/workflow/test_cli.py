@@ -4,9 +4,13 @@ import argparse
 import ast
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
+import yaml
 
 from plugins import workflow as workflow_plugin
 from plugins.workflow.admission import RunAdmissionRequest
@@ -21,6 +25,8 @@ from plugins.workflow.store import RunStore
 from plugins.workflow.trust import build_risk_summary, compute_package_digest
 from plugins.workflow.trust import WorkflowPackageDigest, WorkflowTrustStore
 from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.language_schema import workflow_authoring_contract
+from plugins.workflow.models import WorkflowLanguageProfile
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -41,6 +47,64 @@ def _json_envelope(capsys):
     output = capsys.readouterr()
     assert output.err == ""
     return json.loads(output.out)
+
+
+def _tree_snapshot(root: Path) -> tuple[tuple[str, str, bytes | None], ...]:
+    if not root.exists():
+        return ()
+    entries = []
+    for path in sorted(root.rglob("*")):
+        kind = "directory" if path.is_dir() else "file"
+        entries.append((
+            path.relative_to(root).as_posix(),
+            kind,
+            None if path.is_dir() else path.read_bytes(),
+        ))
+    return tuple(entries)
+
+
+def _run_packaged_schema(tmp_path: Path, arguments: list[str]):
+    home = tmp_path / "fresh-home"
+    hermes_home = tmp_path / "fresh-hermes-home"
+    guard_dir = tmp_path / "process-guards"
+    guard_dir.mkdir()
+    (guard_dir / "sitecustomize.py").write_text(
+        """
+import socket
+import sys
+
+class _ForbiddenRuntimeImports:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in {"run_agent", "model_tools", "tools.mcp_tool"}:
+            raise RuntimeError(f"forbidden runtime import: {fullname}")
+        return None
+
+def _forbid_network(*args, **kwargs):
+    raise RuntimeError("network access is forbidden during schema introspection")
+
+sys.meta_path.insert(0, _ForbiddenRuntimeImports())
+socket.create_connection = _forbid_network
+socket.socket.connect = _forbid_network
+""".lstrip(),
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "HERMES_HOME": str(hermes_home),
+        "PYTHONPATH": os.pathsep.join([str(guard_dir), str(Path(__file__).parents[3])]),
+    }
+    before = (_tree_snapshot(home), _tree_snapshot(hermes_home))
+    completed = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", *arguments],
+        cwd=Path(__file__).parents[3],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    after = (_tree_snapshot(home), _tree_snapshot(hermes_home))
+    return completed, before, after, home, hermes_home
 
 
 def test_success_envelope_sanitizes_every_machine_payload_and_preserves_cleanup_capability():
@@ -89,6 +153,393 @@ def _write(workflow_writer, workdir):
         name="sample",
         nodes=[{"id": "start", "bash": "printf SECRET_BODY"}],
     )
+
+
+def _archon_package(workflow_writer, tmp_path, *, field, value):
+    """Write one declared Archon package with a Phase 1 deferred field."""
+    node = (
+        {"id": "start", "bash": "true", field: value}
+        if field == "timeout"
+        else {"id": "start", "prompt": "x", field: value}
+    )
+    path = workflow_writer(
+        tmp_path / ".hermes" / "workflows",
+        name=f"archon-{field}",
+        filename=f"archon-{field}.yaml",
+        nodes=[node],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    "field, value, code",
+    [
+        ("timeout", 1000, "archon_timeout_semantics_unavailable"),
+        ("retry", {"max_attempts": 2}, "archon_retry_semantics_unavailable"),
+        ("output_format", {"type": "object"}, "archon_output_format_unavailable"),
+        ("output_type", "report", "archon_output_type_unavailable"),
+        ("maxBudgetUsd", 1.0, "archon_budget_enforcement_unavailable"),
+        ("sandbox", {"enabled": True}, "archon_sandbox_enforcement_unavailable"),
+    ],
+)
+def test_archon_deferred_fields_block_validate_trust_and_run(
+    workflow_writer, tmp_path, capsys, field, value, code
+):
+    path = _archon_package(workflow_writer, tmp_path, field=field, value=value)
+    parser = _parser()
+    home = tmp_path / "home"
+    common = ["--workdir", str(tmp_path), "--hermes-home", str(home)]
+
+    validate = parser.parse_args([*common, "validate", path.stem, "--json"])
+    assert validate.func(validate) == machine_contract.EXIT_BLOCKING_FINDING
+    validation = _json_envelope(capsys)
+    assert validation["error"]["code"] == "validation_failed"
+    identities = {
+        (issue["code"], issue["path"])
+        for issue in validation["result"]["issues"]
+    }
+    assert (code, f"nodes[0].{field}") in identities
+    assert len(validation["result"]["issues"]) == len(identities)
+
+    package = load_workflow(path)
+    digest = compute_package_digest(package).sha256
+    trust = parser.parse_args(
+        [*common, "trust", path.stem, "--digest", digest, "--json"]
+    )
+    assert trust.func(trust) == machine_contract.EXIT_BLOCKING_FINDING
+    assert _json_envelope(capsys)["error"]["code"] == "workflow_compatibility_blocked"
+    assert WorkflowTrustStore(home).check(digest) == "untrusted"
+
+    run = parser.parse_args(
+        [
+            *common,
+            "run",
+            path.stem,
+            "--foreground",
+            "--idempotency-key",
+            "archon-refusal",
+            "--json",
+        ]
+    )
+    assert run.func(run) == machine_contract.EXIT_BLOCKING_FINDING
+    assert _json_envelope(capsys)["error"]["code"] == "workflow_compatibility_blocked"
+    store = RunStore(home)
+    assert list(store.runs_root.rglob("run.json")) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
+def test_archon_validate_text_reports_field_specific_compatibility_finding(
+    workflow_writer, tmp_path, capsys
+):
+    path = _archon_package(
+        workflow_writer, tmp_path, field="timeout", value=1000
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(tmp_path),
+        "validate",
+        path.stem,
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_BLOCKING_FINDING
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert "archon-timeout: invalid" in output.out
+    assert "nodes[0].timeout" in output.out
+    assert "Archon timeout semantics are not enforceable in Phase 1" in output.out
+
+
+def test_module_entrypoint_propagates_blocking_doctor_exit(
+    tmp_path, workflow_writer
+):
+    """Catch a top-level dispatcher that discards a workflow handler status."""
+    workdir = tmp_path / "repo"
+    path = workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="sample",
+        nodes=[{"id": "start", "bash": "true", "timeout": 1_000}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+
+    completed, *_ = _run_packaged_schema(
+        tmp_path,
+        [
+            "workflow",
+            "--workdir",
+            str(workdir),
+            "doctor",
+            "sample",
+            "--mode",
+            "foreground",
+            "--compat-report",
+            "--json",
+        ],
+    )
+
+    assert completed.returncode == machine_contract.EXIT_BLOCKING_FINDING
+    assert json.loads(completed.stdout)["error"]["code"] == (
+        "blocking_doctor_findings"
+    )
+
+
+@pytest.mark.parametrize(
+    ("sidecar", "definition", "expected_code"),
+    [
+        (
+            "language_compatibility: unsupported-profile\n",
+            {},
+            "workflow_language_profile_unsupported",
+        ),
+        (
+            "language_compatibility: archon-2026-07\n",
+            {"future_archon_option": True},
+            "archon_unknown_top_level_field",
+        ),
+    ],
+    ids=["unsupported-profile", "unknown-archon-top-level"],
+)
+def test_json_load_failures_preserve_typed_workflow_issue_codes(
+    workflow_writer, tmp_path, capsys, sidecar, definition, expected_code
+):
+    """Catch a generic invalid_request envelope that hides load diagnostics."""
+    path = workflow_writer(
+        tmp_path / ".hermes" / "workflows",
+        name="typed-load-error",
+        **definition,
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        sidecar, encoding="utf-8"
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(tmp_path),
+        "validate",
+        path.stem,
+        "--json",
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_INVOCATION
+    envelope = _json_envelope(capsys)
+    assert envelope["error"]["code"] == expected_code
+    assert envelope["error"]["details"]["issues"][0]["code"] == expected_code
+
+
+def test_doctor_text_renders_sanitized_finding_code_path_and_migration(
+    workflow_writer, tmp_path, capsys
+):
+    """Catch doctor text that omits actionable safe finding diagnostics."""
+    path = _archon_package(
+        workflow_writer, tmp_path, field="timeout", value=1_000
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(tmp_path),
+        "--hermes-home",
+        str(tmp_path / "profile"),
+        "doctor",
+        path.stem,
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_BLOCKING_FINDING
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert "archon_timeout_semantics_unavailable" in output.out
+    assert "nodes[0].timeout" in output.out
+    assert "Remove timeout or wait for Phase 3 timeout semantics." in output.out
+    assert "SECRET_BODY" not in output.out
+    assert str(tmp_path) not in output.out
+
+
+def _doctor_text_payload(findings):
+    return {
+        "name": "sample",
+        "package_digest": "package-digest",
+        "risk_summary": {
+            "risk_digest": "risk-digest",
+            "execution_environment": "trusted_local",
+        },
+        "compatibility": "mapped",
+        "language": {"effective_profile": "hermes-legacy"},
+        "remediation": "Review diagnostics.",
+        "findings": findings,
+    }
+
+
+def test_doctor_text_bounds_finding_diagnostics_to_machine_projection_limit(
+    capsys, monkeypatch
+):
+    """Catch unbounded human output from an oversized finding collection."""
+    findings = [
+        {
+            "code": f"attacker-finding-{index}",
+            "path": f"nodes[{index}].option",
+            "migration": "Remove unsupported option.",
+        }
+        for index in range(201)
+    ]
+    monkeypatch.setattr(
+        "plugins.workflow.cli._doctor_payload",
+        lambda *_args, **_kwargs: _doctor_text_payload(findings),
+    )
+    monkeypatch.setattr("plugins.workflow.cli._resolve", lambda *_args: object())
+    args = _parser().parse_args(["doctor", "sample"])
+
+    assert args.func(args) == 0
+    output = capsys.readouterr().out
+    assert output.count("attacker-finding-") == 200
+    assert "attacker-finding-199" in output
+    assert "attacker-finding-200" not in output
+    assert "truncated after 200 findings" in output
+
+
+@pytest.mark.parametrize(
+    ("unsafe_path", "leaked_fragments"),
+    [
+        ("/private/workflows/secret.yaml", ("secret.yaml",)),
+        (r"C:\Users\alice\secret.yaml", ("secret.yaml",)),
+        (r"\\server\share\secret.yaml", ("secret.yaml",)),
+        (
+            "/private/workflows/secret file.yaml",
+            ("secret file.yaml", "secret", "file.yaml"),
+        ),
+        (
+            r"C:\Users\alice\secret file.yaml",
+            ("secret file.yaml", "secret", "file.yaml"),
+        ),
+        (
+            r"\\server\share\secret file.yaml",
+            ("secret file.yaml", "secret", "file.yaml"),
+        ),
+    ],
+    ids=[
+        "posix",
+        "windows-drive",
+        "windows-unc",
+        "posix-space",
+        "windows-drive-space",
+        "windows-unc-space",
+    ],
+)
+def test_doctor_text_redacts_cross_platform_absolute_finding_paths(
+    unsafe_path, leaked_fragments, capsys, monkeypatch
+):
+    """Catch OS-specific absolute paths that escape doctor text sanitization."""
+    findings = [
+        {
+            "code": "attacker-controlled-finding",
+            "path": f"sidecar.delivery_defaults.inputs.{unsafe_path}",
+            "migration": "Use a portable relative input name.",
+        }
+    ]
+    monkeypatch.setattr(
+        "plugins.workflow.cli._doctor_payload",
+        lambda *_args, **_kwargs: _doctor_text_payload(findings),
+    )
+    monkeypatch.setattr("plugins.workflow.cli._resolve", lambda *_args: object())
+    args = _parser().parse_args(["doctor", "sample"])
+
+    assert args.func(args) == 0
+    output = capsys.readouterr().out
+    assert "attacker-controlled-finding" in output
+    assert "Use a portable relative input name." in output
+    assert unsafe_path not in output
+    assert "[REDACTED_PATH]" in output
+    for fragment in leaked_fragments:
+        assert fragment not in output
+
+
+def test_module_entrypoint_treats_none_returning_plugins_handler_as_success(tmp_path):
+    """Catch SystemExit(None) or a changed non-workflow handler exit contract."""
+    home = tmp_path / "home"
+    hermes_home = tmp_path / "hermes-home"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "plugins",
+            "list",
+            "--plain",
+            "--no-bundled",
+        ],
+        cwd=Path(__file__).parents[3],
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "HERMES_HOME": str(hermes_home),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
+    "declared_profile",
+    [None, "hermes-legacy"],
+    ids=["unversioned", "explicit-legacy"],
+)
+def test_legacy_timeout_and_retry_validate_trust_and_run_with_warnings(
+    workflow_writer, tmp_path, capsys, declared_profile
+):
+    path = workflow_writer(
+        tmp_path / ".hermes" / "workflows",
+        name="legacy-timeout-retry",
+        filename="legacy-timeout-retry.yaml",
+        nodes=[
+            {
+                "id": "start",
+                "bash": "true",
+                "timeout": 1,
+                "retry": {"max_attempts": 2},
+            }
+        ],
+    )
+    if declared_profile is not None:
+        path.with_name(f"{path.stem}.hermes.yaml").write_text(
+            f"language_compatibility: {declared_profile}\n", encoding="utf-8"
+        )
+    home = tmp_path / "home"
+    common = ["--workdir", str(tmp_path), "--hermes-home", str(home)]
+    parser = _parser()
+
+    validate = parser.parse_args([*common, "validate", path.stem, "--json"])
+    assert validate.func(validate) == 0
+    validation = _json_result(capsys)
+    assert validation["language"]["effective_profile"] == "hermes-legacy"
+    assert {
+        issue["code"] for issue in validation["issues"]
+    } >= {"legacy_timeout_seconds", "legacy_retry_total_attempts"}
+
+    package = load_workflow(path)
+    digest = compute_package_digest(package).sha256
+    trust = parser.parse_args(
+        [*common, "trust", path.stem, "--digest", digest, "--json"]
+    )
+    assert trust.func(trust) == 0
+    assert _json_result(capsys)["status"] == "trusted"
+
+    run = parser.parse_args(
+        [
+            *common,
+            "run",
+            path.stem,
+            "--foreground",
+            "--idempotency-key",
+            f"legacy-{declared_profile or 'unversioned'}",
+            "--json",
+        ]
+    )
+    assert run.func(run) == 0
+    assert _json_result(capsys)["status"] == "succeeded"
 
 
 def test_plugin_registers_cli_command_and_background_coordinator():
@@ -149,6 +600,278 @@ def test_cli_module_has_no_agent_provider_network_or_mcp_runtime_imports():
         if isinstance(node, ast.ImportFrom) and node.module
     )
     assert imports.isdisjoint({"run_agent", "model_tools", "mcp", "requests", "httpx"})
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_profile"),
+    [
+        (["schema", "--json"], "archon-2026-07"),
+        (["schema", "--profile", "hermes-legacy", "--json"], "hermes-legacy"),
+    ],
+)
+def test_schema_json_selects_profile_without_workflow_discovery(
+    arguments, expected_profile, tmp_path, capsys, monkeypatch
+):
+    workdir = tmp_path / "missing-workflow-directory"
+    profile = tmp_path / "missing-profile-directory"
+
+    def unexpected_call(*_args, **_kwargs):
+        raise AssertionError("schema must not discover workflows or call runtimes")
+
+    monkeypatch.setattr("plugins.workflow.cli._discover", unexpected_call)
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(profile),
+        *arguments,
+    ])
+
+    assert args.func(args, agent_runner=unexpected_call) == 0
+    output = capsys.readouterr()
+    contract = json.loads(output.out)
+    assert output.err == ""
+    assert contract["profile"] == expected_profile
+    assert not workdir.exists()
+    assert not profile.exists()
+
+
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+def test_schema_json_emits_the_complete_authoring_envelope_unchanged(
+    profile, capsys
+):
+    args = _parser().parse_args(["schema", "--profile", profile.value, "--json"])
+
+    assert args.func(args) == 0
+    emitted = json.loads(capsys.readouterr().out)
+
+    assert emitted == workflow_authoring_contract(profile)
+    assert emitted["contract_digest"].startswith("sha256:")
+    assert emitted["node_kinds"]
+    assert emitted["semantic_rules"]
+
+
+def test_schema_json_is_compact_and_byte_deterministic(capsys):
+    parser = _parser()
+
+    first = parser.parse_args(["schema", "--json"])
+    assert first.func(first) == 0
+    first_output = capsys.readouterr().out
+    second = parser.parse_args(["schema", "--json"])
+    assert second.func(second) == 0
+    second_output = capsys.readouterr().out
+
+    assert first_output == second_output
+    assert first_output.count("\n") == 1
+    assert ": " not in first_output
+
+
+def test_schema_text_is_indented_json(capsys):
+    args = _parser().parse_args(["schema", "--profile", "hermes-legacy"])
+
+    assert args.func(args) == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert json.loads(output.out)["profile"] == "hermes-legacy"
+    assert '\n  "compatibility_codes"' in output.out
+
+
+@pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
+def test_packaged_schema_command_is_read_only_before_normal_startup(
+    tmp_path, json_mode
+):
+    """The exact packaged introspection path must not initialize Hermes."""
+    arguments = [
+        "workflow",
+        "schema",
+        "--profile",
+        "archon-2026-07",
+    ]
+    if json_mode:
+        arguments.append("--json")
+
+    completed, before, after, home, hermes_home = _run_packaged_schema(
+        tmp_path, arguments
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout)["profile"] == "archon-2026-07"
+    if json_mode:
+        assert completed.stdout.count("\n") == 1
+        assert ": " not in completed.stdout
+    else:
+        assert '\n  "compatibility_codes"' in completed.stdout
+    assert before == ((), ())
+    assert after == before
+    assert not home.exists()
+    assert not hermes_home.exists()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--definitely-unknown", "workflow", "schema", "--json"],
+        ["workflow", "--definitely-unknown", "schema", "--json"],
+    ],
+    ids=["global", "workflow-root"],
+)
+def test_packaged_schema_rejects_unknown_precommand_once_without_startup(
+    tmp_path, arguments
+):
+    completed, before, after, home, hermes_home = _run_packaged_schema(
+        tmp_path, arguments
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr.count("usage: hermes") == 1
+    assert completed.stderr.count("error:") == 1
+    assert "unrecognized arguments: --definitely-unknown" in completed.stderr
+    assert '"schema_version"' not in completed.stderr
+    assert before == after == ((), ())
+    assert not home.exists()
+    assert not hermes_home.exists()
+
+
+def test_packaged_schema_help_is_read_only_argparse_output(tmp_path):
+    completed, before, after, home, hermes_home = _run_packaged_schema(
+        tmp_path, ["workflow", "schema", "--help"]
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    assert completed.stdout.count("usage: hermes workflow schema") == 1
+    assert "--profile {hermes-legacy,archon-2026-07}" in completed.stdout
+    assert "--json" in completed.stdout
+    assert before == after == ((), ())
+    assert not home.exists()
+    assert not hermes_home.exists()
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (
+            ["workflow", "schema", "--profile", "future-profile"],
+            "invalid choice: 'future-profile'",
+        ),
+        (
+            ["workflow", "schema", "--profile"],
+            "argument --profile: expected one argument",
+        ),
+        (
+            ["workflow", "schema", "--definitely-child", "--json"],
+            "unrecognized arguments: --definitely-child",
+        ),
+    ],
+    ids=["invalid-profile", "missing-profile", "unknown-child"],
+)
+def test_packaged_schema_parse_errors_are_single_and_read_only(
+    tmp_path, arguments, message
+):
+    completed, before, after, home, hermes_home = _run_packaged_schema(
+        tmp_path, arguments
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr.count("usage: hermes") == 1
+    assert completed.stderr.count("error:") == 1
+    assert message in completed.stderr
+    assert before == after == ((), ())
+    assert not home.exists()
+    assert not hermes_home.exists()
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_profile"),
+    [
+        (
+            [
+                "--profile",
+                "default",
+                "workflow",
+                "schema",
+                "--profile",
+                "hermes-legacy",
+                "--json",
+            ],
+            "hermes-legacy",
+        ),
+        (
+            [
+                "workflow",
+                "--profile",
+                "default",
+                "schema",
+                "--profile",
+                "archon-2026-07",
+                "--json",
+            ],
+            "archon-2026-07",
+        ),
+        (
+            [
+                "workflow",
+                "schema",
+                "--profile",
+                "hermes-legacy",
+                "--json",
+                "-p",
+                "default",
+            ],
+            "hermes-legacy",
+        ),
+    ],
+    ids=["global-before-command", "global-before-action", "global-after-child"],
+)
+def test_packaged_schema_keeps_global_and_child_profiles_distinct(
+    tmp_path, arguments, expected_profile
+):
+    completed, before, after, home, hermes_home = _run_packaged_schema(
+        tmp_path, arguments
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout)["profile"] == expected_profile
+    assert before == after == ((), ())
+    assert not home.exists()
+    assert not hermes_home.exists()
+
+
+@pytest.mark.parametrize("version_flag", ["--version", "-V"])
+def test_packaged_schema_defers_to_normal_version_precedence(tmp_path, version_flag):
+    completed, before, after, home, hermes_home = _run_packaged_schema(
+        tmp_path, [version_flag, "workflow", "schema", "--json"]
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert "Install directory:" in completed.stdout
+    assert '"schema_version"' not in completed.stdout
+    assert before == ((), ())
+    assert after != before
+    assert not home.exists()
+    assert hermes_home.exists()
+
+
+@pytest.mark.parametrize("oneshot_flag", ["--oneshot", "-z"])
+def test_packaged_schema_defers_to_normal_oneshot_precedence(tmp_path, oneshot_flag):
+    completed, before, after, home, hermes_home = _run_packaged_schema(
+        tmp_path,
+        [oneshot_flag, "precedence probe", "workflow", "schema", "--json"],
+    )
+
+    assert completed.returncode == 1
+    assert '"schema_version"' not in completed.stdout
+    assert '"schema_version"' not in completed.stderr
+    assert "forbidden runtime import:" in completed.stderr
+    assert before == ((), ())
+    assert after != before
+    assert not home.exists()
+    assert hermes_home.exists()
 
 
 def test_list_and_show_json_are_stable_and_redacted(workflow_writer, tmp_path, capsys):
@@ -228,9 +951,7 @@ def test_cleanup_cli_is_preview_only_until_exact_token_is_executed(
     workflow_writer, tmp_path, capsys
 ) -> None:
     profile = tmp_path / "profile"
-    package = load_workflow(
-        workflow_writer(tmp_path / "package", name="cleanup-cli")
-    )
+    package = load_workflow(workflow_writer(tmp_path / "package", name="cleanup-cli"))
     store = RunStore(profile)
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -269,6 +990,67 @@ def test_cleanup_cli_is_preview_only_until_exact_token_is_executed(
     assert store.list_runs() == ()
 
 
+def test_resume_authenticates_always_run_before_mutating_durable_state(
+    workflow_writer, tmp_path, capsys
+) -> None:
+    home = tmp_path / "profile"
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "resume-package",
+            name="resume-authentication",
+            nodes=[
+                {"id": "cached", "bash": "true"},
+                {
+                    "id": "fail",
+                    "bash": "false",
+                    "depends_on": ["cached"],
+                },
+            ],
+        )
+    )
+    store = RunStore(home)
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="resume-authentication",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    scheduler = RunScheduler(store)
+    try:
+        assert scheduler.advance(admitted.run_id)["status"] == "failed"
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+    before = store.get_run_status(admitted.run_id)
+    definition_path = store.run_directory(admitted.run_id) / "definition.yaml"
+    definition = yaml.safe_load(definition_path.read_text(encoding="utf-8"))
+    definition["nodes"][0]["always_run"] = True
+    definition_path.write_text(
+        yaml.safe_dump(definition, sort_keys=False), encoding="utf-8"
+    )
+
+    args = _parser().parse_args([
+        "--hermes-home",
+        str(home),
+        "resume",
+        admitted.run_id,
+        "--json",
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_INVOCATION
+    assert _json_envelope(capsys)["error"]["code"] == (
+        "workflow_snapshot_integrity_mismatch"
+    )
+    assert store.get_run_status(admitted.run_id) == before
+
+
 def test_validate_doctor_trust_and_untrust(workflow_writer, tmp_path, capsys):
     workdir = tmp_path / "repo"
     path = _write(workflow_writer, workdir)
@@ -278,12 +1060,32 @@ def test_validate_doctor_trust_and_untrust(workflow_writer, tmp_path, capsys):
 
     args = parser.parse_args([*common, "validate", "sample", "--json"])
     assert args.func(args) == 0
-    assert _json_result(capsys)["valid"] is True
+    validation = _json_result(capsys)
+    assert validation["valid"] is True
+    assert validation["language"] == {
+        "declared_profile": None,
+        "effective_profile": "hermes-legacy",
+        "normalizer_version": 1,
+        "normalized_definition_digest": load_workflow(
+            path
+        ).language.normalized_definition_digest,
+        "legacy": True,
+    }
 
     args = parser.parse_args([*common, "doctor", "sample", "--compat-report", "--json"])
     assert args.func(args) == 0
     doctor = _json_result(capsys)
     assert doctor["package_digest"]
+    assert doctor["language"] == validation["language"]
+    legacy = next(
+        finding
+        for finding in doctor["findings"]
+        if finding["code"] == "legacy_language_profile"
+    )
+    assert legacy["severity"] == "warning"
+    assert legacy["effective_profile"] == "hermes-legacy"
+    assert legacy["migration"]
+    assert doctor["compatibility_findings"] == doctor["findings"]
     assert "SECRET_BODY" not in json.dumps(doctor)
 
     args = parser.parse_args([
@@ -315,6 +1117,24 @@ def test_validate_doctor_trust_and_untrust(workflow_writer, tmp_path, capsys):
     args = parser.parse_args([*common, "untrust", "sample", "--json"])
     assert args.func(args) == 0
     assert _json_result(capsys)["status"] == "untrusted"
+
+
+def test_validate_and_doctor_text_include_effective_language_profile(
+    workflow_writer, tmp_path, capsys
+):
+    workdir = tmp_path / "repo"
+    _write(workflow_writer, workdir)
+    profile = tmp_path / "profile"
+    parser = _parser()
+    common = ["--workdir", str(workdir), "--hermes-home", str(profile)]
+
+    validate_args = parser.parse_args([*common, "validate", "sample"])
+    assert validate_args.func(validate_args) == 0
+    assert "Language: hermes-legacy" in capsys.readouterr().out
+
+    doctor_args = parser.parse_args([*common, "doctor", "sample"])
+    assert doctor_args.func(doctor_args) == 0
+    assert "Language: hermes-legacy" in capsys.readouterr().out
 
 
 def test_trust_rejects_package_mutation_during_admission(
@@ -470,9 +1290,9 @@ def test_foreground_cli_releases_at_gate_and_claims_new_epoch_for_continue(
     assert start_args.func(start_args) == 0
     paused = _json_result(capsys)
     assert paused["status"] == "paused"
-    assert datetime.fromisoformat(paused["foreground_lease_expires_at"]) <= datetime.now(
-        timezone.utc
-    )
+    assert datetime.fromisoformat(
+        paused["foreground_lease_expires_at"]
+    ) <= datetime.now(timezone.utc)
 
     approve_args = parser.parse_args([
         *common,
@@ -590,17 +1410,15 @@ def test_run_refuses_trusted_package_that_requires_an_isolated_backend(
     WorkflowTrustStore(profile).trust(
         digest.sha256, actor="test", risk_digest=risk.risk_digest
     )
-    args = _parser().parse_args(
-        [
-            "--workdir",
-            str(workdir),
-            "--hermes-home",
-            str(profile),
-            "run",
-            "sample",
-            "--json",
-        ]
-    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(profile),
+        "run",
+        "sample",
+        "--json",
+    ])
 
     assert args.func(args) == machine_contract.EXIT_AUTHORIZATION
     assert _json_envelope(capsys)["error"]["code"] == "trust_required"
@@ -638,7 +1456,14 @@ def test_json_failures_use_stable_envelopes_and_exit_categories(
     assert envelope["command"] == "workflow status"
     assert envelope["error"]["code"] == "not_found"
 
-    invalid = parser.parse_args([*common, "events", "missing-run", "--tail", "0", "--json"])
+    invalid = parser.parse_args([
+        *common,
+        "events",
+        "missing-run",
+        "--tail",
+        "0",
+        "--json",
+    ])
     assert invalid.func(invalid) == 2
     assert _json_envelope(capsys)["error"]["code"] == "invalid_request"
 
@@ -696,15 +1521,13 @@ def test_os_error_is_sanitized(tmp_path, capsys, monkeypatch) -> None:
         "plugins.workflow.cli._cmd_status",
         lambda _args: (_ for _ in ()).throw(OSError(private_path)),
     )
-    args = _parser().parse_args(
-        [
-            "--hermes-home",
-            str(tmp_path / "profile"),
-            "status",
-            "run",
-            "--json",
-        ]
-    )
+    args = _parser().parse_args([
+        "--hermes-home",
+        str(tmp_path / "profile"),
+        "status",
+        "run",
+        "--json",
+    ])
 
     assert args.func(args) == machine_contract.EXIT_ACTION_FAILED
     output = capsys.readouterr()
@@ -723,9 +1546,7 @@ def test_runs_json_reports_sanitized_keyset_truncation(
     tmp_path, capsys, workflow_writer
 ) -> None:
     profile = tmp_path / "profile"
-    package = load_workflow(
-        workflow_writer(tmp_path / "package", name="runs-page")
-    )
+    package = load_workflow(workflow_writer(tmp_path / "package", name="runs-page"))
     store = RunStore(
         profile,
         max_executing_runs=10,
@@ -861,6 +1682,7 @@ def test_invalid_workflow_validation_uses_documented_blocking_exit(
         "plugins.workflow.cli.validate_package",
         lambda _package: (
             ValidationIssue("nodes", "invalid", "invalid workflow", blocking=True),
+            ValidationIssue("nodes", "invalid", "invalid workflow", blocking=True),
         ),
     )
     args = _parser().parse_args([
@@ -875,6 +1697,11 @@ def test_invalid_workflow_validation_uses_documented_blocking_exit(
     envelope = _json_envelope(capsys)
     assert envelope["ok"] is False
     assert envelope["error"]["code"] == "validation_failed"
+    identities = {
+        (issue["code"], issue["path"])
+        for issue in envelope["result"]["issues"]
+    }
+    assert len(envelope["result"]["issues"]) == len(identities)
 
 
 def test_machine_start_requires_stable_key_and_background_owner(

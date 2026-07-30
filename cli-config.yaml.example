@@ -391,7 +391,10 @@ browser:
   #     kind: enrolled
   #     executable: auto        # auto-resolves OS-installed Edge, then Chrome
   #     user_data_dir: "${HERMES_HOME}/browser-profiles/enrolled"
-  #     cdp_port: 9222
+  #     cdp_port: 9333        # NOT 9222 -- that is /browser connect's port, and
+  #                           # sharing it would let a plain `/browser connect`
+  #                           # point every untrusted page at this browser.
+  #                           # `/browser connect` refuses enrolled ports.
   #     headed: true            # visible, so you can complete interactive sign-in
   #     trusted_origins:
   #       - "https://wiki.corp.example"

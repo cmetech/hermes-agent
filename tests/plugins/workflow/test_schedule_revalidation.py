@@ -541,6 +541,98 @@ def test_real_coordinator_revalidates_revoked_user_trust_before_any_claim(
         )
 
 
+def test_sealed_snapshot_revalidation_includes_language_identity(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, _package, run_id, _due, _coordinator, _identity, _epoch, _context = (
+        _admit_scheduled_user(
+            home,
+            workflow_writer,
+            name="scheduled-language-identity",
+            binding=binding,
+        )
+    )
+    run = store.load_run(run_id)
+    resources = json.loads(
+        (store.run_directory(run_id) / "resources.json").read_bytes()
+    )
+    assert run["language"] == resources["language"]
+    assert run["sealed_snapshot_digest"] == run["run_metadata"][
+        "sealed_snapshot_digest"
+    ]
+    changed = dict(run)
+    changed["language"] = {
+        **run["language"],
+        "semantic_fingerprint": "0" * 64,
+    }
+
+    with pytest.raises(
+        scheduled_revalidation_module.ScheduledRunRevalidationError,
+        match="language identity changed",
+    ):
+        scheduled_revalidation_module.verify_sealed_snapshot(
+            changed,
+            run_directory=store.run_directory(run_id),
+        )
+
+    changed = dict(run)
+    changed["sealed_snapshot_digest"] = "0" * 64
+    with pytest.raises(
+        scheduled_revalidation_module.ScheduledRunRevalidationError,
+        match="snapshot identity changed",
+    ):
+        scheduled_revalidation_module.verify_sealed_snapshot(
+            changed,
+            run_directory=store.run_directory(run_id),
+        )
+
+
+def test_coordinator_poll_before_fire_does_not_reopen_installed_workflow(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, package, run_id, due, coordinator, identity, epoch, _context = (
+        _admit_scheduled_user(
+            home,
+            workflow_writer,
+            name="scheduled-poll-sealed-only",
+            binding=binding,
+        )
+    )
+    package.workflow_path.unlink()
+    observed = due - timedelta(seconds=1)
+    scheduler = RunScheduler(
+        store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=lambda: observed,
+    )
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(
+            host_kind="web",
+            host_instance_id="schedule-revalidation-test",
+        ),
+        hermes_home=home,
+        utcnow=lambda: observed,
+        runner_binding=binding,
+    )
+    try:
+        service._sweep_once(store, coordinator, identity, epoch, scheduler)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert store.load_run(run_id)["status"] == "queued"
+
+
 @pytest.mark.parametrize("trust_change", ["revoked", "risk-changed"])
 def test_restarted_coordinator_requires_current_exact_user_trust(
     tmp_path: Path,
@@ -1188,6 +1280,68 @@ def test_crash_after_revalidation_before_promotion_revalidates_after_restart(
     )
 
 
+def test_fire_time_revalidation_and_package_prep_share_one_resource_budget(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, _package, run_id, due, _coordinator, identity, epoch, _context = (
+        _admit_scheduled_user(
+            home,
+            workflow_writer,
+            name="scheduled-shared-resource-budget",
+            binding=binding,
+        )
+    )
+    observed: list[object] = []
+    original_verify = scheduled_revalidation_module.verify_sealed_snapshot
+    original_revalidate = scheduled_revalidation_module.revalidate_scheduled_run
+
+    def record_verify(*args, **kwargs):
+        observed.append(kwargs.get("read_budget"))
+        return original_verify(*args, **kwargs)
+
+    def record_revalidate(*args, **kwargs):
+        observed.append(kwargs.get("read_budget"))
+        return original_revalidate(*args, **kwargs)
+
+    monkeypatch.setattr(
+        scheduled_revalidation_module,
+        "verify_sealed_snapshot",
+        record_verify,
+    )
+    monkeypatch.setattr(
+        scheduled_revalidation_module,
+        "revalidate_scheduled_run",
+        record_revalidate,
+    )
+    scheduler = RunScheduler(
+        store,
+        runner_binding=binding,
+        execution_fence=ExecutionFence(identity.owner_id, epoch),
+        utcnow=lambda: due,
+    )
+    original_load = scheduler._load_verified_run_package
+
+    def record_load(target_run_id, *, read_budget=None):
+        observed.append(read_budget)
+        return original_load(target_run_id, read_budget=read_budget)
+
+    monkeypatch.setattr(scheduler, "_load_verified_run_package", record_load)
+    try:
+        result = scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert result["status"] == "succeeded"
+    assert observed
+    assert observed[0] is not None
+    assert {id(budget) for budget in observed} == {id(observed[0])}
+
+
 def test_crash_after_promotion_before_claim_continues_correlated_run_once(
     tmp_path: Path,
     monkeypatch,
@@ -1286,12 +1440,12 @@ def test_live_trust_change_after_package_load_fails_at_atomic_promotion(
         execution_fence=ExecutionFence(identity.owner_id, epoch),
         utcnow=lambda: due,
     )
-    original_load = scheduler._load_run_package
+    original_load = scheduler._load_verified_run_package
     mutated = False
 
-    def load_then_revoke(loaded_run_id: str):
+    def load_then_revoke(loaded_run_id: str, *, read_budget=None):
         nonlocal mutated
-        sealed = original_load(loaded_run_id)
+        sealed = original_load(loaded_run_id, read_budget=read_budget)
         if not mutated:
             mutated = True
             assert WorkflowTrustStore(home).revoke(
@@ -1299,7 +1453,9 @@ def test_live_trust_change_after_package_load_fails_at_atomic_promotion(
             )
         return sealed
 
-    monkeypatch.setattr(scheduler, "_load_run_package", load_then_revoke)
+    monkeypatch.setattr(
+        scheduler, "_load_verified_run_package", load_then_revoke
+    )
     try:
         if batch:
             result = scheduler.advance_all([run_id])[run_id]
@@ -1540,7 +1696,7 @@ def test_package_preparation_error_without_server_authorization_propagates(
     def fail_load(_run_id: str):
         raise RuntimeError("ordinary package load failure")
 
-    monkeypatch.setattr(scheduler, "_load_run_package", fail_load)
+    monkeypatch.setattr(scheduler, "_load_verified_run_package", fail_load)
     try:
         with pytest.raises(RuntimeError, match="ordinary package load failure"):
             scheduler._prepare_run_package("ordinary-or-legacy", None)
@@ -1671,7 +1827,7 @@ def _admit_resource_rich_scheduled_user(
                 "id": "inspect",
                 "command": "inspect",
                 "skills": ["parent-skill"],
-                "mcp": "mcp/echo.yaml",
+                "mcp": "echo",
                 "agents": {
                     "reviewer": {
                         "description": "review",
@@ -1771,6 +1927,46 @@ def test_every_execution_readable_sealed_resource_is_revalidated(
             ).fetchone()[0]
             == 0
         )
+
+
+@pytest.mark.parametrize(
+    ("shadow_relative", "content"),
+    [
+        pytest.param(
+            "scripts/helper",
+            "print('unsealed script shadow')\n",
+            id="script-extensionless",
+        ),
+        pytest.param(
+            "mcp/echo",
+            "command: python\nargs: [-c, 'print(2)']\n",
+            id="mcp-extensionless",
+        ),
+    ],
+)
+def test_scheduled_revalidation_rejects_unsealed_resource_precedence_shadow(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_writer,
+    shadow_relative: str,
+    content: str,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = _binding()
+    store, run_id, due, identity, epoch = _admit_resource_rich_scheduled_user(
+        home,
+        workflow_writer,
+        monkeypatch,
+        binding=binding,
+    )
+    shadow = store.run_directory(run_id) / shadow_relative
+    shadow.write_text(content, encoding="utf-8")
+
+    failed = _advance_with_binding(store, run_id, due, identity, epoch, binding)
+
+    assert failed["status"] == "failed"
+    assert failed["last_error"]["code"] == "schedule_revalidation_failed"
 
 
 def _admit_scheduled_project(

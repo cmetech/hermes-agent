@@ -52,7 +52,10 @@ from plugins.workflow.runner_binding import (
     background_execution_context,
     production_workflow_runner_binding,
 )
-from plugins.workflow.scheduled_revalidation import sealed_snapshot_digest
+from plugins.workflow.scheduled_revalidation import (
+    sealed_snapshot_digest,
+    verify_sealed_snapshot,
+)
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
@@ -689,6 +692,10 @@ def test_future_schedule_is_queued_with_server_owned_identity_and_no_execution(
         "sealed_snapshot_digest": sealed_snapshot_digest(run_directory),
     }
     assert all(node["state"] == "ready" for node in run["nodes"].values())
+    state = run_directory / "legacy-schedule-state.txt"
+    state.write_text("legacy schedule state\n", encoding="utf-8")
+    verify_sealed_snapshot(run, run_directory=run_directory)
+    assert state.read_text(encoding="utf-8") == "legacy schedule state\n"
     with store._connect() as connection:
         row = connection.execute(
             "SELECT status, scheduled_at FROM runs WHERE run_id=?",
@@ -1558,7 +1565,7 @@ def test_post_runs_changed_authenticated_fixture_identity_conflicts_without_raw_
     assert status["input_manifest_digest"] == captured_requests[0].input_manifest_digest
 
 
-def test_post_runs_rejects_environment_incompatible_showcase_before_persistence(
+def test_post_runs_maps_shared_compatibility_refusal_to_conflict_before_persistence(
     tmp_path, monkeypatch
 ) -> None:
     home = tmp_path / "home"
@@ -3314,6 +3321,54 @@ def test_attention_surfaces_run_scoped_notification_repair_damage(
     assert item["health"] == "storage_degraded"
     assert item["cause"] == "notification_reconciliation_unverified"
     assert "events.jsonl" not in response.text
+
+
+def test_resume_authenticates_always_run_before_desktop_mutation(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "resume-package",
+            name="desktop-resume-authentication",
+            nodes=[
+                {"id": "cached", "bash": "true"},
+                {
+                    "id": "fail",
+                    "bash": "false",
+                    "depends_on": ["cached"],
+                },
+            ],
+        )
+    )
+    store = RunStore(home)
+    admitted = _start(store, package, "desktop-resume-authentication")
+    scheduler = RunScheduler(store)
+    try:
+        assert scheduler.advance(admitted.run_id)["status"] == "failed"
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+    before = store.get_run_status(admitted.run_id)
+    definition_path = store.run_directory(admitted.run_id) / "definition.yaml"
+    definition = yaml.safe_load(definition_path.read_text(encoding="utf-8"))
+    definition["nodes"][0]["always_run"] = True
+    definition_path.write_text(
+        yaml.safe_dump(definition, sort_keys=False), encoding="utf-8"
+    )
+    module = _module()
+
+    with TestClient(_app(module.router)) as client:
+        response = client.post(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/resume",
+            json={"expected_version": before["state_version"]},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == (
+        "workflow_snapshot_integrity_mismatch"
+    )
+    assert store.get_run_status(admitted.run_id) == before
 
 
 def test_corrupted_run_rejects_mutation_with_typed_error(

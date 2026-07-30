@@ -13,7 +13,11 @@ from plugins.workflow.models import (
 from plugins.workflow.schema import load_workflow
 
 _PARSE_CACHE: dict[
-    tuple[str, str, int], tuple[tuple[int, int, str], WorkflowPackage]
+    tuple[str, str, int],
+    tuple[
+        tuple[tuple[int, int, str], tuple[bool, int, int, str]],
+        WorkflowPackage,
+    ],
 ] = {}
 _PROFILE_STATE_DIRECTORIES = frozenset({"runs", ".staging", ".quarantine", ".locks"})
 
@@ -49,7 +53,19 @@ def _load_cached(path: Path, *, source: str, precedence: int) -> WorkflowPackage
     resolved = path.resolve(strict=True)
     stat = resolved.stat()
     digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
-    signature = (stat.st_size, stat.st_mtime_ns, digest)
+    workflow_identity = (stat.st_size, stat.st_mtime_ns, digest)
+    companion = resolved.with_name(f"{resolved.stem}.hermes.yaml")
+    if companion.is_file():
+        companion_stat = companion.stat()
+        companion_identity = (
+            True,
+            companion_stat.st_size,
+            companion_stat.st_mtime_ns,
+            hashlib.sha256(companion.read_bytes()).hexdigest(),
+        )
+    else:
+        companion_identity = (False, 0, 0, "")
+    signature = (workflow_identity, companion_identity)
     key = (str(resolved), source, precedence)
     cached = _PARSE_CACHE.get(key)
     if cached is not None and cached[0] == signature:

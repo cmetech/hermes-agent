@@ -1833,6 +1833,13 @@ export const en: Translations = {
     workflowUntrusted: 'untrusted',
     workflowVerifiedBundle: 'verified bundle',
     workflowIncompatible: 'Incompatible',
+    workflowLanguage: 'Workflow language',
+    workflowLanguageArchon: 'Archon 2026-07',
+    workflowLanguageLegacy: 'Legacy semantics',
+    workflowLanguageLegacyDescription:
+      'Existing Hermes behavior is preserved. Review compatibility findings before migrating to Archon 2026-07.',
+    workflowLanguageNormalizer: 'Normalizer',
+    workflowLanguageDigest: 'Normalized digest',
     workflowRequiresAi: 'Runs AI inference through your configured model provider',
     workflowNoInputs: 'No inputs',
     workflowInputCount: count => `${count} input${count === 1 ? '' : 's'}`,

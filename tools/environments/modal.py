@@ -407,7 +407,8 @@ class ModalEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
-                  stdin_data: str | None = None):
+                  stdin_data: str | None = None,
+                  clean: bool = False):
         """Return a _ThreadedProcessHandle wrapping an async Modal sandbox exec."""
         sandbox = self._sandbox
         worker = self._worker
@@ -418,11 +419,22 @@ class ModalEnvironment(BaseEnvironment):
         def exec_fn() -> tuple[str, int]:
             async def _do():
                 args = ["bash"]
-                if login:
+                if clean:
+                    args.extend(
+                        ["--noprofile", "--norc", "+x", "-c", cmd_string]
+                    )
+                elif login:
                     args.extend(["-l", "-c", cmd_string])
                 else:
                     args.extend(["-c", cmd_string])
-                process = await sandbox.exec.aio(*args, timeout=timeout)
+                kwargs = {"timeout": timeout}
+                if clean:
+                    kwargs["env"] = {
+                        "BASH_ENV": "/dev/null",
+                        "ENV": "/dev/null",
+                        "SHELLOPTS": "",
+                    }
+                process = await sandbox.exec.aio(*args, **kwargs)
                 stdout = await process.stdout.read.aio()
                 stderr = await process.stderr.read.aio()
                 exit_code = await process.wait.aio()

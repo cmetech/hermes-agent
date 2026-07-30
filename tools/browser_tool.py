@@ -50,6 +50,7 @@ Usage:
 """
 
 import atexit
+import contextlib
 import functools
 import json
 import logging
@@ -457,6 +458,69 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     return raw
 
 
+_ENROLLED_OVERRIDE_WARNED: set = set()
+
+
+def _reject_enrolled_override(raw: str, source: str) -> bool:
+    """OTTO: True when ``raw`` names a LOCAL enrolled browser and must be dropped.
+
+    THE SECOND DOOR (review finding CRIT-001). ``BROWSER_CDP_URL`` and
+    ``browser.cdp_url`` are process-global: once either is set,
+    ``_navigation_session_key`` returns the BARE task key for every URL and
+    ``_session_cdp_url`` falls through to the override. Pointed at the enrolled
+    browser that means an attacker-controlled public page is driven by the
+    browser holding live SSO cookies and the machine client certificate -- with
+    all six enrolled guard-forcing disjuncts inactive, because the key is not
+    ``::enrolled``. That is exactly the process-global leak per-navigation
+    routing was built to remove, reached through a different input.
+
+    "Nothing seeds it" was not true: the OpenClaw migration copies
+    ``browser.cdpUrl`` straight into ``browser.cdp_url``
+    (``optional-skills/migration/openclaw-migration/scripts/openclaw_to_hermes.py``).
+    And deliberate operator configuration is not an authority boundary -- a user
+    cannot be expected to infer that this global field defeats per-origin trust.
+
+    Dropping the override is deliberately BETTER than hard-failing: with no
+    override, normal routing resumes, so an origin the profile explicitly trusts
+    still reaches the real corporate browser on a guarded ``::enrolled`` key,
+    while everything else gets the throwaway browser. The user's intent survives;
+    the blanket authority does not.
+
+    Checked on the RAW value, BEFORE ``_resolve_cdp_override`` -- that helper
+    makes a discovery request, which we must not send to the corporate browser.
+    """
+    if not raw:
+        return False
+    try:
+        from tools.browser_profiles import enrolled_endpoint_owner
+
+        owner = enrolled_endpoint_owner(raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("enrolled override check skipped: %s", exc)
+        return False
+    if owner is None:
+        return False
+    # Once per (source, endpoint): this runs on every navigation. Capped so a
+    # process that somehow sees many distinct endpoints cannot grow it without
+    # bound; past the cap we simply warn again rather than stay silent.
+    marker = f"{source}:{raw}"
+    if marker not in _ENROLLED_OVERRIDE_WARNED:
+        if len(_ENROLLED_OVERRIDE_WARNED) < 64:
+            _ENROLLED_OVERRIDE_WARNED.add(marker)
+        logger.warning(
+            "Ignoring %s=%s: it points at %s. A process-global CDP endpoint "
+            "would make every page -- including untrusted public sites -- run in "
+            "the browser holding your live SSO session and client certificate. "
+            "Trusted origins still reach that browser through per-navigation "
+            "routing; remove this setting to silence this warning.",
+            source,
+            _sanitize_url_for_logs(raw),
+            f"the enrolled browser profile {owner!r}" if owner
+            else "the reserved enrolled-browser port",
+        )
+    return True
+
+
 def _get_cdp_override() -> str:
     """Return a normalized CDP URL override, or empty string.
 
@@ -467,9 +531,15 @@ def _get_cdp_override() -> str:
     When either is set, we skip both Browserbase and the local headless
     launcher and connect directly to the supplied Chrome DevTools Protocol
     endpoint.
+
+    OTTO: an override naming a LOCAL enrolled browser is DROPPED rather than
+    honoured -- see ``_reject_enrolled_override``. Ordinary throwaway and remote
+    CDP endpoints are unaffected, and env-over-config precedence is unchanged.
     """
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     if env_override:
+        if _reject_enrolled_override(env_override, "BROWSER_CDP_URL"):
+            return ""
         return _resolve_cdp_override(env_override)
 
     try:
@@ -478,11 +548,319 @@ def _get_cdp_override() -> str:
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
+            raw = str(browser_cfg.get("cdp_url", "") or "").strip()
+            if _reject_enrolled_override(raw, "browser.cdp_url"):
+                return ""
+            return _resolve_cdp_override(raw)
     except Exception as e:
         logger.debug("Could not read browser.cdp_url from config: %s", e)
 
     return ""
+
+
+# OTTO: memoized CDP endpoints for sessions driving an enrolled browser profile.
+# Memoization is load-bearing, not an optimization: browser_session_manager's
+# acquire() runs daemon hygiene (``close --all``), so calling it per tool
+# invocation would tear the browser down between navigate and click.
+_session_cdp_lock = threading.Lock()
+_session_cdp_urls: Dict[str, str] = {}
+
+# Per-key locks so exactly one thread acquires a given session's browser.
+# The dict lock alone is not enough: acquire() runs `close --all` hygiene, so a
+# second concurrent acquire tears down the first session mid-navigation (EBL-003).
+#
+# REF-COUNTED, never popped by key. Do NOT "fix" this with a bare
+# `_session_cdp_keylocks.pop(key)` on cleanup: that reintroduces the very race
+# the locks exist to prevent -- thread B can be BLOCKED on the lock while
+# cleanup removes it, then the next acquire for that key calls setdefault() and
+# gets a FRESH, unheld lock, so B and the new thread both enter acquire() and
+# one's `close --all` tears down the other's session. `lock.locked()` cannot
+# make the pop safe either; it is racy by construction (true the instant after
+# you read it as false).
+#
+# The safe form is a refcount that covers the OWNER PLUS EVERY WAITER, taken
+# under _session_cdp_lock before blocking and dropped after release, with the
+# entry removed only at zero. A waiter therefore always holds a reference to the
+# same entry it is blocked on, so it cannot be swapped underneath. That keeps
+# the table bounded by CONCURRENT keys rather than by every key the process has
+# ever seen -- task ids grow without limit in a long-running `hermes serve`
+# (review finding LOW-009).
+_session_cdp_keylocks: Dict[str, "_KeyLockEntry"] = {}
+
+
+class _KeyLockEntry:
+    """A per-key lock plus the number of threads holding or awaiting it."""
+
+    __slots__ = ("lock", "refs")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.refs = 0
+# Live BrowserSession handles, so cleanup can release() exactly once (EBL-005).
+_session_handles: Dict[str, Any] = {}
+
+# Cleanup generation per session key. Bumped every time a key is reaped, so an
+# acquire that was ALREADY IN FLIGHT when its task ended can tell that its
+# result is obsolete and release it instead of publishing enrolled authority
+# after the reaper ran (review finding HIGH-004).
+_session_generations: Dict[str, int] = {}
+
+
+@contextlib.contextmanager
+def _session_cdp_keylock(session_key: str):
+    """Hold this session key's acquire lock; drop the entry when nobody wants it.
+
+    The refcount is taken BEFORE blocking on the lock, so a waiter pins the exact
+    entry it will acquire and the table can be pruned without reopening the
+    single-flight race (see the note on ``_session_cdp_keylocks``).
+    """
+    key = str(session_key)
+    with _session_cdp_lock:
+        entry = _session_cdp_keylocks.get(key)
+        if entry is None:
+            entry = _KeyLockEntry()
+            _session_cdp_keylocks[key] = entry
+        entry.refs += 1
+    try:
+        with entry.lock:
+            yield
+    finally:
+        with _session_cdp_lock:
+            entry.refs -= 1
+            # Identity check: a prior entry could already have been replaced.
+            if entry.refs <= 0 and _session_cdp_keylocks.get(key) is entry:
+                _session_cdp_keylocks.pop(key, None)
+
+
+def _bump_session_generation(session_key: str) -> None:
+    """Mark ``session_key`` as reaped; invalidates any acquire now in flight."""
+    with _session_cdp_lock:
+        _session_generations[str(session_key)] = (
+            _session_generations.get(str(session_key), 0) + 1
+        )
+
+
+def _reset_session_cdp_cache() -> None:
+    """Drop every memoized enrolled CDP endpoint. Test helper."""
+    with _session_cdp_lock:
+        _session_cdp_urls.clear()
+        _session_cdp_keylocks.clear()
+        _session_handles.clear()
+        _session_generations.clear()
+
+
+def _forget_session_cdp_url(session_key: str) -> None:
+    """Drop one session's memoized endpoint; called when its session is reaped."""
+    with _session_cdp_lock:
+        _session_cdp_urls.pop(str(session_key), None)
+
+
+def _release_session_handle(session_key: str) -> None:
+    """Release this session's browser handle, unbinding its profile. Idempotent."""
+    with _session_cdp_lock:
+        handle = _session_handles.pop(str(session_key), None)
+    if handle is None:
+        return
+    try:
+        handle.release()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("releasing browser session %s failed: %s", session_key, exc)
+
+
+_DEAD_CDP_MARKERS = (
+    "econnrefused", "connection refused",
+    # OTTO (fix round 1, EBL-009 Important #1): bare "websocket" is too broad
+    # -- _format_browser_timeout_error embeds up to 1500 raw chars of daemon
+    # stdout/stderr on a timeout, and the non-JSON path embeds up to 2000,
+    # both plausible carriers of ordinary CDP chatter that merely mentions
+    # "websocket" without the browser actually being gone. A false match
+    # here isn't just a harmless relaunch: the next acquire()'s daemon
+    # hygiene runs `close --all` unconditionally, tearing down every
+    # concurrent agent-browser session, not just this one. Narrowed to
+    # phrases that only appear when the transport itself has failed.
+    "websocket connection closed", "websocket error",
+    "target closed", "browser has disconnected", "connect econn",
+)
+
+
+def _evict_dead_enrolled_session(session_key: str) -> None:
+    """Drop an enrolled session whose browser is gone, so the next call relaunches.
+
+    The memo and _active_sessions have no liveness notion, so a closed or
+    crashed browser would keep being driven at a dead endpoint while activity
+    refreshes hold off the idle reaper (review finding EBL-009).
+
+    Must NOT take the per-key lock (_session_cdp_keylock): that lock is held
+    across a slow acquire(), and eviction can run from a command path while
+    another thread is mid-acquire for the same key. This only takes the short
+    dict lock (via _release_session_handle / _forget_session_cdp_url) and
+    _cleanup_lock, one at a time -- mirroring _release_session_handle's own
+    ordering -- so it can never deadlock against an in-flight acquire.
+    """
+    if not _is_enrolled_session_key(session_key):
+        return
+    _release_session_handle(session_key)
+    _forget_session_cdp_url(session_key)
+    with _cleanup_lock:
+        _active_sessions.pop(session_key, None)
+
+
+def _session_browser_profile(session_key: Optional[str]):
+    """OTTO: return the ``BrowserProfile`` this session drives, or None.
+
+    PURE — resolves config only and launches nothing, so guards may consult it
+    without starting a browser.
+
+    An explicit ``bind()`` always wins, so scripted callers keep driving the
+    profile they bound. ``browser.default_profile`` applies ONLY to an
+    enrolled-suffixed key, which routing creates for an origin the profile
+    explicitly trusts. The bare task key is therefore always ephemeral: an
+    untrusted page can never be loaded by the corporate browser.
+    """
+    if not session_key:
+        return None
+    try:
+        from tools import browser_session_registry
+        from tools.browser_profiles import get_profile
+
+        bound = browser_session_registry.profile_for(session_key)
+        if bound:
+            return get_profile(bound)
+        if not _is_enrolled_session_key(session_key):
+            return None
+        name = browser_session_registry.default_profile_name()
+        return get_profile(name) if name else None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("browser profile lookup failed for %s: %s", session_key, exc)
+        return None
+
+
+def _session_uses_enrolled_browser(session_key: Optional[str]) -> bool:
+    """OTTO: True when this session drives an enrolled (real, installed) browser.
+
+    Such a session attaches over CDP to the user's own Chrome/Edge, so it needs
+    no bundled Chromium on disk. Pure — see ``_session_browser_profile``.
+    """
+    profile = _session_browser_profile(session_key)
+    return bool(profile is not None and profile.is_enrolled)
+
+
+def _session_is_cdp_attached(session_key: Optional[str]) -> bool:
+    """OTTO: True when this session drives a CDP endpoint, not a bundled browser.
+
+    The pure equivalent of the ``session_info.get("cdp_url")`` gate on the
+    Lightpanda fallback inside ``_run_browser_command`` (which already holds the
+    session record). Call sites that only have a session KEY -- notably
+    ``browser_vision``'s screenshot pre-route -- need the same answer without
+    launching anything: ``_should_inject_engine`` is session-blind, so with a
+    global ``browser.engine: lightpanda`` it would pre-route an ENROLLED
+    session's screenshot to ``_chrome_fallback_screenshot``, which reads the
+    internal URL off the enrolled session and then opens it in the BUNDLED
+    browser -- a silent fallback to the throwaway browser for a trusted origin,
+    and an internal URL loaded in an unmanaged profile.
+    """
+    if not session_key:
+        return False
+    with _cleanup_lock:
+        info = _active_sessions.get(str(session_key))
+    if isinstance(info, dict) and info.get("cdp_url"):
+        return True
+    return _session_uses_enrolled_browser(session_key)
+
+
+def _default_profile_launchable() -> bool:
+    """OTTO: True when browser.default_profile names a launchable enrolled browser.
+
+    Delegates so the footprint in this heavily-churned upstream file stays a
+    thin helper. Fails CLOSED.
+    """
+    try:
+        from tools.browser_session_registry import default_profile_launchable
+
+        return default_profile_launchable()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _session_cdp_url(session_key: Optional[str]) -> str:
+    """OTTO: return the CDP endpoint this session must drive.
+
+    An ``enrolled`` profile means the user's REAL installed browser: it holds
+    the corporate certificates and SSO that agent-browser's bundled Chrome for
+    Testing does not, so the session is launched (or reattached) through
+    ``browser_session_manager.acquire()`` and driven over its CDP URL. Every
+    other session keeps today's behaviour exactly — ``_get_cdp_override()``,
+    meaning ``BROWSER_CDP_URL`` then ``browser.cdp_url`` — so ``/browser
+    connect`` and a statically configured endpoint are unaffected.
+
+    The endpoint is returned to the caller and stored in the session's own
+    record; it is NOT exported to ``os.environ``. A process-global endpoint
+    cannot model concurrent per-task state — see review finding EBL-001 and
+    ``docs/plans/2026-07-26-per-navigation-browser-profile-design.md``.
+
+    Raises whatever ``acquire()`` raises (``ProfileError`` for an unresolvable
+    enrolled browser). That propagation is deliberate: falling back to the
+    unmanaged bundled browser would be refused by internal sites and read as a
+    broken connection rather than a misconfigured profile. Failures are NOT
+    cached, so a transient launch failure can recover on the next call.
+
+    See docs/plans/2026-07-26-consolidated-browser-automation-design.md §2.
+    """
+    if not session_key:
+        return _get_cdp_override()
+
+    key = str(session_key)
+    with _session_cdp_lock:
+        cached = _session_cdp_urls.get(key)
+    if cached:
+        return cached
+
+    profile = _session_browser_profile(key)
+    if profile is None or not profile.is_enrolled:
+        return _get_cdp_override()
+
+    from tools.browser_session_manager import ProfileError, acquire
+
+    with _session_cdp_keylock(key):
+        # Re-check under the key lock: another thread may have published while
+        # we waited. Without this the loser acquires a second browser and its
+        # `close --all` hygiene tears down the winner's session.
+        # The generation is read HERE, before acquire, so a cleanup that runs
+        # while we are launching is detectable when we come back (HIGH-004).
+        with _session_cdp_lock:
+            cached = _session_cdp_urls.get(key)
+            generation = _session_generations.get(key, 0)
+        if cached:
+            return cached
+
+        session = acquire(profile.name, session_key=key, attach_global=False)
+        cdp_url = _resolve_cdp_override(str(session.cdp_url or ""))
+        if not cdp_url:
+            # Currently unreachable (acquire() raises rather than returning an
+            # enrolled session with no endpoint), but if that ever changes, the
+            # session would be leaked here: it is not yet in _session_handles,
+            # so nothing else would ever release() it or unbind its registry
+            # entry -- and a bound-but-orphaned key keeps enrolled trust.
+            session.release()
+            raise ProfileError(
+                f"browser profile {profile.name!r} exposed no CDP endpoint"
+            )
+        with _session_cdp_lock:
+            stale = _session_generations.get(key, 0) != generation
+            if not stale:
+                _session_cdp_urls[key] = cdp_url
+                _session_handles[key] = session
+        if stale:
+            # The owning task was cleaned up while this acquire was in flight.
+            # Publishing now would resurrect enrolled authority AFTER its
+            # reaper ran, so release instead and fail loudly -- the caller's
+            # navigation belongs to a task that has ended.
+            session.release()
+            raise ProfileError(
+                f"browser session {key!r} was cleaned up while its browser was "
+                "being acquired; not resurrecting it"
+            )
+        return cdp_url
 
 
 def _get_dialog_policy_config() -> Tuple[str, float]:
@@ -1299,17 +1677,25 @@ def _url_is_private(url: str) -> bool:
 def _navigation_session_key(task_id: str, url: str) -> str:
     """Pick the session key that should handle ``url`` for ``task_id``.
 
-    Returns the bare task_id unless ALL of these are true:
-      1. A cloud provider is configured (``_get_cloud_provider()`` is not None).
-      2. Auto-local routing is enabled (``browser.auto_local_for_private_urls``,
-         default True).
-      3. The URL resolves to a private/LAN/loopback address.
-      4. A CDP override is not active (that path owns the whole session).
-      5. Camofox mode is not active (Camofox is already local-only).
+    Checked in order:
+      1. A CDP override is active (``/browser connect`` owns the whole
+         session) -- bare task_id.
+      2. Camofox mode is active (already local-only) -- bare task_id.
+      3. OTTO: ``url``'s origin is explicitly trusted by
+         ``browser.default_profile`` -- ``f"{task_id}::enrolled"``, so the
+         user's real installed browser drives it. Checked before the
+         cloud/hybrid split below so an explicitly trusted origin outranks a
+         local sidecar.
+      4. Otherwise, returns the bare task_id unless ALL of these are true:
+         a. A cloud provider is configured (``_get_cloud_provider()`` is not
+            None).
+         b. Auto-local routing is enabled
+            (``browser.auto_local_for_private_urls``, default True).
+         c. The URL resolves to a private/LAN/loopback address.
 
-    When all are true, returns ``f"{task_id}::local"`` so the hybrid-routing
-    path spawns a local Chromium sidecar while the cloud session (if any)
-    continues to serve public URLs.
+         When all are true, returns ``f"{task_id}::local"`` so the
+         hybrid-routing path spawns a local Chromium sidecar while the cloud
+         session (if any) continues to serve public URLs.
     """
     if task_id is None:
         task_id = "default"
@@ -1317,6 +1703,24 @@ def _navigation_session_key(task_id: str, url: str) -> str:
         return task_id
     if _is_camofox_mode():
         return task_id
+    # OTTO: an origin the enrolled profile explicitly trusts is driven by the
+    # user's REAL installed browser on its own session key. Everything else --
+    # public pages, untrusted private addresses -- stays on the bare key and
+    # the throwaway browser, so untrusted content never touches corporate SSO
+    # cookies or client certificates. Ordered after the CDP-override and
+    # Camofox checks (those backends own their session) and before the
+    # cloud/hybrid split (an explicitly trusted origin outranks a local
+    # sidecar).
+    # No filesystem probe here: an unresolvable executable surfaces at acquire
+    # time as ProfileError, never as a silent downgrade to the bundled
+    # browser.
+    try:
+        from tools.browser_session_registry import default_profile_trusts_url
+
+        if default_profile_trusts_url(url):
+            return f"{task_id}{_ENROLLED_SUFFIX}"
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("enrolled routing check failed for %s: %s", task_id, exc)
     if _get_cloud_provider() is None:
         return task_id
     if not _auto_local_for_private_urls():
@@ -1331,10 +1735,24 @@ def _is_local_sidecar_key(session_key: str) -> bool:
     return session_key.endswith(_LOCAL_SUFFIX)
 
 
+_ENROLLED_SUFFIX = "::enrolled"
+
+
+def _is_enrolled_session_key(session_key: str) -> bool:
+    """OTTO: True when this key drives the user's real enrolled browser.
+
+    Pure suffix test, mirroring _is_local_sidecar_key. Must not read config or
+    launch anything: guard sites call it on every action.
+    """
+    return str(session_key).endswith(_ENROLLED_SUFFIX)
+
+
 def _bare_task_id_for_session_key(session_key: str) -> str:
     """Return the owning bare task id for an opaque browser session key."""
     if _is_local_sidecar_key(session_key):
         return session_key[: -len(_LOCAL_SUFFIX)]
+    if _is_enrolled_session_key(session_key):
+        return session_key[: -len(_ENROLLED_SUFFIX)]
     return session_key
 
 
@@ -2078,8 +2496,14 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     # the bare task_id key.
     force_local = _is_local_sidecar_key(task_id)
 
-    # Create session outside the lock (network call in cloud mode)
-    cdp_override = _get_cdp_override()
+    # Create session outside the lock (network call in cloud mode).
+    # OTTO: _session_cdp_url is the launch decision — for a session driving an
+    # enrolled profile it launches (or reattaches to) the user's real installed
+    # browser and returns its CDP endpoint; for every other session it is
+    # _get_cdp_override() unchanged. Skipped for hybrid-routing sidecars, which
+    # own a deliberately local Chromium (matching the previous code, where this
+    # value was ignored whenever force_local was set).
+    cdp_override = "" if force_local else _session_cdp_url(task_id)
     if cdp_override and not force_local:
         session_info = _create_cdp_session(task_id, cdp_override)
     elif force_local:
@@ -2339,8 +2763,13 @@ def _run_browser_command(
     # Local mode with no Chromium on disk: fail fast with an actionable
     # message instead of hanging for _command_timeout seconds per call.
     # Skip when engine=lightpanda — LP doesn't need Chromium for navigation.
+    # OTTO: also skip for a session driving an enrolled profile — it attaches to
+    # the user's real installed browser over CDP and never uses the bundled
+    # Chromium. The check is the PURE predicate, so closing a session cannot
+    # launch a browser; the acquire happens in _get_session_info below.
     if (
         _is_local_mode()
+        and not _session_uses_enrolled_browser(task_id)
         and not _chromium_installed()
         and _get_browser_engine() != "lightpanda"
         and not _maybe_autoinstall_chromium()
@@ -2605,7 +3034,19 @@ def _run_browser_command(
     # --- Lightpanda automatic Chrome fallback ---
     # If engine is lightpanda and the result looks broken, retry with Chrome.
     # This runs for ALL exit paths (timeout, empty, non-JSON, nonzero rc, parsed).
-    fallback_reason = _lightpanda_fallback_reason(engine, command, result)
+    # OTTO (fix round 1, EBL-009 Important #2): `engine` is the GLOBALLY
+    # configured browser.engine, not proof this specific command actually ran
+    # on Lightpanda -- a CDP-attached session (session_info["cdp_url"] set)
+    # never gets `--engine` appended (see the injection guard above), so it
+    # never runs Lightpanda regardless of what `engine` resolves to. Without
+    # this guard, an operator running an enrolled profile alongside a global
+    # `browser.engine: lightpanda` setting would have every genuine dead-CDP
+    # failure on the enrolled key silently swallowed by this branch's early
+    # `return`, skipping the eviction hook below entirely.
+    fallback_reason = (
+        None if session_info.get("cdp_url")
+        else _lightpanda_fallback_reason(engine, command, result)
+    )
     if fallback_reason:
         logger.info(
             "Lightpanda fallback: retrying '%s' with Chrome (task=%s): %s",
@@ -2620,6 +3061,19 @@ def _run_browser_command(
         else:
             fallback_result = _run_chrome_fallback_command(task_id, command, args, timeout)
         return _annotate_lightpanda_fallback(fallback_result, fallback_reason)
+
+    # OTTO: an enrolled session whose browser died must not keep being driven at
+    # a dead endpoint. Evict so the NEXT command relaunches once; do not retry
+    # here, because the command that just failed may not be idempotent (review
+    # finding EBL-009).
+    if not result.get("success") and _is_enrolled_session_key(task_id):
+        error_text = str(result.get("error", "")).lower()
+        if any(marker in error_text for marker in _DEAD_CDP_MARKERS):
+            logger.warning(
+                "enrolled browser for %s appears gone (%s); evicting so the next "
+                "command relaunches", task_id, result.get("error"),
+            )
+            _evict_dead_enrolled_session(task_id)
 
     return result
 
@@ -2848,7 +3302,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     auto_local_this_nav = _is_local_sidecar_key(nav_session_key)
 
     sensitive_query_key = _sensitive_query_param_name(url)
-    if sensitive_query_key and not _is_local_backend() and not auto_local_this_nav:
+    if sensitive_query_key and (not _is_local_backend() or _is_enrolled_session_key(nav_session_key)) and not auto_local_this_nav:
         return json.dumps({
             "success": False,
             "error": (
@@ -2875,7 +3329,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         })
 
     if (
-        not _is_local_backend()
+        (not _is_local_backend() or _is_enrolled_session_key(nav_session_key))
         and not auto_local_this_nav
         and not _allow_private_urls()
         and not _is_safe_url(url)
@@ -2955,10 +3409,16 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             })
 
         if (
-            not _is_local_backend()
+            (not _is_local_backend() or _is_enrolled_session_key(nav_session_key))
             and not auto_local_this_nav
             and not _allow_private_urls()
             and final_url and final_url != url and not _is_safe_url(final_url)
+            # OTTO: mirror the pre-navigation guard -- an origin this session's
+            # profile explicitly trusts is a legitimate redirect target (SSO and
+            # CF Access land here). Denies for ephemeral keys, which trust
+            # nothing. The metadata floor above is checked first and never
+            # trusted (review finding EBL-008).
+            and not _session_trusts_url(nav_session_key, final_url)
         ):
             # Navigate away to a blank page to prevent snapshot leaks
             _run_browser_command(nav_session_key, "open", ["about:blank"], timeout=10)
@@ -3071,7 +3531,7 @@ def browser_snapshot(
         # private/internal address, the snapshot would expose private page content.
         # Re-check the current URL before returning the snapshot.
         if (
-            not _is_local_backend()
+            (not _is_local_backend() or _is_enrolled_session_key(effective_task_id))
             and not _is_local_sidecar_key(effective_task_id)
             and not _allow_private_urls()
         ):
@@ -3469,7 +3929,7 @@ def _eval_ssrf_guard_active(effective_task_id: str) -> bool:
     sidecar sessions and when ``allow_private_urls`` is set.
     """
     return (
-        not _is_local_backend()
+        (not _is_local_backend() or _is_enrolled_session_key(effective_task_id))
         and not _is_local_sidecar_key(effective_task_id)
         and not _allow_private_urls()
     )
@@ -4133,7 +4593,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     # private/internal address, the screenshot would expose private page content
     # to the vision model.  Re-check the current URL before capturing anything.
     if (
-        not _is_local_backend()
+        (not _is_local_backend() or _is_enrolled_session_key(effective_task_id))
         and not _is_local_sidecar_key(effective_task_id)
         and not _allow_private_urls()
     ):
@@ -4167,7 +4627,16 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     engine = _get_browser_engine()
     _lp_prerouted = False
     _lp_fallback_warning = None
-    if engine == "lightpanda" and _should_inject_engine(engine):
+    # OTTO: gated on _session_is_cdp_attached exactly like the fallback site in
+    # _run_browser_command. A CDP-attached (including enrolled) session never
+    # gets `--engine` appended, so it never ran Lightpanda no matter what the
+    # global browser.engine says -- and pre-routing it here would hand a trusted
+    # internal URL to the BUNDLED browser.
+    if (
+        engine == "lightpanda"
+        and _should_inject_engine(engine)
+        and not _session_is_cdp_attached(effective_task_id)
+    ):
         logger.debug("browser_vision: pre-routing screenshot to Chrome (engine=lightpanda)")
         screenshot_args = []
         if annotate:
@@ -4445,18 +4914,34 @@ def _cleanup_old_recordings(max_age_hours=72):
 # Cleanup and Management Functions
 # ============================================================================
 
-def cleanup_browser(task_id: Optional[str] = None) -> None:
+def cleanup_browser(task_id: Optional[str] = None, *, keep_enrolled: bool = False) -> None:
     """
     Clean up browser session(s) for a task.
 
     Called automatically when a task completes or when inactivity timeout is reached.
     Closes both the agent-browser/Browserbase session and Camofox sessions.
 
-    When ``task_id`` is a bare task identifier (no ``::local`` suffix), reaps
-    BOTH the cloud/primary session AND any hybrid-routing local sidecar that
-    may have been spawned for LAN/localhost URLs in the same task.  When
-    ``task_id`` already carries a ``::local`` suffix (called from the inactivity
-    cleanup loop against a specific session key), reaps only that one.
+    OTTO: ``keep_enrolled=True`` spares an enrolled sidecar. The PER-TURN hook
+    (``agent.chat_completion_helpers.cleanup_task_resources``) passes it; the
+    end-of-task path does NOT, so end-of-task reaping is unchanged. Without it
+    every turn dropped the enrolled session's memo, handle and registry binding
+    while the real browser stayed alive, so the next turn's first trusted
+    navigation re-acquired -- and ``acquire()`` runs ``close --all`` daemon
+    hygiene, which is process-wide, so one conversation's re-acquire could tear
+    down another conversation's in-flight session (review finding H-2). The
+    headed-mode skip does not cover this: it reads the GLOBAL ``browser.headed``,
+    while the seeded enrolled profile sets ``headed`` at PROFILE level, so the
+    skip never fired.
+
+    When ``task_id`` is a bare task identifier (no ``::local``/``::enrolled``
+    suffix), reaps the cloud/primary session PLUS any hybrid-routing local
+    sidecar AND any enrolled-browser sidecar that may have been spawned for
+    this task (review finding EBL-005 fix-round-1: the primary end-of-task
+    path calls this with the bare id, so without this expansion the enrolled
+    session's registry binding/CDP memo/handle never got released here at
+    all). When ``task_id`` already carries a ``::local`` or ``::enrolled``
+    suffix (an explicit session key, e.g. from the inactivity cleanup loop),
+    reaps only that one key -- symmetric with the existing ``::local`` handling.
 
     Args:
         task_id: Task identifier (or explicit session key)
@@ -4464,35 +4949,90 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     if task_id is None:
         task_id = "default"
 
-    # Expand to the full set of session keys to reap. For a bare task_id
-    # that includes the cloud/primary key + the local sidecar if one exists.
+    # Expand to the full set of session keys to reap. For a bare task_id that
+    # includes the cloud/primary key + the local sidecar and/or the enrolled
+    # sidecar, whichever exist.
     if _is_local_sidecar_key(task_id):
         session_keys = [task_id]
         bare_task_id = task_id[: -len(_LOCAL_SUFFIX)]
+    elif _is_enrolled_session_key(task_id):
+        session_keys = [task_id]
+        bare_task_id = task_id[: -len(_ENROLLED_SUFFIX)]
     else:
         session_keys = [task_id]
         sidecar_key = f"{task_id}{_LOCAL_SUFFIX}"
+        enrolled_key = f"{task_id}{_ENROLLED_SUFFIX}"
         with _cleanup_lock:
             if sidecar_key in _active_sessions:
                 session_keys.append(sidecar_key)
+        if not keep_enrolled:
+            # TOMBSTONE FIRST, unconditionally. An acquire that is in flight
+            # right now has published NOTHING -- no active record, no memo, no
+            # handle, no binding -- so there is nothing to detect it by; the
+            # generation bump is what makes it release instead of publishing
+            # enrolled authority after its task's reaper ran (HIGH-004).
+            _bump_session_generation(enrolled_key)
+            # Then reap, gated on any state existing. _session_cdp_url publishes
+            # the memo/handle/binding BEFORE _get_session_info publishes the
+            # active record, so gating on _active_sessions alone (the first
+            # remediation) missed a real window. Gating on nothing at all would
+            # fire per-key teardown (notably Camofox close) for a sidecar that
+            # never existed.
+            if _enrolled_sidecar_has_state(enrolled_key):
+                session_keys.append(enrolled_key)
         bare_task_id = task_id
 
     for session_key in session_keys:
         _cleanup_single_browser_session(session_key)
 
     # Drop stale last-active ownership. Cleaning a bare task drops its binding;
-    # cleaning a sidecar drops the binding only if that sidecar was still the
-    # recorded owner. This prevents a later click/snapshot from resurrecting a
-    # cleaned sidecar on about:blank while preserving a primary-session binding.
-    if _is_local_sidecar_key(task_id):
+    # cleaning a sidecar (local or enrolled) drops the binding only if that
+    # sidecar was still the recorded owner. This prevents a later click/
+    # snapshot from resurrecting a cleaned sidecar on about:blank while
+    # preserving a primary-session binding.
+    if _is_local_sidecar_key(task_id) or _is_enrolled_session_key(task_id):
         if _last_active_session_key.get(bare_task_id) == task_id:
             _last_active_session_key.pop(bare_task_id, None)
+    elif keep_enrolled and _last_active_session_key.get(bare_task_id) == f"{bare_task_id}{_ENROLLED_SUFFIX}":
+        # The spared enrolled session is still the live one; dropping the
+        # binding here would send the next click/snapshot to the bare key and
+        # a different browser.
+        pass
     else:
         _last_active_session_key.pop(bare_task_id, None)
 
 
+def _enrolled_sidecar_has_state(enrolled_key: str) -> bool:
+    """OTTO: True when anything about ``enrolled_key`` still needs reaping.
+
+    Four independent records can exist, and they are NOT published together:
+    ``_session_cdp_url`` writes the memo + handle and ``acquire()`` binds the
+    registry, all BEFORE ``_get_session_info`` writes ``_active_sessions``.
+    Checking only the last one leaves enrolled origin trust bound after the
+    owning task has ended (review finding HIGH-004).
+    """
+    with _cleanup_lock:
+        if enrolled_key in _active_sessions:
+            return True
+    with _session_cdp_lock:
+        if enrolled_key in _session_cdp_urls or enrolled_key in _session_handles:
+            return True
+    try:
+        from tools.browser_session_registry import profile_for
+
+        return profile_for(enrolled_key) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _cleanup_single_browser_session(task_id: str) -> None:
     """Internal: reap a single browser session by its exact session key."""
+    # Tombstone FIRST, before any teardown: an acquire that is in flight right
+    # now must observe the bump when it finishes and release rather than
+    # publish. Doing this after the teardown would leave the same race
+    # (review finding HIGH-004).
+    _bump_session_generation(task_id)
+
     # Stop the CDP supervisor for this task FIRST so we close our WebSocket
     # before the backend tears down the underlying CDP endpoint.
     _stop_cdp_supervisor(task_id)
@@ -4566,6 +5106,15 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         logger.debug("Removed task %s from active sessions", task_id)
     else:
         logger.debug("No active session found for task_id: %s", task_id)
+
+    # OTTO: drop this session's memoized endpoint AND release its browser handle.
+    # release() unbinds the registry; without it the key keeps internal-origin
+    # trust after cleanup and even after browser.default_profile is turned off
+    # (review finding EBL-005). Outside the branch above: an acquire that
+    # succeeded before session registration failed leaves state with no
+    # _active_sessions entry.
+    _release_session_handle(task_id)
+    _forget_session_cdp_url(task_id)
 
 
 def cleanup_all_browsers() -> None:
@@ -4826,6 +5375,13 @@ def check_browser_requirements() -> bool:
     # first use.
     if _requires_real_termux_browser_install(browser_cmd):
         return False
+
+    # OTTO: an enrolled default profile drives the user's REAL installed browser
+    # over CDP, so it needs no bundled Chromium -- but it still drives that
+    # browser THROUGH agent-browser (`--cdp <url>`), so the CLI check above
+    # still applies and this return sits after it (review finding EBL-006).
+    if _default_profile_launchable():
+        return True
 
     # In cloud mode, also require provider credentials. Cloud browsers
     # don't need a local Chromium binary.

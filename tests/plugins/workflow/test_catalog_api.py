@@ -127,6 +127,14 @@ def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compa
         for item in payload["items"]
     }
     assert ("profile", "ordinary-user-workflow") in rows
+    assert rows[("profile", "ordinary-user-workflow")]["language"] == {
+        "effective_profile": "hermes-legacy",
+        "legacy": True,
+    }
+    assert rows[("profile", "ordinary-user-workflow")]["compatibility"] == {
+        "level": "mapped",
+        "runnable": True,
+    }
     showcase_rows = {
         name: row for (source, name), row in rows.items() if source == "showcase"
     }
@@ -138,6 +146,10 @@ def test_workflow_catalog_lists_verified_showcases_with_honest_support_and_compa
         "scheduling",
     }
     approval = showcase_rows["approval-gate"]
+    assert approval["language"] == {
+        "effective_profile": "hermes-legacy",
+        "legacy": True,
+    }
     assert approval["trust_state"] == "verified_bundled"
     assert approval["supported_inputs"] == {
         "supported": True,
@@ -283,6 +295,538 @@ def test_workflow_detail_and_response_model_require_generic_requires_ai(
         )
 
 
+def test_workflow_language_response_models_reject_non_contract_shapes() -> None:
+    module = _module()
+    list_status = {
+        "effective_profile": "hermes-legacy",
+        "legacy": True,
+    }
+    detail_status = {
+        "declared_profile": "archon-2026-07",
+        "effective_profile": "archon-2026-07",
+        "legacy": False,
+        "normalizer_version": 1,
+        "normalized_definition_digest": "a" * 64,
+    }
+
+    assert module.WorkflowCatalogLanguageStatus.model_validate(list_status)
+    assert module.WorkflowDetailLanguageStatus.model_validate(detail_status)
+
+    invalid_list = [
+        {**list_status, "declared_profile": None},
+        {"legacy": True},
+        {**list_status, "effective_profile": "future-profile"},
+        {**list_status, "legacy": 1},
+        {**list_status, "legacy": False},
+    ]
+    invalid_detail = [
+        {**detail_status, "extra": "escape"},
+        {key: value for key, value in detail_status.items() if key != "declared_profile"},
+        {**detail_status, "declared_profile": "future-profile"},
+        {**detail_status, "effective_profile": "hermes-legacy"},
+        {**detail_status, "legacy": 0},
+        {**detail_status, "normalizer_version": True},
+        {**detail_status, "normalizer_version": 2},
+        {**detail_status, "normalized_definition_digest": "A" * 64},
+        {**detail_status, "normalized_definition_digest": "a" * 63},
+    ]
+
+    for payload in invalid_list:
+        with pytest.raises(ValidationError):
+            module.WorkflowCatalogLanguageStatus.model_validate(payload)
+    for payload in invalid_detail:
+        with pytest.raises(ValidationError):
+            module.WorkflowDetailLanguageStatus.model_validate(payload)
+
+
+def test_workflow_compatibility_response_models_are_exact_bounded_and_strict() -> None:
+    module = _module()
+    summary = {"level": "mapped", "runnable": True}
+    finding = {
+        "path": "nodes[0].timeout",
+        "level": "unsupported",
+        "message": "timeout semantics are unavailable",
+        "blocking": True,
+        "code": "archon_timeout_semantics_unavailable",
+    }
+    full = {
+        "level": "unsupported",
+        "runnable": False,
+        "findings": [finding],
+        "findings_truncated": False,
+        "finding_count": 1,
+    }
+
+    assert module.WorkflowCompatibilitySummary.model_validate(summary)
+    assert module.WorkflowCompatibilityFull.model_validate(full)
+
+    invalid_summaries = [
+        {**summary, "findings": []},
+        {"level": "mapped"},
+        {**summary, "level": "future"},
+        {**summary, "runnable": 1},
+    ]
+    invalid_full = [
+        {**full, "unknown": True},
+        {
+            **full,
+            "findings": [finding]
+            * (module.WORKFLOW_COMPATIBILITY_FINDINGS_MAX + 1),
+        },
+        {**full, "findings": [{**finding, "path": ""}]},
+        {**full, "findings": [{**finding, "message": ""}]},
+        {**full, "findings": [{**finding, "code": ""}]},
+        {**full, "findings": [{**finding, "path": "p" * 16_385}]},
+        {**full, "findings": [{**finding, "message": "m" * 16_385}]},
+        {**full, "findings": [{**finding, "code": "c" * 16_385}]},
+        {**full, "findings": [{**finding, "blocking": 1}]},
+        {**full, "findings": [{**finding, "severity": "error"}]},
+        {
+            **full,
+            "findings": [{**finding, "effective_profile": "archon-2026-07"}],
+        },
+        {**full, "findings": [{**finding, "migration": "Remove timeout."}]},
+        {**full, "findings": [{**finding, "extra": "escape"}]},
+        {**full, "findings_truncated": 0},
+        {**full, "finding_count": True},
+        {**full, "finding_count": 0},
+        {**full, "findings_truncated": True},
+    ]
+
+    for payload in invalid_summaries:
+        with pytest.raises(ValidationError):
+            module.WorkflowCompatibilitySummary.model_validate(payload)
+    for payload in invalid_full:
+        with pytest.raises(ValidationError):
+            module.WorkflowCompatibilityFull.model_validate(payload)
+
+
+def test_workflow_compatibility_full_enforces_authoritative_report_state() -> None:
+    module = _module()
+    mapped = {
+        "path": "nodes[0].model",
+        "level": "mapped",
+        "message": "model resolves through Hermes provider profiles",
+        "blocking": False,
+        "code": "provider_profile_resolution",
+    }
+    blocking = {
+        "path": "nodes[0].timeout",
+        "level": "unsupported",
+        "message": "timeout semantics are unavailable",
+        "blocking": True,
+        "code": "archon_timeout_semantics_unavailable",
+    }
+    nonblocking_unsupported = {
+        "path": "legacy_extension",
+        "level": "unsupported",
+        "message": "unknown top-level field",
+        "blocking": False,
+        "code": "unknown_top_level_field",
+    }
+    truncation_sentinel = {
+        "path": "compatibility.findings",
+        "level": "unsupported",
+        "message": (
+            "Compatibility findings truncated: 8 omitted; aggregate level unsupported"
+        ),
+        "blocking": True,
+        "code": "compatibility_findings_truncated",
+    }
+    retained = [{**mapped, "path": f"mapped[{index}]"} for index in range(511)]
+
+    valid = [
+        {
+            "level": "portable",
+            "runnable": True,
+            "findings": [],
+            "findings_truncated": False,
+            "finding_count": 0,
+        },
+        {
+            "level": "mapped",
+            "runnable": True,
+            "findings": [mapped],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "unsupported",
+            "runnable": False,
+            "findings": [blocking],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "unsupported",
+            "runnable": True,
+            "findings": [nonblocking_unsupported],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "unsupported",
+            "runnable": False,
+            "findings": [*retained, truncation_sentinel],
+            "findings_truncated": True,
+            "finding_count": 519,
+        },
+    ]
+    invalid = [
+        {
+            "level": "unsupported",
+            "runnable": True,
+            "findings": [],
+            "findings_truncated": False,
+            "finding_count": 0,
+        },
+        {
+            "level": "portable",
+            "runnable": False,
+            "findings": [blocking],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "portable",
+            "runnable": True,
+            "findings": [mapped],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "mapped",
+            "runnable": True,
+            "findings": [],
+            "findings_truncated": False,
+            "finding_count": 0,
+        },
+        {
+            "level": "mapped",
+            "runnable": False,
+            "findings": [mapped],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "mapped",
+            "runnable": True,
+            "findings": [nonblocking_unsupported],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "unsupported",
+            "runnable": True,
+            "findings": [blocking],
+            "findings_truncated": False,
+            "finding_count": 1,
+        },
+        {
+            "level": "unsupported",
+            "runnable": False,
+            "findings": [*retained, truncation_sentinel],
+            "findings_truncated": True,
+            "finding_count": 518,
+        },
+    ]
+
+    for payload in valid:
+        module.WorkflowCompatibilityFull.model_validate(payload)
+    for payload in invalid:
+        with pytest.raises(ValidationError):
+            module.WorkflowCompatibilityFull.model_validate(payload)
+
+
+def test_workflow_compatibility_full_rejects_malformed_truncation_sentinels() -> None:
+    module = _module()
+    mapped = {
+        "path": "nodes[0].model",
+        "level": "mapped",
+        "message": "model resolves through Hermes provider profiles",
+        "blocking": False,
+        "code": "provider_profile_resolution",
+    }
+    retained = [{**mapped, "path": f"mapped[{index}]"} for index in range(511)]
+
+    def sentinel(*, level: str, blocking: bool, count: str) -> dict[str, object]:
+        return {
+            "path": "compatibility.findings",
+            "level": level,
+            "message": (
+                f"Compatibility findings truncated: {count} omitted; "
+                f"aggregate level {level}"
+            ),
+            "blocking": blocking,
+            "code": "compatibility_findings_truncated",
+        }
+
+    invalid = [
+        {
+            "level": "unsupported",
+            "runnable": True,
+            "findings": [
+                *retained,
+                sentinel(level="unsupported", blocking=False, count="0"),
+            ],
+            "findings_truncated": True,
+            "finding_count": 511,
+        },
+        {
+            "level": "unsupported",
+            "runnable": True,
+            "findings": [
+                *retained,
+                sentinel(level="unsupported", blocking=False, count="01"),
+            ],
+            "findings_truncated": True,
+            "finding_count": 512,
+        },
+        {
+            "level": "unsupported",
+            "runnable": True,
+            "findings": [sentinel(level="unsupported", blocking=False, count="1")],
+            "findings_truncated": True,
+            "finding_count": 1,
+        },
+        {
+            "level": "mapped",
+            "runnable": True,
+            "findings": [
+                *retained,
+                sentinel(level="portable", blocking=False, count="1"),
+            ],
+            "findings_truncated": True,
+            "finding_count": 512,
+        },
+        {
+            "level": "unsupported",
+            "runnable": False,
+            "findings": [
+                *retained,
+                sentinel(level="mapped", blocking=True, count="1"),
+            ],
+            "findings_truncated": True,
+            "finding_count": 512,
+        },
+    ]
+
+    for payload in invalid:
+        with pytest.raises(ValidationError):
+            module.WorkflowCompatibilityFull.model_validate(payload)
+
+
+def test_workflow_compatibility_full_accepts_only_complete_legacy_shape() -> None:
+    module = _module()
+    mapped = {
+        "path": "nodes[0].model",
+        "level": "mapped",
+        "message": "model resolves through Hermes provider profiles",
+        "blocking": False,
+        "code": "provider_profile_resolution",
+    }
+    complete_legacy = {
+        "level": "mapped",
+        "runnable": True,
+        "findings": [mapped],
+    }
+
+    validated = module.WorkflowCompatibilityFull.model_validate(complete_legacy)
+
+    assert validated.findings_truncated is False
+    assert validated.finding_count == 1
+    for partial in (
+        {**complete_legacy, "findings_truncated": False},
+        {**complete_legacy, "finding_count": 1},
+    ):
+        with pytest.raises(ValidationError):
+            module.WorkflowCompatibilityFull.model_validate(partial)
+
+    truncated_legacy = {
+        "level": "unsupported",
+        "runnable": True,
+        "findings": [
+            *({**mapped, "path": f"mapped[{index}]"} for index in range(511)),
+            {
+                "path": "compatibility.findings",
+                "level": "unsupported",
+                "message": (
+                    "Compatibility findings truncated: 1 omitted; "
+                    "aggregate level unsupported"
+                ),
+                "blocking": False,
+                "code": "compatibility_findings_truncated",
+            },
+        ],
+    }
+    with pytest.raises(ValidationError):
+        module.WorkflowCompatibilityFull.model_validate(truncated_legacy)
+
+
+def test_workflow_compatibility_full_rejects_payload_at_one_mib() -> None:
+    module = _module()
+    retained = [
+        {
+            "path": f"mapped[{index}]" + "p" * 16_000,
+            "level": "mapped",
+            "message": "m" * 16_000,
+            "blocking": False,
+            "code": "mapped_finding",
+        }
+        for index in range(511)
+    ]
+    sentinel = {
+        "path": "compatibility.findings",
+        "level": "mapped",
+        "message": (
+            "Compatibility findings truncated: 1 omitted; aggregate level mapped"
+        ),
+        "blocking": False,
+        "code": "compatibility_findings_truncated",
+    }
+
+    with pytest.raises(ValidationError):
+        module.WorkflowCompatibilityFull.model_validate({
+            "level": "mapped",
+            "runnable": True,
+            "findings": [*retained, sentinel],
+            "findings_truncated": True,
+            "finding_count": 512,
+        })
+
+
+def test_workflow_compatibility_finding_api_projection_normalizes_only_empty_paths() -> None:
+    module = _module()
+    base = {
+        "level": "unsupported",
+        "message": "unknown top-level field: raw",
+        "blocking": False,
+        "code": "unknown_top_level_field",
+    }
+
+    legitimate = module._sanitize_compatibility_finding_projection(
+        {**base, "path": "nodes[0].timeout"}
+    )
+    assert legitimate["path"] == "nodes[0].timeout"
+    module.WorkflowCompatibilityFinding.model_validate(legitimate)
+
+    absolute = module._sanitize_compatibility_finding_projection(
+        {**base, "path": "/private/tmp/operator-secret.yaml"}
+    )
+    ansi_prefixed = module._sanitize_compatibility_finding_projection(
+        {**base, "path": "\x1b[31mnodes[0].timeout"}
+    )
+    assert absolute["path"] == "operator-secret.yaml"
+    assert ansi_prefixed["path"] == "nodes[0].timeout"
+    module.WorkflowCompatibilityFinding.model_validate(absolute)
+    module.WorkflowCompatibilityFinding.model_validate(ansi_prefixed)
+
+    for raw_path in ("", "/", ".", "\x1b[31m"):
+        projected = module._sanitize_compatibility_finding_projection(
+            {
+                **base,
+                "path": raw_path,
+                "message": f"unknown top-level field: {raw_path}",
+            }
+        )
+        assert projected == {
+            **base,
+            "path": module.WORKFLOW_COMPATIBILITY_UNKNOWN_PATH,
+            "message": (
+                "unknown top-level field: "
+                f"{module.WORKFLOW_COMPATIBILITY_UNKNOWN_PATH}"
+            ),
+        }
+        module.WorkflowCompatibilityFinding.model_validate(projected)
+
+
+def test_workflow_catalog_response_model_enforces_source_projection_and_old_optional_compatibility() -> None:
+    module = _module()
+    base = {
+        "name": "response-model",
+        "version": "1",
+        "description": "Response model fixture",
+        "requires_ai": False,
+        "source": "profile",
+        "precedence": 2,
+        "trust_state": "untrusted",
+        "inputs": [],
+        "supported_inputs": {"supported": True, "reason": "parameterless"},
+        "run_support": {"supported": True, "reason": "supported"},
+        "language": {"effective_profile": "hermes-legacy", "legacy": True},
+    }
+    summary = {"level": "mapped", "runnable": True}
+    full = {
+        "level": "portable",
+        "runnable": True,
+        "findings": [],
+        "findings_truncated": False,
+        "finding_count": 0,
+    }
+
+    assert module.WorkflowCatalogEntry.model_validate({**base, "compatibility": summary})
+    assert module.WorkflowCatalogEntry.model_validate(base).compatibility is None
+    with pytest.raises(ValidationError):
+        module.WorkflowCatalogEntry.model_validate({**base, "compatibility": full})
+
+    showcase = {
+        **base,
+        "source": "showcase",
+        "precedence": 3,
+        "trust_state": "verified_bundled",
+    }
+    assert module.WorkflowCatalogEntry.model_validate(
+        {**showcase, "compatibility": full}
+    )
+    with pytest.raises(ValidationError):
+        module.WorkflowCatalogEntry.model_validate(
+            {**showcase, "compatibility": summary}
+        )
+
+
+def test_workflow_catalog_openapi_closes_language_and_compatibility_objects() -> None:
+    module = _module()
+    schemas = _app(module.router, token=_reader()).openapi()["components"]["schemas"]
+    nested_names = {
+        "WorkflowCatalogLanguageStatus",
+        "WorkflowDetailLanguageStatus",
+        "WorkflowCompatibilitySummary",
+        "WorkflowCompatibilityFull",
+        "WorkflowCompatibilityFinding",
+    }
+
+    for name in nested_names:
+        schema = schemas[name]
+        assert schema["additionalProperties"] is False
+        assert schema["type"] == "object"
+        assert schema.get("additionalProperties") != {}
+        assert schema.get("additionalProperties") is not True
+
+    finding = schemas["WorkflowCompatibilityFinding"]
+    assert set(finding["properties"]) == {
+        "path",
+        "level",
+        "message",
+        "blocking",
+        "code",
+    }
+    assert set(finding["required"]) == set(finding["properties"])
+    assert finding["properties"]["path"]["minLength"] == 1
+    assert finding["properties"]["message"]["minLength"] == 1
+    assert finding["properties"]["code"]["minLength"] == 1
+    assert (
+        schemas["WorkflowCompatibilityFull"]["properties"]["findings"]["maxItems"]
+        == module.WORKFLOW_COMPATIBILITY_FINDINGS_MAX
+    )
+    assert set(schemas["WorkflowCompatibilityFull"]["properties"]) == {
+        "level",
+        "runnable",
+        "findings",
+        "findings_truncated",
+        "finding_count",
+    }
+
+
 def test_workflow_catalog_keeps_isolation_incompatibility_scenario_local(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
@@ -330,6 +874,13 @@ def test_workflow_catalog_keeps_isolation_incompatibility_scenario_local(
     }
     assert rows["approval-gate"]["compatibility"]["runnable"] is False
     assert rows["approval-gate"]["compatibility"]["findings"] == [
+        {
+            "blocking": False,
+            "code": "legacy_language_profile",
+            "level": "mapped",
+            "message": "workflow uses permissive Hermes legacy language semantics",
+            "path": "sidecar.language_compatibility",
+        },
         {
             "blocking": True,
             "code": "execution_environment_unavailable",
@@ -390,6 +941,7 @@ def test_workflow_catalog_projects_showcase_from_authenticated_snapshot(
     target = copied / "packages/ai-extensions/commands/inspect-evidence.md"
     original_loader = showcase_module.load_verified_showcase_packages
     original_open = Path.open
+    original_stat = Path.stat
     projection_started = False
     authenticated_digest = ""
     projected_digests: list[str] = []
@@ -406,6 +958,11 @@ def test_workflow_catalog_projects_showcase_from_authenticated_snapshot(
         if projection_started and self == target:
             pytest.fail("catalog projection reopened authenticated showcase source")
         return original_open(self, *args, **kwargs)
+
+    def forbid_restat(self, *args, **kwargs):
+        if projection_started and self == target:
+            pytest.fail("catalog projection restatted authenticated showcase source")
+        return original_stat(self, *args, **kwargs)
 
     original_assess = catalog_api.assess_package_execution
 
@@ -425,6 +982,7 @@ def test_workflow_catalog_projects_showcase_from_authenticated_snapshot(
         mutate_after_authentication,
     )
     monkeypatch.setattr(Path, "open", forbid_reopen)
+    monkeypatch.setattr(Path, "stat", forbid_restat)
     monkeypatch.setattr(catalog_api, "assess_package_execution", capture_assessment)
 
     items, truncated = catalog_api.build_workflow_catalog(
@@ -438,7 +996,7 @@ def test_workflow_catalog_projects_showcase_from_authenticated_snapshot(
     assert ai_row["trust_state"] == "verified_bundled"
 
 
-def test_workflow_catalog_omits_showcases_when_resource_disappears_after_authentication(
+def test_workflow_catalog_projects_cached_showcase_when_source_disappears_after_authentication(
     tmp_path, monkeypatch, workflow_writer, caplog
 ) -> None:
     import plugins.workflow.catalog_api as catalog_api
@@ -474,7 +1032,12 @@ def test_workflow_catalog_omits_showcases_when_resource_disappears_after_authent
     )
 
     assert truncated is False
-    assert not any(item.get("source") == "showcase" for item in items)
+    ai_row = next(
+        item
+        for item in items
+        if item.get("source") == "showcase" and item.get("name") == "ai-extensions"
+    )
+    assert ai_row["trust_state"] == "verified_bundled"
     assert any(
         item.get("source") == "profile"
         and item.get("name") == "ordinary-user-workflow"
@@ -485,10 +1048,7 @@ def test_workflow_catalog_omits_showcases_when_resource_disappears_after_authent
         for record in caplog.records
         if record.name == "plugins.workflow.catalog_api"
         and record.levelno == logging.WARNING
-    ] == [
-        "workflow showcase catalog projection verification failed: "
-        "WorkflowValidationError"
-    ]
+    ] == []
 
 
 def test_workflow_catalog_rejects_verified_provenance_on_digest_mismatch(
@@ -784,12 +1344,25 @@ def test_workflow_catalog_returns_stable_redacted_server_classification(
         ],
         "supported_inputs": {"supported": True, "reason": "flat_inputs"},
         "run_support": {"supported": True, "reason": "supported"},
+        "language": {
+            "effective_profile": "hermes-legacy",
+            "legacy": True,
+        },
+        "compatibility": {"level": "mapped", "runnable": True},
     }
     assert user_items[1]["trust_state"] == "untrusted"
     assert user_items[1]["inputs"] == []
     assert user_items[1]["supported_inputs"] == {
         "supported": True,
         "reason": "parameterless",
+    }
+    assert user_items[1]["language"] == {
+        "effective_profile": "hermes-legacy",
+        "legacy": True,
+    }
+    assert user_items[1]["compatibility"] == {
+        "level": "mapped",
+        "runnable": True,
     }
     assert user_items[1]["run_support"] == {
         "supported": True,
@@ -798,6 +1371,136 @@ def test_workflow_catalog_returns_stable_redacted_server_classification(
     assert b"SECRET_NUMERIC_DEFAULT" not in response.content
     assert b"SECRET_TITLE_DEFAULT" not in response.content
     assert beta.is_file()
+
+
+def test_workflow_catalog_projects_archon_language_and_bounded_compatibility(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.chdir(workdir)
+    path = workflow_writer(
+        workdir / ".hermes" / "workflows",
+        name="archon-deferred",
+        filename="archon-deferred.yaml",
+        nodes=[{"id": "start", "bash": "true", "timeout": 5}],
+    )
+    path.with_name("archon-deferred.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+
+    response = _catalog_get(_module().router, token=_reader())
+
+    assert response.status_code == 200
+    row = next(
+        item
+        for item in response.json()["items"]
+        if item.get("source") == "project" and item.get("name") == "archon-deferred"
+    )
+    assert row["language"] == {
+        "effective_profile": "archon-2026-07",
+        "legacy": False,
+    }
+    assert row["compatibility"] == {
+        "level": "unsupported",
+        "runnable": False,
+    }
+    assert set(row["language"]) == {"effective_profile", "legacy"}
+    assert set(row["compatibility"]) == {"level", "runnable"}
+
+
+def test_workflow_detail_bounds_more_than_512_real_findings_and_keeps_omitted_blocker(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    unknown_fields = {f"future_{index:04d}": "x" * 32 for index in range(600)}
+    workflow_writer(
+        home / "workflows",
+        name="bounded-findings",
+        filename="bounded-findings.yaml",
+        nodes=[
+            {
+                "id": "agent",
+                "prompt": "bounded",
+                "allowed_tools": ["UnknownTool"],
+            }
+        ],
+        **unknown_fields,
+    )
+
+    response = _detail_get(
+        _module().router,
+        "bounded-findings",
+        source="profile",
+        token=_reader(),
+    )
+
+    assert response.status_code == 200
+    assert len(response.content) < 1024 * 1024
+    compatibility = response.json()["compatibility"]
+    assert compatibility["level"] == "unsupported"
+    assert compatibility["runnable"] is False
+    assert compatibility["findings_truncated"] is True
+    assert compatibility["finding_count"] == 602
+    assert len(compatibility["findings"]) == 512
+    sentinel = compatibility["findings"][-1]
+    assert sentinel["code"] == "compatibility_findings_truncated"
+    assert sentinel["level"] == "unsupported"
+    assert sentinel["blocking"] is True
+
+
+def test_workflow_detail_bounds_hostile_unicode_and_escaped_compatibility_payload(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    hostile_suffix = "😀" * 240
+    unknown_fields = {
+        f"future_{index:04d}_{hostile_suffix}": "x" for index in range(508)
+    }
+    unknown_fields.update({
+        "future_control_" + "\x01" * 600: "x",
+        "future_quote_" + '"' * 600: "x",
+        "future_backslash_" + "\\" * 600: "x",
+        "future_mixed_" + '😀\x01"\\' * 150: "x",
+    })
+    workflow_path = workflow_writer(
+        home / "workflows",
+        name="hostile-compatibility-payload",
+        filename="hostile-compatibility-payload.yaml",
+        **unknown_fields,
+    )
+    # Keep the valid definition below its independent read budget while retaining
+    # astral Unicode that expands when repeated into compatibility path + message.
+    document = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    workflow_path.write_text(
+        yaml.safe_dump(document, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    response = _detail_get(
+        _module().router,
+        "hostile-compatibility-payload",
+        source="profile",
+        token=_reader(),
+    )
+
+    assert response.status_code == 200
+    compatibility = response.json()["compatibility"]
+    serialized_compatibility = json.dumps(
+        compatibility,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert len(serialized_compatibility) < 1024 * 1024
+    assert len(response.content) < 1024 * 1024
+    assert compatibility["findings_truncated"] is True
+    assert compatibility["finding_count"] == 513
+    assert len(compatibility["findings"]) == 512
 
 
 def test_workflow_catalog_projects_declared_text_bounds_and_support_modes(
@@ -1203,6 +1906,11 @@ def test_workflow_catalog_degrades_unrepresentable_workflow_name_per_entry(
                 "reason": "parameterless",
             },
             "run_support": {"supported": True, "reason": "supported"},
+            "language": {
+                "effective_profile": "hermes-legacy",
+                "legacy": True,
+            },
+            "compatibility": {"level": "mapped", "runnable": True},
         },
         {"name": "x" * 128, "error": "invalid_definition"},
     ]
@@ -1247,6 +1955,11 @@ def test_workflow_catalog_isolates_invalid_definition(
                 "reason": "parameterless",
             },
             "run_support": {"supported": True, "reason": "supported"},
+            "language": {
+                "effective_profile": "hermes-legacy",
+                "legacy": True,
+            },
+            "compatibility": {"level": "mapped", "runnable": True},
         },
     ]
     assert response.json()["truncated"] is False
@@ -1396,8 +2109,10 @@ def test_workflow_catalog_rejects_oversized_resource_without_reading_it_all(
             return self._wrapped.read(size)
 
     def recording_open(path, *args, **kwargs):
+        if Path(path) == resource:
+            raise AssertionError("oversized resource was opened")
         opened = original_open(path, *args, **kwargs)
-        return RecordingReader(opened) if Path(path) == resource else opened
+        return opened
 
     monkeypatch.setattr(Path, "open", recording_open)
 
@@ -1407,8 +2122,7 @@ def test_workflow_catalog_rejects_oversized_resource_without_reading_it_all(
     assert _user_items(response) == [
         {"name": "oversized-resource", "error": "catalog_capacity"}
     ]
-    assert read_sizes
-    assert all(0 < size <= 1024 * 1024 + 1 for size in read_sizes)
+    assert read_sizes == []
 
 
 def test_workflow_catalog_enforces_aggregate_resource_budget(
@@ -1662,6 +2376,11 @@ def test_workflow_catalog_project_definition_overrides_profile(
                 "reason": "parameterless",
             },
             "run_support": {"supported": True, "reason": "supported"},
+            "language": {
+                "effective_profile": "hermes-legacy",
+                "legacy": True,
+            },
+            "compatibility": {"level": "mapped", "runnable": True},
         }
     ]
 

@@ -85,9 +85,15 @@ def test_foreground_owner_stall_does_not_advertise_noop_resume(
     assert status["blocking_reason"] == "foreground_owner_unavailable"
     assert "resume" not in status["next_actions"]
     before = status["state_version"]
+    always_run_nodes = RunScheduler(store).verified_always_run_nodes(
+        admitted.run_id
+    )
 
     with pytest.raises(ForegroundExecutionConflict, match="foreground owner conflict"):
-        store.resume_run(admitted.run_id)
+        store.resume_run(
+            admitted.run_id,
+            always_run_nodes=always_run_nodes,
+        )
 
     assert store.load_run(admitted.run_id)["state_version"] == before
 

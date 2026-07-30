@@ -4,13 +4,22 @@ import json
 import shutil
 import stat
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 import pytest
 
+from plugins.workflow.api_admission import (
+    ApiAdmissionAuthority,
+    ApiAdmissionError,
+    start_api_run,
+)
 from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.models import WorkflowValidationError
 from plugins.workflow.schema import load_workflow
+from plugins.workflow.store import RunStore
 from plugins.workflow.trust import (
+    WorkflowResourceReadBudget,
     WorkflowTrustError,
     WorkflowTrustStore,
     build_risk_summary,
@@ -28,11 +37,18 @@ def _package(workflow_writer, root):
     (root / "scripts" / "helper.py").write_text("print('ok')\n", encoding="utf-8")
     (root / "mcp").mkdir()
     (root / "mcp" / "echo.yaml").write_text(
-        "command: python\nargs: [servers/echo.py]\nenv: {TOKEN: '${TOKEN}'}\n",
+        "command: python\n"
+        "args: [servers/echo.py, --config=config/settings.json]\n"
+        "runtime_files: [data/value.txt]\n"
+        "env: {TOKEN: '${TOKEN}'}\n",
         encoding="utf-8",
     )
     (root / "servers").mkdir()
     (root / "servers" / "echo.py").write_text("print('echo')\n", encoding="utf-8")
+    (root / "config").mkdir()
+    (root / "config" / "settings.json").write_text("{}\n", encoding="utf-8")
+    (root / "data").mkdir()
+    (root / "data" / "value.txt").write_text("sealed\n", encoding="utf-8")
     path = workflow_writer(
         root / "workflows",
         name="risky",
@@ -67,12 +83,75 @@ def _package(workflow_writer, root):
     return load_workflow(path)
 
 
+def _resource_boundary_package(
+    workflow_writer,
+    home,
+    *,
+    canonical_file_count: int,
+):
+    command_root = home / "commands"
+    command_root.mkdir(parents=True)
+    nodes = []
+    # The package authority includes the workflow definition. Every remaining
+    # canonical file is an empty, explicitly declared command resource.
+    for index in range(canonical_file_count - 1):
+        name = f"empty-{index:03d}"
+        (command_root / f"{name}.md").write_bytes(b"")
+        nodes.append({"id": f"command-{index:03d}", "command": name})
+    path = workflow_writer(
+        home / "workflows",
+        name=f"resource-boundary-{canonical_file_count}",
+        filename=f"resource-boundary-{canonical_file_count}.yaml",
+        nodes=nodes,
+    )
+    return load_workflow(path)
+
+
+def _trust_for_api_admission(home, package) -> None:
+    compatibility = assess_compatibility(package)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, compatibility)
+    WorkflowTrustStore(home).trust(
+        digest.sha256,
+        actor="resource-boundary-test",
+        risk_digest=risk.risk_digest,
+    )
+
+
+def _healthy_coordinator(store: RunStore) -> None:
+    acquired = CoordinatorStore(store.database).try_acquire(
+        CoordinatorIdentity(
+            owner_id="resource-boundary-test",
+            host_kind="web",
+            host_instance_id="resource-boundary-test",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=datetime.now(timezone.utc),
+        lease_seconds=60,
+    )
+    assert acquired.is_leader
+
+
+def _api_authority() -> ApiAdmissionAuthority:
+    return ApiAdmissionAuthority(
+        principal="resource-boundary-test",
+        namespace="resource-boundary-test",
+        operator_scope=None,
+        source_instance="desktop:resource-boundary-test",
+        assurance="local_admin_claim",
+        trigger_source="desktop",
+    )
+
+
 def test_digest_covers_yaml_sidecar_and_executable_resources(workflow_writer, tmp_path):
     package = _package(workflow_writer, tmp_path / "package")
     original = compute_package_digest(package)
 
     assert original.covered_relative_paths == (
         "commands/audit.md",
+        "config/settings.json",
+        "data/value.txt",
         "mcp/echo.yaml",
         "scripts/helper.py",
         "servers/echo.py",
@@ -86,6 +165,144 @@ def test_digest_covers_yaml_sidecar_and_executable_resources(workflow_writer, tm
         target = clone_root / relative_path
         target.write_bytes(target.read_bytes() + b"# mutation\n")
         assert compute_package_digest(clone).sha256 != original.sha256
+
+
+def test_production_authority_accepts_512_files_and_refuses_513_before_admission(
+    workflow_writer, tmp_path, monkeypatch
+):
+    accepted_home = tmp_path / "accepted"
+    accepted_package = _resource_boundary_package(
+        workflow_writer,
+        accepted_home,
+        canonical_file_count=512,
+    )
+    _trust_for_api_admission(accepted_home, accepted_package)
+    accepted_store = RunStore(accepted_home)
+    _healthy_coordinator(accepted_store)
+
+    accepted = start_api_run(
+        accepted_store,
+        hermes_home=accepted_home,
+        workdir=tmp_path,
+        user_home=tmp_path,
+        workflow_name=accepted_package.definition.name,
+        values={},
+        idempotency_key="accept-512-files",
+        concurrency_policy="queue",
+        authority=_api_authority(),
+        catalog_source="profile",
+    )
+    accepted_run_id = str(accepted["run_id"])
+
+    assert accepted_store.run_directory(accepted_run_id).is_dir()
+    assert accepted_store.get_run_status(accepted_run_id)["status"] in {
+        "queued",
+        "running",
+    }
+
+    refused_home = tmp_path / "refused"
+    refused_package = _resource_boundary_package(
+        workflow_writer,
+        refused_home,
+        canonical_file_count=513,
+    )
+    _trust_for_api_admission(refused_home, refused_package)
+    refused_store = RunStore(refused_home)
+    _healthy_coordinator(refused_store)
+    before_runs = refused_store.list_runs()
+    before_events = refused_store.list_admission_events()
+    before_run_entries = tuple(refused_store.runs_root.iterdir())
+    before_staging_entries = tuple(refused_store.staging_root.iterdir())
+    preparation_calls = []
+
+    def forbidden_prepare(*_args, **_kwargs):
+        preparation_calls.append(True)
+        raise AssertionError(
+            "513-file authority reached forbidden snapshot preparation"
+        )
+
+    monkeypatch.setattr(
+        refused_store,
+        "prepare_run_snapshot",
+        forbidden_prepare,
+    )
+
+    with pytest.raises(ApiAdmissionError) as exc_info:
+        start_api_run(
+            refused_store,
+            hermes_home=refused_home,
+            workdir=tmp_path,
+            user_home=tmp_path,
+            workflow_name=refused_package.definition.name,
+            values={},
+            idempotency_key="refuse-513-files",
+            concurrency_policy="queue",
+            authority=_api_authority(),
+            catalog_source="profile",
+        )
+
+    assert exc_info.value.code == "workflow_catalog_capacity"
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.retryable is True
+    assert preparation_calls == []
+    assert refused_store.list_runs() == before_runs == ()
+    assert refused_store.list_admission_events() == before_events == ()
+    assert tuple(refused_store.runs_root.iterdir()) == before_run_entries == ()
+    assert tuple(refused_store.staging_root.iterdir()) == before_staging_entries == ()
+
+
+@pytest.mark.parametrize("mutation", ["delete", "rename", "symlink"])
+def test_cached_mcp_transitive_digest_survives_mutable_path_races(
+    workflow_writer, tmp_path, mutation
+):
+    package = _package(workflow_writer, tmp_path / "package")
+    covered = compute_package_digest(package).covered_relative_paths
+    contents = {
+        relative: (package.root / relative).read_bytes() for relative in covered
+    }
+    authority = WorkflowResourceReadBudget.from_authenticated(package.root, contents)
+    expected = compute_package_digest(package, read_budget=authority)
+    target = package.root / "config/settings.json"
+    if mutation == "delete":
+        target.unlink()
+    elif mutation == "rename":
+        target.rename(target.with_suffix(".gone"))
+    else:
+        target.unlink()
+        target.symlink_to(tmp_path / "outside.json")
+
+    observed = compute_package_digest(package, read_budget=authority)
+
+    assert observed == expected
+    assert "config/settings.json" in observed.covered_relative_paths
+
+
+@pytest.mark.parametrize("mutation", ["delete", "rename", "replace", "symlink"])
+def test_mutable_boundary_verification_still_detects_cached_resource_races(
+    workflow_writer, tmp_path, mutation
+):
+    package = _package(workflow_writer, tmp_path / "package")
+    target = package.root / "config/settings.json"
+    authority = WorkflowResourceReadBudget(
+        max_file_bytes=1024 * 1024,
+        max_total_bytes=8 * 1024 * 1024,
+        max_files=512,
+    )
+    authority.read(target)
+    if mutation == "delete":
+        target.unlink()
+    elif mutation == "rename":
+        target.rename(target.with_suffix(".gone"))
+    elif mutation == "replace":
+        target.write_bytes(b"[]\n")
+    else:
+        outside = tmp_path / "outside.json"
+        outside.write_bytes(b"{}\n")
+        target.unlink()
+        target.symlink_to(outside)
+
+    with pytest.raises(OSError):
+        authority.read(target, verify_cached_identity=True)
 
 
 def test_moving_identical_package_preserves_digest_but_not_profile_trust(

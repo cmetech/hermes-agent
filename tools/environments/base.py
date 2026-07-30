@@ -50,6 +50,90 @@ _activity_callback_local = threading.local()
 # path for both bounded and unbounded modes.
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
+_SNAPSHOT_GUARD_FAILURE_EXIT = 125
+_SNAPSHOT_GUARD_PASSED_SENTINEL_PREFIX = "__HERMES_SNAPSHOT_GUARD_PASSED_"
+
+# A token-free first stage for command-string transports whose account shell
+# may inherit xtrace. The wrapper is supplied only after this prelude disables
+# tracing. POSIX mode gives special builtins precedence over shell functions;
+# a startup DEBUG trap is cleared while the script is still token-free, then
+# protected unset removes functions that could intercept the external hygienic
+# launch. The AND-list fails closed before any sentinel-bearing step.
+_CLEAN_OUTER_SHELL_PRELUDE = (
+    "POSIXLY_CORRECT=1 &&\n"
+    "\\set +x &&\n"
+    "case ${BASH_VERSION-} in\n"
+    "    ?*) \\trap - DEBUG ;;\n"
+    "esac &&\n"
+    "\\set +x &&\n"
+    "{ \\unset -f command 2>/dev/null || "
+    "! \\export -f command >/dev/null 2>&1; } &&\n"
+    "{ \\unset -f env 2>/dev/null || "
+    "! \\export -f env >/dev/null 2>&1; } &&\n"
+    "{ \\unset -f bash 2>/dev/null || "
+    "! \\export -f bash >/dev/null 2>&1; } &&\n"
+    "{ \\unset -f set 2>/dev/null || "
+    "! \\export -f set >/dev/null 2>&1; } &&\n"
+    "{ \\unset -f unset 2>/dev/null || "
+    "! \\export -f unset >/dev/null 2>&1; } &&\n"
+    "{ \\unset -f printf 2>/dev/null || "
+    "! \\export -f printf >/dev/null 2>&1; } &&\n"
+    "{ \\unset -f base64 2>/dev/null || "
+    "! \\export -f base64 >/dev/null 2>&1; } &&\n"
+    "{ \\unset -f export 2>/dev/null || "
+    "! \\export -f export >/dev/null 2>&1; } &&\n"
+)
+_CLEAN_ENV_BASH = (
+    "\\command env BASH_ENV=/dev/null ENV=/dev/null SHELLOPTS= bash "
+)
+
+
+# Bash resolves a function named ``builtin`` before ``\builtin``, including on
+# macOS's Bash 3.2.  Enter POSIX mode using assignment syntax (which cannot be
+# function-shadowed), then use the POSIX special-builtin precedence rule to
+# record and remove the three functions that could intercept this bootstrap.
+# Bootstrap rejects a recorded definition rather than publish a snapshot that
+# silently omits it; normal updates may safely remove it inside their isolated
+# writer. Restore the caller's shell mode before running the protected
+# operation. Consumers place this prelude in a subshell, so these removals never
+# mutate the user's shell.
+_SNAPSHOT_OPERATION_PRELUDE = r"""__hermes_snapshot_was_posix=0
+[[ -o posix ]] && __hermes_snapshot_was_posix=1
+__hermes_snapshot_had_posixly_correct=0
+if [[ ${POSIXLY_CORRECT+x} ]]; then
+    __hermes_snapshot_had_posixly_correct=1
+    __hermes_snapshot_old_posixly_correct=$POSIXLY_CORRECT
+fi
+POSIXLY_CORRECT=1
+__hermes_snapshot_had_dispatcher_functions=0
+if \export -f builtin >/dev/null 2>&1 ||
+   \export -f set >/dev/null 2>&1 ||
+   \export -f unset >/dev/null 2>&1; then
+    __hermes_snapshot_had_dispatcher_functions=1
+fi
+if [[ ${__hermes_snapshot_reject_dispatcher_functions:-0} == 1 &&
+      $__hermes_snapshot_had_dispatcher_functions == 1 ]]; then
+    [[ 0 == 1 ]]
+fi &&
+if \unset -f builtin unset set; then
+    if [[ $__hermes_snapshot_had_posixly_correct == 1 ]]; then
+        POSIXLY_CORRECT=$__hermes_snapshot_old_posixly_correct
+    else
+        \unset POSIXLY_CORRECT
+    fi &&
+    if [[ $__hermes_snapshot_was_posix == 1 ]]; then
+        \set -o posix
+    else
+        \set +o posix
+    fi &&
+    \unset __hermes_snapshot_was_posix __hermes_snapshot_had_posixly_correct \
+        __hermes_snapshot_old_posixly_correct \
+        __hermes_snapshot_had_dispatcher_functions \
+        __hermes_snapshot_reject_dispatcher_functions
+else
+    [[ 0 == 1 ]]
+fi"""
+
 
 class _BoundedOutputCollector:
     """Retain a bounded 40/60 head-tail window of streamed text."""
@@ -142,6 +226,58 @@ class _BoundedOutputCollector:
             tail_chars = content_budget - head_chars
             rendered_tail = tail[-tail_chars:] if tail_chars else ""
             return head[:head_chars] + notice[:available] + rendered_tail + suffix
+
+
+class _RawSentinelFilter:
+    """Detect and remove one exact framed sentinel from streamed text.
+
+    The filter runs before bounded output collection. It retains only a suffix
+    that could still become the sentinel on the next chunk, so arbitrary output
+    without newlines cannot grow an unbounded staging buffer. Once the trusted
+    wrapper's sentinel is seen, all later text is user output and passes through
+    unchanged -- including an exact replay of the sentinel.
+    """
+
+    def __init__(self, sentinel: str):
+        self._needle = f"\n{sentinel}\n"
+        self._pending = ""
+        self.seen = False
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        if self.seen:
+            return text
+
+        candidate = self._pending + text
+        index = candidate.find(self._needle)
+        if index != -1:
+            self.seen = True
+            self._pending = ""
+            return candidate[:index] + candidate[index + len(self._needle) :]
+
+        keep = min(len(candidate), len(self._needle) - 1)
+        while keep and not candidate.endswith(self._needle[:keep]):
+            keep -= 1
+        if keep:
+            self._pending = candidate[-keep:]
+            return candidate[:-keep]
+
+        self._pending = ""
+        return candidate
+
+    def finish(self) -> str:
+        # Daytona 0.155 normalizes output through splitlines()/join(), which
+        # removes the final newline from a no-output command's framed sentinel.
+        # The remaining bytes are still exact control data; shorter prefixes
+        # and all nonmatches remain ordinary output and flush losslessly.
+        if not self.seen and self._pending == self._needle[:-1]:
+            self._pending = ""
+            self.seen = True
+            return ""
+        pending = self._pending
+        self._pending = ""
+        return pending
 
 
 def set_activity_callback(cb: Callable[[str], None] | None) -> None:
@@ -425,6 +561,9 @@ class BaseEnvironment(ABC):
         # ``Directory \\drivers\\etc`` startup) so execute() must not fall
         # back to ``bash -l`` per command — use non-login ``bash -c`` instead.
         self._prefer_nonlogin = False
+        self._session_mode = "uninitialized"
+        self._session_diagnostic = ""
+        self._diagnostic_pending = False
 
     # ------------------------------------------------------------------
     # Abstract methods
@@ -437,6 +576,7 @@ class BaseEnvironment(ABC):
         login: bool = False,
         timeout: int = 120,
         stdin_data: str | None = None,
+        clean: bool = False,
     ) -> ProcessHandle:
         """Spawn a bash process to run *cmd_string*.
 
@@ -453,6 +593,13 @@ class BaseEnvironment(ABC):
     # ------------------------------------------------------------------
     # Session snapshot (init_session)
     # ------------------------------------------------------------------
+
+    def _set_session_mode(self, mode: str, diagnostic: str = "") -> None:
+        self._session_mode = mode
+        self._snapshot_ready = mode == "snapshot"
+        self._prefer_nonlogin = mode != "snapshot"
+        self._session_diagnostic = diagnostic
+        self._diagnostic_pending = bool(diagnostic)
 
     def init_session(self):
         """Capture login shell environment into a snapshot file.
@@ -486,19 +633,36 @@ class BaseEnvironment(ABC):
         # source() either sees the old complete snapshot or the new complete
         # one — never a partial/truncated file.
         #
-        # The temp name MUST be unique per concurrent writer.  ``$$`` is the
-        # bash PID, but in ``&``-launched subshells (how concurrent terminal
-        # calls run) ``$$`` stays the *parent* shell's PID — so two concurrent
-        # writers would pick the SAME temp name, clobber each other's temp
-        # mid-write, and mv would then publish a torn file (the corruption is
-        # only narrowed, not closed).  ``$BASHPID`` is the actual subshell PID
-        # and is genuinely unique per writer, which closes the race.  The
-        # static path is shell-quoted (Windows/Git-Bash drive letters, spaces)
-        # with ``$BASHPID`` left outside the quotes so it still expands.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # The temp file MUST be collision-safe for concurrent writers. ``$$``
+        # is shared by ``&``-launched subshells, while ``$BASHPID`` is unset by
+        # macOS's supported Bash 3.2; either PID-derived name can therefore
+        # collapse every writer onto one inode. ``mktemp`` creates the file
+        # exclusively in the snapshot's own directory, preserving same-fs
+        # atomic rename on macOS, Linux/BusyBox, and Git Bash. Quote the static
+        # template for Windows paths and spaces.
+        _snap_tmp_template = self._quote_shell_path(
+            self._snapshot_path + ".tmp.XXXXXX"
+        )
+        _snap_tmp = '"$__hermes_snap_tmp"'
+        # A persisted ``command()`` function shadows the plain ``command``
+        # builtin. Invoke it through Bash's ``builtin`` builtin, and inhibit an
+        # alias named ``builtin``, so user shell customizations cannot replace
+        # Hermes' allocator or file operations.
+        _external = r"\builtin command"
+        _builtin = r"\builtin"
         bootstrap = (
-            f"umask 077\n"
-            f"export -p > {_snap_tmp}\n"
+            "(\n"
+            "__hermes_snapshot_reject_dispatcher_functions=1\n"
+            "if {\n"
+            f"{_SNAPSHOT_OPERATION_PRELUDE}\n"
+            "}; then\n"
+            f"{_builtin} umask 077\n"
+            # Gate the complete assembly and publication. A failure anywhere
+            # leaves the prior snapshot in place and makes init_session reject
+            # this bootstrap instead of accepting a partial snapshot.
+            f"if ! {{\n"
+            f"__hermes_snap_tmp=$({_external} mktemp {_snap_tmp_template} 2>/dev/null) &&\n"
+            f"{_builtin} export -p > {_snap_tmp} &&\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
             # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
@@ -511,27 +675,99 @@ class BaseEnvironment(ABC):
             # ``declare -f`` with no name args dumps ALL functions, so an empty
             # name list (only private funcs present) would otherwise leak the
             # very functions we meant to drop.
-            f"__hermes_fns=$(declare -F | awk '{{print $3}}' | grep -vE '^_[^_]') || true\n"
-            f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns "
-            f">> {_snap_tmp} 2>/dev/null || true\n"
-            f"alias -p >> {_snap_tmp}\n"
-            f"echo 'shopt -s expand_aliases' >> {_snap_tmp}\n"
-            f"echo 'set +e' >> {_snap_tmp}\n"
-            f"echo 'set +u' >> {_snap_tmp}\n"
-            # Publish atomically only if assembly succeeded; otherwise drop the
-            # partial temp rather than leave it to be sourced or orphaned.
-            f"mv -f {_snap_tmp} {_quoted_snap} || rm -f {_snap_tmp}\n"
-            f"builtin cd -- {_quoted_cwd} 2>/dev/null || true\n"
-            f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
+            f"__hermes_fn_catalog=$({_builtin} declare -F) &&\n"
+            f"__hermes_fns=$({_external} awk '$3 !~ /^_[^_]/ {{print $3}}' "
+            f"<<< \"$__hermes_fn_catalog\") &&\n"
+            f"{{ [[ -z \"$__hermes_fns\" ]] || "
+            f"{_builtin} declare -f $__hermes_fns >> {_snap_tmp}; }} &&\n"
+            f"{_builtin} alias -p >> {_snap_tmp} &&\n"
+            f"{_builtin} printf '%s\\n' 'shopt -s expand_aliases' "
+            f"'set +e' 'set +u' >> {_snap_tmp} &&\n"
+            f"{_external} mv -f {_snap_tmp} {_quoted_snap}\n"
+            f"}}; then\n"
+            f"{_external} rm -f {_snap_tmp} 2>/dev/null || true\n"
+            f"{_builtin} exit 1\n"
+            f"fi\n"
+            f"{_builtin} cd -- {_quoted_cwd} 2>/dev/null || true\n"
+            f"{_builtin} printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' "
+            f"\"$({_builtin} pwd -P)\"\n"
+            "else\n"
+            "[[ 0 == 1 ]]\n"
+            "fi\n"
+            ")\n"
         )
+        clean_timeout = min(15, self._snapshot_timeout)
+
+        def _externally_stopped(result: dict) -> bool:
+            """Consume private waiter provenance from session-setup work."""
+            return bool(result.pop("_hermes_externally_stopped", False))
+
+        def _use_interrupted_setup_fallback() -> None:
+            diagnostic = (
+                "Session profile snapshot initialization was interrupted. "
+                "Using a clean non-login shell; profile environment and "
+                "functions are unavailable."
+            )
+            self._set_session_mode("degraded_nonlogin", diagnostic)
+            logger.warning("%s (session=%s)", diagnostic, self._session_id)
+
         try:
-            proc = self._run_bash(bootstrap, login=True, timeout=self._snapshot_timeout)
+            cleanup = self._run_bash(
+                f"builtin command rm -f -- {_quoted_snap}",
+                timeout=clean_timeout,
+                clean=True,
+            )
+            cleanup_result = self._wait_for_process(cleanup, timeout=clean_timeout)
+            if _externally_stopped(cleanup_result):
+                _use_interrupted_setup_fallback()
+                return
+            if int(cleanup_result.get("returncode") or 0) != 0:
+                raise RuntimeError("could not prepare fresh snapshot candidate")
+
+            self._session_mode = "capturing"
+            proc = self._run_bash(
+                bootstrap,
+                login=True,
+                timeout=self._snapshot_timeout,
+                clean=False,
+            )
             result = self._wait_for_process(proc, timeout=self._snapshot_timeout)
-            if int(result.get("returncode") or 0) != 0:
+            if _externally_stopped(result):
+                _use_interrupted_setup_fallback()
+                return
+            returncode = int(result.get("returncode") or 0)
+            if returncode != 0:
                 raise RuntimeError(
-                    f"snapshot bootstrap failed with exit code {result.get('returncode')}"
+                    f"snapshot bootstrap failed with exit code {returncode}"
                 )
-            self._snapshot_ready = True
+
+            validator = (
+                f"[[ -f {_quoted_snap} && ! -L {_quoted_snap} && -s {_quoted_snap} ]] && "
+                f"__hermes_mode=$(builtin command stat -c %a {_quoted_snap} 2>/dev/null || "
+                f"builtin command stat -f %Lp {_quoted_snap} 2>/dev/null) && "
+                "[[ $__hermes_mode == 600 ]] && "
+                f"builtin command bash --noprofile --norc -n {_quoted_snap} && "
+                "(\n"
+                f"builtin source {_quoted_snap} >/dev/null 2>&1 || builtin exit 125\n"
+                "__hermes_snapshot_reject_dispatcher_functions=1\n"
+                "if {\n"
+                f"{_SNAPSHOT_OPERATION_PRELUDE}\n"
+                "}; then builtin exit 0; else builtin exit 125; fi\n"
+                ")"
+            )
+            validation_proc = self._run_bash(
+                validator, timeout=clean_timeout, clean=True
+            )
+            validation = self._wait_for_process(
+                validation_proc, timeout=clean_timeout
+            )
+            if _externally_stopped(validation):
+                _use_interrupted_setup_fallback()
+                return
+            if int(validation.get("returncode") or 0) != 0:
+                raise RuntimeError("snapshot artifact validation failed")
+
+            self._set_session_mode("snapshot")
             self._update_cwd(result)
             logger.info(
                 "Session snapshot created (session=%s, cwd=%s)",
@@ -539,37 +775,48 @@ class BaseEnvironment(ABC):
                 self.cwd,
             )
         except Exception as exc:
-            self._snapshot_ready = False
-            # Default fallback is bash -l per command so PATH/nvm/etc still
-            # load.  If login itself is dead (classic Windows Git Bash
-            # ``Directory \\drivers\\etc does not exist``), that fallback
-            # would brick every tool — prefer non-login bash -c instead.
             detail = str(exc)
-            prefer_nonlogin = False
             try:
-                probe = self._run_bash("true", login=False, timeout=min(15, self._snapshot_timeout))
-                probe_result = self._wait_for_process(probe, timeout=min(15, self._snapshot_timeout))
-                prefer_nonlogin = int(probe_result.get("returncode") or 0) == 0
-                if not prefer_nonlogin:
-                    detail = (probe_result.get("stdout") or detail).strip() or detail
+                rejected = self._run_bash(
+                    f"builtin command rm -f -- {_quoted_snap}",
+                    timeout=clean_timeout,
+                    clean=True,
+                )
+                rejected_result = self._wait_for_process(
+                    rejected, timeout=clean_timeout
+                )
+                if _externally_stopped(rejected_result):
+                    _use_interrupted_setup_fallback()
+                    return
+            except Exception as cleanup_exc:
+                detail = f"{detail}; rejected snapshot cleanup: {cleanup_exc}"
+            try:
+                probe = self._run_bash(
+                    "true", timeout=clean_timeout, clean=True
+                )
+                probe_result = self._wait_for_process(probe, timeout=clean_timeout)
+                if _externally_stopped(probe_result):
+                    _use_interrupted_setup_fallback()
+                    return
+                healthy = int(probe_result.get("returncode") or 0) == 0
             except Exception as probe_exc:
                 detail = f"{detail}; non-login probe: {probe_exc}"
+                healthy = False
 
-            self._prefer_nonlogin = prefer_nonlogin
-            if prefer_nonlogin:
-                logger.warning(
-                    "init_session failed (session=%s): %s — "
-                    "login bash unusable; falling back to non-login bash -c",
-                    self._session_id,
-                    exc,
+            if healthy:
+                diagnostic = (
+                    f"Session profile snapshot unavailable: {detail}. "
+                    "Using a clean non-login shell; profile environment and "
+                    "functions are unavailable."
                 )
+                self._set_session_mode("degraded_nonlogin", diagnostic)
             else:
-                logger.warning(
-                    "init_session failed (session=%s): %s — "
-                    "falling back to bash -l per command",
-                    self._session_id,
-                    detail,
+                diagnostic = (
+                    f"Session profile snapshot unavailable: {detail}. "
+                    "Clean non-login shell health probe failed; refusing command execution."
                 )
+                self._set_session_mode("unavailable", diagnostic)
+            logger.warning("%s (session=%s)", diagnostic, self._session_id)
 
     # ------------------------------------------------------------------
     # Command wrapping
@@ -581,9 +828,9 @@ class BaseEnvironment(ABC):
         if cwd == "~":
             return cwd
         if cwd == "~/":
-            return "$HOME"
+            return '"$HOME"'
         if cwd.startswith("~/"):
-            return f"$HOME/{shlex.quote(cwd[2:])}"
+            return f'"$HOME"/{shlex.quote(cwd[2:])}'
         return shlex.quote(cwd)
 
     def _quote_shell_path(self, path: str) -> str:
@@ -595,7 +842,13 @@ class BaseEnvironment(ABC):
         """
         return shlex.quote(path)
 
-    def _wrap_command(self, command: str, cwd: str) -> str:
+    def _wrap_command(
+        self,
+        command: str,
+        cwd: str,
+        *,
+        guard_passed_sentinel: str | None = None,
+    ) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
         escaped = command.replace("'", "'\\''")
@@ -604,49 +857,159 @@ class BaseEnvironment(ABC):
         # rewrites ``C:/...`` to ``/c/...`` so MSYS doesn't mangle it).
         _quoted_snap = self._quote_shell_path(self._snapshot_path)
         # Use atomic file replacement for env snapshot updates (issue #38249).
-        # Assemble into a per-writer-unique temp file, then mv to atomically
+        # Assemble into a collision-safe temp file, then mv to atomically
         # replace the snapshot so concurrent source() calls never read a
-        # truncated/half-written file.  ``$BASHPID`` (not ``$$``) is the actual
-        # subshell PID — unique per concurrent ``&``-launched writer — so two
-        # writers never share a temp name and clobber each other before the mv.
-        # Static path shell-quoted (Windows/spaces); ``$BASHPID`` left to expand.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # truncated/half-written file. PID-derived names are unsafe here: ``$$``
+        # is shared by background subshells and ``$BASHPID`` is unset in the
+        # supported macOS Bash 3.2. ``mktemp`` creates the file exclusively in
+        # the snapshot's directory. Static template shell-quoted for
+        # Windows/Git-Bash paths and spaces.
+        _snap_tmp_template = self._quote_shell_path(
+            self._snapshot_path + ".tmp.XXXXXX"
+        )
+        _snap_tmp = '"$__hermes_snap_tmp"'
+        _external = r"\builtin command"
+        _builtin = r"\builtin"
 
         parts = []
 
-        # Source snapshot (env vars from previous commands).
-        # Redirect stdout to /dev/null: on macOS (bash 3.2 and certain
-        # Homebrew bash builds) sourcing a file containing ``declare -x``
-        # can emit the declarations to stdout, leaking ~60 lines of env
-        # vars into every tool response (issue #15459).  Linux bash is
-        # silent here, but the redirect is harmless.
-        if self._snapshot_ready:
-            parts.append(
-                f"source {_quoted_snap} >/dev/null 2>&1 || true"
-            )
+        # Enter POSIX mode before exiting so even a partially sourced snapshot
+        # cannot intercept ``exit`` with a function. Failure is inferred from
+        # the absence of the later guard-passed attestation; no failure marker
+        # needs to survive the compromised shell.
+        guarded_failure = f"POSIXLY_CORRECT=1; \\exit {_SNAPSHOT_GUARD_FAILURE_EXIT}"
 
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.
         quoted_cwd = self._quote_cwd_for_cd(cwd)
-        # ``--`` keeps hyphen-prefixed directory names from being parsed as options.
-        parts.append(f"builtin cd -- {quoted_cwd} || exit 126")
+        protected_cwd_setup = (
+            f"__hermes_had_cdpath=0 || {{ {guarded_failure}; }}",
+            "if [[ ${CDPATH+x} ]]; then "
+            "__hermes_had_cdpath=1 && __hermes_old_cdpath=$CDPATH; fi || "
+            f"{{ {guarded_failure}; }}",
+            f"CDPATH= || {{ {guarded_failure}; }}",
+            f"builtin cd -- {quoted_cwd} || {{ {guarded_failure}; }}",
+            "if [[ $__hermes_had_cdpath == 1 ]]; then "
+            "CDPATH=$__hermes_old_cdpath; "
+            "else builtin unset CDPATH; fi || "
+            f"{{ {guarded_failure}; }}",
+            "builtin unset __hermes_had_cdpath __hermes_old_cdpath || "
+            f"{{ {guarded_failure}; }}",
+        )
+
+        # Source and sanitize the snapshot while xtrace is routed to a
+        # temporary /dev/null descriptor. A tampered snapshot can enable
+        # xtrace and choose PS4, including text resembling the guard-passed
+        # sentinel. The compound-command redirection opens fd 19 before the
+        # group and restores/closes it afterward without clobbering any caller
+        # fd 19. The group's stdout/stderr are also suppressed so a snapshot
+        # cannot redirect BASH_XTRACEFD back to 1 or 2 and forge control data.
+        # DEBUG/RETURN/ERR traps, trace state, and cwd are neutralized while
+        # still inside the suppressed group. Failure exits before the group can
+        # expose output or the wrapper can emit its guard-passed attestation.
+        #
+        # Snapshot stdout/stderr is also redirected: on macOS (bash 3.2 and
+        # certain Homebrew bash builds), sourcing ``declare -x`` can emit the
+        # declarations to stdout (issue #15459).
+        if self._snapshot_ready:
+            parts.extend(
+                (
+                    "if {",
+                    f"__hermes_snapshot_had_xtracefd=0 || "
+                    f"{{ {guarded_failure}; }}",
+                    "if [[ ${BASH_XTRACEFD+x} ]]; then "
+                    "__hermes_snapshot_had_xtracefd=1 && "
+                    "__hermes_snapshot_old_xtracefd=$BASH_XTRACEFD; fi || "
+                    f"{{ {guarded_failure}; }}",
+                    f"BASH_XTRACEFD=19 || {{ {guarded_failure}; }}",
+                    f"builtin source {_quoted_snap} >/dev/null 2>&1 || "
+                    f"{{ {guarded_failure}; }}",
+                    "__hermes_snapshot_reject_dispatcher_functions=1 || "
+                    f"{{ {guarded_failure}; }}",
+                    "if {",
+                    _SNAPSHOT_OPERATION_PRELUDE,
+                    f"}}; then :; else {guarded_failure}; fi",
+                    "builtin trap - DEBUG RETURN ERR || "
+                    f"{{ {guarded_failure}; }}",
+                    f"builtin set +x || {{ {guarded_failure}; }}",
+                    "if [[ $__hermes_snapshot_had_xtracefd == 1 ]]; then "
+                    "BASH_XTRACEFD=$__hermes_snapshot_old_xtracefd; "
+                    "else builtin unset BASH_XTRACEFD; fi || "
+                    f"{{ {guarded_failure}; }}",
+                    "builtin unset __hermes_snapshot_had_xtracefd "
+                    "__hermes_snapshot_old_xtracefd || "
+                    f"{{ {guarded_failure}; }}",
+                    *protected_cwd_setup,
+                    f"}}; then :; else {guarded_failure}; "
+                    "fi 19>/dev/null >/dev/null 2>&1",
+                )
+            )
+        else:
+            parts.extend(
+                (
+                    "__hermes_had_cdpath=0",
+                    "if [[ ${CDPATH+x} ]]; then __hermes_had_cdpath=1; "
+                    "__hermes_old_cdpath=$CDPATH; fi",
+                    "CDPATH=",
+                    f"builtin cd -- {quoted_cwd} || builtin exit 126",
+                    "if [[ $__hermes_had_cdpath == 1 ]]; then "
+                    "CDPATH=$__hermes_old_cdpath; else builtin unset CDPATH; fi",
+                    "builtin unset __hermes_had_cdpath __hermes_old_cdpath",
+                )
+            )
+
+        # This is the only READY-path trust attestation. It is emitted after
+        # source, sanitizer, and cwd setup all succeed, immediately before user
+        # code. The raw-stream filter removes it before any bounded rendering.
+        if self._snapshot_ready and guard_passed_sentinel:
+            parts.append(
+                f"builtin printf '\\n%s\\n' "
+                f"{shlex.quote(guard_passed_sentinel)} || "
+                f"{{ {guarded_failure}; }}"
+            )
 
         # Run the actual command
-        parts.append(f"eval '{escaped}'")
+        parts.append(f"builtin eval '{escaped}'")
         parts.append("__hermes_ec=$?")
-        # Restrict Hermes metadata files without changing the user's command
-        # umask. Snapshot files may contain env-carried secrets.
-        parts.append("umask 077")
+        parts.extend(
+            (
+                "__hermes_snapshot_reject_dispatcher_functions=0",
+                "if {",
+                _SNAPSHOT_OPERATION_PRELUDE,
+                f"}}; then :; else \\exit {_SNAPSHOT_GUARD_FAILURE_EXIT}; fi",
+            )
+        )
+
+        # Isolate the defensive shell sanitization from the user's command
+        # environment. Snapshot files may contain env-carried secrets, so the
+        # protected operation also uses a private umask.
+        snapshot_update = [
+            "(",
+            "__hermes_snapshot_reject_dispatcher_functions=0",
+            "if {",
+            _SNAPSHOT_OPERATION_PRELUDE,
+            "}; then",
+            f"{_builtin} umask 077",
+        ]
 
         # Re-dump env vars to snapshot (atomic replacement to avoid races).
         # Chain mv on the export succeeding so a failed/partial dump never
         # replaces a good snapshot; drop the temp on failure so it isn't
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
         if self._snapshot_ready:
-            parts.append(
-                f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_quoted_snap}; }} "
-                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
+            snapshot_update.append(
+                f"{{ __hermes_snap_tmp=$({_external} mktemp {_snap_tmp_template} 2>/dev/null) && "
+                f"{_builtin} export -p > {_snap_tmp} && "
+                f"{_external} mv -f {_snap_tmp} {_quoted_snap}; }} 2>/dev/null || "
+                f"{{ {_external} rm -f {_snap_tmp} 2>/dev/null; [[ 0 == 1 ]]; }}"
             )
+        snapshot_update.extend(("else", "[[ 0 == 1 ]]", "fi"))
+        # Keep the subshell in an OR-list so a user-enabled ``set -e`` cannot
+        # abort the wrapper before its CWD marker and saved-status exit.  The
+        # deliberately false fallback preserves a failed update's nonzero
+        # status for direct callers/tests instead of swallowing the failure.
+        snapshot_update.append(") || [[ 0 == 1 ]]")
+        parts.append("\n".join(snapshot_update))
 
         # Emit the CWD stdout marker; all backends (including local, since
         # PR #63255) parse it from output — no temp-file write needed.
@@ -655,9 +1018,10 @@ class BaseEnvironment(ABC):
         # end with a newline (e.g. printf 'exact'). We'll strip this
         # injected newline in _extract_cwd_from_output.
         parts.append(
-            f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\""
+            f"builtin printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' "
+            '"$(builtin pwd -P)"'
         )
-        parts.append("exit $__hermes_ec")
+        parts.append("builtin exit $__hermes_ec")
 
         return "\n".join(parts)
 
@@ -676,7 +1040,12 @@ class BaseEnvironment(ABC):
     # ------------------------------------------------------------------
 
     def _wait_for_process(
-        self, proc: ProcessHandle, timeout: int = 120, *, bounded_capture: bool = False
+        self,
+        proc: ProcessHandle,
+        timeout: int = 120,
+        *,
+        bounded_capture: bool = False,
+        control_sentinel: str | None = None,
     ) -> dict:
         """Poll-based wait with interrupt checking and stdout draining.
 
@@ -714,6 +1083,33 @@ class BaseEnvironment(ABC):
             # accumulate-everything semantics.
             capture_limit = _UNBOUNDED_CAPTURE_CHARS
         output = _BoundedOutputCollector(capture_limit)
+        sentinel_filter = (
+            _RawSentinelFilter(control_sentinel) if control_sentinel else None
+        )
+
+        def _append_output(text: str) -> None:
+            if sentinel_filter is not None:
+                text = sentinel_filter.feed(text)
+            output.append(text)
+
+        def _finish_output() -> None:
+            if sentinel_filter is not None:
+                output.append(sentinel_filter.finish())
+
+        def _result(
+            rendered: str,
+            returncode: int,
+            *,
+            externally_stopped: bool = False,
+        ) -> dict:
+            result = {"output": rendered, "returncode": returncode}
+            if sentinel_filter is not None:
+                result["control_seen"] = sentinel_filter.seen
+            if externally_stopped:
+                # Private waiter provenance. ``execute`` consumes this before
+                # returning so callers never see an internal control field.
+                result["_hermes_externally_stopped"] = True
+            return result
 
         # Non-blocking drain via select().
         #
@@ -754,18 +1150,19 @@ class BaseEnvironment(ABC):
                     if piece is None:
                         continue
                     if isinstance(piece, bytes):
-                        output.append(decoder.decode(piece))
+                        _append_output(decoder.decode(piece))
                     else:
-                        output.append(str(piece))
+                        _append_output(str(piece))
             except Exception:
                 pass
             finally:
                 try:
                     tail = decoder.decode(b"", final=True)
                     if tail:
-                        output.append(tail)
+                        _append_output(tail)
                 except Exception:
                     pass
+                _finish_output()
 
         def _drain():
             # Resolve a real OS file descriptor up front.  Real subprocesses and
@@ -794,16 +1191,17 @@ class BaseEnvironment(ABC):
                         chunk = os.read(fd, 4096)
                         if not chunk:
                             break
-                        output.append(decoder.decode(chunk))
+                        _append_output(decoder.decode(chunk))
                 except (ValueError, OSError):
                     pass
                 finally:
                     try:
                         tail = decoder.decode(b"", final=True)
                         if tail:
-                            output.append(tail)
+                            _append_output(tail)
                     except Exception:
                         pass
+                    _finish_output()
                 return
             idle_after_exit = 0
             try:
@@ -819,7 +1217,7 @@ class BaseEnvironment(ABC):
                             break
                         if not chunk:
                             break  # true EOF — all writers closed
-                        output.append(decoder.decode(chunk))
+                        _append_output(decoder.decode(chunk))
                         idle_after_exit = 0
                     elif proc.poll() is not None:
                         # bash is gone and the pipe was idle for ~100ms.  Give
@@ -835,9 +1233,10 @@ class BaseEnvironment(ABC):
                 try:
                     tail = decoder.decode(b"", final=True)
                     if tail:
-                        output.append(tail)
+                        _append_output(tail)
                 except Exception:
                     pass
+                _finish_output()
 
         drain_thread = threading.Thread(target=_drain, daemon=True)
         drain_thread.start()
@@ -880,10 +1279,11 @@ class BaseEnvironment(ABC):
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
-                    return {
-                        "output": output.render(suffix="\n[Command interrupted]"),
-                        "returncode": 130,
-                    }
+                    return _result(
+                        output.render(suffix="\n[Command interrupted]"),
+                        130,
+                        externally_stopped=True,
+                    )
                 if time.monotonic() > deadline:
                     if _DEBUG_INTERRUPT:
                         logger.info(
@@ -894,12 +1294,13 @@ class BaseEnvironment(ABC):
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
                     timeout_msg = f"\n[Command timed out after {timeout}s]"
-                    return {
-                        "output": output.render(suffix=timeout_msg).lstrip()
+                    return _result(
+                        output.render(suffix=timeout_msg).lstrip()
                         if output.total_chars == 0
                         else output.render(suffix=timeout_msg),
-                        "returncode": 124,
-                    }
+                        124,
+                        externally_stopped=True,
+                    )
                 # Periodic activity touch so the gateway knows we're alive
                 touch_activity_if_due(_activity_state, "terminal command running")
 
@@ -973,7 +1374,7 @@ class BaseEnvironment(ABC):
                 proc.returncode,
             )
 
-        return {"output": output.render(), "returncode": proc.returncode}
+        return _result(output.render(), proc.returncode)
 
     def _kill_process(self, proc: ProcessHandle):
         """Terminate a process. Subclasses may override for process-group kill."""
@@ -1063,6 +1464,11 @@ class BaseEnvironment(ABC):
         the patch engine, code-execution RPC reads, log reads — MUST leave
         it False: truncating those corrupts data, not just display.
         """
+        if self._session_mode == "unavailable":
+            return {
+                "output": self._session_diagnostic or "Shell environment unavailable",
+                "returncode": _SNAPSHOT_GUARD_FAILURE_EXIT,
+            }
         self._before_execute()
 
         exec_command, sudo_stdin = self._prepare_command(command)
@@ -1088,19 +1494,53 @@ class BaseEnvironment(ABC):
             exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
             effective_stdin = None
 
-        wrapped = self._wrap_command(exec_command, effective_cwd)
-
-        # Use login shell if snapshot failed (so user's profile still loads),
-        # unless login itself is broken — then non-login is the only path.
-        login = not self._snapshot_ready and not self._prefer_nonlogin
+        was_snapshot = self._snapshot_ready
+        guard_passed_sentinel = (
+            f"{_SNAPSHOT_GUARD_PASSED_SENTINEL_PREFIX}{uuid.uuid4().hex}__"
+            if was_snapshot
+            else ""
+        )
+        wrapped = self._wrap_command(
+            exec_command,
+            effective_cwd,
+            guard_passed_sentinel=guard_passed_sentinel or None,
+        )
 
         proc = self._run_bash(
-            wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin
+            wrapped,
+            timeout=effective_timeout,
+            stdin_data=effective_stdin,
+            clean=True,
         )
         result = self._wait_for_process(
-            proc, timeout=effective_timeout, bounded_capture=bounded_capture
+            proc,
+            timeout=effective_timeout,
+            bounded_capture=bounded_capture,
+            control_sentinel=guard_passed_sentinel or None,
+        )
+        guard_seen = bool(result.pop("control_seen", False))
+        externally_stopped = bool(
+            result.pop("_hermes_externally_stopped", False)
         )
         self._update_cwd(result)
+
+        # A missing attestation means guard failure unless the process waiter
+        # itself recorded an external timeout/interrupt. Public status 124/130
+        # is not provenance: a hostile/broken snapshot can exit with either
+        # status during setup before the user's command starts.
+        if was_snapshot and not guard_seen and not externally_stopped:
+            diagnostic = (
+                "Session snapshot failed its source or sanitizer guard, or cwd setup; "
+                "future commands will use a clean non-login shell."
+            )
+            self._set_session_mode("degraded_nonlogin", diagnostic)
+            result["returncode"] = _SNAPSHOT_GUARD_FAILURE_EXIT
+            result["output"] = f"{diagnostic}\n{result.get('output', '')}".rstrip()
+        elif self._diagnostic_pending:
+            result["output"] = (
+                f"{self._session_diagnostic}\n{result.get('output', '')}"
+            ).rstrip()
+            self._diagnostic_pending = False
 
         return result
 

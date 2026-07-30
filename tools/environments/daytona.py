@@ -14,6 +14,8 @@ from pathlib import Path
 
 from tools.environments.base import (
     BaseEnvironment,
+    _CLEAN_ENV_BASH,
+    _CLEAN_OUTER_SHELL_PRELUDE,
     _ThreadedProcessHandle,
 )
 from tools.environments.file_sync import (
@@ -218,7 +220,8 @@ class DaytonaEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
-                  stdin_data: str | None = None):
+                  stdin_data: str | None = None,
+                  clean: bool = False):
         """Return a _ThreadedProcessHandle wrapping a blocking Daytona SDK call."""
         sandbox = self._sandbox
         lock = self._lock
@@ -230,7 +233,14 @@ class DaytonaEnvironment(BaseEnvironment):
                 except Exception:
                     pass
 
-        if login:
+        if clean:
+            shell_cmd = (
+                f"{_CLEAN_OUTER_SHELL_PRELUDE}"
+                f"{_CLEAN_ENV_BASH}"
+                "--noprofile --norc +x -c "
+                f"{shlex.quote(cmd_string)}"
+            )
+        elif login:
             shell_cmd = f"bash -l -c {shlex.quote(cmd_string)}"
         else:
             shell_cmd = f"bash -c {shlex.quote(cmd_string)}"

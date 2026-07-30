@@ -86,6 +86,36 @@ def test_non_approved_command_still_interrupts_on_stale_bit(monkeypatch):
     assert "[Command interrupted]" in result["output"]
 
 
+def test_non_approved_bootstrap_interrupt_cached_env_recovers_after_clear(
+    monkeypatch, tmp_path
+):
+    """A first-bootstrap interrupt stays visible but cannot poison the cache."""
+    config = tt._get_env_config()
+    config.update(env_type="local", cwd=str(tmp_path), timeout=10)
+    monkeypatch.setattr(tt, "_get_env_config", lambda: config)
+    monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(tt, "_active_environments", {})
+    monkeypatch.setattr(tt, "_last_activity", {})
+
+    set_interrupt(True)
+    try:
+        interrupted = json.loads(tt.terminal_tool(command="printf INITIAL"))
+        assert interrupted["exit_code"] == 130, interrupted
+        assert "[Command interrupted]" in interrupted["output"]
+
+        clear_current_thread_interrupt()
+        recovered = json.loads(tt.terminal_tool(command="printf RECOVERED"))
+
+        assert recovered["exit_code"] == 0, recovered
+        assert recovered["output"] == "RECOVERED"
+    finally:
+        clear_current_thread_interrupt()
+        with tt._env_lock:
+            env = tt._active_environments.pop("default", None)
+        if env is not None:
+            env.cleanup()
+
+
 def test_approved_command_genuine_interrupt_after_start_still_kills(tmp_path):
     """The clean-slate clear must NOT make approved commands un-interruptible:
     an interrupt that arrives after execution starts still SIGINTs (130)."""

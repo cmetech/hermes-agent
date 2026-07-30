@@ -177,6 +177,26 @@ class TestSpawnAsyncDiagnostic:
         assert "shutdown diagnostic" in contents
         assert "SIGTERM" in contents
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only diagnostic")
+    def test_reaps_watchdog_process_group_after_normal_completion(self, tmp_path):
+        """A completed diagnostic must not leave its watchdog timer behind."""
+        pid = sf.spawn_async_diagnostic(
+            tmp_path / "diag.log", "SIGTERM", timeout_seconds=10.0
+        )
+        assert pid is not None and pid > 0
+
+        try:
+            waited_pid, _status = os.waitpid(pid, 0)
+            assert waited_pid == pid
+            with pytest.raises(ProcessLookupError):
+                os.killpg(pid, 0)
+        finally:
+            # Keep a RED run from leaving the known leaked timer behind.
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
     def test_returns_none_on_windows(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sf, "sys", type("M", (), {"platform": "win32"})())
         result = sf.spawn_async_diagnostic(

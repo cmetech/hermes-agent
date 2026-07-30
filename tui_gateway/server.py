@@ -16486,6 +16486,16 @@ def _browser_connect(rid, params: dict) -> dict:
     except ValueError:
         return _err(rid, 4015, f"invalid port in browser url: {url}")
 
+    # An enrolled profile's port drives the user's REAL corporate browser, and
+    # this RPC publishes a process-global BROWSER_CDP_URL -- every subsequent
+    # navigation, including untrusted public pages, would run in the browser
+    # holding live SSO cookies and the machine client certificate. Refuse.
+    from hermes_cli.browser_connect import enrolled_port_refusal
+
+    refusal = enrolled_port_refusal(port, parsed.hostname)
+    if refusal:
+        return _err(rid, 4015, refusal)
+
     # Always normalize default-local to 127.0.0.1:9222 so downstream
     # comparisons + messaging match what we'll actually persist.
     if _is_default_local_cdp(parsed):
@@ -16526,7 +16536,12 @@ def _browser_connect(rid, params: dict) -> dict:
 
             if discovered is None:
                 if local_port_in_use(port):
-                    launch_port = find_free_debug_port(port)
+                    try:
+                        launch_port = find_free_debug_port(port)
+                    except RuntimeError as exc:
+                        # Every nearby port is taken or enrolled-reserved.
+                        # Refuse rather than launch onto a reserved port.
+                        return _err(rid, 5031, str(exc))
                     announce(
                         f"Port {port} is occupied by another application that "
                         "isn't a CDP browser (an IDE debugger or dev server may "

@@ -6,20 +6,29 @@ from dataclasses import asdict
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from plugins.workflow.catalog_api import (
     CATALOG_MAX_TRUST_STORE_BYTES,
     resolve_workflow_catalog_package,
 )
+from plugins.workflow.language import (
+    WorkflowLanguageCompatibilityError,
+    read_language_snapshot,
+)
+from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.runner_binding import (
     ExecutionCapabilityContext,
     WorkflowRunnerBinding,
     assess_package_execution,
 )
 from plugins.workflow.trust import (
+    WORKFLOW_RESOURCE_MAX_FILE_BYTES,
+    WORKFLOW_RESOURCE_MAX_FILES,
+    WORKFLOW_RESOURCE_MAX_TOTAL_BYTES,
+    WorkflowResourceCapacityError,
     WorkflowResourceReadBudget,
     WorkflowTrustStore,
     compute_package_digest,
@@ -27,16 +36,25 @@ from plugins.workflow.trust import (
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_RESOURCE_FILE_BYTES = 1024 * 1024
-_RESOURCE_TOTAL_BYTES = 8 * 1024 * 1024
-_RESOURCE_FILES = 512
+_RESOURCE_FILE_BYTES = WORKFLOW_RESOURCE_MAX_FILE_BYTES
+_RESOURCE_TOTAL_BYTES = WORKFLOW_RESOURCE_MAX_TOTAL_BYTES
+_RESOURCE_FILES = WORKFLOW_RESOURCE_MAX_FILES
 _SOURCE_IDENTITY_CHARS = 512
+_SEALED_SNAPSHOT_FILES = 4096
+_SEALED_SNAPSHOT_PATH_CHARS = 512
+_SEALED_SNAPSHOT_REQUIRED = frozenset(
+    {"definition.yaml", "inputs.json", "resources.json"}
+)
 _MUTABLE_RUN_FILES = frozenset({
     ".lock",
     ".snapshot-owner.json",
     "events.jsonl",
     "run.json",
 })
+# These are the only namespaces written by node executors after admission.
+# They remain non-authoritative: resource resolution is separately restricted
+# to journal-corroborated sealed paths.
+_MUTABLE_RUN_ROOTS = frozenset({"artifacts", "nodes"})
 
 
 class ScheduledRunRevalidationError(RuntimeError):
@@ -53,49 +71,153 @@ def showcase_scenario_digest(scenario: object) -> str:
     return hashlib.sha256(material).hexdigest()
 
 
-def sealed_snapshot_digest(root: str | Path) -> str:
-    """Digest every immutable execution-readable file in a sealed run tree."""
+def read_sealed_snapshot_paths(value: object) -> tuple[str, ...]:
+    """Parse the bounded, canonical file identities sealed at admission."""
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ScheduledRunRevalidationError("sealed snapshot paths are missing")
+    if len(value) > _SEALED_SNAPSHOT_FILES:
+        raise ScheduledRunRevalidationError("sealed snapshot has too many paths")
+    paths: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if (
+            not isinstance(item, str)
+            or not item
+            or len(item) > _SEALED_SNAPSHOT_PATH_CHARS
+            or "\\" in item
+            or "\0" in item
+        ):
+            raise ScheduledRunRevalidationError("sealed snapshot path is invalid")
+        relative = PurePosixPath(item)
+        if (
+            relative.is_absolute()
+            or relative.as_posix() != item
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or item in _MUTABLE_RUN_FILES
+            or item in seen
+        ):
+            raise ScheduledRunRevalidationError("sealed snapshot path is invalid")
+        seen.add(item)
+        paths.append(item)
+    if paths != sorted(paths):
+        raise ScheduledRunRevalidationError("sealed snapshot paths are not canonical")
+    if not _SEALED_SNAPSHOT_REQUIRED.issubset(seen):
+        raise ScheduledRunRevalidationError("sealed snapshot paths are incomplete")
+    return tuple(paths)
+
+
+def sealed_snapshot_digest(
+    root: str | Path,
+    *,
+    relative_paths: Iterable[str] | None = None,
+    read_budget: WorkflowResourceReadBudget | None = None,
+    allow_unsealed_regular_files: bool = False,
+) -> str:
+    """Digest the immutable files sealed at admission, or a legacy run tree."""
     snapshot_root = Path(root)
-    entries: list[Path] = []
-    pending = [snapshot_root]
-    while pending:
-        directory = pending.pop()
-        try:
-            children = tuple(os.scandir(directory))
-        except OSError as exc:
-            raise ScheduledRunRevalidationError(
-                "sealed snapshot is unreadable"
-            ) from exc
-        for entry in children:
-            path = Path(entry.path)
+    entries: list[tuple[str, Path]] = []
+    if relative_paths is not None:
+        sealed_paths = read_sealed_snapshot_paths(tuple(relative_paths))
+        sealed_set = frozenset(sealed_paths)
+        sealed_directories = {
+            parent.as_posix()
+            for relative in sealed_paths
+            for parent in PurePosixPath(relative).parents
+            if parent.as_posix() != "."
+        }
+        pending = [snapshot_root]
+        while pending:
+            directory = pending.pop()
             try:
-                if entry.is_symlink():
-                    raise ScheduledRunRevalidationError(
-                        "sealed snapshot contains a symlink"
-                    )
-                if entry.is_dir(follow_symlinks=False):
-                    pending.append(path)
-                elif entry.is_file(follow_symlinks=False):
-                    relative = path.relative_to(snapshot_root).as_posix()
-                    if relative not in _MUTABLE_RUN_FILES:
-                        entries.append(path)
-                else:
-                    raise ScheduledRunRevalidationError(
-                        "sealed snapshot contains a special file"
-                    )
+                children = tuple(os.scandir(directory))
             except OSError as exc:
                 raise ScheduledRunRevalidationError(
                     "sealed snapshot is unreadable"
                 ) from exc
+            for entry in children:
+                path = Path(entry.path)
+                relative = path.relative_to(snapshot_root).as_posix()
+                first_part = PurePosixPath(relative).parts[0]
+                try:
+                    if entry.is_symlink():
+                        raise ScheduledRunRevalidationError(
+                            "sealed snapshot contains a symlink"
+                        )
+                    if entry.is_dir(follow_symlinks=False):
+                        if (
+                            not allow_unsealed_regular_files
+                            and first_part not in _MUTABLE_RUN_ROOTS
+                            and relative not in sealed_directories
+                        ):
+                            raise ScheduledRunRevalidationError(
+                                "sealed snapshot contains an unsealed path"
+                            )
+                        pending.append(path)
+                    elif entry.is_file(follow_symlinks=False):
+                        if relative in sealed_set:
+                            entries.append((relative, path))
+                        elif (
+                            not allow_unsealed_regular_files
+                            and relative not in _MUTABLE_RUN_FILES
+                            and first_part not in _MUTABLE_RUN_ROOTS
+                        ):
+                            raise ScheduledRunRevalidationError(
+                                "sealed snapshot contains an unsealed path"
+                            )
+                    else:
+                        raise ScheduledRunRevalidationError(
+                            "sealed snapshot contains a special file"
+                        )
+                except OSError as exc:
+                    raise ScheduledRunRevalidationError(
+                        "sealed snapshot is unreadable"
+                    ) from exc
+        if {relative for relative, _path in entries} != sealed_set:
+            raise ScheduledRunRevalidationError("sealed snapshot path is missing")
+    else:
+        pending = [snapshot_root]
+        while pending:
+            directory = pending.pop()
+            try:
+                children = tuple(os.scandir(directory))
+            except OSError as exc:
+                raise ScheduledRunRevalidationError(
+                    "sealed snapshot is unreadable"
+                ) from exc
+            for entry in children:
+                path = Path(entry.path)
+                relative = path.relative_to(snapshot_root).as_posix()
+                first_part = PurePosixPath(relative).parts[0]
+                try:
+                    if entry.is_symlink():
+                        raise ScheduledRunRevalidationError(
+                            "sealed snapshot contains a symlink"
+                        )
+                    if entry.is_dir(follow_symlinks=False):
+                        if first_part in _MUTABLE_RUN_ROOTS:
+                            continue
+                        pending.append(path)
+                    elif entry.is_file(follow_symlinks=False):
+                        if relative not in _MUTABLE_RUN_FILES:
+                            entries.append((relative, path))
+                    else:
+                        raise ScheduledRunRevalidationError(
+                            "sealed snapshot contains a special file"
+                        )
+                except OSError as exc:
+                    raise ScheduledRunRevalidationError(
+                        "sealed snapshot is unreadable"
+                    ) from exc
 
     digest = hashlib.sha256()
-    for path in sorted(
-        entries, key=lambda item: item.relative_to(snapshot_root).as_posix()
-    ):
-        relative = path.relative_to(snapshot_root).as_posix()
+    for relative, path in sorted(entries):
         try:
             before = path.stat()
-            data = path.read_bytes()
+            data = (
+                read_budget.read(path, verify_cached_identity=True)
+                if read_budget is not None
+                else path.read_bytes()
+            )
             after = path.stat()
         except OSError as exc:
             raise ScheduledRunRevalidationError(
@@ -188,15 +310,25 @@ def verify_sealed_snapshot(
     run: Mapping[str, object],
     *,
     run_directory: Path,
+    read_budget: WorkflowResourceReadBudget | None = None,
 ) -> None:
     definition = run_directory / "definition.yaml"
     policy = run_directory / "policy.yaml"
     resources = run_directory / "resources.json"
+    budget = read_budget or WorkflowResourceReadBudget(
+        max_file_bytes=_RESOURCE_FILE_BYTES,
+        max_total_bytes=_RESOURCE_TOTAL_BYTES,
+        max_files=_RESOURCE_FILES,
+    )
     try:
-        definition_bytes = definition.read_bytes()
-        policy_bytes = policy.read_bytes() if policy.is_file() else b"{}\n"
-        resources_bytes = resources.read_bytes()
-    except Exception as exc:
+        definition_bytes = budget.read(definition, verify_cached_identity=True)
+        policy_bytes = (
+            budget.read(policy, verify_cached_identity=True)
+            if policy.is_file() or policy.is_symlink()
+            else b"{}\n"
+        )
+        resources_bytes = budget.read(resources, verify_cached_identity=True)
+    except (OSError, WorkflowResourceCapacityError) as exc:
         raise ScheduledRunRevalidationError("sealed snapshot is unreadable") from exc
     expected = (
         _required_digest(run["run_metadata"], "sealed_definition_digest"),
@@ -215,8 +347,52 @@ def verify_sealed_snapshot(
         str(run.get("input_manifest_digest") or ""),
     ):
         raise ScheduledRunRevalidationError("sealed admission identity changed")
-    if sealed_snapshot_digest(run_directory) != _required_digest(
+    expected_snapshot_digest = _required_digest(
         run["run_metadata"], "sealed_snapshot_digest"
+    )
+    projected_snapshot_digest = run.get("sealed_snapshot_digest")
+    if projected_snapshot_digest is not None and (
+        not isinstance(projected_snapshot_digest, str)
+        or _SHA256.fullmatch(projected_snapshot_digest) is None
+        or projected_snapshot_digest != expected_snapshot_digest
+    ):
+        raise ScheduledRunRevalidationError("sealed snapshot identity changed")
+    if run.get("language") is not None and projected_snapshot_digest is None:
+        raise ScheduledRunRevalidationError("sealed snapshot identity changed")
+    try:
+        resources_document = json.loads(resources_bytes)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ScheduledRunRevalidationError("sealed snapshot is unreadable") from exc
+    if not isinstance(resources_document, Mapping):
+        raise ScheduledRunRevalidationError("sealed snapshot is unreadable")
+    try:
+        projected_language = read_language_snapshot(run.get("language"))
+        sealed_language = read_language_snapshot(resources_document.get("language"))
+    except WorkflowLanguageCompatibilityError as exc:
+        raise ScheduledRunRevalidationError(
+            "sealed snapshot language identity changed"
+        ) from exc
+    if projected_language != sealed_language:
+        raise ScheduledRunRevalidationError(
+            "sealed snapshot language identity changed"
+        )
+    sealed_paths = (
+        read_sealed_snapshot_paths(resources_document.get("sealed_paths"))
+        if projected_snapshot_digest is not None
+        else None
+    )
+    if (
+        sealed_snapshot_digest(
+            run_directory,
+            relative_paths=sealed_paths,
+            read_budget=budget,
+            allow_unsealed_regular_files=(
+                sealed_language is not None
+                and sealed_language.effective_profile
+                is WorkflowLanguageProfile.HERMES_LEGACY
+            ),
+        )
+        != expected_snapshot_digest
     ):
         raise ScheduledRunRevalidationError("sealed snapshot identity changed")
 
@@ -287,6 +463,7 @@ def revalidate_scheduled_run(
     *,
     hermes_home: str | Path,
     run_directory: str | Path,
+    read_budget: WorkflowResourceReadBudget | None = None,
 ) -> None:
     """Reauthorize one scheduled run without mutating its durable state."""
     metadata = run.get("run_metadata")
@@ -305,12 +482,15 @@ def revalidate_scheduled_run(
     risk_identity = _required_digest(metadata, "risk_digest")
     if package_identity != str(run.get("definition_digest")):
         raise ScheduledRunRevalidationError("admission package identity changed")
-    verify_sealed_snapshot(run, run_directory=Path(run_directory))
-
-    budget = WorkflowResourceReadBudget(
+    budget = read_budget or WorkflowResourceReadBudget(
         max_file_bytes=_RESOURCE_FILE_BYTES,
         max_total_bytes=_RESOURCE_TOTAL_BYTES,
         max_files=_RESOURCE_FILES,
+    )
+    verify_sealed_snapshot(
+        run,
+        run_directory=Path(run_directory),
+        read_budget=budget,
     )
     source = metadata.get("catalog_source")
     if source == "showcase":
@@ -383,6 +563,7 @@ def revalidate_scheduled_run(
 
 __all__ = [
     "ScheduledRunRevalidationError",
+    "read_sealed_snapshot_paths",
     "revalidate_scheduled_run",
     "scheduled_catalog_source_identity",
     "scheduled_execution_context",

@@ -212,6 +212,9 @@ def test_resume_approve_and_input_capacity_race_queues_every_continuation(
 
     blocker = start("capacity-blocker")
     action_store = RunStore(home, max_executing_runs=1)
+    always_run_nodes = RunScheduler(action_store).verified_always_run_nodes(
+        resume_run
+    )
     barrier = threading.Barrier(4)
 
     def approve() -> None:
@@ -235,6 +238,7 @@ def test_resume_approve_and_input_capacity_race_queues_every_continuation(
         barrier.wait()
         action_store.resume_run(
             resume_run,
+            always_run_nodes=always_run_nodes,
             expected_state_version=resume_state["state_version"],
         )
 

@@ -226,7 +226,30 @@ def spawn_async_diagnostic(
     if sys.platform == "win32":
         return None
 
+    # GNU ``timeout`` is not present on every POSIX host (notably macOS).
+    # A watchdog in the detached bash session keeps the diagnostic bounded
+    # without turning its availability into a coreutils dependency.  The
+    # parent waits for the watchdog during normal cleanup; in turn, the
+    # watchdog kills and reaps its timer before exiting.  Because
+    # ``start_new_session`` below makes bash the process-group leader,
+    # ``kill -TERM -$$`` also reaches a currently running ps/pstree child.
     script = (
+        "watchdog() { "
+        "sleep \"$1\" & timer_pid=$!; "
+        "cleanup_timer() { "
+        "kill -TERM \"$timer_pid\" 2>/dev/null || true; "
+        "wait \"$timer_pid\" 2>/dev/null || true; "
+        "}; "
+        "trap 'cleanup_timer; exit 0' TERM; "
+        "wait \"$timer_pid\"; timer_status=$?; trap - TERM; "
+        "if [ \"$timer_status\" -eq 0 ]; then kill -TERM -$$ 2>/dev/null; fi; "
+        "}; "
+        f"watchdog {timeout_seconds:.0f} & watchdog_pid=$!; "
+        "cleanup() { "
+        "kill -TERM \"$watchdog_pid\" 2>/dev/null || true; "
+        "wait \"$watchdog_pid\" 2>/dev/null || true; "
+        "}; "
+        "trap cleanup EXIT; "
         f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
         "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
         "echo '--- ps auxf (top 60 by cpu) ---'; "
@@ -255,7 +278,7 @@ def spawn_async_diagnostic(
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            ["bash", "-c", script],
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

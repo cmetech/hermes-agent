@@ -227,7 +227,7 @@ Compatibility is reported as supported, degraded with explicit mappings, or unsu
 
 ## Upstream merge and release verification
 
-The customization ledger separates generic managed processes, plugin agents, Kanban persistence, Kanban REST, Desktop composition, packaging, and native portability CI. The merge skill first classifies changes since `last_verified_upstream`; owned-symbol or possible-equivalent overlap requires an explicit `preserve`, `adapt`, or `remove-as-upstream-equivalent` decision. Whole-file `ours`/`theirs` resolution is forbidden for ledger-owned files. Entry-specific invariants and the base gate must pass before the exact tested base commit can propagate to a brand.
+The customization ledger separates generic managed processes, plugin agents, Kanban persistence, Kanban REST, Desktop composition, packaging, and native portability CI. The merge skill limits classification to the strict intersection of files changed upstream since `last_verified_upstream` and files explicitly owned by the ledger. It classifies those entries as `same_file` or `owned_symbol` (and all others as `none`); it does not search unrelated repository paths or generate `possible_upstream_equivalent`. Policy-relevant overlap requires an explicit `preserve`, `adapt`, or human-selected `remove-as-upstream-equivalent` decision. Whole-file `ours`/`theirs` resolution is forbidden for ledger-owned files. Entry-specific invariants and the base gate test compatibility outside that intersection before the exact tested base commit can propagate to a brand.
 
 The lightweight gate is used inside normal merge work:
 

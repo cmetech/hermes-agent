@@ -4,7 +4,8 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from plugins.workflow.models import WorkflowValidationError
+from plugins.workflow import schema as schema_module
+from plugins.workflow.models import WorkflowLanguageProfile, WorkflowValidationError
 from plugins.workflow.schema import load_workflow, validate_package
 
 
@@ -136,6 +137,124 @@ def test_loads_all_seven_portable_node_types(workflow_writer, tmp_path):
     assert validate_package(package) == ()
     with pytest.raises(FrozenInstanceError):
         package.definition.name = "changed"
+
+
+def test_absent_companion_profile_defaults_to_legacy(workflow_writer, tmp_path):
+    package = load_workflow(workflow_writer(tmp_path))
+
+    assert package.language.declared_profile is None
+    assert package.language.effective_profile.value == "hermes-legacy"
+
+
+def test_companion_selects_archon_profile(workflow_writer, tmp_path):
+    path = workflow_writer(tmp_path)
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+
+    package = load_workflow(path)
+
+    assert package.language.effective_profile.value == "archon-2026-07"
+    assert package.source_definition == package.definition
+
+
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+def test_idle_timeout_loader_preserves_the_authored_runtime_value(
+    workflow_writer, tmp_path, profile
+):
+    path = workflow_writer(
+        tmp_path / profile.value,
+        nodes=[{"id": "agent", "prompt": "x", "idle_timeout": 1_234.5}],
+    )
+    if profile is WorkflowLanguageProfile.ARCHON_2026_07:
+        path.with_name(f"{path.stem}.hermes.yaml").write_text(
+            f"language_compatibility: {profile.value}\n", encoding="utf-8"
+        )
+
+    package = load_workflow(path)
+
+    assert package.definition.nodes[0].options["idle_timeout"] == 1_234.5
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "language_compatibility: archon-latest\n",
+        "language_compatibility: null\n",
+        "language_compatibility: true\n",
+        "language_compatibility:\n  profile: archon-2026-07\n",
+        "language_compatibility:\n  - archon-2026-07\n",
+    ],
+)
+def test_invalid_companion_profile_is_rejected(
+    workflow_writer, tmp_path, declaration
+):
+    path = workflow_writer(tmp_path)
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        declaration, encoding="utf-8"
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        load_workflow(path)
+
+    assert exc.value.issues[0].code == "workflow_language_profile_unsupported"
+
+
+def test_unknown_top_level_field_remains_warning_for_legacy(
+    workflow_writer, tmp_path
+):
+    package = load_workflow(workflow_writer(tmp_path, mystery=True))
+
+    issue = next(
+        item
+        for item in package.validation_issues
+        if item.code == "unknown_top_level_field"
+    )
+    assert issue.blocking is False
+
+
+def test_unknown_top_level_field_blocks_archon_profile(workflow_writer, tmp_path):
+    path = workflow_writer(tmp_path, mystery=True)
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        load_workflow(path)
+
+    assert exc.value.issues[0].code == "archon_unknown_top_level_field"
+
+
+def test_identical_bytes_loaded_from_installed_and_sealed_paths_have_same_digest(
+    workflow_writer, tmp_path
+):
+    installed = workflow_writer(tmp_path / "installed")
+    sealed = tmp_path / "run" / "definition.yaml"
+    sealed.parent.mkdir()
+    sealed.write_bytes(installed.read_bytes())
+
+    assert (
+        load_workflow(installed).language.normalized_definition_digest
+        == load_workflow(sealed).language.normalized_definition_digest
+    )
+
+
+def test_loader_invokes_the_versioned_normalizer_exactly_once(
+    workflow_writer, tmp_path, monkeypatch
+):
+    calls = 0
+    normalize = schema_module.normalize_workflow
+
+    def counting_normalize(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return normalize(*args, **kwargs)
+
+    monkeypatch.setattr(schema_module, "normalize_workflow", counting_normalize)
+
+    load_workflow(workflow_writer(tmp_path))
+
+    assert calls == 1
 
 
 @pytest.mark.parametrize(

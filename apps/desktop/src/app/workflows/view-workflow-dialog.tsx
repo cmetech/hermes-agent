@@ -2,6 +2,8 @@ import { lazy, Suspense, useId, useMemo, useState } from 'react'
 
 import { RichBoundary } from '@/components/assistant-ui/embeds/rich-boundary'
 import { CodeCard, CodeCardBody, CodeCardHeader, CodeCardTitle } from '@/components/chat/code-card'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
@@ -20,7 +22,7 @@ import { WorkflowApiError } from '@/lib/hermes-api'
 import { Eye, Play } from '@/lib/icons'
 import type { WorkflowDefinition } from '@/types/hermes'
 
-import { workflowSupportsScheduledRun, workflowTrustAllowsRun } from './catalog-run-policy'
+import { desktopWorkflowLanguageLabel, desktopWorkflowRunDisabledReason } from './catalog-run-policy'
 import { useWorkflowDetailQuery } from './detail-query'
 
 const MermaidRenderer = lazy(() => import('@/components/assistant-ui/embeds/mermaid-embed'))
@@ -98,28 +100,11 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
     [copy.workflowViewDefinition, copy.workflowViewDiagram]
   )
 
-  const runSupportCopy = {
-    schedule_required: null,
-    showcase_cli_required: copy.workflowRunShowcaseFromCli,
-    supported: null,
-    unsupported_inputs: copy.workflowRunUnsupportedInputs
-  }
-
   const runDisabledReason = detail.isError
     ? copy.workflowViewRunError
     : !detail.data
       ? copy.workflowViewRunLoading
-      : !detail.data.run_support
-        ? copy.workflowRunSupportUnavailable
-        : !workflowSupportsScheduledRun(detail.data.run_support)
-          ? runSupportCopy[detail.data.run_support.reason]
-          : detail.data.compatibility.runnable !== true
-            ? copy.workflowRunIncompatible
-            : !workflowTrustAllowsRun(detail.data.trust_state)
-              ? copy.workflowRunUntrusted
-              : !detail.data.coordinator.healthy
-                ? copy.workflowRunCoordinatorUnavailable
-                : null
+      : desktopWorkflowRunDisabledReason(detail.data, copy, 'detail')
 
   const errorDescription =
     detail.error instanceof WorkflowApiError && detail.error.code === 'workflow_not_found'
@@ -147,6 +132,29 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
         ) : null}
         {detail.data ? (
           <div className="grid min-h-0 min-w-0 gap-3 overflow-x-hidden">
+            {detail.data.language ? (
+              <Alert variant={detail.data.language.legacy ? 'warning' : 'default'}>
+                <AlertDescription>
+                  <Badge variant={detail.data.language.legacy ? 'muted' : 'default'}>
+                    {desktopWorkflowLanguageLabel(detail.data.language, copy)}
+                  </Badge>
+                  {detail.data.language.legacy ? <p>{copy.workflowLanguageLegacyDescription}</p> : null}
+                  {detail.data.language.normalizer_version !== undefined ? (
+                    <p>
+                      {copy.workflowLanguageNormalizer} {detail.data.language.normalizer_version}
+                    </p>
+                  ) : null}
+                  {detail.data.language.normalized_definition_digest ? (
+                    <p className="flex flex-wrap gap-1">
+                      <span>{copy.workflowLanguageDigest}</span>
+                      <span className="font-mono" title={detail.data.language.normalized_definition_digest}>
+                        {detail.data.language.normalized_definition_digest.slice(0, 12)}…
+                      </span>
+                    </p>
+                  ) : null}
+                </AlertDescription>
+              </Alert>
+            ) : null}
             <SegmentedControl onChange={setMode} options={modes} value={mode} />
             {mode === 'diagram' ? (
               detail.data.topology.mermaid ? (
