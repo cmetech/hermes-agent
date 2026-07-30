@@ -65,17 +65,22 @@ if [[ ${POSIXLY_CORRECT+x} ]]; then
     __hermes_snapshot_old_posixly_correct=$POSIXLY_CORRECT
 fi
 POSIXLY_CORRECT=1
-\unset -f builtin unset set
-if [[ $__hermes_snapshot_had_posixly_correct == 1 ]]; then
-    POSIXLY_CORRECT=$__hermes_snapshot_old_posixly_correct
+if \unset -f builtin unset set; then
+    if [[ $__hermes_snapshot_had_posixly_correct == 1 ]]; then
+        POSIXLY_CORRECT=$__hermes_snapshot_old_posixly_correct
+    else
+        \unset POSIXLY_CORRECT
+    fi &&
+    if [[ $__hermes_snapshot_was_posix == 1 ]]; then
+        \set -o posix
+    else
+        \set +o posix
+    fi &&
+    \unset __hermes_snapshot_was_posix __hermes_snapshot_had_posixly_correct \
+        __hermes_snapshot_old_posixly_correct
 else
-    \unset POSIXLY_CORRECT
-fi
-if [[ $__hermes_snapshot_was_posix == 0 ]]; then
-    \set +o posix
-fi
-\unset __hermes_snapshot_was_posix __hermes_snapshot_had_posixly_correct \
-    __hermes_snapshot_old_posixly_correct"""
+    [[ 0 == 1 ]]
+fi"""
 
 
 class _BoundedOutputCollector:
@@ -532,7 +537,9 @@ class BaseEnvironment(ABC):
         _builtin = r"\builtin"
         bootstrap = (
             "(\n"
+            "if {\n"
             f"{_SNAPSHOT_OPERATION_PRELUDE}\n"
+            "}; then\n"
             f"{_builtin} umask 077\n"
             # Gate the complete assembly and publication. A failure anywhere
             # leaves the prior snapshot in place and makes init_session reject
@@ -568,6 +575,9 @@ class BaseEnvironment(ABC):
             f"{_builtin} cd -- {_quoted_cwd} 2>/dev/null || true\n"
             f"{_builtin} printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' "
             f"\"$({_builtin} pwd -P)\"\n"
+            "else\n"
+            "[[ 0 == 1 ]]\n"
+            "fi\n"
             ")\n"
         )
         try:
@@ -692,7 +702,9 @@ class BaseEnvironment(ABC):
         # protected operation also uses a private umask.
         snapshot_update = [
             "(",
+            "if {",
             _SNAPSHOT_OPERATION_PRELUDE,
+            "}; then",
             f"{_builtin} umask 077",
         ]
 
@@ -707,6 +719,7 @@ class BaseEnvironment(ABC):
                 f"{_external} mv -f {_snap_tmp} {_quoted_snap}; }} 2>/dev/null || "
                 f"{{ {_external} rm -f {_snap_tmp} 2>/dev/null; [[ 0 == 1 ]]; }}"
             )
+        snapshot_update.extend(("else", "[[ 0 == 1 ]]", "fi"))
         # Keep the subshell in an OR-list so a user-enabled ``set -e`` cannot
         # abort the wrapper before its CWD marker and saved-status exit.  The
         # deliberately false fallback preserves a failed update's nonzero

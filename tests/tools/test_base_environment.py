@@ -275,6 +275,37 @@ class TestAtomicSnapshotWrite:
         assert env._cwd_marker in proc.stdout
         assert snap.read_text() == "export GOOD=1\n"
 
+    def test_readonly_shadow_functions_fail_snapshot_update_closed(self, tmp_path):
+        """If the sanitizer cannot remove its dispatcher shadows, no protected
+        operation may run; wrapper marker/status behavior remains intact."""
+        import shlex
+
+        _q = shlex.quote
+        snap = tmp_path / "snapshot.sh"
+        snap.write_text("export GOOD=1\n")
+        marker = tmp_path / "intercepted"
+        shadow = "\n".join(
+            f"{name} () {{ printf '%s\\n' {name} >> {_q(str(marker))}; return 0; }}"
+            for name in ("builtin", "set", "unset")
+        )
+        user_command = (
+            "set -e\n"
+            f"{shadow}\n"
+            "readonly -f builtin set unset\n"
+            "printf 'USER_COMMAND_COMPLETED\\n'"
+        )
+        env = _TestableEnv(cwd=str(tmp_path))
+        env._snapshot_path = str(snap)
+        env._snapshot_ready = True
+
+        proc = self._run_real_bash(env._wrap_command(user_command, str(tmp_path)))
+
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "USER_COMMAND_COMPLETED" in proc.stdout
+        assert env._cwd_marker in proc.stdout
+        assert not marker.exists(), "failed sanitizer allowed an intercepted operation"
+        assert snap.read_text() == "export GOOD=1\n"
+
     def test_init_session_bootstrap_uses_private_umask(self):
         env = _TestableEnv()
         captured = {}
@@ -362,6 +393,31 @@ class TestAtomicSnapshotWrite:
             "declare -F command >/dev/null && echo OK || echo BROKEN"
         )
         assert "OK" in check.stdout, check.stdout + check.stderr
+
+    def test_readonly_shadow_functions_fail_bootstrap_closed(self, tmp_path):
+        """A login profile can make dispatcher shadows readonly. Bootstrap
+        must reject the snapshot instead of invoking those functions."""
+        import shlex
+
+        _q = shlex.quote
+        snap = tmp_path / "snapshot.sh"
+        snap.write_text("export GOOD=1\n")
+        marker = tmp_path / "intercepted"
+        shadow = "\n".join(
+            f"{name} () {{ printf '%s\\n' {name} >> {_q(str(marker))}; return 0; }}"
+            for name in ("builtin", "set", "unset")
+        )
+        env = _TestableEnv(cwd=str(tmp_path))
+        env._snapshot_path = str(snap)
+        bootstrap = _bootstrap_script(env)
+
+        proc = self._run_real_bash(
+            f"{shadow}\nreadonly -f builtin set unset\n{bootstrap}"
+        )
+
+        assert proc.returncode != 0, proc.stdout + proc.stderr
+        assert not marker.exists(), "failed sanitizer allowed an intercepted operation"
+        assert snap.read_text() == "export GOOD=1\n"
 
     @staticmethod
     def _run_real_bash(script):
