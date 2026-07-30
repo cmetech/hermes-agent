@@ -464,11 +464,7 @@ def _validation_error_metadata(error: object) -> str:
     validator = getattr(error, "validator", None)
     if validator is None:
         return error.__class__.__name__
-    path = getattr(error, "absolute_path", ())
-    pointer = "/" + "/".join(
-        str(segment).replace("~", "~0").replace("/", "~1") for segment in path
-    )
-    return f"{pointer}: validation failed ({validator})"
+    return f"validation failed ({validator})"
 
 
 def _reject_nonfinite_constant(value: str) -> None:

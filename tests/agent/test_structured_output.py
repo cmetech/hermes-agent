@@ -295,6 +295,18 @@ def test_parse_validate_canonicalize_omits_invalid_response_from_diagnostics() -
     assert response_token not in str(exc_info.value)
 
 
+def test_parse_validate_canonicalize_omits_invalid_response_key_from_diagnostics() -> None:
+    response_token = "private-response-token"
+    request = _request({"patternProperties": {".*": {"type": "integer"}}})
+
+    with pytest.raises(StructuredOutputError) as exc_info:
+        structured_output.parse_validate_canonicalize(
+            json.dumps({response_token: "not-an-integer"}), request
+        )
+
+    assert response_token not in str(exc_info.value)
+
+
 def test_validation_summary_is_deterministic_and_utf8_bounded() -> None:
     assert structured_output.validation_summary(["zeta", "alpha"]) == "alpha\nzeta"
 
