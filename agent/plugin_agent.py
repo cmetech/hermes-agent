@@ -8,6 +8,7 @@ contained and cannot alter a long-lived parent conversation.
 from __future__ import annotations
 
 import base64
+import binascii
 from dataclasses import dataclass, field
 import json
 import math
@@ -43,6 +44,7 @@ _MAX_FRAME_BYTES = 4_000_000
 _MAX_QUEUED_FRAMES = 8
 _MAX_PROMPT_CHARS = 500_000
 _MAX_POLICY_NAMES = 256
+_MAX_ENCODED_SCHEMA_BYTES = ((MAX_CANONICAL_SCHEMA_BYTES + 2) // 3) * 4
 _STRUCTURED_EVIDENCE_FIELDS = frozenset(
     {
         "provider_attempts",
@@ -344,13 +346,36 @@ def _structured_output_from_wire(value: object) -> StructuredOutputRequest:
         encoded = schema_wire["canonical_schema_bytes"]
         if not isinstance(encoded, str):
             raise ValueError("structured output schema bytes must be base64 text")
+        if len(encoded) > _MAX_ENCODED_SCHEMA_BYTES:
+            raise ValueError(
+                "structured output encoded schema exceeds the size limit"
+            )
         canonical_bytes = base64.b64decode(encoded, validate=True)
+        if len(canonical_bytes) > MAX_CANONICAL_SCHEMA_BYTES:
+            raise ValueError("structured output schema exceeds the bytes limit")
+        try:
+            decoded_schema = normalize_schema(json.loads(canonical_bytes))
+            supplied_schema = normalize_schema(schema_wire["canonical_schema"])
+        except RecursionError as exc:
+            raise ValueError("structured output schema exceeds the depth limit") from exc
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(f"structured output schema is invalid: {exc}") from exc
+        if (
+            decoded_schema.canonical_schema_bytes != canonical_bytes
+            or supplied_schema.canonical_schema_bytes != canonical_bytes
+            or supplied_schema.schema_fingerprint
+            != decoded_schema.schema_fingerprint
+            or schema_wire["schema_fingerprint"]
+            != decoded_schema.schema_fingerprint
+            or schema_wire["dialect"] != DRAFT_2020_12_DIALECT
+        ):
+            raise ValueError("structured output schema evidence is contradictory")
         request = StructuredOutputRequest(
             schema=StructuredOutputSchema(
-                canonical_schema=schema_wire["canonical_schema"],
-                schema_fingerprint=schema_wire["schema_fingerprint"],
+                canonical_schema=decoded_schema.canonical_schema,
+                schema_fingerprint=decoded_schema.schema_fingerprint,
                 canonical_schema_bytes=canonical_bytes,
-                dialect=schema_wire["dialect"],
+                dialect=DRAFT_2020_12_DIALECT,
             ),
             strategy=StructuredOutputStrategy(value["strategy"]),
             adapter_version=value["adapter_version"],
@@ -359,7 +384,7 @@ def _structured_output_from_wire(value: object) -> StructuredOutputRequest:
         )
     except KeyError as exc:
         raise ValueError(f"structured output is missing {exc.args[0]}") from exc
-    except (ValueError, TypeError) as exc:
+    except (binascii.Error, UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
         if isinstance(exc, ValueError) and str(exc).startswith("structured output"):
             raise
         raise ValueError("structured output wire value is invalid") from exc
@@ -391,11 +416,7 @@ def _validate_structured_output(request: StructuredOutputRequest) -> None:
         raise ValueError("structured output schema evidence is contradictory")
     if not isinstance(request.strategy, StructuredOutputStrategy):
         raise ValueError("structured output strategy is invalid")
-    if (
-        isinstance(request.adapter_version, bool)
-        or not isinstance(request.adapter_version, int)
-        or request.adapter_version <= 0
-    ):
+    if type(request.adapter_version) is not int or request.adapter_version <= 0:
         raise ValueError("structured output adapter version is invalid")
     if (
         isinstance(request.output_bytes_limit, bool)
@@ -403,7 +424,10 @@ def _validate_structured_output(request: StructuredOutputRequest) -> None:
         or not 0 < request.output_bytes_limit <= MAX_OUTPUT_BYTES
     ):
         raise ValueError("structured output bytes limit is invalid")
-    if request.canonicalization_version != 1:
+    if (
+        type(request.canonicalization_version) is not int
+        or request.canonicalization_version != 1
+    ):
         raise ValueError("structured output canonicalization version is invalid")
 
 
@@ -418,10 +442,13 @@ def _validated_structured_evidence(
         raise ValueError(
             f"structured output evidence is missing field(s): {', '.join(missing)}"
         )
-    for name in ("provider_attempts", "model_calls", "adapter_version"):
+    for name in ("provider_attempts", "model_calls"):
         item = value[name]
         if isinstance(item, bool) or not isinstance(item, int) or item < 0:
             raise ValueError(f"structured output evidence {name} is invalid")
+    adapter_version = value["adapter_version"]
+    if type(adapter_version) is not int or adapter_version <= 0:
+        raise ValueError("structured output evidence adapter_version is invalid")
     strategy = value["strategy"]
     if strategy not in {item.value for item in StructuredOutputStrategy}:
         raise ValueError("structured output evidence strategy is invalid")
@@ -433,6 +460,26 @@ def _validated_structured_evidence(
         if not isinstance(item, str) or len(item) > limit:
             raise ValueError(f"structured output evidence {name} is invalid")
     return value
+
+
+def _correlate_structured_result(
+    request: PluginAgentRunRequest, result: PluginAgentRunResult
+) -> None:
+    admitted = request.structured_output
+    evidence = result.structured_output
+    if admitted is None:
+        if evidence is not None:
+            raise RuntimeError("unexpected structured output evidence")
+        return
+    if evidence is None:
+        raise RuntimeError("structured output evidence is missing")
+    if (
+        evidence["strategy"] != admitted.strategy.value
+        or evidence["adapter_version"] != admitted.adapter_version
+        or evidence["schema_fingerprint"]
+        != admitted.schema.schema_fingerprint
+    ):
+        raise RuntimeError("structured output evidence does not match request")
 
 
 def _validate_name_list(label: str, values: tuple[str, ...] | None) -> None:
@@ -863,7 +910,9 @@ class PluginAgentRunner:
             result = frame.get("result")
             if not isinstance(result, dict):
                 raise RuntimeError("plugin-agent result payload is missing")
-            return PluginAgentRunResult.from_wire(result)
+            parsed_result = PluginAgentRunResult.from_wire(result)
+            _correlate_structured_result(request, parsed_result)
+            return parsed_result
         except TimeoutError as exc:
             kind = "idle_timeout" if "idle" in str(exc) else "wall_timeout"
             return PluginAgentRunResult(

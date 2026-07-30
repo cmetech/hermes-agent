@@ -1135,7 +1135,6 @@ def _tool_name(schema: dict[str, Any]) -> str:
 
 
 def _structured_output_evidence(
-    request,
     decision,
     *,
     provider_attempts: int,
@@ -1146,7 +1145,7 @@ def _structured_output_evidence(
         "model_calls": max(0, int(model_calls)),
         "strategy": decision.strategy.value,
         "adapter_version": int(decision.adapter_version),
-        "schema_fingerprint": request.schema.schema_fingerprint,
+        "schema_fingerprint": decision.schema_fingerprint,
         "declaration_source": _sanitize(decision.declaration_source, 64),
     }
 
@@ -1154,12 +1153,10 @@ def _structured_output_evidence(
 def _structured_output_failure(
     *,
     plugin_id: str,
-    request,
     decision,
     failure_kind: str,
 ) -> dict[str, Any]:
     evidence = _structured_output_evidence(
-        request,
         decision,
         provider_attempts=0,
         model_calls=0,
@@ -1442,7 +1439,6 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 if request.structured_output.strategy.value == "unsupported":
                     return _structured_output_failure(
                         plugin_id=plugin_id,
-                        request=request.structured_output,
                         decision=structured_decision,
                         failure_kind="structured_output_unsupported",
                     )
@@ -1450,10 +1446,11 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     request.structured_output.strategy != structured_decision.strategy
                     or request.structured_output.adapter_version
                     != structured_decision.adapter_version
+                    or request.structured_output.schema.schema_fingerprint
+                    != structured_decision.schema_fingerprint
                 ):
                     return _structured_output_failure(
                         plugin_id=plugin_id,
-                        request=request.structured_output,
                         decision=structured_decision,
                         failure_kind="structured_output_capability_drift",
                     )
@@ -1589,7 +1586,6 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     0, int(getattr(agent, "_api_call_count", 0) or 0)
                 )
                 structured_evidence = _structured_output_evidence(
-                    request.structured_output,
                     structured_decision,
                     provider_attempts=provider_attempts,
                     model_calls=model_calls,
@@ -1648,7 +1644,6 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
             if request.structured_output is not None:
                 assert structured_decision is not None
                 structured_evidence = _structured_output_evidence(
-                    request.structured_output,
                     structured_decision,
                     provider_attempts=provider_attempts,
                     model_calls=model_calls,

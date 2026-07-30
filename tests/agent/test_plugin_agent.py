@@ -394,6 +394,140 @@ def test_plugin_runner_returns_usage_without_exposing_credentials(monkeypatch) -
 
 
 @pytest.mark.parametrize(
+    ("evidence", "message"),
+    [
+        (None, "structured output evidence is missing"),
+        (
+            {
+                "provider_attempts": 0,
+                "model_calls": 0,
+                "strategy": "prompt_json_schema",
+                "adapter_version": 1,
+                "schema_fingerprint": "f" * 64,
+                "declaration_source": "managed_loop_default",
+            },
+            "structured output evidence does not match request",
+        ),
+    ],
+    ids=("missing", "wrong-fingerprint"),
+)
+def test_parent_rejects_uncorrelated_structured_worker_results(
+    monkeypatch, evidence, message
+) -> None:
+    structured = _structured_request()
+    audit = {"plugin_id": "test-plugin"}
+    if evidence is not None:
+        audit.update(evidence)
+
+    monkeypatch.setattr(
+        "agent.plugin_agent._exchange_worker",
+        lambda *args, **kwargs: {
+            "protocol_version": 1,
+            "type": "result",
+            "result": {
+                "final_response": "",
+                "session_id": "worker-session",
+                "provider": "fake",
+                "model": "fake-model",
+                "status": "failed",
+                "pending_interaction": None,
+                "usage": {},
+                "audit": audit,
+                "structured_output": evidence,
+            },
+        },
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        PluginAgentRunner("test-plugin").run(
+            PluginAgentRunRequest(prompt="x", structured_output=structured)
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("adapter_version", True),
+        ("adapter_version", 0),
+        ("adapter_version", "1"),
+        ("canonicalization_version", True),
+        ("canonicalization_version", 0),
+        ("canonicalization_version", "1"),
+    ],
+)
+def test_structured_request_wire_requires_exact_positive_integer_versions(
+    field, invalid
+) -> None:
+    wire = PluginAgentRunRequest(
+        prompt="x", structured_output=_structured_request()
+    ).to_wire()
+    wire["structured_output"][field] = invalid
+
+    with pytest.raises(ValueError, match="structured output.*version"):
+        PluginAgentRunRequest.from_wire(wire)
+
+
+@pytest.mark.parametrize("invalid", [True, 0, "1"])
+def test_structured_result_evidence_requires_positive_integer_adapter_version(
+    invalid
+) -> None:
+    request = _structured_request()
+    evidence = {
+        "provider_attempts": 0,
+        "model_calls": 0,
+        "strategy": "prompt_json_schema",
+        "adapter_version": invalid,
+        "schema_fingerprint": request.schema.schema_fingerprint,
+        "declaration_source": "managed_loop_default",
+    }
+
+    with pytest.raises(ValueError, match="structured output evidence adapter_version"):
+        PluginAgentRunResult.from_wire(
+            {
+                "final_response": "",
+                "session_id": "worker-session",
+                "provider": "fake",
+                "model": "fake-model",
+                "status": "failed",
+                "pending_interaction": None,
+                "usage": {},
+                "audit": dict(evidence),
+                "structured_output": evidence,
+            }
+        )
+
+
+def test_direct_worker_rejects_overdeep_wire_schema_without_recursion_error() -> None:
+    import agent.plugin_agent_worker as worker
+
+    nested = {}
+    for _ in range(1_500):
+        nested = {"allOf": [nested]}
+    wire = PluginAgentRunRequest(
+        prompt="x", structured_output=_structured_request()
+    ).to_wire()
+    wire["structured_output"]["schema"]["canonical_schema"] = nested
+
+    with pytest.raises(ValueError, match="depth"):
+        worker._run({"plugin_id": "test-plugin", "request": wire})
+
+
+def test_direct_worker_preflights_oversized_base64_before_decode() -> None:
+    import agent.plugin_agent_worker as worker
+
+    wire = PluginAgentRunRequest(
+        prompt="x", structured_output=_structured_request()
+    ).to_wire()
+    maximum_encoded = ((MAX_CANONICAL_SCHEMA_BYTES + 2) // 3) * 4
+    wire["structured_output"]["schema"]["canonical_schema_bytes"] = (
+        "A" * (maximum_encoded + 4)
+    )
+
+    with pytest.raises(ValueError, match="encoded schema.*limit"):
+        worker._run({"plugin_id": "test-plugin", "request": wire})
+
+
+@pytest.mark.parametrize(
     ("run_request", "message"),
     [
         (PluginAgentRunRequest(prompt=""), "prompt"),
@@ -815,6 +949,58 @@ def test_structured_capability_drift_returns_zero_attempt_evidence_before_agent(
         "schema_fingerprint": admitted.schema.schema_fingerprint,
         "declaration_source": "managed_loop_default",
     }
+
+
+def test_worker_rejects_mismatched_resolved_decision_fingerprint(
+    monkeypatch,
+) -> None:
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+    import run_agent
+
+    original_resolver = runtime_provider.resolve_structured_output_capability
+
+    def mismatched_fingerprint(*args, **kwargs):
+        decision = original_resolver(*args, **kwargs)
+        return dataclasses.replace(decision, schema_fingerprint="f" * 64)
+
+    monkeypatch.setattr(
+        run_agent,
+        "AIAgent",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("agent constructed")),
+    )
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "fake",
+            "model": "fake-model",
+            "api_mode": "chat_completions",
+            "base_url": "https://fake.invalid/v1",
+            "api_key": "secret",
+        },
+    )
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_structured_output_capability",
+        mismatched_fingerprint,
+    )
+    admitted = _structured_request()
+
+    result = worker._run(
+        {
+            "plugin_id": "test-plugin",
+            "request": PluginAgentRunRequest(
+                prompt="x", allowed_tools=(), structured_output=admitted
+            ).to_wire(),
+        }
+    )
+
+    assert result["status"] == "failed"
+    assert result["audit"]["failure_kind"] == "structured_output_capability_drift"
+    assert result["audit"]["provider_attempts"] == 0
+    assert result["audit"]["model_calls"] == 0
+    assert result["structured_output"]["schema_fingerprint"] == "f" * 64
 
 
 def test_unsupported_structured_request_fails_before_agent_or_provider(
