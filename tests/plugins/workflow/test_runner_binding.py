@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import shutil
 
 import pytest
 
-from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
+from agent.structured_output import StructuredOutputStrategy
+from hermes_cli.runtime_provider import (
+    ExecutionRuntimeCapabilities,
+    classify_execution_runtime,
+)
 from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.api_admission import (
     ApiAdmissionAuthority,
@@ -29,6 +34,7 @@ from plugins.workflow.runner_binding import (
 import plugins.workflow.api_admission as api_admission_module
 import plugins.workflow.showcase as showcase_module
 import plugins.workflow.runner_binding as runner_binding_module
+import plugins.workflow.scheduled_revalidation as scheduled_revalidation_module
 import plugins.workflow.coordinator as coordinator_module
 from plugins.workflow.dashboard.plugin_api import StartRunRequest
 from plugins.workflow.models import ExecutionFence
@@ -131,6 +137,301 @@ def test_capability_records_and_binding_are_frozen_and_slotted() -> None:
         binding.real_runner = object()  # type: ignore[misc]
 
 
+def test_execution_context_seals_structured_output_decisions_into_identity(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    path = workflow_writer(
+        tmp_path,
+        name="sealed-structured-output",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Return a report",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                },
+            }
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(path)
+    direct_runtime = classify_execution_runtime(
+        provider="openrouter",
+        model_config={
+            "provider": "openrouter",
+            "default": "gpt-5.4",
+            "base_url": "https://api.openai.com/v1",
+        },
+        provider_config={
+            "api_mode": "codex_responses",
+            "base_url": "https://api.openai.com/v1",
+        },
+    )
+    prompt_runtime = classify_execution_runtime(
+        provider="openrouter",
+        model_config={"provider": "openrouter", "default": "openai/gpt-5.4"},
+        provider_config={
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+    )
+    direct_context = execution_capability_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+        runner_capabilities=RunnerCapabilities(starts_request_mcp=True),
+        runtime_capabilities=direct_runtime,
+    )
+    prompt_context = execution_capability_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+        runner_capabilities=RunnerCapabilities(starts_request_mcp=True),
+        runtime_capabilities=prompt_runtime,
+    )
+
+    direct_decision = next(
+        iter(direct_context.structured_output_decisions(package).values())
+    )
+
+    assert direct_decision.strategy is StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+    assert direct_decision.effective_provider == "openai"
+    assert direct_decision.model == "gpt-5.4"
+    assert direct_decision.schema_fingerprint == (
+        package.language.structured_outputs["producer"].schema_fingerprint
+    )
+    assert direct_context.identity_digest != prompt_context.identity_digest
+
+
+def _structured_package(home: Path, workflow_writer, *, name: str):
+    path = workflow_writer(
+        home / "workflows",
+        name=name,
+        filename=f"{name}.yaml",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Return a report",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                },
+            }
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    return load_workflow(path)
+
+
+def _runtime_binding(runtime, *, runtime_provider=None):
+    return WorkflowRunnerBinding(
+        real_runner=object(),
+        deterministic_runner=object(),
+        real_capabilities=RunnerCapabilities(starts_request_mcp=True),
+        deterministic_capabilities=RunnerCapabilities(starts_request_mcp=False),
+        runtime_capabilities=runtime,
+        runtime_capabilities_provider=runtime_provider,
+    )
+
+
+def _direct_openai_runtime():
+    return classify_execution_runtime(
+        provider="openrouter",
+        model_config={
+            "provider": "openrouter",
+            "default": "gpt-5.4",
+            "base_url": "https://api.openai.com/v1",
+        },
+        provider_config={
+            "api_mode": "codex_responses",
+            "base_url": "https://api.openai.com/v1",
+        },
+    )
+
+
+def test_catalog_exposes_bounded_schema_free_structured_output_summary(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    _structured_package(home, workflow_writer, name="catalog-structured-output")
+
+    catalog, _truncated = build_workflow_catalog(
+        hermes_home=home,
+        workdir=tmp_path,
+        runner_binding=_runtime_binding(_direct_openai_runtime()),
+    )
+
+    row = next(item for item in catalog if item["name"] == "catalog-structured-output")
+    summary = row["structured_output_capability"]
+    assert summary == {
+        "strategy": "native_json_schema",
+        "provider": "openai",
+        "api_mode": "codex_responses",
+        "adapter_version": 1,
+    }
+    serialized = json.dumps(summary, sort_keys=True)
+    assert "fingerprint" not in serialized
+    assert "rationale" not in serialized
+
+
+def test_scheduled_admission_seals_complete_decision_and_detects_provider_drift(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    package = _structured_package(home, workflow_writer, name="sealed-provider-drift")
+    current = {"runtime": _direct_openai_runtime()}
+    binding = _runtime_binding(
+        current["runtime"], runtime_provider=lambda: current["runtime"]
+    )
+    admitted_context = binding.execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+    compatibility, risk = runner_binding_module.assess_package_execution(
+        package, admitted_context
+    )
+    assert compatibility.runnable is True
+    WorkflowTrustStore(home).trust(
+        compute_package_digest(package).sha256,
+        actor="runner-binding-test",
+        risk_digest=risk.risk_digest,
+    )
+    monkeypatch.setattr(
+        "agent.skill_commands.build_preloaded_skills_prompt",
+        lambda *_args, **_kwargs: ("", [], []),
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+
+    admitted = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=tmp_path,
+        user_home=tmp_path,
+        workflow_name=package.definition.name,
+        values={},
+        idempotency_key="sealed-provider-drift",
+        concurrency_policy="queue",
+        authority=_authority(),
+        catalog_source="profile",
+        runner_binding=binding,
+        schedule_at="2099-01-02T03:04:05Z",
+        schedule_now_utc=datetime(2099, 1, 1, tzinfo=timezone.utc),
+    )
+    run = store.load_run(str(admitted["run_id"]))
+    decision_values = [
+        value
+        for key, value in run["run_metadata"].items()
+        if key.startswith("structured_output_decision.")
+    ]
+
+    assert len(decision_values) == 1
+    sealed = json.loads(decision_values[0])
+    assert set(sealed) == {
+        "strategy",
+        "effective_provider",
+        "model",
+        "api_mode",
+        "declaration_source",
+        "adapter_version",
+        "schema_fingerprint",
+        "rationale",
+    }
+    assert sealed["strategy"] == "native_json_schema"
+    assert run["run_metadata"]["execution_identity"] == admitted_context.identity_digest
+
+    current["runtime"] = classify_execution_runtime(
+        provider="openrouter",
+        model_config={"provider": "openrouter", "default": "openai/gpt-5.4"},
+        provider_config={
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+    )
+    fire_context = binding.execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+
+    assert fire_context.identity_digest != admitted_context.identity_digest
+    assert json.loads(decision_values[0]) == sealed
+    with pytest.raises(
+        scheduled_revalidation_module.ScheduledRunRevalidationError,
+        match="execution capability changed",
+    ):
+        scheduled_revalidation_module.revalidate_scheduled_run(
+            run,
+            fire_context,
+            hermes_home=home,
+            run_directory=store.run_directory(str(admitted["run_id"])),
+        )
+
+
+def test_unsupported_structured_output_blocks_before_provider_request(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    package = _structured_package(home, workflow_writer, name="unsupported-output")
+    unsupported_runtime = ExecutionRuntimeCapabilities(
+        api_mode="chat_completions",
+        hermes_managed_tool_loop=True,
+        effective_provider="locked-provider",
+        model="locked-model",
+        declared_structured_output_strategy="unsupported",
+        structured_output_declaration_source="provider_profile",
+    )
+    binding = _runtime_binding(unsupported_runtime)
+    context = binding.execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+    compatibility, risk = runner_binding_module.assess_package_execution(
+        package, context
+    )
+    assert compatibility.runnable is False
+    WorkflowTrustStore(home).trust(
+        compute_package_digest(package).sha256,
+        actor="runner-binding-test",
+        risk_digest=risk.risk_digest,
+    )
+    monkeypatch.setattr(
+        "agent.skill_commands.build_preloaded_skills_prompt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("provider request must not occur")
+        ),
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+
+    with pytest.raises(ApiAdmissionError) as exc_info:
+        start_api_run(
+            store,
+            hermes_home=home,
+            workdir=tmp_path,
+            user_home=tmp_path,
+            workflow_name=package.definition.name,
+            values={},
+            idempotency_key="unsupported-output",
+            concurrency_policy="queue",
+            authority=_authority(),
+            catalog_source="profile",
+            runner_binding=binding,
+        )
+
+    assert exc_info.value.code == "workflow_compatibility_blocked"
+    assert list(store.runs_root.rglob("run.json")) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
 def test_caller_data_cannot_override_execution_capabilities() -> None:
     caller_data = {
         "surface": "background",
@@ -211,6 +512,8 @@ def test_production_binding_factory_declares_real_and_deterministic_runners(
     assert binding.runtime_capabilities == ExecutionRuntimeCapabilities(
         api_mode="codex_app_server",
         hermes_managed_tool_loop=False,
+        effective_provider="openai-codex",
+        model="gpt-5.3-codex",
     )
     assert binding.real_runner.__class__.__name__ == "PluginAgentRunner"
     assert binding.deterministic_runner.__class__.__name__ == (
@@ -240,10 +543,18 @@ def test_production_binding_refreshes_runtime_capabilities_per_context(
     initial_capabilities = ExecutionRuntimeCapabilities(
         api_mode="chat_completions",
         hermes_managed_tool_loop=True,
+        effective_provider="openrouter",
+        model="openai/gpt-5.3",
+        base_url_trust_class="aggregator",
     )
     changed_capabilities = ExecutionRuntimeCapabilities(
         api_mode="anthropic_messages",
         hermes_managed_tool_loop=True,
+        effective_provider="anthropic",
+        model="claude-sonnet-4-5",
+        base_url_trust_class="trusted_direct",
+        declared_structured_output_strategy="native_json_schema",
+        structured_output_declaration_source="provider_profile",
     )
 
     assert binding.runtime_capabilities == initial_capabilities
@@ -284,7 +595,10 @@ def test_production_binding_refreshes_runtime_capabilities_per_context(
             surface="background",
             entitlement=entitlement,
         ).runtime_capabilities
-        == initial_capabilities
+        == ExecutionRuntimeCapabilities(
+            api_mode="chat_completions",
+            hermes_managed_tool_loop=True,
+        )
     )
 
 

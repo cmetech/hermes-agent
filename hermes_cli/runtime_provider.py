@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, Optional
 logger = logging.getLogger(__name__)
 
 from hermes_cli import auth as auth_mod
+from agent.structured_output import StructuredOutputStrategy
 from agent.credential_pool import (
     CredentialPool,
     PooledCredential,
@@ -373,16 +374,156 @@ _HERMES_MANAGED_TOOL_LOOP_API_MODES = frozenset({
 class ExecutionRuntimeCapabilities:
     api_mode: str
     hermes_managed_tool_loop: bool
+    effective_provider: str = ""
+    model: str = ""
+    base_url_trust_class: str = "unknown"
+    declared_structured_output_strategy: str | None = None
+    structured_output_declaration_source: str | None = None
 
 
-def _classify_execution_api_mode(api_mode: object) -> ExecutionRuntimeCapabilities:
+@dataclass(frozen=True, slots=True)
+class StructuredOutputCapabilityDecision:
+    strategy: StructuredOutputStrategy
+    effective_provider: str
+    model: str
+    api_mode: str
+    declaration_source: str
+    adapter_version: int
+    schema_fingerprint: str
+    rationale: str
+
+
+_STRUCTURED_OUTPUT_ADAPTER_VERSION = 1
+_STRUCTURED_OUTPUT_RATIONALE_MAX_CHARS = 256
+_STRUCTURED_OUTPUT_TRUST_CLASSES = frozenset(
+    {"trusted_direct", "aggregator", "custom", "unknown"}
+)
+
+
+def _structured_output_rationale(value: str) -> str:
+    return value[:_STRUCTURED_OUTPUT_RATIONALE_MAX_CHARS]
+
+
+def _execution_model(
+    model_config: Mapping[str, Any] | object,
+    provider_config: Mapping[str, Any] | object | None,
+    target_model: object,
+) -> str:
+    if isinstance(target_model, str) and target_model.strip():
+        return target_model.strip()
+    for config in (model_config, provider_config):
+        if not isinstance(config, Mapping):
+            continue
+        for key in ("default", "model", "default_model"):
+            value = config.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _execution_base_url(
+    model_config: Mapping[str, Any] | object,
+    provider_config: Mapping[str, Any] | object | None,
+) -> str:
+    for config in (provider_config, model_config):
+        if not isinstance(config, Mapping):
+            continue
+        for key in ("base_url", "api", "url"):
+            value = config.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().rstrip("/")
+    return ""
+
+
+def _structured_output_runtime_declaration(
+    *,
+    provider: str,
+    api_mode: str,
+    base_url: str,
+) -> tuple[str, str, str | None, str | None]:
+    """Return effective provider, URL trust, declaration, and its authority."""
+    normalized_provider = provider.strip().lower()
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(normalized_provider)
+    except Exception:
+        profile = None
+    effective_base_url = base_url or (
+        str(profile.base_url) if profile is not None else ""
+    )
+    hostname = (base_url_hostname(effective_base_url) or "").lower()
+
+    # Hermes historically labels a direct OpenAI API-key route as openrouter.
+    # The exact official host is the authority that safely recovers its actual
+    # provider identity. A user-selected generic custom route remains custom.
+    if hostname == "api.openai.com" and normalized_provider != "custom":
+        strategy = (
+            StructuredOutputStrategy.NATIVE_JSON_SCHEMA.value
+            if api_mode in {"chat_completions", "codex_responses"}
+            else None
+        )
+        return "openai", "trusted_direct", strategy, (
+            "trusted_runtime_classifier" if strategy is not None else None
+        )
+
+    if hostname == "api.anthropic.com" and normalized_provider == "anthropic":
+        trust_class = "trusted_direct"
+    elif hostname == "openrouter.ai" or normalized_provider == "openrouter":
+        trust_class = "aggregator"
+    elif normalized_provider == "custom":
+        trust_class = "custom"
+    else:
+        trust_class = "unknown"
+
+    declared_strategy = None
+    declaration_source = None
+    if profile is not None and profile.structured_output_strategy is not None:
+        candidate = str(profile.structured_output_strategy).strip().lower()
+        if candidate in {strategy.value for strategy in StructuredOutputStrategy}:
+            declared_strategy = candidate
+            declaration_source = "provider_profile"
+
+    return (
+        normalized_provider,
+        trust_class if trust_class in _STRUCTURED_OUTPUT_TRUST_CLASSES else "unknown",
+        declared_strategy,
+        declaration_source,
+    )
+
+
+def _classify_execution_api_mode(
+    api_mode: object,
+    *,
+    provider: object = "",
+    model: object = "",
+    base_url: object = "",
+) -> ExecutionRuntimeCapabilities:
     """Classify one already-derived API mode."""
     normalized = api_mode.strip().lower() if isinstance(api_mode, str) else ""
+    normalized_provider = provider.strip().lower() if isinstance(provider, str) else ""
+    normalized_model = model.strip() if isinstance(model, str) else ""
+    normalized_base_url = base_url.strip() if isinstance(base_url, str) else ""
+    (
+        effective_provider,
+        trust_class,
+        declared_strategy,
+        declaration_source,
+    ) = _structured_output_runtime_declaration(
+        provider=normalized_provider,
+        api_mode=normalized,
+        base_url=normalized_base_url,
+    )
     return ExecutionRuntimeCapabilities(
         api_mode=normalized,
         hermes_managed_tool_loop=(
             normalized in _HERMES_MANAGED_TOOL_LOOP_API_MODES
         ),
+        effective_provider=effective_provider,
+        model=normalized_model,
+        base_url_trust_class=trust_class,
+        declared_structured_output_strategy=declared_strategy,
+        structured_output_declaration_source=declaration_source,
     )
 
 
@@ -406,15 +547,74 @@ def classify_execution_runtime(
         provider_config=provider_config,
         target_model=target_model,
     )
-    return _classify_execution_api_mode(api_mode)
+    return _classify_execution_api_mode(
+        api_mode,
+        provider=provider,
+        model=_execution_model(model_config, provider_config, target_model),
+        base_url=_execution_base_url(model_config, provider_config),
+    )
 
 
 def classify_resolved_execution_runtime(
     runtime: Mapping[str, Any] | object,
+    *,
+    target_model: object = None,
 ) -> ExecutionRuntimeCapabilities:
     """Classify the API mode on an already-resolved runtime mapping."""
-    api_mode = runtime.get("api_mode") if isinstance(runtime, Mapping) else None
-    return _classify_execution_api_mode(api_mode)
+    if not isinstance(runtime, Mapping):
+        return _classify_execution_api_mode(None)
+    return _classify_execution_api_mode(
+        runtime.get("api_mode"),
+        provider=runtime.get("provider"),
+        model=_execution_model({}, runtime, target_model),
+        base_url=runtime.get("base_url"),
+    )
+
+
+def resolve_structured_output_capability(
+    runtime: ExecutionRuntimeCapabilities,
+    *,
+    schema_fingerprint: str,
+    model: str | None = None,
+) -> StructuredOutputCapabilityDecision:
+    """Seal one structured-output strategy from explicit runtime authority."""
+    declared = runtime.declared_structured_output_strategy
+    if declared == StructuredOutputStrategy.UNSUPPORTED.value:
+        strategy = StructuredOutputStrategy.UNSUPPORTED
+        source = "explicit_unsupported"
+        rationale = "provider explicitly forbids structured-output adaptation"
+    elif not runtime.hermes_managed_tool_loop:
+        strategy = StructuredOutputStrategy.UNSUPPORTED
+        source = "delegated_runtime"
+        rationale = "delegated runtime has no Hermes structured-output contract"
+    elif (
+        runtime.base_url_trust_class == "trusted_direct"
+        and declared
+        in {
+            StructuredOutputStrategy.NATIVE_JSON_SCHEMA.value,
+            StructuredOutputStrategy.NATIVE_JSON_MODE.value,
+        }
+    ):
+        strategy = StructuredOutputStrategy(declared)
+        source = runtime.structured_output_declaration_source or "provider_profile"
+        rationale = "trusted direct provider explicitly declares native support"
+    else:
+        strategy = StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+        source = "managed_loop_default"
+        rationale = (
+            "Hermes-managed loop uses prompt schema adaptation without a trusted "
+            "direct native declaration"
+        )
+    return StructuredOutputCapabilityDecision(
+        strategy=strategy,
+        effective_provider=runtime.effective_provider,
+        model=(model.strip() if isinstance(model, str) else runtime.model),
+        api_mode=runtime.api_mode,
+        declaration_source=source,
+        adapter_version=_STRUCTURED_OUTPUT_ADAPTER_VERSION,
+        schema_fingerprint=schema_fingerprint,
+        rationale=_structured_output_rationale(rationale),
+    )
 
 
 def _parse_api_mode(raw: Any) -> Optional[str]:

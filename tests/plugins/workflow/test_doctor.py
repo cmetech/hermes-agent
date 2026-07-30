@@ -246,3 +246,66 @@ def test_doctor_matches_runtime_authorization_for_explicit_provider_and_model(
         finding.code.endswith("_override_not_authorized")
         for finding in authorized.findings
     )
+
+
+def _archon_structured_package(tmp_path: Path, workflow_writer):
+    path = workflow_writer(
+        tmp_path,
+        name="doctor-structured-output",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Return a report",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                },
+            }
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    return load_workflow(path)
+
+
+def test_doctor_reports_existing_extra_guidance_when_validator_is_missing(
+    tmp_path: Path, workflow_writer, monkeypatch
+) -> None:
+    package = _archon_structured_package(tmp_path, workflow_writer)
+    monkeypatch.setattr(
+        "plugins.workflow.cli._structured_output_validator_available",
+        lambda: False,
+    )
+
+    report = doctor_package(package, hermes_home=tmp_path / "home")
+
+    finding = next(
+        item
+        for item in report.findings
+        if item.code == "structured_output_unavailable"
+    )
+    assert finding.blocking is True
+    assert "install the Hermes mcp or all extra" in finding.message
+
+
+def test_doctor_schemaless_workflow_does_not_require_validator(
+    tmp_path: Path, workflow_writer, monkeypatch
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path,
+            name="doctor-schemaless",
+            nodes=[{"id": "agent", "prompt": "Return prose"}],
+        )
+    )
+    monkeypatch.setattr(
+        "plugins.workflow.cli._structured_output_validator_available",
+        lambda: False,
+    )
+
+    report = doctor_package(package, hermes_home=tmp_path / "home")
+
+    assert not any(
+        item.code == "structured_output_unavailable" for item in report.findings
+    )

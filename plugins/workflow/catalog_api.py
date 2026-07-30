@@ -117,6 +117,7 @@ class CatalogEntry(TypedDict):
     run_support: CatalogRunSupport
     language: dict[str, object]
     compatibility: NotRequired[dict[str, object]]
+    structured_output_capability: NotRequired[dict[str, object]]
 
 
 class InvalidCatalogEntry(TypedDict):
@@ -530,6 +531,22 @@ def _compatibility_summary(compatibility) -> dict[str, object]:
     }
 
 
+def _structured_output_capability_summary(
+    package: WorkflowPackage,
+    execution_context: ExecutionCapabilityContext,
+) -> dict[str, object] | None:
+    decisions = execution_context.structured_output_decisions(package)
+    if not decisions:
+        return None
+    decision = next(iter(decisions.values()))
+    return {
+        "strategy": decision.strategy.value,
+        "provider": decision.effective_provider,
+        "api_mode": decision.api_mode,
+        "adapter_version": decision.adapter_version,
+    }
+
+
 def _catalog_language_projection(
     package: WorkflowPackage, *, detail: bool = False
 ) -> dict[str, object]:
@@ -670,6 +687,11 @@ def _catalog_entry(
         entry["compatibility"] = _compatibility_projection(compatibility)
     else:
         entry["compatibility"] = _compatibility_summary(compatibility)
+    structured_output_capability = _structured_output_capability_summary(
+        package, execution_context
+    )
+    if structured_output_capability is not None:
+        entry["structured_output_capability"] = structured_output_capability
     return entry
 
 

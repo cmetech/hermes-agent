@@ -470,6 +470,14 @@ def start_api_run(
             include_verified_marker=True,
         )
         concurrency_key = f"showcase:{verified_showcase.scenario.id}"
+    structured_output_metadata = execution_context.structured_output_run_metadata(
+        package
+    )
+    if structured_output_metadata:
+        run_metadata = {
+            **dict(run_metadata or {}),
+            **structured_output_metadata,
+        }
     if schedule_at is not None:
         from plugins.workflow.scheduled_revalidation import (
             ScheduledRunRevalidationError,

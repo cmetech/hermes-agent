@@ -1,5 +1,13 @@
 """Tests for the provider module registry and profiles."""
 
+import pytest
+
+from agent.structured_output import StructuredOutputStrategy
+from hermes_cli.runtime_provider import (
+    ExecutionRuntimeCapabilities,
+    classify_execution_runtime,
+    resolve_structured_output_capability,
+)
 from providers import get_provider_profile, _REGISTRY
 from providers.base import ProviderProfile, OMIT_TEMPERATURE
 
@@ -573,6 +581,10 @@ class TestBaseProfile:
         p = ProviderProfile(name="example")
         assert p.model_capabilities_path == ""
 
+    def test_structured_output_strategy_defaults_undeclared(self):
+        p = ProviderProfile(name="example")
+        assert p.structured_output_strategy is None
+
     def test_prepare_messages_passthrough(self):
         p = ProviderProfile(name="test")
         msgs = [{"role": "user", "content": "hi"}]
@@ -587,3 +599,142 @@ class TestBaseProfile:
         eb, tl = p.build_api_kwargs_extras()
         assert eb == {}
         assert tl == {}
+
+
+@pytest.mark.parametrize(
+    ("provider", "model_config", "provider_config", "expected_strategy"),
+    [
+        pytest.param(
+            "openrouter",
+            {
+                "provider": "openrouter",
+                "default": "gpt-5.4",
+                "base_url": "https://api.openai.com/v1",
+            },
+            {"api_mode": "codex_responses", "base_url": "https://api.openai.com/v1"},
+            StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+            id="direct-openai-responses",
+        ),
+        pytest.param(
+            "openrouter",
+            {
+                "provider": "openrouter",
+                "default": "gpt-4.1",
+                "base_url": "https://api.openai.com/v1",
+            },
+            {"api_mode": "chat_completions", "base_url": "https://api.openai.com/v1"},
+            StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+            id="direct-openai-chat-completions",
+        ),
+        pytest.param(
+            "anthropic",
+            {"provider": "anthropic", "default": "claude-sonnet-4-6"},
+            {
+                "api_mode": "anthropic_messages",
+                "base_url": "https://api.anthropic.com",
+            },
+            StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+            id="direct-anthropic-messages",
+        ),
+        pytest.param(
+            "custom",
+            {
+                "provider": "custom",
+                "default": "local-model",
+                "base_url": "http://127.0.0.1:11434/v1",
+            },
+            {
+                "api_mode": "chat_completions",
+                "base_url": "http://127.0.0.1:11434/v1",
+            },
+            StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            id="custom-endpoint",
+        ),
+        pytest.param(
+            "openrouter",
+            {"provider": "openrouter", "default": "openai/gpt-5.4"},
+            {
+                "api_mode": "chat_completions",
+                "base_url": "https://openrouter.ai/api/v1",
+            },
+            StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            id="aggregator",
+        ),
+        pytest.param(
+            "community-provider",
+            {"provider": "community-provider", "default": "community-model"},
+            {"api_mode": "chat_completions"},
+            StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            id="unknown-hermes-managed-loop",
+        ),
+        pytest.param(
+            "openai-codex",
+            {
+                "provider": "openai-codex",
+                "default": "gpt-5.4-codex",
+                "openai_runtime": "codex_app_server",
+            },
+            {"api_mode": "codex_app_server"},
+            StructuredOutputStrategy.UNSUPPORTED,
+            id="delegated-runtime",
+        ),
+        pytest.param(
+            "community-provider",
+            {"provider": "community-provider", "default": "community-model"},
+            {"api_mode": "chat_completions", "structured_output": True},
+            StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            id="community-metadata-cannot-promote",
+        ),
+        pytest.param(
+            "openai-codex",
+            {"provider": "openai-codex", "default": "gpt-5.4-codex"},
+            {
+                "api_mode": "codex_responses",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+            },
+            StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            id="chatgpt-subscription-is-not-native",
+        ),
+    ],
+)
+def test_structured_output_capability_matrix_is_authority_based(
+    provider,
+    model_config,
+    provider_config,
+    expected_strategy,
+):
+    runtime = classify_execution_runtime(
+        provider=provider,
+        model_config=model_config,
+        provider_config=provider_config,
+    )
+
+    decision = resolve_structured_output_capability(
+        runtime,
+        schema_fingerprint="a" * 64,
+    )
+
+    assert decision.strategy is expected_strategy
+    assert decision.schema_fingerprint == "a" * 64
+    assert decision.adapter_version == 1
+    assert len(decision.rationale) <= 256
+
+
+def test_explicit_unsupported_declaration_forbids_prompt_adaptation():
+    runtime = ExecutionRuntimeCapabilities(
+        api_mode="chat_completions",
+        hermes_managed_tool_loop=True,
+        effective_provider="locked-provider",
+        model="locked-model",
+        base_url_trust_class="unknown",
+        declared_structured_output_strategy="unsupported",
+        structured_output_declaration_source="provider_profile",
+    )
+
+    decision = resolve_structured_output_capability(
+        runtime,
+        schema_fingerprint="b" * 64,
+    )
+
+    assert decision.strategy is StructuredOutputStrategy.UNSUPPORTED
+    assert decision.declaration_source == "explicit_unsupported"

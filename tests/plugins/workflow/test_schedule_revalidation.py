@@ -357,6 +357,11 @@ def test_same_binding_refreshes_runtime_before_scheduled_admission(
     assert context.runtime_capabilities == ExecutionRuntimeCapabilities(
         api_mode="anthropic_messages",
         hermes_managed_tool_loop=True,
+        effective_provider="anthropic",
+        model="claude-sonnet-4-5",
+        base_url_trust_class="trusted_direct",
+        declared_structured_output_strategy="native_json_schema",
+        structured_output_declaration_source="provider_profile",
     )
     admitted = store.load_run(run_id)
     assert admitted["run_metadata"]["execution_identity"] == context.identity_digest

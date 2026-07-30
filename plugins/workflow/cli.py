@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextvars import ContextVar
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -1190,6 +1191,14 @@ def _provider_override_findings(
     )
 
 
+def _structured_output_validator_available() -> bool:
+    """Probe the optional instance validator without importing it."""
+    try:
+        return importlib.util.find_spec("jsonschema") is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def doctor_package(
     package: WorkflowPackage,
     *,
@@ -1214,6 +1223,21 @@ def doctor_package(
         mcp_available=mcp_available,
     )
     findings = list(compatibility.findings)
+    if (
+        package.language.structured_outputs
+        and not _structured_output_validator_available()
+    ):
+        findings.append(
+            _doctor_finding(
+                code="structured_output_unavailable",
+                path="language.structured_outputs",
+                message=(
+                    "jsonschema is required; install the Hermes mcp or all extra"
+                ),
+                blocking=True,
+                level=CompatibilityLevel.UNSUPPORTED,
+            )
+        )
     findings.extend(
         _provider_override_findings(package, hermes_home=hermes_home)
     )

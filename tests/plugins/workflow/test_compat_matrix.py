@@ -665,20 +665,6 @@ def test_legacy_profile_finding_is_stable_for_default_and_explicit_declarations(
         ),
         (
             "archon-2026-07",
-            {"output_format": {"type": "object"}},
-            "archon_output_format_unavailable",
-            True,
-            "error",
-        ),
-        (
-            "archon-2026-07",
-            {"output_type": "text"},
-            "archon_output_type_unavailable",
-            True,
-            "error",
-        ),
-        (
-            "archon-2026-07",
             {"maxBudgetUsd": 1},
             "archon_budget_enforcement_unavailable",
             True,

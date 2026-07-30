@@ -5,12 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Literal, Mapping
 
 from hermes_cli.config import get_compatible_custom_providers, read_raw_config
 from hermes_cli.runtime_provider import (
     ExecutionRuntimeCapabilities,
+    StructuredOutputCapabilityDecision,
     classify_execution_runtime,
+    resolve_structured_output_capability,
 )
 from plugins.workflow.entitlement import (
     AIEntitlementResolution,
@@ -39,6 +42,65 @@ class ExecutionCapabilityContext:
     runtime_capabilities: ExecutionRuntimeCapabilities
     mcp_available: bool
 
+    def structured_output_decisions(
+        self,
+        package: "WorkflowPackage",
+    ) -> Mapping[str, StructuredOutputCapabilityDecision]:
+        """Return immutable per-node decisions for sealed Archon schemas."""
+        decisions: dict[str, StructuredOutputCapabilityDecision] = {}
+        nodes_by_id = {node.id: node for node in package.definition.nodes}
+        for node_id, output in sorted(package.language.structured_outputs.items()):
+            node = nodes_by_id[node_id]
+            configured_model = node.options.get("model")
+            decisions[node_id] = resolve_structured_output_capability(
+                self.runtime_capabilities,
+                schema_fingerprint=output.schema_fingerprint,
+                model=(configured_model if isinstance(configured_model, str) else None),
+            )
+        return MappingProxyType(decisions)
+
+    def structured_output_run_metadata(
+        self,
+        package: "WorkflowPackage",
+    ) -> dict[str, str]:
+        """Serialize complete decisions as bounded immutable run metadata rows."""
+        metadata: dict[str, str] = {}
+        for node_id, decision in self.structured_output_decisions(package).items():
+            key = (
+                "structured_output_decision."
+                + hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:16]
+            )
+            metadata[key] = json.dumps(
+                {
+                    "strategy": decision.strategy.value,
+                    "effective_provider": decision.effective_provider,
+                    "model": decision.model,
+                    "api_mode": decision.api_mode,
+                    "declaration_source": decision.declaration_source,
+                    "adapter_version": decision.adapter_version,
+                    "schema_fingerprint": decision.schema_fingerprint,
+                    "rationale": decision.rationale,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        return metadata
+
+    @property
+    def _structured_output_runtime_identity(self) -> dict[str, object]:
+        decision = resolve_structured_output_capability(
+            self.runtime_capabilities,
+            schema_fingerprint="0" * 64,
+        )
+        return {
+            "adapter_version": decision.adapter_version,
+            "api_mode": decision.api_mode,
+            "declaration_source": decision.declaration_source,
+            "effective_provider": decision.effective_provider,
+            "model": decision.model,
+            "strategy": decision.strategy.value,
+        }
+
     @property
     def identity_digest(self) -> str:
         """Return the canonical identity sealed for scheduled revalidation."""
@@ -53,6 +115,17 @@ class ExecutionCapabilityContext:
                 "runtime_api_mode": self.runtime_capabilities.api_mode,
                 "runtime_hermes_managed_tool_loop": (
                     self.runtime_capabilities.hermes_managed_tool_loop
+                ),
+                "runtime_provider": self.runtime_capabilities.effective_provider,
+                "runtime_model": self.runtime_capabilities.model,
+                "runtime_base_url_trust_class": (
+                    self.runtime_capabilities.base_url_trust_class
+                ),
+                "runtime_declared_structured_output_strategy": (
+                    self.runtime_capabilities.declared_structured_output_strategy
+                ),
+                "structured_output_decision": (
+                    self._structured_output_runtime_identity
                 ),
                 "surface": self.surface,
             },
@@ -215,6 +288,7 @@ def assess_package_execution(
     compatibility = assess_compatibility(
         package,
         mcp_available=context.mcp_available,
+        structured_output_decisions=context.structured_output_decisions(package),
     )
     if package.sidecar.get("execution_environment", "trusted_local") != (
         "trusted_local"
