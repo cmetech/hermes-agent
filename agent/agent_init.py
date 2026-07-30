@@ -457,6 +457,7 @@ def init_agent(
     reasoning_config: Dict[str, Any] = None,
     service_tier: str = None,
     request_overrides: Dict[str, Any] = None,
+    structured_output: "StructuredOutputRequest" = None,
     prefill_messages: List[Dict[str, Any]] = None,
     platform: str = None,
     user_id: str = None,
@@ -532,6 +533,23 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
+    if structured_output is not None:
+        from agent.structured_output import StructuredOutputRequest
+
+        if not isinstance(structured_output, StructuredOutputRequest):
+            raise TypeError("structured_output must be StructuredOutputRequest or None")
+        structured_overrides = request_overrides or {}
+        if "response_format" in structured_overrides or (
+            isinstance(structured_overrides.get("text"), dict)
+            and "format" in structured_overrides["text"]
+        ) or (
+            isinstance(structured_overrides.get("output_config"), dict)
+            and "format" in structured_overrides["output_config"]
+        ):
+            raise ValueError(
+                "structured output cannot be combined with a provider format override"
+            )
+
     _install_safe_stdio()
 
     agent.model = model
@@ -780,6 +798,7 @@ def init_agent(
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
     agent.service_tier = service_tier
     agent.request_overrides = dict(request_overrides or {})
+    agent.structured_output = structured_output
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
     

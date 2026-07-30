@@ -26,6 +26,14 @@ from agent.plugin_agent import (
     _exchange_worker,
     _read_stream,
 )
+from agent.structured_output import (
+    MAX_CANONICAL_SCHEMA_BYTES,
+    MAX_OUTPUT_BYTES,
+    StructuredOutputRequest,
+    StructuredOutputSchema,
+    StructuredOutputStrategy,
+    normalize_schema,
+)
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from tools.managed_process import ProcessResourceLimits, TerminationPolicy
 from tools.registry import ToolRegistry
@@ -37,6 +45,26 @@ def _register(registry: ToolRegistry, name: str) -> None:
         toolset="test",
         schema={"name": name, "description": name, "parameters": {"type": "object"}},
         handler=lambda args: name,
+    )
+
+
+def _structured_request(
+    strategy: StructuredOutputStrategy = StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+    *,
+    output_bytes_limit: int = 321,
+) -> StructuredOutputRequest:
+    return StructuredOutputRequest(
+        schema=normalize_schema(
+            {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": False,
+            }
+        ),
+        strategy=strategy,
+        adapter_version=1,
+        output_bytes_limit=output_bytes_limit,
     )
 
 
@@ -157,6 +185,175 @@ def test_request_and_result_are_immutable() -> None:
         request.prompt = "changed"  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.status = "failed"  # type: ignore[misc]
+
+
+def test_structured_request_and_result_round_trip_explicit_wire_values() -> None:
+    request = PluginAgentRunRequest(
+        prompt="return data", structured_output=_structured_request()
+    )
+    request_wire = request.to_wire()
+
+    assert request_wire["structured_output"]["strategy"] == "prompt_json_schema"
+    assert isinstance(
+        request_wire["structured_output"]["schema"]["canonical_schema_bytes"], str
+    )
+    restored = PluginAgentRunRequest.from_wire(request_wire)
+    assert restored == request
+    assert isinstance(restored.structured_output.strategy, StructuredOutputStrategy)
+    with pytest.raises(TypeError):
+        restored.structured_output.schema.canonical_schema["new"] = True
+
+    result = PluginAgentRunResult(
+        final_response='{"answer":"ok"}',
+        session_id="session-1",
+        provider="fake",
+        model="fake-model",
+        status="completed",
+        pending_interaction=None,
+        usage={"input_tokens": 1},
+        audit={
+            "provider_attempts": 1,
+            "model_calls": 1,
+            "strategy": "prompt_json_schema",
+            "adapter_version": 1,
+            "schema_fingerprint": request.structured_output.schema.schema_fingerprint,
+            "declaration_source": "managed_loop_default",
+        },
+        structured_output={
+            "provider_attempts": 1,
+            "model_calls": 1,
+            "strategy": "prompt_json_schema",
+            "adapter_version": 1,
+            "schema_fingerprint": request.structured_output.schema.schema_fingerprint,
+            "declaration_source": "managed_loop_default",
+        },
+    )
+    restored_result = PluginAgentRunResult.from_wire(result.to_wire())
+    assert restored_result == result
+    with pytest.raises(TypeError):
+        restored_result.structured_output["strategy"] = "unsupported"
+
+
+def test_protocol_v1_accepts_old_frames_without_structured_output() -> None:
+    request = PluginAgentRunRequest.from_wire({"prompt": "old client"})
+    result = PluginAgentRunResult.from_wire(
+        {
+            "final_response": "done",
+            "session_id": "session-1",
+            "provider": "fake",
+            "model": "fake-model",
+            "status": "completed",
+            "pending_interaction": None,
+            "usage": {},
+            "audit": {},
+        }
+    )
+
+    assert request.structured_output is None
+    assert result.structured_output is None
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        {"prompt": "x", "unknown": True},
+        {
+            "prompt": "x",
+            "structured_output": {
+                "schema": {
+                    "canonical_schema": {"type": "object"},
+                    "schema_fingerprint": "0" * 64,
+                    "canonical_schema_bytes": "e30=",
+                    "dialect": "https://json-schema.org/draft/2020-12/schema",
+                    "unknown": True,
+                },
+                "strategy": "prompt_json_schema",
+                "adapter_version": 1,
+                "output_bytes_limit": 100,
+                "canonicalization_version": 1,
+            },
+        },
+    ],
+)
+def test_protocol_rejects_unknown_fields(wire) -> None:
+    with pytest.raises(ValueError, match="unknown"):
+        PluginAgentRunRequest.from_wire(wire)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"response_format": {"type": "json_object"}},
+        {"text": {"format": {"type": "json_schema"}}},
+        {"output_config": {"format": {"type": "json_schema"}}},
+    ],
+)
+def test_structured_request_rejects_contradictory_wire_overrides_before_spawn(
+    monkeypatch, overrides
+) -> None:
+    monkeypatch.setattr(
+        "agent.plugin_agent._exchange_worker",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("started")),
+    )
+
+    with pytest.raises(ValueError, match="structured output.*override"):
+        PluginAgentRunner("test-plugin").run(
+            PluginAgentRunRequest(
+                prompt="x",
+                structured_output=_structured_request(),
+                request_overrides=overrides,
+            )
+        )
+
+
+def test_ai_agent_forwards_one_stable_structured_contract_to_initialization(
+    monkeypatch,
+) -> None:
+    import agent.agent_init as agent_init
+    from run_agent import AIAgent
+
+    captured = {}
+    structured = _structured_request()
+
+    def capture_init(agent, **kwargs):
+        captured.update(kwargs)
+        agent.structured_output = kwargs["structured_output"]
+
+    monkeypatch.setattr(agent_init, "init_agent", capture_init)
+
+    agent = AIAgent(structured_output=structured)
+
+    assert captured["structured_output"] is structured
+    assert agent.structured_output is structured
+
+
+@pytest.mark.parametrize(
+    "structured_request",
+    [
+        StructuredOutputRequest(
+            schema=StructuredOutputSchema(
+                canonical_schema={"type": "object"},
+                schema_fingerprint="0" * 64,
+                canonical_schema_bytes=b"x" * (MAX_CANONICAL_SCHEMA_BYTES + 1),
+            ),
+            strategy=StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            adapter_version=1,
+        ),
+        _structured_request(output_bytes_limit=MAX_OUTPUT_BYTES + 1),
+    ],
+)
+def test_oversized_structured_contract_fails_before_worker_start(
+    monkeypatch, structured_request
+) -> None:
+    monkeypatch.setattr(
+        "agent.plugin_agent._exchange_worker",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("started")),
+    )
+
+    with pytest.raises(ValueError, match="structured output"):
+        PluginAgentRunner("test-plugin").run(
+            PluginAgentRunRequest(prompt="x", structured_output=structured_request)
+        )
 
 
 def test_real_plugin_agent_runner_declares_request_mcp_ownership() -> None:
@@ -472,6 +669,257 @@ def test_worker_consumes_exact_approval_digest_once(monkeypatch) -> None:
     assert result["status"] == "paused"
     assert result["pending_interaction"]["action_digest"] == digest
     assert [kind for kind, _payload in emitted].count("interaction") == 1
+
+
+def test_prompt_structured_output_adapts_only_initial_user_message(
+    monkeypatch,
+) -> None:
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+    import hermes_state
+    import run_agent
+
+    captured = {}
+    history = [
+        {"role": "user", "content": "earlier"},
+        {"role": "assistant", "content": "earlier response"},
+    ]
+
+    class FakeDB:
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def get_messages_as_conversation(self, session_id):
+            assert session_id == "shared-session"
+            return history
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["init"] = kwargs
+            self.session_id = kwargs["session_id"]
+            self.provider = kwargs["provider"]
+            self.model = kwargs["model"]
+            self.tools = []
+            self.valid_tool_names = set()
+            self.session_input_tokens = 3
+            self.session_output_tokens = 2
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+
+        def run_conversation(self, prompt, conversation_history=None):
+            captured["prompt"] = prompt
+            captured["history"] = conversation_history
+            return {"final_response": '{"answer":"ok"}', "api_calls": 1}
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(hermes_state, "SessionDB", FakeDB)
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "fake",
+            "model": "fake-model",
+            "api_mode": "chat_completions",
+            "base_url": "https://fake.invalid/v1",
+            "api_key": "secret",
+        },
+    )
+    monkeypatch.setattr(worker, "_emit", lambda *args, **kwargs: None)
+    structured = _structured_request()
+    request = PluginAgentRunRequest(
+        prompt="Return the answer",
+        context_mode="shared",
+        session_id="shared-session",
+        allowed_tools=(),
+        ephemeral_system_prompt="SYSTEM-BYTES-STAY-STABLE",
+        structured_output=structured,
+    )
+
+    result = worker._run(
+        {"plugin_id": "test-plugin", "request": request.to_wire()}
+    )
+
+    prompt = captured["prompt"]
+    assert prompt.startswith("Return the answer\n\n")
+    assert prompt.count("<hermes_structured_output") == 1
+    assert prompt.count("</hermes_structured_output>") == 1
+    assert structured.schema.canonical_schema_bytes.decode("utf-8") in prompt
+    assert len(prompt.encode("utf-8")) <= (
+        len(request.prompt.encode("utf-8"))
+        + MAX_CANONICAL_SCHEMA_BYTES
+        + 512
+    )
+    assert captured["history"] is history
+    assert history == [
+        {"role": "user", "content": "earlier"},
+        {"role": "assistant", "content": "earlier response"},
+    ]
+    assert captured["init"]["ephemeral_system_prompt"] == "SYSTEM-BYTES-STAY-STABLE"
+    assert captured["init"]["structured_output"] == structured
+    assert result["status"] == "completed"
+    assert result["structured_output"] == {
+        "provider_attempts": 1,
+        "model_calls": 1,
+        "strategy": "prompt_json_schema",
+        "adapter_version": 1,
+        "schema_fingerprint": structured.schema.schema_fingerprint,
+        "declaration_source": "managed_loop_default",
+    }
+    assert result["audit"]["provider_attempts"] == 1
+    assert result["audit"]["model_calls"] == 1
+
+
+def test_structured_capability_drift_returns_zero_attempt_evidence_before_agent(
+    monkeypatch,
+) -> None:
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+    import run_agent
+
+    monkeypatch.setattr(
+        run_agent,
+        "AIAgent",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("agent constructed")),
+    )
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "fake",
+            "model": "fake-model",
+            "api_mode": "chat_completions",
+            "base_url": "https://fake.invalid/v1",
+            "api_key": "secret",
+        },
+    )
+    admitted = _structured_request(StructuredOutputStrategy.NATIVE_JSON_SCHEMA)
+
+    result = worker._run(
+        {
+            "plugin_id": "test-plugin",
+            "request": PluginAgentRunRequest(
+                prompt="x", allowed_tools=(), structured_output=admitted
+            ).to_wire(),
+        }
+    )
+
+    assert result["status"] == "failed"
+    assert result["audit"]["failure_kind"] == "structured_output_capability_drift"
+    assert result["audit"]["provider_attempts"] == 0
+    assert result["audit"]["model_calls"] == 0
+    assert result["structured_output"] == {
+        "provider_attempts": 0,
+        "model_calls": 0,
+        "strategy": "prompt_json_schema",
+        "adapter_version": 1,
+        "schema_fingerprint": admitted.schema.schema_fingerprint,
+        "declaration_source": "managed_loop_default",
+    }
+
+
+def test_unsupported_structured_request_fails_before_agent_or_provider(
+    monkeypatch,
+) -> None:
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+    import run_agent
+
+    monkeypatch.setattr(
+        run_agent,
+        "AIAgent",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("agent constructed")),
+    )
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "fake",
+            "model": "fake-model",
+            "api_mode": "chat_completions",
+            "base_url": "https://fake.invalid/v1",
+            "api_key": "secret",
+        },
+    )
+    unsupported = _structured_request(StructuredOutputStrategy.UNSUPPORTED)
+
+    result = worker._run(
+        {
+            "plugin_id": "test-plugin",
+            "request": PluginAgentRunRequest(
+                prompt="x", allowed_tools=(), structured_output=unsupported
+            ).to_wire(),
+        }
+    )
+
+    assert result["status"] == "failed"
+    assert result["audit"]["failure_kind"] == "structured_output_unsupported"
+    assert result["audit"]["provider_attempts"] == 0
+    assert result["audit"]["model_calls"] == 0
+
+
+def test_structured_provider_exception_keeps_exact_bounded_attempt_evidence(
+    monkeypatch,
+) -> None:
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+    import hermes_state
+    import run_agent
+
+    class FakeDB:
+        pass
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.session_id = "worker-session"
+            self.provider = kwargs["provider"]
+            self.model = kwargs["model"]
+            self.tools = []
+            self.valid_tool_names = set()
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self._api_call_count = 0
+
+        def _interruptible_api_call(self, _kwargs):
+            raise RuntimeError("bounded-provider-failure")
+
+        def run_conversation(self, prompt, conversation_history=None):
+            self._api_call_count = 1
+            self._interruptible_api_call({})
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(hermes_state, "SessionDB", FakeDB)
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "fake",
+            "model": "fake-model",
+            "api_mode": "chat_completions",
+            "base_url": "https://fake.invalid/v1",
+            "api_key": "secret",
+        },
+    )
+    monkeypatch.setattr(worker, "_emit", lambda *args, **kwargs: None)
+    structured = _structured_request()
+
+    result = worker._run(
+        {
+            "plugin_id": "test-plugin",
+            "request": PluginAgentRunRequest(
+                prompt="x", allowed_tools=(), structured_output=structured
+            ).to_wire(),
+        }
+    )
+
+    assert result["status"] == "failed"
+    assert result["audit"]["failure_kind"] == "RuntimeError"
+    assert result["audit"]["provider_attempts"] == 1
+    assert result["audit"]["model_calls"] == 1
+    assert result["structured_output"]["schema_fingerprint"] == (
+        structured.schema.schema_fingerprint
+    )
 
 
 def test_approval_digest_is_validated_before_worker_start(monkeypatch) -> None:

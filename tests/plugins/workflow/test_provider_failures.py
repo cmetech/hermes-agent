@@ -42,6 +42,36 @@ def test_internal_provider_attempts_consume_combined_attempt_budget():
     )
 
 
+def test_structured_result_rejects_attempt_evidence_that_disagrees_with_audit():
+    with pytest.raises(ValueError, match="structured output evidence.*provider_attempts"):
+        PluginAgentRunResult(
+            final_response="",
+            session_id="",
+            provider="fake",
+            model="fake",
+            status="failed",
+            pending_interaction=None,
+            usage={},
+            audit={
+                "failure_kind": "structured_output_capability_drift",
+                "provider_attempts": 1,
+                "model_calls": 0,
+                "strategy": "prompt_json_schema",
+                "adapter_version": 1,
+                "schema_fingerprint": "a" * 64,
+                "declaration_source": "managed_loop_default",
+            },
+            structured_output={
+                "provider_attempts": 0,
+                "model_calls": 0,
+                "strategy": "prompt_json_schema",
+                "adapter_version": 1,
+                "schema_fingerprint": "a" * 64,
+                "declaration_source": "managed_loop_default",
+            },
+        )
+
+
 def test_run_combined_retries_bound_provider_and_workflow_attempts(
     tmp_path, workflow_writer
 ):

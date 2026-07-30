@@ -1134,6 +1134,69 @@ def _tool_name(schema: dict[str, Any]) -> str:
     return str(function.get("name", "")) if isinstance(function, dict) else ""
 
 
+def _structured_output_evidence(
+    request,
+    decision,
+    *,
+    provider_attempts: int,
+    model_calls: int,
+) -> dict[str, str | int]:
+    return {
+        "provider_attempts": max(0, int(provider_attempts)),
+        "model_calls": max(0, int(model_calls)),
+        "strategy": decision.strategy.value,
+        "adapter_version": int(decision.adapter_version),
+        "schema_fingerprint": request.schema.schema_fingerprint,
+        "declaration_source": _sanitize(decision.declaration_source, 64),
+    }
+
+
+def _structured_output_failure(
+    *,
+    plugin_id: str,
+    request,
+    decision,
+    failure_kind: str,
+) -> dict[str, Any]:
+    evidence = _structured_output_evidence(
+        request,
+        decision,
+        provider_attempts=0,
+        model_calls=0,
+    )
+    return {
+        "final_response": "",
+        "session_id": "",
+        "provider": _sanitize(decision.effective_provider, 64),
+        "model": _sanitize(decision.model, 192),
+        "status": "failed",
+        "pending_interaction": None,
+        "usage": {},
+        "audit": {
+            "plugin_id": plugin_id,
+            "failure_kind": failure_kind,
+            **evidence,
+        },
+        "structured_output": evidence,
+    }
+
+
+def _prompt_with_structured_output(prompt: str, request) -> str:
+    schema = request.schema.canonical_schema_bytes.decode("utf-8")
+    block = (
+        '<hermes_structured_output adapter_version="'
+        f"{request.adapter_version}"
+        f' schema_fingerprint="{request.schema.schema_fingerprint}"'
+        f' output_bytes_limit="{request.output_bytes_limit}">\n'
+        "Return exactly one complete JSON value and no prose, markdown fences, "
+        "or trailing content. The value must validate against this Draft 2020-12 "
+        "JSON Schema:\n"
+        f"{schema}\n"
+        "</hermes_structured_output>"
+    )
+    return f"{prompt}\n\n{block}"
+
+
 def _run(payload: dict[str, Any]) -> dict[str, Any]:
     global _active_agent
     from agent.plugin_agent import PluginAgentRunRequest, _validate_request
@@ -1141,19 +1204,7 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
     request_data = payload.get("request")
     if not isinstance(request_data, dict):
         raise ValueError("request payload is missing")
-    request_data = dict(request_data)
-    if request_data.get("workdir"):
-        request_data["workdir"] = Path(request_data["workdir"])
-    for name in (
-        "enabled_toolsets",
-        "allowed_tools",
-        "denied_tools",
-        "skills",
-        "hooks",
-    ):
-        if request_data.get(name) is not None:
-            request_data[name] = tuple(request_data[name])
-    request = PluginAgentRunRequest(**request_data)
+    request = PluginAgentRunRequest.from_wire(request_data)
     _validate_request(request)
     plugin_id = str(payload.get("plugin_id") or "")
     if not plugin_id:
@@ -1223,6 +1274,7 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
         from hermes_cli.runtime_provider import (
             classify_resolved_execution_runtime,
             resolve_runtime_provider,
+            resolve_structured_output_capability,
         )
 
         model = _configured_model(request.model)
@@ -1375,6 +1427,37 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     requested=request.provider, target_model=model or None
                 )
 
+            structured_decision = None
+            if request.structured_output is not None:
+                runtime_capabilities = classify_resolved_execution_runtime(
+                    runtime, target_model=model or None
+                )
+                structured_decision = resolve_structured_output_capability(
+                    runtime_capabilities,
+                    schema_fingerprint=(
+                        request.structured_output.schema.schema_fingerprint
+                    ),
+                    model=model or None,
+                )
+                if request.structured_output.strategy.value == "unsupported":
+                    return _structured_output_failure(
+                        plugin_id=plugin_id,
+                        request=request.structured_output,
+                        decision=structured_decision,
+                        failure_kind="structured_output_unsupported",
+                    )
+                if (
+                    request.structured_output.strategy != structured_decision.strategy
+                    or request.structured_output.adapter_version
+                    != structured_decision.adapter_version
+                ):
+                    return _structured_output_failure(
+                        plugin_id=plugin_id,
+                        request=request.structured_output,
+                        decision=structured_decision,
+                        failure_kind="structured_output_capability_drift",
+                    )
+
             session_db = SessionDB()
             history = None
             if request.context_mode == "shared":
@@ -1396,6 +1479,13 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     # system prompt mutation, preserving cache and role
                     # alternation.
                     prompt = f"{skill_text}\n\n{request.prompt}"
+            if (
+                request.structured_output is not None
+                and request.structured_output.strategy.value == "prompt_json_schema"
+            ):
+                prompt = _prompt_with_structured_output(
+                    prompt, request.structured_output
+                )
 
             from tools import skills_tool, terminal_tool
 
@@ -1427,6 +1517,7 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     else None
                 ),
                 request_overrides=dict(request.request_overrides),
+                structured_output=request.structured_output,
                 enabled_toolsets=(
                     list(request.enabled_toolsets)
                     if request.enabled_toolsets is not None
@@ -1439,6 +1530,24 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 clarify_callback=clarify,
             )
             agent._api_max_retries = request.max_api_attempts
+            provider_attempt_counter = [0]
+            counted_provider_methods = 0
+            for method_name in (
+                "_interruptible_streaming_api_call",
+                "_interruptible_api_call",
+            ):
+                original_method = getattr(agent, method_name, None)
+                if not callable(original_method):
+                    continue
+                counted_provider_methods += 1
+
+                def counted_provider_call(
+                    *args, _original_method=original_method, **kwargs
+                ):
+                    provider_attempt_counter[0] += 1
+                    return _original_method(*args, **kwargs)
+
+                setattr(agent, method_name, counted_provider_call)
             _active_agent = agent
             from hermes_cli.plugins import get_plugin_manager
 
@@ -1467,7 +1576,57 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 raise RuntimeError("agent tool scope verification failed")
 
             _emit("progress", phase="running", session_id=agent.session_id)
-            response = agent.run_conversation(prompt, conversation_history=history)
+            try:
+                response = agent.run_conversation(
+                    prompt, conversation_history=history
+                )
+            except Exception as exc:
+                if request.structured_output is None:
+                    raise
+                assert structured_decision is not None
+                provider_attempts = provider_attempt_counter[0]
+                model_calls = max(
+                    0, int(getattr(agent, "_api_call_count", 0) or 0)
+                )
+                structured_evidence = _structured_output_evidence(
+                    request.structured_output,
+                    structured_decision,
+                    provider_attempts=provider_attempts,
+                    model_calls=model_calls,
+                )
+                failure_kind = getattr(exc, "failure_kind", type(exc).__name__)
+                if not isinstance(failure_kind, str) or not failure_kind:
+                    failure_kind = type(exc).__name__
+                return {
+                    "final_response": "",
+                    "session_id": str(agent.session_id or ""),
+                    "provider": str(agent.provider or ""),
+                    "model": str(agent.model or ""),
+                    "status": "failed",
+                    "pending_interaction": None,
+                    "usage": {
+                        "input_tokens": int(
+                            getattr(agent, "session_input_tokens", 0) or 0
+                        ),
+                        "output_tokens": int(
+                            getattr(agent, "session_output_tokens", 0) or 0
+                        ),
+                        "cache_read_tokens": int(
+                            getattr(agent, "session_cache_read_tokens", 0) or 0
+                        ),
+                        "cache_write_tokens": int(
+                            getattr(agent, "session_cache_write_tokens", 0) or 0
+                        ),
+                    },
+                    "audit": {
+                        "plugin_id": plugin_id,
+                        "failure_kind": failure_kind,
+                        "error": _sanitize(exc),
+                        "tool_names": sorted(agent.valid_tool_names),
+                        **structured_evidence,
+                    },
+                    "structured_output": structured_evidence,
+                }
             usage = {
                 "input_tokens": int(getattr(agent, "session_input_tokens", 0) or 0),
                 "output_tokens": int(getattr(agent, "session_output_tokens", 0) or 0),
@@ -1479,6 +1638,21 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                 ),
             }
             failed = bool(response.get("failed"))
+            model_calls = max(0, int(response.get("api_calls", 0) or 0))
+            provider_attempts = (
+                provider_attempt_counter[0]
+                if counted_provider_methods
+                else model_calls
+            )
+            structured_evidence = None
+            if request.structured_output is not None:
+                assert structured_decision is not None
+                structured_evidence = _structured_output_evidence(
+                    request.structured_output,
+                    structured_decision,
+                    provider_attempts=provider_attempts,
+                    model_calls=model_calls,
+                )
             return {
                 "final_response": _sanitize(
                     response.get("final_response", ""), 500_000
@@ -1495,10 +1669,14 @@ def _run(payload: dict[str, Any]) -> dict[str, Any]:
                     "plugin_id": plugin_id,
                     "tool_names": sorted(agent.valid_tool_names),
                     "api_calls": int(response.get("api_calls", 0) or 0),
+                    "provider_attempts": provider_attempts,
+                    "model_calls": model_calls,
                     "hook_events": hook_events,
                     "max_budget_usd": request.max_budget_usd,
                     "sandbox_policy_declared": request.sandbox_policy is not None,
+                    **(structured_evidence or {}),
                 },
+                "structured_output": structured_evidence,
             }
     finally:
         _active_agent = None

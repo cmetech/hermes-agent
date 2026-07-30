@@ -7,7 +7,8 @@ contained and cannot alter a long-lived parent conversation.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+import base64
+from dataclasses import dataclass, field
 import json
 import math
 from pathlib import Path
@@ -20,6 +21,15 @@ import time
 from types import MappingProxyType
 from typing import Any, Callable, Literal, Mapping
 
+from agent.structured_output import (
+    DRAFT_2020_12_DIALECT,
+    MAX_CANONICAL_SCHEMA_BYTES,
+    MAX_OUTPUT_BYTES,
+    StructuredOutputRequest,
+    StructuredOutputSchema,
+    StructuredOutputStrategy,
+    normalize_schema,
+)
 from tools.managed_process import (
     ManagedProcessTree,
     ProcessResourceLimits,
@@ -33,6 +43,21 @@ _MAX_FRAME_BYTES = 4_000_000
 _MAX_QUEUED_FRAMES = 8
 _MAX_PROMPT_CHARS = 500_000
 _MAX_POLICY_NAMES = 256
+_STRUCTURED_EVIDENCE_FIELDS = frozenset(
+    {
+        "provider_attempts",
+        "model_calls",
+        "strategy",
+        "adapter_version",
+        "schema_fingerprint",
+        "declaration_source",
+    }
+)
+_STRUCTURED_EVIDENCE_TEXT_LIMITS = {
+    "strategy": 32,
+    "schema_fingerprint": 64,
+    "declaration_source": 64,
+}
 
 
 class _PluginAgentCancelled(RuntimeError):
@@ -61,6 +86,7 @@ class PluginAgentRunRequest:
     fallback_model: str | None = None
     ephemeral_system_prompt: str | None = None
     request_overrides: Mapping[str, Any] = field(default_factory=dict)
+    structured_output: StructuredOutputRequest | None = None
     max_budget_usd: float | None = None
     sandbox_policy: Mapping[str, Any] | None = None
     approved_action_digest: str | None = None
@@ -77,6 +103,108 @@ class PluginAgentRunRequest:
     term_grace_seconds: float = 5.0
     kill_reap_grace_seconds: float = 2.0
 
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "prompt": self.prompt,
+            "provider": self.provider,
+            "model": self.model,
+            "context_mode": self.context_mode,
+            "session_id": self.session_id,
+            "enabled_toolsets": _wire_json(self.enabled_toolsets),
+            "allowed_tools": _wire_json(self.allowed_tools),
+            "denied_tools": _wire_json(self.denied_tools),
+            "skills": _wire_json(self.skills),
+            "hooks": _wire_json(self.hooks),
+            "mcp_servers": _wire_json(self.mcp_servers),
+            "inline_agents": _wire_json(self.inline_agents),
+            "reasoning_config": _wire_json(self.reasoning_config),
+            "fallback_model": self.fallback_model,
+            "ephemeral_system_prompt": self.ephemeral_system_prompt,
+            "request_overrides": _wire_json(self.request_overrides),
+            "structured_output": (
+                _structured_output_to_wire(self.structured_output)
+                if self.structured_output is not None
+                else None
+            ),
+            "max_budget_usd": self.max_budget_usd,
+            "sandbox_policy": _wire_json(self.sandbox_policy),
+            "approved_action_digest": self.approved_action_digest,
+            "workdir": str(self.workdir) if self.workdir is not None else None,
+            "max_iterations": self.max_iterations,
+            "max_api_attempts": self.max_api_attempts,
+            "idle_timeout_seconds": self.idle_timeout_seconds,
+            "wall_timeout_seconds": self.wall_timeout_seconds,
+            "provider_request_timeout_seconds": self.provider_request_timeout_seconds,
+            "max_process_tree_rss_bytes": self.max_process_tree_rss_bytes,
+            "max_process_tree_cpu_seconds": self.max_process_tree_cpu_seconds,
+            "max_descendants": self.max_descendants,
+            "cooperative_shutdown_seconds": self.cooperative_shutdown_seconds,
+            "term_grace_seconds": self.term_grace_seconds,
+            "kill_reap_grace_seconds": self.kill_reap_grace_seconds,
+        }
+
+    @classmethod
+    def from_wire(cls, value: Mapping[str, Any]) -> "PluginAgentRunRequest":
+        if not isinstance(value, Mapping):
+            raise ValueError("plugin-agent request must be an object")
+        allowed = {
+            "prompt",
+            "provider",
+            "model",
+            "context_mode",
+            "session_id",
+            "enabled_toolsets",
+            "allowed_tools",
+            "denied_tools",
+            "skills",
+            "hooks",
+            "mcp_servers",
+            "inline_agents",
+            "reasoning_config",
+            "fallback_model",
+            "ephemeral_system_prompt",
+            "request_overrides",
+            "structured_output",
+            "max_budget_usd",
+            "sandbox_policy",
+            "approved_action_digest",
+            "workdir",
+            "max_iterations",
+            "max_api_attempts",
+            "idle_timeout_seconds",
+            "wall_timeout_seconds",
+            "provider_request_timeout_seconds",
+            "max_process_tree_rss_bytes",
+            "max_process_tree_cpu_seconds",
+            "max_descendants",
+            "cooperative_shutdown_seconds",
+            "term_grace_seconds",
+            "kill_reap_grace_seconds",
+        }
+        _reject_unknown_fields("plugin-agent request", value, allowed)
+        data = dict(value)
+        for name in (
+            "enabled_toolsets",
+            "allowed_tools",
+            "denied_tools",
+            "skills",
+            "hooks",
+        ):
+            if data.get(name) is not None:
+                data[name] = tuple(data[name])
+        if data.get("workdir") is not None:
+            if not isinstance(data["workdir"], str):
+                raise ValueError("plugin-agent request workdir must be text")
+            data["workdir"] = Path(data["workdir"])
+        if data.get("structured_output") is not None:
+            data["structured_output"] = _structured_output_from_wire(
+                data["structured_output"]
+            )
+        try:
+            return cls(**data)
+        except TypeError as exc:
+            raise ValueError("plugin-agent request wire value is invalid") from exc
+
 
 @dataclass(frozen=True)
 class PluginAgentRunResult:
@@ -88,6 +216,7 @@ class PluginAgentRunResult:
     pending_interaction: Mapping[str, str] | None
     usage: Mapping[str, int | float | None]
     audit: Mapping[str, Any]
+    structured_output: Mapping[str, str | int] | None = None
 
     def __post_init__(self) -> None:
         if self.pending_interaction is not None:
@@ -98,6 +227,212 @@ class PluginAgentRunResult:
             )
         object.__setattr__(self, "usage", MappingProxyType(dict(self.usage)))
         object.__setattr__(self, "audit", MappingProxyType(dict(self.audit)))
+        if self.structured_output is not None:
+            evidence = _validated_structured_evidence(self.structured_output)
+            for name in _STRUCTURED_EVIDENCE_FIELDS:
+                if self.audit.get(name) != evidence[name]:
+                    raise ValueError(
+                        "structured output evidence disagrees with audit field "
+                        f"{name}"
+                    )
+            object.__setattr__(
+                self, "structured_output", MappingProxyType(dict(evidence))
+            )
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "final_response": self.final_response,
+            "session_id": self.session_id,
+            "provider": self.provider,
+            "model": self.model,
+            "status": self.status,
+            "pending_interaction": _wire_json(self.pending_interaction),
+            "usage": _wire_json(self.usage),
+            "audit": _wire_json(self.audit),
+            "structured_output": _wire_json(self.structured_output),
+        }
+
+    @classmethod
+    def from_wire(cls, value: Mapping[str, Any]) -> "PluginAgentRunResult":
+        if not isinstance(value, Mapping):
+            raise ValueError("plugin-agent result must be an object")
+        allowed = {
+            "final_response",
+            "session_id",
+            "provider",
+            "model",
+            "status",
+            "pending_interaction",
+            "usage",
+            "audit",
+            "structured_output",
+        }
+        _reject_unknown_fields("plugin-agent result", value, allowed)
+        try:
+            return cls(
+                final_response=value["final_response"],
+                session_id=value["session_id"],
+                provider=value["provider"],
+                model=value["model"],
+                status=value["status"],
+                pending_interaction=value["pending_interaction"],
+                usage=value["usage"],
+                audit=value["audit"],
+                structured_output=value.get("structured_output"),
+            )
+        except KeyError as exc:
+            raise ValueError(f"plugin-agent result is missing {exc.args[0]}") from exc
+
+
+def _wire_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _wire_json(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_wire_json(item) for item in value]
+    return value
+
+
+def _reject_unknown_fields(
+    label: str, value: Mapping[str, Any], allowed: set[str] | frozenset[str]
+) -> None:
+    unknown = sorted(set(value) - set(allowed))
+    if unknown:
+        raise ValueError(f"{label} contains unknown field(s): {', '.join(unknown)}")
+
+
+def _structured_output_to_wire(request: StructuredOutputRequest) -> dict[str, Any]:
+    _validate_structured_output(request)
+    schema = request.schema
+    return {
+        "schema": {
+            "canonical_schema": _wire_json(schema.canonical_schema),
+            "schema_fingerprint": schema.schema_fingerprint,
+            "canonical_schema_bytes": base64.b64encode(
+                schema.canonical_schema_bytes
+            ).decode("ascii"),
+            "dialect": schema.dialect,
+        },
+        "strategy": request.strategy.value,
+        "adapter_version": request.adapter_version,
+        "output_bytes_limit": request.output_bytes_limit,
+        "canonicalization_version": request.canonicalization_version,
+    }
+
+
+def _structured_output_from_wire(value: object) -> StructuredOutputRequest:
+    if not isinstance(value, Mapping):
+        raise ValueError("structured output must be an object")
+    allowed = {
+        "schema",
+        "strategy",
+        "adapter_version",
+        "output_bytes_limit",
+        "canonicalization_version",
+    }
+    _reject_unknown_fields("structured output", value, allowed)
+    schema_wire = value.get("schema")
+    if not isinstance(schema_wire, Mapping):
+        raise ValueError("structured output schema must be an object")
+    schema_allowed = {
+        "canonical_schema",
+        "schema_fingerprint",
+        "canonical_schema_bytes",
+        "dialect",
+    }
+    _reject_unknown_fields("structured output schema", schema_wire, schema_allowed)
+    try:
+        encoded = schema_wire["canonical_schema_bytes"]
+        if not isinstance(encoded, str):
+            raise ValueError("structured output schema bytes must be base64 text")
+        canonical_bytes = base64.b64decode(encoded, validate=True)
+        request = StructuredOutputRequest(
+            schema=StructuredOutputSchema(
+                canonical_schema=schema_wire["canonical_schema"],
+                schema_fingerprint=schema_wire["schema_fingerprint"],
+                canonical_schema_bytes=canonical_bytes,
+                dialect=schema_wire["dialect"],
+            ),
+            strategy=StructuredOutputStrategy(value["strategy"]),
+            adapter_version=value["adapter_version"],
+            output_bytes_limit=value["output_bytes_limit"],
+            canonicalization_version=value["canonicalization_version"],
+        )
+    except KeyError as exc:
+        raise ValueError(f"structured output is missing {exc.args[0]}") from exc
+    except (ValueError, TypeError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("structured output"):
+            raise
+        raise ValueError("structured output wire value is invalid") from exc
+    _validate_structured_output(request)
+    return request
+
+
+def _validate_structured_output(request: StructuredOutputRequest) -> None:
+    if not isinstance(request, StructuredOutputRequest):
+        raise ValueError("structured output must be StructuredOutputRequest")
+    schema = request.schema
+    if not isinstance(schema, StructuredOutputSchema):
+        raise ValueError("structured output schema is invalid")
+    if len(schema.canonical_schema_bytes) > MAX_CANONICAL_SCHEMA_BYTES:
+        raise ValueError("structured output schema exceeds the bytes limit")
+    if schema.dialect != DRAFT_2020_12_DIALECT:
+        raise ValueError("structured output schema dialect is invalid")
+    try:
+        raw_schema = json.loads(schema.canonical_schema_bytes)
+        normalized = normalize_schema(raw_schema)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"structured output schema is invalid: {exc}") from exc
+    if (
+        normalized.schema_fingerprint != schema.schema_fingerprint
+        or normalized.canonical_schema_bytes != schema.canonical_schema_bytes
+        or _wire_json(schema.canonical_schema)
+        != _wire_json(normalized.canonical_schema)
+    ):
+        raise ValueError("structured output schema evidence is contradictory")
+    if not isinstance(request.strategy, StructuredOutputStrategy):
+        raise ValueError("structured output strategy is invalid")
+    if (
+        isinstance(request.adapter_version, bool)
+        or not isinstance(request.adapter_version, int)
+        or request.adapter_version <= 0
+    ):
+        raise ValueError("structured output adapter version is invalid")
+    if (
+        isinstance(request.output_bytes_limit, bool)
+        or not isinstance(request.output_bytes_limit, int)
+        or not 0 < request.output_bytes_limit <= MAX_OUTPUT_BYTES
+    ):
+        raise ValueError("structured output bytes limit is invalid")
+    if request.canonicalization_version != 1:
+        raise ValueError("structured output canonicalization version is invalid")
+
+
+def _validated_structured_evidence(
+    value: Mapping[str, Any],
+) -> Mapping[str, str | int]:
+    if not isinstance(value, Mapping):
+        raise ValueError("structured output evidence must be an object")
+    _reject_unknown_fields("structured output evidence", value, _STRUCTURED_EVIDENCE_FIELDS)
+    missing = sorted(_STRUCTURED_EVIDENCE_FIELDS - set(value))
+    if missing:
+        raise ValueError(
+            f"structured output evidence is missing field(s): {', '.join(missing)}"
+        )
+    for name in ("provider_attempts", "model_calls", "adapter_version"):
+        item = value[name]
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise ValueError(f"structured output evidence {name} is invalid")
+    strategy = value["strategy"]
+    if strategy not in {item.value for item in StructuredOutputStrategy}:
+        raise ValueError("structured output evidence strategy is invalid")
+    fingerprint = value["schema_fingerprint"]
+    if not isinstance(fingerprint, str) or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
+        raise ValueError("structured output evidence schema fingerprint is invalid")
+    for name, limit in _STRUCTURED_EVIDENCE_TEXT_LIMITS.items():
+        item = value[name]
+        if not isinstance(item, str) or len(item) > limit:
+            raise ValueError(f"structured output evidence {name} is invalid")
+    return value
 
 
 def _validate_name_list(label: str, values: tuple[str, ...] | None) -> None:
@@ -259,6 +594,19 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         or request.max_budget_usd <= 0
     ):
         raise ValueError("max_budget_usd must be finite and positive")
+    if request.structured_output is not None:
+        _validate_structured_output(request.structured_output)
+        overrides = request.request_overrides
+        if "response_format" in overrides or (
+            isinstance(overrides.get("text"), Mapping)
+            and "format" in overrides["text"]
+        ) or (
+            isinstance(overrides.get("output_config"), Mapping)
+            and "format" in overrides["output_config"]
+        ):
+            raise ValueError(
+                "structured output cannot be combined with a provider format override"
+            )
     if request.workdir is not None:
         path = Path(request.workdir).expanduser()
         if not path.is_dir():
@@ -294,7 +642,7 @@ def _agent_override_allowed(
 
 
 def _request_payload(plugin_id: str, request: PluginAgentRunRequest) -> dict[str, Any]:
-    body = asdict(request)
+    body = request.to_wire()
     body["workdir"] = (
         str(Path(request.workdir).expanduser().resolve()) if request.workdir else None
     )
@@ -515,7 +863,7 @@ class PluginAgentRunner:
             result = frame.get("result")
             if not isinstance(result, dict):
                 raise RuntimeError("plugin-agent result payload is missing")
-            return PluginAgentRunResult(**result)
+            return PluginAgentRunResult.from_wire(result)
         except TimeoutError as exc:
             kind = "idle_timeout" if "idle" in str(exc) else "wall_timeout"
             return PluginAgentRunResult(
