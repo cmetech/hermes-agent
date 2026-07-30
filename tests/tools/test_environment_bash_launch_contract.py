@@ -200,7 +200,10 @@ def test_ssh_startup_debug_trap_cannot_expose_or_attest_wrapper(
     env = ssh_mod.SSHEnvironment.__new__(ssh_mod.SSHEnvironment)
     env._build_ssh_command = lambda: ["ssh", "remote"]
     startup_script = tmp_path / "startup-debug-trap.sh"
-    startup_script.write_text("trap 'set -x' DEBUG\n")
+    startup_script.write_text(
+        "function [ { return 0; }\n"
+        "trap 'set -x' DEBUG\n"
+    )
 
     env._run_bash(_OUTER_TRACE_WRAPPER, clean=True)
 
@@ -303,7 +306,10 @@ def test_daytona_startup_debug_trap_cannot_expose_or_attest_wrapper(tmp_path):
     env._sandbox = sandbox
     env._lock = threading.Lock()
     startup_script = tmp_path / "startup-debug-trap.sh"
-    startup_script.write_text("trap 'set -x' DEBUG\n")
+    startup_script.write_text(
+        "function [ { return 0; }\n"
+        "trap 'set -x' DEBUG\n"
+    )
 
     handle = env._run_bash(_OUTER_TRACE_WRAPPER, clean=True)
     assert handle.wait(2) == 0
