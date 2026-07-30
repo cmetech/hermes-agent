@@ -12,6 +12,7 @@ from agent.structured_output import StructuredOutputStrategy
 from hermes_cli.runtime_provider import (
     ExecutionRuntimeCapabilities,
     classify_execution_runtime,
+    snapshot_configured_execution_routes,
 )
 from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.api_admission import (
@@ -246,13 +247,14 @@ def _structured_route_package(
     return load_workflow(path)
 
 
-def _runtime_binding(runtime, *, runtime_provider=None):
+def _runtime_binding(runtime, *, runtime_provider=None, configured_routes=None):
     return WorkflowRunnerBinding(
         real_runner=object(),
         deterministic_runner=object(),
         real_capabilities=RunnerCapabilities(starts_request_mcp=True),
         deterministic_capabilities=RunnerCapabilities(starts_request_mcp=False),
         runtime_capabilities=runtime,
+        configured_provider_routes=configured_routes or {},
         runtime_capabilities_provider=runtime_provider,
     )
 
@@ -442,14 +444,157 @@ def test_catalog_exposes_bounded_schema_free_structured_output_summary(
     row = next(item for item in catalog if item["name"] == "catalog-structured-output")
     summary = row["structured_output_capability"]
     assert summary == {
-        "strategy": "native_json_schema",
-        "provider": "openai",
-        "api_mode": "codex_responses",
-        "adapter_version": 1,
+        "mixed": False,
+        "summary_count": 1,
+        "summaries_truncated": False,
+        "summaries": [
+            {
+                "strategy": "native_json_schema",
+                "provider": "openai",
+                "api_mode": "codex_responses",
+                "adapter_version": 1,
+            }
+        ],
     }
     serialized = json.dumps(summary, sort_keys=True)
     assert "fingerprint" not in serialized
     assert "rationale" not in serialized
+
+
+def test_catalog_exposes_deterministic_bounded_heterogeneous_summaries(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    _structured_route_package(
+        home,
+        workflow_writer,
+        name="catalog-mixed-structured-output",
+        nodes=[
+            {
+                "id": "direct",
+                "prompt": "Return direct JSON",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "output_format": {"type": "object"},
+            },
+            {
+                "id": "community",
+                "prompt": "Return community JSON",
+                "provider": "community",
+                "model": "community/model-v1",
+                "output_format": {"type": "object"},
+            },
+        ],
+    )
+    routes = snapshot_configured_execution_routes(
+        {
+            "providers": {
+                "community": {
+                    "api": "https://community.example.test/v1",
+                    "transport": "chat_completions",
+                }
+            }
+        }
+    )
+    binding = _runtime_binding(
+        _direct_openai_runtime(),
+        configured_routes=routes,
+    )
+
+    first, _first_truncated = build_workflow_catalog(
+        hermes_home=home,
+        workdir=tmp_path,
+        runner_binding=binding,
+    )
+    second, _second_truncated = build_workflow_catalog(
+        hermes_home=home,
+        workdir=tmp_path,
+        runner_binding=binding,
+    )
+    first_row = next(
+        item for item in first if item["name"] == "catalog-mixed-structured-output"
+    )
+    second_row = next(
+        item for item in second if item["name"] == "catalog-mixed-structured-output"
+    )
+    summary = first_row["structured_output_capability"]
+
+    assert summary == {
+        "mixed": True,
+        "summary_count": 2,
+        "summaries_truncated": False,
+        "summaries": [
+            {
+                "strategy": "native_json_schema",
+                "provider": "anthropic",
+                "api_mode": "anthropic_messages",
+                "adapter_version": 1,
+            },
+            {
+                "strategy": "prompt_json_schema",
+                "provider": "custom",
+                "api_mode": "chat_completions",
+                "adapter_version": 1,
+            },
+        ],
+    }
+    assert second_row["structured_output_capability"] == summary
+    assert len(summary["summaries"]) <= 16
+    serialized = json.dumps(summary, sort_keys=True)
+    assert len(serialized) <= 4096
+    assert all(
+        forbidden not in serialized.lower()
+        for forbidden in (
+            "fingerprint",
+            "rationale",
+            "route",
+            "credential",
+            "token",
+            "query",
+        )
+    )
+
+
+def test_catalog_bounds_unique_structured_output_summaries(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    _structured_route_package(
+        home,
+        workflow_writer,
+        name="catalog-bounded-structured-output",
+        nodes=[
+            {
+                "id": f"node-{index:02d}",
+                "prompt": "Return JSON",
+                "provider": f"unconfigured-{index:02d}",
+                "model": "unknown-model",
+                "output_format": {"type": "object"},
+            }
+            for index in range(20)
+        ],
+    )
+
+    catalog, _truncated = build_workflow_catalog(
+        hermes_home=home,
+        workdir=tmp_path,
+        runner_binding=_runtime_binding(_direct_openai_runtime()),
+    )
+    row = next(
+        item for item in catalog if item["name"] == "catalog-bounded-structured-output"
+    )
+    summary = row["structured_output_capability"]
+
+    assert summary["mixed"] is True
+    assert summary["summary_count"] == 20
+    assert summary["summaries_truncated"] is True
+    assert len(summary["summaries"]) == 16
+    assert [item["provider"] for item in summary["summaries"]] == [
+        f"unconfigured-{index:02d}" for index in range(16)
+    ]
+    assert len(json.dumps(summary, sort_keys=True)) <= 4096
 
 
 def test_scheduled_admission_seals_complete_decision_and_detects_provider_drift(
@@ -606,6 +751,66 @@ def test_unsupported_structured_output_blocks_before_provider_request(
         )
 
     assert exc_info.value.code == "workflow_compatibility_blocked"
+    assert list(store.runs_root.rglob("run.json")) == []
+    assert list(store.staging_root.iterdir()) == []
+
+
+def test_overlong_structured_decision_metadata_blocks_without_residue(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    home = tmp_path / "home"
+    package = _structured_route_package(
+        home,
+        workflow_writer,
+        name="overlong-structured-metadata",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Return JSON",
+                "model": "m" * 400,
+                "output_format": {"type": "object"},
+            }
+        ],
+    )
+    binding = _runtime_binding(_direct_openai_runtime())
+    context = binding.execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+    compatibility, risk = runner_binding_module.assess_package_execution(
+        package, context
+    )
+    WorkflowTrustStore(home).trust(
+        compute_package_digest(package).sha256,
+        actor="runner-binding-test",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    _healthy_coordinator(store)
+
+    assert compatibility.runnable is False
+    assert any(
+        finding.code == "structured_output_metadata_too_large"
+        for finding in compatibility.blocking_findings
+    )
+    with pytest.raises(ApiAdmissionError) as exc_info:
+        start_api_run(
+            store,
+            hermes_home=home,
+            workdir=tmp_path,
+            user_home=tmp_path,
+            workflow_name=package.definition.name,
+            values={},
+            idempotency_key="overlong-structured-metadata",
+            concurrency_policy="queue",
+            authority=_authority(),
+            catalog_source="profile",
+            runner_binding=binding,
+        )
+
+    assert exc_info.value.code == "workflow_compatibility_blocked"
+    assert store.list_runs() == ()
     assert list(store.runs_root.rglob("run.json")) == []
     assert list(store.staging_root.iterdir()) == []
 
@@ -891,6 +1096,127 @@ def test_configured_custom_override_uses_actual_managed_route(
     assert metadata["strategy"] == "prompt_json_schema"
     assert metadata["effective_provider"] == "custom"
     assert metadata["api_mode"] == "chat_completions"
+
+
+def test_route_secret_changes_do_not_change_identity_or_leak_metadata(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_source = {
+        "current": {
+            "model": {"provider": "openrouter", "default": "openai/gpt-5.4"},
+            "providers": {
+                "private-route": {
+                    "api": (
+                        "https://alice:first-password@community.example.test/v1"
+                        "?token=first-token&region=us-east-1#first-fragment"
+                    ),
+                    "transport": "chat_completions",
+                }
+            },
+        }
+    }
+    monkeypatch.setattr(
+        runner_binding_module,
+        "read_raw_config",
+        lambda: config_source["current"],
+    )
+    package = _structured_route_package(
+        tmp_path,
+        workflow_writer,
+        name="secret-free-route-identity",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Return JSON",
+                "provider": "private-route",
+                "model": "community/model-v1",
+                "output_format": {"type": "object"},
+            }
+        ],
+    )
+    binding = runner_binding_module.production_workflow_runner_binding()
+    first_context = binding.execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+    first_identity = first_context.identity_digest_for(package)
+    first_projection = repr(first_context.configured_provider_routes) + json.dumps(
+        first_context.structured_output_run_metadata(package), sort_keys=True
+    )
+
+    config_source["current"]["providers"]["private-route"]["api"] = (
+        "https://bob:second-password@community.example.test/v1"
+        "?token=second-token&region=eu-west-1#second-fragment"
+    )
+    second_context = binding.execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+    second_projection = repr(second_context.configured_provider_routes) + json.dumps(
+        second_context.structured_output_run_metadata(package), sort_keys=True
+    )
+
+    assert second_context.identity_digest_for(package) == first_identity
+    for secret in (
+        "alice",
+        "first-password",
+        "first-token",
+        "us-east-1",
+        "first-fragment",
+        "bob",
+        "second-password",
+        "second-token",
+        "eu-west-1",
+        "second-fragment",
+    ):
+        assert secret not in first_projection
+        assert secret not in second_projection
+
+
+def test_configured_custom_anthropic_alias_preserves_custom_precedence(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner_binding_module,
+        "read_raw_config",
+        lambda: {
+            "model": {"provider": "openrouter", "default": "openai/gpt-5.4"},
+            "providers": {
+                "claude": {
+                    "api": "https://community.example.test/anthropic",
+                    "transport": "anthropic_messages",
+                }
+            },
+        },
+    )
+    package = _structured_route_package(
+        tmp_path,
+        workflow_writer,
+        name="custom-claude-shadow",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Return JSON",
+                "provider": "claude",
+                "model": "community/claude",
+                "output_format": {"type": "object"},
+            }
+        ],
+    )
+    context = runner_binding_module.production_workflow_runner_binding().execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+
+    decision = context.structured_output_decisions(package)["producer"]
+
+    assert decision.strategy is StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+    assert decision.effective_provider == "custom"
+    assert decision.api_mode == "anthropic_messages"
 
 
 def test_official_direct_anthropic_override_remains_native(

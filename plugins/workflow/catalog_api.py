@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sqlite3
@@ -71,6 +72,8 @@ _RICH_INPUT_FIELDS = frozenset({"items", "properties", "schema"})
 _ENUM_INPUT_FIELDS = ("values", "enum", "options", "choices")
 _ENUM_MAX_CHOICES = 128
 _ENUM_MAX_CHOICE_LENGTH = 512
+_STRUCTURED_OUTPUT_SUMMARY_LIMIT = 16
+_STRUCTURED_OUTPUT_SUMMARY_TEXT_MAX_CHARS = 64
 
 CatalogSource = Literal["project", "profile", "showcase"]
 CatalogTrustState = Literal["trusted", "untrusted", "verified_bundled"]
@@ -538,12 +541,42 @@ def _structured_output_capability_summary(
     decisions = execution_context.structured_output_decisions(package)
     if not decisions:
         return None
-    decision = next(iter(decisions.values()))
+
+    unique = sorted(
+        {
+            (
+                decision.strategy.value,
+                decision.effective_provider,
+                decision.api_mode,
+                decision.adapter_version,
+            )
+            for decision in decisions.values()
+        }
+    )
+
+    def bounded_text(value: str) -> str:
+        cleaned, _truncated = sanitize_text(value)
+        if len(cleaned) <= _STRUCTURED_OUTPUT_SUMMARY_TEXT_MAX_CHARS:
+            return cleaned
+        suffix = "…#" + hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:12]
+        prefix_length = _STRUCTURED_OUTPUT_SUMMARY_TEXT_MAX_CHARS - len(suffix)
+        return cleaned[:prefix_length] + suffix
+
     return {
-        "strategy": decision.strategy.value,
-        "provider": decision.effective_provider,
-        "api_mode": decision.api_mode,
-        "adapter_version": decision.adapter_version,
+        "mixed": len(unique) > 1,
+        "summary_count": len(unique),
+        "summaries_truncated": len(unique) > _STRUCTURED_OUTPUT_SUMMARY_LIMIT,
+        "summaries": [
+            {
+                "strategy": bounded_text(strategy),
+                "provider": bounded_text(provider),
+                "api_mode": bounded_text(api_mode),
+                "adapter_version": adapter_version,
+            }
+            for strategy, provider, api_mode, adapter_version in unique[
+                :_STRUCTURED_OUTPUT_SUMMARY_LIMIT
+            ]
+        ],
     }
 
 

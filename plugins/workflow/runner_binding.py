@@ -32,6 +32,60 @@ if TYPE_CHECKING:
     )
 
 
+_RUN_METADATA_VALUE_MAX_CHARS = 512
+_STRUCTURED_OUTPUT_METADATA_FIELD_LIMITS = MappingProxyType(
+    {
+        "strategy": 32,
+        "effective_provider": 64,
+        "model": 192,
+        "api_mode": 64,
+        "declaration_source": 64,
+        "schema_fingerprint": 64,
+        "rationale": 256,
+    }
+)
+
+
+class StructuredOutputMetadataCapacityError(ValueError):
+    """A sealed decision cannot fit the persistent run metadata contract."""
+
+    def __init__(self, node_id: str, detail: str) -> None:
+        super().__init__(detail)
+        self.node_id = node_id
+
+
+def _structured_output_metadata_row(
+    node_id: str,
+    decision: StructuredOutputCapabilityDecision,
+) -> str:
+    row: dict[str, object] = {
+        "strategy": decision.strategy.value,
+        "effective_provider": decision.effective_provider,
+        "model": decision.model,
+        "api_mode": decision.api_mode,
+        "declaration_source": decision.declaration_source,
+        "adapter_version": decision.adapter_version,
+        "schema_fingerprint": decision.schema_fingerprint,
+        "rationale": decision.rationale,
+    }
+    for field_name, maximum in _STRUCTURED_OUTPUT_METADATA_FIELD_LIMITS.items():
+        value = row[field_name]
+        if value is None:
+            continue
+        if not isinstance(value, str) or len(value) > maximum:
+            raise StructuredOutputMetadataCapacityError(
+                node_id,
+                f"{field_name} exceeds its run metadata limit",
+            )
+    serialized = json.dumps(row, sort_keys=True, separators=(",", ":"))
+    if len(serialized) > _RUN_METADATA_VALUE_MAX_CHARS:
+        raise StructuredOutputMetadataCapacityError(
+            node_id,
+            "structured output decision exceeds the run metadata row limit",
+        )
+    return serialized
+
+
 @dataclass(frozen=True, slots=True)
 class RunnerCapabilities:
     starts_request_mcp: bool
@@ -207,20 +261,7 @@ class ExecutionCapabilityContext:
                 "structured_output_decision."
                 + hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:16]
             )
-            metadata[key] = json.dumps(
-                {
-                    "strategy": decision.strategy.value,
-                    "effective_provider": decision.effective_provider,
-                    "model": decision.model,
-                    "api_mode": decision.api_mode,
-                    "declaration_source": decision.declaration_source,
-                    "adapter_version": decision.adapter_version,
-                    "schema_fingerprint": decision.schema_fingerprint,
-                    "rationale": decision.rationale,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
+            metadata[key] = _structured_output_metadata_row(node_id, decision)
         return metadata
 
     @property
@@ -480,6 +521,27 @@ def assess_package_execution(
         mcp_available=context.mcp_available,
         structured_output_decisions=context.structured_output_decisions(package),
     )
+    try:
+        context.structured_output_run_metadata(package)
+    except StructuredOutputMetadataCapacityError as exc:
+        compatibility = CompatibilityReport(
+            level=CompatibilityLevel.UNSUPPORTED,
+            findings=(
+                *compatibility.findings,
+                CompatibilityFinding(
+                    path=f"nodes[{exc.node_id!r}].output_format",
+                    level=CompatibilityLevel.UNSUPPORTED,
+                    message=(
+                        "structured output decision exceeds persistent run "
+                        "metadata limits"
+                    ),
+                    blocking=True,
+                    code="structured_output_metadata_too_large",
+                    effective_profile=package.language.effective_profile,
+                ),
+            ),
+            runnable=False,
+        )
     if package.sidecar.get("execution_environment", "trusted_local") != (
         "trusted_local"
     ):

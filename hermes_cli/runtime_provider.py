@@ -9,7 +9,7 @@ import logging
 import os
 import re
 from types import MappingProxyType
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, quote, urlparse, urlunsplit
 from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -66,6 +66,37 @@ def _getenv(name: str, default: str = "") -> str:
 
 def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
+
+
+def _credential_free_route_url(value: object) -> str:
+    """Return stable route evidence without credential-bearing URL material."""
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    parsed = urlparse(value.strip())
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if scheme not in {"http", "https"} or not hostname:
+        return ""
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    normalized_host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        normalized_host = f"{normalized_host}:{port}"
+    query_keys = sorted(
+        {
+            key
+            for key, _value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key
+        }
+    )
+    structural_query = "&".join(quote(key, safe="") for key in query_keys)
+    return urlunsplit(
+        (scheme, normalized_host, parsed.path or "", structural_query, "")
+    ).rstrip("/")
 
 
 def _loopback_hostname(host: str) -> bool:
@@ -469,6 +500,11 @@ def _structured_output_runtime_declaration(
         profile = get_provider_profile(normalized_provider)
     except Exception:
         profile = None
+    effective_provider = normalized_provider
+    if profile is not None and normalized_provider != "custom":
+        profile_name = str(getattr(profile, "name", "") or "").strip().lower()
+        if profile_name:
+            effective_provider = profile_name
     effective_base_url = base_url or (
         str(profile.base_url) if profile is not None else ""
     )
@@ -487,7 +523,7 @@ def _structured_output_runtime_declaration(
     # configured URL happens to use an official-looking hostname.
     if declared_strategy == StructuredOutputStrategy.UNSUPPORTED.value:
         return (
-            normalized_provider,
+            effective_provider,
             "unknown",
             declared_strategy,
             declaration_source,
@@ -496,7 +532,7 @@ def _structured_output_runtime_declaration(
     # Native OpenAI support belongs only to Hermes' built-in API-key identity.
     # Hostname alone is not provider authority: OAuth Codex, custom profiles,
     # and arbitrary provider names can all be configured with the same URL.
-    if normalized_provider == "openai-api" and (
+    if effective_provider == "openai-api" and (
         hostname == "api.openai.com" or not effective_base_url
     ):
         strategy = (
@@ -508,17 +544,17 @@ def _structured_output_runtime_declaration(
             "trusted_runtime_classifier" if strategy is not None else None
         )
 
-    if hostname == "api.anthropic.com" and normalized_provider == "anthropic":
+    if hostname == "api.anthropic.com" and effective_provider == "anthropic":
         trust_class = "trusted_direct"
-    elif hostname == "openrouter.ai" or normalized_provider == "openrouter":
+    elif hostname == "openrouter.ai" or effective_provider == "openrouter":
         trust_class = "aggregator"
-    elif normalized_provider == "custom":
+    elif effective_provider == "custom":
         trust_class = "custom"
     else:
         trust_class = "unknown"
 
     return (
-        normalized_provider,
+        effective_provider,
         trust_class if trust_class in _STRUCTURED_OUTPUT_TRUST_CLASSES else "unknown",
         declared_strategy,
         declaration_source,
@@ -601,7 +637,7 @@ def snapshot_configured_execution_routes(
             continue
         name = str(entry.get("name") or "").strip()
         provider_key = str(entry.get("provider_key") or "").strip()
-        base_url = str(entry.get("base_url") or "").strip().rstrip("/")
+        base_url = _credential_free_route_url(entry.get("base_url"))
         if not base_url or not (name or provider_key):
             continue
         model = str(entry.get("model") or "").strip()
@@ -654,6 +690,14 @@ def snapshot_configured_execution_routes(
                 for key in safe_keys
                 if key in model_config
             }
+            for key in ("base_url", "api", "url"):
+                if key not in safe_model_config:
+                    continue
+                safe_url = _credential_free_route_url(safe_model_config[key])
+                if safe_url:
+                    safe_model_config[key] = safe_url
+                else:
+                    safe_model_config.pop(key, None)
             if effective_provider == "anthropic":
                 configured_base_url = _execution_base_url(
                     safe_model_config, safe_model_config

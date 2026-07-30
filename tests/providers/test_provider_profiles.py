@@ -7,6 +7,7 @@ from hermes_cli.runtime_provider import (
     ExecutionRuntimeCapabilities,
     classify_execution_runtime,
     resolve_structured_output_capability,
+    snapshot_configured_execution_routes,
 )
 from providers import get_provider_profile, _REGISTRY
 from providers.base import ProviderProfile, OMIT_TEMPERATURE
@@ -804,3 +805,63 @@ def test_explicit_unsupported_profile_wins_even_on_openai_host(monkeypatch):
 
     assert decision.strategy is StructuredOutputStrategy.UNSUPPORTED
     assert decision.declaration_source == "explicit_unsupported"
+
+
+@pytest.mark.parametrize("provider", ("claude", "claude-oauth", "claude-code"))
+def test_anthropic_aliases_use_canonical_native_declaration(provider):
+    runtime = classify_execution_runtime(
+        provider=provider,
+        model_config={"provider": provider, "default": "claude-sonnet-4-6"},
+        provider_config={
+            "api_mode": "anthropic_messages",
+            "base_url": "https://api.anthropic.com",
+        },
+    )
+    decision = resolve_structured_output_capability(
+        runtime,
+        schema_fingerprint="d" * 64,
+    )
+
+    assert runtime.effective_provider == "anthropic"
+    assert runtime.base_url_trust_class == "trusted_direct"
+    assert decision.strategy is StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+
+
+@pytest.mark.parametrize(
+    ("configured_url", "expected_url", "forbidden"),
+    [
+        pytest.param(
+            "https://alice:password@proxy.example.test/anthropic",
+            "https://proxy.example.test/anthropic",
+            ("alice", "password"),
+            id="userinfo",
+        ),
+        pytest.param(
+            "https://community.example.test/v1?token=supersecret&region=us-east-1#fragmentsecret",
+            "https://community.example.test/v1?region&token",
+            ("supersecret", "us-east-1", "fragmentsecret"),
+            id="query-values-and-fragment",
+        ),
+    ],
+)
+def test_configured_route_snapshot_contains_only_non_secret_url_evidence(
+    configured_url,
+    expected_url,
+    forbidden,
+):
+    routes = snapshot_configured_execution_routes(
+        {
+            "providers": {
+                "private-route": {
+                    "api": configured_url,
+                    "transport": "chat_completions",
+                }
+            }
+        }
+    )
+
+    route = routes["private-route"]
+    serialized = repr(routes)
+
+    assert route.provider_config["base_url"] == expected_url
+    assert all(secret not in serialized for secret in forbidden)
