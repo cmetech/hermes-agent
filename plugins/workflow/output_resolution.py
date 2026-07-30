@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -29,6 +30,7 @@ _RETRYABLE_READ_ERRNOS = frozenset({
     errno.EINTR,
     errno.EIO,
     errno.EMFILE,
+    errno.ENOMEM,
     errno.ENFILE,
     getattr(errno, "ESTALE", -1),
 })
@@ -273,6 +275,58 @@ def _freeze_json(value: object) -> object:
     return value
 
 
+def _normalize_candidate_json(
+    value: object,
+    active: set[int] | None = None,
+    owned_mappings: dict[int, object] | None = None,
+) -> object:
+    """Copy candidate containers into compact storage owned by the candidate."""
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is float:
+        if math.isfinite(value):
+            return value
+        raise ArchonOutputIntegrityError(
+            "Archon output candidate structured value is invalid"
+        )
+    if not isinstance(value, Mapping | tuple | list):
+        raise ArchonOutputIntegrityError(
+            "Archon output candidate structured value is invalid"
+        )
+    if active is None:
+        active = set()
+    if owned_mappings is None:
+        owned_mappings = {}
+    identity = id(value)
+    if identity in active:
+        raise ArchonOutputIntegrityError(
+            "Archon output candidate structured value is invalid"
+        )
+    if isinstance(value, Mapping) and identity in owned_mappings:
+        return owned_mappings[identity]
+    active.add(identity)
+    try:
+        if isinstance(value, Mapping):
+            owned: dict[str, object] = {}
+            proxy = MappingProxyType(owned)
+            owned_mappings[identity] = proxy
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ArchonOutputIntegrityError(
+                        "Archon output candidate structured value is invalid"
+                    )
+                owned[str(key)] = _normalize_candidate_json(
+                    item, active, owned_mappings
+                )
+            return proxy
+        return tuple(
+            _normalize_candidate_json(item, active, owned_mappings)
+            for item in value
+        )
+    finally:
+        active.remove(identity)
+
+
 def _is_frozen_json(value: object) -> bool:
     if type(value) is MappingProxyType:
         return all(
@@ -299,9 +353,15 @@ class PrimaryOutputCandidate:
 
     def __post_init__(self) -> None:
         if self.structured_value is not None:
-            object.__setattr__(
-                self, "structured_value", _freeze_json(self.structured_value)
-            )
+            try:
+                normalized = _normalize_candidate_json(self.structured_value)
+            except ArchonOutputIntegrityError:
+                raise
+            except (RecursionError, RuntimeError, TypeError, ValueError) as exc:
+                raise ArchonOutputIntegrityError(
+                    "Archon output candidate structured value is invalid"
+                ) from exc
+            object.__setattr__(self, "structured_value", normalized)
 
 
 def primary_output_candidate_identity(

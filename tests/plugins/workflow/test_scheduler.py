@@ -402,8 +402,13 @@ def test_archon_shell_output_retains_stdout_compatibility(tmp_path):
     assert resolved.value["ok"] is True
 
 
+@pytest.mark.parametrize(
+    "error_number",
+    (errno.EIO, errno.ENOMEM),
+    ids=("io", "host-memory"),
+)
 def test_archon_transient_read_failure_is_retried_for_the_same_identity(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, error_number
 ):
     canonical = b'{"ok":true}'
     output = tmp_path / "output.json"
@@ -453,7 +458,7 @@ def test_archon_transient_read_failure_is_retried_for_the_same_identity(
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            raise OSError(errno.EIO, "temporary read failure")
+            raise OSError(error_number, "temporary read failure")
         return original_read(descriptor, size)
 
     monkeypatch.setattr(output_resolution.os, "read", fail_once)

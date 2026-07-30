@@ -5,11 +5,14 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
+from types import MappingProxyType
 
 import pytest
 
 from plugins.workflow.models import TerminalJournalReserve
 from plugins.workflow import output_resolution
+from plugins.workflow import scheduler as workflow_scheduler
 from plugins.workflow.machine_contract import projection_was_truncated
 from plugins.workflow.resources import ResourceResolver, VariableContext
 
@@ -187,6 +190,92 @@ def test_primary_output_candidate_identity_preserves_open_output_type_boundary()
     assert restored.output_type == output_type
     assert output_resolution.primary_output_candidate_identity(restored) == identity
     assert not projection_was_truncated(identity)
+
+
+def test_primary_output_candidate_owns_compact_copies_of_nested_proxy_mappings():
+    backing = dict.fromkeys(range(100_000))
+    while backing:
+        backing.popitem()
+    assert sys.getsizeof(backing) > 1_000_000
+    hostile_proxies = tuple(MappingProxyType(backing) for _ in range(128))
+
+    candidate = output_resolution.PrimaryOutputCandidate(
+        attempt_relative_path="output.json",
+        media_type="application/json",
+        size_bytes=2,
+        sha256=hashlib.sha256(b"{}").hexdigest(),
+        structured_value=hostile_proxies,
+        schema_fingerprint=None,
+        canonicalization_version=1,
+        output_type=None,
+    )
+
+    assert candidate.structured_value is not hostile_proxies
+    assert all(
+        owned is not supplied
+        for owned, supplied in zip(
+            candidate.structured_value, hostile_proxies, strict=True
+        )
+    )
+    backing["late-mutation"] = True
+    assert all(dict(owned) == {} for owned in candidate.structured_value)
+    owned_graph_size = (
+        sys.getsizeof(candidate)
+        + sys.getsizeof(candidate.structured_value)
+        + sum(
+            sys.getsizeof(owned) + sys.getsizeof(dict(owned))
+            for owned in candidate.structured_value
+        )
+    )
+    cache_weight = workflow_scheduler._primary_candidate_weight(
+        ("run", "node", "attempt"), candidate
+    )
+    assert owned_graph_size <= cache_weight
+    assert cache_weight < workflow_scheduler._OUTPUT_RESOLUTION_CACHE_MAX_BYTES
+
+
+def test_primary_output_candidate_rejects_cyclic_structured_values_safely():
+    cyclic = {}
+    cyclic["self"] = (cyclic,)
+
+    with pytest.raises(
+        output_resolution.ArchonOutputIntegrityError,
+        match="structured value is invalid",
+    ):
+        output_resolution.PrimaryOutputCandidate(
+            attempt_relative_path="output.json",
+            media_type="application/json",
+            size_bytes=2,
+            sha256=hashlib.sha256(b"{}").hexdigest(),
+            structured_value=cyclic,
+            schema_fingerprint=None,
+            canonicalization_version=1,
+            output_type=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "structured_value",
+    (object(), {1: "value"}, {"value": {1, 2}}, float("inf")),
+    ids=("object", "non-string-key", "set", "non-finite-number"),
+)
+def test_primary_output_candidate_rejects_non_json_structured_values(
+    structured_value,
+):
+    with pytest.raises(
+        output_resolution.ArchonOutputIntegrityError,
+        match="structured value is invalid",
+    ):
+        output_resolution.PrimaryOutputCandidate(
+            attempt_relative_path="output.json",
+            media_type="application/json",
+            size_bytes=2,
+            sha256=hashlib.sha256(b"{}").hexdigest(),
+            structured_value=structured_value,
+            schema_fingerprint=None,
+            canonicalization_version=1,
+            output_type=None,
+        )
 
 
 @pytest.mark.parametrize(
