@@ -372,7 +372,7 @@
 - Modify: `tests/plugins/workflow/test_node_hooks.py`
 - Modify: `tests/plugins/workflow/test_node_agents.py`
 
-- [ ] Add failing executor tests for canonical success and invalid terminal outcomes.
+- [x] Add failing executor tests for canonical success and invalid terminal outcomes.
 
   Cover equivalent provider JSON encodings, native refusal/truncation/prose/fence/multiple values/oversize, prompt-adapted invalid output, aggregate usage, exact provider attempts, and the schema fingerprint in the AI cache fingerprint.
 
@@ -380,27 +380,27 @@
 
   Expected: FAIL because Archon AI execution still uses legacy post-validation and scheduler retries.
 
-- [ ] Add `PrimaryOutputCandidate` to the executor boundary.
+- [x] Add `PrimaryOutputCandidate` to the executor boundary.
 
   Define it in `plugins/workflow/output_resolution.py` and add `primary_output: PrimaryOutputCandidate | None = None` to `NodeExecutionResult`. The candidate contains the attempt-local relative path, media type, byte size, digest, parsed structured value when applicable, schema fingerprint, canonicalization version, and `output_type`; it is not a published artifact.
 
-- [ ] Bind the admitted structured request in `AgentNodeExecutor`.
+- [x] Bind the admitted structured request in `AgentNodeExecutor`.
 
   For Archon nodes, obtain the normalized schema and sealed capability decision from `NodeExecutionContext`, add the schema fingerprint/strategy/adapter version to `_fingerprint`, send the generic structured request, validate the returned audit identity, and write canonical bytes once to an attempt-local regular file. Leave the legacy branch unchanged.
 
-- [ ] Add failing repair-isolation tests.
+- [x] Add failing repair-isolation tests.
 
   Capture the second `PluginAgentRunRequest` and assert: `context_mode="fresh"`, `session_id=None`, `allowed_tools=()`, `enabled_toolsets=()`, delegation denied, `hooks=()`, `mcp_servers=None`, `skills=()`, `inline_agents={}`, `fallback_model=None`, `ephemeral_system_prompt=None`, `max_iterations=1`, no original task/history, and a prompt containing only canonical schema, bounded invalid excerpt, and bounded diagnostics.
 
-- [ ] Implement exactly one eligible prompt repair with shared accounting.
+- [x] Implement exactly one eligible prompt repair with shared accounting.
 
   Charge the first result's exact provider/model attempts before constructing repair. Pass only remaining wall/provider/model allowance. Aggregate usage and audits. Skip repair for native strategies, outward nodes, uncertain effects, cancellation, exhausted attempts, exhausted wall time, or output too large to bound. Persist only digest/size/diagnostic summary and repair disposition.
 
-- [ ] Make `structured_output_invalid` terminal only for Archon.
+- [x] Make `structured_output_invalid` terminal only for Archon.
 
   Add `archon_terminal_failure: True` to result metadata and make `_persist_result()` bypass retry only when both the admitted profile is Archon and that trusted metadata is present. Do not add the code to the global `never_retry` set because that would mutate legacy behavior.
 
-- [ ] Run AI, retry, and extension-isolation suites and commit.
+- [x] Run AI, retry, and extension-isolation suites and commit.
 
   Run: `scripts/run_tests.sh tests/plugins/workflow/test_ai_executor.py tests/plugins/workflow/test_ai_e2e.py tests/plugins/workflow/test_retry.py tests/plugins/workflow/test_node_mcp.py tests/plugins/workflow/test_node_skills.py tests/plugins/workflow/test_node_hooks.py tests/plugins/workflow/test_node_agents.py`
 
