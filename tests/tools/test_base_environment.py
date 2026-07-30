@@ -26,7 +26,7 @@ def _snapshot_update_script(env):
     """Extract the production-generated snapshot update from a wrapped command."""
     wrapped_lines = env._wrap_command(":", env.cwd).splitlines()
     snapshot_start = next(
-        i for i, line in enumerate(wrapped_lines) if line.endswith("umask 077")
+        i for i, line in enumerate(wrapped_lines) if line == "__hermes_ec=$?"
     ) + 1
     snapshot_end = next(
         i for i, line in enumerate(wrapped_lines[snapshot_start:], snapshot_start)
@@ -280,16 +280,18 @@ class TestAtomicSnapshotWrite:
         env._snapshot_path = str(snap)
         bootstrap = _bootstrap_script(env)
         proc = self._run_real_bash(
+            "exit () { printf 'exit-shadowed\\n'; return 0; }\n"
             f"PATH={shlex.quote(str(fake_bin))}; export PATH\n{bootstrap}"
         )
 
         assert proc.returncode != 0, proc.stdout + proc.stderr
+        assert "exit-shadowed" not in proc.stdout
         assert snap.read_text() == "export GOOD=1\n"
         assert not list(Path(tmp_path).glob("snapshot.sh.tmp.*"))
 
     def test_bootstrap_bypasses_login_shell_operation_functions(self, tmp_path):
         """Login profiles may define functions with coreutils names. Hermes
-        must bypass them internally while still preserving them in the snapshot."""
+        must bypass them internally while preserving unrelated functions."""
         import shlex
 
         _q = shlex.quote
@@ -297,7 +299,17 @@ class TestAtomicSnapshotWrite:
         marker = tmp_path / "shadowed"
         shadow = "\n".join(
             f"{name} () {{ printf '%s\\n' {name} >> {_q(str(marker))}; return 0; }}"
-            for name in ("command", "mktemp", "mv", "rm", "umask", "export")
+            for name in (
+                "builtin",
+                "command",
+                "mktemp",
+                "mv",
+                "rm",
+                "set",
+                "umask",
+                "unset",
+                "export",
+            )
         )
         env = _TestableEnv(cwd=str(tmp_path))
         env._snapshot_path = str(snap)
@@ -476,6 +488,39 @@ class TestAtomicSnapshotConcurrencyBehavioral:
                 "[ \"$UPDATED\" = 1 ] && echo OK || echo BROKEN"
             )
             assert "OK" in check.stdout, f"{kind} prevented snapshot replacement: {check.stdout}"
+
+    def test_snapshot_update_bypasses_builtin_set_and_unset_functions(self, tmp_path):
+        """The internal update boundary must neutralize functions that can
+        intercept the builtins used to bypass all other shell shadows."""
+        import shlex
+
+        _q = shlex.quote
+        snap = tmp_path / "snapshot.sh"
+        marker = tmp_path / "shadowed"
+        snap.write_text("export GOOD=1\n")
+        env = _TestableEnv(cwd=str(tmp_path))
+        env._snapshot_path = str(snap)
+        env._snapshot_ready = True
+        snapshot_update = _snapshot_update_script(env)
+        shadow = "\n".join(
+            f"{name} () {{ printf '%s\\n' {name} >> {_q(str(marker))}; return 0; }}"
+            for name in ("builtin", "set", "unset")
+        )
+
+        proc = self._run(
+            f"{shadow}\nexport UPDATED=1\n{snapshot_update}\n"
+            "__hermes_test_update_rc=$?\n"
+            "declare -F builtin set unset >/dev/null || exit 92\n"
+            "exit $__hermes_test_update_rc"
+        )
+
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert not marker.exists(), "shell function intercepted snapshot update"
+        check = self._run(
+            f"source {_q(str(snap))} >/dev/null 2>&1 && "
+            '[ "$UPDATED" = 1 ] && echo OK || echo BROKEN'
+        )
+        assert "OK" in check.stdout, check.stdout + check.stderr
 
 
 class TestSnapshotFileModes:

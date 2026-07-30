@@ -51,6 +51,33 @@ _activity_callback_local = threading.local()
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
 
+# Bash resolves a function named ``builtin`` before ``\builtin``, including on
+# macOS's Bash 3.2.  Enter POSIX mode using assignment syntax (which cannot be
+# function-shadowed), then use the POSIX special-builtin precedence rule to
+# remove the three functions that could intercept this bootstrap.  Restore the
+# caller's shell mode before running the protected operation.  Consumers place
+# this prelude in a subshell, so these removals never mutate the user's shell.
+_SNAPSHOT_OPERATION_PRELUDE = r"""__hermes_snapshot_was_posix=0
+[[ -o posix ]] && __hermes_snapshot_was_posix=1
+__hermes_snapshot_had_posixly_correct=0
+if [[ ${POSIXLY_CORRECT+x} ]]; then
+    __hermes_snapshot_had_posixly_correct=1
+    __hermes_snapshot_old_posixly_correct=$POSIXLY_CORRECT
+fi
+POSIXLY_CORRECT=1
+\unset -f builtin unset set
+if [[ $__hermes_snapshot_had_posixly_correct == 1 ]]; then
+    POSIXLY_CORRECT=$__hermes_snapshot_old_posixly_correct
+else
+    \unset POSIXLY_CORRECT
+fi
+if [[ $__hermes_snapshot_was_posix == 0 ]]; then
+    \set +o posix
+fi
+\unset __hermes_snapshot_was_posix __hermes_snapshot_had_posixly_correct \
+    __hermes_snapshot_old_posixly_correct"""
+
+
 class _BoundedOutputCollector:
     """Retain a bounded 40/60 head-tail window of streamed text."""
     def __init__(self, max_chars: int):
@@ -504,6 +531,8 @@ class BaseEnvironment(ABC):
         _external = r"\builtin command"
         _builtin = r"\builtin"
         bootstrap = (
+            "(\n"
+            f"{_SNAPSHOT_OPERATION_PRELUDE}\n"
             f"{_builtin} umask 077\n"
             # Gate the complete assembly and publication. A failure anywhere
             # leaves the prior snapshot in place and makes init_session reject
@@ -534,10 +563,12 @@ class BaseEnvironment(ABC):
             f"{_external} mv -f {_snap_tmp} {_quoted_snap}\n"
             f"}}; then\n"
             f"{_external} rm -f {_snap_tmp} 2>/dev/null || true\n"
-            f"exit 1\n"
+            f"{_builtin} exit 1\n"
             f"fi\n"
-            f"builtin cd -- {_quoted_cwd} 2>/dev/null || true\n"
-            f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
+            f"{_builtin} cd -- {_quoted_cwd} 2>/dev/null || true\n"
+            f"{_builtin} printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' "
+            f"\"$({_builtin} pwd -P)\"\n"
+            ")\n"
         )
         try:
             proc = self._run_bash(bootstrap, login=True, timeout=self._snapshot_timeout)
@@ -655,21 +686,29 @@ class BaseEnvironment(ABC):
         # Run the actual command
         parts.append(f"eval '{escaped}'")
         parts.append("__hermes_ec=$?")
-        # Restrict Hermes metadata files without changing the user's command
-        # umask. Snapshot files may contain env-carried secrets.
-        parts.append(f"{_builtin} umask 077")
+
+        # Isolate the defensive shell sanitization from the user's command
+        # environment. Snapshot files may contain env-carried secrets, so the
+        # protected operation also uses a private umask.
+        snapshot_update = [
+            "(",
+            _SNAPSHOT_OPERATION_PRELUDE,
+            f"{_builtin} umask 077",
+        ]
 
         # Re-dump env vars to snapshot (atomic replacement to avoid races).
         # Chain mv on the export succeeding so a failed/partial dump never
         # replaces a good snapshot; drop the temp on failure so it isn't
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
         if self._snapshot_ready:
-            parts.append(
+            snapshot_update.append(
                 f"{{ __hermes_snap_tmp=$({_external} mktemp {_snap_tmp_template} 2>/dev/null) && "
                 f"{_builtin} export -p > {_snap_tmp} && "
                 f"{_external} mv -f {_snap_tmp} {_quoted_snap}; }} 2>/dev/null || "
                 f"{{ {_external} rm -f {_snap_tmp} 2>/dev/null; [[ 0 == 1 ]]; }}"
             )
+        snapshot_update.append(")")
+        parts.append("\n".join(snapshot_update))
 
         # Emit the CWD stdout marker; all backends (including local, since
         # PR #63255) parse it from output — no temp-file write needed.
