@@ -403,10 +403,7 @@ class TestAtomicSnapshotWrite:
         snap = tmp_path / "snapshot.sh"
         marker = tmp_path / "intercepted"
         shadow = (
-            "builtin () {\n"
-            "    if [[ $1 == cd ]]; then shift; cd \"$@\"; return; fi\n"
-            f"    printf '%s\\n' builtin >> {_q(str(marker))}; return 0\n"
-            "}\n"
+            f"builtin () {{ printf '%s\\n' builtin >> {_q(str(marker))}; return 91; }}\n"
             + "\n".join(
                 f"{name} () {{ printf '%s\\n' {name} >> {_q(str(marker))}; return 0; }}"
                 for name in ("set", "unset")
@@ -415,6 +412,7 @@ class TestAtomicSnapshotWrite:
         login_profile = (
             "export PROFILE_SENTINEL=profile-loaded\n"
             f"{shadow}\nordinary () {{ printf 'ordinary-loaded\\n'; }}\n"
+            "trap 'exit 0' EXIT\n"
         )
         login_calls = []
 
@@ -435,6 +433,8 @@ class TestAtomicSnapshotWrite:
 
         env = LoginProfileEnv(cwd=str(tmp_path))
         env._snapshot_path = str(snap)
+        target_cwd = tmp_path / "target-cwd"
+        target_cwd.mkdir()
 
         env.init_session()
 
@@ -446,13 +446,17 @@ class TestAtomicSnapshotWrite:
         result = env.execute(
             "printf 'ENV=%s\\n' \"$PROFILE_SENTINEL\"; "
             "ordinary; "
-            "declare -F builtin set unset >/dev/null && printf 'FUNCTIONS=present\\n'"
+            "declare -F builtin set unset >/dev/null && printf 'FUNCTIONS=present\\n'; "
+            "printf 'PWD=%s\\n' \"$PWD\"",
+            cwd=str(target_cwd),
         )
 
         assert result["returncode"] == 0, result["output"]
         assert "ENV=profile-loaded" in result["output"]
         assert "ordinary-loaded" in result["output"]
         assert "FUNCTIONS=present" in result["output"]
+        assert f"PWD={target_cwd}" in result["output"]
+        assert env.cwd == str(target_cwd)
         assert login_calls == [True, True]
         assert not snap.exists(), "fallback execute published a lossy snapshot"
         assert not marker.exists(), "snapshot internals invoked a profile function"
@@ -818,6 +822,36 @@ class TestInitSessionFailure:
         env.init_session()
 
         assert env._snapshot_ready is False
+
+    def test_profile_exit_78_before_bootstrap_is_not_safe_rejection(self, tmp_path):
+        """Status 78 alone is not proof that Hermes reached its rejection
+        path; a profile can terminate with that status before bootstrap runs."""
+        import subprocess
+
+        login_calls = []
+
+        class EarlyExitEnv(_TestableEnv):
+            def _run_bash(
+                self, cmd_string, *, login=False, timeout=120, stdin_data=None
+            ):
+                login_calls.append(login)
+                script = f"exit 78\n{cmd_string}" if login else cmd_string
+                return subprocess.Popen(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", script],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    cwd=self.cwd,
+                )
+
+        env = EarlyExitEnv(cwd=str(tmp_path))
+
+        env.init_session()
+
+        assert env._snapshot_ready is False
+        assert env._prefer_nonlogin is True
+        assert login_calls == [True, False]
 
     def test_login_flag_when_snapshot_not_ready(self):
         """When _snapshot_ready=False, execute() should pass login=True to _run_bash."""

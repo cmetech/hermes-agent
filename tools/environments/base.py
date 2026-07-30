@@ -50,9 +50,9 @@ _activity_callback_local = threading.local()
 # path for both bounded and unbounded modes.
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
-# Bootstrap status reserved for a healthy login shell whose profile contains
-# functions that cannot be represented without weakening the internal
-# dispatcher sanitizer. Keep using login shells per command in this case.
+# Bootstrap status paired with a per-invocation output marker for a healthy
+# login shell whose profile cannot be represented without weakening the
+# dispatcher sanitizer. The status alone is intentionally not authoritative.
 _SNAPSHOT_PROFILE_FALLBACK_EXIT = 78
 
 
@@ -85,6 +85,10 @@ else
 fi &&
 if [[ ${__hermes_snapshot_reject_dispatcher_functions:-0} == 1 &&
       $__hermes_snapshot_had_dispatcher_functions == 1 ]]; then
+    \readonly __hermes_snapshot_profile_fallback_marker
+    # Bash 3.2 accepts a name after ``readonly -p`` but prints nothing; listing
+    # all readonly variables is the portable way to emit the nonce value.
+    \readonly -p
     \exit "$__hermes_snapshot_profile_fallback_exit"
 fi &&
 if \unset -f builtin unset set; then
@@ -102,7 +106,8 @@ if \unset -f builtin unset set; then
         __hermes_snapshot_old_posixly_correct __hermes_snapshot_shell_catalog \
         __hermes_snapshot_had_dispatcher_functions \
         __hermes_snapshot_reject_dispatcher_functions \
-        __hermes_snapshot_profile_fallback_exit
+        __hermes_snapshot_profile_fallback_exit \
+        __hermes_snapshot_profile_fallback_marker
 else
     [[ 0 == 1 ]]
 fi"""
@@ -560,10 +565,19 @@ class BaseEnvironment(ABC):
         # Hermes' allocator or file operations.
         _external = r"\builtin command"
         _builtin = r"\builtin"
+        profile_fallback_marker = (
+            f"__HERMES_SNAPSHOT_PROFILE_FALLBACK_{uuid.uuid4().hex}__"
+        )
+        profile_fallback_record = (
+            "readonly __hermes_snapshot_profile_fallback_marker="
+            f'"{profile_fallback_marker}"'
+        )
         bootstrap = (
             "(\n"
             "__hermes_snapshot_reject_dispatcher_functions=1\n"
             f"__hermes_snapshot_profile_fallback_exit={_SNAPSHOT_PROFILE_FALLBACK_EXIT}\n"
+            "__hermes_snapshot_profile_fallback_marker="
+            f"{shlex.quote(profile_fallback_marker)}\n"
             "if {\n"
             f"{_SNAPSHOT_OPERATION_PRELUDE}\n"
             "}; then\n"
@@ -612,8 +626,12 @@ class BaseEnvironment(ABC):
             proc = self._run_bash(bootstrap, login=True, timeout=self._snapshot_timeout)
             result = self._wait_for_process(proc, timeout=self._snapshot_timeout)
             returncode = int(result.get("returncode") or 0)
+            profile_fallback = profile_fallback_record in str(
+                result.get("output") or ""
+            ).splitlines()
+            if profile_fallback:
+                raise RuntimeError("snapshot bootstrap rejected unsafe login profile")
             if returncode != 0:
-                profile_fallback = returncode == _SNAPSHOT_PROFILE_FALLBACK_EXIT
                 raise RuntimeError(
                     f"snapshot bootstrap failed with exit code {returncode}"
                 )
@@ -689,7 +707,9 @@ class BaseEnvironment(ABC):
         """
         return shlex.quote(path)
 
-    def _wrap_command(self, command: str, cwd: str) -> str:
+    def _wrap_command(
+        self, command: str, cwd: str, *, login_fallback: bool = False
+    ) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
         escaped = command.replace("'", "'\\''")
@@ -729,7 +749,8 @@ class BaseEnvironment(ABC):
         # ``$HOME`` so suffixes with spaces remain a single shell word.
         quoted_cwd = self._quote_cwd_for_cd(cwd)
         # ``--`` keeps hyphen-prefixed directory names from being parsed as options.
-        parts.append(f"builtin cd -- {quoted_cwd} || exit 126")
+        cd_command = r"\cd" if login_fallback else "builtin cd"
+        parts.append(f"{cd_command} -- {quoted_cwd} || exit 126")
 
         # Run the actual command
         parts.append(f"eval '{escaped}'")
@@ -1206,11 +1227,12 @@ class BaseEnvironment(ABC):
             exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
             effective_stdin = None
 
-        wrapped = self._wrap_command(exec_command, effective_cwd)
-
         # Use login shell if snapshot failed (so user's profile still loads),
         # unless login itself is broken — then non-login is the only path.
         login = not self._snapshot_ready and not self._prefer_nonlogin
+        wrapped = self._wrap_command(
+            exec_command, effective_cwd, login_fallback=login
+        )
 
         proc = self._run_bash(
             wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin
