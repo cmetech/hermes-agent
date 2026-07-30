@@ -366,14 +366,11 @@ class TestAtomicSnapshotWrite:
         shadow = "\n".join(
             f"{name} () {{ printf '%s\\n' {name} >> {_q(str(marker))}; return 0; }}"
             for name in (
-                "builtin",
                 "command",
                 "mktemp",
                 "mv",
                 "rm",
-                "set",
                 "umask",
-                "unset",
                 "export",
             )
         )
@@ -393,6 +390,47 @@ class TestAtomicSnapshotWrite:
             "declare -F command >/dev/null && echo OK || echo BROKEN"
         )
         assert "OK" in check.stdout, check.stdout + check.stderr
+
+    def test_dispatcher_functions_reject_lossy_bootstrap_and_use_fallback(
+        self, tmp_path
+    ):
+        """Bootstrap must not claim success after dropping legitimate
+        dispatcher-named functions from an otherwise complete snapshot."""
+        import shlex
+        import subprocess
+
+        _q = shlex.quote
+        snap = tmp_path / "snapshot.sh"
+        marker = tmp_path / "intercepted"
+        shadow = "\n".join(
+            f"{name} () {{ printf '%s\\n' {name} >> {_q(str(marker))}; return 0; }}"
+            for name in ("builtin", "set", "unset")
+        )
+        login_profile = f"{shadow}\nordinary () {{ printf 'ordinary\\n'; }}\n"
+
+        class LoginProfileEnv(_TestableEnv):
+            def _run_bash(
+                self, cmd_string, *, login=False, timeout=120, stdin_data=None
+            ):
+                script = f"{login_profile}{cmd_string}" if login else cmd_string
+                return subprocess.Popen(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", script],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    cwd=self.cwd,
+                )
+
+        env = LoginProfileEnv(cwd=str(tmp_path))
+        env._snapshot_path = str(snap)
+
+        env.init_session()
+
+        assert env._snapshot_ready is False
+        assert env._prefer_nonlogin is True
+        assert not snap.exists(), "bootstrap published a lossy function snapshot"
+        assert not marker.exists(), "presence detection invoked a shadow function"
 
     def test_readonly_shadow_functions_fail_bootstrap_closed(self, tmp_path):
         """A login profile can make dispatcher shadows readonly. Bootstrap

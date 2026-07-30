@@ -54,9 +54,12 @@ _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 # Bash resolves a function named ``builtin`` before ``\builtin``, including on
 # macOS's Bash 3.2.  Enter POSIX mode using assignment syntax (which cannot be
 # function-shadowed), then use the POSIX special-builtin precedence rule to
-# remove the three functions that could intercept this bootstrap.  Restore the
-# caller's shell mode before running the protected operation.  Consumers place
-# this prelude in a subshell, so these removals never mutate the user's shell.
+# record and remove the three functions that could intercept this bootstrap.
+# Bootstrap rejects a recorded definition rather than publish a snapshot that
+# silently omits it; normal updates may safely remove it inside their isolated
+# writer. Restore the caller's shell mode before running the protected
+# operation. Consumers place this prelude in a subshell, so these removals never
+# mutate the user's shell.
 _SNAPSHOT_OPERATION_PRELUDE = r"""__hermes_snapshot_was_posix=0
 [[ -o posix ]] && __hermes_snapshot_was_posix=1
 __hermes_snapshot_had_posixly_correct=0
@@ -65,6 +68,16 @@ if [[ ${POSIXLY_CORRECT+x} ]]; then
     __hermes_snapshot_old_posixly_correct=$POSIXLY_CORRECT
 fi
 POSIXLY_CORRECT=1
+__hermes_snapshot_had_dispatcher_functions=0
+if __hermes_snapshot_shell_catalog=$(\set); then
+    if [[ "$__hermes_snapshot_shell_catalog" == *$'\nbuiltin () '* ||
+          "$__hermes_snapshot_shell_catalog" == *$'\nset () '* ||
+          "$__hermes_snapshot_shell_catalog" == *$'\nunset () '* ]]; then
+        __hermes_snapshot_had_dispatcher_functions=1
+    fi
+else
+    [[ 0 == 1 ]]
+fi &&
 if \unset -f builtin unset set; then
     if [[ $__hermes_snapshot_had_posixly_correct == 1 ]]; then
         POSIXLY_CORRECT=$__hermes_snapshot_old_posixly_correct
@@ -77,7 +90,7 @@ if \unset -f builtin unset set; then
         \set +o posix
     fi &&
     \unset __hermes_snapshot_was_posix __hermes_snapshot_had_posixly_correct \
-        __hermes_snapshot_old_posixly_correct
+        __hermes_snapshot_old_posixly_correct __hermes_snapshot_shell_catalog
 else
     [[ 0 == 1 ]]
 fi"""
@@ -539,7 +552,8 @@ class BaseEnvironment(ABC):
             "(\n"
             "if {\n"
             f"{_SNAPSHOT_OPERATION_PRELUDE}\n"
-            "}; then\n"
+            f"}} && [[ $__hermes_snapshot_had_dispatcher_functions == 0 ]] && "
+            f"{_builtin} unset __hermes_snapshot_had_dispatcher_functions; then\n"
             f"{_builtin} umask 077\n"
             # Gate the complete assembly and publication. A failure anywhere
             # leaves the prior snapshot in place and makes init_session reject
@@ -704,7 +718,8 @@ class BaseEnvironment(ABC):
             "(",
             "if {",
             _SNAPSHOT_OPERATION_PRELUDE,
-            "}; then",
+            f"}} && {_builtin} unset "
+            "__hermes_snapshot_had_dispatcher_functions; then",
             f"{_builtin} umask 077",
         ]
 
