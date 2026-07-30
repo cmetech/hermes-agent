@@ -407,8 +407,12 @@ class ModalEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
-                  stdin_data: str | None = None):
+                  stdin_data: str | None = None,
+                  script_stdin: bool = False,
+                  cwd: str | None = None):
         """Return a _ThreadedProcessHandle wrapping an async Modal sandbox exec."""
+        if script_stdin and stdin_data is not None:
+            raise ValueError("script_stdin cannot be combined with stdin_data")
         sandbox = self._sandbox
         worker = self._worker
 
@@ -418,11 +422,20 @@ class ModalEnvironment(BaseEnvironment):
         def exec_fn() -> tuple[str, int]:
             async def _do():
                 args = ["bash"]
-                if login:
+                if script_stdin and login:
+                    args.extend(["-l", "-s"])
+                elif script_stdin:
+                    args.append("-s")
+                elif login:
                     args.extend(["-l", "-c", cmd_string])
                 else:
                     args.extend(["-c", cmd_string])
-                process = await sandbox.exec.aio(*args, timeout=timeout)
+                process = await sandbox.exec.aio(*args, timeout=timeout, workdir=cwd)
+                if script_stdin:
+                    process.stdin.write(cmd_string)
+                    await process.stdin.drain.aio()
+                    process.stdin.write_eof()
+                    await process.stdin.drain.aio()
                 stdout = await process.stdout.read.aio()
                 stderr = await process.stderr.read.aio()
                 exit_code = await process.wait.aio()

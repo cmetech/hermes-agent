@@ -10,6 +10,7 @@ import math
 import os
 import shlex
 import threading
+import uuid
 from pathlib import Path
 
 from tools.environments.base import (
@@ -218,8 +219,12 @@ class DaytonaEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
-                  stdin_data: str | None = None):
+                  stdin_data: str | None = None,
+                  script_stdin: bool = False,
+                  cwd: str | None = None):
         """Return a _ThreadedProcessHandle wrapping a blocking Daytona SDK call."""
+        if script_stdin and stdin_data is not None:
+            raise ValueError("script_stdin cannot be combined with stdin_data")
         sandbox = self._sandbox
         lock = self._lock
 
@@ -230,13 +235,20 @@ class DaytonaEnvironment(BaseEnvironment):
                 except Exception:
                     pass
 
-        if login:
+        if script_stdin:
+            delimiter = f"HERMES_BOOTSTRAP_{uuid.uuid4().hex}"
+            login_flag = "-l " if login else ""
+            shell_cmd = (
+                f"bash {login_flag}-s <<'{delimiter}'\n"
+                f"{cmd_string}\n{delimiter}"
+            )
+        elif login:
             shell_cmd = f"bash -l -c {shlex.quote(cmd_string)}"
         else:
             shell_cmd = f"bash -c {shlex.quote(cmd_string)}"
 
         def exec_fn() -> tuple[str, int]:
-            response = sandbox.process.exec(shell_cmd, timeout=timeout)
+            response = sandbox.process.exec(shell_cmd, cwd=cwd, timeout=timeout)
             return (response.result or "", response.exit_code)
 
         return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel)

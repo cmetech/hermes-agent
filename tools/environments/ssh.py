@@ -342,13 +342,31 @@ class SSHEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
-                  stdin_data: str | None = None) -> subprocess.Popen:
+                  stdin_data: str | None = None,
+                  script_stdin: bool = False,
+                  cwd: str | None = None) -> subprocess.Popen:
         """Spawn an SSH process that runs bash on the remote host."""
+        if script_stdin and stdin_data is not None:
+            raise ValueError("script_stdin cannot be combined with stdin_data")
         cmd = self._build_ssh_command()
-        if login:
-            cmd.extend(["bash", "-l", "-c", shlex.quote(cmd_string)])
+        if script_stdin:
+            stdin_data = cmd_string
+            bash_command = "bash -l -s" if login else "bash -s"
+        elif login:
+            bash_command = f"bash -l -c {shlex.quote(cmd_string)}"
         else:
-            cmd.extend(["bash", "-c", shlex.quote(cmd_string)])
+            bash_command = f"bash -c {shlex.quote(cmd_string)}"
+
+        if cwd:
+            launcher = (
+                "POSIXLY_CORRECT=1; "
+                "if \\unset -f builtin unset set cd; then "
+                f"\\builtin cd -- {shlex.quote(cwd)} && exec {bash_command}; "
+                "else \\exit 126; fi"
+            )
+            cmd.append(f"bash --noprofile --norc -c {shlex.quote(launcher)}")
+        else:
+            cmd.append(bash_command)
 
         return _popen_bash(cmd, stdin_data)
 

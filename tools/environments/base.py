@@ -499,6 +499,8 @@ class BaseEnvironment(ABC):
         login: bool = False,
         timeout: int = 120,
         stdin_data: str | None = None,
+        script_stdin: bool = False,
+        cwd: str | None = None,
     ) -> ProcessHandle:
         """Spawn a bash process to run *cmd_string*.
 
@@ -623,7 +625,12 @@ class BaseEnvironment(ABC):
         )
         profile_fallback = False
         try:
-            proc = self._run_bash(bootstrap, login=True, timeout=self._snapshot_timeout)
+            proc = self._run_bash(
+                bootstrap,
+                login=True,
+                timeout=self._snapshot_timeout,
+                script_stdin=True,
+            )
             result = self._wait_for_process(proc, timeout=self._snapshot_timeout)
             returncode = int(result.get("returncode") or 0)
             profile_fallback = profile_fallback_record in str(
@@ -707,9 +714,7 @@ class BaseEnvironment(ABC):
         """
         return shlex.quote(path)
 
-    def _wrap_command(
-        self, command: str, cwd: str, *, login_fallback: bool = False
-    ) -> str:
+    def _wrap_command(self, command: str, cwd: str, *, process_cwd: bool = False) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
         escaped = command.replace("'", "'\\''")
@@ -749,8 +754,8 @@ class BaseEnvironment(ABC):
         # ``$HOME`` so suffixes with spaces remain a single shell word.
         quoted_cwd = self._quote_cwd_for_cd(cwd)
         # ``--`` keeps hyphen-prefixed directory names from being parsed as options.
-        cd_command = r"\cd" if login_fallback else "builtin cd"
-        parts.append(f"{cd_command} -- {quoted_cwd} || exit 126")
+        if not process_cwd:
+            parts.append(f"builtin cd -- {quoted_cwd} || exit 126")
 
         # Run the actual command
         parts.append(f"eval '{escaped}'")
@@ -1230,12 +1235,14 @@ class BaseEnvironment(ABC):
         # Use login shell if snapshot failed (so user's profile still loads),
         # unless login itself is broken — then non-login is the only path.
         login = not self._snapshot_ready and not self._prefer_nonlogin
-        wrapped = self._wrap_command(
-            exec_command, effective_cwd, login_fallback=login
-        )
+        wrapped = self._wrap_command(exec_command, effective_cwd, process_cwd=login)
 
         proc = self._run_bash(
-            wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin
+            wrapped,
+            login=login,
+            timeout=effective_timeout,
+            stdin_data=effective_stdin,
+            cwd=effective_cwd if login else None,
         )
         result = self._wait_for_process(
             proc, timeout=effective_timeout, bounded_capture=bounded_capture

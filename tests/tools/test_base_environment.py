@@ -6,6 +6,8 @@ init_session() failure handling, and the CWD marker contract.
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
 
 
@@ -15,7 +17,16 @@ class _TestableEnv(BaseEnvironment):
     def __init__(self, cwd="/tmp", timeout=10):
         super().__init__(cwd=cwd, timeout=timeout)
 
-    def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+    def _run_bash(
+        self,
+        cmd_string,
+        *,
+        login=False,
+        timeout=120,
+        stdin_data=None,
+        script_stdin=False,
+        cwd=None,
+    ):
         raise NotImplementedError("Use mock")
 
     def cleanup(self):
@@ -39,7 +50,7 @@ def _bootstrap_script(env):
     """Capture the production-generated init_session bootstrap script."""
     captured = {}
 
-    def fake_run_bash(cmd_string, *, login=False, timeout=120, stdin_data=None):
+    def fake_run_bash(cmd_string, **kwargs):
         captured.setdefault("cmd", cmd_string)
         raise RuntimeError("stop after capture")
 
@@ -216,7 +227,7 @@ class TestAtomicSnapshotWrite:
         env = _TestableEnv()
         captured = {}
 
-        def fake_run_bash(cmd_string, *, login=False, timeout=120, stdin_data=None):
+        def fake_run_bash(cmd_string, **kwargs):
             captured.setdefault("cmd", cmd_string)  # only the bootstrap; ignore the failure-path probe
             raise RuntimeError("stop after capture")
 
@@ -310,7 +321,7 @@ class TestAtomicSnapshotWrite:
         env = _TestableEnv()
         captured = {}
 
-        def fake_run_bash(cmd_string, *, login=False, timeout=120, stdin_data=None):
+        def fake_run_bash(cmd_string, **kwargs):
             captured.setdefault("cmd", cmd_string)  # only the bootstrap; ignore the failure-path probe
             raise RuntimeError("stop after capture")
 
@@ -391,8 +402,9 @@ class TestAtomicSnapshotWrite:
         )
         assert "OK" in check.stdout, check.stdout + check.stderr
 
+    @pytest.mark.parametrize("exit_trap", [False, True])
     def test_dispatcher_functions_reject_lossy_bootstrap_and_use_fallback(
-        self, tmp_path
+        self, tmp_path, exit_trap
     ):
         """A rejected snapshot must retain the complete login profile on the
         next execution instead of switching to a lossy non-login shell."""
@@ -402,34 +414,66 @@ class TestAtomicSnapshotWrite:
         _q = shlex.quote
         snap = tmp_path / "snapshot.sh"
         marker = tmp_path / "intercepted"
+        forgery_marker = tmp_path / "forgery-attempted"
         shadow = (
             f"builtin () {{ printf '%s\\n' builtin >> {_q(str(marker))}; return 91; }}\n"
             + "\n".join(
                 f"{name} () {{ printf '%s\\n' {name} >> {_q(str(marker))}; return 0; }}"
-                for name in ("set", "unset")
+                for name in ("set", "unset", "cd")
             )
+        )
+        nonce_forgery = (
+            "if [[ $BASH_EXECUTION_STRING =~ "
+            "(__HERMES_SNAPSHOT_PROFILE_FALLBACK_[0-9a-f]{32}__) ]]; then\n"
+            f"  printf 'attempted\\n' > {_q(str(forgery_marker))}\n"
+            "  readonly __hermes_snapshot_profile_fallback_marker="
+            "\"${BASH_REMATCH[1]}\"\n"
+            "  readonly -p\n"
+            "  exit 78\n"
+            "fi\n"
         )
         login_profile = (
             "export PROFILE_SENTINEL=profile-loaded\n"
-            f"{shadow}\nordinary () {{ printf 'ordinary-loaded\\n'; }}\n"
-            "trap 'exit 0' EXIT\n"
+            f"{nonce_forgery}{shadow}\n"
+            "ordinary () { printf 'ordinary-loaded\\n'; }\n"
+            + ("trap 'exit 0' EXIT\n" if exit_trap else "")
         )
         login_calls = []
 
         class LoginProfileEnv(_TestableEnv):
             def _run_bash(
-                self, cmd_string, *, login=False, timeout=120, stdin_data=None
+                self,
+                cmd_string,
+                *,
+                login=False,
+                timeout=120,
+                stdin_data=None,
+                script_stdin=False,
+                cwd=None,
             ):
                 login_calls.append(login)
-                script = f"{login_profile}{cmd_string}" if login else cmd_string
-                return subprocess.Popen(
+                if script_stdin:
+                    assert stdin_data is None
+                    script = f"{login_profile}source /dev/stdin" if login else "source /dev/stdin"
+                    stdin_data = cmd_string
+                else:
+                    script = f"{login_profile}{cmd_string}" if login else cmd_string
+                proc = subprocess.Popen(
                     ["/bin/bash", "--noprofile", "--norc", "-c", script],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
+                    stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
                     text=True,
-                    cwd=self.cwd,
+                    cwd=cwd or self.cwd,
                 )
+                if stdin_data is not None:
+                    assert proc.stdin is not None
+                    try:
+                        proc.stdin.write(stdin_data)
+                        proc.stdin.close()
+                    except BrokenPipeError:
+                        pass
+                return proc
 
         env = LoginProfileEnv(cwd=str(tmp_path))
         env._snapshot_path = str(snap)
@@ -442,11 +486,12 @@ class TestAtomicSnapshotWrite:
         assert env._prefer_nonlogin is False
         assert not snap.exists(), "bootstrap published a lossy function snapshot"
         assert not marker.exists(), "presence detection invoked a shadow function"
+        assert not forgery_marker.exists(), "profile read the bootstrap nonce"
 
         result = env.execute(
             "printf 'ENV=%s\\n' \"$PROFILE_SENTINEL\"; "
             "ordinary; "
-            "declare -F builtin set unset >/dev/null && printf 'FUNCTIONS=present\\n'; "
+            "declare -F builtin set unset cd >/dev/null && printf 'FUNCTIONS=present\\n'; "
             "printf 'PWD=%s\\n' \"$PWD\"",
             cwd=str(target_cwd),
         )
@@ -460,6 +505,26 @@ class TestAtomicSnapshotWrite:
         assert login_calls == [True, True]
         assert not snap.exists(), "fallback execute published a lossy snapshot"
         assert not marker.exists(), "snapshot internals invoked a profile function"
+        assert not forgery_marker.exists(), "fallback exposed a bootstrap nonce"
+
+        # This profile attack can forge the exact nonce when the bootstrap is
+        # embedded in ``bash -c``.  Feeding it after profile evaluation keeps
+        # that nonce out of BASH_EXECUTION_STRING, so only Hermes can emit it.
+        bootstrap = _bootstrap_script(_TestableEnv(cwd=str(tmp_path)))
+        vulnerable = subprocess.run(
+            [
+                "/bin/bash",
+                "--noprofile",
+                "--norc",
+                "-c",
+                f"{login_profile}{bootstrap}",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+        )
+        assert "__HERMES_SNAPSHOT_PROFILE_FALLBACK_" in vulnerable.stdout
+        assert forgery_marker.read_text() == "attempted\n"
 
     def test_readonly_shadow_functions_fail_bootstrap_closed(self, tmp_path):
         """A login profile can make dispatcher shadows readonly. Bootstrap
@@ -702,16 +767,30 @@ class TestSnapshotFileModes:
             def get_temp_dir(self):
                 return self._temp_dir
 
-            def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+            def _run_bash(
+                self,
+                cmd_string,
+                *,
+                login=False,
+                timeout=120,
+                stdin_data=None,
+                script_stdin=False,
+                cwd=None,
+            ):
+                if script_stdin:
+                    stdin_data = cmd_string
+                    args = ["/bin/bash", "-l", "-s"] if login else ["/bin/bash", "-s"]
+                else:
+                    args = ["/bin/bash", "-lc" if login else "-c", cmd_string]
                 proc = subprocess.Popen(
-                    ["/bin/bash", "-lc", cmd_string],
+                    args,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
+                    stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
                     text=True,
-                    cwd=self.cwd,
+                    cwd=cwd or self.cwd,
                 )
-                proc.communicate(timeout=timeout)
+                proc.communicate(input=stdin_data, timeout=timeout)
                 return proc
 
             def cleanup(self):
@@ -832,17 +911,26 @@ class TestInitSessionFailure:
 
         class EarlyExitEnv(_TestableEnv):
             def _run_bash(
-                self, cmd_string, *, login=False, timeout=120, stdin_data=None
+                self,
+                cmd_string,
+                *,
+                login=False,
+                timeout=120,
+                stdin_data=None,
+                script_stdin=False,
+                cwd=None,
             ):
                 login_calls.append(login)
-                script = f"exit 78\n{cmd_string}" if login else cmd_string
+                # The login profile exits before the shell can read a bootstrap
+                # sent on stdin.  A bare 78 must not authenticate rejection.
+                script = "exit 78" if login else cmd_string
                 return subprocess.Popen(
                     ["/bin/bash", "--noprofile", "--norc", "-c", script],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
                     text=True,
-                    cwd=self.cwd,
+                    cwd=cwd or self.cwd,
                 )
 
         env = EarlyExitEnv(cwd=str(tmp_path))
@@ -859,7 +947,8 @@ class TestInitSessionFailure:
         env._snapshot_ready = False
 
         calls = []
-        def mock_run_bash(cmd, *, login=False, timeout=120, stdin_data=None):
+        def mock_run_bash(cmd, **kwargs):
+            login = kwargs.get("login", False)
             calls.append({"login": login})
             # Return a mock process handle
             mock = MagicMock()
@@ -878,7 +967,8 @@ class TestInitSessionFailure:
         """Login snapshot failure + working non-login probe → don't use bash -l."""
         env = _TestableEnv()
 
-        def mock_run_bash(cmd, *, login=False, timeout=120, stdin_data=None):
+        def mock_run_bash(cmd, **kwargs):
+            login = kwargs.get("login", False)
             mock = MagicMock()
             mock.poll.return_value = 0
             mock.stdout = iter([])
@@ -896,7 +986,8 @@ class TestInitSessionFailure:
 
         calls = []
 
-        def track_run_bash(cmd, *, login=False, timeout=120, stdin_data=None):
+        def track_run_bash(cmd, **kwargs):
+            login = kwargs.get("login", False)
             calls.append({"login": login})
             mock = MagicMock()
             mock.poll.return_value = 0
