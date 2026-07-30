@@ -4,8 +4,9 @@
 The minimum-viable replacement for pytest-xdist + a subprocess-isolation
 plugin. Discovers test files under ``tests/`` (excluding integration/e2e
 unless explicitly requested), then runs one ``python -m pytest <file>``
-subprocess per file, with bounded parallelism (default: half the known logical
-CPU count, rounded down and clamped to one; one worker if the count is unknown).
+subprocess per file, with bounded parallelism (default: half the process-usable
+CPU budget from affinity, cgroup quota, and machine count, rounded down and
+clamped to one; one worker if capacity is unknown).
 
 Why per-file rather than per-test?
     Per-test spawn overhead (~250ms × 17k tests = 70min CPU minimum)
@@ -32,8 +33,8 @@ Usage:
     a literal ``--`` is also passed through, and stacks with bare flags.
 
 Environment:
-    HERMES_TEST_WORKERS  Override worker count (default: half the known logical
-                         CPU count, minimum 1; unknown count defaults to 1)
+    HERMES_TEST_WORKERS  Override worker count (default: half the process-usable
+                         CPUs, minimum 1; unknown capacity defaults to 1)
     HERMES_TEST_PATHS    Override discovery roots (colon-sep, default: 'tests')
 
 Exit code: 0 if every file's pytest exited 0; 1 otherwise.
@@ -57,6 +58,103 @@ from typing import Dict, List, Tuple
 _DEFAULT_ROOTS = ["tests"]
 
 
+def _cpu_quota_count(quota_raw: str, period_raw: str) -> int | None:
+    """Convert a finite cgroup CPU quota to conservative whole-CPU capacity."""
+    try:
+        quota = int(quota_raw)
+        period = int(period_raw)
+    except ValueError:
+        return None
+    if quota <= 0 or period <= 0:
+        return None
+    return max(1, quota // period)
+
+
+def _parse_cgroup_v2_cpu_max(raw: str) -> int | None:
+    """Parse ``cpu.max``; ``max`` or malformed values mean no usable limit."""
+    fields = raw.split()
+    if len(fields) != 2 or fields[0] == "max":
+        return None
+    return _cpu_quota_count(fields[0], fields[1])
+
+
+def _parse_cgroup_v1_cpu_quota(
+    quota_raw: str,
+    period_raw: str,
+) -> int | None:
+    """Parse cgroup v1 CPU quota/period; negative quota means unlimited."""
+    return _cpu_quota_count(quota_raw.strip(), period_raw.strip())
+
+
+def _read_cgroup_cpu_count(
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> int | None:
+    """Read the process-visible cgroup v2 or v1 whole-CPU quota."""
+    v2_path = cgroup_root / "cpu.max"
+    try:
+        v2_raw = v2_path.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    else:
+        # A present cpu.max identifies a v2 hierarchy. ``max`` is unlimited;
+        # do not reinterpret unrelated/stale v1-looking files below it.
+        return _parse_cgroup_v2_cpu_max(v2_raw)
+
+    for controller_dir in (
+        cgroup_root / "cpu",
+        cgroup_root / "cpu,cpuacct",
+        cgroup_root,
+    ):
+        try:
+            quota_raw = (controller_dir / "cpu.cfs_quota_us").read_text(
+                encoding="utf-8"
+            )
+            period_raw = (controller_dir / "cpu.cfs_period_us").read_text(
+                encoding="utf-8"
+            )
+        except OSError:
+            continue
+        return _parse_cgroup_v1_cpu_quota(quota_raw, period_raw)
+    return None
+
+
+def _affinity_cpu_count() -> int | None:
+    """Return CPUs in this process's scheduler affinity, when supported."""
+    try:
+        affinity = os.sched_getaffinity(0)  # type: ignore[attr-defined]
+    except (AttributeError, NotImplementedError, OSError):
+        return None
+    return len(affinity) or None
+
+
+def _process_usable_cpu_count(
+    machine_cpu_count: int | None,
+    affinity_cpu_count: int | None,
+    cgroup_cpu_count: int | None,
+) -> int | None:
+    """Return affinity (or machine fallback), bounded by cgroup quota."""
+    scheduler_count = (
+        affinity_cpu_count
+        if affinity_cpu_count is not None and affinity_cpu_count > 0
+        else machine_cpu_count
+    )
+    limits = [
+        count
+        for count in (scheduler_count, cgroup_cpu_count)
+        if count is not None and count > 0
+    ]
+    return min(limits) if limits else None
+
+
+def _detect_process_usable_cpu_count() -> int | None:
+    """Detect machine, scheduler-affinity, and cgroup CPU limits."""
+    return _process_usable_cpu_count(
+        os.cpu_count(),
+        _affinity_cpu_count(),
+        _read_cgroup_cpu_count(),
+    )
+
+
 def _default_worker_count(cpu_count: int | None) -> int:
     """Reserve half of known CPUs for test-owned concurrency.
 
@@ -69,10 +167,10 @@ def _default_worker_count(cpu_count: int | None) -> int:
 
 
 # A file subprocess is not a single execution context: many test files spawn
-# their own threads and child processes. Reserve half the schedulable CPUs for
-# that test-owned concurrency. Explicit -j / HERMES_TEST_WORKERS values remain
-# exact overrides for callers that know their workload.
-_DEFAULT_WORKERS = _default_worker_count(os.cpu_count())
+# their own threads and child processes. Reserve half the process-usable CPU
+# budget for that test-owned concurrency. Explicit -j / HERMES_TEST_WORKERS
+# values remain exact overrides for callers that know their workload.
+_DEFAULT_WORKERS = _default_worker_count(_detect_process_usable_cpu_count())
 
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
@@ -677,7 +775,7 @@ def main() -> int:
         default=int(os.environ.get("HERMES_TEST_WORKERS") or _DEFAULT_WORKERS),
         help=(
             "Parallel worker count (default: $HERMES_TEST_WORKERS or half "
-            "the known logical CPUs, minimum 1; unknown CPU count uses 1)"
+            "the process-usable CPUs, minimum 1; unknown CPU capacity uses 1)"
         ),
     )
     parser.add_argument(

@@ -231,12 +231,6 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
 @pytest.mark.parametrize(
     ("env_workers", "cli_args", "expected_jobs"),
     [
-        pytest.param(
-            None,
-            (),
-            max(1, (os.cpu_count() or 1) // 2),
-            id="resource-safe-default",
-        ),
         pytest.param("3", (), 3, id="environment-override"),
         pytest.param("3", ("-j", "2"), 2, id="cli-override"),
     ],
@@ -247,7 +241,7 @@ def test_worker_selection_policy(
     cli_args: tuple[str, ...],
     expected_jobs: int,
 ) -> None:
-    """Reserve CPU for test-owned concurrency; preserve exact opt-in overrides."""
+    """Preserve exact opt-in worker overrides through the canonical wrapper."""
     probe_dir = _make_probe_dir(tmp_path)
     repo_root = Path(__file__).resolve().parent.parent
     runner = repo_root / "scripts" / "run_tests.sh"
@@ -304,7 +298,7 @@ def test_canonical_wrapper_help_exits_without_running_tests(
     normalized_output = " ".join(proc.stdout.split())
     expected_default = (
         "Parallel worker count (default: $HERMES_TEST_WORKERS or half the "
-        "known logical CPUs, minimum 1; unknown CPU count uses 1)"
+        "process-usable CPUs, minimum 1; unknown CPU capacity uses 1)"
     )
     assert proc.returncode == 0, proc.stdout
     assert expected_default in normalized_output, proc.stdout
@@ -333,6 +327,160 @@ def test_default_worker_count_policy(
 ) -> None:
     """Unknown/low CPU counts fail safe; known hosts reserve half their CPUs."""
     assert run_tests_parallel._default_worker_count(cpu_count) == expected_jobs
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_cpus"),
+    [
+        pytest.param("max 100000", None, id="unlimited"),
+        pytest.param("100000 100000", 1, id="one-cpu"),
+        pytest.param("250000 100000", 2, id="fractional-quota-floors"),
+        pytest.param("50000 100000", 1, id="sub-cpu-quota-clamps"),
+        pytest.param("0 100000", None, id="zero-quota-invalid"),
+        pytest.param("100000 0", None, id="zero-period-invalid"),
+        pytest.param("garbage", None, id="malformed"),
+    ],
+)
+def test_parse_cgroup_v2_cpu_max(
+    raw: str,
+    expected_cpus: int | None,
+) -> None:
+    """Parse cgroup v2 quota boundaries without consulting the host cgroup."""
+    assert run_tests_parallel._parse_cgroup_v2_cpu_max(raw) == expected_cpus
+
+
+@pytest.mark.parametrize(
+    ("quota_raw", "period_raw", "expected_cpus"),
+    [
+        pytest.param("-1", "100000", None, id="unlimited"),
+        pytest.param("100000", "100000", 1, id="one-cpu"),
+        pytest.param("250000", "100000", 2, id="fractional-quota-floors"),
+        pytest.param("50000", "100000", 1, id="sub-cpu-quota-clamps"),
+        pytest.param("0", "100000", None, id="zero-quota-invalid"),
+        pytest.param("100000", "0", None, id="zero-period-invalid"),
+        pytest.param("garbage", "100000", None, id="malformed"),
+    ],
+)
+def test_parse_cgroup_v1_cpu_quota(
+    quota_raw: str,
+    period_raw: str,
+    expected_cpus: int | None,
+) -> None:
+    """Parse cgroup v1 quota boundaries without consulting the host cgroup."""
+    assert (
+        run_tests_parallel._parse_cgroup_v1_cpu_quota(quota_raw, period_raw)
+        == expected_cpus
+    )
+
+
+def test_read_cgroup_cpu_count_prefers_v2_hierarchy(tmp_path: Path) -> None:
+    """A present v2 cpu.max defines the hierarchy even when it is unlimited."""
+    (tmp_path / "cpu.max").write_text("max 100000\n")
+    v1_dir = tmp_path / "cpu"
+    v1_dir.mkdir()
+    (v1_dir / "cpu.cfs_quota_us").write_text("200000\n")
+    (v1_dir / "cpu.cfs_period_us").write_text("100000\n")
+
+    assert run_tests_parallel._read_cgroup_cpu_count(tmp_path) is None
+
+
+def test_read_cgroup_cpu_count_falls_back_to_v1(tmp_path: Path) -> None:
+    """Read the v1 cpu controller when the v2 interface does not exist."""
+    v1_dir = tmp_path / "cpu"
+    v1_dir.mkdir()
+    (v1_dir / "cpu.cfs_quota_us").write_text("200000\n")
+    (v1_dir / "cpu.cfs_period_us").write_text("100000\n")
+
+    assert run_tests_parallel._read_cgroup_cpu_count(tmp_path) == 2
+
+
+@pytest.mark.parametrize(
+    ("machine_cpus", "affinity_cpus", "quota_cpus", "expected_cpus"),
+    [
+        pytest.param(64, 2, None, 2, id="affinity-restricts-large-host"),
+        pytest.param(64, None, 2, 2, id="quota-restricts-large-host"),
+        pytest.param(64, 8, 2, 2, id="tightest-process-limit-wins"),
+        pytest.param(8, 16, None, 16, id="affinity-precedes-machine-fallback"),
+        pytest.param(8, None, None, 8, id="machine-count-fallback"),
+        pytest.param(None, None, 2, 2, id="quota-without-machine-count"),
+        pytest.param(None, None, None, None, id="unknown-remains-unknown"),
+    ],
+)
+def test_process_usable_cpu_count(
+    machine_cpus: int | None,
+    affinity_cpus: int | None,
+    quota_cpus: int | None,
+    expected_cpus: int | None,
+) -> None:
+    """Use affinity or machine fallback, capped by any cgroup quota."""
+    assert (
+        run_tests_parallel._process_usable_cpu_count(
+            machine_cpus,
+            affinity_cpus,
+            quota_cpus,
+        )
+        == expected_cpus
+    )
+
+
+def test_detect_process_usable_cpu_count_combines_all_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime detection feeds machine, affinity, and quota into one budget."""
+    monkeypatch.setattr(run_tests_parallel.os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(run_tests_parallel, "_affinity_cpu_count", lambda: 8)
+    monkeypatch.setattr(run_tests_parallel, "_read_cgroup_cpu_count", lambda: 2)
+
+    assert run_tests_parallel._detect_process_usable_cpu_count() == 2
+
+
+def test_runner_default_honors_linux_process_affinity(tmp_path: Path) -> None:
+    """A real affinity-restricted runner process selects from its usable CPUs."""
+    if sys.platform != "linux" or not all(
+        hasattr(os, name) for name in ("sched_getaffinity", "sched_setaffinity")
+    ):
+        pytest.skip("Linux sched_getaffinity/sched_setaffinity are unavailable")
+
+    allowed_cpus = sorted(os.sched_getaffinity(0))
+    assert allowed_cpus, "the current process has no schedulable CPUs"
+    restricted_cpu = allowed_cpus[0]
+    probe_dir = _make_probe_dir(tmp_path)
+    repo_root = Path(__file__).resolve().parent.parent
+    wrapper = repo_root / "scripts" / "run_tests.sh"
+    launcher = textwrap.dedent(
+        f"""
+        import os
+
+        os.sched_setaffinity(0, {{{restricted_cpu}}})
+        os.execv(
+            {str(wrapper)!r},
+            [
+                {str(wrapper)!r},
+                {str(probe_dir)!r},
+                "--file-retries",
+                "0",
+                "-q",
+            ],
+        )
+        """
+    )
+    env = os.environ.copy()
+    env.pop("HERMES_TEST_WORKERS", None)
+
+    proc = subprocess.run(
+        [sys.executable, "-c", launcher],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=30,
+    )
+
+    announced = re.search(r"running with -j (?P<jobs>\d+)(?:\s|$)", proc.stdout)
+    assert proc.returncode == 0, proc.stdout
+    assert announced is not None, proc.stdout
+    assert int(announced.group("jobs")) == 1, proc.stdout
 
 
 def test_bare_q_flag_passes_through(tmp_path: Path) -> None:
