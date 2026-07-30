@@ -68,6 +68,14 @@ class WorkflowLanguageCompatibilityError(ValueError):
         super().__init__(message)
 
 
+class WorkflowStructuredOutputNormalizationError(StructuredOutputError):
+    """Attach a workflow node location to a structured-output failure."""
+
+    def __init__(self, source_index: int, error: StructuredOutputError):
+        self.source_index = source_index
+        super().__init__(str(error))
+
+
 @dataclass(frozen=True, slots=True)
 class DynamicCompatibilityCode:
     """One stable runtime language code not attached to an inventory field."""
@@ -251,7 +259,12 @@ def _normalize_v2(
             continue
         if not isinstance(output_format, Mapping):
             raise StructuredOutputError("structured-output schema must be an object")
-        normalized_schema = normalize_schema(_thaw(output_format))
+        try:
+            normalized_schema = normalize_schema(_thaw(output_format))
+        except StructuredOutputError as exc:
+            raise WorkflowStructuredOutputNormalizationError(
+                node.source_index, exc
+            ) from exc
         options = dict(node.options)
         options["output_format"] = _thaw(normalized_schema.canonical_schema)
         normalized_nodes.append(replace(node, options=freeze_value(options)))
@@ -261,7 +274,10 @@ def _normalize_v2(
             canonicalization_version=STRUCTURED_OUTPUT_CANONICALIZATION_VERSION,
         )
         if len(structured_outputs) > MAX_SNAPSHOTTED_STRUCTURED_OUTPUTS:
-            raise StructuredOutputError("workflow exceeds structured outputs limit")
+            raise WorkflowStructuredOutputNormalizationError(
+                node.source_index,
+                StructuredOutputError("workflow exceeds structured outputs limit"),
+            )
     return replace(source_definition, nodes=tuple(normalized_nodes)), MappingProxyType(
         structured_outputs
     )
@@ -378,6 +394,22 @@ def language_compatibility_findings(
                 "archon_retry_semantics_unavailable",
                 "Archon retry semantics are not enforceable in Phase 1",
                 "Remove retry or wait for Phase 3 retry semantics.",
+                blocking=True,
+            )
+        if metadata.normalizer_version < 2 and "output_format" in options:
+            add(
+                f"{prefix}.output_format",
+                "archon_output_format_unavailable",
+                "Archon output_format enforcement is not available in Phase 1",
+                "Remove output_format or wait for Phase 2 enforcement.",
+                blocking=True,
+            )
+        if metadata.normalizer_version < 2 and "output_type" in options:
+            add(
+                f"{prefix}.output_type",
+                "archon_output_type_unavailable",
+                "Archon output_type artifacts are not available in Phase 1",
+                "Remove output_type or wait for Phase 2 typed artifacts.",
                 blocking=True,
             )
         if "maxBudgetUsd" in options:
@@ -621,7 +653,9 @@ def _read_structured_outputs(value: object) -> Mapping[str, WorkflowStructuredOu
         schema = raw_output["canonical_schema"]
         fingerprint = raw_output["schema_fingerprint"]
         if (
-            version != STRUCTURED_OUTPUT_CANONICALIZATION_VERSION
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version != STRUCTURED_OUTPUT_CANONICALIZATION_VERSION
             or not isinstance(schema, Mapping)
             or not isinstance(fingerprint, str)
             or _SHA256.fullmatch(fingerprint) is None

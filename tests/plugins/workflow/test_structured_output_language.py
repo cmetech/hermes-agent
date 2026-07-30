@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import pytest
 
+from agent.structured_output import normalize_schema
+from plugins.workflow.language import (
+    WorkflowLanguageCompatibilityError,
+    read_language_snapshot,
+)
 from plugins.workflow.models import WorkflowValidationError
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 
 
 def _archon_workflow(workflow_writer, tmp_path, *, nodes):
@@ -52,6 +57,91 @@ def test_archon_normalizes_output_format_and_accepts_output_type(
         "archon_output_format_unavailable",
         "archon_output_type_unavailable",
     }.intersection(finding.code for finding in package.compatibility_findings)
+
+
+def test_version_one_archon_package_keeps_structured_output_unavailability(
+    workflow_writer, tmp_path
+):
+    path = _archon_workflow(
+        workflow_writer,
+        tmp_path,
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Return a report",
+                "output_type": "report",
+                "output_format": {"type": "object"},
+            }
+        ],
+    )
+    package = load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
+        normalizer_version=1,
+    )
+
+    assert package.language.structured_outputs == {}
+    assert {
+        finding.code for finding in package.compatibility_findings
+    } >= {
+        "archon_output_format_unavailable",
+        "archon_output_type_unavailable",
+    }
+
+
+@pytest.mark.parametrize("version", (True, 1.0, "1", None, 2))
+def test_v2_snapshot_rejects_noncanonicalization_versions(version):
+    schema = normalize_schema({"type": "object"})
+    structured_output = {
+        "canonical_schema": dict(schema.canonical_schema),
+        "schema_fingerprint": schema.schema_fingerprint,
+        "canonicalization_version": version,
+    }
+    if version is None:
+        structured_output.pop("canonicalization_version")
+    value = {
+        "effective_profile": "archon-2026-07",
+        "normalizer_version": 2,
+        "normalized_definition_digest": "a" * 64,
+        "semantic_fingerprint": "b" * 64,
+        "structured_outputs": {"producer": structured_output},
+    }
+
+    with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
+        read_language_snapshot(value)
+
+    assert exc.value.code == "workflow_language_snapshot_invalid"
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"$schema": "https://example.invalid/not-draft-2020-12"},
+        {"description": "x" * 70_000},
+    ],
+)
+def test_archon_invalid_output_format_is_a_coded_workflow_validation_error(
+    workflow_writer, tmp_path, schema
+):
+    with pytest.raises(WorkflowValidationError) as exc:
+        load_workflow(
+            _archon_workflow(
+                workflow_writer,
+                tmp_path,
+                nodes=[
+                    {
+                        "id": "producer",
+                        "prompt": "Return a report",
+                        "output_format": schema,
+                    }
+                ],
+            )
+        )
+
+    assert [(issue.path, issue.code) for issue in exc.value.issues] == [
+        ("nodes[0].output_format", "invalid_output_format")
+    ]
 
 
 def _consumer_nodes(schema, path="missing", *, depends_on=True):

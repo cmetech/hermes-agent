@@ -16,6 +16,7 @@ from plugins.workflow.language import (
     UNKNOWN_TOP_LEVEL_FIELD_CODE,
     WORKFLOW_NORMALIZER_VERSION,
     WorkflowLanguageCompatibilityError,
+    WorkflowStructuredOutputNormalizationError,
     language_compatibility_findings,
     normalize_workflow,
     prove_output_path_impossible,
@@ -970,11 +971,18 @@ def _load_workflow_bytes(
     )
     node_ids = frozenset(node.id for node in nodes)
     _validate_sidecar_node_references(sidecar, node_ids)
-    normalized = normalize_workflow(
-        definition,
-        selection=selection,
-        normalizer_version=normalizer_version,
-    )
+    try:
+        normalized = normalize_workflow(
+            definition,
+            selection=selection,
+            normalizer_version=normalizer_version,
+        )
+    except WorkflowStructuredOutputNormalizationError as exc:
+        _fail(
+            f"nodes[{exc.source_index}].output_format",
+            "invalid_output_format",
+            "output_format is not a valid bounded structured-output schema",
+        )
     _validate_structured_output_field_references(
         normalized.definition.nodes, normalized.metadata.structured_outputs
     )
