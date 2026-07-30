@@ -136,12 +136,12 @@ def _copy_and_validate_schema(source: dict[str, object]) -> dict[str, object]:
 
     while stack:
         current, copied, depth, path = stack.pop()
+        node_count += 1
+        if node_count > MAX_SCHEMA_NODES:
+            raise StructuredOutputError("schema exceeds traversed nodes limit")
+        if depth > MAX_SCHEMA_DEPTH:
+            raise StructuredOutputError("schema exceeds depth limit")
         if isinstance(current, Mapping):
-            node_count += 1
-            if node_count > MAX_SCHEMA_NODES:
-                raise StructuredOutputError("schema exceeds traversed nodes limit")
-            if depth > MAX_SCHEMA_DEPTH:
-                raise StructuredOutputError("schema exceeds depth limit")
             assert isinstance(copied, dict)
             for key, value in current.items():
                 if not isinstance(key, str):
@@ -204,7 +204,7 @@ def _copy_schema_value(
         return copied
     if isinstance(value, list):
         copied_list: list[object] = []
-        stack.append((value, copied_list, depth, path))
+        stack.append((value, copied_list, depth + 1, path))
         return copied_list
     if isinstance(value, float) and not math.isfinite(value):
         raise StructuredOutputError("schema numbers must be finite")

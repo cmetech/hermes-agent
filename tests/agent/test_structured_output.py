@@ -106,11 +106,20 @@ def test_normalize_schema_accepts_schema_depth_32_and_rejects_33() -> None:
         normalize_schema(rejected)
 
 
+def test_normalize_schema_rejects_33_nested_json_arrays() -> None:
+    nested_arrays: list[object] = []
+    for _ in range(33):
+        nested_arrays = [nested_arrays]
+
+    with pytest.raises(StructuredOutputError, match="depth"):
+        normalize_schema({"examples": nested_arrays})
+
+
 def test_normalize_schema_accepts_4096_schema_nodes_and_rejects_4097() -> None:
-    normalize_schema({"allOf": [{} for _ in range(4_095)]})
+    normalize_schema({"allOf": [{} for _ in range(4_094)]})
 
     with pytest.raises(StructuredOutputError, match="nodes"):
-        normalize_schema({"allOf": [{} for _ in range(4_096)]})
+        normalize_schema({"allOf": [{} for _ in range(4_095)]})
 
 
 def test_normalize_schema_accepts_1024_properties_and_rejects_1025() -> None:
