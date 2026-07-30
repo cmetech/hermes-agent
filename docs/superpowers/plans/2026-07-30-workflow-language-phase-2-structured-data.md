@@ -156,7 +156,7 @@
 - Modify: `tests/plugins/workflow/test_language_schema.py`
 - Modify: `skills/software-development/workflow-builder/references/portable-schema.md`
 
-- [ ] Add failing tests that `archon-2026-07` accepts valid `output_format` and `output_type`, stores the normalized schema/fingerprint in the language snapshot, and stops emitting `archon_output_format_unavailable` and `archon_output_type_unavailable`.
+- [x] Add failing tests that `archon-2026-07` accepts valid `output_format` and `output_type`, stores the normalized schema/fingerprint in the language snapshot, and stops emitting `archon_output_format_unavailable` and `archon_output_type_unavailable`.
 
   Also assert legacy still emits `legacy_output_format_post_validation` and `legacy_output_type_not_published`, and that a version-1 admitted snapshot remains readable.
 
@@ -164,13 +164,13 @@
 
   Expected: FAIL because Phase 1 blocks both Archon fields.
 
-- [ ] Introduce normalizer version 2 without changing version 1.
+- [x] Introduce normalizer version 2 without changing version 1.
 
   Set the current authoring version to 2, retain `SUPPORTED_NORMALIZER_VERSIONS = frozenset({1, 2})`, and dispatch normalization by version. Version 1 must remain identity-only. Version 2 replaces each Archon node's `output_format` option with its canonical thawed mapping and fills `WorkflowLanguageMetadata.structured_outputs`, an immutable node-ID mapping of canonical schemas, fingerprints, and canonicalization versions. Include that mapping in `normalized_definition_digest` and `semantic_fingerprint` without adding new YAML surface.
 
   Extend `WorkflowLanguageSnapshot` with `structured_outputs`. `read_language_snapshot()` must accept the exact four-field legacy shape only for normalizer version 1 and require the new bounded field for version 2. `make_language_snapshot()` copies the immutable mapping so the canonical schema and fingerprint are sealed in `resources.json` rather than re-derived from mutable provider state.
 
-- [ ] Add failing static-reference tests for `$producer.output.field`.
+- [x] Add failing static-reference tests for `$producer.output.field`.
 
   Test closed objects that prove a field impossible, optional declared properties, `additionalProperties: true`, `anyOf`/`oneOf` branches where one branch permits the field, schemaless producers, nested field paths, and references to nodes that are not dependencies.
 
@@ -178,15 +178,15 @@
 
   Expected: FAIL because static schema-aware reference analysis is absent.
 
-- [ ] Implement conservative `prove_output_path_impossible(schema, path_parts) -> bool` in `plugins/workflow/language.py`.
+- [x] Implement conservative `prove_output_path_impossible(schema, path_parts) -> bool` in `plugins/workflow/language.py`.
 
   Resolve only the already-normalized local `$defs` graph. Return `True` only when every applicable branch is closed and excludes the requested path. Emit stable blocking code `structured_output_field_impossible`; do not change runtime missing-field behavior.
 
-- [ ] Update the dependency-neutral field inventory and generated contracts.
+- [x] Update the dependency-neutral field inventory and generated contracts.
 
   Mark Archon `output_format` and `output_type` as supported in Phase 2, keep legacy codes unchanged, and update the examples, descriptions, codes, and bounds in `skills/software-development/workflow-builder/references/portable-schema.md`. Verify the dynamic CLI contract directly with `.venv/bin/hermes workflow schema --profile archon-2026-07 --json`; there is no checked-in generated JSON schema file.
 
-- [ ] Run language and schema suites and commit.
+- [x] Run language and schema suites and commit.
 
   Run: `scripts/run_tests.sh tests/plugins/workflow/test_schema.py tests/plugins/workflow/test_language.py tests/plugins/workflow/test_language_schema.py tests/plugins/workflow/test_language_snapshot.py tests/plugins/workflow/test_structured_output_language.py`
 
