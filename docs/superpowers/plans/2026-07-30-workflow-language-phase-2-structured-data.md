@@ -82,7 +82,7 @@
 - Create: `tests/agent/test_structured_output.py`
 - Test: `tests/agent/test_plugin_agent.py`
 
-- [ ] Add failing tests for Draft 2020-12 schema normalization, canonical equivalence, and every approved bound.
+- [x] Add failing tests for Draft 2020-12 schema normalization, canonical equivalence, and every approved bound.
 
   Cover 65,536 canonical schema bytes, depth 32, 4,096 traversed nodes, 1,024 properties, 256 local refs, 1,024 bytes per regex, 16,384 total regex bytes, 1,024 enum values, non-finite numerics, invalid regex, external/unresolved/cyclic refs, `$dynamicRef`, `$id`, and anchors that change resolution scope. Assert a missing `jsonschema` import raises `StructuredOutputValidatorUnavailable` only when validation is requested.
 
@@ -90,7 +90,7 @@
 
   Expected: FAIL because `agent.structured_output` does not exist.
 
-- [ ] Implement the immutable generic value objects and constants in `agent/structured_output.py`.
+- [x] Implement the immutable generic value objects and constants in `agent/structured_output.py`.
 
   Use this public shape:
 
@@ -127,17 +127,17 @@
 
   Freeze nested schema structures, reject booleans where integer bounds are expected, walk iteratively with explicit counters, validate local JSON Pointers below `$defs`, and compile every pattern before accepting the schema.
 
-- [ ] Add failing parser/canonicalizer tests for prose, fenced JSON, two values, trailing non-space content, NaN/Infinity, refusal text, truncation, and outputs over 500,000 bytes.
+- [x] Add failing parser/canonicalizer tests for prose, fenced JSON, two values, trailing non-space content, NaN/Infinity, refusal text, truncation, and outputs over 500,000 bytes.
 
   Run: `scripts/run_tests.sh tests/agent/test_structured_output.py`
 
   Expected: FAIL on the new complete-value and canonicalization cases.
 
-- [ ] Implement `parse_validate_canonicalize(response: str, request: StructuredOutputRequest) -> StructuredOutputValue` and `validation_summary(...)`.
+- [x] Implement `parse_validate_canonicalize(response: str, request: StructuredOutputRequest) -> StructuredOutputValue` and `validation_summary(...)`.
 
   Decode exactly one full JSON value with `json.JSONDecoder.raw_decode`, require only trailing whitespace, reject non-finite numbers with `parse_constant`, validate using `Draft202012Validator`, then encode using `ensure_ascii=False`, `sort_keys=True`, `separators=(",", ":")`, and `allow_nan=False`. Bound diagnostics to 16,384 UTF-8 bytes without persisting the raw response.
 
-- [ ] Run the focused generic suite and commit.
+- [x] Run the focused generic suite and commit.
 
   Run: `scripts/run_tests.sh tests/agent/test_structured_output.py tests/agent/test_plugin_agent.py`
 
