@@ -2229,6 +2229,21 @@ def terminal_tool(
                     "status": "error",
                 }, ensure_ascii=False)
 
+        # ``force`` is the second call after a user has already approved a
+        # command. Clear the stale approval-wait interrupt before lazy
+        # environment construction: snapshot bootstrap and its health probe
+        # use the same interrupt-aware process waiter as user commands. If the
+        # clear waits until ``env.execute()``, that stale bit can kill both
+        # setup shells and permanently cache an unavailable environment.
+        # Remember the clear so a genuine interrupt arriving during setup is
+        # not erased again immediately before execution.
+        _approved_interrupt_cleared = False
+        if force:
+            from tools.interrupt import clear_current_thread_interrupt
+
+            clear_current_thread_interrupt()
+            _approved_interrupt_cleared = True
+
         # Start cleanup thread
         _start_cleanup_thread()
 
@@ -2713,7 +2728,7 @@ def terminal_tool(
             # re-clear inside the loop -- a genuine interrupt arriving during the
             # backoff sleep between retries must survive and abort the command
             # (caught by the next attempt's _wait_for_process poll loop -> 130).
-            if _approved_run:
+            if _approved_run and not _approved_interrupt_cleared:
                 from tools.interrupt import clear_current_thread_interrupt
                 clear_current_thread_interrupt()
 

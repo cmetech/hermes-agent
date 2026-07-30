@@ -1478,7 +1478,14 @@ class BaseEnvironment(ABC):
         guard_seen = bool(result.pop("control_seen", False))
         self._update_cwd(result)
 
-        if was_snapshot and not guard_seen:
+        # A missing attestation means guard failure only when the process
+        # completed normally enough to report its own status. The waiter uses
+        # 124/130 for an external timeout/interrupt that can kill the shell
+        # before it emits the pre-command sentinel; preserve that lifecycle
+        # result and the still-valid snapshot instead of relabeling it 125 and
+        # degrading the session.
+        externally_stopped = result.get("returncode") in {124, 130}
+        if was_snapshot and not guard_seen and not externally_stopped:
             diagnostic = (
                 "Session snapshot failed its source or sanitizer guard, or cwd setup; "
                 "future commands will use a clean non-login shell."

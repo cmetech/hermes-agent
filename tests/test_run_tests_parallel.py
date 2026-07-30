@@ -27,6 +27,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -225,6 +226,67 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
         stderr=subprocess.STDOUT,
         text=True,
         timeout=60,
+    )
+
+
+def test_parallel_files_receive_disjoint_pytest_temp_roots(tmp_path: Path) -> None:
+    """Per-file pytest processes must not share a cleanup namespace.
+
+    Pytest's default ``pytest-of-<user>`` root is process-global.  Independent
+    pytest processes perform retention cleanup there at exit, so sharing that
+    root defeats this runner's per-file isolation and can remove another live
+    process's ``tmp_path`` tree.  Each runner attempt must instead receive its
+    own pytest temp root.
+    """
+    probe_dir = tmp_path / "temp-root-probes"
+    probe_dir.mkdir()
+    nonce = uuid.uuid4().hex
+    handoffs = [tmp_path / f"pytest-temp-root-{index}.txt" for index in range(2)]
+    for index in range(2):
+        probe_source = textwrap.dedent(
+            f"""
+            from pathlib import Path
+
+            HANDOFF = Path({str(handoffs[index])!r})
+
+            def test_records_pytest_temp_namespace(tmp_path):
+                HANDOFF.write_text(str(tmp_path.parents[1]), encoding="utf-8")
+            """
+        ).strip()
+        (probe_dir / f"test_temp_root_{nonce}_{index}.py").write_text(
+            probe_source + "\n",
+            encoding="utf-8",
+        )
+
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "2",
+            "--file-retries",
+            "0",
+            "--file-timeout",
+            "30",
+            "-q",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    namespaces = [path.read_text(encoding="utf-8") for path in handoffs]
+    assert len(namespaces) == 2, (namespaces, proc.stdout)
+    assert len(set(namespaces)) == 2, (
+        "parallel pytest files shared one temp cleanup namespace: "
+        f"{namespaces!r}\n{proc.stdout}"
     )
 
 
