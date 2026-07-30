@@ -264,29 +264,29 @@
 - Modify: `tests/agent/test_plugin_agent.py`
 - Modify: `tests/plugins/workflow/test_provider_failures.py`
 
-- [ ] Add failing protocol tests for structured request round trips, contradictory strategies, oversized schema/output limits, immutable nested values, unknown fields, and additive old-client compatibility.
+- [x] Add failing protocol tests for structured request round trips, contradictory strategies, oversized schema/output limits, immutable nested values, unknown fields, and additive old-client compatibility.
 
   Run: `scripts/run_tests.sh tests/agent/test_plugin_agent.py`
 
   Expected: FAIL because the request/result protocol has no structured-output field.
 
-- [ ] Add `structured_output: StructuredOutputRequest | None` to `PluginAgentRunRequest` and structured evidence to `PluginAgentRunResult`.
+- [x] Add `structured_output: StructuredOutputRequest | None` to `PluginAgentRunRequest` and structured evidence to `PluginAgentRunResult`.
 
   Serialize with explicit `to_wire()`/`from_wire()` helpers so enums, bytes, and immutable mappings do not depend on `asdict()` accidents. Preserve `_PROTOCOL_VERSION = 1` by making fields additive and optional. Validate schema/request bounds before spawning the worker.
 
-- [ ] Thread the request through `AIAgent.__init__` and `agent_init.init_agent` as an immutable per-run value.
+- [x] Thread the request through `AIAgent.__init__` and `agent_init.init_agent` as an immutable per-run value.
 
   Do not expose provider wire fields through `request_overrides`. Keep the value stable for the worker lifetime and reject attempts to combine it with arbitrary `response_format`, `text.format`, or `output_config.format` overrides.
 
-- [ ] Resolve actual runtime capability before constructing `AIAgent`.
+- [x] Resolve actual runtime capability before constructing `AIAgent`.
 
   In `plugin_agent_worker.py`, compare the resolved provider/model/API-mode decision with the admitted decision. Return `structured_output_capability_drift` with zero provider attempts when it cannot honor the admission. Record exact `provider_attempts`, `model_calls`, strategy, adapter version, schema fingerprint, and declaration source in bounded result audit data.
 
-- [ ] Add prompt-adapter message tests.
+- [x] Add prompt-adapter message tests.
 
   Assert `prompt_json_schema` adds one deterministic bounded instruction block to the initial user message; it does not modify the system prompt, history, tools, or role alternation. Assert `unsupported` fails before a provider request.
 
-- [ ] Run the isolated-agent suites and commit.
+- [x] Run the isolated-agent suites and commit.
 
   Run: `scripts/run_tests.sh tests/agent/test_plugin_agent.py tests/plugins/workflow/test_provider_failures.py`
 
