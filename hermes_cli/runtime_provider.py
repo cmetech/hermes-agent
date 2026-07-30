@@ -68,6 +68,64 @@ def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
 
 
+_NON_SECRET_ROUTE_QUERY_KEYS = frozenset({
+    "api-version",
+    "api_version",
+    "apiversion",
+    "deployment",
+    "deployment-id",
+    "deployment-name",
+    "deployment_id",
+    "deployment_name",
+    "deploymentid",
+    "deploymentname",
+    "location",
+    "region",
+    "tenant",
+    "tenant-id",
+    "tenant_id",
+    "tenantid",
+})
+_CREDENTIAL_ROUTE_QUERY_KEYS = frozenset({
+    "access-key",
+    "access-token",
+    "access_key",
+    "access_token",
+    "apikey",
+    "api-key",
+    "api_key",
+    "auth",
+    "auth-token",
+    "auth_token",
+    "authorization",
+    "client-secret",
+    "client_secret",
+    "code",
+    "credential",
+    "credentials",
+    "key",
+    "password",
+    "secret",
+    "sig",
+    "signature",
+    "subscription-key",
+    "subscription_key",
+    "token",
+    "x-amz-algorithm",
+    "x-amz-credential",
+    "x-amz-date",
+    "x-amz-expires",
+    "x-amz-security-token",
+    "x-amz-signature",
+    "x-amz-signedheaders",
+})
+_UNCLASSIFIED_ROUTE_QUERY = "unclassified_query_parameter"
+
+
+class _UnclassifiedRouteQuery(ValueError):
+    """A route query value cannot safely enter credential-free evidence."""
+
+
 def _credential_free_route_url(value: object) -> str:
     """Return stable route evidence without credential-bearing URL material."""
     if not isinstance(value, str) or not value.strip():
@@ -86,14 +144,21 @@ def _credential_free_route_url(value: object) -> str:
         (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
     ):
         normalized_host = f"{normalized_host}:{port}"
-    query_keys = sorted(
-        {
-            key
-            for key, _value in parse_qsl(parsed.query, keep_blank_values=True)
-            if key
-        }
+    query_evidence: list[tuple[str, str | None]] = []
+    for key, query_value in parse_qsl(parsed.query, keep_blank_values=True):
+        normalized_key = key.strip().casefold()
+        if normalized_key in _NON_SECRET_ROUTE_QUERY_KEYS:
+            query_evidence.append((normalized_key, query_value))
+        elif normalized_key in _CREDENTIAL_ROUTE_QUERY_KEYS:
+            query_evidence.append((normalized_key, None))
+        else:
+            raise _UnclassifiedRouteQuery(_UNCLASSIFIED_ROUTE_QUERY)
+    structural_query = "&".join(
+        quote(key, safe="")
+        if query_value is None
+        else f"{quote(key, safe='')}={quote(query_value, safe='')}"
+        for key, query_value in sorted(query_evidence)
     )
-    structural_query = "&".join(quote(key, safe="") for key in query_keys)
     return urlunsplit(
         (scheme, normalized_host, parsed.path or "", structural_query, "")
     ).rstrip("/")
@@ -434,6 +499,7 @@ class ConfiguredExecutionRoute:
     effective_provider: str
     model_config: Mapping[str, object]
     provider_config: Mapping[str, object]
+    route_evidence_error: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -637,8 +703,15 @@ def snapshot_configured_execution_routes(
             continue
         name = str(entry.get("name") or "").strip()
         provider_key = str(entry.get("provider_key") or "").strip()
-        base_url = _credential_free_route_url(entry.get("base_url"))
-        if not base_url or not (name or provider_key):
+        route_evidence_error = None
+        try:
+            base_url = _credential_free_route_url(entry.get("base_url"))
+        except _UnclassifiedRouteQuery:
+            base_url = ""
+            route_evidence_error = _UNCLASSIFIED_ROUTE_QUERY
+        if (not base_url and route_evidence_error is None) or not (
+            name or provider_key
+        ):
             continue
         model = str(entry.get("model") or "").strip()
         api_mode = str(entry.get("api_mode") or "").strip().lower()
@@ -647,10 +720,11 @@ def snapshot_configured_execution_routes(
             effective_provider="custom",
             model_config={"provider": "custom", "default": model},
             provider_config={
-                "base_url": base_url,
+                **({"base_url": base_url} if base_url else {}),
                 **({"api_mode": api_mode} if api_mode else {}),
                 **({"model": model} if model else {}),
             },
+            route_evidence_error=route_evidence_error,
         )
         aliases: set[str] = set()
         for candidate in (name, provider_key):
@@ -690,10 +764,17 @@ def snapshot_configured_execution_routes(
                 for key in safe_keys
                 if key in model_config
             }
+            route_evidence_error = None
             for key in ("base_url", "api", "url"):
                 if key not in safe_model_config:
                     continue
-                safe_url = _credential_free_route_url(safe_model_config[key])
+                try:
+                    safe_url = _credential_free_route_url(safe_model_config[key])
+                except _UnclassifiedRouteQuery:
+                    route_evidence_error = _UNCLASSIFIED_ROUTE_QUERY
+                    for url_key in ("base_url", "api", "url"):
+                        safe_model_config.pop(url_key, None)
+                    break
                 if safe_url:
                     safe_model_config[key] = safe_url
                 else:
@@ -715,13 +796,14 @@ def snapshot_configured_execution_routes(
                 isinstance(safe_model_config.get(key), str)
                 and bool(str(safe_model_config.get(key)).strip())
                 for key in route_keys
-            )
+            ) or route_evidence_error is not None
             if effective_provider and has_route_evidence:
                 routes[requested] = ConfiguredExecutionRoute(
                     requested_provider=requested,
                     effective_provider=effective_provider,
                     model_config=safe_model_config,
                     provider_config=safe_model_config,
+                    route_evidence_error=route_evidence_error,
                 )
 
     return MappingProxyType(routes)
@@ -733,11 +815,24 @@ def classify_configured_execution_route(
     target_model: str | None = None,
 ) -> ExecutionRuntimeCapabilities:
     """Classify one frozen configured record without credentials or live config."""
-    return classify_execution_runtime(
+    classified = classify_execution_runtime(
         provider=route.effective_provider,
         model_config=route.model_config,
         provider_config=route.provider_config,
         target_model=target_model,
+    )
+    if route.route_evidence_error is None:
+        return classified
+    return ExecutionRuntimeCapabilities(
+        api_mode=classified.api_mode,
+        hermes_managed_tool_loop=False,
+        effective_provider=classified.effective_provider,
+        model=classified.model,
+        base_url_trust_class="unknown",
+        declared_structured_output_strategy=(
+            StructuredOutputStrategy.UNSUPPORTED.value
+        ),
+        structured_output_declaration_source="route_query_unclassified",
     )
 
 
@@ -767,8 +862,14 @@ def resolve_structured_output_capability(
     declared = runtime.declared_structured_output_strategy
     if declared == StructuredOutputStrategy.UNSUPPORTED.value:
         strategy = StructuredOutputStrategy.UNSUPPORTED
-        source = "explicit_unsupported"
-        rationale = "provider explicitly forbids structured-output adaptation"
+        if runtime.structured_output_declaration_source == (
+            "route_query_unclassified"
+        ):
+            source = "route_query_unclassified"
+            rationale = "provider route query cannot be classified without secrets"
+        else:
+            source = "explicit_unsupported"
+            rationale = "provider explicitly forbids structured-output adaptation"
     elif not runtime.hermes_managed_tool_loop:
         strategy = StructuredOutputStrategy.UNSUPPORTED
         source = "delegated_runtime"

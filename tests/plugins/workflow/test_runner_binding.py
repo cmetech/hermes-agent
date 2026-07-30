@@ -30,6 +30,7 @@ from plugins.workflow.runner_binding import (
     ExecutionCapabilityContext,
     RunnerCapabilities,
     WorkflowRunnerBinding,
+    assess_package_execution,
     execution_capability_context,
 )
 import plugins.workflow.api_admission as api_admission_module
@@ -1110,7 +1111,8 @@ def test_route_secret_changes_do_not_change_identity_or_leak_metadata(
                 "private-route": {
                     "api": (
                         "https://alice:first-password@community.example.test/v1"
-                        "?token=first-token&region=us-east-1#first-fragment"
+                        "?token=first-token&region=us-east-1"
+                        "&api-version=2026-07-01#first-fragment"
                     ),
                     "transport": "chat_completions",
                 }
@@ -1148,7 +1150,8 @@ def test_route_secret_changes_do_not_change_identity_or_leak_metadata(
 
     config_source["current"]["providers"]["private-route"]["api"] = (
         "https://bob:second-password@community.example.test/v1"
-        "?token=second-token&region=eu-west-1#second-fragment"
+        "?api-version=2026-07-01&token=second-token"
+        "&region=us-east-1#second-fragment"
     )
     second_context = binding.execution_context(
         surface="background",
@@ -1163,16 +1166,159 @@ def test_route_secret_changes_do_not_change_identity_or_leak_metadata(
         "alice",
         "first-password",
         "first-token",
-        "us-east-1",
         "first-fragment",
         "bob",
         "second-password",
         "second-token",
-        "eu-west-1",
         "second-fragment",
     ):
         assert secret not in first_projection
         assert secret not in second_projection
+
+
+@pytest.mark.parametrize(
+    "changed_query",
+    (
+        "api-version=2026-08-01&region=us-east-1&token=second-token",
+        "api-version=2026-07-01&region=eu-west-1&token=second-token",
+    ),
+)
+def test_route_authority_changes_change_package_identity(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_query: str,
+) -> None:
+    config_source = {
+        "current": {
+            "model": {"provider": "openrouter", "default": "openai/gpt-5.4"},
+            "providers": {
+                "private-route": {
+                    "api": (
+                        "https://community.example.test/v1"
+                        "?token=first-token&region=us-east-1"
+                        "&api-version=2026-07-01"
+                    ),
+                    "transport": "chat_completions",
+                }
+            },
+        }
+    }
+    monkeypatch.setattr(
+        runner_binding_module,
+        "read_raw_config",
+        lambda: config_source["current"],
+    )
+    package = _structured_route_package(
+        tmp_path,
+        workflow_writer,
+        name="route-authority-identity",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Return JSON",
+                "provider": "private-route",
+                "model": "community/model-v1",
+                "output_format": {"type": "object"},
+            }
+        ],
+    )
+    binding = runner_binding_module.production_workflow_runner_binding()
+    first_context = binding.execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+
+    config_source["current"]["providers"]["private-route"]["api"] = (
+        f"https://community.example.test/v1?{changed_query}"
+    )
+    second_context = binding.execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+
+    assert second_context.identity_digest_for(package) != (
+        first_context.identity_digest_for(package)
+    )
+
+
+def test_unclassified_route_query_blocks_without_leaking_or_untracked_execution(
+    tmp_path: Path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_source = {
+        "current": {
+            "model": {"provider": "openrouter", "default": "openai/gpt-5.4"},
+            "providers": {
+                "private-route": {
+                    "api": (
+                        "https://community.example.test/v1"
+                        "?feature-mode=first-opaque-value"
+                    ),
+                    "transport": "chat_completions",
+                }
+            },
+        }
+    }
+    monkeypatch.setattr(
+        runner_binding_module,
+        "read_raw_config",
+        lambda: config_source["current"],
+    )
+    package = _structured_route_package(
+        tmp_path,
+        workflow_writer,
+        name="unclassified-route-query",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Return JSON",
+                "provider": "private-route",
+                "model": "community/model-v1",
+                "output_format": {"type": "object"},
+            }
+        ],
+    )
+    binding = runner_binding_module.production_workflow_runner_binding()
+    first_context = binding.execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+    first_compatibility, _first_risk = assess_package_execution(
+        package,
+        first_context,
+    )
+    first_projection = repr(first_context.configured_provider_routes)
+
+    config_source["current"]["providers"]["private-route"]["api"] = (
+        "https://community.example.test/v1?feature-mode=second-opaque-value"
+    )
+    second_context = binding.execution_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+    )
+    second_compatibility, _second_risk = assess_package_execution(
+        package,
+        second_context,
+    )
+    second_projection = repr(second_context.configured_provider_routes)
+
+    assert first_compatibility.runnable is False
+    assert second_compatibility.runnable is False
+    assert any(
+        finding.code == "structured_output_strategy_unsupported"
+        for finding in first_compatibility.findings
+    )
+    assert any(
+        finding.code == "structured_output_strategy_unsupported"
+        for finding in second_compatibility.findings
+    )
+    assert first_context.identity_digest_for(package) == (
+        second_context.identity_digest_for(package)
+    )
+    assert "first-opaque-value" not in first_projection
+    assert "second-opaque-value" not in second_projection
 
 
 def test_configured_custom_anthropic_alias_preserves_custom_precedence(

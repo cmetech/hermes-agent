@@ -837,9 +837,15 @@ def test_anthropic_aliases_use_canonical_native_declaration(provider):
             id="userinfo",
         ),
         pytest.param(
-            "https://community.example.test/v1?token=supersecret&region=us-east-1#fragmentsecret",
-            "https://community.example.test/v1?region&token",
-            ("supersecret", "us-east-1", "fragmentsecret"),
+            (
+                "https://community.example.test/v1?token=supersecret"
+                "&region=us-east-1&api-version=2026-07-01#fragmentsecret"
+            ),
+            (
+                "https://community.example.test/v1?api-version=2026-07-01"
+                "&region=us-east-1&token"
+            ),
+            ("supersecret", "fragmentsecret"),
             id="query-values-and-fragment",
         ),
     ],
@@ -865,3 +871,61 @@ def test_configured_route_snapshot_contains_only_non_secret_url_evidence(
 
     assert route.provider_config["base_url"] == expected_url
     assert all(secret not in serialized for secret in forbidden)
+
+
+def test_configured_route_snapshot_is_query_order_deterministic():
+    first = snapshot_configured_execution_routes(
+        {
+            "providers": {
+                "private-route": {
+                    "api": (
+                        "https://community.example.test/v1?region=us-east-1"
+                        "&token=first-token&api-version=2026-07-01"
+                    ),
+                    "transport": "chat_completions",
+                }
+            }
+        }
+    )["private-route"]
+    second = snapshot_configured_execution_routes(
+        {
+            "providers": {
+                "private-route": {
+                    "api": (
+                        "https://community.example.test/v1?api-version=2026-07-01"
+                        "&token=second-token&region=us-east-1"
+                    ),
+                    "transport": "chat_completions",
+                }
+            }
+        }
+    )["private-route"]
+
+    assert first == second
+    assert first.provider_config["base_url"] == (
+        "https://community.example.test/v1?api-version=2026-07-01"
+        "&region=us-east-1&token"
+    )
+
+
+def test_configured_route_snapshot_rejects_unclassified_query_values():
+    routes = snapshot_configured_execution_routes(
+        {
+            "providers": {
+                "private-route": {
+                    "api": (
+                        "https://community.example.test/v1"
+                        "?feature-mode=opaque-secret"
+                    ),
+                    "transport": "chat_completions",
+                }
+            }
+        }
+    )
+
+    route = routes["private-route"]
+    serialized = repr(routes)
+
+    assert route.route_evidence_error == "unclassified_query_parameter"
+    assert "base_url" not in route.provider_config
+    assert "opaque-secret" not in serialized

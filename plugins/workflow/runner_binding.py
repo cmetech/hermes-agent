@@ -197,6 +197,9 @@ class ExecutionCapabilityContext:
                     "effective_provider": configured_route.effective_provider,
                     "model_config": dict(configured_route.model_config),
                     "provider_config": dict(configured_route.provider_config),
+                    "route_evidence_error": (
+                        configured_route.route_evidence_error
+                    ),
                 }
                 if configured_route is not None
                 else None
