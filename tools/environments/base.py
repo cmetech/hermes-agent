@@ -707,7 +707,11 @@ class BaseEnvironment(ABC):
                 f"{_external} mv -f {_snap_tmp} {_quoted_snap}; }} 2>/dev/null || "
                 f"{{ {_external} rm -f {_snap_tmp} 2>/dev/null; [[ 0 == 1 ]]; }}"
             )
-        snapshot_update.append(")")
+        # Keep the subshell in an OR-list so a user-enabled ``set -e`` cannot
+        # abort the wrapper before its CWD marker and saved-status exit.  The
+        # deliberately false fallback preserves a failed update's nonzero
+        # status for direct callers/tests instead of swallowing the failure.
+        snapshot_update.append(") || [[ 0 == 1 ]]")
         parts.append("\n".join(snapshot_update))
 
         # Emit the CWD stdout marker; all backends (including local, since

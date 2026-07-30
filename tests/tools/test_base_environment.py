@@ -240,6 +240,41 @@ class TestAtomicSnapshotWrite:
         assert wrapped.index("eval 'echo hi'") < wrapped.index("umask 077")
         assert wrapped.index("umask 077") < wrapped.index("export -p >")
 
+    def test_failed_snapshot_update_under_errexit_preserves_wrapper_contract(
+        self, tmp_path
+    ):
+        """Snapshot publication is metadata bookkeeping: even under a user's
+        ``set -e``, its failure must not skip the CWD marker or replace the
+        successful user-command status."""
+        import shlex
+        import shutil
+
+        snap = tmp_path / "snapshot.sh"
+        snap.write_text("export GOOD=1\n")
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        failing_mktemp = fake_bin / "mktemp"
+        failing_mktemp.write_text("#!/bin/sh\nexit 23\n")
+        failing_mktemp.chmod(0o755)
+        rm = shutil.which("rm")
+        assert rm
+        (fake_bin / "rm").symlink_to(rm)
+        env = _TestableEnv(cwd=str(tmp_path))
+        env._snapshot_path = str(snap)
+        env._snapshot_ready = True
+        wrapped = env._wrap_command(
+            "set -e; printf 'USER_COMMAND_COMPLETED\\n'", str(tmp_path)
+        )
+
+        proc = self._run_real_bash(
+            f"PATH={shlex.quote(str(fake_bin))}; export PATH\n{wrapped}"
+        )
+
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "USER_COMMAND_COMPLETED" in proc.stdout
+        assert env._cwd_marker in proc.stdout
+        assert snap.read_text() == "export GOOD=1\n"
+
     def test_init_session_bootstrap_uses_private_umask(self):
         env = _TestableEnv()
         captured = {}
