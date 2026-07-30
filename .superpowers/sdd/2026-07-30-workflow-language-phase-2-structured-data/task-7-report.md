@@ -7,8 +7,10 @@ Task 7 is implemented in commits `908b00005`
 (`fix(workflow): preserve resolved output authority`), with open output-type
 boundary alignment in `eda27235c` (`fix(workflow): preserve open output types`).
 Authoring is aligned to that boundary in `4d42af019`
-(`fix(workflow): bound output type metadata`). Archon downstream consumers now
-resolve the successful attempt's canonical
+(`fix(workflow): bound output type metadata`). Cache, read, and completion
+hardening is in `cd520e993`
+(`fix(workflow): harden resolved output caching`). Archon downstream consumers
+now resolve the successful attempt's canonical
 `output.*` descriptor once into a frozen `ResolvedNodeOutput`. The resolver
 verifies containment,
 regular-file identity, byte size, SHA-256, UTF-8, candidate/descriptor agreement,
@@ -100,7 +102,7 @@ metadata and keeps the executor's authoritative parsed candidate only in a
 bounded scheduler cache. AI consumers require a corroborating canonical
 descriptor; Bash/script nodes retain the stdout compatibility adapter.
 Successful resolutions and integrity failures are cached by immutable
-run/node/attempt/descriptor/candidate identity and stale identities are pruned.
+run/node/attempt/descriptor/candidate identity in a bounded scheduler cache.
 
 The final focused command passed 61/61:
 
@@ -108,11 +110,13 @@ The final focused command passed 61/61:
 scripts/run_tests.sh tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_script_executor.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_ai_e2e.py -q
 ```
 
-A deliberate mutation removing stale-key pruning made the descriptor-change
-test fail with two retained cache entries instead of one. Restoring the pruning
-made that test and the full focused suite pass. A second targeted RED proved
-that preserving the authoritative parsed value required avoiding a second
-freeze/copy of an already immutable candidate value.
+At that intermediate revision, a deliberate mutation removing stale-key
+pruning made the descriptor-change test fail with two retained cache entries
+instead of one. The later quality review proved snapshot-driven pruning was
+not concurrency-safe and superseded it with byte-weighted LRU eviction and
+terminal-run lifecycle cleanup. A second targeted RED proved that preserving
+the authoritative parsed value required avoiding a second freeze/copy of an
+already immutable candidate value.
 
 ### Review fix round 2 RED/GREEN
 
@@ -154,6 +158,31 @@ language/schema regression gate passed 776/776. The live
 reported the supported direct field with `minLength: 1`, `pattern: "\\S"`, and
 `maxLength: 16384`.
 
+### Quality fix round 1 RED/GREEN
+
+Five focused regressions were written before the cache/read hardening:
+
+- The descriptor-read race test failed because pathname-based `read_bytes()`
+  bypassed the injected descriptor read. Resolution now opens every component
+  relative to a trusted directory descriptor with no-follow semantics, verifies
+  the same file descriptor with `fstat`, and reads at most the declared byte
+  count plus one byte. Unsupported hosts fail closed.
+- A first-read `EIO` escaped and prevented retry. Transient host I/O now returns
+  an uncached unavailable outcome; stable integrity failures remain cached.
+- A stale parallel projection deleted a newer cached resolution. Projection
+  snapshots no longer act as cache authority.
+- The entry-count cache had no retained-byte bound. Resolved bytes, rendered
+  text, parsed immutable values, and retained candidates now share one
+  conservative 16 MiB byte-weighted LRU. Terminal runs purge their entries once
+  no active or submitted execution can consume them.
+- A deterministic completion barrier showed a resolver could observe durable
+  completion before candidate registration. Candidate registration and
+  `complete_node` visibility are now linearized by the resolution lock, and a
+  failed durable completion rolls back the attempt's candidate and resolution
+  entries.
+
+The focused scheduler/resource/AI E2E suite passed 51/51 after these changes.
+
 ## Consumer invariants
 
 - Successful-attempt identity wins; failed/losing attempts cannot supply a
@@ -192,7 +221,15 @@ Exact required suite:
 scripts/run_tests.sh tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_language.py tests/plugins/workflow/test_bash_e2e.py tests/plugins/workflow/test_script_executor.py
 ```
 
-Fresh result after review fix round 2: 5 files, 75 passed, 0 failed.
+Fresh result after quality fix round 1: 5 files, 82 passed, 0 failed.
+
+Focused cache/read/completion suite:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_ai_e2e.py -q
+```
+
+Result: 3 files, 51 passed, 0 failed.
 
 Adjacent Archon/condition/shared-context suite:
 
@@ -205,7 +242,7 @@ Result: 3 files, 116 passed, 0 failed.
 Static verification:
 
 ```text
-.venv/bin/ruff check plugins/workflow/output_resolution.py plugins/workflow/scheduler.py plugins/workflow/resources.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_script_executor.py tests/plugins/workflow/test_ai_e2e.py
+.venv/bin/ruff check plugins/workflow/output_resolution.py plugins/workflow/scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_ai_e2e.py
 git diff --check
 ```
 
