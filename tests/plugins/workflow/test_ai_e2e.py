@@ -238,6 +238,7 @@ def test_scheduler_sidecar_caps_normal_ai_request_fields_exactly(
 def test_archon_scheduler_binds_sealed_structured_request_and_canonical_output(
     tmp_path, workflow_writer, monkeypatch
 ):
+    output_type = "MixedCase/rapport-分析-" + ("Ω" * 300)
     workflow = workflow_writer(
         tmp_path / "package",
         name="archon-structured-e2e",
@@ -247,6 +248,7 @@ def test_archon_scheduler_binds_sealed_structured_request_and_canonical_output(
             {
                 "id": "work",
                 "prompt": "produce",
+                "output_type": output_type,
                 "output_format": {
                     "type": "object",
                     "required": ["a", "b"],
@@ -320,7 +322,7 @@ def test_archon_scheduler_binds_sealed_structured_request_and_canonical_output(
             package.language.structured_outputs["work"].schema_fingerprint
         ),
         "canonicalization_version": 1,
-        "output_type": None,
+        "output_type": output_type,
     }
     monkeypatch.setattr(
         output_resolution.json,
@@ -335,6 +337,7 @@ def test_archon_scheduler_binds_sealed_structured_request_and_canonical_output(
         (admitted.run_id, "work", result["nodes"]["work"]["attempts"][-1]["attempt_id"])
     ]
     assert resolved.value is live_candidate.structured_value
+    assert live_candidate.output_type == output_type
 
 
 @pytest.mark.parametrize(

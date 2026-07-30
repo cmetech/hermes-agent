@@ -9,6 +9,7 @@ import pytest
 
 from plugins.workflow.models import TerminalJournalReserve
 from plugins.workflow import output_resolution
+from plugins.workflow.machine_contract import projection_was_truncated
 from plugins.workflow.resources import ResourceResolver, VariableContext
 
 
@@ -94,6 +95,45 @@ def test_archon_resolver_uses_canonical_candidate_identity_and_verified_bytes(
     assert resolved.node_id == "collect"
     assert resolved.attempt_id == "attempt-winner"
     assert resolved.publication_id is None
+
+
+def test_primary_output_candidate_identity_preserves_open_output_type_boundary():
+    output_type = "MixedCase/分析/" + ("Ω" * (16_384 - len("MixedCase/分析/")))
+    identity = {
+        "attempt_relative_path": "nodes/work/attempt/output.json",
+        "media_type": "application/json",
+        "size_bytes": 11,
+        "sha256": "1" * 64,
+        "schema_fingerprint": "2" * 64,
+        "canonicalization_version": 1,
+        "output_type": output_type,
+    }
+
+    restored = output_resolution.primary_output_candidate_from_identity(identity)
+
+    assert restored.output_type == output_type
+    assert output_resolution.primary_output_candidate_identity(restored) == identity
+    assert not projection_was_truncated(identity)
+
+
+@pytest.mark.parametrize(
+    "output_type", (object(), 42, "", " \t ", "x" * 16_385)
+)
+def test_primary_output_candidate_identity_rejects_invalid_or_oversized_output_type(
+    output_type,
+):
+    identity = {
+        "attempt_relative_path": "nodes/work/attempt/output.json",
+        "media_type": "application/json",
+        "size_bytes": 11,
+        "sha256": "1" * 64,
+        "schema_fingerprint": "2" * 64,
+        "canonicalization_version": 1,
+        "output_type": output_type,
+    }
+
+    with pytest.raises(output_resolution.ArchonOutputIntegrityError):
+        output_resolution.primary_output_candidate_from_identity(identity)
 
 
 def test_archon_resolver_rejects_candidate_descriptor_digest_disagreement(
