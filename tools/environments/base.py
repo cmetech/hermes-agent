@@ -697,6 +697,20 @@ class BaseEnvironment(ABC):
             ")\n"
         )
         clean_timeout = min(15, self._snapshot_timeout)
+
+        def _externally_stopped(result: dict) -> bool:
+            """Consume private waiter provenance from session-setup work."""
+            return bool(result.pop("_hermes_externally_stopped", False))
+
+        def _use_interrupted_setup_fallback() -> None:
+            diagnostic = (
+                "Session profile snapshot initialization was interrupted. "
+                "Using a clean non-login shell; profile environment and "
+                "functions are unavailable."
+            )
+            self._set_session_mode("degraded_nonlogin", diagnostic)
+            logger.warning("%s (session=%s)", diagnostic, self._session_id)
+
         try:
             cleanup = self._run_bash(
                 f"builtin command rm -f -- {_quoted_snap}",
@@ -704,6 +718,9 @@ class BaseEnvironment(ABC):
                 clean=True,
             )
             cleanup_result = self._wait_for_process(cleanup, timeout=clean_timeout)
+            if _externally_stopped(cleanup_result):
+                _use_interrupted_setup_fallback()
+                return
             if int(cleanup_result.get("returncode") or 0) != 0:
                 raise RuntimeError("could not prepare fresh snapshot candidate")
 
@@ -715,6 +732,9 @@ class BaseEnvironment(ABC):
                 clean=False,
             )
             result = self._wait_for_process(proc, timeout=self._snapshot_timeout)
+            if _externally_stopped(result):
+                _use_interrupted_setup_fallback()
+                return
             returncode = int(result.get("returncode") or 0)
             if returncode != 0:
                 raise RuntimeError(
@@ -741,6 +761,9 @@ class BaseEnvironment(ABC):
             validation = self._wait_for_process(
                 validation_proc, timeout=clean_timeout
             )
+            if _externally_stopped(validation):
+                _use_interrupted_setup_fallback()
+                return
             if int(validation.get("returncode") or 0) != 0:
                 raise RuntimeError("snapshot artifact validation failed")
 
@@ -759,7 +782,12 @@ class BaseEnvironment(ABC):
                     timeout=clean_timeout,
                     clean=True,
                 )
-                self._wait_for_process(rejected, timeout=clean_timeout)
+                rejected_result = self._wait_for_process(
+                    rejected, timeout=clean_timeout
+                )
+                if _externally_stopped(rejected_result):
+                    _use_interrupted_setup_fallback()
+                    return
             except Exception as cleanup_exc:
                 detail = f"{detail}; rejected snapshot cleanup: {cleanup_exc}"
             try:
@@ -767,6 +795,9 @@ class BaseEnvironment(ABC):
                     "true", timeout=clean_timeout, clean=True
                 )
                 probe_result = self._wait_for_process(probe, timeout=clean_timeout)
+                if _externally_stopped(probe_result):
+                    _use_interrupted_setup_fallback()
+                    return
                 healthy = int(probe_result.get("returncode") or 0) == 0
             except Exception as probe_exc:
                 detail = f"{detail}; non-login probe: {probe_exc}"

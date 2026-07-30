@@ -1241,6 +1241,57 @@ trap __hermes_debug_attack DEBUG
             set_interrupt(False)
             env.cleanup()
 
+    def test_interrupted_first_bootstrap_recovers_after_interrupt_clear(self, tmp_path):
+        """A cancelled initial snapshot must not permanently refuse later work."""
+        from tools.environments.local import LocalEnvironment
+        from tools.interrupt import set_interrupt
+
+        set_interrupt(True)
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+        try:
+            set_interrupt(False)
+            result = env.execute("printf RECOVERED")
+
+            assert result["returncode"] == 0
+            assert result["output"].endswith("RECOVERED")
+            assert set(result) == {"output", "returncode"}
+            assert env._session_mode == "degraded_nonlogin"
+        finally:
+            set_interrupt(False)
+            env.cleanup()
+
+    def test_natural_bootstrap_exit_130_still_uses_fail_closed_recovery(self):
+        """Public 130 without waiter provenance is not a cancellation."""
+        env = _TestableEnv()
+        calls = []
+        wait_results = iter(
+            (
+                {"output": "", "returncode": 0},
+                {"output": "", "returncode": 130},
+                {"output": "", "returncode": 0},
+                {"output": "", "returncode": 0},
+            )
+        )
+
+        def fake_run_bash(command, **kwargs):
+            calls.append((command, kwargs))
+            return object()
+
+        env._run_bash = fake_run_bash  # type: ignore[assignment]
+        env._wait_for_process = lambda *_args, **_kwargs: next(wait_results)  # type: ignore[assignment]
+
+        env.init_session()
+
+        assert env._session_mode == "degraded_nonlogin"
+        assert "bootstrap failed with exit code 130" in env._session_diagnostic
+        assert "initialization was interrupted" not in env._session_diagnostic
+        assert [kwargs.get("clean") for _command, kwargs in calls] == [
+            True,
+            False,
+            True,
+            True,
+        ]
+
     def test_real_waiter_timeout_preserves_ready_snapshot_and_private_state(
         self, tmp_path
     ):

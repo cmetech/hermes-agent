@@ -2233,8 +2233,8 @@ def terminal_tool(
         # command. Clear the stale approval-wait interrupt before lazy
         # environment construction: snapshot bootstrap and its health probe
         # use the same interrupt-aware process waiter as user commands. If the
-        # clear waits until ``env.execute()``, that stale bit can kill both
-        # setup shells and permanently cache an unavailable environment.
+        # clear waits until ``env.execute()``, that stale bit can kill setup
+        # shells and force a clean non-login fallback for this cached session.
         # Remember the clear so a genuine interrupt arriving during setup is
         # not erased again immediately before execution.
         _approved_interrupt_cleared = False
