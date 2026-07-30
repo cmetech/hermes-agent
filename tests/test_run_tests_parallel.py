@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -274,7 +275,44 @@ def test_worker_selection_policy(
     )
 
     assert proc.returncode == 0, proc.stdout
-    assert f"running with -j {expected_jobs}" in proc.stdout, proc.stdout
+    announced = re.search(r"running with -j (?P<jobs>\d+)(?:\s|$)", proc.stdout)
+    assert announced is not None, proc.stdout
+    assert int(announced.group("jobs")) == expected_jobs, proc.stdout
+
+
+@pytest.mark.parametrize("help_flag", ["-h", "--help"])
+def test_canonical_wrapper_help_exits_without_running_tests(
+    tmp_path: Path,
+    help_flag: str,
+) -> None:
+    """Runner help remains reachable through the canonical clean wrapper."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests.sh"
+    nonexistent = tmp_path / "does-not-exist"
+
+    started = time.monotonic()
+    proc = subprocess.run(
+        [str(runner), str(nonexistent), help_flag],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=10,
+    )
+    elapsed = time.monotonic() - started
+
+    normalized_output = " ".join(proc.stdout.split())
+    expected_default = (
+        "Parallel worker count (default: $HERMES_TEST_WORKERS or half the "
+        "known logical CPUs, minimum 1; unknown CPU count uses 1)"
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert expected_default in normalized_output, proc.stdout
+    assert elapsed < 5, proc.stdout
+    assert "No test files found" not in proc.stdout, proc.stdout
+    assert "No test files to run" not in proc.stdout, proc.stdout
+    assert "Discovered " not in proc.stdout, proc.stdout
+    assert "=== Summary" not in proc.stdout, proc.stdout
 
 
 @pytest.mark.parametrize(
