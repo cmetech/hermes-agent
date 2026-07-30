@@ -497,10 +497,20 @@ class BaseEnvironment(ABC):
             self._snapshot_path + ".tmp.XXXXXX"
         )
         _snap_tmp = '"$__hermes_snap_tmp"'
+        # A persisted ``command()`` function shadows the plain ``command``
+        # builtin. Invoke it through Bash's ``builtin`` builtin, and inhibit an
+        # alias named ``builtin``, so user shell customizations cannot replace
+        # Hermes' allocator or file operations.
+        _external = r"\builtin command"
+        _builtin = r"\builtin"
         bootstrap = (
-            f"umask 077\n"
-            f"__hermes_snap_tmp=$(command mktemp {_snap_tmp_template} 2>/dev/null) || exit 1\n"
-            f"export -p > {_snap_tmp}\n"
+            f"{_builtin} umask 077\n"
+            # Gate the complete assembly and publication. A failure anywhere
+            # leaves the prior snapshot in place and makes init_session reject
+            # this bootstrap instead of accepting a partial snapshot.
+            f"if ! {{\n"
+            f"__hermes_snap_tmp=$({_external} mktemp {_snap_tmp_template} 2>/dev/null) &&\n"
+            f"{_builtin} export -p > {_snap_tmp} &&\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
             # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
@@ -513,16 +523,19 @@ class BaseEnvironment(ABC):
             # ``declare -f`` with no name args dumps ALL functions, so an empty
             # name list (only private funcs present) would otherwise leak the
             # very functions we meant to drop.
-            f"__hermes_fns=$(declare -F | awk '{{print $3}}' | grep -vE '^_[^_]') || true\n"
-            f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns "
-            f">> {_snap_tmp} 2>/dev/null || true\n"
-            f"alias -p >> {_snap_tmp}\n"
-            f"echo 'shopt -s expand_aliases' >> {_snap_tmp}\n"
-            f"echo 'set +e' >> {_snap_tmp}\n"
-            f"echo 'set +u' >> {_snap_tmp}\n"
-            # Publish atomically only if assembly succeeded; otherwise drop the
-            # partial temp rather than leave it to be sourced or orphaned.
-            f"mv -f {_snap_tmp} {_quoted_snap} || rm -f {_snap_tmp}\n"
+            f"__hermes_fn_catalog=$({_builtin} declare -F) &&\n"
+            f"__hermes_fns=$({_external} awk '$3 !~ /^_[^_]/ {{print $3}}' "
+            f"<<< \"$__hermes_fn_catalog\") &&\n"
+            f"{{ [[ -z \"$__hermes_fns\" ]] || "
+            f"{_builtin} declare -f $__hermes_fns >> {_snap_tmp}; }} &&\n"
+            f"{_builtin} alias -p >> {_snap_tmp} &&\n"
+            f"{_builtin} printf '%s\\n' 'shopt -s expand_aliases' "
+            f"'set +e' 'set +u' >> {_snap_tmp} &&\n"
+            f"{_external} mv -f {_snap_tmp} {_quoted_snap}\n"
+            f"}}; then\n"
+            f"{_external} rm -f {_snap_tmp} 2>/dev/null || true\n"
+            f"exit 1\n"
+            f"fi\n"
             f"builtin cd -- {_quoted_cwd} 2>/dev/null || true\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
@@ -617,6 +630,8 @@ class BaseEnvironment(ABC):
             self._snapshot_path + ".tmp.XXXXXX"
         )
         _snap_tmp = '"$__hermes_snap_tmp"'
+        _external = r"\builtin command"
+        _builtin = r"\builtin"
 
         parts = []
 
@@ -642,7 +657,7 @@ class BaseEnvironment(ABC):
         parts.append("__hermes_ec=$?")
         # Restrict Hermes metadata files without changing the user's command
         # umask. Snapshot files may contain env-carried secrets.
-        parts.append("umask 077")
+        parts.append(f"{_builtin} umask 077")
 
         # Re-dump env vars to snapshot (atomic replacement to avoid races).
         # Chain mv on the export succeeding so a failed/partial dump never
@@ -650,9 +665,10 @@ class BaseEnvironment(ABC):
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
         if self._snapshot_ready:
             parts.append(
-                f"{{ __hermes_snap_tmp=$(command mktemp {_snap_tmp_template} 2>/dev/null) && "
-                f"export -p > {_snap_tmp} && mv -f {_snap_tmp} {_quoted_snap}; }} "
-                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
+                f"{{ __hermes_snap_tmp=$({_external} mktemp {_snap_tmp_template} 2>/dev/null) && "
+                f"{_builtin} export -p > {_snap_tmp} && "
+                f"{_external} mv -f {_snap_tmp} {_quoted_snap}; }} 2>/dev/null || "
+                f"{{ {_external} rm -f {_snap_tmp} 2>/dev/null; [[ 0 == 1 ]]; }}"
             )
 
         # Emit the CWD stdout marker; all backends (including local, since

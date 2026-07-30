@@ -22,6 +22,32 @@ class _TestableEnv(BaseEnvironment):
         pass
 
 
+def _snapshot_update_script(env):
+    """Extract the production-generated snapshot update from a wrapped command."""
+    wrapped_lines = env._wrap_command(":", env.cwd).splitlines()
+    snapshot_start = next(
+        i for i, line in enumerate(wrapped_lines) if line.endswith("umask 077")
+    ) + 1
+    snapshot_end = next(
+        i for i, line in enumerate(wrapped_lines[snapshot_start:], snapshot_start)
+        if line.startswith("printf ")
+    )
+    return "\n".join(wrapped_lines[snapshot_start:snapshot_end])
+
+
+def _bootstrap_script(env):
+    """Capture the production-generated init_session bootstrap script."""
+    captured = {}
+
+    def fake_run_bash(cmd_string, *, login=False, timeout=120, stdin_data=None):
+        captured.setdefault("cmd", cmd_string)
+        raise RuntimeError("stop after capture")
+
+    env._run_bash = fake_run_bash  # type: ignore[assignment]
+    env.init_session()
+    return captured["cmd"]
+
+
 class TestBoundedOutputCollector:
     def test_large_stream_retains_bounded_head_and_tail(self):
         collector = _BoundedOutputCollector(1_000)
@@ -179,7 +205,8 @@ class TestAtomicSnapshotWrite:
         env = _TestableEnv()
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
-        assert "export -p > " in wrapped and "&& mv -f " in wrapped
+        assert r"\builtin export -p > " in wrapped
+        assert r"&& \builtin command mv -f " in wrapped
         assert "rm -f " in wrapped  # temp cleanup on failure
 
     def test_init_session_bootstrap_also_uses_collision_safe_temp(self):
@@ -230,6 +257,70 @@ class TestAtomicSnapshotWrite:
         assert "umask 077" in boot
         assert boot.index("umask 077") < boot.index("export -p >")
 
+    def test_bootstrap_assembly_failure_preserves_existing_snapshot(self, tmp_path):
+        """Any failed assembly step must leave the prior snapshot untouched,
+        remove its private temp, and make bootstrap report failure."""
+        from pathlib import Path
+        import shlex
+        import shutil
+
+        snap = tmp_path / "snapshot.sh"
+        snap.write_text("export GOOD=1\n")
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        for name in ("mktemp", "mv", "rm"):
+            target = shutil.which(name)
+            assert target
+            (fake_bin / name).symlink_to(target)
+        failing_awk = fake_bin / "awk"
+        failing_awk.write_text("#!/bin/sh\nexit 23\n")
+        failing_awk.chmod(0o755)
+
+        env = _TestableEnv(cwd=str(tmp_path))
+        env._snapshot_path = str(snap)
+        bootstrap = _bootstrap_script(env)
+        proc = self._run_real_bash(
+            f"PATH={shlex.quote(str(fake_bin))}; export PATH\n{bootstrap}"
+        )
+
+        assert proc.returncode != 0, proc.stdout + proc.stderr
+        assert snap.read_text() == "export GOOD=1\n"
+        assert not list(Path(tmp_path).glob("snapshot.sh.tmp.*"))
+
+    def test_bootstrap_bypasses_login_shell_operation_functions(self, tmp_path):
+        """Login profiles may define functions with coreutils names. Hermes
+        must bypass them internally while still preserving them in the snapshot."""
+        import shlex
+
+        _q = shlex.quote
+        snap = tmp_path / "snapshot.sh"
+        marker = tmp_path / "shadowed"
+        shadow = "\n".join(
+            f"{name} () {{ printf '%s\\n' {name} >> {_q(str(marker))}; return 0; }}"
+            for name in ("command", "mktemp", "mv", "rm", "umask", "export")
+        )
+        env = _TestableEnv(cwd=str(tmp_path))
+        env._snapshot_path = str(snap)
+        bootstrap = _bootstrap_script(env)
+
+        proc = self._run_real_bash(
+            f"export BOOTSTRAP_SENTINEL=1\n{shadow}\n{bootstrap}"
+        )
+
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert not marker.exists(), "login-shell function intercepted bootstrap"
+        check = self._run_real_bash(
+            f"source {_q(str(snap))} >/dev/null 2>&1 && "
+            "[ \"$BOOTSTRAP_SENTINEL\" = 1 ] && "
+            "declare -F command >/dev/null && echo OK || echo BROKEN"
+        )
+        assert "OK" in check.stdout, check.stdout + check.stderr
+
+    @staticmethod
+    def _run_real_bash(script):
+        import subprocess
+        return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True)
+
 
 class TestAtomicSnapshotConcurrencyBehavioral:
     """Behavioral regression for #38249 — actually EXECUTES the generated
@@ -259,40 +350,57 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         env = _TestableEnv(cwd=str(tmp_path))
         env._snapshot_path = snap
         env._snapshot_ready = True
-        wrapped = env._wrap_command(":", str(tmp_path))
-        wrapped_lines = wrapped.splitlines()
-        snapshot_start = wrapped_lines.index("umask 077") + 1
-        snapshot_end = next(
-            i for i, line in enumerate(wrapped_lines[snapshot_start:], snapshot_start)
-            if line.startswith("printf ")
-        )
-        snapshot_update = "\n".join(wrapped_lines[snapshot_start:snapshot_end])
+        snapshot_update = _snapshot_update_script(env)
 
         # One writer iteration executes the exact atomic sequence emitted by
         # production, under the system's real Bash.
-        writer = (
-            "for i in $(seq 1 80); do "
-            "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
-            f"{snapshot_update}; "
-            "done"
-        )
+        writers = [
+            (
+                f"export HERMES_SNAPSHOT_WRITER={writer_id}; "
+                "for i in $(seq 1 80); do "
+                "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
+                f"if ! {{ {snapshot_update}; }}; then exit 91; fi; "
+                "done"
+            )
+            for writer_id in range(1, 5)
+        ]
         # Reader: repeatedly source the snapshot and check PATH never absorbs
         # an `export `/`declare -x` fragment (the corruption signature).
         reader = (
             "export PATH=/usr/bin:/bin; "
             "for i in $(seq 1 160); do "
-            f"( source {_q(snap)} >/dev/null 2>&1 || true; "
+            f"( if ! source {_q(snap)} >/dev/null 2>&1; then echo BROKEN; exit; fi; "
             "case \"$PATH\" in *'declare -x'*|*'export '*) echo CORRUPT;; esac ); "
             "done"
         )
-        self._run(f"export -p > {_q(snap)}")  # seed a valid snapshot
+        self._run(f"echo 'export HERMES_SNAPSHOT_SEED=1' > {_q(snap)}")
         # 4 concurrent writers + 4 readers, repeated.
-        w = " & ".join([writer] * 4)
-        r = " & ".join([reader] * 4)
-        procs = [self._run(f"{w} & {r} & wait") for _ in range(3)]
-        corrupt = any("CORRUPT" in p.stdout for p in procs)
-        assert not corrupt, "snapshot tore — PATH absorbed a declare-x/export fragment"
-        final = self._run(f"source {_q(snap)} >/dev/null 2>&1 && echo OK || echo BROKEN")
+        jobs = writers + [reader] * 4
+        launch = " ".join(
+            f"( {job} ) & __hermes_test_pids=\"$__hermes_test_pids $!\";"
+            for job in jobs
+        )
+        wait_each = (
+            "__hermes_test_status=0; "
+            "for pid in $__hermes_test_pids; do "
+            "wait \"$pid\" || __hermes_test_status=1; done; "
+            "exit $__hermes_test_status"
+        )
+        procs = [
+            self._run(f"__hermes_test_pids=''; {launch} {wait_each}")
+            for _ in range(3)
+        ]
+        failures = [
+            f"rc={p.returncode} stdout={p.stdout!r} stderr={p.stderr!r}"
+            for p in procs
+            if p.returncode != 0 or "CORRUPT" in p.stdout or "BROKEN" in p.stdout
+        ]
+        assert not failures, "snapshot writer/read failure: " + "; ".join(failures)
+        final = self._run(
+            f"source {_q(snap)} >/dev/null 2>&1 && "
+            "[ -n \"${HERMES_SNAPSHOT_WRITER:-}\" ] && "
+            "[ -z \"${HERMES_SNAPSHOT_SEED+x}\" ] && echo OK || echo BROKEN"
+        )
         assert "OK" in final.stdout, f"final snapshot not sourceable: {final.stdout} {final.stderr}"
 
     def test_failed_export_does_not_destroy_good_snapshot(self, tmp_path):
@@ -306,16 +414,68 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         snap = str(tmp_path / "snap.sh")
         _q = shlex.quote
         self._run(f"echo 'export GOOD=1' > {_q(snap)}")  # seed good snapshot
-        # Redirect export into an unwritable dir so the export side fails; mv
-        # must then NOT run (&&) and not clobber snap.
-        bad_tmp = _q("/nonexistent-dir/snap.tmp.") + "$BASHPID"
-        script = (
-            f"{{ export -p > {bad_tmp} && mv -f {bad_tmp} {_q(snap)}; }} "
-            f"2>/dev/null || rm -f {bad_tmp} 2>/dev/null || true"
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        marker = tmp_path / "mktemp-ran"
+        bad_temp = tmp_path / "missing" / "snapshot.tmp"
+        fake_mktemp = fake_bin / "mktemp"
+        fake_mktemp.write_text(
+            "#!/bin/sh\n"
+            f": > {_q(str(marker))}\n"
+            f"printf '%s\\n' {_q(str(bad_temp))}\n"
         )
-        self._run(script)
+        fake_mktemp.chmod(0o755)
+        env = _TestableEnv(cwd=str(tmp_path))
+        env._snapshot_path = snap
+        env._snapshot_ready = True
+        snapshot_update = _snapshot_update_script(env)
+
+        out = self._run(f"PATH={_q(str(fake_bin))}; {snapshot_update}")
+
+        assert out.returncode != 0, out.stdout + out.stderr
+        assert marker.exists(), "production-generated mktemp path did not execute"
         out = self._run(f"cat {_q(snap)}")
         assert "export GOOD=1" in out.stdout, "good snapshot was destroyed by a failed export"
+
+    def test_snapshot_operations_bypass_persisted_functions_and_aliases(self, tmp_path):
+        """User shell customizations may use internal command names, but they
+        must not intercept Hermes' allocator, rename, or cleanup operations."""
+        import shlex
+
+        _q = shlex.quote
+        for kind in ("functions", "aliases"):
+            case_dir = tmp_path / kind
+            case_dir.mkdir()
+            snap = case_dir / "snapshot.sh"
+            marker = case_dir / "shadowed"
+            if kind == "functions":
+                shadow = "\n".join(
+                    f"{name} () {{ printf '%s\\n' {name} >> {_q(str(marker))}; return 0; }}"
+                    for name in ("command", "mktemp", "mv", "rm", "umask", "export")
+                )
+            else:
+                shadow = "\n".join(
+                    f"alias {name}={_q(f'printf {name} >> {_q(str(marker))}; false #')}"
+                    for name in ("command", "mktemp", "mv", "rm", "umask", "export")
+                )
+            snap.write_text(
+                f"builtin export SHADOW_SEED=1\n{shadow}\nshopt -s expand_aliases\n"
+            )
+            env = _TestableEnv(cwd=str(case_dir))
+            env._snapshot_path = str(snap)
+            env._snapshot_ready = True
+
+            proc = self._run(
+                env._wrap_command("builtin export UPDATED=1", str(case_dir))
+            )
+
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            assert not marker.exists(), f"{kind} intercepted an internal operation"
+            check = self._run(
+                f"source {_q(str(snap))} >/dev/null 2>&1 && "
+                "[ \"$UPDATED\" = 1 ] && echo OK || echo BROKEN"
+            )
+            assert "OK" in check.stdout, f"{kind} prevented snapshot replacement: {check.stdout}"
 
 
 class TestSnapshotFileModes:
