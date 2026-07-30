@@ -51,7 +51,7 @@ _activity_callback_local = threading.local()
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
 _SNAPSHOT_GUARD_FAILURE_EXIT = 125
-_SNAPSHOT_GUARD_FAILURE_MARKER_PREFIX = "__HERMES_SNAPSHOT_GUARD_FAILURE_"
+_SNAPSHOT_GUARD_PASSED_SENTINEL_PREFIX = "__HERMES_SNAPSHOT_GUARD_PASSED_"
 
 
 # Bash resolves a function named ``builtin`` before ``\builtin``, including on
@@ -192,6 +192,50 @@ class _BoundedOutputCollector:
             tail_chars = content_budget - head_chars
             rendered_tail = tail[-tail_chars:] if tail_chars else ""
             return head[:head_chars] + notice[:available] + rendered_tail + suffix
+
+
+class _RawSentinelFilter:
+    """Detect and remove one exact framed sentinel from streamed text.
+
+    The filter runs before bounded output collection. It retains only a suffix
+    that could still become the sentinel on the next chunk, so arbitrary output
+    without newlines cannot grow an unbounded staging buffer. Once the trusted
+    wrapper's sentinel is seen, all later text is user output and passes through
+    unchanged -- including an exact replay of the sentinel.
+    """
+
+    def __init__(self, sentinel: str):
+        self._needle = f"\n{sentinel}\n"
+        self._pending = ""
+        self.seen = False
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        if self.seen:
+            return text
+
+        candidate = self._pending + text
+        index = candidate.find(self._needle)
+        if index != -1:
+            self.seen = True
+            self._pending = ""
+            return candidate[:index] + candidate[index + len(self._needle) :]
+
+        keep = min(len(candidate), len(self._needle) - 1)
+        while keep and not candidate.endswith(self._needle[:keep]):
+            keep -= 1
+        if keep:
+            self._pending = candidate[-keep:]
+            return candidate[:-keep]
+
+        self._pending = ""
+        return candidate
+
+    def finish(self) -> str:
+        pending = self._pending
+        self._pending = ""
+        return pending
 
 
 def set_activity_callback(cb: Callable[[str], None] | None) -> None:
@@ -730,7 +774,7 @@ class BaseEnvironment(ABC):
         command: str,
         cwd: str,
         *,
-        guard_failure_marker: str | None = None,
+        guard_passed_sentinel: str | None = None,
     ) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
@@ -756,16 +800,11 @@ class BaseEnvironment(ABC):
 
         parts = []
 
-        if guard_failure_marker is None:
-            guard_failure_marker = (
-                f"{_SNAPSHOT_GUARD_FAILURE_MARKER_PREFIX}{uuid.uuid4().hex}__"
-            )
-        guarded_failure = (
-            "POSIXLY_CORRECT=1; "
-            "if \\unset -f builtin unset set; then "
-            f"\\builtin printf '%s\\n' {shlex.quote(guard_failure_marker)}; "
-            "fi; \\exit 125"
-        )
+        # Enter POSIX mode before exiting so even a partially sourced snapshot
+        # cannot intercept ``exit`` with a function. Failure is inferred from
+        # the absence of the later guard-passed attestation; no failure marker
+        # needs to survive the compromised shell.
+        guarded_failure = f"POSIXLY_CORRECT=1; \\exit {_SNAPSHOT_GUARD_FAILURE_EXIT}"
 
         # Source snapshot (env vars from previous commands).
         # Redirect stdout to /dev/null: on macOS (bash 3.2 and certain
@@ -800,6 +839,14 @@ class BaseEnvironment(ABC):
                 "builtin unset __hermes_had_cdpath __hermes_old_cdpath",
             )
         )
+
+        # This is the only READY-path trust attestation. It is emitted after
+        # source, sanitizer, and cwd setup all succeed, immediately before user
+        # code. The raw-stream filter removes it before any bounded rendering.
+        if self._snapshot_ready and guard_passed_sentinel:
+            parts.append(
+                f"builtin printf '\\n%s\\n' {shlex.quote(guard_passed_sentinel)}"
+            )
 
         # Run the actual command
         parts.append(f"builtin eval '{escaped}'")
@@ -873,7 +920,12 @@ class BaseEnvironment(ABC):
     # ------------------------------------------------------------------
 
     def _wait_for_process(
-        self, proc: ProcessHandle, timeout: int = 120, *, bounded_capture: bool = False
+        self,
+        proc: ProcessHandle,
+        timeout: int = 120,
+        *,
+        bounded_capture: bool = False,
+        control_sentinel: str | None = None,
     ) -> dict:
         """Poll-based wait with interrupt checking and stdout draining.
 
@@ -911,6 +963,24 @@ class BaseEnvironment(ABC):
             # accumulate-everything semantics.
             capture_limit = _UNBOUNDED_CAPTURE_CHARS
         output = _BoundedOutputCollector(capture_limit)
+        sentinel_filter = (
+            _RawSentinelFilter(control_sentinel) if control_sentinel else None
+        )
+
+        def _append_output(text: str) -> None:
+            if sentinel_filter is not None:
+                text = sentinel_filter.feed(text)
+            output.append(text)
+
+        def _finish_output() -> None:
+            if sentinel_filter is not None:
+                output.append(sentinel_filter.finish())
+
+        def _result(rendered: str, returncode: int) -> dict:
+            result = {"output": rendered, "returncode": returncode}
+            if sentinel_filter is not None:
+                result["control_seen"] = sentinel_filter.seen
+            return result
 
         # Non-blocking drain via select().
         #
@@ -951,18 +1021,19 @@ class BaseEnvironment(ABC):
                     if piece is None:
                         continue
                     if isinstance(piece, bytes):
-                        output.append(decoder.decode(piece))
+                        _append_output(decoder.decode(piece))
                     else:
-                        output.append(str(piece))
+                        _append_output(str(piece))
             except Exception:
                 pass
             finally:
                 try:
                     tail = decoder.decode(b"", final=True)
                     if tail:
-                        output.append(tail)
+                        _append_output(tail)
                 except Exception:
                     pass
+                _finish_output()
 
         def _drain():
             # Resolve a real OS file descriptor up front.  Real subprocesses and
@@ -991,16 +1062,17 @@ class BaseEnvironment(ABC):
                         chunk = os.read(fd, 4096)
                         if not chunk:
                             break
-                        output.append(decoder.decode(chunk))
+                        _append_output(decoder.decode(chunk))
                 except (ValueError, OSError):
                     pass
                 finally:
                     try:
                         tail = decoder.decode(b"", final=True)
                         if tail:
-                            output.append(tail)
+                            _append_output(tail)
                     except Exception:
                         pass
+                    _finish_output()
                 return
             idle_after_exit = 0
             try:
@@ -1016,7 +1088,7 @@ class BaseEnvironment(ABC):
                             break
                         if not chunk:
                             break  # true EOF — all writers closed
-                        output.append(decoder.decode(chunk))
+                        _append_output(decoder.decode(chunk))
                         idle_after_exit = 0
                     elif proc.poll() is not None:
                         # bash is gone and the pipe was idle for ~100ms.  Give
@@ -1032,9 +1104,10 @@ class BaseEnvironment(ABC):
                 try:
                     tail = decoder.decode(b"", final=True)
                     if tail:
-                        output.append(tail)
+                        _append_output(tail)
                 except Exception:
                     pass
+                _finish_output()
 
         drain_thread = threading.Thread(target=_drain, daemon=True)
         drain_thread.start()
@@ -1077,10 +1150,9 @@ class BaseEnvironment(ABC):
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
-                    return {
-                        "output": output.render(suffix="\n[Command interrupted]"),
-                        "returncode": 130,
-                    }
+                    return _result(
+                        output.render(suffix="\n[Command interrupted]"), 130
+                    )
                 if time.monotonic() > deadline:
                     if _DEBUG_INTERRUPT:
                         logger.info(
@@ -1091,12 +1163,12 @@ class BaseEnvironment(ABC):
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
                     timeout_msg = f"\n[Command timed out after {timeout}s]"
-                    return {
-                        "output": output.render(suffix=timeout_msg).lstrip()
+                    return _result(
+                        output.render(suffix=timeout_msg).lstrip()
                         if output.total_chars == 0
                         else output.render(suffix=timeout_msg),
-                        "returncode": 124,
-                    }
+                        124,
+                    )
                 # Periodic activity touch so the gateway knows we're alive
                 touch_activity_if_due(_activity_state, "terminal command running")
 
@@ -1170,7 +1242,7 @@ class BaseEnvironment(ABC):
                 proc.returncode,
             )
 
-        return {"output": output.render(), "returncode": proc.returncode}
+        return _result(output.render(), proc.returncode)
 
     def _kill_process(self, proc: ProcessHandle):
         """Terminate a process. Subclasses may override for process-group kill."""
@@ -1220,20 +1292,6 @@ class BaseEnvironment(ABC):
         line_end = line_end + 1 if line_end != -1 else len(output)
 
         result["output"] = output[:line_start] + output[line_end:]
-
-    @staticmethod
-    def _consume_exact_output_line(result: dict, marker: str) -> bool:
-        """Remove one exact internal marker line from captured output."""
-        output = str(result.get("output") or "")
-        rendered: list[str] = []
-        found = False
-        for line in output.splitlines(keepends=True):
-            if not found and line.rstrip("\r\n") == marker:
-                found = True
-                continue
-            rendered.append(line)
-        result["output"] = "".join(rendered)
-        return found
 
     # ------------------------------------------------------------------
     # Hooks
@@ -1305,15 +1363,15 @@ class BaseEnvironment(ABC):
             effective_stdin = None
 
         was_snapshot = self._snapshot_ready
-        guard_failure_marker = (
-            f"{_SNAPSHOT_GUARD_FAILURE_MARKER_PREFIX}{uuid.uuid4().hex}__"
+        guard_passed_sentinel = (
+            f"{_SNAPSHOT_GUARD_PASSED_SENTINEL_PREFIX}{uuid.uuid4().hex}__"
             if was_snapshot
             else ""
         )
         wrapped = self._wrap_command(
             exec_command,
             effective_cwd,
-            guard_failure_marker=guard_failure_marker or None,
+            guard_passed_sentinel=guard_passed_sentinel or None,
         )
 
         proc = self._run_bash(
@@ -1323,23 +1381,21 @@ class BaseEnvironment(ABC):
             clean=True,
         )
         result = self._wait_for_process(
-            proc, timeout=effective_timeout, bounded_capture=bounded_capture
+            proc,
+            timeout=effective_timeout,
+            bounded_capture=bounded_capture,
+            control_sentinel=guard_passed_sentinel or None,
         )
-        guard_failed = bool(guard_failure_marker) and self._consume_exact_output_line(
-            result, guard_failure_marker
-        )
+        guard_seen = bool(result.pop("control_seen", False))
         self._update_cwd(result)
 
-        if (
-            was_snapshot
-            and guard_failed
-            and result.get("returncode") == _SNAPSHOT_GUARD_FAILURE_EXIT
-        ):
+        if was_snapshot and not guard_seen:
             diagnostic = (
-                "Session snapshot failed its source or sanitizer guard; "
+                "Session snapshot failed its source or sanitizer guard, or cwd setup; "
                 "future commands will use a clean non-login shell."
             )
             self._set_session_mode("degraded_nonlogin", diagnostic)
+            result["returncode"] = _SNAPSHOT_GUARD_FAILURE_EXIT
             result["output"] = f"{diagnostic}\n{result.get('output', '')}".rstrip()
         elif self._diagnostic_pending:
             result["output"] = (

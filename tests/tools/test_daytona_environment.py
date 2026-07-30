@@ -1,5 +1,6 @@
 """Unit tests for the Daytona cloud sandbox environment backend."""
 
+import re
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -75,6 +76,35 @@ def make_env(daytona_sdk, monkeypatch):
         **kwargs,
     ):
         sandbox = sandbox or _make_sandbox()
+        sdk_side_effect = sandbox.process.exec.side_effect
+        if sdk_side_effect is not None:
+            if isinstance(sdk_side_effect, BaseException):
+                def invoke_side_effect(*_args, **_kwargs):
+                    raise sdk_side_effect
+            elif callable(sdk_side_effect):
+                invoke_side_effect = sdk_side_effect
+            else:
+                response_iter = iter(sdk_side_effect)
+
+                def invoke_side_effect(*_args, **_kwargs):
+                    return next(response_iter)
+
+            def bash_aware_side_effect(cmd, *args, **kwargs):
+                response = invoke_side_effect(cmd, *args, **kwargs)
+                if isinstance(response, BaseException):
+                    raise response
+                sentinel = re.search(
+                    r"__HERMES_SNAPSHOT_GUARD_PASSED_[0-9a-f]{32}__", cmd
+                )
+                if sentinel and hasattr(response, "result"):
+                    response.result = (
+                        f"\n{sentinel.group(0)}\n{response.result or ''}"
+                    )
+                return response
+
+            # The SDK fake stands in for Bash here, so reproduce the wrapper's
+            # guard-passed stdout attestation before returning command output.
+            sandbox.process.exec.side_effect = bash_aware_side_effect
         # Mock the $HOME detection
         sandbox.process.exec.return_value = _make_exec_response(result=home_dir)
 
@@ -324,9 +354,9 @@ class TestExecute:
         env = make_env(sandbox=sb)
 
         result = env.execute("echo retry")
-        # DaytonaError now surfaces directly through _ThreadedProcessHandle
-        # (no retry logic) — the error becomes returncode=1
-        assert result["returncode"] == 1
+        # No remote stdout was observed, so READY cannot prove user code began.
+        assert result["returncode"] == 125
+        assert env._session_mode == "degraded_nonlogin"
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +387,9 @@ class TestResourceConversion:
 # ---------------------------------------------------------------------------
 
 class TestInterrupt:
-    def test_interrupt_stops_sandbox_and_returns_130(self, make_env, monkeypatch):
+    def test_unattested_interrupt_stops_sandbox_and_fails_closed(
+        self, make_env, monkeypatch
+    ):
         sb = _make_sandbox()
         sb.state = "started"
         event = threading.Event()
@@ -382,7 +414,8 @@ class TestInterrupt:
         )
         try:
             result = env.execute("sleep 10")
-            assert result["returncode"] == 130
+            assert result["returncode"] == 125
+            assert env._session_mode == "degraded_nonlogin"
             sb.stop.assert_called()
         finally:
             event.set()
@@ -407,8 +440,9 @@ class TestRetryExhausted:
         env = make_env(sandbox=sb)
 
         result = env.execute("echo x")
-        # Error surfaces directly through _ThreadedProcessHandle (rc=1)
-        assert result["returncode"] == 1
+        # Error has no observable remote stdout attestation, so it fails closed.
+        assert result["returncode"] == 125
+        assert env._session_mode == "degraded_nonlogin"
 
 
 # ---------------------------------------------------------------------------

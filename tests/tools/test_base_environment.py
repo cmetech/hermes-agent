@@ -8,7 +8,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
+from tools.environments.base import (
+    BaseEnvironment,
+    _BoundedOutputCollector,
+    _RawSentinelFilter,
+)
 
 
 class _TestableEnv(BaseEnvironment):
@@ -97,6 +101,79 @@ class TestBoundedOutputCollector:
         assert len(rendered) <= 120
         assert rendered.endswith("[Command timed out after 1s]")
         assert "[OUTPUT TRUNCATED" in rendered
+
+
+class TestRawSentinelFilter:
+    def test_detects_and_strips_exact_sentinel_split_across_chunks(self):
+        sentinel_filter = _RawSentinelFilter("__HERMES_GUARD_PASSED_nonce__")
+
+        visible = "".join(
+            (
+                sentinel_filter.feed("before\n__HERMES_GUARD_"),
+                sentinel_filter.feed("PASSED_nonce__\nafter"),
+                sentinel_filter.finish(),
+            )
+        )
+
+        assert visible == "beforeafter"
+        assert sentinel_filter.seen is True
+
+    def test_only_first_exact_sentinel_is_control_data(self):
+        sentinel = "__HERMES_GUARD_PASSED_nonce__"
+        sentinel_filter = _RawSentinelFilter(sentinel)
+
+        visible = "".join(
+            (
+                sentinel_filter.feed(f"\n{sentinel}\n"),
+                sentinel_filter.feed(f"\n{sentinel}\n"),
+                sentinel_filter.finish(),
+            )
+        )
+
+        assert visible == f"\n{sentinel}\n"
+        assert sentinel_filter.seen is True
+
+    def test_partial_sentinel_prefix_is_flushed_losslessly_at_eof(self):
+        sentinel_filter = _RawSentinelFilter("__HERMES_GUARD_PASSED_nonce__")
+
+        visible = sentinel_filter.feed("user output\n__HERMES_GUARD_")
+        visible += sentinel_filter.finish()
+
+        assert visible == "user output\n__HERMES_GUARD_"
+        assert sentinel_filter.seen is False
+
+    @pytest.mark.parametrize("max_bytes", [1, 32])
+    @pytest.mark.parametrize("stream_type", [bytes, str])
+    def test_wait_detects_sentinel_before_bounded_rendering(
+        self, monkeypatch, max_bytes, stream_type
+    ):
+        sentinel = "__HERMES_GUARD_PASSED_nonce__"
+        pieces = [
+            "A" * 100,
+            "\n__HERMES_GUARD_",
+            "PASSED_nonce__\n",
+            "Z" * 100,
+        ]
+        proc = MagicMock()
+        proc.poll.return_value = 125
+        proc.returncode = 125
+        proc.stdout = iter(
+            piece.encode() if stream_type is bytes else piece for piece in pieces
+        )
+        monkeypatch.setattr(
+            "tools.tool_output_limits.get_max_bytes", lambda: max_bytes
+        )
+
+        result = _TestableEnv()._wait_for_process(
+            proc,
+            bounded_capture=True,
+            control_sentinel=sentinel,
+        )
+
+        assert result["control_seen"] is True
+        assert result["returncode"] == 125
+        assert sentinel not in result["output"]
+        assert len(result["output"]) <= max_bytes
 
 
 class TestWrapCommand:
@@ -871,6 +948,7 @@ class TestEmbedStdinHeredoc:
 class TestInitSessionFailure:
     def test_legitimate_exit_125_preserves_ready_snapshot(self, tmp_path):
         import os
+        import re
         import subprocess
 
         class RealBashEnv(_TestableEnv):
@@ -899,14 +977,63 @@ class TestInitSessionFailure:
         env._set_session_mode("snapshot")
 
         result = env.execute(
-            "printf '__HERMES_SNAPSHOT_GUARD_FAILURE_marker-like__\\n'; "
+            "if [[ $BASH_EXECUTION_STRING =~ "
+            "(__HERMES_SNAPSHOT_GUARD_PASSED_[0-9a-f]{32}__) ]]; then "
+            "printf '\\n%s\\n' \"${BASH_REMATCH[1]}\"; fi; "
             "sh -c 'exit 125'"
         )
 
         assert result["returncode"] == 125
-        assert result["output"] == "__HERMES_SNAPSHOT_GUARD_FAILURE_marker-like__\n"
+        replayed_sentinels = re.findall(
+            r"__HERMES_SNAPSHOT_GUARD_PASSED_[0-9a-f]{32}__",
+            result["output"],
+        )
+        assert len(replayed_sentinels) == 1
         assert env._session_mode == "snapshot"
         assert env._snapshot_ready is True
+
+    def test_readonly_dispatcher_source_failure_demotes_without_marker(
+        self, tmp_path
+    ):
+        import os
+        import subprocess
+
+        class RealBashEnv(_TestableEnv):
+            def _run_bash(
+                self, cmd_string, *, login=False, timeout=120,
+                stdin_data=None, clean=False,
+            ):
+                run_env = dict(os.environ)
+                if clean:
+                    run_env.update(BASH_ENV="/dev/null", ENV="/dev/null")
+                return subprocess.Popen(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", cmd_string],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    cwd=self.cwd,
+                    env=run_env,
+                )
+
+        snapshot = tmp_path / "snapshot.sh"
+        snapshot.write_text(
+            "builtin () { return 0; }\n"
+            "readonly -f builtin\n"
+        )
+        snapshot.chmod(0o600)
+        user_effect = tmp_path / "must-not-run"
+        env = RealBashEnv(cwd=str(tmp_path))
+        env._snapshot_path = str(snapshot)
+        env._set_session_mode("snapshot")
+
+        result = env.execute(f"touch {user_effect}")
+
+        assert result["returncode"] == 125
+        assert "source or sanitizer guard" in result["output"]
+        assert "__HERMES_SNAPSHOT_GUARD_PASSED_" not in result["output"]
+        assert not user_effect.exists()
+        assert env._session_mode == "degraded_nonlogin"
 
     def test_real_source_guard_failure_demotes_and_hides_internal_marker(
         self, tmp_path
@@ -941,7 +1068,7 @@ class TestInitSessionFailure:
 
         assert result["returncode"] == 125
         assert "source or sanitizer guard" in result["output"]
-        assert "__HERMES_SNAPSHOT_GUARD_FAILURE_" not in result["output"]
+        assert "__HERMES_SNAPSHOT_GUARD_PASSED_" not in result["output"]
         assert not user_effect.exists()
         assert env._session_mode == "degraded_nonlogin"
 
@@ -1059,8 +1186,6 @@ class TestInitSessionFailure:
         assert "rm -f" in calls[-2][0]
 
     def test_ready_source_failure_stops_command_and_demotes(self, tmp_path):
-        import re
-
         env = _TestableEnv(cwd=str(tmp_path))
         env._snapshot_ready = True
         env._session_mode = "snapshot"
@@ -1072,11 +1197,8 @@ class TestInitSessionFailure:
             mock = MagicMock()
             mock.poll.return_value = 0
             mock.returncode = 125
-            marker = re.search(
-                r"__HERMES_SNAPSHOT_GUARD_FAILURE_[0-9a-f]{32}__", cmd
-            )
-            assert marker
-            mock.stdout = iter([marker.group(0) + "\n"])
+            assert "__HERMES_SNAPSHOT_GUARD_PASSED_" in cmd
+            mock.stdout = iter([])
             return mock
 
         env._run_bash = mock_run_bash
