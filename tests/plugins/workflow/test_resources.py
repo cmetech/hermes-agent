@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -95,6 +96,78 @@ def test_archon_resolver_uses_canonical_candidate_identity_and_verified_bytes(
     assert resolved.node_id == "collect"
     assert resolved.attempt_id == "attempt-winner"
     assert resolved.publication_id is None
+
+
+def test_archon_resolver_reads_once_from_a_bounded_no_follow_descriptor(
+    tmp_path: Path, monkeypatch
+):
+    canonical = b'{"ok":true}'
+    output = tmp_path / "nodes" / "node" / "attempt" / "output.json"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(canonical)
+    held = output.with_name("held.json")
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(b'{"no":true}')
+    original_read = os.read
+    read_sizes = []
+    injected = False
+
+    def swap_path_after_open(descriptor, size):
+        nonlocal injected
+        read_sizes.append(size)
+        if not injected:
+            output.rename(held)
+            output.symlink_to(outside)
+            injected = True
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(output_resolution.os, "read", swap_path_after_open)
+
+    resolved = output_resolution.resolve_node_output(
+        run_directory=tmp_path,
+        node_id="collect",
+        attempt_id="attempt-winner",
+        descriptor={
+            "node_id": "collect",
+            "attempt_id": "attempt-winner",
+            "relative_path": "nodes/node/attempt/output.json",
+            "media_type": "application/json",
+            "size_bytes": len(canonical),
+            "sha256": hashlib.sha256(canonical).hexdigest(),
+        },
+    )
+
+    assert injected
+    assert output.is_symlink()
+    assert read_sizes and max(read_sizes) <= len(canonical) + 1
+    assert resolved.canonical_bytes == canonical
+    assert resolved.value["ok"] is True
+
+
+def test_archon_resolver_fails_closed_without_safe_descriptor_io(
+    tmp_path: Path, monkeypatch
+):
+    canonical = b'{"ok":true}'
+    (tmp_path / "output.json").write_bytes(canonical)
+    monkeypatch.setattr(output_resolution, "_HAS_DESCRIPTOR_RELATIVE_IO", False)
+
+    with pytest.raises(
+        output_resolution.ArchonOutputIntegrityError,
+        match="descriptor-relative.*reading is unavailable",
+    ):
+        output_resolution.resolve_node_output(
+            run_directory=tmp_path,
+            node_id="collect",
+            attempt_id="attempt-winner",
+            descriptor={
+                "node_id": "collect",
+                "attempt_id": "attempt-winner",
+                "relative_path": "output.json",
+                "media_type": "application/json",
+                "size_bytes": len(canonical),
+                "sha256": hashlib.sha256(canonical).hexdigest(),
+            },
+        )
 
 
 def test_primary_output_candidate_identity_preserves_open_output_type_boundary():

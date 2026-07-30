@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -19,6 +20,7 @@ _HAS_DESCRIPTOR_RELATIVE_IO = (
     os.open in os.supports_dir_fd
     and os.mkdir in os.supports_dir_fd
     and os.unlink in os.supports_dir_fd
+    and hasattr(os, "O_NOFOLLOW")
 )
 PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY = "primary_output_candidate"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -35,6 +37,10 @@ _PRIMARY_OUTPUT_CANDIDATE_FIELDS = frozenset({
 
 class ArchonOutputIntegrityError(RuntimeError):
     """An attempt-local Archon output could not be created safely."""
+
+
+class ArchonOutputUnavailableError(RuntimeError):
+    """An attempt-local output could not be read due to transient host I/O."""
 
 
 def _safe_component(kind: str, value: str) -> str:
@@ -159,6 +165,75 @@ def write_archon_output_exclusive(
         filename,
         data,
     )
+
+
+def _read_descriptor_relative(
+    run_directory: Path,
+    relative_path: str,
+    *,
+    size_bytes: int,
+) -> bytes:
+    """Read one bounded file through a no-follow descriptor chain."""
+    relative = PurePosixPath(relative_path)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or ".." in relative.parts
+        or "\\" in relative_path
+    ):
+        raise ArchonOutputIntegrityError("Archon output path is invalid")
+    if not _HAS_DESCRIPTOR_RELATIVE_IO:
+        raise ArchonOutputIntegrityError(
+            "Secure descriptor-relative Archon output reading is unavailable"
+        )
+    descriptors: list[int] = []
+    output_descriptor: int | None = None
+    try:
+        root = os.open(run_directory, _directory_flags())
+        descriptors.append(root)
+        parent = root
+        for component in relative.parts[:-1]:
+            parent = _open_directory(parent, component, create=False)
+            descriptors.append(parent)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+        output_descriptor = os.open(relative.parts[-1], flags, dir_fd=parent)
+        observed = os.fstat(output_descriptor)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_size != size_bytes
+        ):
+            raise ArchonOutputIntegrityError("Archon output file identity changed")
+        remaining = size_bytes + 1
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(output_descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    except ArchonOutputIntegrityError:
+        raise
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}:
+            raise ArchonOutputIntegrityError(
+                "Archon output path is not regular"
+            ) from exc
+        raise ArchonOutputUnavailableError(
+            "Archon output is temporarily unavailable"
+        ) from exc
+    finally:
+        if output_descriptor is not None:
+            try:
+                os.close(output_descriptor)
+            except OSError:
+                pass
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _freeze_json(value: object) -> object:
@@ -336,21 +411,11 @@ def resolve_node_output(
         raise ArchonOutputIntegrityError(
             "Archon output candidate and descriptor disagree"
         )
-    root = run_directory.resolve()
-    path = run_directory / relative_path
-    try:
-        if path.is_symlink():
-            raise ArchonOutputIntegrityError("Archon output path is not regular")
-        resolved_path = path.resolve(strict=True)
-        resolved_path.relative_to(root)
-        observed = resolved_path.stat()
-        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-            raise ArchonOutputIntegrityError("Archon output path is not regular")
-        canonical_bytes = resolved_path.read_bytes()
-    except ArchonOutputIntegrityError:
-        raise
-    except (OSError, ValueError) as exc:
-        raise ArchonOutputIntegrityError("Archon output could not be read") from exc
+    canonical_bytes = _read_descriptor_relative(
+        run_directory,
+        relative_path,
+        size_bytes=size_bytes,
+    )
     if (
         len(canonical_bytes) != size_bytes
         or hashlib.sha256(canonical_bytes).hexdigest() != digest
@@ -414,6 +479,7 @@ def resolve_legacy_output_values(
 
 __all__ = [
     "ArchonOutputIntegrityError",
+    "ArchonOutputUnavailableError",
     "PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY",
     "PrimaryOutputCandidate",
     "ResolvedNodeOutput",

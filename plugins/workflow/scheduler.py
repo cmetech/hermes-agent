@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -50,6 +51,7 @@ from plugins.workflow.models import (
 )
 from plugins.workflow.output_resolution import (
     ArchonOutputIntegrityError,
+    ArchonOutputUnavailableError,
     PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY,
     PrimaryOutputCandidate,
     ResolvedNodeOutput,
@@ -82,7 +84,9 @@ _CLAUSE = re.compile(
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LEGACY_PACKAGE_PATHS = 4096
 _LEGACY_PACKAGE_PATH_CHARS = 512
-_OUTPUT_RESOLUTION_CACHE_LIMIT = 4096
+_OUTPUT_RESOLUTION_CACHE_MAX_BYTES = 16 * 1024 * 1024
+_OUTPUT_CACHE_ENTRY_OVERHEAD = 512
+_OUTPUT_CACHE_MISS = object()
 _LEGACY_NON_PACKAGE_FILES = frozenset(
     {
         ".lock",
@@ -96,6 +100,72 @@ _LEGACY_NON_PACKAGE_FILES = frozenset(
 _LEGACY_NON_PACKAGE_ROOTS = frozenset(
     {"artifacts", "inputs", "node-agent-skills", "node-skills", "nodes"}
 )
+
+
+def _cache_text_weight(value: str) -> int:
+    return 49 + len(value.encode("utf-8"))
+
+
+def _cache_value_weight(value: object) -> int:
+    """Conservatively estimate retained immutable JSON memory."""
+    if value is None or isinstance(value, bool):
+        return 16
+    if isinstance(value, int | float):
+        return 32
+    if isinstance(value, str):
+        return _cache_text_weight(value)
+    if isinstance(value, bytes):
+        return 33 + len(value)
+    if isinstance(value, Mapping):
+        return 64 + sum(
+            _cache_text_weight(str(key)) + _cache_value_weight(item) + 16
+            for key, item in value.items()
+        )
+    if isinstance(value, tuple | list):
+        return 56 + sum(_cache_value_weight(item) + 8 for item in value)
+    return 128
+
+
+def _cache_key_weight(key: tuple[object, ...]) -> int:
+    return 64 + sum(_cache_value_weight(item) for item in key)
+
+
+def _resolved_output_weight(
+    key: tuple[object, ...], value: ResolvedNodeOutput | None
+) -> int:
+    weight = _OUTPUT_CACHE_ENTRY_OVERHEAD + _cache_key_weight(key)
+    if value is None:
+        return weight
+    return (
+        weight
+        + len(value.canonical_bytes)
+        + len(value.text.encode("utf-8"))
+        + _cache_value_weight(value.value)
+    )
+
+
+def _primary_candidate_weight(
+    key: tuple[str, str, str], candidate: PrimaryOutputCandidate
+) -> int:
+    return (
+        _OUTPUT_CACHE_ENTRY_OVERHEAD
+        + _cache_key_weight(key)
+        + candidate.size_bytes
+        + _cache_value_weight(candidate.structured_value)
+        + _cache_text_weight(candidate.attempt_relative_path)
+        + _cache_text_weight(candidate.media_type)
+        + _cache_text_weight(candidate.sha256)
+        + (
+            _cache_text_weight(candidate.schema_fingerprint)
+            if candidate.schema_fingerprint is not None
+            else 0
+        )
+        + (
+            _cache_text_weight(candidate.output_type)
+            if candidate.output_type is not None
+            else 0
+        )
+    )
 
 _SEALED_STRUCTURED_DECISION_FIELDS = frozenset({
     "strategy",
@@ -450,6 +520,11 @@ class RunScheduler:
         self._primary_output_candidates: dict[
             tuple[str, str, str], PrimaryOutputCandidate
         ] = {}
+        self._output_resolution_cache_lru: OrderedDict[
+            tuple[str, tuple[object, ...]], int
+        ] = OrderedDict()
+        self._output_resolution_cache_bytes = 0
+        self._output_resolution_cache_max_bytes = _OUTPUT_RESOLUTION_CACHE_MAX_BYTES
         self._submission_pool = ThreadPoolExecutor(
             max_workers=self.max_parallel_nodes,
             thread_name_prefix="workflow-run",
@@ -559,8 +634,6 @@ class RunScheduler:
         self._ensure_output_resolution_state()
         run_id = str(projection.get("run_id", ""))
         root_identity = str(run_directory.resolve())
-        active_resolution_keys: set[tuple[object, ...]] = set()
-        active_candidate_keys: set[tuple[str, str, str]] = set()
         outputs: dict[str, object] = {}
         for node_id, node_state in nodes.items():
             if not isinstance(node_id, str) or not isinstance(node_state, Mapping):
@@ -580,7 +653,6 @@ class RunScheduler:
                 continue
             winning_attempt = str(winning_attempt_state["attempt_id"])
             candidate_key = (run_id, node_id, winning_attempt)
-            active_candidate_keys.add(candidate_key)
             node_type = str(node_state.get("type", ""))
             requires_candidate = node_type in {"command", "prompt"}
             raw_metadata = winning_attempt_state.get("metadata")
@@ -598,7 +670,9 @@ class RunScheduler:
                 except ArchonOutputIntegrityError:
                     continue
                 with self._output_resolution_lock:
-                    live_candidate = self._primary_output_candidates.get(candidate_key)
+                    live_candidate = self._cached_primary_output_candidate(
+                        candidate_key
+                    )
                 if live_candidate is not None:
                     if primary_output_candidate_identity(live_candidate) != dict(
                         raw_candidate
@@ -666,9 +740,9 @@ class RunScheduler:
                     else (None,) * 7
                 ),
             )
-            active_resolution_keys.add(resolution_key)
             with self._output_resolution_lock:
-                if resolution_key not in self._resolved_output_cache:
+                resolved = self._cached_resolved_output(resolution_key)
+                if resolved is _OUTPUT_CACHE_MISS:
                     try:
                         resolved = resolve_node_output(
                             run_directory=run_directory,
@@ -686,21 +760,13 @@ class RunScheduler:
                         # Preserve Phase 2 missing-output outcomes. Phase 3
                         # makes integrity and missing references strict.
                         resolved = None
-                    self._resolved_output_cache[resolution_key] = resolved
-                    self._bound_output_resolution_caches()
-                resolved = self._resolved_output_cache[resolution_key]
+                    except ArchonOutputUnavailableError:
+                        # Host-level read availability is retryable. Do not
+                        # turn one transient failure into a stable cache miss.
+                        continue
+                    self._cache_resolved_output(resolution_key, resolved)
             if resolved is not None:
                 outputs[node_id] = resolved
-        with self._output_resolution_lock:
-            for key in tuple(self._resolved_output_cache):
-                if (
-                    key[:2] == (root_identity, run_id)
-                    and key not in active_resolution_keys
-                ):
-                    self._resolved_output_cache.pop(key, None)
-            for key in tuple(self._primary_output_candidates):
-                if key[0] == run_id and key not in active_candidate_keys:
-                    self._primary_output_candidates.pop(key, None)
         return outputs
 
     def _ensure_output_resolution_state(self) -> None:
@@ -709,26 +775,124 @@ class RunScheduler:
         self._output_resolution_lock = threading.RLock()
         self._resolved_output_cache = {}
         self._primary_output_candidates = {}
+        self._output_resolution_cache_lru = OrderedDict()
+        self._output_resolution_cache_bytes = 0
+        self._output_resolution_cache_max_bytes = _OUTPUT_RESOLUTION_CACHE_MAX_BYTES
 
     def _bound_output_resolution_caches(self) -> None:
-        for cache in (
-            self._resolved_output_cache,
-            self._primary_output_candidates,
+        while (
+            self._output_resolution_cache_bytes
+            > self._output_resolution_cache_max_bytes
+            and self._output_resolution_cache_lru
         ):
-            while len(cache) > _OUTPUT_RESOLUTION_CACHE_LIMIT:
-                cache.pop(next(iter(cache)))
+            (kind, key), weight = self._output_resolution_cache_lru.popitem(
+                last=False
+            )
+            self._output_resolution_cache_bytes -= weight
+            if kind == "resolved":
+                self._resolved_output_cache.pop(key, None)
+            else:
+                self._primary_output_candidates.pop(key, None)
 
-    def _remember_primary_output_candidate(
+    def _track_output_cache_entry(
         self,
-        claim: NodeClaim,
-        candidate: PrimaryOutputCandidate,
+        kind: str,
+        key: tuple[object, ...],
+        weight: int,
     ) -> None:
+        cache_key = (kind, key)
+        previous = self._output_resolution_cache_lru.pop(cache_key, 0)
+        self._output_resolution_cache_bytes -= previous
+        self._output_resolution_cache_lru[cache_key] = weight
+        self._output_resolution_cache_bytes += weight
+        self._bound_output_resolution_caches()
+
+    def _remove_output_cache_entry(
+        self, kind: str, key: tuple[object, ...]
+    ) -> None:
+        weight = self._output_resolution_cache_lru.pop((kind, key), 0)
+        self._output_resolution_cache_bytes -= weight
+        if kind == "resolved":
+            self._resolved_output_cache.pop(key, None)
+        else:
+            self._primary_output_candidates.pop(key, None)
+
+    def _purge_run_output_cache(self, run_id: str) -> None:
         self._ensure_output_resolution_state()
         with self._output_resolution_lock:
-            self._primary_output_candidates[
-                (claim.run_id, claim.node_id, claim.attempt_id)
-            ] = candidate
-            self._bound_output_resolution_caches()
+            for key in tuple(self._resolved_output_cache):
+                if key[1] == run_id:
+                    self._remove_output_cache_entry("resolved", key)
+            for key in tuple(self._primary_output_candidates):
+                if key[0] == run_id:
+                    self._remove_output_cache_entry("candidate", key)
+
+    def _purge_attempt_output_cache(self, claim: NodeClaim) -> None:
+        candidate_key = (claim.run_id, claim.node_id, claim.attempt_id)
+        self._remove_output_cache_entry("candidate", candidate_key)
+        for key in tuple(self._resolved_output_cache):
+            if key[1:4] == candidate_key:
+                self._remove_output_cache_entry("resolved", key)
+
+    def _purge_terminal_run_output_cache(self, run_id: str) -> None:
+        try:
+            terminal = self.store.load_run(run_id).get("status") in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "abandoned",
+            }
+        except (KeyError, OSError, RuntimeError, ValueError):
+            return
+        if not terminal:
+            return
+        with self._activity:
+            if run_id in self._active_runs or run_id in self._submitted_runs:
+                return
+            self._purge_run_output_cache(run_id)
+
+    def _touch_output_cache_entry(
+        self, kind: str, key: tuple[object, ...]
+    ) -> None:
+        cache_key = (kind, key)
+        if cache_key in self._output_resolution_cache_lru:
+            self._output_resolution_cache_lru.move_to_end(cache_key)
+
+    def _cached_resolved_output(
+        self, key: tuple[object, ...]
+    ) -> object:
+        if key not in self._resolved_output_cache:
+            return _OUTPUT_CACHE_MISS
+        self._touch_output_cache_entry("resolved", key)
+        return self._resolved_output_cache[key]
+
+    def _cache_resolved_output(
+        self,
+        key: tuple[object, ...],
+        resolved: ResolvedNodeOutput | None,
+    ) -> None:
+        self._resolved_output_cache[key] = resolved
+        self._track_output_cache_entry(
+            "resolved", key, _resolved_output_weight(key, resolved)
+        )
+
+    def _cached_primary_output_candidate(
+        self, key: tuple[str, str, str]
+    ) -> PrimaryOutputCandidate | None:
+        candidate = self._primary_output_candidates.get(key)
+        if candidate is not None:
+            self._touch_output_cache_entry("candidate", key)
+        return candidate
+
+    def _cache_primary_output_candidate(
+        self,
+        key: tuple[str, str, str],
+        candidate: PrimaryOutputCandidate,
+    ) -> None:
+        self._primary_output_candidates[key] = candidate
+        self._track_output_cache_entry(
+            "candidate", key, _primary_candidate_weight(key, candidate)
+        )
 
     def _variables(
         self,
@@ -2229,16 +2393,34 @@ class RunScheduler:
                     candidate_identity
                 )
                 retained_candidate = result.primary_output
-            self.store.complete_node(
-                claim,
-                status=result.status,
-                artifacts=result.artifacts,
-                error_code=result.error_code,
-                error_message=result.error_message,
-                metadata=completion_metadata,
-            )
             if retained_candidate is not None:
-                self._remember_primary_output_candidate(claim, retained_candidate)
+                self._ensure_output_resolution_state()
+                with self._output_resolution_lock:
+                    self._cache_primary_output_candidate(
+                        (claim.run_id, claim.node_id, claim.attempt_id),
+                        retained_candidate,
+                    )
+                    try:
+                        self.store.complete_node(
+                            claim,
+                            status=result.status,
+                            artifacts=result.artifacts,
+                            error_code=result.error_code,
+                            error_message=result.error_message,
+                            metadata=completion_metadata,
+                        )
+                    except BaseException:
+                        self._purge_attempt_output_cache(claim)
+                        raise
+            else:
+                self.store.complete_node(
+                    claim,
+                    status=result.status,
+                    artifacts=result.artifacts,
+                    error_code=result.error_code,
+                    error_message=result.error_message,
+                    metadata=completion_metadata,
+                )
             return
         policy = self._effective_retry_policy(node, execution_limits)
         projection = self.store.load_run(claim.run_id)
@@ -2455,6 +2637,7 @@ class RunScheduler:
             with self._activity:
                 self._active_runs.discard(run_id)
                 self._activity.notify_all()
+            self._purge_terminal_run_output_cache(run_id)
 
     def submit(self, run_id: str, fence: ExecutionFence) -> bool:
         """Submit one run without waiting, deduplicated under the exact fence."""
@@ -2474,6 +2657,7 @@ class RunScheduler:
                 with self._activity:
                     self._submitted_runs.discard(run_id)
                     self._activity.notify_all()
+                self._purge_terminal_run_output_cache(run_id)
 
         try:
             self._submission_pool.submit(execute)
@@ -2703,6 +2887,8 @@ class RunScheduler:
             with self._activity:
                 self._active_runs.difference_update(run_ids)
                 self._activity.notify_all()
+            for run_id in run_ids:
+                self._purge_terminal_run_output_cache(run_id)
 
     def shutdown(self, *, deadline_seconds: float | None = None) -> None:
         deadline_seconds = (

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import copy
+from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import multiprocessing
@@ -8,11 +11,14 @@ import threading
 
 import pytest
 
+from plugins.workflow import output_resolution
 from plugins.workflow.admission import RunAdmissionRequest
-from plugins.workflow.output_resolution import ResolvedNodeOutput
+from plugins.workflow.executors.base import NodeExecutionResult
+from plugins.workflow.models import RunExecutionLimits, WorkflowNode
+from plugins.workflow.output_resolution import PrimaryOutputCandidate, ResolvedNodeOutput
 from plugins.workflow.scheduler import RunScheduler, evaluate_condition
 from plugins.workflow.schema import load_workflow
-from plugins.workflow.store import RunStore
+from plugins.workflow.store import ArtifactRef, NodeClaim, RunStore
 from plugins.workflow import locks
 
 
@@ -253,7 +259,9 @@ def test_archon_consumers_select_winning_canonical_output_once(tmp_path):
 
     assert replacement_resolved is not resolved
     assert replacement_resolved.value["summary"]["count"] == 4
-    assert len(scheduler._resolved_output_cache) == 1
+    assert scheduler._output_resolution_cache_bytes <= (
+        scheduler._output_resolution_cache_max_bytes
+    )
 
 
 @pytest.mark.parametrize("candidate_state", ("missing", "disagrees"))
@@ -392,6 +400,71 @@ def test_archon_shell_output_retains_stdout_compatibility(tmp_path):
     assert resolved.value["ok"] is True
 
 
+def test_archon_transient_read_failure_is_retried_for_the_same_identity(
+    tmp_path, monkeypatch
+):
+    canonical = b'{"ok":true}'
+    output = tmp_path / "output.json"
+    output.write_bytes(canonical)
+    digest = hashlib.sha256(canonical).hexdigest()
+    candidate = {
+        "attempt_relative_path": "output.json",
+        "media_type": "application/json",
+        "size_bytes": len(canonical),
+        "sha256": digest,
+        "schema_fingerprint": "3" * 64,
+        "canonicalization_version": 1,
+        "output_type": None,
+    }
+    projection = {
+        "run_id": "run-1",
+        "language": {
+            "effective_profile": "archon-2026-07",
+            "normalizer_version": 2,
+            "normalized_definition_digest": "1" * 64,
+            "semantic_fingerprint": "2" * 64,
+            "structured_outputs": {},
+        },
+        "nodes": {
+            "collect": {
+                "type": "prompt",
+                "attempts": [{
+                    "attempt_id": "attempt-winner",
+                    "state": "succeeded",
+                    "metadata": {"primary_output_candidate": candidate},
+                }],
+            }
+        },
+        "artifacts": [{
+            "node_id": "collect",
+            "attempt_id": "attempt-winner",
+            "relative_path": "output.json",
+            "media_type": "application/json",
+            "size_bytes": len(canonical),
+            "sha256": digest,
+        }],
+    }
+    original_read = output_resolution.os.read
+    attempts = 0
+
+    def fail_once(descriptor, size):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError(errno.EIO, "temporary read failure")
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(output_resolution.os, "read", fail_once)
+    scheduler = RunScheduler.__new__(RunScheduler)
+
+    first = scheduler._output_values(projection, tmp_path)
+    second = scheduler._output_values(projection, tmp_path)
+
+    assert first == {}
+    assert second["collect"].value["ok"] is True
+    assert attempts >= 2
+
+
 def test_archon_resolution_failure_is_stable_for_one_descriptor_identity(tmp_path):
     canonical = b'{"ok":true}'
     output = tmp_path / "output.json"
@@ -441,6 +514,274 @@ def test_archon_resolution_failure_is_stable_for_one_descriptor_identity(tmp_pat
     second = scheduler._output_values(projection, tmp_path)
 
     assert first == second == {}
+
+
+def test_stale_parallel_projection_cannot_prune_newer_resolved_output(tmp_path):
+    paths = {node_id: tmp_path / node_id / "output.json" for node_id in ("a", "b")}
+    for node_id, path in paths.items():
+        path.parent.mkdir()
+        path.write_bytes(json.dumps({"node": node_id}).encode())
+
+    def descriptor(node_id):
+        data = paths[node_id].read_bytes()
+        return {
+            "node_id": node_id,
+            "attempt_id": f"attempt-{node_id}",
+            "relative_path": paths[node_id].relative_to(tmp_path).as_posix(),
+            "media_type": "application/json",
+            "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+
+    projection = {
+        "run_id": "run-1",
+        "language": {
+            "effective_profile": "archon-2026-07",
+            "normalizer_version": 2,
+            "normalized_definition_digest": "1" * 64,
+            "semantic_fingerprint": "2" * 64,
+            "structured_outputs": {},
+        },
+        "nodes": {
+            node_id: {
+                "type": "bash",
+                "attempts": [{
+                    "attempt_id": f"attempt-{node_id}",
+                    "state": "succeeded",
+                }],
+            }
+            for node_id in paths
+        },
+        "artifacts": [descriptor(node_id) for node_id in paths],
+    }
+    stale = copy.deepcopy(projection)
+    stale["nodes"].pop("b")
+    stale["artifacts"] = [stale["artifacts"][0]]
+    scheduler = RunScheduler.__new__(RunScheduler)
+    authoritative = scheduler._output_values(projection, tmp_path)
+    paths["b"].write_bytes(b'{"node":"mutated"}')
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(scheduler._output_values, stale, tmp_path).result()
+    after_stale = scheduler._output_values(projection, tmp_path)
+
+    assert after_stale["b"] is authoritative["b"]
+
+
+def test_resolved_output_cache_uses_a_shared_byte_weighted_lru(tmp_path):
+    def projection(node_id):
+        data = json.dumps({"node": node_id, "value": "x" * 64}).encode()
+        path = tmp_path / node_id / "output.json"
+        path.parent.mkdir()
+        path.write_bytes(data)
+        return data, path, {
+            "run_id": "run-1",
+            "language": {
+                "effective_profile": "archon-2026-07",
+                "normalizer_version": 2,
+                "normalized_definition_digest": "1" * 64,
+                "semantic_fingerprint": "2" * 64,
+                "structured_outputs": {},
+            },
+            "nodes": {
+                node_id: {
+                    "type": "bash",
+                    "attempts": [{
+                        "attempt_id": f"attempt-{node_id}",
+                        "state": "succeeded",
+                    }],
+                }
+            },
+            "artifacts": [{
+                "node_id": node_id,
+                "attempt_id": f"attempt-{node_id}",
+                "relative_path": path.relative_to(tmp_path).as_posix(),
+                "media_type": "application/json",
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }],
+        }
+
+    entries = {node_id: projection(node_id) for node_id in ("a", "b", "c")}
+    scheduler = RunScheduler.__new__(RunScheduler)
+    scheduler._ensure_output_resolution_state()
+    scheduler._output_resolution_cache_max_bytes = 1_000_000
+    first = scheduler._output_values(entries["a"][2], tmp_path)["a"]
+    single_weight = scheduler._output_resolution_cache_bytes
+    scheduler._output_resolution_cache_max_bytes = single_weight * 2
+
+    scheduler._output_values(entries["b"][2], tmp_path)
+    assert scheduler._output_values(entries["a"][2], tmp_path)["a"] is first
+    entries["a"][1].write_bytes(b"x" * len(entries["a"][0]))
+    entries["b"][1].write_bytes(b"x" * len(entries["b"][0]))
+    scheduler._output_values(entries["c"][2], tmp_path)
+
+    assert single_weight >= len(entries["a"][0]) * 3
+    assert scheduler._output_resolution_cache_bytes <= (
+        scheduler._output_resolution_cache_max_bytes
+    )
+    assert scheduler._output_values(entries["a"][2], tmp_path)["a"] is first
+    assert scheduler._output_values(entries["b"][2], tmp_path) == {}
+
+
+def test_candidate_registration_is_linearized_with_durable_completion(tmp_path):
+    canonical = b'{"ok":true}'
+    output = tmp_path / "output.json"
+    output.write_bytes(canonical)
+    digest = hashlib.sha256(canonical).hexdigest()
+    artifact = ArtifactRef("output.json", "application/json", len(canonical), digest)
+    candidate = PrimaryOutputCandidate(
+        attempt_relative_path="output.json",
+        media_type="application/json",
+        size_bytes=len(canonical),
+        sha256=digest,
+        structured_value={"ok": True},
+        schema_fingerprint="3" * 64,
+        canonicalization_version=1,
+        output_type="Result",
+    )
+    claim = NodeClaim(
+        run_id="run-1",
+        node_id="collect",
+        attempt_id="attempt-1",
+        owner_id="owner",
+        lease_expires_at=datetime.now(timezone.utc),
+    )
+    visible = threading.Event()
+    release = threading.Event()
+    resolver_started = threading.Event()
+    resolver_done = threading.Event()
+
+    class BlockingStore:
+        def __init__(self):
+            self.projection = {
+                "run_id": "run-1",
+                "language": {
+                    "effective_profile": "archon-2026-07",
+                    "normalizer_version": 2,
+                    "normalized_definition_digest": "1" * 64,
+                    "semantic_fingerprint": "2" * 64,
+                    "structured_outputs": {},
+                },
+                "nodes": {
+                    "collect": {
+                        "type": "prompt",
+                        "attempts": [{
+                            "attempt_id": "attempt-1",
+                            "state": "running",
+                        }],
+                    }
+                },
+                "artifacts": [],
+            }
+
+        def complete_node(self, completed_claim, **kwargs):
+            attempt = self.projection["nodes"]["collect"]["attempts"][-1]
+            attempt.update({
+                "state": kwargs["status"],
+                "metadata": copy.deepcopy(kwargs["metadata"]),
+            })
+            self.projection["artifacts"] = [{
+                "node_id": completed_claim.node_id,
+                "attempt_id": completed_claim.attempt_id,
+                "relative_path": artifact.relative_path,
+                "media_type": artifact.media_type,
+                "size_bytes": artifact.size_bytes,
+                "sha256": artifact.sha256,
+            }]
+            visible.set()
+            assert release.wait(timeout=2)
+
+        def load_run(self, _run_id):
+            return copy.deepcopy(self.projection)
+
+    scheduler = RunScheduler.__new__(RunScheduler)
+    scheduler.store = BlockingStore()
+    scheduler._ensure_output_resolution_state()
+    result = NodeExecutionResult(
+        "succeeded",
+        (artifact,),
+        primary_output=candidate,
+    )
+    node = WorkflowNode("collect", "prompt", "produce", (), 0, None, {})
+
+    def resolve_visible_output():
+        resolver_started.set()
+        try:
+            return scheduler._output_values(
+                scheduler.store.load_run("run-1"), tmp_path
+            )
+        finally:
+            resolver_done.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        persist = pool.submit(
+            scheduler._persist_result,
+            claim,
+            node,
+            result,
+            RunExecutionLimits(),
+        )
+        assert visible.wait(timeout=1)
+        resolve = pool.submit(resolve_visible_output)
+        assert resolver_started.wait(timeout=1)
+        try:
+            assert not resolver_done.wait(timeout=0.1)
+        finally:
+            release.set()
+        persist.result(timeout=1)
+        resolved = resolve.result(timeout=1)["collect"]
+
+    assert resolved.value is candidate.structured_value
+
+
+def test_failed_durable_completion_rolls_back_registered_candidate(tmp_path):
+    canonical = b'{"ok":true}'
+    digest = hashlib.sha256(canonical).hexdigest()
+    candidate = PrimaryOutputCandidate(
+        attempt_relative_path="output.json",
+        media_type="application/json",
+        size_bytes=len(canonical),
+        sha256=digest,
+        structured_value={"ok": True},
+        schema_fingerprint="3" * 64,
+        canonicalization_version=1,
+        output_type=None,
+    )
+    claim = NodeClaim(
+        "run-1",
+        "collect",
+        "attempt-1",
+        "owner",
+        datetime.now(timezone.utc),
+    )
+
+    class FailingStore:
+        @staticmethod
+        def complete_node(*_args, **_kwargs):
+            raise RuntimeError("durable completion failed")
+
+    scheduler = RunScheduler.__new__(RunScheduler)
+    scheduler.store = FailingStore()
+    scheduler._ensure_output_resolution_state()
+    result = NodeExecutionResult(
+        "succeeded",
+        (ArtifactRef("output.json", "application/json", len(canonical), digest),),
+        primary_output=candidate,
+    )
+    node = WorkflowNode("collect", "prompt", "produce", (), 0, None, {})
+
+    with pytest.raises(RuntimeError, match="durable completion failed"):
+        scheduler._persist_result(
+            claim,
+            node,
+            result,
+            RunExecutionLimits(),
+        )
+
+    assert scheduler._primary_output_candidates == {}
+    assert scheduler._resolved_output_cache == {}
+    assert scheduler._output_resolution_cache_bytes == 0
 
 
 def test_legacy_output_scanning_and_parsing_order_remains_unchanged(tmp_path):

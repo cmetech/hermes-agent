@@ -10,7 +10,6 @@ from agent.plugin_agent import PluginAgentRunResult
 from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.entitlement import AIEntitlementResolution
-from plugins.workflow import output_resolution
 from plugins.workflow.runner_binding import (
     RunnerCapabilities,
     execution_capability_context,
@@ -236,7 +235,7 @@ def test_scheduler_sidecar_caps_normal_ai_request_fields_exactly(
 
 
 def test_archon_scheduler_binds_sealed_structured_request_and_canonical_output(
-    tmp_path, workflow_writer, monkeypatch
+    tmp_path, workflow_writer
 ):
     output_type = "MixedCase/rapport-分析-" + ("Ω" * 300)
     workflow = workflow_writer(
@@ -324,20 +323,13 @@ def test_archon_scheduler_binds_sealed_structured_request_and_canonical_output(
         "canonicalization_version": 1,
         "output_type": output_type,
     }
-    monkeypatch.setattr(
-        output_resolution.json,
-        "loads",
-        lambda _value: pytest.fail("canonical output was reparsed"),
-    )
+    assert scheduler._primary_output_candidates == {}
+    assert scheduler._resolved_output_cache == {}
+    assert scheduler._output_resolution_cache_bytes == 0
     resolved = scheduler._output_values(
         result, store.run_directory(admitted.run_id)
     )["work"]
     assert resolved.value == {"a": 1, "b": True}
-    live_candidate = scheduler._primary_output_candidates[
-        (admitted.run_id, "work", result["nodes"]["work"]["attempts"][-1]["attempt_id"])
-    ]
-    assert resolved.value is live_candidate.structured_value
-    assert live_candidate.output_type == output_type
 
 
 @pytest.mark.parametrize(
