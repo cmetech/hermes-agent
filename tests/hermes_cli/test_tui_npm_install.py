@@ -8,9 +8,12 @@ import pytest
 
 
 @pytest.fixture
-def main_mod():
+def main_mod(monkeypatch):
     import hermes_cli.main as m
 
+    # Source-flow tests must not depend on whether this checkout happens to
+    # contain the ignored wheel artifact. Bundled-flow tests opt in explicitly.
+    monkeypatch.setattr(m, "_find_bundled_tui", lambda *_args, **_kwargs: None)
     return m
 
 
