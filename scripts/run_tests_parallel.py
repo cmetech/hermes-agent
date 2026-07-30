@@ -50,7 +50,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, List, Tuple
 
 
@@ -86,10 +86,8 @@ def _parse_cgroup_v1_cpu_quota(
     return _cpu_quota_count(quota_raw.strip(), period_raw.strip())
 
 
-def _read_cgroup_cpu_count(
-    cgroup_root: Path = Path("/sys/fs/cgroup"),
-) -> int | None:
-    """Read the process-visible cgroup v2 or v1 whole-CPU quota."""
+def _read_cgroup_root_cpu_count(cgroup_root: Path) -> int | None:
+    """Best-effort fallback for namespaced cgroup roots without proc metadata."""
     v2_path = cgroup_root / "cpu.max"
     try:
         v2_raw = v2_path.read_text(encoding="utf-8")
@@ -116,6 +114,161 @@ def _read_cgroup_cpu_count(
             continue
         return _parse_cgroup_v1_cpu_quota(quota_raw, period_raw)
     return None
+
+
+def _read_optional_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+
+
+def _parse_cgroup_memberships(raw: str) -> tuple[str | None, str | None]:
+    """Return unified-v2 and v1-CPU membership paths from proc cgroup text."""
+    v2_membership: str | None = None
+    v1_cpu_membership: str | None = None
+    for line in raw.splitlines():
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            continue
+        hierarchy_id, controllers_raw, membership = fields
+        membership = membership.strip()
+        if not membership.startswith("/"):
+            continue
+        controllers = set(filter(None, controllers_raw.split(",")))
+        if hierarchy_id == "0" and not controllers:
+            v2_membership = membership
+        elif "cpu" in controllers:
+            v1_cpu_membership = membership
+    return v2_membership, v1_cpu_membership
+
+
+def _unescape_mountinfo_path(raw: str) -> str:
+    """Decode the octal escapes used for mountinfo root/mountpoint fields."""
+    for escaped, value in (
+        (r"\040", " "),
+        (r"\011", "\t"),
+        (r"\012", "\n"),
+        (r"\134", "\\"),
+    ):
+        raw = raw.replace(escaped, value)
+    return raw
+
+
+def _parse_cgroup_mounts(
+    raw: str,
+) -> list[tuple[str, PurePosixPath, Path]]:
+    """Return applicable ``(version, hierarchy_root, mountpoint)`` entries."""
+    mounts: list[tuple[str, PurePosixPath, Path]] = []
+    for line in raw.splitlines():
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+        except ValueError:
+            continue
+        if len(fields) < 6 or len(fields) <= separator + 3:
+            continue
+        fs_type = fields[separator + 1]
+        mount_options = set(fields[5].split(","))
+        super_options = set(fields[separator + 3].split(","))
+        if fs_type == "cgroup2":
+            version = "v2"
+        elif fs_type == "cgroup" and "cpu" in mount_options | super_options:
+            version = "v1"
+        else:
+            continue
+        hierarchy_root = PurePosixPath(_unescape_mountinfo_path(fields[3]))
+        mountpoint = Path(_unescape_mountinfo_path(fields[4]))
+        if not hierarchy_root.is_absolute() or not mountpoint.is_absolute():
+            continue
+        mounts.append((version, hierarchy_root, mountpoint))
+    return mounts
+
+
+def _map_cgroup_membership(
+    membership: str,
+    hierarchy_root: PurePosixPath,
+    mountpoint: Path,
+) -> Path | None:
+    """Map a proc membership path through a mount's hierarchy root."""
+    member_path = PurePosixPath(membership)
+    try:
+        relative = member_path.relative_to(hierarchy_root)
+    except ValueError:
+        return None
+    if ".." in relative.parts:
+        return None
+    return mountpoint.joinpath(*relative.parts)
+
+
+def _cgroup_nodes_to_mountpoint(leaf: Path, mountpoint: Path) -> list[Path]:
+    """Return leaf and ancestors through the visible hierarchy mountpoint."""
+    if leaf != mountpoint and mountpoint not in leaf.parents:
+        return []
+    nodes: list[Path] = []
+    current = leaf
+    while True:
+        nodes.append(current)
+        if current == mountpoint:
+            return nodes
+        current = current.parent
+
+
+def _read_process_cgroup_cpu_limits(
+    proc_cgroup_path: Path,
+    mountinfo_path: Path,
+) -> tuple[bool, list[int]]:
+    """Resolve applicable cgroup nodes and collect every finite CPU quota."""
+    cgroup_raw = _read_optional_text(proc_cgroup_path)
+    mountinfo_raw = _read_optional_text(mountinfo_path)
+    if cgroup_raw is None or mountinfo_raw is None:
+        return False, []
+
+    v2_membership, v1_cpu_membership = _parse_cgroup_memberships(cgroup_raw)
+    memberships = {"v2": v2_membership, "v1": v1_cpu_membership}
+    found_hierarchy = False
+    limits: list[int] = []
+    for version, hierarchy_root, mountpoint in _parse_cgroup_mounts(mountinfo_raw):
+        membership = memberships[version]
+        if membership is None:
+            continue
+        leaf = _map_cgroup_membership(membership, hierarchy_root, mountpoint)
+        if leaf is None:
+            continue
+        found_hierarchy = True
+        for node in _cgroup_nodes_to_mountpoint(leaf, mountpoint):
+            if version == "v2":
+                raw = _read_optional_text(node / "cpu.max")
+                limit = (
+                    _parse_cgroup_v2_cpu_max(raw) if raw is not None else None
+                )
+            else:
+                quota_raw = _read_optional_text(node / "cpu.cfs_quota_us")
+                period_raw = _read_optional_text(node / "cpu.cfs_period_us")
+                limit = (
+                    _parse_cgroup_v1_cpu_quota(quota_raw, period_raw)
+                    if quota_raw is not None and period_raw is not None
+                    else None
+                )
+            if limit is not None:
+                limits.append(limit)
+    return found_hierarchy, limits
+
+
+def _read_cgroup_cpu_count(
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    *,
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+    mountinfo_path: Path = Path("/proc/self/mountinfo"),
+) -> int | None:
+    """Return the tightest CPU quota applying to this process's cgroups."""
+    found_hierarchy, limits = _read_process_cgroup_cpu_limits(
+        proc_cgroup_path,
+        mountinfo_path,
+    )
+    if found_hierarchy:
+        return min(limits) if limits else None
+    return _read_cgroup_root_cpu_count(cgroup_root)
 
 
 def _affinity_cpu_count() -> int | None:

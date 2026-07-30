@@ -381,7 +381,14 @@ def test_read_cgroup_cpu_count_prefers_v2_hierarchy(tmp_path: Path) -> None:
     (v1_dir / "cpu.cfs_quota_us").write_text("200000\n")
     (v1_dir / "cpu.cfs_period_us").write_text("100000\n")
 
-    assert run_tests_parallel._read_cgroup_cpu_count(tmp_path) is None
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path,
+            proc_cgroup_path=tmp_path / "missing-cgroup",
+            mountinfo_path=tmp_path / "missing-mountinfo",
+        )
+        is None
+    )
 
 
 def test_read_cgroup_cpu_count_falls_back_to_v1(tmp_path: Path) -> None:
@@ -391,7 +398,197 @@ def test_read_cgroup_cpu_count_falls_back_to_v1(tmp_path: Path) -> None:
     (v1_dir / "cpu.cfs_quota_us").write_text("200000\n")
     (v1_dir / "cpu.cfs_period_us").write_text("100000\n")
 
-    assert run_tests_parallel._read_cgroup_cpu_count(tmp_path) == 2
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path,
+            proc_cgroup_path=tmp_path / "missing-cgroup",
+            mountinfo_path=tmp_path / "missing-mountinfo",
+        )
+        == 2
+    )
+
+
+def _write_v2_quota(node: Path, raw: str) -> None:
+    node.mkdir(parents=True, exist_ok=True)
+    (node / "cpu.max").write_text(raw)
+
+
+def _write_v1_quota(node: Path, quota: str, period: str = "100000") -> None:
+    node.mkdir(parents=True, exist_ok=True)
+    (node / "cpu.cfs_quota_us").write_text(quota)
+    (node / "cpu.cfs_period_us").write_text(period)
+
+
+def _mountinfo_line(
+    mount_root: str,
+    mountpoint: Path,
+    fs_type: str,
+    super_options: str,
+) -> str:
+    return (
+        f"31 24 0:27 {mount_root} {mountpoint} rw,nosuid,nodev,noexec "
+        f"- {fs_type} cgroup {super_options}\n"
+    )
+
+
+def test_read_nested_cgroup_v2_uses_tightest_leaf_or_ancestor_quota(
+    tmp_path: Path,
+) -> None:
+    """Unlimited v2 root cannot hide finite intermediate and leaf quotas."""
+    mountpoint = tmp_path / "unified"
+    _write_v2_quota(mountpoint, "max 100000")
+    _write_v2_quota(mountpoint / "tenant", "max 100000")
+    _write_v2_quota(mountpoint / "tenant/team", "400000 100000")
+    _write_v2_quota(mountpoint / "tenant/team/job", "200000 100000")
+    proc_cgroup = tmp_path / "proc-cgroup"
+    proc_cgroup.write_text("0::/tenant/team/job\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(_mountinfo_line("/", mountpoint, "cgroup2", "rw"))
+
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path / "fallback",
+            proc_cgroup_path=proc_cgroup,
+            mountinfo_path=mountinfo,
+        )
+        == 2
+    )
+
+
+def test_read_nested_cgroup_v2_translates_non_root_mount(
+    tmp_path: Path,
+) -> None:
+    """Strip the mount root from v2 membership before joining the mountpoint."""
+    mountpoint = tmp_path / "delegated-unified"
+    _write_v2_quota(mountpoint, "max 100000")
+    _write_v2_quota(mountpoint / "team", "300000 100000")
+    _write_v2_quota(mountpoint / "team/job", "max 100000")
+    proc_cgroup = tmp_path / "proc-cgroup"
+    proc_cgroup.write_text("0::/docker/parent/team/job\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        _mountinfo_line(
+            "/docker/parent",
+            mountpoint,
+            "cgroup2",
+            "rw",
+        )
+    )
+
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path / "fallback",
+            proc_cgroup_path=proc_cgroup,
+            mountinfo_path=mountinfo,
+        )
+        == 3
+    )
+
+
+def test_read_nested_cgroup_v1_uses_tightest_leaf_or_ancestor_quota(
+    tmp_path: Path,
+) -> None:
+    """Walk the process's v1 CPU hierarchy rather than controller root only."""
+    mountpoint = tmp_path / "cpu-controller"
+    _write_v1_quota(mountpoint, "-1")
+    _write_v1_quota(mountpoint / "docker", "-1")
+    _write_v1_quota(mountpoint / "docker/abc", "400000")
+    _write_v1_quota(mountpoint / "docker/abc/job", "200000")
+    proc_cgroup = tmp_path / "proc-cgroup"
+    proc_cgroup.write_text("2:cpu,cpuacct:/docker/abc/job\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        _mountinfo_line("/", mountpoint, "cgroup", "rw,cpu,cpuacct")
+    )
+
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path / "fallback",
+            proc_cgroup_path=proc_cgroup,
+            mountinfo_path=mountinfo,
+        )
+        == 2
+    )
+
+
+def test_read_nested_cgroup_v1_translates_non_root_mount(
+    tmp_path: Path,
+) -> None:
+    """Map v1 membership relative to a delegated controller mount root."""
+    mountpoint = tmp_path / "delegated-cpu"
+    _write_v1_quota(mountpoint, "300000")
+    _write_v1_quota(mountpoint / "job", "-1")
+    proc_cgroup = tmp_path / "proc-cgroup"
+    proc_cgroup.write_text("5:cpu,cpuacct:/docker/parent/job\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        _mountinfo_line(
+            "/docker/parent",
+            mountpoint,
+            "cgroup",
+            "rw,cpu,cpuacct",
+        )
+    )
+
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path / "fallback",
+            proc_cgroup_path=proc_cgroup,
+            mountinfo_path=mountinfo,
+        )
+        == 3
+    )
+
+
+def test_read_hybrid_cgroup_layout_applies_cpu_controller_quota(
+    tmp_path: Path,
+) -> None:
+    """A hybrid v2 membership must not hide the finite v1 CPU controller."""
+    unified = tmp_path / "unified"
+    cpu = tmp_path / "cpu-controller"
+    _write_v2_quota(unified, "max 100000")
+    _write_v2_quota(unified / "scope", "max 100000")
+    _write_v1_quota(cpu, "-1")
+    _write_v1_quota(cpu / "legacy/scope", "200000")
+    proc_cgroup = tmp_path / "proc-cgroup"
+    proc_cgroup.write_text("0::/scope\n4:cpu,cpuacct:/legacy/scope\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        _mountinfo_line("/", unified, "cgroup2", "rw")
+        + _mountinfo_line("/", cpu, "cgroup", "rw,cpu,cpuacct")
+    )
+
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path / "fallback",
+            proc_cgroup_path=proc_cgroup,
+            mountinfo_path=mountinfo,
+        )
+        == 2
+    )
+
+
+def test_read_nested_cgroup_skips_missing_and_malformed_nodes(
+    tmp_path: Path,
+) -> None:
+    """Continue to a finite ancestor past a missing leaf and malformed node."""
+    mountpoint = tmp_path / "unified"
+    _write_v2_quota(mountpoint, "500000 100000")
+    _write_v2_quota(mountpoint / "team", "not-a-quota")
+    (mountpoint / "team/job").mkdir(parents=True)
+    proc_cgroup = tmp_path / "proc-cgroup"
+    proc_cgroup.write_text("0::/team/job\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(_mountinfo_line("/", mountpoint, "cgroup2", "rw"))
+
+    assert (
+        run_tests_parallel._read_cgroup_cpu_count(
+            tmp_path / "fallback",
+            proc_cgroup_path=proc_cgroup,
+            mountinfo_path=mountinfo,
+        )
+        == 5
+    )
 
 
 @pytest.mark.parametrize(
