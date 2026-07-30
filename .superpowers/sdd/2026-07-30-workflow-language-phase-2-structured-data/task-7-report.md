@@ -6,7 +6,9 @@ Task 7 is implemented in commits `908b00005`
 (`refactor(workflow): centralize archon output resolution`) and `2ceae14ec`
 (`fix(workflow): preserve resolved output authority`), with open output-type
 boundary alignment in `eda27235c` (`fix(workflow): preserve open output types`).
-Archon downstream consumers now resolve the successful attempt's canonical
+Authoring is aligned to that boundary in `4d42af019`
+(`fix(workflow): bound output type metadata`). Archon downstream consumers now
+resolve the successful attempt's canonical
 `output.*` descriptor once into a frozen `ResolvedNodeOutput`. The resolver
 verifies containment,
 regular-file identity, byte size, SHA-256, UTF-8, candidate/descriptor agreement,
@@ -129,6 +131,28 @@ The whitespace-only case supplied a second RED before validation was aligned
 with the authoring schema's non-empty-string rule.
 
 The four-file focused suite passed 67/67 after the round-2 fix.
+
+### Review fix round 3 RED/GREEN
+
+The authoring boundary test initially failed because a 16,385-character
+`output_type` loaded successfully even though completion metadata rejects that
+value. The exact 16,384-character mixed-case Unicode boundary already loaded
+and was preserved verbatim.
+
+The durable 16,384-character limit now lives on the canonical
+`language_schema.FIELD_INVENTORY` field specification. Loader validation reads
+that direct field bound and emits `string_too_long` at
+`nodes[0].output_type`; the runtime-generated JSON Schema publishes
+`maxLength: 16384` from the same spec. It also publishes the existing nonblank
+contract without normalizing authored values. Tests cover exact-boundary
+Unicode/case preservation, 16,385 rejection, and existing empty/whitespace
+diagnostics through both loader and JSON-Schema paths.
+
+Round-3 focused schema/resource/AI coverage passed 704/704. The complete Task 2
+language/schema regression gate passed 776/776. The live
+`hermes workflow schema --profile archon-2026-07 --json` generation path
+reported the supported direct field with `minLength: 1`, `pattern: "\\S"`, and
+`maxLength: 16384`.
 
 ## Consumer invariants
 
