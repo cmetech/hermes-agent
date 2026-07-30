@@ -77,6 +77,11 @@ from plugins.workflow.sanitize import (
     workflow_input_name_is_portable,
     workflow_input_names_are_portable,
 )
+from plugins.workflow.sessions import (
+    TypedMirrorIntegrityError,
+    TypedMirrorObligation,
+    TypedMirrorStore,
+)
 from plugins.workflow.trust import (
     WorkflowPackageDigest,
     WorkflowResourceReadBudget,
@@ -177,6 +182,29 @@ class TypedPublicationRef:
     size_bytes: int
     sha256: str
     metadata_sha256: str
+    schema_fingerprint: str | None
+    canonicalization_version: int
+    produced_at: str
+    session_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _JournaledTypedPublication:
+    publication_id: str
+    content_name: str
+    output_type: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    metadata_sha256: str
+    schema_fingerprint: str | None
+    canonicalization_version: int
+    produced_at: str
+    session_id: str | None
+    run_id: str
+    node_id: str
+    attempt_id: str
+    relative_path: str
 
 
 @dataclass(frozen=True)
@@ -196,6 +224,7 @@ _RUN_SCOPED_REPAIR_REASONS = frozenset(
         "legacy_effect_policy_uncorroborated",
         "notification_reconciliation_unverified",
         "run_evidence_uncorroborated",
+        "typed_publication_integrity",
     }
 )
 _UNATTENDED_REVALIDATION_REASONS = frozenset(
@@ -624,7 +653,220 @@ def _typed_publication_fields(reference: TypedPublicationRef) -> dict[str, objec
         "size_bytes": reference.size_bytes,
         "sha256": reference.sha256,
         "metadata_sha256": reference.metadata_sha256,
+        "schema_fingerprint": reference.schema_fingerprint,
+        "canonicalization_version": reference.canonicalization_version,
+        "produced_at": reference.produced_at,
+        "session_id": reference.session_id,
     }
+
+
+def _typed_publication_metadata_bytes(
+    *,
+    publication_id: str,
+    content_name: str,
+    output_type: str,
+    media_type: str,
+    sha256: str,
+    node_id: str,
+    attempt_id: str,
+    run_id: str,
+    schema_fingerprint: str | None,
+    size_bytes: int,
+    produced_at: str,
+    session_id: str | None,
+    canonicalization_version: int,
+) -> bytes:
+    return json.dumps(
+        {
+            "publication_id": publication_id,
+            "content_name": content_name,
+            "output_type": output_type,
+            "media_type": media_type,
+            "sha256": sha256,
+            "node_id": node_id,
+            "attempt_id": attempt_id,
+            "run_id": run_id,
+            "language_profile": "archon-2026-07",
+            "schema_fingerprint": schema_fingerprint,
+            "size_bytes": size_bytes,
+            "produced_at": produced_at,
+            "session_id": session_id,
+            "canonicalization_version": canonicalization_version,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8") + b"\n"
+
+
+def _journaled_typed_publications(
+    projection: Mapping[str, object],
+) -> tuple[_JournaledTypedPublication, ...]:
+    run_id = projection.get("run_id")
+    nodes = projection.get("nodes")
+    artifacts = projection.get("artifacts")
+    if not isinstance(run_id, str) or not isinstance(nodes, Mapping) or not isinstance(
+        artifacts, list
+    ):
+        raise JournalRecoveryError("typed publication descriptor authority is invalid")
+    descriptors: list[_JournaledTypedPublication] = []
+    publication_ids: set[str] = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping):
+            continue
+        typed_markers = {
+            "publication_id",
+            "content_name",
+            "metadata_sha256",
+            "produced_at",
+        }
+        if not typed_markers.intersection(artifact):
+            continue
+        publication_id = artifact.get("publication_id")
+        content_name = artifact.get("content_name")
+        output_type = artifact.get("output_type")
+        media_type = artifact.get("media_type")
+        size_bytes = artifact.get("size_bytes")
+        content_sha256 = artifact.get("sha256")
+        metadata_sha256 = artifact.get("metadata_sha256")
+        schema_fingerprint = artifact.get("schema_fingerprint")
+        canonicalization_version = artifact.get("canonicalization_version")
+        produced_at = artifact.get("produced_at")
+        session_id = artifact.get("session_id")
+        node_id = artifact.get("node_id")
+        attempt_id = artifact.get("attempt_id")
+        relative_path = artifact.get("relative_path")
+        expected_content = {
+            _TYPED_PUBLICATION_JSON_MEDIA_TYPE: "content.json",
+            _TYPED_PUBLICATION_TEXT_MEDIA_TYPE: "content.md",
+        }.get(media_type)
+        if (
+            not isinstance(publication_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", publication_id) is None
+            or publication_id in publication_ids
+            or not isinstance(content_name, str)
+            or content_name != expected_content
+            or not isinstance(output_type, str)
+            or not output_type.strip()
+            or len(output_type) > DURABLE_METADATA_STRING_MAX_CHARS
+            or not isinstance(node_id, str)
+            or not isinstance(attempt_id, str)
+            or not isinstance(relative_path, str)
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or not 0 <= size_bytes <= 500_000
+            or not isinstance(content_sha256, str)
+            or _SHA256_PATTERN.fullmatch(content_sha256) is None
+            or not isinstance(metadata_sha256, str)
+            or _SHA256_PATTERN.fullmatch(metadata_sha256) is None
+            or (
+                schema_fingerprint is not None
+                and (
+                    not isinstance(schema_fingerprint, str)
+                    or _SHA256_PATTERN.fullmatch(schema_fingerprint) is None
+                )
+            )
+            or isinstance(canonicalization_version, bool)
+            or canonicalization_version != 1
+            or not isinstance(produced_at, str)
+            or not produced_at
+            or len(produced_at) > DURABLE_METADATA_STRING_MAX_CHARS
+            or (
+                session_id is not None
+                and (
+                    not isinstance(session_id, str)
+                    or len(session_id) > DURABLE_METADATA_STRING_MAX_CHARS
+                )
+            )
+        ):
+            raise JournalRecoveryError("typed publication descriptor is invalid")
+        try:
+            produced = datetime.fromisoformat(produced_at)
+        except ValueError as exc:
+            raise JournalRecoveryError(
+                "typed publication descriptor production time is invalid"
+            ) from exc
+        if produced.tzinfo is None:
+            raise JournalRecoveryError(
+                "typed publication descriptor production time is invalid"
+            )
+        node = nodes.get(node_id)
+        relative = PurePosixPath(relative_path)
+        owned_prefixes = {
+            ("nodes", node_id, attempt_id),
+            (
+                "nodes",
+                _safe_component("node", node_id),
+                _safe_component("attempt", attempt_id),
+            ),
+        }
+        loop_state = node.get("loop_state") if isinstance(node, Mapping) else None
+        iteration = (
+            loop_state.get("iteration")
+            if isinstance(loop_state, Mapping)
+            else None
+        )
+        if isinstance(iteration, int) and not isinstance(iteration, bool):
+            nested_attempt = f"{attempt_id}/iteration-{iteration:04d}"
+            owned_prefixes.add((
+                "nodes",
+                _safe_component("node", node_id),
+                _safe_component("attempt", nested_attempt),
+            ))
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or len(relative.parts) <= 3
+            or relative.parts[:3] not in owned_prefixes
+        ):
+            raise JournalRecoveryError(
+                "typed publication winning attempt path is invalid"
+            )
+        attempts = node.get("attempts") if isinstance(node, Mapping) else None
+        winners = (
+            [
+                attempt
+                for attempt in attempts
+                if isinstance(attempt, Mapping)
+                and attempt.get("attempt_id") == attempt_id
+                and attempt.get("state") == "succeeded"
+            ]
+            if isinstance(attempts, list)
+            else []
+        )
+        if len(winners) != 1:
+            raise JournalRecoveryError(
+                "typed publication winning attempt is not corroborated"
+            )
+        language = projection.get("language")
+        if (
+            not isinstance(language, Mapping)
+            or language.get("effective_profile") != "archon-2026-07"
+        ):
+            raise JournalRecoveryError(
+                "typed publication language authority is invalid"
+            )
+        publication_ids.add(publication_id)
+        descriptors.append(
+            _JournaledTypedPublication(
+                publication_id=publication_id,
+                content_name=content_name,
+                output_type=output_type,
+                media_type=str(media_type),
+                size_bytes=size_bytes,
+                sha256=content_sha256,
+                metadata_sha256=metadata_sha256,
+                schema_fingerprint=schema_fingerprint,
+                canonicalization_version=canonicalization_version,
+                produced_at=produced_at,
+                session_id=session_id,
+                run_id=run_id,
+                node_id=node_id,
+                attempt_id=attempt_id,
+                relative_path=relative_path,
+            )
+        )
+    return tuple(descriptors)
 
 
 def _write_or_reuse_typed_approval_output(
@@ -4388,6 +4630,14 @@ class RunStore:
                     )
                     raise
                 if journal_current:
+                    verified_content = self._recover_typed_publications_locked(
+                        directory, projection
+                    )
+                    self._recover_typed_mirrors_locked(
+                        directory,
+                        projection,
+                        verified_content,
+                    )
                     self._sync_loaded_integrity(directory, projection)
                     self._transition_run_repair(
                         "run_evidence_uncorroborated",
@@ -4409,6 +4659,14 @@ class RunStore:
                     outcome="repair_required",
                 )
                 raise
+            verified_content = self._recover_typed_publications_locked(
+                directory, rebuilt
+            )
+            self._recover_typed_mirrors_locked(
+                directory,
+                rebuilt,
+                verified_content,
+            )
             scheduled_at = self._scheduled_at_from_projection(rebuilt)
             _atomic_json(path, rebuilt)
             with self._connect() as connection:
@@ -4530,6 +4788,15 @@ class RunStore:
                     raise JournalRecoveryError("journal projection sequence mismatch")
                 if checksum != _projection_digest(snapshot):
                     raise JournalRecoveryError("journal projection digest mismatch")
+                try:
+                    _journaled_typed_publications(snapshot)
+                except JournalRecoveryError:
+                    self._transition_run_repair(
+                        "typed_publication_integrity",
+                        run_id=run_id,
+                        outcome="repair_required",
+                    )
+                    raise
                 latest = snapshot
             elif event.get("event_type") == "node_heartbeat" and latest is not None:
                 node = latest["nodes"].get(event.get("node_id"))
@@ -7480,32 +7747,33 @@ class RunStore:
             if candidate.media_type == _TYPED_PUBLICATION_JSON_MEDIA_TYPE
             else "content.md"
         )
-        metadata = {
-            "publication_id": publication_id,
-            "content_name": content_name,
-            "output_type": candidate.output_type,
-            "media_type": candidate.media_type,
-            "sha256": candidate.sha256,
-            "node_id": node_id,
-            "attempt_id": attempt_id,
-            "run_id": run_id,
-            "language_profile": language_profile,
-            "schema_fingerprint": candidate.schema_fingerprint,
-            "size_bytes": candidate.size_bytes,
-            "produced_at": _utc_now(),
-            "session_id": candidate.session_id,
-            "canonicalization_version": candidate.canonicalization_version,
-        }
-        metadata_bytes = json.dumps(
-            metadata,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8") + b"\n"
+        produced_at = _utc_now()
+        metadata_bytes = _typed_publication_metadata_bytes(
+            publication_id=publication_id,
+            content_name=content_name,
+            output_type=candidate.output_type,
+            media_type=candidate.media_type,
+            sha256=candidate.sha256,
+            node_id=node_id,
+            attempt_id=attempt_id,
+            run_id=run_id,
+            schema_fingerprint=candidate.schema_fingerprint,
+            size_bytes=candidate.size_bytes,
+            produced_at=produced_at,
+            session_id=candidate.session_id,
+            canonicalization_version=candidate.canonicalization_version,
+        )
         if len(metadata_bytes) > _TYPED_PUBLICATION_METADATA_MAX_BYTES:
             raise ArchonOutputIntegrityError(
                 "typed publication metadata exceeds its byte ceiling"
             )
+
+        self._ensure_free_disk()
+        required_bytes = len(content) + len(metadata_bytes)
+        if self._directory_bytes(directory) + required_bytes > self.max_run_bytes:
+            raise StorageQuotaError("run_storage_quota exceeded by typed publication")
+        if self._directory_bytes(self.runs_root) + required_bytes > self.max_profile_bytes:
+            raise StorageQuotaError("profile_storage_quota exceeded by typed publication")
 
         _require_secure_publication_io()
         run_descriptor: int | None = None
@@ -7614,7 +7882,582 @@ class RunStore:
             size_bytes=candidate.size_bytes,
             sha256=candidate.sha256,
             metadata_sha256=_sha256(metadata_bytes),
+            schema_fingerprint=candidate.schema_fingerprint,
+            canonicalization_version=candidate.canonicalization_version,
+            produced_at=produced_at,
+            session_id=candidate.session_id,
         )
+
+    @staticmethod
+    def _discard_publication_entry(path: Path) -> None:
+        try:
+            observed = path.lstat()
+        except FileNotFoundError:
+            return
+        discarded = path.parent / f".discard-{uuid.uuid4().hex}"
+        os.replace(path, discarded)
+        _fsync_directory(path.parent)
+        if stat.S_ISDIR(observed.st_mode) and not stat.S_ISLNK(observed.st_mode):
+            shutil.rmtree(discarded)
+        else:
+            discarded.unlink(missing_ok=True)
+        _fsync_directory(path.parent)
+
+    def _commit_recovered_publication_bundle(
+        self,
+        directory: Path,
+        descriptor: _JournaledTypedPublication,
+        content: bytes,
+        metadata_bytes: bytes,
+    ) -> None:
+        self._ensure_free_disk()
+        required_bytes = len(content) + len(metadata_bytes)
+        if self._directory_bytes(directory) + required_bytes > self.max_run_bytes:
+            raise StorageQuotaError(
+                "run_storage_quota exceeded during typed publication recovery"
+            )
+        if self._directory_bytes(self.runs_root) + required_bytes > self.max_profile_bytes:
+            raise StorageQuotaError(
+                "profile_storage_quota exceeded during typed publication recovery"
+            )
+        _require_secure_publication_io()
+        run_descriptor: int | None = None
+        publications_descriptor: int | None = None
+        staging_descriptor: int | None = None
+        staging_name = f".staging-{uuid.uuid4().hex}"
+        file_names = (descriptor.content_name, "metadata.json")
+        staging_created = False
+        committed = False
+        try:
+            run_descriptor = os.open(directory, _publication_directory_flags())
+            run_identity = _publication_directory_identity(run_descriptor)
+            try:
+                os.mkdir("publications", mode=0o700, dir_fd=run_descriptor)
+                _fsync_publication_directory(run_descriptor, boundary="run root")
+            except FileExistsError:
+                pass
+            publications_descriptor = os.open(
+                "publications",
+                _publication_directory_flags(),
+                dir_fd=run_descriptor,
+            )
+            publications_identity = _publication_directory_identity(
+                publications_descriptor
+            )
+            if publications_identity[0] != run_identity[0]:
+                raise JournalRecoveryError(
+                    "typed publication directory is not on the run filesystem"
+                )
+            os.mkdir(staging_name, mode=0o700, dir_fd=publications_descriptor)
+            staging_created = True
+            staging_descriptor = os.open(
+                staging_name,
+                _publication_directory_flags(),
+                dir_fd=publications_descriptor,
+            )
+            os.fchmod(staging_descriptor, 0o700)
+            _write_publication_file(staging_descriptor, descriptor.content_name, content)
+            _write_publication_file(staging_descriptor, "metadata.json", metadata_bytes)
+            _fsync_publication_directory(staging_descriptor, boundary="staging")
+            _commit_publication_directory_noreplace(
+                run_descriptor,
+                publications_descriptor,
+                staging_name,
+                descriptor.publication_id,
+                publications_identity,
+            )
+            committed = True
+            _fsync_publication_directory(
+                publications_descriptor,
+                boundary="publication parent",
+            )
+        except BaseException:
+            if staging_created and not committed and publications_descriptor is not None:
+                _cleanup_publication_staging(
+                    publications_descriptor,
+                    staging_descriptor,
+                    staging_name,
+                    file_names,
+                )
+                staging_descriptor = None
+            raise
+        finally:
+            if staging_descriptor is not None:
+                os.close(staging_descriptor)
+            if publications_descriptor is not None:
+                os.close(publications_descriptor)
+            if run_descriptor is not None:
+                os.close(run_descriptor)
+
+    @staticmethod
+    def _expected_publication_metadata(
+        descriptor: _JournaledTypedPublication,
+    ) -> bytes:
+        return _typed_publication_metadata_bytes(
+            publication_id=descriptor.publication_id,
+            content_name=descriptor.content_name,
+            output_type=descriptor.output_type,
+            media_type=descriptor.media_type,
+            sha256=descriptor.sha256,
+            node_id=descriptor.node_id,
+            attempt_id=descriptor.attempt_id,
+            run_id=descriptor.run_id,
+            schema_fingerprint=descriptor.schema_fingerprint,
+            size_bytes=descriptor.size_bytes,
+            produced_at=descriptor.produced_at,
+            session_id=descriptor.session_id,
+            canonicalization_version=descriptor.canonicalization_version,
+        )
+
+    def _verified_publication_content(
+        self,
+        directory: Path,
+        descriptor: _JournaledTypedPublication,
+    ) -> bytes | None:
+        bundle = directory / "publications" / descriptor.publication_id
+        try:
+            observed = bundle.lstat()
+        except FileNotFoundError:
+            return None
+        reparse_marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or stat.S_ISLNK(observed.st_mode)
+            or (
+                reparse_marker
+                and getattr(observed, "st_file_attributes", 0) & reparse_marker
+            )
+        ):
+            return None
+        try:
+            names = {entry.name for entry in os.scandir(bundle)}
+        except OSError:
+            return None
+        if names != {descriptor.content_name, "metadata.json"}:
+            return None
+        metadata_path = bundle / "metadata.json"
+        try:
+            metadata_size = metadata_path.lstat().st_size
+            if metadata_size > _TYPED_PUBLICATION_METADATA_MAX_BYTES:
+                return None
+            content = _read_descriptor_relative(
+                directory,
+                f"publications/{descriptor.publication_id}/{descriptor.content_name}",
+                size_bytes=descriptor.size_bytes,
+            )
+            metadata = _read_descriptor_relative(
+                directory,
+                f"publications/{descriptor.publication_id}/metadata.json",
+                size_bytes=metadata_size,
+            )
+        except (ArchonOutputIntegrityError, ArchonOutputUnavailableError, OSError):
+            return None
+        expected_metadata = self._expected_publication_metadata(descriptor)
+        if (
+            len(content) != descriptor.size_bytes
+            or not hmac.compare_digest(_sha256(content), descriptor.sha256)
+            or not hmac.compare_digest(metadata, expected_metadata)
+            or not hmac.compare_digest(_sha256(metadata), descriptor.metadata_sha256)
+        ):
+            return None
+        return content
+
+    def _recover_typed_publications_locked(
+        self,
+        directory: Path,
+        projection: Mapping[str, object],
+    ) -> dict[str, bytes]:
+        run_id = str(projection["run_id"])
+        try:
+            descriptors = _journaled_typed_publications(projection)
+            expected = {descriptor.publication_id: descriptor for descriptor in descriptors}
+            publications = directory / "publications"
+            if publications.exists() or publications.is_symlink():
+                observed = publications.lstat()
+                reparse_marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+                if (
+                    not stat.S_ISDIR(observed.st_mode)
+                    or stat.S_ISLNK(observed.st_mode)
+                    or (
+                        reparse_marker
+                        and getattr(observed, "st_file_attributes", 0)
+                        & reparse_marker
+                    )
+                ):
+                    raise JournalRecoveryError(
+                        "typed publication integrity: publication root is unsafe"
+                    )
+                for entry in tuple(publications.iterdir()):
+                    if entry.name.startswith(".staging-") or entry.name.startswith(
+                        ".discard-"
+                    ):
+                        self._discard_publication_entry(entry)
+                    elif entry.name not in expected:
+                        self._discard_publication_entry(entry)
+            verified: dict[str, bytes] = {}
+            for descriptor in descriptors:
+                content = self._verified_publication_content(directory, descriptor)
+                if content is not None:
+                    verified[descriptor.publication_id] = content
+                    continue
+                bundle = publications / descriptor.publication_id
+                if bundle.exists() or bundle.is_symlink():
+                    self._discard_publication_entry(bundle)
+                try:
+                    source_observed = (directory / descriptor.relative_path).lstat()
+                    reparse_marker = getattr(
+                        stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0
+                    )
+                    if (
+                        not stat.S_ISREG(source_observed.st_mode)
+                        or stat.S_ISLNK(source_observed.st_mode)
+                        or (
+                            reparse_marker
+                            and getattr(source_observed, "st_file_attributes", 0)
+                            & reparse_marker
+                        )
+                    ):
+                        raise ArchonOutputUnavailableError(
+                            "winning attempt source is not a regular file"
+                        )
+                    content = _read_descriptor_relative(
+                        directory,
+                        descriptor.relative_path,
+                        size_bytes=descriptor.size_bytes,
+                    )
+                except (
+                    ArchonOutputIntegrityError,
+                    ArchonOutputUnavailableError,
+                    OSError,
+                ) as exc:
+                    raise JournalRecoveryError(
+                        "typed publication integrity: winning attempt is unavailable"
+                    ) from exc
+                if (
+                    len(content) != descriptor.size_bytes
+                    or not hmac.compare_digest(_sha256(content), descriptor.sha256)
+                ):
+                    raise JournalRecoveryError(
+                        "typed publication integrity: winning attempt digest mismatch"
+                    )
+                metadata_bytes = self._expected_publication_metadata(descriptor)
+                if not hmac.compare_digest(
+                    _sha256(metadata_bytes), descriptor.metadata_sha256
+                ):
+                    raise JournalRecoveryError(
+                        "typed publication integrity: metadata descriptor mismatch"
+                    )
+                self._commit_recovered_publication_bundle(
+                    directory,
+                    descriptor,
+                    content,
+                    metadata_bytes,
+                )
+                verified[descriptor.publication_id] = content
+        except (
+            JournalRecoveryError,
+            OSError,
+            StorageQuotaError,
+            ValueError,
+        ):
+            self._transition_run_repair(
+                "typed_publication_integrity",
+                run_id=run_id,
+                outcome="repair_required",
+            )
+            raise
+        self._transition_run_repair(
+            "typed_publication_integrity",
+            run_id=run_id,
+            outcome="repair_verified",
+        )
+        return verified
+
+    @staticmethod
+    def _typed_mirror_payload(
+        obligation: TypedMirrorObligation,
+    ) -> dict[str, object]:
+        return {
+            "mirror_id": obligation.mirror_id,
+            "workflow": obligation.workflow,
+            "node_id": obligation.node_id,
+            "operator_scope": obligation.operator_scope,
+            "run_id": obligation.run_id,
+            "attempt_id": obligation.attempt_id,
+            "publication_id": obligation.publication_id,
+            "content_name": obligation.content_name,
+            "output_type": obligation.output_type,
+            "media_type": obligation.media_type,
+            "size_bytes": obligation.size_bytes,
+            "sha256": obligation.sha256,
+        }
+
+    @classmethod
+    def _typed_mirror_obligation(
+        cls,
+        projection: Mapping[str, object],
+        descriptor: _JournaledTypedPublication,
+    ) -> TypedMirrorObligation:
+        operator_scope = str(projection.get("operator_scope_digest") or "local")
+        identity = {
+            "workflow": str(projection["workflow"]),
+            "node_id": descriptor.node_id,
+            "operator_scope": operator_scope,
+            "run_id": descriptor.run_id,
+            "attempt_id": descriptor.attempt_id,
+            "publication_id": descriptor.publication_id,
+            "content_name": descriptor.content_name,
+            "output_type": descriptor.output_type,
+            "media_type": descriptor.media_type,
+            "size_bytes": descriptor.size_bytes,
+            "sha256": descriptor.sha256,
+        }
+        mirror_id = _sha256(
+            json.dumps(
+                identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        return TypedMirrorObligation(mirror_id=mirror_id, **identity)
+
+    @staticmethod
+    def _effective_persistent_publication(
+        directory: Path,
+        projection: Mapping[str, object],
+        descriptor: _JournaledTypedPublication,
+    ) -> bool:
+        if descriptor.session_id is None:
+            return False
+        metadata = projection.get("run_metadata")
+        if isinstance(metadata, Mapping) and metadata.get("ai_entitlement") == (
+            "deterministic"
+        ):
+            return False
+        node_state = projection.get("nodes", {}).get(descriptor.node_id)
+        if (
+            not isinstance(node_state, Mapping)
+            or node_state.get("session_id") != descriptor.session_id
+            or not isinstance(node_state.get("cache_fingerprint"), str)
+            or not node_state.get("cache_fingerprint")
+        ):
+            return False
+        definition = directory / "definition.yaml"
+        try:
+            observed = definition.lstat()
+            if not stat.S_ISREG(observed.st_mode) or observed.st_size > 2 * 1024 * 1024:
+                raise JournalRecoveryError(
+                    "typed mirror workflow definition is unsafe"
+                )
+            document = yaml.safe_load(
+                _read_descriptor_relative(
+                    directory,
+                    "definition.yaml",
+                    size_bytes=observed.st_size,
+                )
+            )
+        except (
+            ArchonOutputIntegrityError,
+            ArchonOutputUnavailableError,
+            OSError,
+            yaml.YAMLError,
+        ) as exc:
+            raise JournalRecoveryError(
+                "typed mirror workflow definition is unavailable"
+            ) from exc
+        if not isinstance(document, Mapping) or not isinstance(
+            document.get("nodes"), list
+        ):
+            raise JournalRecoveryError("typed mirror workflow definition is malformed")
+        matching = [
+            node
+            for node in document["nodes"]
+            if isinstance(node, Mapping) and node.get("id") == descriptor.node_id
+        ]
+        if len(matching) != 1:
+            raise JournalRecoveryError("typed mirror node definition is ambiguous")
+        node = matching[0]
+        if not ("command" in node or "prompt" in node):
+            return False
+        context = node.get("context")
+        if context in {"fresh", "shared"}:
+            return False
+        persist = node.get("persist_session", document.get("persist_sessions", False))
+        return persist is True
+
+    @classmethod
+    def _typed_mirror_from_payload(
+        cls,
+        payload: object,
+    ) -> TypedMirrorObligation:
+        if not isinstance(payload, Mapping):
+            raise JournalRecoveryError("typed mirror obligation is malformed")
+        value = payload.get("mirror")
+        if not isinstance(value, Mapping):
+            raise JournalRecoveryError("typed mirror obligation is malformed")
+        try:
+            obligation = TypedMirrorObligation(
+                mirror_id=value["mirror_id"],
+                workflow=value["workflow"],
+                node_id=value["node_id"],
+                operator_scope=value["operator_scope"],
+                run_id=value["run_id"],
+                attempt_id=value["attempt_id"],
+                publication_id=value["publication_id"],
+                content_name=value["content_name"],
+                output_type=value["output_type"],
+                media_type=value["media_type"],
+                size_bytes=value["size_bytes"],
+                sha256=value["sha256"],
+            )
+            TypedMirrorStore._validate_obligation(obligation)
+        except (KeyError, TypeError, TypedMirrorIntegrityError) as exc:
+            raise JournalRecoveryError("typed mirror obligation is malformed") from exc
+        expected_identity = dict(cls._typed_mirror_payload(obligation))
+        expected_identity.pop("mirror_id")
+        expected_mirror_id = _sha256(
+            json.dumps(
+                expected_identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        if not hmac.compare_digest(obligation.mirror_id, expected_mirror_id):
+            raise JournalRecoveryError("typed mirror obligation identity is invalid")
+        return obligation
+
+    def _recover_typed_mirrors_locked(
+        self,
+        directory: Path,
+        projection: dict[str, object],
+        verified_content: Mapping[str, bytes],
+    ) -> None:
+        descriptors = {
+            descriptor.publication_id: descriptor
+            for descriptor in _journaled_typed_publications(projection)
+        }
+        expected = {
+            obligation.mirror_id: obligation
+            for descriptor in descriptors.values()
+            if self._effective_persistent_publication(
+                directory,
+                projection,
+                descriptor,
+            )
+            for obligation in (self._typed_mirror_obligation(projection, descriptor),)
+        }
+        if not expected:
+            return
+        events = self._read_journal_events(directory)
+        required: dict[str, TypedMirrorObligation] = {}
+        completed: dict[str, str] = {}
+        for event in events:
+            event_type = event.get("event_type")
+            if event_type == "typed_mirror_required":
+                obligation = self._typed_mirror_from_payload(event.get("payload"))
+                if (
+                    event.get("node_id") != obligation.node_id
+                    or event.get("attempt_id") != obligation.attempt_id
+                    or obligation.run_id != projection.get("run_id")
+                ):
+                    raise JournalRecoveryError(
+                        "typed mirror obligation is not corroborated"
+                    )
+                if obligation.mirror_id in required and required[
+                    obligation.mirror_id
+                ] != obligation:
+                    raise JournalRecoveryError(
+                        "typed mirror obligation identity conflicts"
+                    )
+                required[obligation.mirror_id] = obligation
+            elif event_type == "typed_mirror_completed":
+                payload = event.get("payload")
+                mirror_id = payload.get("mirror_id") if isinstance(payload, Mapping) else None
+                entry_id = payload.get("entry_id") if isinstance(payload, Mapping) else None
+                if (
+                    not isinstance(mirror_id, str)
+                    or _SHA256_PATTERN.fullmatch(mirror_id) is None
+                    or not isinstance(entry_id, str)
+                    or _SHA256_PATTERN.fullmatch(entry_id) is None
+                    or mirror_id not in required
+                    or event.get("node_id") != required[mirror_id].node_id
+                    or event.get("attempt_id") != required[mirror_id].attempt_id
+                ):
+                    raise JournalRecoveryError(
+                        "typed mirror completion is not corroborated"
+                    )
+                expected_entry_id = TypedMirrorStore._entry_document(
+                    required[mirror_id]
+                )["entry_id"]
+                if not hmac.compare_digest(entry_id, str(expected_entry_id)):
+                    raise JournalRecoveryError(
+                        "typed mirror completion identity is invalid"
+                    )
+                previous = completed.get(mirror_id)
+                if previous is not None and previous != entry_id:
+                    raise JournalRecoveryError(
+                        "typed mirror completion identity conflicts"
+                    )
+                completed[mirror_id] = entry_id
+        if set(required) - set(expected) or set(completed) - set(expected):
+            raise JournalRecoveryError(
+                "typed mirror journal obligation is not backed by a publication"
+            )
+        mirror_store = TypedMirrorStore(self.hermes_home)
+        for mirror_id, obligation in expected.items():
+            existing = required.get(mirror_id)
+            if existing is not None and existing != obligation:
+                raise JournalRecoveryError("typed mirror obligation conflicts with journal")
+            new_requirement = existing is None
+            if new_requirement:
+                self._append_locked(
+                    directory,
+                    projection,
+                    "typed_mirror_required",
+                    {"mirror": self._typed_mirror_payload(obligation)},
+                    node_id=obligation.node_id,
+                    attempt_id=obligation.attempt_id,
+                )
+                required[mirror_id] = obligation
+            descriptor = descriptors.get(obligation.publication_id)
+            content = verified_content.get(obligation.publication_id)
+            if descriptor is None or content is None:
+                raise JournalRecoveryError(
+                    "typed mirror requires a verified run publication"
+                )
+            try:
+                record = mirror_store.stage(
+                    obligation,
+                    content,
+                )
+            except TypedMirrorIntegrityError as exc:
+                raise JournalRecoveryError("typed mirror integrity failure") from exc
+            was_completed = mirror_id in completed
+            try:
+                pointed = mirror_store.point(
+                    record,
+                    replace_current=not was_completed,
+                )
+            except TypedMirrorIntegrityError as exc:
+                raise JournalRecoveryError("typed mirror integrity failure") from exc
+            if not was_completed and not pointed:
+                continue
+            if not was_completed:
+                self._append_locked(
+                    directory,
+                    projection,
+                    "typed_mirror_completed",
+                    {"mirror_id": mirror_id, "entry_id": record.entry_id},
+                    node_id=obligation.node_id,
+                    attempt_id=obligation.attempt_id,
+                )
+                completed[mirror_id] = record.entry_id
+            try:
+                mirror_store.verify(record)
+            except TypedMirrorIntegrityError as exc:
+                raise JournalRecoveryError("typed mirror integrity failure") from exc
 
     def complete_node(
         self,
@@ -7823,6 +8666,16 @@ class RunStore:
                 terminal_reserve_attempt_id=claim.attempt_id,
                 reserve_connection=fence_connection,
             )
+            if publication_ref is not None:
+                verified_content = self._recover_typed_publications_locked(
+                    directory,
+                    projection,
+                )
+                self._recover_typed_mirrors_locked(
+                    directory,
+                    projection,
+                    verified_content,
+                )
             states = {candidate["state"] for candidate in projection["nodes"].values()}
             terminal = None
             if status == "failed":

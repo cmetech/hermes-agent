@@ -13,7 +13,12 @@ from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
-from plugins.workflow.store import JournalRecoveryError, RunStore
+from plugins.workflow.store import (
+    ArtifactRef,
+    JournalRecoveryError,
+    RunStore,
+    TypedPublicationCandidate,
+)
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
@@ -704,6 +709,77 @@ def test_structurally_invalid_projection_rebuilds_from_journal(
     (run_dir / "run.json").write_text(json.dumps(invalid))
 
     assert store.load_run(admitted.run_id)["status"] == "running"
+
+
+def test_projection_rebuild_restores_journaled_publication_descriptor_and_bundle(
+    tmp_path, workflow_writer
+) -> None:
+    root = tmp_path / "typed-projection-rebuild"
+    workflow = workflow_writer(
+        root,
+        name="typed-projection-rebuild",
+        nodes=[{"id": "start", "bash": "true", "output_type": "Report"}],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    store = RunStore(tmp_path / "home")
+    admitted = _run(store, load_workflow(workflow))
+    claim = store.claim_node(admitted.run_id, "start", "owner")
+    assert claim is not None
+    data = b"journal authority"
+    source = (
+        store.run_directory(admitted.run_id)
+        / "nodes"
+        / claim.node_id
+        / claim.attempt_id
+        / "output.md"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_bytes(data)
+    relative = source.relative_to(store.run_directory(admitted.run_id)).as_posix()
+    digest = hashlib.sha256(data).hexdigest()
+    artifact = ArtifactRef(
+        relative,
+        "text/markdown; charset=utf-8",
+        len(data),
+        digest,
+    )
+    store.complete_node(
+        claim,
+        status="succeeded",
+        artifacts=(artifact,),
+        typed_publication=TypedPublicationCandidate(
+            attempt_relative_path=relative,
+            output_type="Report",
+            media_type="text/markdown; charset=utf-8",
+            size_bytes=len(data),
+            sha256=digest,
+            schema_fingerprint=None,
+            canonicalization_version=1,
+            session_id=None,
+        ),
+    )
+    expected = store.load_run(admitted.run_id)
+    publication = next(
+        entry for entry in expected["artifacts"] if "publication_id" in entry
+    )
+    bundle = (
+        store.run_directory(admitted.run_id)
+        / "publications"
+        / publication["publication_id"]
+    )
+    (store.run_directory(admitted.run_id) / "run.json").unlink()
+    for path in tuple(bundle.iterdir()):
+        path.unlink()
+    bundle.rmdir()
+
+    rebuilt = store.load_run(admitted.run_id)
+
+    assert rebuilt == expected
+    assert (bundle / "content.md").read_bytes() == data
+    assert (bundle / "metadata.json").is_file()
 
 
 def test_monotonic_gap_expires_claim_after_wall_clock_moves_backward(

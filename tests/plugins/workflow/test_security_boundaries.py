@@ -15,6 +15,11 @@ import plugins.workflow.evidence as evidence_module
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import WorkflowTrustStore, compute_package_digest
 from plugins.workflow.schema import load_workflow
+from plugins.workflow.sessions import (
+    TypedMirrorIntegrityError,
+    TypedMirrorObligation,
+    TypedMirrorStore,
+)
 
 
 SHOWCASES = Path(__file__).parents[3] / "plugins/workflow/showcases"
@@ -186,3 +191,64 @@ def test_log_evidence_rejects_non_regular_fifo(
     assert "NON_REGULAR_SENTINEL" not in str(page)
     assert page["items"] == []
     assert page["warnings"] == ["unsafe_evidence_path"]
+
+
+def _mirror_obligation(data: bytes, *, run_id: str = "run-1"):
+    digest = hashlib.sha256(data).hexdigest()
+    return TypedMirrorObligation(
+        mirror_id=hashlib.sha256(f"mirror:{run_id}".encode()).hexdigest(),
+        workflow="workflow",
+        node_id="node",
+        operator_scope="scope",
+        run_id=run_id,
+        attempt_id="attempt-1",
+        publication_id="a" * 32,
+        content_name="content.md",
+        output_type="Report",
+        media_type="text/markdown; charset=utf-8",
+        size_bytes=len(data),
+        sha256=digest,
+    )
+
+
+def test_typed_mirror_storage_is_profile_isolated_and_hides_unverified_index(
+    tmp_path
+) -> None:
+    data = b"profile one"
+    first = TypedMirrorStore(tmp_path / "profile-one")
+    second = TypedMirrorStore(tmp_path / "profile-two")
+    obligation = _mirror_obligation(data)
+
+    staged = first.stage(obligation, data)
+
+    assert first.get("workflow", "node", "scope") is None
+    completed = first.activate(staged)
+
+    assert first.get("workflow", "node", "scope") == completed
+    assert second.get("workflow", "node", "scope") is None
+    content = (
+        tmp_path
+        / "profile-one"
+        / "workflows"
+        / "typed-mirrors"
+        / "content"
+        / obligation.sha256
+    )
+    content.write_bytes(b"same-size-bad")
+    assert first.get("workflow", "node", "scope") is None
+
+
+def test_typed_mirror_content_symlink_never_reaches_outside_profile(tmp_path) -> None:
+    data = b"safe"
+    mirrors = TypedMirrorStore(tmp_path / "profile")
+    obligation = _mirror_obligation(data)
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"keep")
+    content = mirrors.root / "content" / obligation.sha256
+    content.parent.mkdir(parents=True, exist_ok=True)
+    content.symlink_to(outside)
+
+    with pytest.raises(TypedMirrorIntegrityError):
+        mirrors.complete(obligation, data)
+
+    assert outside.read_bytes() == b"keep"
