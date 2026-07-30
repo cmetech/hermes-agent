@@ -275,6 +275,151 @@ class TestCodexBuildKwargs:
             },
         }
 
+    @pytest.mark.parametrize(
+        "strategy",
+        [
+            StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            StructuredOutputStrategy.NATIVE_JSON_MODE,
+            StructuredOutputStrategy.UNSUPPORTED,
+        ],
+    )
+    def test_structured_non_native_preflight_strips_extra_body_text_injection(
+        self, transport, strategy
+    ):
+        extra_body = {
+            "text": {
+                "verbosity": "low",
+                "format": {
+                    "type": "json_schema",
+                    "name": "smuggled",
+                    "schema": {"type": "string"},
+                    "strict": False,
+                },
+                "unapproved": "drop-me",
+            },
+            "trace_id": "keep-me",
+        }
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            request_overrides={"extra_body": extra_body},
+            structured_output=_structured_request(strategy),
+        )
+        preflight = transport.preflight_kwargs(kwargs)
+
+        assert kwargs["text"] == {"verbosity": "low"}
+        assert kwargs["extra_body"] == {"trace_id": "keep-me"}
+        assert preflight["text"] == {"verbosity": "low"}
+        assert preflight["extra_body"] == {"trace_id": "keep-me"}
+        assert extra_body["text"]["format"]["name"] == "smuggled"
+
+    def test_native_schema_preflight_cannot_be_shadowed_by_extra_body_text(
+        self, transport
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            request_overrides={
+                "text": {"verbosity": "medium"},
+                "extra_body": {
+                    "text": {
+                        "verbosity": "high",
+                        "format": {
+                            "type": "json_schema",
+                            "name": "smuggled",
+                            "schema": {"type": "string"},
+                            "strict": False,
+                        },
+                    },
+                    "trace_id": "keep-me",
+                },
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+        preflight = transport.preflight_kwargs(kwargs)
+        expected_text = {
+            "verbosity": "high",
+            "format": {
+                "type": "json_schema",
+                "name": "hermes_output",
+                "schema": _STRUCTURED_SCHEMA,
+                "strict": True,
+            },
+        }
+
+        assert kwargs["text"] == expected_text
+        assert kwargs["extra_body"] == {"trace_id": "keep-me"}
+        assert preflight["text"] == expected_text
+        assert preflight["extra_body"] == {"trace_id": "keep-me"}
+
+    @pytest.mark.parametrize(
+        "nested_text",
+        [
+            "malformed",
+            {"verbosity": "ultra", "format": {"type": "json_object"}},
+        ],
+    )
+    def test_structured_request_drops_unapproved_extra_body_text_subtree(
+        self, transport, nested_text
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            request_overrides={
+                "extra_body": {"text": nested_text, "trace_id": "keep-me"}
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+            ),
+        )
+
+        assert "text" not in kwargs
+        assert kwargs["extra_body"] == {"trace_id": "keep-me"}
+
+    def test_structured_request_removes_empty_extra_body_after_text_reservation(
+        self, transport
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            request_overrides={
+                "extra_body": {"text": {"format": {"type": "json_object"}}}
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+            ),
+        )
+
+        assert "text" not in kwargs
+        assert "extra_body" not in kwargs
+
+    def test_legacy_call_preserves_extra_body_text_override(self, transport):
+        extra_body = {
+            "text": {
+                "verbosity": "low",
+                "format": {"type": "json_object"},
+            },
+            "trace_id": "legacy",
+        }
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            request_overrides={"extra_body": extra_body},
+        )
+
+        assert kwargs["extra_body"] == extra_body
+
     def test_system_extracted_from_messages(self, transport):
         messages = [
             {"role": "system", "content": "Custom system prompt"},

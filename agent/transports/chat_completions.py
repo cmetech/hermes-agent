@@ -74,6 +74,24 @@ def _build_native_response_format(
     }
 
 
+def _reserve_structured_response_format(
+    api_kwargs: dict[str, Any], request: Any
+) -> None:
+    """Keep SDK ``extra_body`` merging from overriding governed output format."""
+    if request is None:
+        return
+
+    api_kwargs.pop("response_format", None)
+    extra_body = api_kwargs.get("extra_body")
+    if isinstance(extra_body, dict):
+        sanitized_extra_body = dict(extra_body)
+        sanitized_extra_body.pop("response_format", None)
+        if sanitized_extra_body:
+            api_kwargs["extra_body"] = sanitized_extra_body
+        else:
+            api_kwargs.pop("extra_body", None)
+
+
 def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> dict | None:
     """Return the model's wire-compatible reasoning config."""
     if not isinstance(reasoning_config, dict):
@@ -395,8 +413,9 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs = self._build_kwargs_from_profile(
                 _profile, model, sanitized, tools, params
             )
-            if params.get("structured_output") is not None:
-                api_kwargs.pop("response_format", None)
+            _reserve_structured_response_format(
+                api_kwargs, params.get("structured_output")
+            )
             response_format = _build_native_response_format(
                 params.get("structured_output"),
                 provider_name=params.get("provider_name"),
@@ -576,8 +595,9 @@ class ChatCompletionsTransport(ProviderTransport):
         if overrides:
             api_kwargs.update(overrides)
 
-        if params.get("structured_output") is not None:
-            api_kwargs.pop("response_format", None)
+        _reserve_structured_response_format(
+            api_kwargs, params.get("structured_output")
+        )
         response_format = _build_native_response_format(
             params.get("structured_output"),
             provider_name=params.get("provider_name"),

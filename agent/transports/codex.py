@@ -66,6 +66,44 @@ def _build_native_text_format(
     }
 
 
+def _reserve_structured_text_format(
+    kwargs: dict[str, Any], request: Any
+) -> None:
+    """Prevent SDK ``extra_body`` merging from replacing governed text format."""
+    if request is None:
+        return
+
+    existing_text = kwargs.get("text")
+    if isinstance(existing_text, dict) and "format" in existing_text:
+        reserved_text = dict(existing_text)
+        reserved_text.pop("format")
+        if reserved_text:
+            kwargs["text"] = reserved_text
+        else:
+            kwargs.pop("text")
+
+    extra_body = kwargs.get("extra_body")
+    if not isinstance(extra_body, dict):
+        return
+
+    reserved_extra_body = dict(extra_body)
+    nested_text = reserved_extra_body.pop("text", None)
+    if isinstance(nested_text, dict):
+        nested_verbosity = nested_text.get("verbosity")
+        if nested_verbosity in {"low", "medium", "high"}:
+            existing_text = kwargs.get("text")
+            promoted_text = (
+                dict(existing_text) if isinstance(existing_text, dict) else {}
+            )
+            promoted_text["verbosity"] = nested_verbosity
+            kwargs["text"] = promoted_text
+
+    if reserved_extra_body:
+        kwargs["extra_body"] = reserved_extra_body
+    else:
+        kwargs.pop("extra_body", None)
+
+
 def _bounded_prompt_cache_key(value: Any) -> Optional[str]:
     """Return a provider-safe cache key without changing session identity."""
     if value is None:
@@ -371,15 +409,9 @@ class ResponsesApiTransport(ProviderTransport):
         if request_overrides:
             kwargs.update(request_overrides)
 
-        if params.get("structured_output") is not None:
-            existing_text = kwargs.get("text")
-            if isinstance(existing_text, dict) and "format" in existing_text:
-                reserved_text = dict(existing_text)
-                reserved_text.pop("format")
-                if reserved_text:
-                    kwargs["text"] = reserved_text
-                else:
-                    kwargs.pop("text")
+        _reserve_structured_text_format(
+            kwargs, params.get("structured_output")
+        )
 
         text_format = _build_native_text_format(
             params.get("structured_output"),

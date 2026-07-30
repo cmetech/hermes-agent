@@ -483,6 +483,110 @@ class TestChatCompletionsBuildKwargs:
             },
         }
 
+    @pytest.mark.parametrize("profile_name", [None, "openrouter"])
+    def test_structured_non_native_final_kwargs_strip_nested_response_format(
+        self, transport, profile_name
+    ):
+        profile = None
+        provider_name = "openai-api"
+        base_url = "https://api.openai.com/v1"
+        if profile_name is not None:
+            from providers import get_provider_profile
+
+            profile = get_provider_profile(profile_name)
+            provider_name = "openrouter"
+            base_url = "https://openrouter.ai/api/v1"
+        extra_body = {
+            "response_format": {"type": "json_object"},
+            "trace_id": "keep-me",
+        }
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name=provider_name,
+            base_url=base_url,
+            provider_profile=profile,
+            request_overrides={"extra_body": extra_body},
+            structured_output=_structured_request(
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+            ),
+        )
+
+        assert "response_format" not in kwargs
+        assert kwargs["extra_body"]["trace_id"] == "keep-me"
+        assert "response_format" not in kwargs["extra_body"]
+        assert extra_body == {
+            "response_format": {"type": "json_object"},
+            "trace_id": "keep-me",
+        }
+
+    def test_native_schema_final_kwargs_cannot_be_shadowed_by_extra_body(
+        self, transport
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            request_overrides={
+                "extra_body": {
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "smuggled",
+                            "schema": {"type": "string"},
+                            "strict": False,
+                        },
+                    },
+                    "trace_id": "keep-me",
+                }
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert kwargs["response_format"] == {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "hermes_output",
+                "schema": _STRUCTURED_SCHEMA,
+                "strict": True,
+            },
+        }
+        assert kwargs["extra_body"] == {"trace_id": "keep-me"}
+
+    def test_structured_request_removes_empty_extra_body_after_reservation(
+        self, transport
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            request_overrides={
+                "extra_body": {"response_format": {"type": "json_object"}}
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+            ),
+        )
+
+        assert "extra_body" not in kwargs
+
+    def test_legacy_call_preserves_nested_response_format_override(self, transport):
+        extra_body = {
+            "response_format": {"type": "json_object"},
+            "trace_id": "legacy",
+        }
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            request_overrides={"extra_body": extra_body},
+        )
+
+        assert kwargs["extra_body"] == extra_body
+
     def test_developer_role_swap(self, transport):
         msgs = [{"role": "system", "content": "You are helpful"}, {"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(model="gpt-5.4", messages=msgs, model_lower="gpt-5.4")
