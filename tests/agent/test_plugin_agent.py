@@ -445,6 +445,114 @@ def test_parent_rejects_uncorrelated_structured_worker_results(
 
 
 @pytest.mark.parametrize(
+    ("admitted_strategy", "failure_kind"),
+    [
+        (
+            StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+            "structured_output_capability_drift",
+        ),
+        (
+            StructuredOutputStrategy.UNSUPPORTED,
+            "structured_output_unsupported",
+        ),
+    ],
+    ids=("capability-drift", "unsupported"),
+)
+def test_public_runner_returns_typed_structured_negotiation_failures(
+    monkeypatch, admitted_strategy, failure_kind
+) -> None:
+    import agent.plugin_agent_worker as worker
+    import hermes_cli.runtime_provider as runtime_provider
+    import run_agent
+
+    monkeypatch.setattr(
+        run_agent,
+        "AIAgent",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("agent constructed")),
+    )
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "fake",
+            "model": "fake-model",
+            "api_mode": "chat_completions",
+            "base_url": "https://fake.invalid/v1",
+            "api_key": "secret",
+        },
+    )
+    monkeypatch.setattr(
+        "agent.plugin_agent._exchange_worker",
+        lambda payload, **kwargs: {
+            "protocol_version": 1,
+            "type": "result",
+            "result": worker._run(payload),
+        },
+    )
+
+    result = PluginAgentRunner("test-plugin").run(
+        PluginAgentRunRequest(
+            prompt="x",
+            allowed_tools=(),
+            structured_output=_structured_request(admitted_strategy),
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.audit["failure_kind"] == failure_kind
+    assert result.structured_output is not None
+    assert result.structured_output["provider_attempts"] == 0
+    assert result.structured_output["model_calls"] == 0
+    assert result.structured_output["strategy"] == "prompt_json_schema"
+
+
+@pytest.mark.parametrize(
+    ("status", "provider_attempts", "model_calls"),
+    [("completed", 0, 0), ("failed", 1, 0), ("failed", 0, 1)],
+    ids=("wrong-status", "nonzero-provider-attempts", "nonzero-model-calls"),
+)
+def test_parent_rejects_malformed_typed_structured_failure(
+    monkeypatch, status, provider_attempts, model_calls
+) -> None:
+    admitted = _structured_request()
+    evidence = {
+        "provider_attempts": provider_attempts,
+        "model_calls": model_calls,
+        "strategy": "prompt_json_schema",
+        "adapter_version": 1,
+        "schema_fingerprint": admitted.schema.schema_fingerprint,
+        "declaration_source": "managed_loop_default",
+    }
+    monkeypatch.setattr(
+        "agent.plugin_agent._exchange_worker",
+        lambda *args, **kwargs: {
+            "protocol_version": 1,
+            "type": "result",
+            "result": {
+                "final_response": "",
+                "session_id": "",
+                "provider": "fake",
+                "model": "fake-model",
+                "status": status,
+                "pending_interaction": None,
+                "usage": {},
+                "audit": {
+                    "plugin_id": "test-plugin",
+                    "failure_kind": "structured_output_capability_drift",
+                    **evidence,
+                },
+                "structured_output": evidence,
+            },
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="structured output negotiation failure"):
+        PluginAgentRunner("test-plugin").run(
+            PluginAgentRunRequest(prompt="x", structured_output=admitted)
+        )
+
+
+@pytest.mark.parametrize(
     ("field", "invalid"),
     [
         ("adapter_version", True),

@@ -473,6 +473,18 @@ def _correlate_structured_result(
         return
     if evidence is None:
         raise RuntimeError("structured output evidence is missing")
+    failure_kind = result.audit.get("failure_kind")
+    if failure_kind in {
+        "structured_output_capability_drift",
+        "structured_output_unsupported",
+    }:
+        if (
+            result.status != "failed"
+            or evidence["provider_attempts"] != 0
+            or evidence["model_calls"] != 0
+        ):
+            raise RuntimeError("structured output negotiation failure is invalid")
+        return
     if (
         evidence["strategy"] != admitted.strategy.value
         or evidence["adapter_version"] != admitted.adapter_version
