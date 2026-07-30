@@ -115,6 +115,22 @@ def test_normalize_schema_rejects_33_nested_json_arrays() -> None:
         normalize_schema({"examples": nested_arrays})
 
 
+@pytest.mark.parametrize(
+    ("keyword", "annotation"),
+    [
+        ("examples", [{"$ref": "https://example.test/annotation", "pattern": "["}]),
+        ("default", {"$id": "annotation-id", "properties": {"value": True}}),
+        ("const", {"$dynamicRef": "annotation-value"}),
+    ],
+)
+def test_normalize_schema_treats_annotation_values_as_generic_json(
+    keyword: str, annotation: object
+) -> None:
+    normalized = normalize_schema({"type": "object", keyword: annotation})
+
+    assert json.loads(normalized.canonical_schema_bytes)[keyword] == annotation
+
+
 def test_normalize_schema_accepts_4096_schema_nodes_and_rejects_4097() -> None:
     normalize_schema({"allOf": [{} for _ in range(4_094)]})
 
@@ -265,8 +281,18 @@ def test_parse_validate_canonicalize_validates_then_canonicalizes_response() -> 
 def test_parse_validate_canonicalize_reports_schema_validation_failures() -> None:
     request = _request({"type": "object", "required": ["answer"]})
 
-    with pytest.raises(StructuredOutputError, match="answer"):
+    with pytest.raises(StructuredOutputError, match="required"):
         structured_output.parse_validate_canonicalize("{}", request)
+
+
+def test_parse_validate_canonicalize_omits_invalid_response_from_diagnostics() -> None:
+    response_token = "private-response-token"
+    request = _request({"type": "integer"})
+
+    with pytest.raises(StructuredOutputError) as exc_info:
+        structured_output.parse_validate_canonicalize(json.dumps(response_token), request)
+
+    assert response_token not in str(exc_info.value)
 
 
 def test_validation_summary_is_deterministic_and_utf8_bounded() -> None:

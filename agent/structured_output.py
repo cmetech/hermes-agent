@@ -44,6 +44,36 @@ _INTEGER_BOUND_KEYWORDS = frozenset(
     }
 )
 _SCOPE_CHANGING_KEYWORDS = frozenset({"$anchor", "$dynamicAnchor", "$id"})
+_SCHEMA_VALUE_KEYWORDS = frozenset(
+    {
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+_SCHEMA_MAP_KEYWORDS = frozenset(
+    {
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    }
+)
+_SCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+_GENERIC_CONTEXT = "generic"
+_SCHEMA_CONTEXT = "schema"
+_SCHEMA_MAP_CONTEXT = "schema_map"
+_SCHEMA_ARRAY_CONTEXT = "schema_array"
 
 
 class StructuredOutputError(ValueError):
@@ -127,7 +157,9 @@ def normalize_schema(schema: Mapping[str, object]) -> StructuredOutputSchema:
 
 def _copy_and_validate_schema(source: dict[str, object]) -> dict[str, object]:
     root: dict[str, object] = {}
-    stack: list[tuple[object, object, int, tuple[object, ...]]] = [(source, root, 1, ())]
+    stack: list[tuple[object, object, int, tuple[object, ...], str]] = [
+        (source, root, 1, (), _SCHEMA_CONTEXT)
+    ]
     node_count = 0
     property_count = 0
     ref_count = 0
@@ -135,7 +167,7 @@ def _copy_and_validate_schema(source: dict[str, object]) -> dict[str, object]:
     refs: list[tuple[tuple[object, ...], str]] = []
 
     while stack:
-        current, copied, depth, path = stack.pop()
+        current, copied, depth, path, context = stack.pop()
         node_count += 1
         if node_count > MAX_SCHEMA_NODES:
             raise StructuredOutputError("schema exceeds traversed nodes limit")
@@ -147,46 +179,35 @@ def _copy_and_validate_schema(source: dict[str, object]) -> dict[str, object]:
                 if not isinstance(key, str):
                     raise StructuredOutputError("schema object keys must be strings")
                 child_path = path + (key,)
-                if key in _SCOPE_CHANGING_KEYWORDS:
-                    raise StructuredOutputError(f"schema {key} changes resolution scope")
-                if key == "$dynamicRef":
-                    raise StructuredOutputError("schema $dynamicRef is unsupported")
-                if key in _INTEGER_BOUND_KEYWORDS and (
-                    isinstance(value, bool) or not isinstance(value, int)
-                ):
-                    raise StructuredOutputError(f"schema {key} must be an integer")
-                if key == "properties":
-                    if not isinstance(value, Mapping):
-                        raise StructuredOutputError("schema properties must be an object")
-                    property_count += len(value)
-                    if property_count > MAX_SCHEMA_PROPERTIES:
-                        raise StructuredOutputError("schema exceeds properties limit")
-                if key == "enum":
-                    if not isinstance(value, list):
-                        raise StructuredOutputError("schema enum must be an array")
-                    if len(value) > MAX_ENUM_VALUES:
-                        raise StructuredOutputError("schema exceeds enum values limit")
-                if key == "$ref":
-                    if not isinstance(value, str):
-                        raise StructuredOutputError("schema $ref must be a string")
-                    ref_count += 1
-                    if ref_count > MAX_LOCAL_REFS:
-                        raise StructuredOutputError("schema exceeds local refs limit")
-                    refs.append((child_path, value))
-                if key == "pattern":
-                    regex_bytes = _validate_regex(value, regex_bytes)
-                if key == "patternProperties":
-                    if not isinstance(value, Mapping):
-                        raise StructuredOutputError("schema patternProperties must be an object")
-                    for pattern in value:
-                        regex_bytes = _validate_regex(pattern, regex_bytes)
-                copied[key] = _copy_schema_value(value, stack, depth, child_path)
+                child_context = _GENERIC_CONTEXT
+                if context == _SCHEMA_CONTEXT:
+                    child_context, property_count, ref_count, regex_bytes = (
+                        _validate_schema_keyword(
+                            key,
+                            value,
+                            child_path,
+                            refs,
+                            property_count,
+                            ref_count,
+                            regex_bytes,
+                        )
+                    )
+                elif context == _SCHEMA_MAP_CONTEXT:
+                    child_context = _SCHEMA_CONTEXT
+                copied[key] = _copy_schema_value(
+                    value, stack, depth, child_path, child_context
+                )
         else:
             assert isinstance(current, list)
             assert isinstance(copied, list)
             for index, value in enumerate(current):
                 child_path = path + (index,)
-                copied.append(_copy_schema_value(value, stack, depth, child_path))
+                child_context = (
+                    _SCHEMA_CONTEXT if context == _SCHEMA_ARRAY_CONTEXT else _GENERIC_CONTEXT
+                )
+                copied.append(
+                    _copy_schema_value(value, stack, depth, child_path, child_context)
+                )
 
     _validate_local_refs(source, refs)
     return root
@@ -194,23 +215,79 @@ def _copy_and_validate_schema(source: dict[str, object]) -> dict[str, object]:
 
 def _copy_schema_value(
     value: object,
-    stack: list[tuple[object, object, int, tuple[object, ...]]],
+    stack: list[tuple[object, object, int, tuple[object, ...], str]],
     depth: int,
     path: tuple[object, ...],
+    context: str,
 ) -> object:
     if isinstance(value, Mapping):
         copied: dict[str, object] = {}
-        stack.append((value, copied, depth + 1, path))
+        stack.append((value, copied, depth + 1, path, context))
         return copied
     if isinstance(value, list):
         copied_list: list[object] = []
-        stack.append((value, copied_list, depth + 1, path))
+        stack.append((value, copied_list, depth + 1, path, context))
         return copied_list
     if isinstance(value, float) and not math.isfinite(value):
         raise StructuredOutputError("schema numbers must be finite")
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     raise StructuredOutputError("schema must contain JSON values")
+
+
+def _validate_schema_keyword(
+    key: str,
+    value: object,
+    path: tuple[object, ...],
+    refs: list[tuple[tuple[object, ...], str]],
+    property_count: int,
+    ref_count: int,
+    regex_bytes: int,
+) -> tuple[str, int, int, int]:
+    if key in _SCOPE_CHANGING_KEYWORDS:
+        raise StructuredOutputError(f"schema {key} changes resolution scope")
+    if key == "$dynamicRef":
+        raise StructuredOutputError("schema $dynamicRef is unsupported")
+    if key in _INTEGER_BOUND_KEYWORDS and (
+        isinstance(value, bool) or not isinstance(value, int)
+    ):
+        raise StructuredOutputError(f"schema {key} must be an integer")
+    if key == "properties":
+        if not isinstance(value, Mapping):
+            raise StructuredOutputError("schema properties must be an object")
+        property_count += len(value)
+        if property_count > MAX_SCHEMA_PROPERTIES:
+            raise StructuredOutputError("schema exceeds properties limit")
+    if key == "enum":
+        if not isinstance(value, list):
+            raise StructuredOutputError("schema enum must be an array")
+        if len(value) > MAX_ENUM_VALUES:
+            raise StructuredOutputError("schema exceeds enum values limit")
+    if key == "$ref":
+        if not isinstance(value, str):
+            raise StructuredOutputError("schema $ref must be a string")
+        ref_count += 1
+        if ref_count > MAX_LOCAL_REFS:
+            raise StructuredOutputError("schema exceeds local refs limit")
+        refs.append((path, value))
+    if key == "pattern":
+        regex_bytes = _validate_regex(value, regex_bytes)
+    if key == "patternProperties":
+        if not isinstance(value, Mapping):
+            raise StructuredOutputError("schema patternProperties must be an object")
+        for pattern in value:
+            regex_bytes = _validate_regex(pattern, regex_bytes)
+    return _schema_child_context(key), property_count, ref_count, regex_bytes
+
+
+def _schema_child_context(key: str) -> str:
+    if key in _SCHEMA_VALUE_KEYWORDS:
+        return _SCHEMA_CONTEXT
+    if key in _SCHEMA_MAP_KEYWORDS:
+        return _SCHEMA_MAP_CONTEXT
+    if key in _SCHEMA_ARRAY_KEYWORDS:
+        return _SCHEMA_ARRAY_CONTEXT
+    return _GENERIC_CONTEXT
 
 
 def _validate_regex(value: object, total_bytes: int) -> int:
@@ -368,8 +445,7 @@ def validation_summary(
         if isinstance(error, str):
             messages.append(error)
         else:
-            message = getattr(error, "message", None)
-            messages.append(str(message if message is not None else error))
+            messages.append(_validation_error_metadata(error))
     summary = "\n".join(sorted(messages))
     encoded = summary.encode("utf-8")
     if len(encoded) <= limit_bytes:
@@ -382,6 +458,17 @@ def validation_summary(
         except UnicodeDecodeError:
             truncated = truncated[:-1]
     return marker[:limit_bytes].decode("ascii")
+
+
+def _validation_error_metadata(error: object) -> str:
+    validator = getattr(error, "validator", None)
+    if validator is None:
+        return error.__class__.__name__
+    path = getattr(error, "absolute_path", ())
+    pointer = "/" + "/".join(
+        str(segment).replace("~", "~0").replace("/", "~1") for segment in path
+    )
+    return f"{pointer}: validation failed ({validator})"
 
 
 def _reject_nonfinite_constant(value: str) -> None:
