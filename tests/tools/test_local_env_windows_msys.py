@@ -429,7 +429,7 @@ class TestWrapCommandWindowsNativeCwd:
         env._snapshot_ready = True
         wrapped = env._wrap_command("pwd", r"C:\Users\liush")
 
-        assert "builtin cd -- /c/Users/liush || builtin exit 126" in wrapped
+        assert "builtin cd -- /c/Users/liush || { POSIXLY_CORRECT=1;" in wrapped
         assert r"builtin cd -- C:\Users\liush || builtin exit 126" not in wrapped
 
     def test_init_session_bootstrap_converts_native_cwd_for_cd(self, monkeypatch):

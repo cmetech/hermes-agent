@@ -348,7 +348,7 @@ class SSHEnvironment(BaseEnvironment):
         cmd = self._build_ssh_command()
         if clean:
             bash_command = (
-                "BASH_ENV=/dev/null ENV=/dev/null SHELLOPTS= "
+                "command env BASH_ENV=/dev/null ENV=/dev/null SHELLOPTS= "
                 "bash --noprofile --norc +x -c "
                 f"{shlex.quote(cmd_string)}"
             )

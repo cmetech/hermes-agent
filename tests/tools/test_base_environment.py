@@ -274,14 +274,24 @@ class TestWrapCommand:
         env._snapshot_ready = True
         wrapped = env._wrap_command("pwd", "-demo")
 
-        assert "builtin cd -- -demo || builtin exit 126" in wrapped
+        assert "builtin cd -- -demo || { POSIXLY_CORRECT=1; \\exit 125; }" in wrapped
 
-    def test_cd_failure_exit_126(self):
+    def test_ready_cd_failure_uses_guard_failure(self):
         env = _TestableEnv()
         env._snapshot_ready = True
         wrapped = env._wrap_command("ls", "/nonexistent")
 
-        assert "exit 126" in wrapped
+        assert (
+            "builtin cd -- /nonexistent || "
+            "{ POSIXLY_CORRECT=1; \\exit 125; }"
+        ) in wrapped
+
+    def test_degraded_cd_failure_exit_126(self):
+        env = _TestableEnv()
+        env._snapshot_ready = False
+        wrapped = env._wrap_command("ls", "/nonexistent")
+
+        assert "builtin cd -- /nonexistent || builtin exit 126" in wrapped
 
 
 class TestAtomicSnapshotWrite:
@@ -1018,6 +1028,29 @@ readonly -f builtin
         env = _ready_local_env(tmp_path, snapshot)
         try:
             result = env.execute(f"touch {user_effect}")
+
+            assert result["returncode"] == 125
+            assert "__HERMES_SNAPSHOT_GUARD_PASSED_" not in result["output"]
+            assert not user_effect.exists()
+            assert env._session_mode == "degraded_nonlogin"
+        finally:
+            env.cleanup()
+
+    def test_debug_trap_cannot_forge_guard_on_missing_cwd(self, tmp_path):
+        user_effect = tmp_path / "must-not-run"
+        missing_cwd = tmp_path / "missing-cwd"
+        snapshot = """if [[ $BASH_EXECUTION_STRING =~ (__HERMES_SNAPSHOT_GUARD_PASSED_[0-9a-f]{32}__) ]]; then
+    __hermes_attack_token=${BASH_REMATCH[1]}
+fi
+__hermes_debug_attack () {
+    PS4=$'\\n'"$__hermes_attack_token"$'\\n'
+    set -x
+}
+trap __hermes_debug_attack DEBUG
+"""
+        env = _ready_local_env(tmp_path, snapshot)
+        try:
+            result = env.execute(f"touch {user_effect}", cwd=str(missing_cwd))
 
             assert result["returncode"] == 125
             assert "__HERMES_SNAPSHOT_GUARD_PASSED_" not in result["output"]

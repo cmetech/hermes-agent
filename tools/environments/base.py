@@ -814,6 +814,24 @@ class BaseEnvironment(ABC):
         # needs to survive the compromised shell.
         guarded_failure = f"POSIXLY_CORRECT=1; \\exit {_SNAPSHOT_GUARD_FAILURE_EXIT}"
 
+        # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
+        # ``$HOME`` so suffixes with spaces remain a single shell word.
+        quoted_cwd = self._quote_cwd_for_cd(cwd)
+        protected_cwd_setup = (
+            f"__hermes_had_cdpath=0 || {{ {guarded_failure}; }}",
+            "if [[ ${CDPATH+x} ]]; then "
+            "__hermes_had_cdpath=1 && __hermes_old_cdpath=$CDPATH; fi || "
+            f"{{ {guarded_failure}; }}",
+            f"CDPATH= || {{ {guarded_failure}; }}",
+            f"builtin cd -- {quoted_cwd} || {{ {guarded_failure}; }}",
+            "if [[ $__hermes_had_cdpath == 1 ]]; then "
+            "CDPATH=$__hermes_old_cdpath; "
+            "else builtin unset CDPATH; fi || "
+            f"{{ {guarded_failure}; }}",
+            "builtin unset __hermes_had_cdpath __hermes_old_cdpath || "
+            f"{{ {guarded_failure}; }}",
+        )
+
         # Source and sanitize the snapshot while xtrace is routed to a
         # temporary /dev/null descriptor. A tampered snapshot can enable
         # xtrace and choose PS4, including text resembling the guard-passed
@@ -821,8 +839,9 @@ class BaseEnvironment(ABC):
         # group and restores/closes it afterward without clobbering any caller
         # fd 19. The group's stdout/stderr are also suppressed so a snapshot
         # cannot redirect BASH_XTRACEFD back to 1 or 2 and forge control data.
-        # Trace is disabled and BASH_XTRACEFD restored only after the sanitizer
-        # succeeds; failure exits while trace remains suppressed.
+        # DEBUG/RETURN/ERR traps, trace state, and cwd are neutralized while
+        # still inside the suppressed group. Failure exits before the group can
+        # expose output or the wrapper can emit its guard-passed attestation.
         #
         # Snapshot stdout/stderr is also redirected: on macOS (bash 3.2 and
         # certain Homebrew bash builds), sourcing ``declare -x`` can emit the
@@ -831,51 +850,57 @@ class BaseEnvironment(ABC):
             parts.extend(
                 (
                     "if {",
-                    "__hermes_snapshot_had_xtracefd=0",
+                    f"__hermes_snapshot_had_xtracefd=0 || "
+                    f"{{ {guarded_failure}; }}",
                     "if [[ ${BASH_XTRACEFD+x} ]]; then "
-                    "__hermes_snapshot_had_xtracefd=1; "
-                    "__hermes_snapshot_old_xtracefd=$BASH_XTRACEFD; fi",
+                    "__hermes_snapshot_had_xtracefd=1 && "
+                    "__hermes_snapshot_old_xtracefd=$BASH_XTRACEFD; fi || "
+                    f"{{ {guarded_failure}; }}",
                     f"BASH_XTRACEFD=19 || {{ {guarded_failure}; }}",
                     f"builtin source {_quoted_snap} >/dev/null 2>&1 || "
                     f"{{ {guarded_failure}; }}",
-                    "__hermes_snapshot_reject_dispatcher_functions=1",
+                    "__hermes_snapshot_reject_dispatcher_functions=1 || "
+                    f"{{ {guarded_failure}; }}",
                     "if {",
                     _SNAPSHOT_OPERATION_PRELUDE,
                     f"}}; then :; else {guarded_failure}; fi",
-                    "builtin set +x",
+                    "builtin trap - DEBUG RETURN ERR || "
+                    f"{{ {guarded_failure}; }}",
+                    f"builtin set +x || {{ {guarded_failure}; }}",
                     "if [[ $__hermes_snapshot_had_xtracefd == 1 ]]; then "
                     "BASH_XTRACEFD=$__hermes_snapshot_old_xtracefd; "
                     "else builtin unset BASH_XTRACEFD; fi || "
                     f"{{ {guarded_failure}; }}",
                     "builtin unset __hermes_snapshot_had_xtracefd "
-                    "__hermes_snapshot_old_xtracefd",
+                    "__hermes_snapshot_old_xtracefd || "
+                    f"{{ {guarded_failure}; }}",
+                    *protected_cwd_setup,
                     f"}}; then :; else {guarded_failure}; "
                     "fi 19>/dev/null >/dev/null 2>&1",
                 )
             )
-
-        # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
-        # ``$HOME`` so suffixes with spaces remain a single shell word.
-        quoted_cwd = self._quote_cwd_for_cd(cwd)
-        parts.extend(
-            (
-                "__hermes_had_cdpath=0",
-                "if [[ ${CDPATH+x} ]]; then __hermes_had_cdpath=1; "
-                "__hermes_old_cdpath=$CDPATH; fi",
-                "CDPATH=",
-                f"builtin cd -- {quoted_cwd} || builtin exit 126",
-                "if [[ $__hermes_had_cdpath == 1 ]]; then "
-                "CDPATH=$__hermes_old_cdpath; else builtin unset CDPATH; fi",
-                "builtin unset __hermes_had_cdpath __hermes_old_cdpath",
+        else:
+            parts.extend(
+                (
+                    "__hermes_had_cdpath=0",
+                    "if [[ ${CDPATH+x} ]]; then __hermes_had_cdpath=1; "
+                    "__hermes_old_cdpath=$CDPATH; fi",
+                    "CDPATH=",
+                    f"builtin cd -- {quoted_cwd} || builtin exit 126",
+                    "if [[ $__hermes_had_cdpath == 1 ]]; then "
+                    "CDPATH=$__hermes_old_cdpath; else builtin unset CDPATH; fi",
+                    "builtin unset __hermes_had_cdpath __hermes_old_cdpath",
+                )
             )
-        )
 
         # This is the only READY-path trust attestation. It is emitted after
         # source, sanitizer, and cwd setup all succeed, immediately before user
         # code. The raw-stream filter removes it before any bounded rendering.
         if self._snapshot_ready and guard_passed_sentinel:
             parts.append(
-                f"builtin printf '\\n%s\\n' {shlex.quote(guard_passed_sentinel)}"
+                f"builtin printf '\\n%s\\n' "
+                f"{shlex.quote(guard_passed_sentinel)} || "
+                f"{{ {guarded_failure}; }}"
             )
 
         # Run the actual command
