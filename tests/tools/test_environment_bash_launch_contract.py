@@ -53,6 +53,7 @@ def _assert_outer_trace_cannot_attest(
     *,
     script_stdin=None,
     shell_command_from_stdin=False,
+    startup_script=None,
 ):
     bash = shutil.which("bash")
     if bash is None:
@@ -64,6 +65,8 @@ def _assert_outer_trace_cannot_attest(
     )
     run_env = dict(os.environ)
     run_env.update(SHELLOPTS="xtrace", PS4=dynamic_ps4)
+    if startup_script is not None:
+        run_env["BASH_ENV"] = str(startup_script)
     args = [bash, "--noprofile", "--norc"]
     if shell_command_from_stdin:
         args.append("-s")
@@ -184,7 +187,10 @@ def test_ssh_command_string_clears_readonly_shellopts_in_real_bash(monkeypatch):
     _assert_clean_child_under_inherited_xtrace(captured["cmd"][-1])
 
 
-def test_ssh_outer_trace_cannot_expose_or_attest_wrapper(monkeypatch):
+def test_ssh_startup_debug_trap_cannot_expose_or_attest_wrapper(
+    monkeypatch,
+    tmp_path,
+):
     captured = {}
     monkeypatch.setattr(
         ssh_mod,
@@ -193,12 +199,15 @@ def test_ssh_outer_trace_cannot_expose_or_attest_wrapper(monkeypatch):
     )
     env = ssh_mod.SSHEnvironment.__new__(ssh_mod.SSHEnvironment)
     env._build_ssh_command = lambda: ["ssh", "remote"]
+    startup_script = tmp_path / "startup-debug-trap.sh"
+    startup_script.write_text("trap 'set -x' DEBUG\n")
 
     env._run_bash(_OUTER_TRACE_WRAPPER, clean=True)
 
     _assert_outer_trace_cannot_attest(
         captured["cmd"][-1],
         script_stdin=captured["stdin"],
+        startup_script=startup_script,
     )
 
 
@@ -287,12 +296,14 @@ def test_daytona_command_string_clears_readonly_shellopts_in_real_bash():
     _assert_clean_child_under_inherited_xtrace(shell_command)
 
 
-def test_daytona_outer_trace_cannot_expose_or_attest_wrapper():
+def test_daytona_startup_debug_trap_cannot_expose_or_attest_wrapper(tmp_path):
     sandbox = MagicMock()
     sandbox.process.exec.return_value = SimpleNamespace(result="", exit_code=0)
     env = DaytonaEnvironment.__new__(DaytonaEnvironment)
     env._sandbox = sandbox
     env._lock = threading.Lock()
+    startup_script = tmp_path / "startup-debug-trap.sh"
+    startup_script.write_text("trap 'set -x' DEBUG\n")
 
     handle = env._run_bash(_OUTER_TRACE_WRAPPER, clean=True)
     assert handle.wait(2) == 0
@@ -301,4 +312,5 @@ def test_daytona_outer_trace_cannot_expose_or_attest_wrapper():
     _assert_outer_trace_cannot_attest(
         decoded_sdk_script,
         shell_command_from_stdin=True,
+        startup_script=startup_script,
     )

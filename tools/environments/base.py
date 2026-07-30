@@ -56,10 +56,13 @@ _SNAPSHOT_GUARD_PASSED_SENTINEL_PREFIX = "__HERMES_SNAPSHOT_GUARD_PASSED_"
 # A token-free first stage for command-string transports whose account shell
 # may inherit xtrace. The wrapper is supplied only after this prelude disables
 # tracing. POSIX mode gives special builtins precedence over shell functions;
-# protected unset then removes functions that could intercept the external
-# hygienic launch. The AND-list fails closed before any sentinel-bearing step.
+# a startup DEBUG trap is cleared while the script is still token-free, then
+# protected unset removes functions that could intercept the external hygienic
+# launch. The AND-list fails closed before any sentinel-bearing step.
 _CLEAN_OUTER_SHELL_PRELUDE = (
     "POSIXLY_CORRECT=1 &&\n"
+    "\\set +x &&\n"
+    "{ [ -z \"${BASH_VERSION-}\" ] || \\trap - DEBUG; } &&\n"
     "\\set +x &&\n"
     "{ \\unset -f command 2>/dev/null || "
     "! \\export -f command >/dev/null 2>&1; } &&\n"
