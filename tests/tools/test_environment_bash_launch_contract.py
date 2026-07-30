@@ -1,4 +1,4 @@
-"""Behavioral coverage for BaseEnvironment's protected launch contract."""
+"""Behavioral coverage for hygienic BaseEnvironment shell launches."""
 
 import asyncio
 import threading
@@ -13,119 +13,73 @@ from tools.environments import ssh as ssh_mod
 from tools.environments.daytona import DaytonaEnvironment
 
 
-def test_local_applies_script_stdin_and_process_cwd(monkeypatch, tmp_path):
+def test_local_clean_launch_suppresses_startup_hooks(monkeypatch):
     captured = {}
     proc = MagicMock(pid=123)
-
-    def fake_popen(args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return proc
-
     monkeypatch.setattr(local_mod, "_find_bash", lambda: "/bin/bash")
-    monkeypatch.setattr(local_mod, "_resolve_shell_init_files", lambda: [])
-    monkeypatch.setattr(local_mod.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(local_mod, "_pipe_stdin", lambda handle, data: captured.update(stdin=data))
+    monkeypatch.setattr(local_mod.subprocess, "Popen", lambda args, **kw: captured.update(args=args, kwargs=kw) or proc)
     monkeypatch.setattr(local_mod.os, "getpgid", lambda pid: pid)
-
     env = local_mod.LocalEnvironment.__new__(local_mod.LocalEnvironment)
-    env.cwd = "/default"
-    env.env = {}
+    env.cwd = "/tmp"
+    env.env = {"BASH_ENV": "/malicious", "ENV": "/malicious"}
 
-    target = str(tmp_path)
-    assert env._run_bash(
-        "protected-script", login=True, script_stdin=True, cwd=target
-    ) is proc
-    assert captured["args"] == ["/bin/bash", "-l", "-s"]
-    assert captured["stdin"] == "protected-script"
-    assert captured["kwargs"]["cwd"] == target
+    assert env._run_bash("protected-script", clean=True) is proc
+    assert captured["args"] == ["/bin/bash", "--noprofile", "--norc", "-c", "protected-script"]
+    assert captured["kwargs"]["env"]["BASH_ENV"] == "/dev/null"
+    assert captured["kwargs"]["env"]["ENV"] == "/dev/null"
 
 
-def test_docker_applies_script_stdin_and_process_cwd(monkeypatch):
+def test_docker_clean_launch_suppresses_startup_hooks(monkeypatch):
     captured = {}
     sentinel = object()
-    monkeypatch.setattr(
-        docker_mod,
-        "_popen_bash",
-        lambda cmd, stdin: captured.update(cmd=cmd, stdin=stdin) or sentinel,
-    )
+    monkeypatch.setattr(docker_mod, "_popen_bash", lambda cmd, stdin: captured.update(cmd=cmd, stdin=stdin) or sentinel)
     env = docker_mod.DockerEnvironment.__new__(docker_mod.DockerEnvironment)
     env._docker_exe = "docker"
     env._container_id = "container-id"
-    env._init_env_args = ["-e", "PROFILE=value"]
+    env._init_env_args = []
 
-    assert env._run_bash("protected-script", login=True, script_stdin=True, cwd="/target") is sentinel
+    assert env._run_bash("protected-script", clean=True) is sentinel
     assert captured["cmd"] == [
-        "docker",
-        "exec",
-        "-i",
-        "-w",
-        "/target",
-        "-e",
-        "PROFILE=value",
-        "container-id",
-        "bash",
-        "-l",
-        "-s",
+        "docker", "exec", "-e", "BASH_ENV=/dev/null", "-e", "ENV=/dev/null",
+        "container-id", "bash", "--noprofile", "--norc", "-c", "protected-script",
     ]
-    assert captured["stdin"] == "protected-script"
+    assert captured["stdin"] is None
 
 
-def test_singularity_applies_script_stdin_and_process_cwd(monkeypatch):
+def test_singularity_clean_launch_suppresses_startup_hooks(monkeypatch):
     captured = {}
     sentinel = object()
-    monkeypatch.setattr(
-        singularity_mod,
-        "_popen_bash",
-        lambda cmd, stdin: captured.update(cmd=cmd, stdin=stdin) or sentinel,
-    )
-    env = singularity_mod.SingularityEnvironment.__new__(
-        singularity_mod.SingularityEnvironment
-    )
+    monkeypatch.setattr(singularity_mod, "_popen_bash", lambda cmd, stdin: captured.update(cmd=cmd, stdin=stdin) or sentinel)
+    env = singularity_mod.SingularityEnvironment.__new__(singularity_mod.SingularityEnvironment)
     env._instance_started = True
     env.executable = "apptainer"
     env.instance_id = "instance-id"
 
-    assert env._run_bash("protected-script", login=True, script_stdin=True, cwd="/target") is sentinel
+    assert env._run_bash("protected-script", clean=True) is sentinel
     assert captured["cmd"] == [
-        "apptainer",
-        "exec",
-        "--pwd",
-        "/target",
-        "instance://instance-id",
-        "bash",
-        "-l",
-        "-s",
+        "apptainer", "exec", "instance://instance-id", "env",
+        "BASH_ENV=/dev/null", "ENV=/dev/null", "bash", "--noprofile", "--norc",
+        "-c", "protected-script",
     ]
-    assert captured["stdin"] == "protected-script"
+    assert captured["stdin"] is None
 
 
-def test_ssh_applies_script_stdin_and_process_cwd(monkeypatch):
+def test_ssh_clean_launch_suppresses_startup_hooks(monkeypatch):
     captured = {}
     sentinel = object()
-    monkeypatch.setattr(
-        ssh_mod,
-        "_popen_bash",
-        lambda cmd, stdin: captured.update(cmd=cmd, stdin=stdin) or sentinel,
-    )
+    monkeypatch.setattr(ssh_mod, "_popen_bash", lambda cmd, stdin: captured.update(cmd=cmd, stdin=stdin) or sentinel)
     env = ssh_mod.SSHEnvironment.__new__(ssh_mod.SSHEnvironment)
     env._build_ssh_command = lambda: ["ssh", "remote"]
 
-    assert env._run_bash(
-        "protected-script", login=True, script_stdin=True, cwd="/target path"
-    ) is sentinel
+    assert env._run_bash("protected-script", clean=True) is sentinel
     assert captured["cmd"][:2] == ["ssh", "remote"]
-    launcher = captured["cmd"][-1]
-    assert "protected-script" not in launcher
-    assert "bash -l -s" in launcher
-    assert "/target path" in launcher
-    assert "unset -f builtin unset set cd" in launcher
-    assert captured["stdin"] == "protected-script"
+    assert "BASH_ENV=/dev/null ENV=/dev/null bash --noprofile --norc -c" in captured["cmd"][-1]
+    assert "protected-script" in captured["cmd"][-1]
+    assert captured["stdin"] is None
 
 
-def test_modal_writes_script_to_stdin_and_applies_process_cwd():
+def test_modal_clean_launch_uses_sdk_env_without_stdin_transport():
     process = MagicMock()
-    process.stdin.drain.aio = AsyncMock()
     process.stdout.read.aio = AsyncMock(return_value=b"stdout")
     process.stderr.read.aio = AsyncMock(return_value=b"")
     process.wait.aio = AsyncMock(return_value=0)
@@ -133,36 +87,30 @@ def test_modal_writes_script_to_stdin_and_applies_process_cwd():
     sandbox.exec.aio = AsyncMock(return_value=process)
     worker = MagicMock()
     worker.run_coroutine.side_effect = lambda coro, timeout: asyncio.run(coro)
-
     env = modal_mod.ModalEnvironment.__new__(modal_mod.ModalEnvironment)
     env._sandbox = sandbox
     env._worker = worker
 
-    handle = env._run_bash(
-        "protected-script", login=True, script_stdin=True, cwd="/target"
-    )
+    handle = env._run_bash("protected-script", clean=True)
     assert handle.wait(2) == 0
     sandbox.exec.aio.assert_awaited_once_with(
-        "bash", "-l", "-s", timeout=120, workdir="/target"
+        "bash", "--noprofile", "--norc", "-c", "protected-script", timeout=120,
+        env={"BASH_ENV": "/dev/null", "ENV": "/dev/null"},
     )
-    process.stdin.write.assert_called_once_with("protected-script")
-    process.stdin.write_eof.assert_called_once_with()
-    assert process.stdin.drain.aio.await_count == 2
+    process.stdin.write.assert_not_called()
 
 
-def test_daytona_uses_inner_login_stdin_shell_and_process_cwd():
+def test_daytona_clean_launch_uses_inner_hygienic_bash():
     sandbox = MagicMock()
     sandbox.process.exec.return_value = SimpleNamespace(result="stdout", exit_code=0)
     env = DaytonaEnvironment.__new__(DaytonaEnvironment)
     env._sandbox = sandbox
     env._lock = threading.Lock()
 
-    handle = env._run_bash(
-        "protected-script", login=True, script_stdin=True, cwd="/target"
-    )
+    handle = env._run_bash("protected-script", clean=True)
     assert handle.wait(2) == 0
     shell_cmd = sandbox.process.exec.call_args.args[0]
-    assert shell_cmd.startswith("bash -l -s <<'HERMES_BOOTSTRAP_")
-    assert "\nprotected-script\n" in shell_cmd
-    assert "bash -l -c" not in shell_cmd
-    sandbox.process.exec.assert_called_once_with(shell_cmd, cwd="/target", timeout=120)
+    assert shell_cmd == (
+        "BASH_ENV=/dev/null ENV=/dev/null bash --noprofile --norc -c protected-script"
+    )
+    sandbox.process.exec.assert_called_once_with(shell_cmd, timeout=120)

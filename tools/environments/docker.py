@@ -1057,19 +1057,14 @@ class DockerEnvironment(BaseEnvironment):
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None,
-                  script_stdin: bool = False,
-                  cwd: str | None = None) -> subprocess.Popen:
+                  clean: bool = False) -> subprocess.Popen:
         """Spawn a bash process inside the Docker container."""
         assert self._container_id, "Container not started"
         cmd = [self._docker_exe, "exec"]
-        if script_stdin and stdin_data is not None:
-            raise ValueError("script_stdin cannot be combined with stdin_data")
-        if script_stdin:
-            stdin_data = cmd_string
         if stdin_data is not None:
             cmd.append("-i")
-        if cwd:
-            cmd.extend(["-w", cwd])
+        if clean:
+            cmd.extend(["-e", "BASH_ENV=/dev/null", "-e", "ENV=/dev/null"])
 
         # Only inject -e env args during init_session (login=True).
         # Subsequent commands get env vars from the snapshot.
@@ -1078,10 +1073,8 @@ class DockerEnvironment(BaseEnvironment):
 
         cmd.extend([self._container_id])
 
-        if script_stdin and login:
-            cmd.extend(["bash", "-l", "-s"])
-        elif script_stdin:
-            cmd.extend(["bash", "-s"])
+        if clean:
+            cmd.extend(["bash", "--noprofile", "--norc", "-c", cmd_string])
         elif login:
             cmd.extend(["bash", "-l", "-c", cmd_string])
         else:

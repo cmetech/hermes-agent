@@ -1359,11 +1359,8 @@ class LocalEnvironment(BaseEnvironment):
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None,
-                  script_stdin: bool = False,
-                  cwd: str | None = None) -> subprocess.Popen:
+                  clean: bool = False) -> subprocess.Popen:
         bash = _find_bash()
-        if script_stdin and stdin_data is not None:
-            raise ValueError("script_stdin cannot be combined with stdin_data")
         # For login-shell invocations (used by init_session to build the
         # environment snapshot), prepend sources for the user's bashrc /
         # custom init files so tools registered outside bash_profile
@@ -1374,12 +1371,14 @@ class LocalEnvironment(BaseEnvironment):
             init_files = _resolve_shell_init_files()
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
-        if script_stdin:
-            args = [bash, "-l", "-s"] if login else [bash, "-s"]
-            stdin_data = cmd_string
+        if clean:
+            args = [bash, "--noprofile", "--norc", "-c", cmd_string]
         else:
             args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
+        if clean:
+            run_env["BASH_ENV"] = "/dev/null"
+            run_env["ENV"] = "/dev/null"
 
         # Recover when the cwd has been deleted out from under us — usually by
         # a previous tool call that ran ``rm -rf`` on its own working dir
@@ -1391,7 +1390,7 @@ class LocalEnvironment(BaseEnvironment):
         # POSIX paths (``/c/Users/...``) to native form so a perfectly valid
         # ``pwd -P`` result from bash isn't mistakenly treated as "missing"
         # and spammed as a warning on every command.
-        requested_cwd = cwd or self.cwd
+        requested_cwd = self.cwd
         safe_cwd = _resolve_safe_cwd(requested_cwd)
         if safe_cwd != requested_cwd:
             # MSYS → Windows translation alone shouldn't surface as a warning
@@ -1405,8 +1404,7 @@ class LocalEnvironment(BaseEnvironment):
                     requested_cwd,
                     safe_cwd,
                 )
-            if cwd is None:
-                self.cwd = safe_cwd
+            self.cwd = safe_cwd
 
         _popen_cwd = safe_cwd
 

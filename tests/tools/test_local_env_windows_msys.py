@@ -19,7 +19,7 @@ on the real OS.
 """
 
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from tools.environments.base import BaseEnvironment
 from tools.environments import local as local_mod
@@ -429,8 +429,8 @@ class TestWrapCommandWindowsNativeCwd:
         env._snapshot_ready = True
         wrapped = env._wrap_command("pwd", r"C:\Users\liush")
 
-        assert "builtin cd -- /c/Users/liush || exit 126" in wrapped
-        assert r"builtin cd -- C:\Users\liush || exit 126" not in wrapped
+        assert "builtin cd -- /c/Users/liush || builtin exit 126" in wrapped
+        assert r"builtin cd -- C:\Users\liush || builtin exit 126" not in wrapped
 
     def test_init_session_bootstrap_converts_native_cwd_for_cd(self, monkeypatch):
         """The snapshot bootstrap ``cd`` must also use the Git-Bash path form,
@@ -441,8 +441,12 @@ class TestWrapCommandWindowsNativeCwd:
         captured = {}
 
         def fake_run_bash(self, cmd_string, **kwargs):
-            captured.setdefault("script", cmd_string)  # bootstrap only; ignore the failure-path probe
-            raise RuntimeError("stop after capturing bootstrap")
+            if kwargs.get("login"):
+                captured.setdefault("script", cmd_string)
+                raise RuntimeError("stop after capturing bootstrap")
+            mock = MagicMock(returncode=0, stdout=iter([]))
+            mock.poll.return_value = 0
+            return mock
 
         monkeypatch.setattr(LocalEnvironment, "_run_bash", fake_run_bash)
 
@@ -461,8 +465,12 @@ class TestWrapCommandWindowsNativeCwd:
         captured = {}
 
         def fake_run_bash(self, cmd_string, **kwargs):
-            captured.setdefault("script", cmd_string)  # bootstrap only; ignore the failure-path probe
-            raise RuntimeError("stop after capturing bootstrap")
+            if kwargs.get("login"):
+                captured.setdefault("script", cmd_string)
+                raise RuntimeError("stop after capturing bootstrap")
+            mock = MagicMock(returncode=0, stdout=iter([]))
+            mock.poll.return_value = 0
+            return mock
 
         monkeypatch.setattr(LocalEnvironment, "_run_bash", fake_run_bash)
 
@@ -490,8 +498,12 @@ class TestWrapCommandWindowsNativeCwd:
         captured = {}
 
         def fake_run_bash(self, cmd_string, **kwargs):
-            captured.setdefault("script", cmd_string)  # bootstrap only; ignore the failure-path probe
-            raise RuntimeError("stop after capturing bootstrap")
+            if kwargs.get("login"):
+                captured.setdefault("script", cmd_string)
+                raise RuntimeError("stop after capturing bootstrap")
+            mock = MagicMock(returncode=0, stdout=iter([]))
+            mock.poll.return_value = 0
+            return mock
 
         monkeypatch.setattr(LocalEnvironment, "_run_bash", fake_run_bash)
 

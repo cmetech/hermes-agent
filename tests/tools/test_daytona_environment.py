@@ -221,10 +221,12 @@ class TestCleanup:
 class TestExecute:
     def test_basic_command(self, make_env):
         sb = _make_sandbox()
-        # Calls: (1) $HOME detection, (2) init_session bootstrap, (3) actual command
+        # Calls: HOME, snapshot preclean/capture/validation, actual command.
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),       # $HOME
-            _make_exec_response(result="", exit_code=0),  # init_session
+            _make_exec_response(result="", exit_code=0),  # preclean
+            _make_exec_response(result="", exit_code=0),  # capture
+            _make_exec_response(result="", exit_code=0),  # validation
             _make_exec_response(result="hello", exit_code=0),  # actual cmd
         ]
         sb.state = "started"
@@ -239,7 +241,9 @@ class TestExecute:
         sb = _make_sandbox()
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),
-            _make_exec_response(result="", exit_code=0),  # init_session
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
             _make_exec_response(result="ok", exit_code=0),
         ]
         sb.state = "started"
@@ -258,7 +262,9 @@ class TestExecute:
         sb = _make_sandbox()
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),
-            _make_exec_response(result="", exit_code=0),  # init_session
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
             _make_exec_response(result="", exit_code=124),  # actual cmd
         ]
         sb.state = "started"
@@ -271,7 +277,9 @@ class TestExecute:
         sb = _make_sandbox()
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),
-            _make_exec_response(result="", exit_code=0),  # init_session
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
             _make_exec_response(result="not found", exit_code=127),
         ]
         sb.state = "started"
@@ -284,7 +292,9 @@ class TestExecute:
         sb = _make_sandbox()
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),
-            _make_exec_response(result="", exit_code=0),  # init_session
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
             _make_exec_response(result="ok", exit_code=0),
         ]
         sb.state = "started"
@@ -305,7 +315,9 @@ class TestExecute:
         sb.state = "started"
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),  # $HOME
-            _make_exec_response(result="", exit_code=0),  # init_session
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
             daytona_sdk.DaytonaError("transient"),  # first attempt fails
             _make_exec_response(result="ok", exit_code=0),  # retry succeeds
         ]
@@ -387,7 +399,9 @@ class TestRetryExhausted:
         sb.state = "started"
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),       # $HOME
-            _make_exec_response(result="", exit_code=0),  # init_session
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
             daytona_sdk.DaytonaError("fail1"),         # actual command fails
         ]
         env = make_env(sandbox=sb)

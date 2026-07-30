@@ -43,7 +43,8 @@ class TestInitSessionCwdRespect:
         captured = {}
 
         def mock_run_bash(cmd_string, **kwargs):
-            captured["cmd"] = cmd_string
+            if kwargs.get("login"):
+                captured["cmd"] = cmd_string
             mock = MagicMock()
             mock.poll.return_value = 0
             mock.returncode = 0
@@ -129,7 +130,8 @@ class TestInitSessionCwdRespect:
         captured = {}
 
         def mock_run_bash(cmd_string, **kwargs):
-            captured["cmd"] = cmd_string
+            if kwargs.get("login"):
+                captured["cmd"] = cmd_string
             mock = MagicMock()
             mock.poll.return_value = 0
             mock.returncode = 0

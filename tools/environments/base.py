@@ -50,10 +50,7 @@ _activity_callback_local = threading.local()
 # path for both bounded and unbounded modes.
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
-# Bootstrap status paired with a per-invocation output marker for a healthy
-# login shell whose profile cannot be represented without weakening the
-# dispatcher sanitizer. The status alone is intentionally not authoritative.
-_SNAPSHOT_PROFILE_FALLBACK_EXIT = 78
+_SNAPSHOT_GUARD_FAILURE_EXIT = 125
 
 
 # Bash resolves a function named ``builtin`` before ``\builtin``, including on
@@ -74,22 +71,14 @@ if [[ ${POSIXLY_CORRECT+x} ]]; then
 fi
 POSIXLY_CORRECT=1
 __hermes_snapshot_had_dispatcher_functions=0
-if __hermes_snapshot_shell_catalog=$(\set); then
-    if [[ "$__hermes_snapshot_shell_catalog" == *$'\nbuiltin () '* ||
-          "$__hermes_snapshot_shell_catalog" == *$'\nset () '* ||
-          "$__hermes_snapshot_shell_catalog" == *$'\nunset () '* ]]; then
-        __hermes_snapshot_had_dispatcher_functions=1
-    fi
-else
-    [[ 0 == 1 ]]
-fi &&
+if \export -f builtin >/dev/null 2>&1 ||
+   \export -f set >/dev/null 2>&1 ||
+   \export -f unset >/dev/null 2>&1; then
+    __hermes_snapshot_had_dispatcher_functions=1
+fi
 if [[ ${__hermes_snapshot_reject_dispatcher_functions:-0} == 1 &&
       $__hermes_snapshot_had_dispatcher_functions == 1 ]]; then
-    \readonly __hermes_snapshot_profile_fallback_marker
-    # Bash 3.2 accepts a name after ``readonly -p`` but prints nothing; listing
-    # all readonly variables is the portable way to emit the nonce value.
-    \readonly -p
-    \exit "$__hermes_snapshot_profile_fallback_exit"
+    \exit 125
 fi &&
 if \unset -f builtin unset set; then
     if [[ $__hermes_snapshot_had_posixly_correct == 1 ]]; then
@@ -103,11 +92,9 @@ if \unset -f builtin unset set; then
         \set +o posix
     fi &&
     \unset __hermes_snapshot_was_posix __hermes_snapshot_had_posixly_correct \
-        __hermes_snapshot_old_posixly_correct __hermes_snapshot_shell_catalog \
+        __hermes_snapshot_old_posixly_correct \
         __hermes_snapshot_had_dispatcher_functions \
-        __hermes_snapshot_reject_dispatcher_functions \
-        __hermes_snapshot_profile_fallback_exit \
-        __hermes_snapshot_profile_fallback_marker
+        __hermes_snapshot_reject_dispatcher_functions
 else
     [[ 0 == 1 ]]
 fi"""
@@ -487,6 +474,9 @@ class BaseEnvironment(ABC):
         # ``Directory \\drivers\\etc`` startup) so execute() must not fall
         # back to ``bash -l`` per command — use non-login ``bash -c`` instead.
         self._prefer_nonlogin = False
+        self._session_mode = "uninitialized"
+        self._session_diagnostic = ""
+        self._diagnostic_pending = False
 
     # ------------------------------------------------------------------
     # Abstract methods
@@ -499,8 +489,7 @@ class BaseEnvironment(ABC):
         login: bool = False,
         timeout: int = 120,
         stdin_data: str | None = None,
-        script_stdin: bool = False,
-        cwd: str | None = None,
+        clean: bool = False,
     ) -> ProcessHandle:
         """Spawn a bash process to run *cmd_string*.
 
@@ -517,6 +506,13 @@ class BaseEnvironment(ABC):
     # ------------------------------------------------------------------
     # Session snapshot (init_session)
     # ------------------------------------------------------------------
+
+    def _set_session_mode(self, mode: str, diagnostic: str = "") -> None:
+        self._session_mode = mode
+        self._snapshot_ready = mode == "snapshot"
+        self._prefer_nonlogin = mode != "snapshot"
+        self._session_diagnostic = diagnostic
+        self._diagnostic_pending = bool(diagnostic)
 
     def init_session(self):
         """Capture login shell environment into a snapshot file.
@@ -567,19 +563,9 @@ class BaseEnvironment(ABC):
         # Hermes' allocator or file operations.
         _external = r"\builtin command"
         _builtin = r"\builtin"
-        profile_fallback_marker = (
-            f"__HERMES_SNAPSHOT_PROFILE_FALLBACK_{uuid.uuid4().hex}__"
-        )
-        profile_fallback_record = (
-            "readonly __hermes_snapshot_profile_fallback_marker="
-            f'"{profile_fallback_marker}"'
-        )
         bootstrap = (
             "(\n"
             "__hermes_snapshot_reject_dispatcher_functions=1\n"
-            f"__hermes_snapshot_profile_fallback_exit={_SNAPSHOT_PROFILE_FALLBACK_EXIT}\n"
-            "__hermes_snapshot_profile_fallback_marker="
-            f"{shlex.quote(profile_fallback_marker)}\n"
             "if {\n"
             f"{_SNAPSHOT_OPERATION_PRELUDE}\n"
             "}; then\n"
@@ -623,26 +609,55 @@ class BaseEnvironment(ABC):
             "fi\n"
             ")\n"
         )
-        profile_fallback = False
+        clean_timeout = min(15, self._snapshot_timeout)
         try:
+            cleanup = self._run_bash(
+                f"builtin command rm -f -- {_quoted_snap}",
+                timeout=clean_timeout,
+                clean=True,
+            )
+            cleanup_result = self._wait_for_process(cleanup, timeout=clean_timeout)
+            if int(cleanup_result.get("returncode") or 0) != 0:
+                raise RuntimeError("could not prepare fresh snapshot candidate")
+
+            self._session_mode = "capturing"
             proc = self._run_bash(
                 bootstrap,
                 login=True,
                 timeout=self._snapshot_timeout,
-                script_stdin=True,
+                clean=False,
             )
             result = self._wait_for_process(proc, timeout=self._snapshot_timeout)
             returncode = int(result.get("returncode") or 0)
-            profile_fallback = profile_fallback_record in str(
-                result.get("output") or ""
-            ).splitlines()
-            if profile_fallback:
-                raise RuntimeError("snapshot bootstrap rejected unsafe login profile")
             if returncode != 0:
                 raise RuntimeError(
                     f"snapshot bootstrap failed with exit code {returncode}"
                 )
-            self._snapshot_ready = True
+
+            validator = (
+                f"[[ -f {_quoted_snap} && ! -L {_quoted_snap} && -s {_quoted_snap} ]] && "
+                f"__hermes_mode=$(builtin command stat -c %a {_quoted_snap} 2>/dev/null || "
+                f"builtin command stat -f %Lp {_quoted_snap} 2>/dev/null) && "
+                "[[ $__hermes_mode == 600 ]] && "
+                f"builtin command bash --noprofile --norc -n {_quoted_snap} && "
+                "(\n"
+                f"builtin source {_quoted_snap} >/dev/null 2>&1 || builtin exit 125\n"
+                "__hermes_snapshot_reject_dispatcher_functions=1\n"
+                "if {\n"
+                f"{_SNAPSHOT_OPERATION_PRELUDE}\n"
+                "}; then builtin exit 0; else builtin exit 125; fi\n"
+                ")"
+            )
+            validation_proc = self._run_bash(
+                validator, timeout=clean_timeout, clean=True
+            )
+            validation = self._wait_for_process(
+                validation_proc, timeout=clean_timeout
+            )
+            if int(validation.get("returncode") or 0) != 0:
+                raise RuntimeError("snapshot artifact validation failed")
+
+            self._set_session_mode("snapshot")
             self._update_cwd(result)
             logger.info(
                 "Session snapshot created (session=%s, cwd=%s)",
@@ -650,45 +665,35 @@ class BaseEnvironment(ABC):
                 self.cwd,
             )
         except Exception as exc:
-            self._snapshot_ready = False
-            if profile_fallback:
-                self._prefer_nonlogin = False
-                logger.warning(
-                    "snapshot disabled (session=%s): login profile contains "
-                    "protected shell functions — falling back to bash -l per command",
-                    self._session_id,
-                )
-                return
-            # Default fallback is bash -l per command so PATH/nvm/etc still
-            # load.  If login itself is dead (classic Windows Git Bash
-            # ``Directory \\drivers\\etc does not exist``), that fallback
-            # would brick every tool — prefer non-login bash -c instead.
             detail = str(exc)
-            prefer_nonlogin = False
             try:
-                probe = self._run_bash("true", login=False, timeout=min(15, self._snapshot_timeout))
-                probe_result = self._wait_for_process(probe, timeout=min(15, self._snapshot_timeout))
-                prefer_nonlogin = int(probe_result.get("returncode") or 0) == 0
-                if not prefer_nonlogin:
-                    detail = (probe_result.get("stdout") or detail).strip() or detail
+                rejected = self._run_bash(
+                    f"builtin command rm -f -- {_quoted_snap}",
+                    timeout=clean_timeout,
+                    clean=True,
+                )
+                self._wait_for_process(rejected, timeout=clean_timeout)
+            except Exception as cleanup_exc:
+                detail = f"{detail}; rejected snapshot cleanup: {cleanup_exc}"
+            try:
+                probe = self._run_bash(
+                    "true", timeout=clean_timeout, clean=True
+                )
+                probe_result = self._wait_for_process(probe, timeout=clean_timeout)
+                healthy = int(probe_result.get("returncode") or 0) == 0
             except Exception as probe_exc:
                 detail = f"{detail}; non-login probe: {probe_exc}"
+                healthy = False
 
-            self._prefer_nonlogin = prefer_nonlogin
-            if prefer_nonlogin:
-                logger.warning(
-                    "init_session failed (session=%s): %s — "
-                    "login bash unusable; falling back to non-login bash -c",
-                    self._session_id,
-                    exc,
-                )
+            diagnostic = (
+                f"Session profile snapshot unavailable: {detail}. "
+                "Using a clean non-login shell; profile environment and functions are unavailable."
+            )
+            if healthy:
+                self._set_session_mode("degraded_nonlogin", diagnostic)
             else:
-                logger.warning(
-                    "init_session failed (session=%s): %s — "
-                    "falling back to bash -l per command",
-                    self._session_id,
-                    detail,
-                )
+                self._set_session_mode("unavailable", diagnostic)
+            logger.warning("%s (session=%s)", diagnostic, self._session_id)
 
     # ------------------------------------------------------------------
     # Command wrapping
@@ -700,9 +705,9 @@ class BaseEnvironment(ABC):
         if cwd == "~":
             return cwd
         if cwd == "~/":
-            return "$HOME"
+            return '"$HOME"'
         if cwd.startswith("~/"):
-            return f"$HOME/{shlex.quote(cwd[2:])}"
+            return f'"$HOME"/{shlex.quote(cwd[2:])}'
         return shlex.quote(cwd)
 
     def _quote_shell_path(self, path: str) -> str:
@@ -714,7 +719,7 @@ class BaseEnvironment(ABC):
         """
         return shlex.quote(path)
 
-    def _wrap_command(self, command: str, cwd: str, *, process_cwd: bool = False) -> str:
+    def _wrap_command(self, command: str, cwd: str) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
         escaped = command.replace("'", "'\\''")
@@ -746,20 +751,44 @@ class BaseEnvironment(ABC):
         # vars into every tool response (issue #15459).  Linux bash is
         # silent here, but the redirect is harmless.
         if self._snapshot_ready:
-            parts.append(
-                f"source {_quoted_snap} >/dev/null 2>&1 || true"
+            parts.extend(
+                (
+                    f"builtin source {_quoted_snap} >/dev/null 2>&1 || "
+                    f"builtin exit {_SNAPSHOT_GUARD_FAILURE_EXIT}",
+                    "__hermes_snapshot_reject_dispatcher_functions=1",
+                    "if {",
+                    _SNAPSHOT_OPERATION_PRELUDE,
+                    f"}}; then :; else builtin exit {_SNAPSHOT_GUARD_FAILURE_EXIT}; fi",
+                )
             )
 
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.
         quoted_cwd = self._quote_cwd_for_cd(cwd)
-        # ``--`` keeps hyphen-prefixed directory names from being parsed as options.
-        if not process_cwd:
-            parts.append(f"builtin cd -- {quoted_cwd} || exit 126")
+        parts.extend(
+            (
+                "__hermes_had_cdpath=0",
+                "if [[ ${CDPATH+x} ]]; then __hermes_had_cdpath=1; "
+                "__hermes_old_cdpath=$CDPATH; fi",
+                "CDPATH=",
+                f"builtin cd -- {quoted_cwd} || builtin exit 126",
+                "if [[ $__hermes_had_cdpath == 1 ]]; then "
+                "CDPATH=$__hermes_old_cdpath; else builtin unset CDPATH; fi",
+                "builtin unset __hermes_had_cdpath __hermes_old_cdpath",
+            )
+        )
 
         # Run the actual command
-        parts.append(f"eval '{escaped}'")
+        parts.append(f"builtin eval '{escaped}'")
         parts.append("__hermes_ec=$?")
+        parts.extend(
+            (
+                "__hermes_snapshot_reject_dispatcher_functions=0",
+                "if {",
+                _SNAPSHOT_OPERATION_PRELUDE,
+                f"}}; then :; else \\exit {_SNAPSHOT_GUARD_FAILURE_EXIT}; fi",
+            )
+        )
 
         # Isolate the defensive shell sanitization from the user's command
         # environment. Snapshot files may contain env-carried secrets, so the
@@ -799,9 +828,10 @@ class BaseEnvironment(ABC):
         # end with a newline (e.g. printf 'exact'). We'll strip this
         # injected newline in _extract_cwd_from_output.
         parts.append(
-            f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\""
+            f"builtin printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' "
+            '"$(builtin pwd -P)"'
         )
-        parts.append("exit $__hermes_ec")
+        parts.append("builtin exit $__hermes_ec")
 
         return "\n".join(parts)
 
@@ -1207,6 +1237,11 @@ class BaseEnvironment(ABC):
         the patch engine, code-execution RPC reads, log reads — MUST leave
         it False: truncating those corrupts data, not just display.
         """
+        if self._session_mode == "unavailable":
+            return {
+                "output": self._session_diagnostic or "Shell environment unavailable",
+                "returncode": _SNAPSHOT_GUARD_FAILURE_EXIT,
+            }
         self._before_execute()
 
         exec_command, sudo_stdin = self._prepare_command(command)
@@ -1232,22 +1267,32 @@ class BaseEnvironment(ABC):
             exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
             effective_stdin = None
 
-        # Use login shell if snapshot failed (so user's profile still loads),
-        # unless login itself is broken — then non-login is the only path.
-        login = not self._snapshot_ready and not self._prefer_nonlogin
-        wrapped = self._wrap_command(exec_command, effective_cwd, process_cwd=login)
+        was_snapshot = self._snapshot_ready
+        wrapped = self._wrap_command(exec_command, effective_cwd)
 
         proc = self._run_bash(
             wrapped,
-            login=login,
             timeout=effective_timeout,
             stdin_data=effective_stdin,
-            cwd=effective_cwd if login else None,
+            clean=True,
         )
         result = self._wait_for_process(
             proc, timeout=effective_timeout, bounded_capture=bounded_capture
         )
         self._update_cwd(result)
+
+        if was_snapshot and result.get("returncode") == _SNAPSHOT_GUARD_FAILURE_EXIT:
+            diagnostic = (
+                "Session snapshot failed its source or sanitizer guard; "
+                "future commands will use a clean non-login shell."
+            )
+            self._set_session_mode("degraded_nonlogin", diagnostic)
+            result["output"] = f"{diagnostic}\n{result.get('output', '')}".rstrip()
+        elif self._diagnostic_pending:
+            result["output"] = (
+                f"{self._session_diagnostic}\n{result.get('output', '')}"
+            ).rstrip()
+            self._diagnostic_pending = False
 
         return result
 

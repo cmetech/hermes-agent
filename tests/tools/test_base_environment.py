@@ -24,8 +24,7 @@ class _TestableEnv(BaseEnvironment):
         login=False,
         timeout=120,
         stdin_data=None,
-        script_stdin=False,
-        cwd=None,
+        clean=False,
     ):
         raise NotImplementedError("Use mock")
 
@@ -41,7 +40,7 @@ def _snapshot_update_script(env):
     ) + 1
     snapshot_end = next(
         i for i, line in enumerate(wrapped_lines[snapshot_start:], snapshot_start)
-        if line.startswith("printf ")
+        if line.startswith("builtin printf ")
     )
     return "\n".join(wrapped_lines[snapshot_start:snapshot_end])
 
@@ -51,8 +50,14 @@ def _bootstrap_script(env):
     captured = {}
 
     def fake_run_bash(cmd_string, **kwargs):
-        captured.setdefault("cmd", cmd_string)
-        raise RuntimeError("stop after capture")
+        if kwargs.get("login"):
+            captured.setdefault("cmd", cmd_string)
+            raise RuntimeError("stop after capture")
+        mock = MagicMock()
+        mock.poll.return_value = 0
+        mock.returncode = 0
+        mock.stdout = iter([])
+        return mock
 
     env._run_bash = fake_run_bash  # type: ignore[assignment]
     env.init_session()
@@ -137,7 +142,7 @@ class TestWrapCommand:
         env._snapshot_ready = True
         wrapped = env._wrap_command("ls", "~/my repo")
 
-        assert "cd -- $HOME/'my repo'" in wrapped
+        assert 'cd -- "$HOME"/\'my repo\'' in wrapped
         assert "cd -- ~/my repo" not in wrapped
 
     def test_tilde_slash_maps_to_home(self):
@@ -145,7 +150,7 @@ class TestWrapCommand:
         env._snapshot_ready = True
         wrapped = env._wrap_command("ls", "~/")
 
-        assert "cd -- $HOME" in wrapped
+        assert 'cd -- "$HOME"' in wrapped
         assert "cd -- ~/" not in wrapped
 
     def test_hyphen_prefixed_workdir_is_passed_after_double_dash(self):
@@ -153,7 +158,7 @@ class TestWrapCommand:
         env._snapshot_ready = True
         wrapped = env._wrap_command("pwd", "-demo")
 
-        assert "builtin cd -- -demo || exit 126" in wrapped
+        assert "builtin cd -- -demo || builtin exit 126" in wrapped
 
     def test_cd_failure_exit_126(self):
         env = _TestableEnv()
@@ -228,8 +233,14 @@ class TestAtomicSnapshotWrite:
         captured = {}
 
         def fake_run_bash(cmd_string, **kwargs):
-            captured.setdefault("cmd", cmd_string)  # only the bootstrap; ignore the failure-path probe
-            raise RuntimeError("stop after capture")
+            if kwargs.get("login"):
+                captured.setdefault("cmd", cmd_string)
+                raise RuntimeError("stop after capture")
+            mock = MagicMock()
+            mock.poll.return_value = 0
+            mock.returncode = 0
+            mock.stdout = iter([])
+            return mock
 
         env._run_bash = fake_run_bash  # type: ignore[assignment]
         try:
@@ -311,9 +322,8 @@ class TestAtomicSnapshotWrite:
 
         proc = self._run_real_bash(env._wrap_command(user_command, str(tmp_path)))
 
-        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert proc.returncode == 125, proc.stdout + proc.stderr
         assert "USER_COMMAND_COMPLETED" in proc.stdout
-        assert env._cwd_marker in proc.stdout
         assert not marker.exists(), "failed sanitizer allowed an intercepted operation"
         assert snap.read_text() == "export GOOD=1\n"
 
@@ -322,8 +332,14 @@ class TestAtomicSnapshotWrite:
         captured = {}
 
         def fake_run_bash(cmd_string, **kwargs):
-            captured.setdefault("cmd", cmd_string)  # only the bootstrap; ignore the failure-path probe
-            raise RuntimeError("stop after capture")
+            if kwargs.get("login"):
+                captured.setdefault("cmd", cmd_string)
+                raise RuntimeError("stop after capture")
+            mock = MagicMock()
+            mock.poll.return_value = 0
+            mock.returncode = 0
+            mock.stdout = iter([])
+            return mock
 
         env._run_bash = fake_run_bash  # type: ignore[assignment]
         try:
@@ -406,8 +422,10 @@ class TestAtomicSnapshotWrite:
     def test_dispatcher_functions_reject_lossy_bootstrap_and_use_fallback(
         self, tmp_path, exit_trap
     ):
-        """A rejected snapshot must retain the complete login profile on the
-        next execution instead of switching to a lossy non-login shell."""
+        """Protected dispatcher profiles degrade explicitly without
+        publishing a lossy snapshot or selecting per-command login."""
+        import shlex
+        import os
         import shlex
         import subprocess
 
@@ -448,23 +466,17 @@ class TestAtomicSnapshotWrite:
                 login=False,
                 timeout=120,
                 stdin_data=None,
-                script_stdin=False,
-                cwd=None,
+                clean=False,
             ):
                 login_calls.append(login)
-                if script_stdin:
-                    assert stdin_data is None
-                    script = f"{login_profile}source /dev/stdin" if login else "source /dev/stdin"
-                    stdin_data = cmd_string
-                else:
-                    script = f"{login_profile}{cmd_string}" if login else cmd_string
+                script = f"{login_profile}{cmd_string}" if login else cmd_string
                 proc = subprocess.Popen(
                     ["/bin/bash", "--noprofile", "--norc", "-c", script],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
                     text=True,
-                    cwd=cwd or self.cwd,
+                    cwd=self.cwd,
                 )
                 if stdin_data is not None:
                     assert proc.stdin is not None
@@ -483,7 +495,8 @@ class TestAtomicSnapshotWrite:
         env.init_session()
 
         assert env._snapshot_ready is False
-        assert env._prefer_nonlogin is False
+        assert env._prefer_nonlogin is True
+        assert env._session_mode == "degraded_nonlogin"
         assert not snap.exists(), "bootstrap published a lossy function snapshot"
         assert not marker.exists(), "presence detection invoked a shadow function"
         assert not forgery_marker.exists(), "profile read the bootstrap nonce"
@@ -497,34 +510,20 @@ class TestAtomicSnapshotWrite:
         )
 
         assert result["returncode"] == 0, result["output"]
-        assert "ENV=profile-loaded" in result["output"]
-        assert "ordinary-loaded" in result["output"]
-        assert "FUNCTIONS=present" in result["output"]
+        assert "clean non-login shell" in result["output"]
+        assert "ENV=" in result["output"]
+        assert "ordinary-loaded" not in result["output"]
+        assert "FUNCTIONS=present" not in result["output"]
         assert f"PWD={target_cwd}" in result["output"]
         assert env.cwd == str(target_cwd)
-        assert login_calls == [True, True]
+        assert login_calls.count(True) == 1
+        assert login_calls[-1] is False
         assert not snap.exists(), "fallback execute published a lossy snapshot"
         assert not marker.exists(), "snapshot internals invoked a profile function"
         assert not forgery_marker.exists(), "fallback exposed a bootstrap nonce"
 
-        # This profile attack can forge the exact nonce when the bootstrap is
-        # embedded in ``bash -c``.  Feeding it after profile evaluation keeps
-        # that nonce out of BASH_EXECUTION_STRING, so only Hermes can emit it.
         bootstrap = _bootstrap_script(_TestableEnv(cwd=str(tmp_path)))
-        vulnerable = subprocess.run(
-            [
-                "/bin/bash",
-                "--noprofile",
-                "--norc",
-                "-c",
-                f"{login_profile}{bootstrap}",
-            ],
-            capture_output=True,
-            text=True,
-            cwd=tmp_path,
-        )
-        assert "__HERMES_SNAPSHOT_PROFILE_FALLBACK_" in vulnerable.stdout
-        assert forgery_marker.read_text() == "attempted\n"
+        assert "__HERMES_SNAPSHOT_PROFILE_FALLBACK_" not in bootstrap
 
     def test_readonly_shadow_functions_fail_bootstrap_closed(self, tmp_path):
         """A login profile can make dispatcher shadows readonly. Bootstrap
@@ -733,7 +732,7 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         proc = self._run(
             f"{shadow}\nexport UPDATED=1\n{snapshot_update}\n"
             "__hermes_test_update_rc=$?\n"
-            "declare -F builtin set unset >/dev/null || exit 92\n"
+            "declare -F builtin set unset >/dev/null && exit 92\n"
             "exit $__hermes_test_update_rc"
         )
 
@@ -774,21 +773,16 @@ class TestSnapshotFileModes:
                 login=False,
                 timeout=120,
                 stdin_data=None,
-                script_stdin=False,
-                cwd=None,
+                clean=False,
             ):
-                if script_stdin:
-                    stdin_data = cmd_string
-                    args = ["/bin/bash", "-l", "-s"] if login else ["/bin/bash", "-s"]
-                else:
-                    args = ["/bin/bash", "-lc" if login else "-c", cmd_string]
+                args = ["/bin/bash", "-lc" if login else "-c", cmd_string]
                 proc = subprocess.Popen(
                     args,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
                     text=True,
-                    cwd=cwd or self.cwd,
+                    cwd=self.cwd,
                 )
                 proc.communicate(input=stdin_data, timeout=timeout)
                 return proc
@@ -875,6 +869,159 @@ class TestEmbedStdinHeredoc:
 
 
 class TestInitSessionFailure:
+    def test_normal_profile_snapshot_preserves_env_functions_cd_and_tilde_cwd(
+        self, tmp_path
+    ):
+        import os
+        import shlex
+        import subprocess
+
+        profile_home = tmp_path / "profile home"
+        target = profile_home / "target path"
+        target.mkdir(parents=True)
+        profile = (
+            f"export HOME={shlex.quote(str(profile_home))}\n"
+            "export PROFILE_SENTINEL=loaded\n"
+            "ordinary () { printf 'ordinary-loaded\\n'; }\n"
+            "cd () { printf 'cd-function-called\\n'; builtin cd \"$@\"; }\n"
+        )
+
+        class ProfileEnv(_TestableEnv):
+            def _run_bash(
+                self, cmd_string, *, login=False, timeout=120,
+                stdin_data=None, clean=False,
+            ):
+                script = f"{profile}{cmd_string}" if login else cmd_string
+                run_env = dict(os.environ)
+                if clean:
+                    run_env.update(BASH_ENV="/dev/null", ENV="/dev/null")
+                return subprocess.Popen(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", script],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    cwd=self.cwd,
+                    env=run_env,
+                )
+
+        env = ProfileEnv(cwd=str(tmp_path))
+        env._snapshot_path = str(tmp_path / "snapshot.sh")
+        env.init_session()
+
+        assert env._session_mode == "snapshot"
+        result = env.execute(
+            "printf 'ENV=%s\\n' \"$PROFILE_SENTINEL\"; ordinary; "
+            "declare -F cd >/dev/null && printf 'CD=present\\n'; pwd",
+            cwd="~/target path",
+        )
+        assert result["returncode"] == 0, result["output"]
+        assert "ENV=loaded" in result["output"]
+        assert "ordinary-loaded" in result["output"]
+        assert "CD=present" in result["output"]
+        assert "cd-function-called" not in result["output"]
+        assert str(target) in result["output"]
+
+    def test_profile_drains_stdin_and_returns_zero_but_never_enables_snapshot(
+        self, tmp_path
+    ):
+        import subprocess
+
+        class DrainingProfileEnv(_TestableEnv):
+            def _run_bash(
+                self, cmd_string, *, login=False, timeout=120,
+                stdin_data=None, clean=False,
+            ):
+                script = (
+                    "cat /dev/stdin >/dev/null; exit 0; " + cmd_string
+                    if login
+                    else cmd_string
+                )
+                return subprocess.Popen(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", script],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    cwd=self.cwd,
+                )
+
+        env = DrainingProfileEnv(cwd=str(tmp_path))
+        env.init_session()
+
+        assert env._session_mode == "degraded_nonlogin"
+        assert env._snapshot_ready is False
+        assert not (tmp_path / env._snapshot_path).exists()
+        result = env.execute("pwd")
+        assert "clean non-login shell" in result["output"]
+        assert str(tmp_path) in result["output"]
+
+    def test_success_status_without_snapshot_artifact_degrades(self, tmp_path):
+        """A profile may drain the bootstrap and return zero; READY still
+        requires an independent artifact validator."""
+        env = _TestableEnv(cwd=str(tmp_path))
+        calls = []
+        returncodes = iter((0, 0, 1, 0, 0))  # preclean, capture, validate, cleanup, probe
+
+        def mock_run_bash(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            mock = MagicMock()
+            mock.poll.return_value = 0
+            mock.returncode = next(returncodes)
+            mock.stdout = iter([])
+            return mock
+
+        env._run_bash = mock_run_bash
+        env.init_session()
+
+        assert env._session_mode == "degraded_nonlogin"
+        assert env._snapshot_ready is False
+        assert env._prefer_nonlogin is True
+        assert [call[1].get("clean") for call in calls] == [
+            True, False, True, True, True
+        ]
+        assert "rm -f" in calls[-2][0]
+
+    def test_ready_source_failure_stops_command_and_demotes(self, tmp_path):
+        env = _TestableEnv(cwd=str(tmp_path))
+        env._snapshot_ready = True
+        env._session_mode = "snapshot"
+        captured = {}
+
+        def mock_run_bash(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            mock = MagicMock()
+            mock.poll.return_value = 0
+            mock.returncode = 125
+            mock.stdout = iter([])
+            return mock
+
+        env._run_bash = mock_run_bash
+        result = env.execute("touch SHOULD_NOT_RUN")
+
+        assert "source" in captured["cmd"]
+        assert captured["cmd"].index("source") < captured["cmd"].index("SHOULD_NOT_RUN")
+        assert "|| true" not in captured["cmd"].split("SHOULD_NOT_RUN", 1)[0]
+        assert captured["kwargs"]["clean"] is True
+        assert env._session_mode == "degraded_nonlogin"
+        assert env._snapshot_ready is False
+        assert result["returncode"] == 125
+        assert "snapshot" in result["output"].lower()
+
+    def test_post_source_cwd_uses_protected_builtin_and_preserves_cdpath(self):
+        env = _TestableEnv(cwd="~")
+        env._snapshot_ready = True
+        wrapped = env._wrap_command("declare -F cd >/dev/null", "~/target path")
+
+        source_at = wrapped.index("source")
+        sanitizer_at = wrapped.index("POSIXLY_CORRECT=1")
+        cd_at = wrapped.index("builtin cd --")
+        command_at = wrapped.index("declare -F cd")
+        assert source_at < sanitizer_at < cd_at < command_at
+        assert "CDPATH=" in wrapped
+        assert '"$HOME"/\'target path\'' in wrapped
+
     def test_snapshot_ready_false_on_failure(self):
         env = _TestableEnv()
 
@@ -901,6 +1048,10 @@ class TestInitSessionFailure:
         env.init_session()
 
         assert env._snapshot_ready is False
+        assert env._session_mode == "unavailable"
+        result = env.execute("touch MUST_NOT_RUN")
+        assert result["returncode"] == 125
+        assert "profile snapshot unavailable" in result["output"]
 
     def test_profile_exit_78_before_bootstrap_is_not_safe_rejection(self, tmp_path):
         """Status 78 alone is not proof that Hermes reached its rejection
@@ -917,8 +1068,7 @@ class TestInitSessionFailure:
                 login=False,
                 timeout=120,
                 stdin_data=None,
-                script_stdin=False,
-                cwd=None,
+                clean=False,
             ):
                 login_calls.append(login)
                 # The login profile exits before the shell can read a bootstrap
@@ -930,7 +1080,7 @@ class TestInitSessionFailure:
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
                     text=True,
-                    cwd=cwd or self.cwd,
+                    cwd=self.cwd,
                 )
 
         env = EarlyExitEnv(cwd=str(tmp_path))
@@ -939,17 +1089,16 @@ class TestInitSessionFailure:
 
         assert env._snapshot_ready is False
         assert env._prefer_nonlogin is True
-        assert login_calls == [True, False]
+        assert env._session_mode == "degraded_nonlogin"
+        assert login_calls == [False, True, False, False]
 
-    def test_login_flag_when_snapshot_not_ready(self):
-        """When _snapshot_ready=False, execute() should pass login=True to _run_bash."""
+    def test_clean_nonlogin_when_snapshot_not_ready(self):
         env = _TestableEnv()
         env._snapshot_ready = False
 
         calls = []
         def mock_run_bash(cmd, **kwargs):
-            login = kwargs.get("login", False)
-            calls.append({"login": login})
+            calls.append(kwargs)
             # Return a mock process handle
             mock = MagicMock()
             mock.poll.return_value = 0
@@ -961,7 +1110,8 @@ class TestInitSessionFailure:
         env.execute("echo test")
 
         assert len(calls) == 1
-        assert calls[0]["login"] is True
+        assert calls[0].get("login", False) is False
+        assert calls[0]["clean"] is True
 
     def test_prefer_nonlogin_when_login_bash_is_dead(self):
         """Login snapshot failure + working non-login probe → don't use bash -l."""
