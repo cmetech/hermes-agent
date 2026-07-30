@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -145,6 +147,21 @@ def _archon_context(
     )
 
 
+def _archon_text_context(
+    tmp_path: Path, node: WorkflowNode, **kwargs
+) -> NodeExecutionContext:
+    return _context(
+        tmp_path,
+        node,
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        **kwargs,
+    )
+
+
+def _safe_output_component(kind: str, value: str) -> str:
+    return f"{kind}-{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
+
+
 def test_fresh_prompt_uses_host_runner_and_validates_structured_output(tmp_path):
     runner = FakeAgentRunner('{"answer":"ok","count":2}')
     node = _node(
@@ -259,6 +276,105 @@ def test_archon_structured_output_writes_one_canonical_primary_candidate(
     output = tmp_path / "run" / result.primary_output.attempt_relative_path
     assert output.read_bytes() == b'{"a":1,"b":[true,null]}'
     assert result.artifacts[0].sha256 == result.primary_output.sha256
+
+
+@pytest.mark.parametrize(
+    "node_id",
+    [".", "..", "nested/name", "nested\\name", "/absolute/node"],
+    ids=("dot", "dotdot", "slash", "backslash", "absolute"),
+)
+def test_archon_output_uses_contained_deterministic_components(tmp_path, node_id):
+    runner = FakeAgentRunner("{}")
+    node = _node(node_id, "Produce data", output_format={"type": "object"})
+    context = _archon_context(tmp_path, node)
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "succeeded"
+    assert result.primary_output is not None
+    expected = (
+        Path("nodes")
+        / _safe_output_component("node", node_id)
+        / _safe_output_component("attempt", context.attempt_id)
+        / "output.json"
+    )
+    assert result.primary_output.attempt_relative_path == expected.as_posix()
+    output = context.run_directory / result.primary_output.attempt_relative_path
+    assert output.resolve().is_relative_to(context.run_directory.resolve())
+
+
+def test_archon_output_rejects_symlinked_nodes_directory(tmp_path):
+    runner = FakeAgentRunner("{}")
+    node = _node("symlink-root", "Produce data", output_format={"type": "object"})
+    context = _archon_context(tmp_path, node)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (context.run_directory / "nodes").symlink_to(outside, target_is_directory=True)
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_integrity"
+    assert result.metadata["archon_terminal_failure"] is True
+    assert not tuple(outside.iterdir())
+
+
+@pytest.mark.skipif(
+    os.open not in os.supports_dir_fd or os.mkdir not in os.supports_dir_fd,
+    reason="descriptor-relative race injection requires dir_fd support",
+)
+@pytest.mark.parametrize("collision", ["symlink", "directory", "fifo"])
+def test_archon_output_exclusive_write_rejects_injected_nonregular_collision(
+    tmp_path, monkeypatch, collision
+):
+    if collision == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation is unavailable")
+    runner = FakeAgentRunner("{}")
+    node = _node("raced", "Produce data", output_format={"type": "object"})
+    context = _archon_context(tmp_path, node)
+    attempt_component = _safe_output_component("attempt", context.attempt_id)
+    outside = tmp_path / "outside.json"
+    outside.write_text("sentinel", encoding="utf-8")
+    original_mkdir = os.mkdir
+
+    def injecting_mkdir(path, mode=0o777, *, dir_fd=None):
+        original_mkdir(path, mode, dir_fd=dir_fd)
+        if path != attempt_component or dir_fd is None:
+            return
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        attempt_descriptor = os.open(path, flags, dir_fd=dir_fd)
+        try:
+            if collision == "symlink":
+                os.symlink(outside, "output.json", dir_fd=attempt_descriptor)
+            elif collision == "directory":
+                original_mkdir("output.json", dir_fd=attempt_descriptor)
+            else:
+                os.mkfifo("output.json", dir_fd=attempt_descriptor)
+        finally:
+            os.close(attempt_descriptor)
+
+    monkeypatch.setattr(os, "mkdir", injecting_mkdir)
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_integrity"
+    assert result.metadata["archon_terminal_failure"] is True
+    assert outside.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_archon_text_candidate_and_artifact_share_plain_text_media_type(tmp_path):
+    runner = FakeAgentRunner("plain response")
+    node = _node("plain", "Produce text")
+
+    result = AgentNodeExecutor(runner).execute(_archon_text_context(tmp_path, node))
+
+    assert result.status == "succeeded"
+    assert result.primary_output is not None
+    assert result.primary_output.media_type == "text/plain"
+    assert result.artifacts[0].media_type == result.primary_output.media_type
 
 
 @pytest.mark.parametrize(
@@ -377,9 +493,7 @@ def test_prompt_adapter_repairs_once_in_a_fresh_action_free_request(tmp_path):
         "invalid_response",
         "validation_diagnostics",
     }
-    assert repair_payload["invalid_response"] == (
-        '{"answer":"wrong wrapper"} trailing'
-    )
+    assert repair_payload["invalid_response"] == ('{"answer":"wrong wrapper"} trailing')
     assert "ORIGINAL TASK MUST NOT ENTER REPAIR" not in repair.prompt
     assert "original system prompt" not in repair.prompt
     assert "wrong wrapper" in repair.prompt
@@ -390,9 +504,71 @@ def test_prompt_adapter_repairs_once_in_a_fresh_action_free_request(tmp_path):
     assert result.metadata["audit"]["model_calls"] == 3
     assert result.metadata["audit"]["api_calls"] == 3
     assert result.metadata["provider_attempts"] == 1
+    assert result.metadata["audit"]["repair_accounting"] == "exact"
+    assert result.metadata["audit"]["provider_attempts_exact"] is True
+    assert result.metadata["audit"]["model_calls_exact"] is True
+    assert result.metadata["audit"]["api_calls_exact"] is True
     assert result.metadata["repair_disposition"] == "succeeded"
     output = tmp_path / "run" / result.primary_output.attempt_relative_path
     assert output.read_bytes() == b'{"answer":"fixed"}'
+
+
+@pytest.mark.parametrize(
+    "repair_outcome",
+    ["timeout", "resource_exception", "cancelled", "resource_result"],
+)
+def test_archon_evidence_free_repair_uses_bounded_conservative_accounting(
+    tmp_path, repair_outcome
+):
+    class EvidenceFreeRepairRunner(FakeAgentRunner):
+        def run(self, request, **kwargs):
+            if not self.requests:
+                return super().run(request, **kwargs)
+            self.requests.append(request)
+            if repair_outcome == "timeout":
+                raise TimeoutError("repair timed out")
+            if repair_outcome == "resource_exception":
+                raise RuntimeError("repair resource limit")
+            status = "cancelled" if repair_outcome == "cancelled" else "failed"
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="repair-session",
+                provider="fake-provider",
+                model="fake-model",
+                status=status,
+                pending_interaction=None,
+                usage={"input_tokens": 7, "output_tokens": 3},
+                audit={"failure_kind": repair_outcome},
+                structured_output=None,
+            )
+
+    runner = EvidenceFreeRepairRunner("not json")
+    node = _node(
+        "evidence-free-repair",
+        "Produce data",
+        output_format={"type": "object"},
+    )
+
+    result = AgentNodeExecutor(runner).execute(
+        _archon_context(tmp_path, node, max_provider_attempts=3)
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_invalid"
+    assert result.metadata["provider_attempts"] == 2
+    assert result.metadata["audit"]["provider_attempts"] == 3
+    assert result.metadata["audit"]["model_calls"] == 2
+    assert result.metadata["audit"]["api_calls"] == 2
+    assert result.metadata["audit"]["repair_accounting"] == "conservative"
+    assert result.metadata["audit"]["provider_attempts_exact"] is False
+    assert result.metadata["audit"]["model_calls_exact"] is False
+    assert result.metadata["audit"]["api_calls_exact"] is False
+    expected_usage = (
+        {"input_tokens": 4, "output_tokens": 2}
+        if repair_outcome in {"timeout", "resource_exception"}
+        else {"input_tokens": 11, "output_tokens": 5}
+    )
+    assert result.metadata["usage"] == expected_usage
 
 
 @pytest.mark.parametrize(
@@ -555,12 +731,11 @@ def test_prompt_adapter_bounds_fully_serialized_repair_with_maximum_schema(
     excerpt = json.loads(repair.prompt)["invalid_response"]
     assert excerpt != invalid
     assert invalid.startswith(excerpt)
-    assert result.metadata["invalid_output_size_bytes"] == len(
-        invalid.encode("utf-8")
+    assert result.metadata["invalid_output_size_bytes"] == len(invalid.encode("utf-8"))
+    assert (
+        result.metadata["invalid_output_sha256"]
+        == hashlib.sha256(invalid.encode("utf-8")).hexdigest()
     )
-    assert result.metadata["invalid_output_sha256"] == hashlib.sha256(
-        invalid.encode("utf-8")
-    ).hexdigest()
 
 
 def test_prompt_adapter_skips_repair_after_shared_wall_deadline_expires(tmp_path):
@@ -762,6 +937,7 @@ def test_archon_typed_negotiation_failure_preserves_zero_attempt_accounting(tmp_
                 usage={},
                 audit={
                     **evidence,
+                    "api_mode": "chat_completions",
                     "failure_kind": "structured_output_capability_drift",
                 },
                 structured_output=evidence,
@@ -774,13 +950,88 @@ def test_archon_typed_negotiation_failure_preserves_zero_attempt_accounting(tmp_
     )
 
     result = AgentNodeExecutor(NegotiationFailureRunner()).execute(
-        _archon_context(tmp_path, node)
+        _archon_context(tmp_path, node, max_provider_attempts=3)
     )
 
     assert result.status == "failed"
     assert result.error_code == "structured_output_capability_drift"
     assert result.metadata["provider_attempts"] == 0
     assert result.metadata["archon_terminal_failure"] is True
+    assert result.metadata["negotiation_evidence"] == "corroborated"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        ("provider", "spoof-provider"),
+        ("model", "spoof-model"),
+        ("api_mode", "responses"),
+        ("strategy", StructuredOutputStrategy.NATIVE_JSON_SCHEMA.value),
+        ("adapter_version", 99),
+        ("schema_fingerprint", "0" * 64),
+        ("declaration_source", "spoof-source"),
+        ("evidence", None),
+    ],
+)
+def test_archon_zero_count_negotiation_failure_requires_sealed_identity_evidence(
+    tmp_path, mutation, value
+):
+    class NegotiationFailureRunner:
+        def run(self, request, **_kwargs):
+            evidence = {
+                "provider_attempts": 0,
+                "model_calls": 0,
+                "strategy": request.structured_output.strategy.value,
+                "adapter_version": request.structured_output.adapter_version,
+                "schema_fingerprint": (
+                    request.structured_output.schema.schema_fingerprint
+                ),
+                "declaration_source": "test",
+            }
+            provider = "fake-provider"
+            model = "fake-model"
+            api_mode = "chat_completions"
+            if mutation == "provider":
+                provider = value
+            elif mutation == "model":
+                model = value
+            elif mutation == "api_mode":
+                api_mode = value
+            elif mutation in evidence:
+                evidence[mutation] = value
+            structured_evidence = evidence if mutation != "evidence" else None
+            audit = {
+                **(evidence if structured_evidence is not None else {}),
+                "api_mode": api_mode,
+                "failure_kind": "structured_output_capability_drift",
+            }
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="",
+                provider=provider,
+                model=model,
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit=audit,
+                structured_output=structured_evidence,
+            )
+
+    node = _node(
+        "spoofed-negotiation",
+        "work",
+        output_format={"type": "object"},
+    )
+
+    result = AgentNodeExecutor(NegotiationFailureRunner()).execute(
+        _archon_context(tmp_path, node, max_provider_attempts=3)
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_capability_drift"
+    assert result.metadata["provider_attempts"] == 2
+    assert result.metadata["archon_terminal_failure"] is True
+    assert result.metadata["negotiation_evidence"] == "invalid"
 
 
 def test_archon_cache_fingerprint_includes_sealed_schema_identity(tmp_path):
@@ -815,6 +1066,34 @@ def test_archon_cache_fingerprint_includes_sealed_schema_identity(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("effective_provider", "other-provider"),
+        ("model", "other-model"),
+        ("api_mode", "responses"),
+        ("declaration_source", "other-source"),
+    ],
+)
+def test_archon_cache_fingerprint_includes_sealed_effective_route(
+    tmp_path, field, value
+):
+    node = _node(
+        "sealed-route-fingerprint",
+        "work",
+        output_format={"type": "object"},
+    )
+    context = _archon_context(tmp_path, node)
+    decision = context.structured_output_decision
+    assert decision is not None
+    mutated = replace(
+        context, structured_output_decision=replace(decision, **{field: value})
+    )
+    executor = AgentNodeExecutor(FakeAgentRunner())
+
+    assert executor._fingerprint(context) != executor._fingerprint(mutated)
+
+
 def test_legacy_cache_fingerprint_preserves_pre_archon_known_material(tmp_path):
     node = _node(
         "legacy-fingerprint",
@@ -826,7 +1105,10 @@ def test_legacy_cache_fingerprint_preserves_pre_archon_known_material(tmp_path):
         _context(tmp_path, node)
     )
 
-    assert fingerprint == "0e03d8d5cb2c039c376b70a633f22ae228e3e6860df5dc90b864cd1f9f9db514"
+    assert (
+        fingerprint
+        == "0e03d8d5cb2c039c376b70a633f22ae228e3e6860df5dc90b864cd1f9f9db514"
+    )
 
 
 def test_shared_context_resumes_only_one_compatible_predecessor(tmp_path):
@@ -1020,10 +1302,7 @@ def test_ai_request_maps_every_run_execution_limit_exactly(tmp_path):
     assert request.max_process_tree_rss_bytes == limits.process_tree_rss_bytes
     assert request.max_process_tree_cpu_seconds == limits.process_tree_cpu_seconds
     assert request.max_descendants == limits.max_descendants
-    assert (
-        request.cooperative_shutdown_seconds
-        == limits.cooperative_shutdown_seconds
-    )
+    assert request.cooperative_shutdown_seconds == limits.cooperative_shutdown_seconds
     assert request.term_grace_seconds == limits.term_grace_seconds
     assert request.kill_reap_grace_seconds == limits.kill_reap_grace_seconds
     assert request.max_iterations == 90

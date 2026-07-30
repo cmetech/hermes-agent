@@ -30,7 +30,11 @@ from plugins.workflow.executors.base import (
     validated_provider_retry_count,
 )
 from plugins.workflow.models import WorkflowLanguageProfile
-from plugins.workflow.output_resolution import PrimaryOutputCandidate
+from plugins.workflow.output_resolution import (
+    ArchonOutputIntegrityError,
+    PrimaryOutputCandidate,
+    write_archon_output_exclusive,
+)
 from plugins.workflow.resources import (
     AuthenticatedExecutionMaterializer,
     ResourceResolver,
@@ -84,7 +88,9 @@ def _aggregate_usage(
 ) -> dict[str, int | float | None]:
     aggregate: dict[str, int | float | None] = {}
     for key in sorted(set(first) | set(second)):
-        values = [value for value in (first.get(key), second.get(key)) if value is not None]
+        values = [
+            value for value in (first.get(key), second.get(key)) if value is not None
+        ]
         if values and all(isinstance(value, int | float) for value in values):
             aggregate[key] = sum(values)
         else:
@@ -119,6 +125,14 @@ class AgentNodeExecutor:
                 "schema_fingerprint": context.structured_output.schema_fingerprint,
                 "strategy": context.structured_output_decision.strategy.value,
                 "adapter_version": context.structured_output_decision.adapter_version,
+                "effective_provider": (
+                    context.structured_output_decision.effective_provider
+                ),
+                "model": context.structured_output_decision.model,
+                "api_mode": context.structured_output_decision.api_mode,
+                "declaration_source": (
+                    context.structured_output_decision.declaration_source
+                ),
             }
         material = {
             "provider": node.options.get("provider") or workflow.get("provider"),
@@ -207,8 +221,7 @@ class AgentNodeExecutor:
             or result.audit.get("api_mode") != decision.api_mode
             or evidence.get("strategy") != request.strategy.value
             or evidence.get("adapter_version") != request.adapter_version
-            or evidence.get("schema_fingerprint")
-            != request.schema.schema_fingerprint
+            or evidence.get("schema_fingerprint") != request.schema.schema_fingerprint
             or evidence.get("declaration_source") != declaration_source
         ):
             raise ValueError("structured output evidence does not match admission")
@@ -217,9 +230,7 @@ class AgentNodeExecutor:
         if (
             isinstance(provider_attempts, bool)
             or not isinstance(provider_attempts, int)
-            or not (1 if require_positive else 0)
-            <= provider_attempts
-            <= provider_limit
+            or not (1 if require_positive else 0) <= provider_attempts <= provider_limit
             or isinstance(model_calls, bool)
             or not isinstance(model_calls, int)
             or not (1 if require_positive else 0) <= model_calls <= model_limit
@@ -313,20 +324,29 @@ class AgentNodeExecutor:
     ) -> NodeExecutionResult:
         node = context.node
         extension = ".json" if is_structured else ".md"
-        media_type = (
-            "application/json"
-            if is_structured
-            else "text/markdown; charset=utf-8"
-        )
-        attempt = context.run_directory / "nodes" / node.id / context.attempt_id
-        attempt.mkdir(parents=True, exist_ok=False)
-        output_path = attempt / f"output{extension}"
-        output_path.write_bytes(data)
+        media_type = "application/json" if is_structured else "text/plain"
+        try:
+            output_path = write_archon_output_exclusive(
+                context.run_directory,
+                node_id=node.id,
+                attempt_id=context.attempt_id,
+                filename=f"output{extension}",
+                data=data,
+            )
+        except ArchonOutputIntegrityError:
+            metadata["archon_terminal_failure"] = True
+            metadata.pop("output", None)
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_integrity",
+                error_message="Archon output could not be sealed",
+                metadata=metadata,
+            )
         artifact = _artifact_for_bytes(
             output_path,
             context.run_directory,
             data,
-            media_type="application/json" if is_structured else "text/plain",
+            media_type=media_type,
         )
         relative_path = output_path.relative_to(context.run_directory).as_posix()
         candidate = PrimaryOutputCandidate(
@@ -399,7 +419,32 @@ class AgentNodeExecutor:
                 metadata=metadata,
             )
 
-        if structured_request.strategy is not StructuredOutputStrategy.PROMPT_JSON_SCHEMA:
+        def conservatively_account(repair_result=None) -> None:
+            if repair_result is not None:
+                metadata["usage"] = _aggregate_usage(
+                    initial_result.usage, repair_result.usage
+                )
+            total_model_calls = first_model_calls + 1
+            aggregate_audit = dict(initial_result.audit)
+            aggregate_audit.update({
+                "provider_attempts": granted_provider_attempts,
+                "model_calls": total_model_calls,
+                "api_calls": total_model_calls,
+                "effective_provider": decision.effective_provider,
+                "model": decision.model,
+                "api_mode": decision.api_mode,
+                "repair_accounting": "conservative",
+                "provider_attempts_exact": False,
+                "model_calls_exact": False,
+                "api_calls_exact": False,
+            })
+            metadata["audit"] = aggregate_audit
+            metadata["provider_attempts"] = max(0, granted_provider_attempts - 1)
+
+        if (
+            structured_request.strategy
+            is not StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+        ):
             return failed("ineligible_native_strategy")
         if context.outward_action:
             return failed("ineligible_outward_action")
@@ -446,20 +491,18 @@ class AgentNodeExecutor:
             workdir=context.run_directory,
             max_iterations=1,
             max_api_attempts=remaining_provider_attempts,
-            idle_timeout_seconds=min(initial_request.idle_timeout_seconds, remaining_wall),
+            idle_timeout_seconds=min(
+                initial_request.idle_timeout_seconds, remaining_wall
+            ),
             wall_timeout_seconds=remaining_wall,
             provider_request_timeout_seconds=min(
                 initial_request.provider_request_timeout_seconds,
                 remaining_wall,
             ),
             max_process_tree_rss_bytes=initial_request.max_process_tree_rss_bytes,
-            max_process_tree_cpu_seconds=(
-                initial_request.max_process_tree_cpu_seconds
-            ),
+            max_process_tree_cpu_seconds=(initial_request.max_process_tree_cpu_seconds),
             max_descendants=initial_request.max_descendants,
-            cooperative_shutdown_seconds=(
-                initial_request.cooperative_shutdown_seconds
-            ),
+            cooperative_shutdown_seconds=(initial_request.cooperative_shutdown_seconds),
             term_grace_seconds=initial_request.term_grace_seconds,
             kill_reap_grace_seconds=initial_request.kill_reap_grace_seconds,
         )
@@ -477,11 +520,10 @@ class AgentNodeExecutor:
                 is_cancelled=context.is_cancelled,
             )
         except (OSError, RuntimeError, ValueError):
+            conservatively_account()
             return failed("repair_failed")
 
-        metadata["usage"] = _aggregate_usage(
-            initial_result.usage, repair_result.usage
-        )
+        metadata["usage"] = _aggregate_usage(initial_result.usage, repair_result.usage)
         repair_counts: tuple[int, int] | None = None
         if repair_result.structured_output is not None:
             try:
@@ -490,16 +532,16 @@ class AgentNodeExecutor:
                     repair_result,
                     structured_request,
                     decision,
-                    declaration_source=(
-                        decision.declaration_source
-                    ),
+                    declaration_source=(decision.declaration_source),
                     provider_limit=remaining_provider_attempts,
                     model_limit=1,
                     require_positive=repair_result.status == "completed",
                 )
             except ValueError:
+                conservatively_account(repair_result)
                 return failed("repair_evidence_invalid")
         if repair_counts is None:
+            conservatively_account(repair_result)
             return failed(
                 "repair_cancelled"
                 if repair_result.status == "cancelled"
@@ -516,6 +558,10 @@ class AgentNodeExecutor:
             "effective_provider": decision.effective_provider,
             "model": decision.model,
             "api_mode": decision.api_mode,
+            "repair_accounting": "exact",
+            "provider_attempts_exact": True,
+            "model_calls_exact": True,
+            "api_calls_exact": True,
         })
         metadata["audit"] = aggregate_audit
         metadata["provider_attempts"] = max(0, total_provider_attempts - 1)
@@ -559,7 +605,9 @@ class AgentNodeExecutor:
                     context.run_directory,
                     sealed_paths=context.sealed_resource_paths,
                     sealed_bytes=context.sealed_resource_bytes,
-                ).command(str(node.value)).body
+                )
+                .command(str(node.value))
+                .body
             )
         else:
             template = str(node.value)
@@ -597,9 +645,7 @@ class AgentNodeExecutor:
                     context.run_directory,
                     sealed_paths=context.sealed_resource_paths,
                     sealed_bytes=context.sealed_resource_bytes,
-                ).text(
-                    f"node-agent-skills/{context.node.id}/{agent_id}.md"
-                )
+                ).text(f"node-agent-skills/{context.node.id}/{agent_id}.md")
             definitions[str(agent_id)] = {
                 "description": str(raw["description"]),
                 "prompt": str(raw["prompt"]),
@@ -928,12 +974,41 @@ class AgentNodeExecutor:
             "structured_output_capability_drift",
             "structured_output_unsupported",
         }:
-            metadata["provider_attempts"] = 0
+            try:
+                if result.status != "failed":
+                    raise ValueError("structured output negotiation status is invalid")
+                assert context.structured_output_decision is not None
+                negotiation_counts = self._structured_counts(
+                    result,
+                    structured_request,
+                    context.structured_output_decision,
+                    declaration_source=(
+                        context.structured_output_decision.declaration_source
+                    ),
+                    provider_limit=granted_provider_attempts,
+                    model_limit=request.max_iterations,
+                    require_positive=False,
+                )
+                if negotiation_counts != (0, 0):
+                    raise ValueError(
+                        "structured output negotiation accounting is invalid"
+                    )
+            except ValueError as exc:
+                metadata["negotiation_evidence"] = "invalid"
+                error_message = str(exc)
+                metadata["provider_attempts"] = conservative_provider_retry_count(
+                    None,
+                    granted_attempts=granted_provider_attempts,
+                )
+            else:
+                metadata["negotiation_evidence"] = "corroborated"
+                error_message = "structured output negotiation failed"
+                metadata["provider_attempts"] = 0
             metadata["archon_terminal_failure"] = True
             return NodeExecutionResult(
                 "failed",
                 error_code=negotiation_failure,
-                error_message="structured output negotiation failed",
+                error_message=error_message,
                 metadata=metadata,
             )
         if structured_request is not None and result.structured_output is not None:
