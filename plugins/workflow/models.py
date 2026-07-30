@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 import math
 from pathlib import Path
@@ -18,7 +18,11 @@ class ExecutionFence:
     owner_epoch: int
 
     def __post_init__(self) -> None:
-        if not isinstance(self.owner_id, str) or not self.owner_id or len(self.owner_id) > 256:
+        if (
+            not isinstance(self.owner_id, str)
+            or not self.owner_id
+            or len(self.owner_id) > 256
+        ):
             raise ValueError("owner_id must be bounded non-empty text")
         if (
             isinstance(self.owner_epoch, bool)
@@ -130,6 +134,30 @@ class WorkflowLanguageMetadata:
     effective_profile: WorkflowLanguageProfile
     normalizer_version: int
     normalized_definition_digest: str
+    structured_outputs: Mapping[str, "WorkflowStructuredOutput"] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "structured_outputs",
+            MappingProxyType(dict(self.structured_outputs)),
+        )
+
+
+@dataclass(frozen=True)
+class WorkflowStructuredOutput:
+    """One sealed normalized output contract for a workflow node."""
+
+    canonical_schema: Mapping[str, object]
+    schema_fingerprint: str
+    canonicalization_version: int = 1
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "canonical_schema", freeze_value(self.canonical_schema)
+        )
 
 
 class CompatibilityLevel(StrEnum):
@@ -457,9 +485,7 @@ class WorkflowRuntimeConfig:
             "ai_wall_timeout_seconds", resolved.ai_wall_timeout_seconds
         )
         tightened["ai_idle_timeout_seconds"] = min(
-            tightened.get(
-                "ai_idle_timeout_seconds", resolved.ai_idle_timeout_seconds
-            ),
+            tightened.get("ai_idle_timeout_seconds", resolved.ai_idle_timeout_seconds),
             wall,
         )
         tightened["provider_request_timeout_seconds"] = min(

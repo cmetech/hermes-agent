@@ -38,7 +38,7 @@ ECMASCRIPT_WHEN_REFERENCE_PATTERN = (
 ECMASCRIPT_WHEN_CLAUSE_PATTERN = (
     r"\$[\p{L}\p{N}_.:-]+\.output(?:\.[\p{L}\p{N}_.-]+)*\s*"
     r"(?:==|!=|<=|>=|<|>)\s*"
-    r'''(?:'[^']*'|"[^"]*"|-?(?:\d+(?:\.\d*)?|\.\d+))'''
+    r"""(?:'[^']*'|"[^"]*"|-?(?:\d+(?:\.\d*)?|\.\d+))"""
 )
 ECMASCRIPT_WHEN_EXPRESSION_PATTERN = (
     rf"^\s*{ECMASCRIPT_WHEN_CLAUSE_PATTERN}"
@@ -252,9 +252,7 @@ def _freeze_editor_value(value: object) -> object:
 
 def _thaw_editor_value(value: object) -> object:
     if isinstance(value, Mapping):
-        return {
-            str(key): _thaw_editor_value(item) for key, item in value.items()
-        }
+        return {str(key): _thaw_editor_value(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [_thaw_editor_value(item) for item in value]
     return value
@@ -499,8 +497,6 @@ _NODE_FIELDS = (
         phase=2,
         legacy_status="warning",
         legacy_code="legacy_output_type_not_published",
-        archon_status="blocking",
-        archon_code="archon_output_type_unavailable",
     ),
     _field(
         "node",
@@ -536,8 +532,6 @@ _NODE_FIELDS = (
         phase=2,
         legacy_status="warning",
         legacy_code="legacy_output_format_post_validation",
-        archon_status="blocking",
-        archon_code="archon_output_format_unavailable",
     ),
     _field(
         "node",
@@ -950,11 +944,7 @@ def _field_unit(
     if spec.yaml_name == "delay_ms":
         return "milliseconds"
     if spec.yaml_name in {"idle_timeout", "timeout"}:
-        return (
-            "seconds"
-            if profile is WorkflowLanguageProfile.HERMES_LEGACY
-            else None
-        )
+        return "seconds" if profile is WorkflowLanguageProfile.HERMES_LEGACY else None
     if spec.yaml_name == "maxBudgetUsd":
         return "USD"
     if spec.yaml_name in {"max_iterations", "max_attempts", "maxTurns"}:
@@ -1305,9 +1295,7 @@ def compatibility_code_catalog(
             status.code,
             {
                 "status": _editor_status(status.status),
-                "description": _compatibility_description(
-                    status.code, status.status
-                ),
+                "description": _compatibility_description(status.code, status.status),
                 "migration": _compatibility_migration(status.code),
                 "runtime_status": status.status,
                 "severity": "error" if status.status == "blocking" else "warning",
@@ -1344,8 +1332,7 @@ def _nested_specs_for_kind(
     nested: list[tuple[WorkflowFieldSpec, str]] = []
     if node_type != "loop":
         nested.extend(
-            (spec, f"nodes[].retry.{spec.yaml_name}")
-            for spec in _specs("retry")
+            (spec, f"nodes[].retry.{spec.yaml_name}") for spec in _specs("retry")
         )
     if node_type == "loop":
         nested.extend(
@@ -1353,8 +1340,7 @@ def _nested_specs_for_kind(
         )
     if node_type == "approval":
         nested.extend(
-            (spec, f"nodes[].approval.{spec.yaml_name}")
-            for spec in _specs("approval")
+            (spec, f"nodes[].approval.{spec.yaml_name}") for spec in _specs("approval")
         )
         nested.extend(
             (spec, f"nodes[].approval.on_reject.{spec.yaml_name}")
@@ -1362,12 +1348,10 @@ def _nested_specs_for_kind(
         )
     if node_type in _AI_NODE_TYPES:
         nested.extend(
-            (spec, f"nodes[].agents.*.{spec.yaml_name}")
-            for spec in _specs("agent")
+            (spec, f"nodes[].agents.*.{spec.yaml_name}") for spec in _specs("agent")
         )
         nested.extend(
-            (spec, f"nodes[].hooks.{spec.yaml_name}")
-            for spec in _specs("hook_event")
+            (spec, f"nodes[].hooks.{spec.yaml_name}") for spec in _specs("hook_event")
         )
         nested.extend(
             (spec, f"nodes[].hooks.*[].{spec.yaml_name}")
@@ -1380,8 +1364,7 @@ def _nested_specs_for_kind(
         nested.extend(
             (
                 spec,
-                "nodes[].hooks.*[].response."
-                f"hookSpecificOutput.{spec.yaml_name}",
+                f"nodes[].hooks.*[].response.hookSpecificOutput.{spec.yaml_name}",
             )
             for spec in _specs("hook_specific")
         )
@@ -1438,7 +1421,10 @@ def _node_example(node_type: str) -> dict[str, object]:
         "approval": {"message": "Continue?"},
         "cancel": "Cancellation requested.",
     }
-    example: dict[str, object] = {"id": f"{node_type}-node", node_type: payloads[node_type]}
+    example: dict[str, object] = {
+        "id": f"{node_type}-node",
+        node_type: payloads[node_type],
+    }
     if node_type == "script":
         example["runtime"] = "uv"
     return example
@@ -1451,11 +1437,7 @@ def node_kind_descriptors(
     selected = _profile(profile)
     descriptors: list[dict[str, object]] = []
     for kind_order, node_type in enumerate(NODE_TYPES, start=1):
-        payload = next(
-            spec
-            for spec in _specs("node")
-            if spec.yaml_name == node_type
-        )
+        payload = next(spec for spec in _specs("node") if spec.yaml_name == node_type)
         fields = [
             _field_descriptor(
                 spec,
@@ -1554,8 +1536,7 @@ def semantic_rule_descriptors(
                 "expression_flags": "u",
             },
             "examples": [
-                "$prepare.output.status == 'ready' && "
-                "$inspect.output.count >= 2",
+                "$prepare.output.status == 'ready' && $inspect.output.count >= 2",
                 "$café.output.status == 'ready'",
             ],
         },
@@ -1633,9 +1614,7 @@ def contract_documentation(
                     "The definition YAML is the workflow graph authority. Each node "
                     "declares exactly one node-kind field."
                 ),
-                "field_paths": [
-                    _contract_path(spec) for spec in _specs("definition")
-                ],
+                "field_paths": [_contract_path(spec) for spec in _specs("definition")],
                 "applicability": applicability,
                 "examples": [definition],
             },
@@ -1663,9 +1642,7 @@ def contract_documentation(
                     "The optional companion YAML may declare metadata and policy but "
                     "never graph topology or trust authority."
                 ),
-                "field_paths": [
-                    _contract_path(spec) for spec in _specs("sidecar")
-                ],
+                "field_paths": [_contract_path(spec) for spec in _specs("sidecar")],
                 "applicability": {
                     "profiles": [selected.value],
                     "documents": ["sidecar"],
@@ -1742,13 +1719,17 @@ def canonical_contract_json(value: object) -> str:
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
             raise TypeError("canonical contract JSON object keys must be strings")
-        return "{" + ",".join(
-            f"{json.dumps(key, ensure_ascii=False)}:{canonical_contract_json(value[key])}"
-            for key in sorted(
-                value,
-                key=lambda item: item.encode("utf-16-be", "surrogatepass"),
+        return (
+            "{"
+            + ",".join(
+                f"{json.dumps(key, ensure_ascii=False)}:{canonical_contract_json(value[key])}"
+                for key in sorted(
+                    value,
+                    key=lambda item: item.encode("utf-16-be", "surrogatepass"),
+                )
             )
-        ) + "}"
+            + "}"
+        )
     if isinstance(value, list | tuple):
         return "[" + ",".join(canonical_contract_json(item) for item in value) + "]"
     raise TypeError(

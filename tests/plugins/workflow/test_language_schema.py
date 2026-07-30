@@ -48,7 +48,7 @@ def test_archon_authoring_contract_is_bounded_and_versioned():
 
     assert contract["schema_version"] == 1
     assert contract["profile"] == "archon-2026-07"
-    assert contract["normalizer_version"] == 1
+    assert contract["normalizer_version"] == 2
     assert (
         contract["definition_schema"]["$schema"]
         == "https://json-schema.org/draft/2020-12/schema"
@@ -75,7 +75,9 @@ def test_authoring_contract_generation_is_byte_deterministic(profile):
 @pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
 def test_authoring_contract_publishes_a_self_verifying_editor_envelope(profile):
     contract = workflow_authoring_contract(profile)
-    digest_payload = {key: value for key, value in contract.items() if key != "contract_digest"}
+    digest_payload = {
+        key: value for key, value in contract.items() if key != "contract_digest"
+    }
     expected_digest = sha256(
         language_schema.canonical_contract_json(digest_payload).encode()
     ).hexdigest()
@@ -86,9 +88,7 @@ def test_authoring_contract_publishes_a_self_verifying_editor_envelope(profile):
     assert contract["x-hermes-provenance"]["field_authority"] == (
         "plugins.workflow.language_schema.FIELD_INVENTORY"
     )
-    assert contract["x-hermes-filenames"]["companion_suffix"] == (
-        ".hermes.yaml"
-    )
+    assert contract["x-hermes-filenames"]["companion_suffix"] == (".hermes.yaml")
 
 
 def test_contract_canonical_json_matches_javascript_number_and_sorting_rules():
@@ -114,8 +114,7 @@ def test_contract_canonical_json_matches_javascript_unicode_rules():
     }
 
     assert language_schema.canonical_contract_json(payload) == (
-        '{"é":"line one\\nline \\"two\\"","😀":"snowman ☃",'
-        '"\ue000":"private-use"}'
+        '{"é":"line one\\nline \\"two\\"","😀":"snowman ☃","\ue000":"private-use"}'
     )
 
 
@@ -147,7 +146,9 @@ def test_node_kind_descriptors_cover_each_applicable_node_field_once(profile):
         assert len(paths) == len(set(paths))
         assert len(orders) == len(set(orders))
         assert all(field["description"] for field in fields)
-        assert all(field["applicability"]["node_kinds"] == [node_type] for field in fields)
+        assert all(
+            field["applicability"]["node_kinds"] == [node_type] for field in fields
+        )
 
     assert "nodes[].retry.max_attempts" in {
         field["field_path"] for field in descriptors["command"]["fields"]
@@ -206,7 +207,7 @@ def test_condition_contract_publishes_ecmascript_unicode_grammar():
     expression_pattern = conditions["parameters"]["expression_pattern"]
     assert conditions["parameters"]["expression_flags"] == "u"
     assert r"\w" not in expression_pattern
-    assert r'\"' not in expression_pattern
+    assert r"\"" not in expression_pattern
     assert r"[\p{L}\p{N}_.:-]+" in expression_pattern
     assert r"[\p{L}\p{N}_.-]+" in expression_pattern
     assert unicode_condition in conditions["examples"]
@@ -226,7 +227,7 @@ def test_condition_contract_publishes_ecmascript_unicode_grammar():
             "$prepare.output.status == 'ready' && $inspect.output.count >= 2",
             True,
         ),
-        ("$prepare.output.status != \"blocked\"", True),
+        ('$prepare.output.status != "blocked"', True),
         ("$prepare.output.status ==", False),
         ("prepare.output.status == 'ready'", False),
         ("$prepare.output.status == 'ready' &&", False),
@@ -235,7 +236,9 @@ def test_condition_contract_publishes_ecmascript_unicode_grammar():
 def test_condition_expression_descriptor_matches_the_real_loader(condition, expected):
     contract = workflow_authoring_contract(WorkflowLanguageProfile.HERMES_LEGACY)
     rule = next(
-        item for item in contract["semantic_rules"] if item["id"] == "condition-expression"
+        item
+        for item in contract["semantic_rules"]
+        if item["id"] == "condition-expression"
     )
     assert rule["parameters"]["expression_flags"] == "u"
     pattern = re.compile(language_schema.WHEN_EXPRESSION_PATTERN)
@@ -297,7 +300,9 @@ def test_editor_descriptors_and_schema_annotations_share_inventory_metadata(prof
         )
         for field_name, field in direct.items():
             assert field_name in variant["properties"]
-            annotation = schema["properties"]["nodes"]["items"]["properties"][field_name]
+            annotation = schema["properties"]["nodes"]["items"]["properties"][
+                field_name
+            ]
             assert annotation["title"] == field["label"]
             assert annotation["description"] == field["description"]
             assert annotation["x-hermes-widget"] == field["widget"]
@@ -377,8 +382,12 @@ def test_editor_status_distinguishes_legacy_advisories_from_archon_blockers():
     archon = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
 
     def command_field(contract, field_path):
-        command = next(item for item in contract["node_kinds"] if item["id"] == "command")
-        return next(field for field in command["fields"] if field["field_path"] == field_path)
+        command = next(
+            item for item in contract["node_kinds"] if item["id"] == "command"
+        )
+        return next(
+            field for field in command["fields"] if field["field_path"] == field_path
+        )
 
     assert command_field(legacy, "nodes[].idle_timeout")["status"] == "supported"
     assert command_field(archon, "nodes[].idle_timeout")["status"] == "deferred"
@@ -387,12 +396,20 @@ def test_editor_status_distinguishes_legacy_advisories_from_archon_blockers():
     archon_code = archon["compatibility_codes"][
         "archon_idle_timeout_semantics_unavailable"
     ]
-    assert (legacy_code["status"], legacy_code["runtime_status"], legacy_code["blocking"]) == (
+    assert (
+        legacy_code["status"],
+        legacy_code["runtime_status"],
+        legacy_code["blocking"],
+    ) == (
         "supported",
         "warning",
         False,
     )
-    assert (archon_code["status"], archon_code["runtime_status"], archon_code["blocking"]) == (
+    assert (
+        archon_code["status"],
+        archon_code["runtime_status"],
+        archon_code["blocking"],
+    ) == (
         "deferred",
         "blocking",
         True,
@@ -679,8 +696,7 @@ def test_compatibility_applicability_consumes_the_live_field_inventory(monkeypat
     findings = assess_compatibility(package).findings
 
     assert any(
-        finding.code == "field_not_applicable"
-        and finding.path == "nodes[0].always_run"
+        finding.code == "field_not_applicable" and finding.path == "nodes[0].always_run"
         for finding in findings
     )
 
@@ -935,8 +951,6 @@ def test_interactive_gate_message_json_truthiness_matches_loader(
         ),
         ("bash", "timeout", "archon_timeout_semantics_unavailable", 3),
         ("bash", "retry", "archon_retry_semantics_unavailable", 3),
-        ("prompt", "output_format", "archon_output_format_unavailable", 2),
-        ("prompt", "output_type", "archon_output_type_unavailable", 2),
         ("prompt", "maxBudgetUsd", "archon_budget_enforcement_unavailable", 5),
         ("prompt", "sandbox", "archon_sandbox_enforcement_unavailable", 5),
     ],
@@ -950,6 +964,18 @@ def test_archon_deferred_fields_publish_blocking_codes(node_type, field, code, p
     assert field_schema["x-hermes-enforcement-phase"] == phase
     assert schema["additionalProperties"] is False
     assert schema["properties"]["nodes"]["items"]["additionalProperties"] is False
+
+
+@pytest.mark.parametrize("field", ("output_format", "output_type"))
+def test_archon_structured_output_fields_publish_supported_contracts(field):
+    schema = definition_json_schema(WorkflowLanguageProfile.ARCHON_2026_07)
+    field_schema = _node_property(schema, "prompt", field)
+    codes = compatibility_code_catalog(WorkflowLanguageProfile.ARCHON_2026_07)
+
+    assert field_schema["x-hermes-status"] == "supported"
+    assert "x-hermes-compatibility-code" not in field_schema
+    assert "archon_output_format_unavailable" not in codes
+    assert "archon_output_type_unavailable" not in codes
 
 
 @pytest.mark.parametrize(
@@ -1104,9 +1130,7 @@ def test_dynamic_catalog_codes_are_emitted_by_real_runtime_paths():
         assert emitted_codes <= set(compatibility_code_catalog(profile))
         for reference in references:
             documented = reference.read_text(encoding="utf-8")
-            assert not {
-                code for code in emitted_codes if f"`{code}`" not in documented
-            }
+            assert not {code for code in emitted_codes if f"`{code}`" not in documented}
 
 
 def test_generated_language_codes_are_covered_by_authoring_references():

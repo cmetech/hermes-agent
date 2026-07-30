@@ -74,6 +74,52 @@ def test_archon_profile_normalization_is_deterministic(definition):
     assert len(first.metadata.normalized_definition_digest) == 64
 
 
+def test_version_one_keeps_archon_structured_output_identity(definition):
+    definition = replace(
+        definition,
+        nodes=(
+            replace(
+                definition.nodes[0],
+                node_type="prompt",
+                value="Return JSON",
+                options=freeze_value({"output_format": {"type": "object"}}),
+            ),
+        ),
+    )
+    selection = WorkflowLanguageSelection(
+        declared_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        effective_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+    )
+
+    normalized = normalize_workflow(
+        definition, selection=selection, normalizer_version=1
+    )
+
+    assert normalized.definition is definition
+    assert normalized.metadata.structured_outputs == {}
+
+
+def test_legacy_structured_output_findings_remain_unchanged(workflow_writer, tmp_path):
+    package = load_workflow(
+        workflow_writer(
+            tmp_path,
+            nodes=[
+                {
+                    "id": "prompt",
+                    "prompt": "Return JSON",
+                    "output_format": {"type": "object"},
+                    "output_type": "report",
+                }
+            ],
+        )
+    )
+
+    assert {finding.code for finding in package.compatibility_findings} >= {
+        "legacy_output_format_post_validation",
+        "legacy_output_type_not_published",
+    }
+
+
 def test_unknown_normalizer_version_fails_closed(definition):
     with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
         normalize_workflow(

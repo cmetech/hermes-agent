@@ -44,19 +44,29 @@ because older strict companion parsers reject the new field. An explicit
 `hermes-legacy` declaration is suitable only when every reader recognizes
 `language_compatibility`.
 
-Phase 1 intentionally blocks these Archon declarations:
+Phase 2 supports Archon AI `output_format` and `output_type`. `output_format`
+is normalized as bounded Draft 2020-12 JSON Schema during admission, and
+direct `$node.output.field` condition references are rejected only when every
+closed schema branch proves that field path impossible. `output_type` is
+accepted as the portable declaration; it does not change the legacy published
+artifact behavior.
+
+Under `hermes-legacy`, these same declarations retain their existing warning
+semantics: `output_format` emits `legacy_output_format_post_validation`, and
+`output_type` emits `legacy_output_type_not_published` because no typed artifact
+is published.
+
+The following declarations remain intentionally blocked under Archon:
 
 | Field | Archon contract code | Archon enforcement phase | Current legacy meaning and warning code |
 | --- | --- | ---: | --- |
-| AI `output_format` | `archon_output_format_unavailable` | 2 | Post-generation JSON Schema validation; `legacy_output_format_post_validation`. |
-| Any `output_type` | `archon_output_type_unavailable` | 2 | Accepted but no typed artifact is published; `legacy_output_type_not_published`. |
 | Node `idle_timeout` | `archon_idle_timeout_semantics_unavailable` | 3 | Positive seconds without reinterpretation; `legacy_idle_timeout_seconds`. Archon millisecond normalization is deferred to Phase 3. |
 | Bash/script `timeout` | `archon_timeout_semantics_unavailable` | 3 | Positive seconds; `legacy_timeout_seconds`. |
 | Node `retry` | `archon_retry_semantics_unavailable` | 3 | `max_attempts` counts total attempts and `delay_ms` is milliseconds; `legacy_retry_total_attempts`. |
 | `maxBudgetUsd` | `archon_budget_enforcement_unavailable` | 5 | Provider-capability mapping only; not a portable guarantee. |
 | Workflow/node `sandbox` | `archon_sandbox_enforcement_unavailable` | 5 | Provider/backend capability only; resource limits are not a sandbox. |
 
-When one is requested, apply the two-choice recipe in the parent skill. Do not
+When a blocked declaration is requested, apply the two-choice recipe in the parent skill. Do not
 rewrite the request into legacy silently. Companion `limits` and
 `resource_limits` may be included inside the omit-and-remain-Archon choice to
 tighten Hermes execution policy without claiming the blocked Archon semantics;
@@ -80,7 +90,7 @@ array. Each node has `id`, exactly one node-type payload, and optional
 `approval`, and `cancel`. Graph and `$node.output` references must be upstream.
 
 Common fields include `when`, `trigger_rule`, `context`, `idle_timeout`,
-`always_run`, plus the deferred `retry` and `output_type`. AI nodes may use
+`always_run`, `output_type`, plus the deferred `retry`. AI nodes may use
 provider/model selection, `persist_session`, `allowed_tools`, `denied_tools`,
 `hooks`, `mcp`, `skills`, inline `agents`, reasoning controls, `systemPrompt`, and
 fallbacks when doctor confirms the Hermes mapping. Tool aliases such as
@@ -92,6 +102,26 @@ on every node. Hermes legacy interprets the authored value as seconds and
 emits `legacy_idle_timeout_seconds`. Under `archon-2026-07`, it blocks with
 `archon_idle_timeout_semantics_unavailable`; do not convert or reinterpret the
 value until Phase 3 supplies Archon millisecond normalization.
+
+For a structured Archon output, declare a bounded local JSON Schema directly
+on the AI node:
+
+```yaml
+- id: summarize
+  prompt: Summarize the evidence.
+  output_type: report
+  output_format:
+    type: object
+    properties:
+      answer: {type: string}
+    additionalProperties: false
+```
+
+`when: $summarize.output.answer != ''` is valid; a reference to an undeclared
+field of a closed object is blocked with
+`structured_output_field_impossible`. Open objects, optional declared fields,
+and schema branches that permit the field remain admissible for runtime
+evaluation.
 
 Script nodes require `runtime: uv` or `runtime: bun`; named scripts resolve
 below `scripts/`. Named command templates resolve below `commands/`. MCP names

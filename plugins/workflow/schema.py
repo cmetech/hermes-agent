@@ -18,6 +18,7 @@ from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
     language_compatibility_findings,
     normalize_workflow,
+    prove_output_path_impossible,
     resolve_language_profile,
 )
 from plugins.workflow.language_schema import (
@@ -73,6 +74,7 @@ SIDECAR_FIELDS = sidecar_field_names()
 _CONTROL_OR_ANSI = re.compile(r"[\x00-\x1f\x7f-\x9f]|\x1b\[")
 _SAFE_NAME = re.compile(r"^[^\s/\\]+$")
 _WHEN_REFERENCE = re.compile(WHEN_REFERENCE_PATTERN, re.UNICODE)
+_WHEN_OUTPUT_REFERENCE = re.compile(r"\$([\w.:-]+)\.output((?:\.[\w.-]+)*)", re.UNICODE)
 _WHEN_EXPRESSION = re.compile(WHEN_EXPRESSION_PATTERN, re.UNICODE)
 _INLINE_SCRIPT_METACHAR = re.compile(r"[\s;(){}&|<>$`\"']")
 
@@ -345,9 +347,7 @@ def _validate_agents(value: Any, path: str) -> None:
                 f"{agent_path} must use a kebab-case agent id",
             )
         agent = _mapping(raw_agent, agent_path)
-        unknown = sorted(
-            set(agent) - AGENT_FIELDS
-        )
+        unknown = sorted(set(agent) - AGENT_FIELDS)
         if unknown:
             _fail(
                 agent_path,
@@ -427,9 +427,7 @@ def _validate_node_type(node: Mapping[str, Any], node_type: str, path: str) -> N
             )
     if node_type == "loop":
         loop = _mapping(value, f"{path}.loop")
-        unknown = sorted(
-            set(loop) - LOOP_FIELDS
-        )
+        unknown = sorted(set(loop) - LOOP_FIELDS)
         if unknown:
             _fail(
                 f"{path}.loop",
@@ -669,6 +667,40 @@ def _validate_graph(nodes: tuple[WorkflowNode, ...]) -> None:
         raise WorkflowValidationError(upstream_issues)
 
 
+def _validate_structured_output_field_references(
+    nodes: tuple[WorkflowNode, ...],
+    structured_outputs: Mapping[str, object],
+) -> None:
+    """Reject only field paths every normalized producer branch excludes."""
+    issues: list[ValidationIssue] = []
+    for node in nodes:
+        when = node.options.get("when")
+        if not isinstance(when, str):
+            continue
+        for match in _WHEN_OUTPUT_REFERENCE.finditer(when):
+            producer_id = match.group(1)
+            output = structured_outputs.get(producer_id)
+            if output is None:
+                continue
+            schema = getattr(output, "canonical_schema", None)
+            path_parts = tuple(part for part in match.group(2).split(".") if part)
+            if (
+                isinstance(schema, Mapping)
+                and path_parts
+                and prove_output_path_impossible(schema, path_parts)
+            ):
+                issues.append(
+                    _issue(
+                        f"nodes[{node.source_index}].when",
+                        "structured_output_field_impossible",
+                        f"structured output field {'.'.join(path_parts)} is impossible for node {producer_id}",
+                        line=node.source_line,
+                    )
+                )
+    if issues:
+        raise WorkflowValidationError(tuple(issues))
+
+
 def _parse_sidecar(
     sidecar_path: Path,
     data: bytes,
@@ -748,9 +780,10 @@ def _parse_sidecar(
             "invalid_sidecar",
             "pause_lane_policy must be hold or release",
         )
-    if "pause_lane_policy" in sidecar and sidecar.get(
-        "overlap_policy", "queue"
-    ) != "queue":
+    if (
+        "pause_lane_policy" in sidecar
+        and sidecar.get("overlap_policy", "queue") != "queue"
+    ):
         _fail(
             "sidecar.pause_lane_policy",
             "invalid_sidecar",
@@ -941,6 +974,9 @@ def _load_workflow_bytes(
         definition,
         selection=selection,
         normalizer_version=normalizer_version,
+    )
+    _validate_structured_output_field_references(
+        normalized.definition.nodes, normalized.metadata.structured_outputs
     )
     return WorkflowPackage(
         source_definition=definition,

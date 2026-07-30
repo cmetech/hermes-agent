@@ -38,10 +38,7 @@ from plugins.workflow.trust import WorkflowResourceReadBudget
 
 
 LEGACY_STORE_FIXTURE = (
-    Path(__file__).parent
-    / "fixtures"
-    / "store"
-    / "pre-production-amendment-v2.0.9"
+    Path(__file__).parent / "fixtures" / "store" / "pre-production-amendment-v2.0.9"
 )
 
 
@@ -220,6 +217,8 @@ def _legacy_skill_package(workflow_writer, root: Path, monkeypatch):
             ],
         )
     )
+
+
 def _rewrite_resources(store: RunStore, run_id: str, mutate) -> None:
     resources_path = store.run_directory(run_id) / "resources.json"
     resources = json.loads(resources_path.read_bytes())
@@ -269,18 +268,52 @@ def _load_with_scheduler(
         scheduler.shutdown(deadline_seconds=2)
 
 
-def test_admission_seals_package_bound_language_metadata(
-    tmp_path, workflow_writer
-):
-    package = _profile_package(workflow_writer, tmp_path, profile="archon-2026-07")
+def test_admission_seals_package_bound_language_metadata(tmp_path, workflow_writer):
+    path = workflow_writer(
+        tmp_path / "package",
+        name="archon-structured-snapshot",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Return JSON",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                },
+            }
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(path)
     store = RunStore(tmp_path / "home")
     prepared = store.prepare_run_snapshot(package)
-    resources = json.loads(
-        (prepared.staging_directory / "resources.json").read_text()
-    )
+    resources = json.loads((prepared.staging_directory / "resources.json").read_text())
 
     assert resources["language"]["effective_profile"] == "archon-2026-07"
-    assert resources["language"]["normalizer_version"] == 1
+    assert resources["language"]["normalizer_version"] == 2
+    assert resources["language"]["structured_outputs"] == {
+        "producer": {
+            "canonical_schema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+            },
+            "schema_fingerprint": package.language.structured_outputs[
+                "producer"
+            ].schema_fingerprint,
+            "canonicalization_version": 1,
+        }
+    }
+    assert (
+        len(
+            resources["language"]["structured_outputs"]["producer"][
+                "schema_fingerprint"
+            ]
+        )
+        == 64
+    )
     assert len(resources["language"]["normalized_definition_digest"]) == 64
     assert len(resources["language"]["semantic_fingerprint"]) == 64
     assert prepared.language == resources["language"]
@@ -291,9 +324,7 @@ def test_admission_seals_package_bound_language_metadata(
         "inputs.json",
         "policy.yaml",
         "resources.json",
-    }.issubset(
-        resources["sealed_paths"]
-    )
+    }.issubset(resources["sealed_paths"])
     assert len(resources["sealed_paths"]) <= 4096
 
 
@@ -313,7 +344,23 @@ def test_admission_projects_the_same_bounded_language_metadata(
         "normalizer_version",
         "normalized_definition_digest",
         "semantic_fingerprint",
+        "structured_outputs",
     }
+
+
+def test_version_one_language_snapshot_keeps_the_legacy_four_field_shape():
+    value = {
+        "effective_profile": "archon-2026-07",
+        "normalizer_version": 1,
+        "normalized_definition_digest": "a" * 64,
+        "semantic_fingerprint": "b" * 64,
+    }
+
+    snapshot = read_language_snapshot(value)
+
+    assert snapshot is not None
+    assert snapshot.to_dict() == value
+    assert snapshot.structured_outputs == {}
 
 
 def test_language_snapshot_identity_is_independent_of_install_path(
@@ -334,9 +381,7 @@ def test_language_snapshot_identity_is_independent_of_install_path(
     assert left_snapshot.language == right_snapshot.language
 
 
-def test_clone_prepared_snapshot_preserves_language_metadata(
-    tmp_path, workflow_writer
-):
+def test_clone_prepared_snapshot_preserves_language_metadata(tmp_path, workflow_writer):
     package = _profile_package(workflow_writer, tmp_path, profile="archon-2026-07")
     store = RunStore(tmp_path / "home")
     prepared = store.prepare_run_snapshot(package)
@@ -345,9 +390,12 @@ def test_clone_prepared_snapshot_preserves_language_metadata(
 
     assert cloned.language == prepared.language
     assert cloned.sealed_snapshot_digest == prepared.sealed_snapshot_digest
-    assert json.loads((cloned.staging_directory / "resources.json").read_bytes())[
-        "language"
-    ] == prepared.language
+    assert (
+        json.loads((cloned.staging_directory / "resources.json").read_bytes())[
+            "language"
+        ]
+        == prepared.language
+    )
 
 
 def test_resume_reads_sealed_definition_after_installed_source_changes(
@@ -437,10 +485,7 @@ def test_legacy_node_run_root_write_does_not_break_next_verified_load(
     finally:
         scheduler.shutdown(deadline_seconds=2)
 
-    assert (
-        loaded.language.effective_profile
-        is WorkflowLanguageProfile.HERMES_LEGACY
-    )
+    assert loaded.language.effective_profile is WorkflowLanguageProfile.HERMES_LEGACY
     assert state.read_text(encoding="utf-8") == "legacy state\n"
 
 
@@ -505,8 +550,8 @@ def test_legacy_unsealed_regular_file_never_becomes_execution_authority(
     shadow.write_text("Unsealed command.\n", encoding="utf-8")
 
     try:
-        _loaded, sealed_paths, sealed_bytes = (
-            scheduler._load_verified_run_package(run_id)
+        _loaded, sealed_paths, sealed_bytes = scheduler._load_verified_run_package(
+            run_id
         )
     finally:
         scheduler.shutdown(deadline_seconds=2)
@@ -543,9 +588,7 @@ def test_verified_always_run_nodes_uses_authenticated_definition(
     assert always_run_nodes == frozenset({"refresh"})
 
 
-def test_resume_rejects_symlink_inside_mutable_output_root(
-    tmp_path, workflow_writer
-):
+def test_resume_rejects_symlink_inside_mutable_output_root(tmp_path, workflow_writer):
     package = _profile_package(workflow_writer, tmp_path, profile="archon-2026-07")
     store = RunStore(tmp_path / "home")
     _prepared, admitted = _start(store, package, key="mutable-output-symlink")
@@ -626,20 +669,14 @@ def test_concurrent_same_run_preparation_returns_independent_sealed_paths(
         barrier.wait(timeout=5)
         return loaded
 
-    monkeypatch.setattr(
-        scheduler, "_load_verified_run_package", synchronized_load
-    )
+    monkeypatch.setattr(scheduler, "_load_verified_run_package", synchronized_load)
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = tuple(
                 future.result(timeout=10)
                 for future in (
-                    pool.submit(
-                        scheduler._prepare_run_package, admitted.run_id, None
-                    ),
-                    pool.submit(
-                        scheduler._prepare_run_package, admitted.run_id, None
-                    ),
+                    pool.submit(scheduler._prepare_run_package, admitted.run_id, None),
+                    pool.submit(scheduler._prepare_run_package, admitted.run_id, None),
                 )
             )
     finally:
@@ -653,9 +690,9 @@ def test_concurrent_same_run_preparation_returns_independent_sealed_paths(
         "print('shadow')\n", encoding="utf-8"
     )
     assert {
-        ResourceResolver(
-            run_directory, sealed_paths=paths
-        ).script("helper", runtime="uv").path.name
+        ResourceResolver(run_directory, sealed_paths=paths)
+        .script("helper", runtime="uv")
+        .path.name
         for paths in sealed_path_sets
     } == {"helper.py"}
 
@@ -669,9 +706,7 @@ def test_resume_rejects_unjournaled_unknown_normalizer_rewrite(
     _rewrite_resources(
         store,
         admitted.run_id,
-        lambda resources: resources["language"].__setitem__(
-            "normalizer_version", 99
-        ),
+        lambda resources: resources["language"].__setitem__("normalizer_version", 99),
     )
 
     with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
@@ -694,9 +729,7 @@ def test_resume_rejects_unknown_journaled_normalizer(tmp_path, workflow_writer):
         prepared,
         input_manifest_digest=sha256(encoded).hexdigest(),
         language=language,
-        sealed_snapshot_digest=sealed_snapshot_digest(
-            prepared.staging_directory
-        ),
+        sealed_snapshot_digest=sealed_snapshot_digest(prepared.staging_directory),
     )
     admitted = store.start_run(
         RunAdmissionRequest(
@@ -723,9 +756,7 @@ def test_resume_rejects_sealed_profile_change(tmp_path, workflow_writer):
     store = RunStore(tmp_path / "home")
     _prepared, admitted = _start(store, package, key="profile-change")
     policy_path = store.run_directory(admitted.run_id) / "policy.yaml"
-    policy_path.write_text(
-        "language_compatibility: hermes-legacy\n", encoding="utf-8"
-    )
+    policy_path.write_text("language_compatibility: hermes-legacy\n", encoding="utf-8")
 
     with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
         _load_with_scheduler(store, admitted.run_id)
@@ -740,9 +771,7 @@ def test_resume_rejects_coherent_policy_downgrade_and_language_rewrite(
     store = RunStore(tmp_path / "home")
     _prepared, admitted = _start(store, package, key="coherent-policy-downgrade")
     policy_path = store.run_directory(admitted.run_id) / "policy.yaml"
-    policy_path.write_text(
-        "language_compatibility: hermes-legacy\n", encoding="utf-8"
-    )
+    policy_path.write_text("language_compatibility: hermes-legacy\n", encoding="utf-8")
     _rewrite_language_for_sealed_package(store, admitted.run_id)
 
     with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
@@ -856,9 +885,7 @@ def test_resume_rejects_tampered_digest_covered_package_resource(
     "field",
     ["normalized_definition_digest", "semantic_fingerprint"],
 )
-def test_resume_rejects_changed_language_digest(
-    tmp_path, workflow_writer, field
-):
+def test_resume_rejects_changed_language_digest(tmp_path, workflow_writer, field):
     package = _profile_package(workflow_writer, tmp_path, profile="archon-2026-07")
     store = RunStore(tmp_path / "home")
     _prepared, admitted = _start(store, package, key=f"changed-{field}")
@@ -879,9 +906,7 @@ def test_pre_language_snapshot_with_reconstructible_package_digest_still_loads(
 ):
     name = "reconstructible-legacy"
     package = load_workflow(
-        workflow_writer(
-            tmp_path / "package", name=name, filename=f"{name}.yaml"
-        )
+        workflow_writer(tmp_path / "package", name=name, filename=f"{name}.yaml")
     )
     store = RunStore(tmp_path / "home")
     prepared = _prepare_pre_language_snapshot(store, package)
@@ -899,9 +924,7 @@ def test_pre_language_snapshot_with_reconstructible_package_digest_still_loads(
     )
     assert admitted.run_id is not None
 
-    loaded = _load_with_scheduler(
-        store, admitted.run_id, historical_projection=True
-    )
+    loaded = _load_with_scheduler(store, admitted.run_id, historical_projection=True)
 
     assert loaded.language.effective_profile.value == "hermes-legacy"
 
@@ -938,9 +961,7 @@ def test_unverifiable_pre_language_snapshot_never_reaches_workflow_parser(
     monkeypatch.setattr(scheduler_module, "load_workflow_snapshot", forbidden_parser)
 
     with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
-        _load_with_scheduler(
-            store, admitted.run_id, historical_projection=True
-        )
+        _load_with_scheduler(store, admitted.run_id, historical_projection=True)
 
     assert exc.value.code == "workflow_legacy_snapshot_unverifiable"
     assert parse_calls == 0
@@ -951,9 +972,7 @@ def test_reconstructible_pre_language_snapshot_is_verified_before_parser(
 ):
     name = "legacy-parser-order-valid"
     package = load_workflow(
-        workflow_writer(
-            tmp_path / "package", name=name, filename=f"{name}.yaml"
-        )
+        workflow_writer(tmp_path / "package", name=name, filename=f"{name}.yaml")
     )
     store = RunStore(tmp_path / "home")
     prepared = _prepare_pre_language_snapshot(store, package)
@@ -989,13 +1008,9 @@ def test_reconstructible_pre_language_snapshot_is_verified_before_parser(
         "_legacy_package_digest_for_identity",
         staticmethod(recording_digest),
     )
-    monkeypatch.setattr(
-        scheduler_module, "load_workflow_snapshot", recording_parser
-    )
+    monkeypatch.setattr(scheduler_module, "load_workflow_snapshot", recording_parser)
 
-    loaded = _load_with_scheduler(
-        store, admitted.run_id, historical_projection=True
-    )
+    loaded = _load_with_scheduler(store, admitted.run_id, historical_projection=True)
 
     assert loaded.definition.name == name
     assert events.index("verified") < events.index("parsed")
@@ -1006,9 +1021,7 @@ def test_pre_language_file_replacement_cannot_authenticate_different_parser_byte
 ):
     name = "legacy-parser-byte-binding"
     package = load_workflow(
-        workflow_writer(
-            tmp_path / "package", name=name, filename=f"{name}.yaml"
-        )
+        workflow_writer(tmp_path / "package", name=name, filename=f"{name}.yaml")
     )
     store = RunStore(tmp_path / "home")
     prepared = _prepare_pre_language_snapshot(store, package)
@@ -1049,14 +1062,10 @@ def test_pre_language_file_replacement_cannot_authenticate_different_parser_byte
         "_legacy_raw_package_paths",
         staticmethod(restore_after_initial_read),
     )
-    monkeypatch.setattr(
-        scheduler_module, "load_workflow_snapshot", recording_parser
-    )
+    monkeypatch.setattr(scheduler_module, "load_workflow_snapshot", recording_parser)
 
     with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
-        _load_with_scheduler(
-            store, admitted.run_id, historical_projection=True
-        )
+        _load_with_scheduler(store, admitted.run_id, historical_projection=True)
 
     assert exc.value.code == "workflow_snapshot_integrity_mismatch"
     assert parse_calls == 0
@@ -1086,9 +1095,7 @@ def test_checked_in_v209_snapshot_loads_through_full_scheduler_path(
         "_legacy_package_digest_for_identity",
         staticmethod(recording_digest),
     )
-    monkeypatch.setattr(
-        scheduler_module, "load_workflow_snapshot", recording_parser
-    )
+    monkeypatch.setattr(scheduler_module, "load_workflow_snapshot", recording_parser)
     scheduler = RunScheduler(store)
     try:
         package = scheduler._load_run_package("migration-run")
@@ -1133,16 +1140,14 @@ def test_pre_language_raw_authentication_covers_transitive_package_resources(
         scheduler.shutdown(deadline_seconds=2)
 
     assert loaded.definition.name == "legacy-transitive"
-    assert sealed_paths == frozenset(
-        {
-            "definition.yaml",
-            "mcp/echo.yaml",
-            "scripts/helper.py",
-            "servers/echo.py",
-            "inputs.json",
-            "resources.json",
-        }
-    )
+    assert sealed_paths == frozenset({
+        "definition.yaml",
+        "mcp/echo.yaml",
+        "scripts/helper.py",
+        "servers/echo.py",
+        "inputs.json",
+        "resources.json",
+    })
     assert frozenset(sealed_bytes) == sealed_paths | {
         "inputs.json",
         "resources.json",
@@ -1346,13 +1351,9 @@ def test_historical_mcp_consumers_rebind_same_size_bytes_for_every_seal_mode(
             sealed_paths=sealed_paths,
             sealed_bytes=sealed_bytes,
         ).mcp_servers("mcp/echo.yaml", materializer=materializer)
-        authority = next(iter(servers.values()))[
-            "__hermes_authenticated_local_mcp"
-        ]
+        authority = next(iter(servers.values()))["__hermes_authenticated_local_mcp"]
         private_target = (
-            Path(authority["root"])
-            / authority["payload"]
-            / target.relative_to(run)
+            Path(authority["root"]) / authority["payload"] / target.relative_to(run)
         )
         assert private_target.read_bytes() == original
     finally:
@@ -1448,15 +1449,19 @@ def test_legacy_raw_package_bytes_accepts_exact_authoritative_boundaries(tmp_pat
         path = run / f"count-{index:03}.bin"
         path.write_bytes(b"")
         count_paths.append(path.name)
-    assert len(
-        RunScheduler._legacy_raw_package_bytes(run, frozenset(count_paths))
-    ) == CATALOG_MAX_RESOURCE_FILES
+    assert (
+        len(RunScheduler._legacy_raw_package_bytes(run, frozenset(count_paths)))
+        == CATALOG_MAX_RESOURCE_FILES
+    )
 
     boundary = run / "boundary.bin"
     boundary.write_bytes(b"x" * CATALOG_MAX_RESOURCE_FILE_BYTES)
-    assert RunScheduler._legacy_raw_package_bytes(
-        run, frozenset({boundary.name})
-    )[boundary.name] == b"x" * CATALOG_MAX_RESOURCE_FILE_BYTES
+    assert (
+        RunScheduler._legacy_raw_package_bytes(run, frozenset({boundary.name}))[
+            boundary.name
+        ]
+        == b"x" * CATALOG_MAX_RESOURCE_FILE_BYTES
+    )
 
     total_paths = []
     chunk_size = CATALOG_MAX_RESOURCE_FILE_BYTES
@@ -1535,9 +1540,7 @@ def test_scheduler_input_variables_use_authenticated_bytes_without_reopening_sou
         variables = scheduler._variables(
             {"run_id": "authority-input", "artifacts": []},
             run,
-            sealed_resource_paths=frozenset(
-                {"inputs.json", "inputs/arguments.txt"}
-            ),
+            sealed_resource_paths=frozenset({"inputs.json", "inputs/arguments.txt"}),
             sealed_resource_bytes={
                 "inputs.json": manifest,
                 "inputs/arguments.txt": arguments,
@@ -1636,9 +1639,7 @@ def test_shared_snapshot_budget_deduplicates_same_canonical_file(tmp_path):
         max_files=1,
     )
 
-    first = RunScheduler._stable_snapshot_bytes(
-        run, (path.name,), read_budget=budget
-    )
+    first = RunScheduler._stable_snapshot_bytes(run, (path.name,), read_budget=budget)
     second = RunScheduler._legacy_raw_package_bytes(
         run, frozenset({path.name}), read_budget=budget
     )
@@ -1670,9 +1671,7 @@ def test_modern_oversized_file_is_rejected_before_open(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("overflow", ["files", "total-bytes"])
-def test_modern_snapshot_authority_rejects_shared_budget_overflow(
-    tmp_path, overflow
-):
+def test_modern_snapshot_authority_rejects_shared_budget_overflow(tmp_path, overflow):
     run = tmp_path / "run"
     run.mkdir()
     paths = []
@@ -1774,9 +1773,7 @@ def test_changed_pre_language_transitive_closure_is_rejected_before_parser(
     monkeypatch.setattr(scheduler_module, "load_workflow_snapshot", forbidden_parser)
 
     with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
-        _load_with_scheduler(
-            store, admitted.run_id, historical_projection=True
-        )
+        _load_with_scheduler(store, admitted.run_id, historical_projection=True)
 
     assert exc.value.code == "workflow_legacy_snapshot_unverifiable"
     assert parse_calls == 0
@@ -1784,10 +1781,7 @@ def test_changed_pre_language_transitive_closure_is_rejected_before_parser(
 
 def test_checked_in_v209_snapshot_package_identity_is_reconstructible():
     run_directory = (
-        LEGACY_STORE_FIXTURE
-        / "runs"
-        / "migration-fixture"
-        / "migration-run"
+        LEGACY_STORE_FIXTURE / "runs" / "migration-fixture" / "migration-run"
     )
     projection = json.loads((run_directory / "run.json").read_bytes())
 
@@ -1806,10 +1800,7 @@ def test_checked_in_v209_snapshot_package_identity_is_reconstructible():
 )
 def test_v209_snapshot_rejects_wrong_or_escaping_path_identity(identity):
     run_directory = (
-        LEGACY_STORE_FIXTURE
-        / "runs"
-        / "migration-fixture"
-        / "migration-run"
+        LEGACY_STORE_FIXTURE / "runs" / "migration-fixture" / "migration-run"
     )
     projection = json.loads((run_directory / "run.json").read_bytes())
 
@@ -1823,12 +1814,7 @@ def test_v209_snapshot_rejects_wrong_or_escaping_path_identity(identity):
 
 
 def test_v209_snapshot_reconstruction_rejects_altered_definition(tmp_path):
-    source = (
-        LEGACY_STORE_FIXTURE
-        / "runs"
-        / "migration-fixture"
-        / "migration-run"
-    )
+    source = LEGACY_STORE_FIXTURE / "runs" / "migration-fixture" / "migration-run"
     run_directory = tmp_path / "migration-run"
     run_directory.mkdir()
     for relative in ("definition.yaml", "policy.yaml", "run.json"):
@@ -1872,16 +1858,12 @@ def test_verifiable_pre_language_scheduled_snapshot_still_loads(
     output.parent.mkdir(parents=True)
     output.write_text("legitimate mutable output\n", encoding="utf-8")
 
-    loaded = _load_with_scheduler(
-        store, admitted.run_id, historical_projection=True
-    )
+    loaded = _load_with_scheduler(store, admitted.run_id, historical_projection=True)
 
     assert loaded.language.effective_profile.value == "hermes-legacy"
 
 
-def test_pre_language_snapshot_rejects_altered_definition(
-    tmp_path, workflow_writer
-):
+def test_pre_language_snapshot_rejects_altered_definition(tmp_path, workflow_writer):
     name = "legacy-definition-integrity"
     path = workflow_writer(tmp_path / "package", name=name, filename=f"{name}.yaml")
     package = load_workflow(path)
@@ -1909,9 +1891,7 @@ def test_pre_language_snapshot_rejects_altered_definition(
     )
 
     with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
-        _load_with_scheduler(
-            store, admitted.run_id, historical_projection=True
-        )
+        _load_with_scheduler(store, admitted.run_id, historical_projection=True)
 
     assert exc.value.code == "workflow_snapshot_integrity_mismatch"
 
@@ -1952,9 +1932,7 @@ def test_pre_language_snapshot_rejects_altered_package_resource(
     sealed_command.write_text("Execute forged instructions.\n", encoding="utf-8")
 
     with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
-        _load_with_scheduler(
-            store, admitted.run_id, historical_projection=True
-        )
+        _load_with_scheduler(store, admitted.run_id, historical_projection=True)
 
     assert exc.value.code == "workflow_snapshot_integrity_mismatch"
 
@@ -1984,9 +1962,7 @@ def test_unverifiable_pre_language_snapshot_requires_readmission(
     assert store.load_run(admitted.run_id)["snapshot_format_version"] == 1
 
     with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
-        _load_with_scheduler(
-            store, admitted.run_id, historical_projection=True
-        )
+        _load_with_scheduler(store, admitted.run_id, historical_projection=True)
 
     assert exc.value.code == "workflow_legacy_snapshot_unverifiable"
     assert "re-trust" in str(exc.value)
@@ -1998,9 +1974,7 @@ def test_pre_language_snapshot_rejects_ambiguous_reconstructed_identities(
 ):
     name = "ambiguous-legacy"
     package = load_workflow(
-        workflow_writer(
-            tmp_path / "package", name=name, filename=f"{name}.yaml"
-        )
+        workflow_writer(tmp_path / "package", name=name, filename=f"{name}.yaml")
     )
     store = RunStore(tmp_path / "home")
     prepared = _prepare_pre_language_snapshot(store, package)
@@ -2024,9 +1998,7 @@ def test_pre_language_snapshot_rejects_ambiguous_reconstructed_identities(
     )
 
     with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
-        _load_with_scheduler(
-            store, admitted.run_id, historical_projection=True
-        )
+        _load_with_scheduler(store, admitted.run_id, historical_projection=True)
 
     assert exc.value.code == "workflow_legacy_snapshot_unverifiable"
 
@@ -2065,9 +2037,7 @@ def test_pre_language_legacy_snapshot_rejects_executable_shadow(
     )
 
     with pytest.raises(WorkflowLanguageCompatibilityError) as exc:
-        _load_with_scheduler(
-            store, admitted.run_id, historical_projection=True
-        )
+        _load_with_scheduler(store, admitted.run_id, historical_projection=True)
 
     assert exc.value.code == "workflow_snapshot_integrity_mismatch"
 
@@ -2219,9 +2189,7 @@ def test_archon_snapshot_without_language_metadata_fails_closed(
             "workflow_normalizer_version_unsupported",
         ),
         (
-            lambda value: value.__setitem__(
-                "normalized_definition_digest", "A" * 64
-            ),
+            lambda value: value.__setitem__("normalized_definition_digest", "A" * 64),
             "workflow_language_snapshot_invalid",
         ),
     ],
