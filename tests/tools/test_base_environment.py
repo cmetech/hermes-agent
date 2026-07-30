@@ -1199,6 +1199,63 @@ trap __hermes_debug_attack DEBUG
         assert not user_effect.exists()
         assert env._session_mode == "degraded_nonlogin"
 
+    @pytest.mark.parametrize("snapshot_exit", [124, 130])
+    def test_snapshot_setup_exit_uses_guard_failure_not_external_stop(
+        self, tmp_path, snapshot_exit
+    ):
+        """A snapshot can choose public timeout/interrupt-looking statuses.
+
+        Exiting while the snapshot is sourced happens before Hermes' guard
+        attestation and is a setup failure, not proof that the process waiter
+        performed an external timeout or interrupt.
+        """
+        user_effect = tmp_path / "must-not-run"
+        env = _ready_local_env(tmp_path, f"exit {snapshot_exit}\n")
+        try:
+            result = env.execute(f"touch {user_effect}")
+
+            assert result["returncode"] == 125
+            assert "source or sanitizer guard" in result["output"]
+            assert not user_effect.exists()
+            assert env._session_mode == "degraded_nonlogin"
+            assert env._snapshot_ready is False
+        finally:
+            env.cleanup()
+
+    def test_real_waiter_interrupt_preserves_ready_snapshot_and_private_state(
+        self, tmp_path
+    ):
+        from tools.interrupt import set_interrupt
+
+        env = _ready_local_env(tmp_path, "export PROFILE_SENTINEL=loaded\n")
+        try:
+            set_interrupt(True)
+            result = env.execute("sleep 1")
+
+            assert result["returncode"] == 130
+            assert "[Command interrupted]" in result["output"]
+            assert set(result) == {"output", "returncode"}
+            assert env._session_mode == "snapshot"
+            assert env._snapshot_ready is True
+        finally:
+            set_interrupt(False)
+            env.cleanup()
+
+    def test_real_waiter_timeout_preserves_ready_snapshot_and_private_state(
+        self, tmp_path
+    ):
+        env = _ready_local_env(tmp_path, "export PROFILE_SENTINEL=loaded\n")
+        try:
+            result = env.execute("sleep 1", timeout=0.01)
+
+            assert result["returncode"] == 124
+            assert "[Command timed out" in result["output"]
+            assert set(result) == {"output", "returncode"}
+            assert env._session_mode == "snapshot"
+            assert env._snapshot_ready is True
+        finally:
+            env.cleanup()
+
     def test_normal_profile_snapshot_preserves_env_functions_cd_and_tilde_cwd(
         self, tmp_path
     ):

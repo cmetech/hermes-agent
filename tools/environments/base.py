@@ -1065,10 +1065,19 @@ class BaseEnvironment(ABC):
             if sentinel_filter is not None:
                 output.append(sentinel_filter.finish())
 
-        def _result(rendered: str, returncode: int) -> dict:
+        def _result(
+            rendered: str,
+            returncode: int,
+            *,
+            externally_stopped: bool = False,
+        ) -> dict:
             result = {"output": rendered, "returncode": returncode}
             if sentinel_filter is not None:
                 result["control_seen"] = sentinel_filter.seen
+            if externally_stopped:
+                # Private waiter provenance. ``execute`` consumes this before
+                # returning so callers never see an internal control field.
+                result["_hermes_externally_stopped"] = True
             return result
 
         # Non-blocking drain via select().
@@ -1240,7 +1249,9 @@ class BaseEnvironment(ABC):
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
                     return _result(
-                        output.render(suffix="\n[Command interrupted]"), 130
+                        output.render(suffix="\n[Command interrupted]"),
+                        130,
+                        externally_stopped=True,
                     )
                 if time.monotonic() > deadline:
                     if _DEBUG_INTERRUPT:
@@ -1257,6 +1268,7 @@ class BaseEnvironment(ABC):
                         if output.total_chars == 0
                         else output.render(suffix=timeout_msg),
                         124,
+                        externally_stopped=True,
                     )
                 # Periodic activity touch so the gateway knows we're alive
                 touch_activity_if_due(_activity_state, "terminal command running")
@@ -1476,15 +1488,15 @@ class BaseEnvironment(ABC):
             control_sentinel=guard_passed_sentinel or None,
         )
         guard_seen = bool(result.pop("control_seen", False))
+        externally_stopped = bool(
+            result.pop("_hermes_externally_stopped", False)
+        )
         self._update_cwd(result)
 
-        # A missing attestation means guard failure only when the process
-        # completed normally enough to report its own status. The waiter uses
-        # 124/130 for an external timeout/interrupt that can kill the shell
-        # before it emits the pre-command sentinel; preserve that lifecycle
-        # result and the still-valid snapshot instead of relabeling it 125 and
-        # degrading the session.
-        externally_stopped = result.get("returncode") in {124, 130}
+        # A missing attestation means guard failure unless the process waiter
+        # itself recorded an external timeout/interrupt. Public status 124/130
+        # is not provenance: a hostile/broken snapshot can exit with either
+        # status during setup before the user's command starts.
         if was_snapshot and not guard_seen and not externally_stopped:
             diagnostic = (
                 "Session snapshot failed its source or sanitizer guard, or cwd setup; "
