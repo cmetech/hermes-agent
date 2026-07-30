@@ -48,6 +48,12 @@ from plugins.workflow.models import (
     WorkflowPackage,
     WorkflowRuntimeConfig,
 )
+from plugins.workflow.output_resolution import (
+    ArchonOutputIntegrityError,
+    ResolvedNodeOutput,
+    resolve_legacy_output_values,
+    resolve_node_output,
+)
 from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.schema import is_inline_script, load_workflow_snapshot
 from plugins.workflow.sessions import NodeSessionRegistry
@@ -252,6 +258,10 @@ def _output_value(outputs: Mapping[str, object], node_id: str, path: str) -> obj
     if node_id not in outputs:
         raise ConditionEvaluationError(f"missing output for {node_id}")
     value = outputs[node_id]
+    if isinstance(value, ResolvedNodeOutput):
+        # Phase 2 deliberately retains current coercion, missing-field, and
+        # comparison behavior; Phase 3 replaces this compatibility adapter.
+        value = value.value
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -521,21 +531,72 @@ class RunScheduler:
     def _output_values(
         self, projection: Mapping[str, object], run_directory: Path
     ) -> dict[str, object]:
+        snapshot = read_language_snapshot(projection.get("language"))
+        if (
+            snapshot is None
+            or snapshot.effective_profile is WorkflowLanguageProfile.HERMES_LEGACY
+        ):
+            return resolve_legacy_output_values(
+                projection,
+                run_directory,
+                read_text=self._read_text,
+            )
+
+        artifacts = projection.get("artifacts", [])
+        nodes = projection.get("nodes", {})
+        if not isinstance(artifacts, list) or not isinstance(nodes, Mapping):
+            return {}
         outputs: dict[str, object] = {}
-        for artifact in projection.get("artifacts", []):
-            if not isinstance(artifact, dict):
+        for node_id, node_state in nodes.items():
+            if not isinstance(node_id, str) or not isinstance(node_state, Mapping):
                 continue
-            relative = str(artifact.get("relative_path", ""))
-            if not Path(relative).name.startswith(("output.", "stdout.")):
+            attempts = node_state.get("attempts", [])
+            winning_attempt = next(
+                (
+                    attempt.get("attempt_id")
+                    for attempt in reversed(attempts)
+                    if isinstance(attempt, Mapping)
+                    and attempt.get("state") == "succeeded"
+                    and isinstance(attempt.get("attempt_id"), str)
+                ),
+                None,
+            )
+            if winning_attempt is None:
                 continue
-            node_id = str(artifact.get("node_id", ""))
+            candidates = [
+                artifact
+                for artifact in artifacts
+                if isinstance(artifact, dict)
+                and artifact.get("node_id") == node_id
+                and artifact.get("attempt_id") == winning_attempt
+                and Path(str(artifact.get("relative_path", ""))).name.startswith(
+                    ("output.", "stdout.")
+                )
+            ]
+            canonical = [
+                artifact
+                for artifact in candidates
+                if Path(str(artifact.get("relative_path", ""))).name.startswith(
+                    "output."
+                )
+            ]
+            descriptor = (canonical or candidates)[-1] if candidates else None
+            if descriptor is None:
+                continue
+            publication_id = descriptor.get("publication_id")
             try:
-                text = self._read_text(run_directory / relative)
-                try:
-                    outputs[node_id] = json.loads(text)
-                except json.JSONDecodeError:
-                    outputs[node_id] = text
-            except (OSError, UnicodeError, ValueError):
+                outputs[node_id] = resolve_node_output(
+                    run_directory=run_directory,
+                    node_id=node_id,
+                    attempt_id=winning_attempt,
+                    descriptor=descriptor,
+                    publication_id=(
+                        publication_id if isinstance(publication_id, str) else None
+                    ),
+                )
+            except ArchonOutputIntegrityError:
+                # Preserve Phase 2 missing-output outcomes. Phase 3 makes
+                # integrity and missing references strict at the consumer.
                 continue
         return outputs
 
@@ -571,7 +632,9 @@ class RunScheduler:
                         run_directory / entry["relative_path"]
                     )
         outputs = {
-            node: value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+            node: value
+            if isinstance(value, str | ResolvedNodeOutput)
+            else json.dumps(value, sort_keys=True)
             for node, value in self._output_values(projection, run_directory).items()
         }
         return VariableContext(
@@ -583,6 +646,38 @@ class RunScheduler:
             docs_dir=run_directory / "docs",
             node_outputs=outputs,
         )
+
+    @staticmethod
+    def _predecessor_results(
+        projection: Mapping[str, object],
+        dependencies: Iterable[str],
+        outputs: Mapping[str, object],
+    ) -> dict[str, dict[str, object]]:
+        results: dict[str, dict[str, object]] = {}
+        nodes = projection.get("nodes", {})
+        if not isinstance(nodes, Mapping):
+            return results
+        for dependency in dependencies:
+            state = nodes.get(dependency)
+            if not isinstance(state, Mapping):
+                continue
+            evidence = {
+                field: state[field]
+                for field in ("session_id", "cache_fingerprint")
+                if field in state
+            }
+            output = outputs.get(dependency)
+            if isinstance(output, ResolvedNodeOutput):
+                evidence["output_evidence"] = MappingProxyType({
+                    "media_type": output.media_type,
+                    "size_bytes": len(output.canonical_bytes),
+                    "sha256": output.sha256,
+                    "node_id": output.node_id,
+                    "attempt_id": output.attempt_id,
+                    "publication_id": output.publication_id,
+                })
+            results[dependency] = evidence
+        return results
 
     def _cancelled(self, run_id: str) -> bool:
         if self._shutdown.is_set():
@@ -1861,14 +1956,11 @@ class RunScheduler:
                             workflow_name=package.definition.name,
                             workflow_options=package.definition.options,
                             variable_context=variables,
-                            predecessor_results={
-                                dependency: {
-                                    field: projection["nodes"][dependency][field]
-                                    for field in ("session_id", "cache_fingerprint")
-                                    if field in projection["nodes"][dependency]
-                                }
-                                for dependency in node.depends_on
-                            },
+                            predecessor_results=self._predecessor_results(
+                                projection,
+                                node.depends_on,
+                                variables.node_outputs,
+                            ),
                             node_state=node_state,
                             operator_scope=str(
                                 projection.get("operator_scope_digest") or "local"

@@ -18,6 +18,8 @@ from typing import Iterable, Mapping
 
 import yaml
 
+from plugins.workflow.output_resolution import ResolvedNodeOutput
+
 
 _COMMAND_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _AUTHORITY_DESCRIPTOR_KEY = "__hermes_authenticated_local_mcp"
@@ -561,7 +563,7 @@ class VariableContext:
     loop_user_input: str = ""
     loop_prev_output: str = ""
     rejection_reason: str = ""
-    node_outputs: Mapping[str, str] = field(default_factory=dict)
+    node_outputs: Mapping[str, str | ResolvedNodeOutput] = field(default_factory=dict)
 
     def _value(self, match: re.Match[str]) -> str | None:
         position = match.group("position")
@@ -579,13 +581,20 @@ class VariableContext:
                 return ""
             dot = match.group("dot")
             if not dot:
-                return raw
+                return raw.text if isinstance(raw, ResolvedNodeOutput) else raw
             try:
-                value: object = json.loads(raw)
+                # Phase 2 keeps the legacy string adapter below. Archon values
+                # arrive already parsed so prompt and shell consumers never
+                # independently reinterpret provider text.
+                value: object = (
+                    raw.value
+                    if isinstance(raw, ResolvedNodeOutput)
+                    else json.loads(raw)
+                )
                 for part in dot.split("."):
-                    if isinstance(value, dict):
+                    if isinstance(value, Mapping):
                         value = value[part]
-                    elif isinstance(value, list) and part.isdigit():
+                    elif isinstance(value, tuple | list) and part.isdigit():
                         value = value[int(part)]
                     else:
                         return ""

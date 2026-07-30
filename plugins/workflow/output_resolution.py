@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping
+from typing import Callable, Mapping
 
 
 _HAS_DESCRIPTOR_RELATIVE_IO = (
@@ -176,8 +177,141 @@ class PrimaryOutputCandidate:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedNodeOutput:
+    """One immutable downstream view of a winning node output."""
+
+    canonical_bytes: bytes
+    value: object
+    text: str
+    media_type: str
+    sha256: str
+    node_id: str
+    attempt_id: str
+    publication_id: str | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", _freeze_json(self.value))
+
+
+def resolve_node_output(
+    *,
+    run_directory: Path,
+    node_id: str,
+    attempt_id: str,
+    descriptor: Mapping[str, object],
+    candidate: PrimaryOutputCandidate | None = None,
+    publication_id: str | None = None,
+) -> ResolvedNodeOutput:
+    """Resolve one descriptor without consulting raw provider response text."""
+    relative_path = descriptor.get("relative_path")
+    media_type = descriptor.get("media_type")
+    size_bytes = descriptor.get("size_bytes")
+    digest = descriptor.get("sha256")
+    if (
+        descriptor.get("node_id") != node_id
+        or descriptor.get("attempt_id") != attempt_id
+        or not isinstance(relative_path, str)
+        or not relative_path
+        or not isinstance(media_type, str)
+        or isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or size_bytes < 0
+        or size_bytes > 500_000
+        or not isinstance(digest, str)
+        or len(digest) != 64
+    ):
+        raise ArchonOutputIntegrityError("Archon output descriptor is invalid")
+    if candidate is not None and (
+        candidate.attempt_relative_path != relative_path
+        or candidate.media_type != media_type
+        or candidate.size_bytes != size_bytes
+        or candidate.sha256 != digest
+    ):
+        raise ArchonOutputIntegrityError(
+            "Archon output candidate and descriptor disagree"
+        )
+    root = run_directory.resolve()
+    path = run_directory / relative_path
+    try:
+        if path.is_symlink():
+            raise ArchonOutputIntegrityError("Archon output path is not regular")
+        resolved_path = path.resolve(strict=True)
+        resolved_path.relative_to(root)
+        observed = resolved_path.stat()
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise ArchonOutputIntegrityError("Archon output path is not regular")
+        canonical_bytes = resolved_path.read_bytes()
+    except ArchonOutputIntegrityError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise ArchonOutputIntegrityError("Archon output could not be read") from exc
+    if (
+        len(canonical_bytes) != size_bytes
+        or hashlib.sha256(canonical_bytes).hexdigest() != digest
+    ):
+        raise ArchonOutputIntegrityError("Archon output digest does not match")
+    try:
+        text = canonical_bytes.decode("utf-8")
+    except UnicodeError as exc:
+        raise ArchonOutputIntegrityError("Archon output is not UTF-8") from exc
+    if candidate is not None and candidate.structured_value is not None:
+        value = candidate.structured_value
+    else:
+        try:
+            # Phase 2 retains the legacy JSON-looking text adapter for shell,
+            # script, and schemaless outputs. Phase 3 may make media/type
+            # interpretation strict without changing the canonical bytes.
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            if media_type == "application/json":
+                raise ArchonOutputIntegrityError(
+                    "Archon JSON output is invalid"
+                ) from exc
+            value = text
+    return ResolvedNodeOutput(
+        canonical_bytes=canonical_bytes,
+        value=value,
+        text=text,
+        media_type=media_type,
+        sha256=digest,
+        node_id=node_id,
+        attempt_id=attempt_id,
+        publication_id=publication_id,
+    )
+
+
+def resolve_legacy_output_values(
+    projection: Mapping[str, object],
+    run_directory: Path,
+    *,
+    read_text: Callable[[Path], str],
+) -> dict[str, object]:
+    """Run the frozen Hermes artifact scan and text/JSON parsing behavior."""
+    outputs: dict[str, object] = {}
+    for artifact in projection.get("artifacts", []):
+        if not isinstance(artifact, dict):
+            continue
+        relative = str(artifact.get("relative_path", ""))
+        if not Path(relative).name.startswith(("output.", "stdout.")):
+            continue
+        node_id = str(artifact.get("node_id", ""))
+        try:
+            text = read_text(run_directory / relative)
+            try:
+                outputs[node_id] = json.loads(text)
+            except json.JSONDecodeError:
+                outputs[node_id] = text
+        except (OSError, UnicodeError, ValueError):
+            continue
+    return outputs
+
+
 __all__ = [
     "ArchonOutputIntegrityError",
     "PrimaryOutputCandidate",
+    "ResolvedNodeOutput",
+    "resolve_legacy_output_values",
+    "resolve_node_output",
     "write_archon_output_exclusive",
 ]

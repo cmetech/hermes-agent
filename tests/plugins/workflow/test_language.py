@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,8 @@ from plugins.workflow.models import (
     WorkflowNode,
     freeze_value,
 )
+from plugins.workflow.output_resolution import ResolvedNodeOutput
+from plugins.workflow.scheduler import ConditionEvaluationError, evaluate_condition
 from plugins.workflow.schema import load_workflow
 
 
@@ -118,6 +121,30 @@ def test_legacy_structured_output_findings_remain_unchanged(workflow_writer, tmp
         "legacy_output_format_post_validation",
         "legacy_output_type_not_published",
     }
+
+
+def test_phase2_resolved_output_keeps_condition_compatibility_adapters():
+    canonical = b'{"count":"2","flag":"yes"}'
+    output = ResolvedNodeOutput(
+        canonical_bytes=canonical,
+        value={"count": "2", "flag": "yes"},
+        text=canonical.decode("utf-8"),
+        media_type="application/json",
+        sha256=hashlib.sha256(canonical).hexdigest(),
+        node_id="collect",
+        attempt_id="attempt-winner",
+        publication_id=None,
+    )
+    outputs = {"collect": output}
+
+    assert not evaluate_condition("$collect.output.count == 2", outputs)
+    assert evaluate_condition(
+        "$collect.output.flag == 'yes' || "
+        "$collect.output.count == 1 && $collect.output.count == 0",
+        outputs,
+    )
+    with pytest.raises(ConditionEvaluationError, match="missing output path"):
+        evaluate_condition("$collect.output.missing == 'x'", outputs)
 
 
 def test_unknown_normalizer_version_fails_closed(definition):
