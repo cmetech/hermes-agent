@@ -7,7 +7,9 @@ import errno
 import hashlib
 import json
 import multiprocessing
+import sys
 import threading
+from types import MappingProxyType
 
 import pytest
 
@@ -465,6 +467,86 @@ def test_archon_transient_read_failure_is_retried_for_the_same_identity(
     assert attempts >= 2
 
 
+def test_archon_missing_completed_output_is_stable_for_descriptor_identity(tmp_path):
+    canonical = b'{"ok":true}'
+    digest = hashlib.sha256(canonical).hexdigest()
+    projection = {
+        "run_id": "run-1",
+        "language": {
+            "effective_profile": "archon-2026-07",
+            "normalizer_version": 2,
+            "normalized_definition_digest": "1" * 64,
+            "semantic_fingerprint": "2" * 64,
+            "structured_outputs": {},
+        },
+        "nodes": {
+            "collect": {
+                "type": "bash",
+                "attempts": [{
+                    "attempt_id": "attempt-winner",
+                    "state": "succeeded",
+                }],
+            }
+        },
+        "artifacts": [{
+            "node_id": "collect",
+            "attempt_id": "attempt-winner",
+            "relative_path": "output.json",
+            "media_type": "application/json",
+            "size_bytes": len(canonical),
+            "sha256": digest,
+        }],
+    }
+    scheduler = RunScheduler.__new__(RunScheduler)
+
+    first = scheduler._output_values(projection, tmp_path)
+    (tmp_path / "output.json").write_bytes(canonical)
+    second = scheduler._output_values(projection, tmp_path)
+
+    assert first == second == {}
+
+
+@pytest.mark.parametrize("relative_path", ("output.json\0", "./output.json"))
+def test_archon_invalid_descriptor_path_is_a_stable_missing_output(
+    tmp_path, relative_path
+):
+    canonical = b'{"ok":true}'
+    (tmp_path / "output.json").write_bytes(canonical)
+    projection = {
+        "run_id": "run-1",
+        "language": {
+            "effective_profile": "archon-2026-07",
+            "normalizer_version": 2,
+            "normalized_definition_digest": "1" * 64,
+            "semantic_fingerprint": "2" * 64,
+            "structured_outputs": {},
+        },
+        "nodes": {
+            "collect": {
+                "type": "bash",
+                "attempts": [{
+                    "attempt_id": "attempt-winner",
+                    "state": "succeeded",
+                }],
+            }
+        },
+        "artifacts": [{
+            "node_id": "collect",
+            "attempt_id": "attempt-winner",
+            "relative_path": relative_path,
+            "media_type": "application/json",
+            "size_bytes": len(canonical),
+            "sha256": hashlib.sha256(canonical).hexdigest(),
+        }],
+    }
+    scheduler = RunScheduler.__new__(RunScheduler)
+
+    first = scheduler._output_values(projection, tmp_path)
+    second = scheduler._output_values(projection, tmp_path)
+
+    assert first == second == {}
+
+
 def test_archon_resolution_failure_is_stable_for_one_descriptor_identity(tmp_path):
     canonical = b'{"ok":true}'
     output = tmp_path / "output.json"
@@ -622,6 +704,57 @@ def test_resolved_output_cache_uses_a_shared_byte_weighted_lru(tmp_path):
     )
     assert scheduler._output_values(entries["a"][2], tmp_path)["a"] is first
     assert scheduler._output_values(entries["b"][2], tmp_path) == {}
+
+
+def test_resolved_output_cache_does_not_retain_overweight_proxy_graph(tmp_path):
+    item_count = 2_048
+    canonical = ("[" + ",".join("{}" for _ in range(item_count)) + "]").encode()
+    output = tmp_path / "output.json"
+    output.write_bytes(canonical)
+    projection = {
+        "run_id": "run-1",
+        "language": {
+            "effective_profile": "archon-2026-07",
+            "normalizer_version": 2,
+            "normalized_definition_digest": "1" * 64,
+            "semantic_fingerprint": "2" * 64,
+            "structured_outputs": {},
+        },
+        "nodes": {
+            "collect": {
+                "type": "bash",
+                "attempts": [{
+                    "attempt_id": "attempt-winner",
+                    "state": "succeeded",
+                }],
+            }
+        },
+        "artifacts": [{
+            "node_id": "collect",
+            "attempt_id": "attempt-winner",
+            "relative_path": "output.json",
+            "media_type": "application/json",
+            "size_bytes": len(canonical),
+            "sha256": hashlib.sha256(canonical).hexdigest(),
+        }],
+    }
+    # Deliberately incomplete retained-size lower bound: body bytes + text,
+    # tuple storage, and each proxy plus an equivalent empty backing dict.
+    retained_lower_bound = (
+        len(canonical) * 2
+        + sys.getsizeof(tuple(None for _ in range(item_count)))
+        + item_count
+        * (sys.getsizeof(MappingProxyType({})) + sys.getsizeof({}))
+    )
+    scheduler = RunScheduler.__new__(RunScheduler)
+    scheduler._ensure_output_resolution_state()
+    scheduler._output_resolution_cache_max_bytes = retained_lower_bound - 1
+
+    resolved = scheduler._output_values(projection, tmp_path)["collect"]
+
+    assert len(resolved.value) == item_count
+    assert scheduler._resolved_output_cache == {}
+    assert scheduler._output_resolution_cache_bytes == 0
 
 
 def test_candidate_registration_is_linearized_with_durable_completion(tmp_path):

@@ -16,6 +16,7 @@ import os
 from pathlib import Path, PurePosixPath
 import random
 import re
+import sys
 import threading
 import time
 import uuid
@@ -85,7 +86,9 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LEGACY_PACKAGE_PATHS = 4096
 _LEGACY_PACKAGE_PATH_CHARS = 512
 _OUTPUT_RESOLUTION_CACHE_MAX_BYTES = 16 * 1024 * 1024
-_OUTPUT_CACHE_ENTRY_OVERHEAD = 512
+# Conservatively covers cache-table slots, the OrderedDict node, the LRU
+# composite key, the stored weight integer, and allocator slack.
+_OUTPUT_CACHE_ENTRY_OVERHEAD = 1024
 _OUTPUT_CACHE_MISS = object()
 _LEGACY_NON_PACKAGE_FILES = frozenset(
     {
@@ -103,31 +106,34 @@ _LEGACY_NON_PACKAGE_ROOTS = frozenset(
 
 
 def _cache_text_weight(value: str) -> int:
-    return 49 + len(value.encode("utf-8"))
+    return sys.getsizeof(value)
 
 
-def _cache_value_weight(value: object) -> int:
+def _cache_value_weight(value: object, seen: set[int] | None = None) -> int:
     """Conservatively estimate retained immutable JSON memory."""
-    if value is None or isinstance(value, bool):
-        return 16
-    if isinstance(value, int | float):
-        return 32
-    if isinstance(value, str):
-        return _cache_text_weight(value)
-    if isinstance(value, bytes):
-        return 33 + len(value)
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return 0
+    seen.add(identity)
+    weight = sys.getsizeof(value)
     if isinstance(value, Mapping):
-        return 64 + sum(
-            _cache_text_weight(str(key)) + _cache_value_weight(item) + 16
+        if isinstance(value, MappingProxyType):
+            # The proxy retains a separate, otherwise invisible backing dict.
+            # A shallow copy exposes equivalent table allocation/capacity.
+            weight += sys.getsizeof(dict(value))
+        return weight + sum(
+            _cache_value_weight(key, seen) + _cache_value_weight(item, seen)
             for key, item in value.items()
         )
     if isinstance(value, tuple | list):
-        return 56 + sum(_cache_value_weight(item) + 8 for item in value)
-    return 128
+        return weight + sum(_cache_value_weight(item, seen) for item in value)
+    return weight
 
 
 def _cache_key_weight(key: tuple[object, ...]) -> int:
-    return 64 + sum(_cache_value_weight(item) for item in key)
+    return _cache_value_weight(key)
 
 
 def _resolved_output_weight(
@@ -138,8 +144,9 @@ def _resolved_output_weight(
         return weight
     return (
         weight
-        + len(value.canonical_bytes)
-        + len(value.text.encode("utf-8"))
+        + sys.getsizeof(value)
+        + sys.getsizeof(value.canonical_bytes)
+        + _cache_text_weight(value.text)
         + _cache_value_weight(value.value)
     )
 
@@ -150,6 +157,7 @@ def _primary_candidate_weight(
     return (
         _OUTPUT_CACHE_ENTRY_OVERHEAD
         + _cache_key_weight(key)
+        + sys.getsizeof(candidate)
         + candidate.size_bytes
         + _cache_value_weight(candidate.structured_value)
         + _cache_text_weight(candidate.attempt_relative_path)

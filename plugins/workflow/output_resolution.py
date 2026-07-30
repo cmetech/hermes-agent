@@ -24,6 +24,14 @@ _HAS_DESCRIPTOR_RELATIVE_IO = (
 )
 PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY = "primary_output_candidate"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_RETRYABLE_READ_ERRNOS = frozenset({
+    errno.EAGAIN,
+    errno.EINTR,
+    errno.EIO,
+    errno.EMFILE,
+    errno.ENFILE,
+    getattr(errno, "ESTALE", -1),
+})
 _PRIMARY_OUTPUT_CANDIDATE_FIELDS = frozenset({
     "attempt_relative_path",
     "media_type",
@@ -41,6 +49,26 @@ class ArchonOutputIntegrityError(RuntimeError):
 
 class ArchonOutputUnavailableError(RuntimeError):
     """An attempt-local output could not be read due to transient host I/O."""
+
+
+def _canonical_relative_path(value: object) -> PurePosixPath | None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 1024
+        or "\0" in value
+        or "\\" in value
+    ):
+        return None
+    relative = PurePosixPath(value)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or ".." in relative.parts
+        or relative.as_posix() != value
+    ):
+        return None
+    return relative
 
 
 def _safe_component(kind: str, value: str) -> str:
@@ -174,13 +202,8 @@ def _read_descriptor_relative(
     size_bytes: int,
 ) -> bytes:
     """Read one bounded file through a no-follow descriptor chain."""
-    relative = PurePosixPath(relative_path)
-    if (
-        relative.is_absolute()
-        or not relative.parts
-        or ".." in relative.parts
-        or "\\" in relative_path
-    ):
+    relative = _canonical_relative_path(relative_path)
+    if relative is None:
         raise ArchonOutputIntegrityError("Archon output path is invalid")
     if not _HAS_DESCRIPTOR_RELATIVE_IO:
         raise ArchonOutputIntegrityError(
@@ -215,13 +238,15 @@ def _read_descriptor_relative(
         return b"".join(chunks)
     except ArchonOutputIntegrityError:
         raise
+    except ValueError as exc:
+        raise ArchonOutputIntegrityError("Archon output path is invalid") from exc
     except OSError as exc:
-        if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}:
-            raise ArchonOutputIntegrityError(
-                "Archon output path is not regular"
+        if exc.errno in _RETRYABLE_READ_ERRNOS:
+            raise ArchonOutputUnavailableError(
+                "Archon output is temporarily unavailable"
             ) from exc
-        raise ArchonOutputUnavailableError(
-            "Archon output is temporarily unavailable"
+        raise ArchonOutputIntegrityError(
+            "Archon output path is not regular"
         ) from exc
     finally:
         if output_descriptor is not None:
@@ -309,14 +334,9 @@ def primary_output_candidate_from_identity(
     schema_fingerprint = value["schema_fingerprint"]
     canonicalization_version = value["canonicalization_version"]
     output_type = value["output_type"]
-    relative = PurePosixPath(relative_path) if isinstance(relative_path, str) else None
+    relative = _canonical_relative_path(relative_path)
     if (
         relative is None
-        or not relative_path
-        or len(relative_path) > 1024
-        or relative.is_absolute()
-        or ".." in relative.parts
-        or "\\" in relative_path
         or not isinstance(media_type, str)
         or not media_type
         or len(media_type) > 128
@@ -388,11 +408,11 @@ def resolve_node_output(
     media_type = descriptor.get("media_type")
     size_bytes = descriptor.get("size_bytes")
     digest = descriptor.get("sha256")
+    relative = _canonical_relative_path(relative_path)
     if (
         descriptor.get("node_id") != node_id
         or descriptor.get("attempt_id") != attempt_id
-        or not isinstance(relative_path, str)
-        or not relative_path
+        or relative is None
         or not isinstance(media_type, str)
         or isinstance(size_bytes, bool)
         or not isinstance(size_bytes, int)

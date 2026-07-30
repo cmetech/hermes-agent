@@ -190,6 +190,34 @@ def test_primary_output_candidate_identity_preserves_open_output_type_boundary()
 
 
 @pytest.mark.parametrize(
+    "relative_path",
+    (
+        "output.json\0",
+        "./output.json",
+        "nodes//output.json",
+        "nodes/./output.json",
+        "nodes/output.json/",
+    ),
+)
+def test_primary_output_candidate_rejects_noncanonical_paths(relative_path):
+    identity = {
+        "attempt_relative_path": relative_path,
+        "media_type": "application/json",
+        "size_bytes": 2,
+        "sha256": hashlib.sha256(b"{}").hexdigest(),
+        "schema_fingerprint": None,
+        "canonicalization_version": 1,
+        "output_type": None,
+    }
+
+    with pytest.raises(
+        output_resolution.ArchonOutputIntegrityError,
+        match="candidate identity is invalid",
+    ):
+        output_resolution.primary_output_candidate_from_identity(identity)
+
+
+@pytest.mark.parametrize(
     "output_type", (object(), 42, "", " \t ", "x" * 16_385)
 )
 def test_primary_output_candidate_identity_rejects_invalid_or_oversized_output_type(
