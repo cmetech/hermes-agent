@@ -10,8 +10,10 @@ Authoring is aligned to that boundary in `4d42af019`
 (`fix(workflow): bound output type metadata`). Cache, read, and completion
 hardening is in `cd520e993`
 (`fix(workflow): harden resolved output caching`), with boundary validation in
-`59306c605` (`fix(workflow): validate resolved output boundaries`). Archon
-downstream consumers now resolve the successful attempt's canonical
+`59306c605` (`fix(workflow): validate resolved output boundaries`) and owned
+candidate normalization in `660cdf1b7`
+(`fix(workflow): normalize cached output ownership`). Archon downstream
+consumers now resolve the successful attempt's canonical
 `output.*` descriptor once into a frozen `ResolvedNodeOutput`. The resolver
 verifies containment,
 regular-file identity, byte size, SHA-256, UTF-8, candidate/descriptor agreement,
@@ -209,6 +211,28 @@ Three additional boundary regressions were driven from RED to GREEN:
 
 The focused scheduler/resource/AI E2E suite passed 60/60 after these changes.
 
+### Quality fix round 3 RED/GREEN
+
+Two final ownership and host-resource regressions were driven from RED to GREEN:
+
+- A tuple of 128 `MappingProxyType` views over a grown-then-pop-emptied backing
+  dict retained that external allocation by identity, escaped the compact-dict
+  weight estimate, and reflected later external mutation. The candidate trust
+  boundary now recursively rebuilds every mapping and sequence into fresh owned
+  compact containers, including mappings nested in tuples. Shared mappings
+  reuse only their owned normalized proxy; active graph identities reject
+  cycles. Non-string keys, arbitrary objects, sets, and non-finite numbers are
+  rejected as non-JSON with a bounded integrity error. Resolved output preserves
+  the resulting normalized candidate identity without another copy. The test
+  independently measures the owned graph and verifies its cache charge covers
+  that graph while remaining below the shared cache budget.
+- A fail-once `ENOMEM` read was incorrectly negative-cached even though a second
+  read succeeded. `ENOMEM` now joins the narrow retryable host-resource errno
+  allow-list. Both injected `EIO` and `ENOMEM` retry successfully, while the
+  stable `ENOENT` control remains negative-cached.
+
+The focused scheduler/resource/AI E2E suite passed 67/67 after these changes.
+
 ## Consumer invariants
 
 - Successful-attempt identity wins; failed/losing attempts cannot supply a
@@ -247,7 +271,7 @@ Exact required suite:
 scripts/run_tests.sh tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_language.py tests/plugins/workflow/test_bash_e2e.py tests/plugins/workflow/test_script_executor.py
 ```
 
-Fresh result after quality fix round 2: 5 files, 91 passed, 0 failed.
+Fresh result after quality fix round 3: 5 files, 98 passed, 0 failed.
 
 Focused cache/read/completion suite:
 
@@ -255,7 +279,7 @@ Focused cache/read/completion suite:
 scripts/run_tests.sh tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_ai_e2e.py -q
 ```
 
-Result: 3 files, 60 passed, 0 failed.
+Result: 3 files, 67 passed, 0 failed.
 
 Adjacent Archon/condition/shared-context suite:
 
@@ -268,7 +292,7 @@ Result: 3 files, 116 passed, 0 failed.
 Static verification:
 
 ```text
-.venv/bin/ruff check plugins/workflow/output_resolution.py plugins/workflow/scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_scheduler.py
+.venv/bin/ruff check plugins/workflow/output_resolution.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_scheduler.py
 git diff --check
 ```
 
