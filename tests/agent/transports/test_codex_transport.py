@@ -361,6 +361,94 @@ class TestCodexBuildKwargs:
         assert preflight["extra_body"] == {"trace_id": "keep-me"}
 
     @pytest.mark.parametrize(
+        "nested_verbosity",
+        [[], {}, True, 1, None, "ultra"],
+        ids=["list", "dict", "bool", "int", "none", "wrong-string"],
+    )
+    def test_structured_request_discards_malformed_nested_verbosity(
+        self, transport, nested_verbosity
+    ):
+        extra_body = {
+            "text": {
+                "verbosity": nested_verbosity,
+                "format": {"type": "json_object"},
+            },
+            "trace_id": "keep-me",
+        }
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            request_overrides={
+                "text": {"verbosity": "medium"},
+                "extra_body": extra_body,
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+            ),
+        )
+        preflight = transport.preflight_kwargs(kwargs)
+
+        assert kwargs["text"] == {"verbosity": "medium"}
+        assert kwargs["extra_body"] == {"trace_id": "keep-me"}
+        assert preflight["text"] == {"verbosity": "medium"}
+        assert preflight["extra_body"] == {"trace_id": "keep-me"}
+        assert extra_body == {
+            "text": {
+                "verbosity": nested_verbosity,
+                "format": {"type": "json_object"},
+            },
+            "trace_id": "keep-me",
+        }
+
+    @pytest.mark.parametrize("nested_verbosity", ["low", "medium", "high"])
+    def test_structured_request_promotes_only_valid_nested_verbosity_strings(
+        self, transport, nested_verbosity
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            request_overrides={
+                "text": {"verbosity": "medium"},
+                "extra_body": {
+                    "text": {"verbosity": nested_verbosity},
+                    "trace_id": "keep-me",
+                },
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+            ),
+        )
+        preflight = transport.preflight_kwargs(kwargs)
+
+        assert kwargs["text"] == {"verbosity": nested_verbosity}
+        assert kwargs["extra_body"] == {"trace_id": "keep-me"}
+        assert preflight["text"] == {"verbosity": nested_verbosity}
+        assert preflight["extra_body"] == {"trace_id": "keep-me"}
+
+    @pytest.mark.parametrize(
+        "nested_verbosity",
+        [[], {}, True, 1, None, "ultra"],
+        ids=["list", "dict", "bool", "int", "none", "wrong-string"],
+    )
+    def test_legacy_call_preserves_malformed_nested_verbosity(
+        self, transport, nested_verbosity
+    ):
+        extra_body = {
+            "text": {"verbosity": nested_verbosity},
+            "trace_id": "legacy",
+        }
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            request_overrides={"extra_body": extra_body},
+        )
+
+        assert kwargs["extra_body"] == extra_body
+
+    @pytest.mark.parametrize(
         "nested_text",
         [
             "malformed",

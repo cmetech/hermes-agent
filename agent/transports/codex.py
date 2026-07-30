@@ -90,7 +90,9 @@ def _reserve_structured_text_format(
     nested_text = reserved_extra_body.pop("text", None)
     if isinstance(nested_text, dict):
         nested_verbosity = nested_text.get("verbosity")
-        if nested_verbosity in {"low", "medium", "high"}:
+        if isinstance(nested_verbosity, str) and nested_verbosity in {
+            "low", "medium", "high"
+        }:
             existing_text = kwargs.get("text")
             promoted_text = (
                 dict(existing_text) if isinstance(existing_text, dict) else {}
