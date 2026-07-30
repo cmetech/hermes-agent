@@ -308,16 +308,20 @@ class TestGmiMainFlow:
     def test_chat_parser_accepts_gmi_provider(self, monkeypatch):
         recorded: dict[str, str] = {}
 
+        def fake_cmd_chat(args):
+            recorded["provider"] = args.provider
+            return 0
+
         monkeypatch.setattr("hermes_cli.config.get_container_exec_info", lambda: None)
         monkeypatch.setattr(
             "hermes_cli.main.cmd_chat",
-            lambda args: recorded.setdefault("provider", args.provider),
+            fake_cmd_chat,
         )
         monkeypatch.setattr(sys, "argv", ["hermes", "chat", "--provider", "gmi"])
 
         from hermes_cli.main import main
 
-        main()
+        assert main() == 0
 
         assert recorded["provider"] == "gmi"
 
