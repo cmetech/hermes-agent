@@ -51,6 +51,7 @@ _activity_callback_local = threading.local()
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
 _SNAPSHOT_GUARD_FAILURE_EXIT = 125
+_SNAPSHOT_GUARD_FAILURE_MARKER_PREFIX = "__HERMES_SNAPSHOT_GUARD_FAILURE_"
 
 
 # Bash resolves a function named ``builtin`` before ``\builtin``, including on
@@ -78,7 +79,7 @@ if \export -f builtin >/dev/null 2>&1 ||
 fi
 if [[ ${__hermes_snapshot_reject_dispatcher_functions:-0} == 1 &&
       $__hermes_snapshot_had_dispatcher_functions == 1 ]]; then
-    \exit 125
+    [[ 0 == 1 ]]
 fi &&
 if \unset -f builtin unset set; then
     if [[ $__hermes_snapshot_had_posixly_correct == 1 ]]; then
@@ -685,13 +686,18 @@ class BaseEnvironment(ABC):
                 detail = f"{detail}; non-login probe: {probe_exc}"
                 healthy = False
 
-            diagnostic = (
-                f"Session profile snapshot unavailable: {detail}. "
-                "Using a clean non-login shell; profile environment and functions are unavailable."
-            )
             if healthy:
+                diagnostic = (
+                    f"Session profile snapshot unavailable: {detail}. "
+                    "Using a clean non-login shell; profile environment and "
+                    "functions are unavailable."
+                )
                 self._set_session_mode("degraded_nonlogin", diagnostic)
             else:
+                diagnostic = (
+                    f"Session profile snapshot unavailable: {detail}. "
+                    "Clean non-login shell health probe failed; refusing command execution."
+                )
                 self._set_session_mode("unavailable", diagnostic)
             logger.warning("%s (session=%s)", diagnostic, self._session_id)
 
@@ -719,7 +725,13 @@ class BaseEnvironment(ABC):
         """
         return shlex.quote(path)
 
-    def _wrap_command(self, command: str, cwd: str) -> str:
+    def _wrap_command(
+        self,
+        command: str,
+        cwd: str,
+        *,
+        guard_failure_marker: str | None = None,
+    ) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
         escaped = command.replace("'", "'\\''")
@@ -744,6 +756,17 @@ class BaseEnvironment(ABC):
 
         parts = []
 
+        if guard_failure_marker is None:
+            guard_failure_marker = (
+                f"{_SNAPSHOT_GUARD_FAILURE_MARKER_PREFIX}{uuid.uuid4().hex}__"
+            )
+        guarded_failure = (
+            "POSIXLY_CORRECT=1; "
+            "if \\unset -f builtin unset set; then "
+            f"\\builtin printf '%s\\n' {shlex.quote(guard_failure_marker)}; "
+            "fi; \\exit 125"
+        )
+
         # Source snapshot (env vars from previous commands).
         # Redirect stdout to /dev/null: on macOS (bash 3.2 and certain
         # Homebrew bash builds) sourcing a file containing ``declare -x``
@@ -754,11 +777,11 @@ class BaseEnvironment(ABC):
             parts.extend(
                 (
                     f"builtin source {_quoted_snap} >/dev/null 2>&1 || "
-                    f"builtin exit {_SNAPSHOT_GUARD_FAILURE_EXIT}",
+                    f"{{ {guarded_failure}; }}",
                     "__hermes_snapshot_reject_dispatcher_functions=1",
                     "if {",
                     _SNAPSHOT_OPERATION_PRELUDE,
-                    f"}}; then :; else builtin exit {_SNAPSHOT_GUARD_FAILURE_EXIT}; fi",
+                    f"}}; then :; else {guarded_failure}; fi",
                 )
             )
 
@@ -1198,6 +1221,20 @@ class BaseEnvironment(ABC):
 
         result["output"] = output[:line_start] + output[line_end:]
 
+    @staticmethod
+    def _consume_exact_output_line(result: dict, marker: str) -> bool:
+        """Remove one exact internal marker line from captured output."""
+        output = str(result.get("output") or "")
+        rendered: list[str] = []
+        found = False
+        for line in output.splitlines(keepends=True):
+            if not found and line.rstrip("\r\n") == marker:
+                found = True
+                continue
+            rendered.append(line)
+        result["output"] = "".join(rendered)
+        return found
+
     # ------------------------------------------------------------------
     # Hooks
     # ------------------------------------------------------------------
@@ -1268,7 +1305,16 @@ class BaseEnvironment(ABC):
             effective_stdin = None
 
         was_snapshot = self._snapshot_ready
-        wrapped = self._wrap_command(exec_command, effective_cwd)
+        guard_failure_marker = (
+            f"{_SNAPSHOT_GUARD_FAILURE_MARKER_PREFIX}{uuid.uuid4().hex}__"
+            if was_snapshot
+            else ""
+        )
+        wrapped = self._wrap_command(
+            exec_command,
+            effective_cwd,
+            guard_failure_marker=guard_failure_marker or None,
+        )
 
         proc = self._run_bash(
             wrapped,
@@ -1279,9 +1325,16 @@ class BaseEnvironment(ABC):
         result = self._wait_for_process(
             proc, timeout=effective_timeout, bounded_capture=bounded_capture
         )
+        guard_failed = bool(guard_failure_marker) and self._consume_exact_output_line(
+            result, guard_failure_marker
+        )
         self._update_cwd(result)
 
-        if was_snapshot and result.get("returncode") == _SNAPSHOT_GUARD_FAILURE_EXIT:
+        if (
+            was_snapshot
+            and guard_failed
+            and result.get("returncode") == _SNAPSHOT_GUARD_FAILURE_EXIT
+        ):
             diagnostic = (
                 "Session snapshot failed its source or sanitizer guard; "
                 "future commands will use a clean non-login shell."

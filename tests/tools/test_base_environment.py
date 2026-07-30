@@ -869,6 +869,82 @@ class TestEmbedStdinHeredoc:
 
 
 class TestInitSessionFailure:
+    def test_legitimate_exit_125_preserves_ready_snapshot(self, tmp_path):
+        import os
+        import subprocess
+
+        class RealBashEnv(_TestableEnv):
+            def _run_bash(
+                self, cmd_string, *, login=False, timeout=120,
+                stdin_data=None, clean=False,
+            ):
+                run_env = dict(os.environ)
+                if clean:
+                    run_env.update(BASH_ENV="/dev/null", ENV="/dev/null")
+                return subprocess.Popen(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", cmd_string],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    cwd=self.cwd,
+                    env=run_env,
+                )
+
+        snapshot = tmp_path / "snapshot.sh"
+        snapshot.write_text("export PROFILE_SENTINEL=loaded\n")
+        snapshot.chmod(0o600)
+        env = RealBashEnv(cwd=str(tmp_path))
+        env._snapshot_path = str(snapshot)
+        env._set_session_mode("snapshot")
+
+        result = env.execute(
+            "printf '__HERMES_SNAPSHOT_GUARD_FAILURE_marker-like__\\n'; "
+            "sh -c 'exit 125'"
+        )
+
+        assert result["returncode"] == 125
+        assert result["output"] == "__HERMES_SNAPSHOT_GUARD_FAILURE_marker-like__\n"
+        assert env._session_mode == "snapshot"
+        assert env._snapshot_ready is True
+
+    def test_real_source_guard_failure_demotes_and_hides_internal_marker(
+        self, tmp_path
+    ):
+        import os
+        import subprocess
+
+        class RealBashEnv(_TestableEnv):
+            def _run_bash(
+                self, cmd_string, *, login=False, timeout=120,
+                stdin_data=None, clean=False,
+            ):
+                run_env = dict(os.environ)
+                if clean:
+                    run_env.update(BASH_ENV="/dev/null", ENV="/dev/null")
+                return subprocess.Popen(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", cmd_string],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    cwd=self.cwd,
+                    env=run_env,
+                )
+
+        user_effect = tmp_path / "must-not-run"
+        env = RealBashEnv(cwd=str(tmp_path))
+        env._snapshot_path = str(tmp_path / "missing-snapshot.sh")
+        env._set_session_mode("snapshot")
+
+        result = env.execute(f"touch {user_effect}")
+
+        assert result["returncode"] == 125
+        assert "source or sanitizer guard" in result["output"]
+        assert "__HERMES_SNAPSHOT_GUARD_FAILURE_" not in result["output"]
+        assert not user_effect.exists()
+        assert env._session_mode == "degraded_nonlogin"
+
     def test_normal_profile_snapshot_preserves_env_functions_cd_and_tilde_cwd(
         self, tmp_path
     ):
@@ -983,6 +1059,8 @@ class TestInitSessionFailure:
         assert "rm -f" in calls[-2][0]
 
     def test_ready_source_failure_stops_command_and_demotes(self, tmp_path):
+        import re
+
         env = _TestableEnv(cwd=str(tmp_path))
         env._snapshot_ready = True
         env._session_mode = "snapshot"
@@ -994,7 +1072,11 @@ class TestInitSessionFailure:
             mock = MagicMock()
             mock.poll.return_value = 0
             mock.returncode = 125
-            mock.stdout = iter([])
+            marker = re.search(
+                r"__HERMES_SNAPSHOT_GUARD_FAILURE_[0-9a-f]{32}__", cmd
+            )
+            assert marker
+            mock.stdout = iter([marker.group(0) + "\n"])
             return mock
 
         env._run_bash = mock_run_bash
@@ -1052,6 +1134,8 @@ class TestInitSessionFailure:
         result = env.execute("touch MUST_NOT_RUN")
         assert result["returncode"] == 125
         assert "profile snapshot unavailable" in result["output"]
+        assert "Using a clean non-login shell" not in result["output"]
+        assert "refusing command execution" in result["output"]
 
     def test_profile_exit_78_before_bootstrap_is_not_safe_rejection(self, tmp_path):
         """Status 78 alone is not proof that Hermes reached its rejection
