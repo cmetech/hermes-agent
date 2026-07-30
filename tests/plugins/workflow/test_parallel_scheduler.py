@@ -195,12 +195,22 @@ def test_mixed_run_limits_share_profile_pool_without_leaking(
     maximum = defaultdict(int)
     maximum_total = 0
     observed_limits = defaultdict(set)
+    run_b_starts = 0
+    first_run_b_wave = threading.Barrier(4, timeout=10)
 
     class MixedLimitExecutor:
         def execute(self, context):
-            nonlocal maximum_total
+            nonlocal maximum_total, run_b_starts
+            # Model one lazy pool worker entering after its peers can finish.
+            if context.workflow_name == "run-b" and context.node.id == "n3":
+                time.sleep(0.2)
             with lock:
                 active[context.workflow_name] += 1
+                if context.workflow_name == "run-b":
+                    run_b_starts += 1
+                    wait_for_first_wave = run_b_starts <= 4
+                else:
+                    wait_for_first_wave = False
                 maximum[context.workflow_name] = max(
                     maximum[context.workflow_name], active[context.workflow_name]
                 )
@@ -209,6 +219,8 @@ def test_mixed_run_limits_share_profile_pool_without_leaking(
                     context.execution_limits.max_parallel_nodes,
                     context.execution_limits.max_total_workers,
                 ))
+            if wait_for_first_wave:
+                first_run_b_wave.wait()
             time.sleep(0.06)
             with lock:
                 active[context.workflow_name] -= 1
