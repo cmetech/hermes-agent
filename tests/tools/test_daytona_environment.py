@@ -7,10 +7,19 @@ from unittest.mock import MagicMock
 
 import pytest
 
+try:
+    from daytona._sync.process import Process as _InstalledDaytonaProcess
+except ImportError:  # Optional SDK is lazy-installed in production.
+    _InstalledDaytonaProcess = None
+
 
 # ---------------------------------------------------------------------------
 # Helpers to build mock Daytona SDK objects
 # ---------------------------------------------------------------------------
+
+def _normalize_daytona_output(raw_output: str) -> str:
+    """Faithfully model Daytona 0.155's splitlines/join output normalization."""
+    return "\n".join(raw_output.splitlines())
 
 def _make_exec_response(result="", exit_code=0):
     return SimpleNamespace(result=result, exit_code=exit_code)
@@ -97,9 +106,10 @@ def make_env(daytona_sdk, monkeypatch):
                     r"__HERMES_SNAPSHOT_GUARD_PASSED_[0-9a-f]{32}__", cmd
                 )
                 if sentinel and hasattr(response, "result"):
-                    response.result = (
+                    raw_result = (
                         f"\n{sentinel.group(0)}\n{response.result or ''}"
                     )
+                    response.result = _normalize_daytona_output(raw_result)
                 return response
 
             # The SDK fake stands in for Bash here, so reproduce the wrapper's
@@ -137,6 +147,20 @@ def make_env(daytona_sdk, monkeypatch):
         return env
 
     return _factory
+
+
+@pytest.mark.skipif(
+    _InstalledDaytonaProcess is None,
+    reason="Daytona SDK is not installed",
+)
+def test_output_normalizer_matches_installed_daytona_sdk():
+    raw_output = "\n__HERMES_GUARD__\n"
+
+    installed = _InstalledDaytonaProcess._parse_output(
+        raw_output.splitlines()
+    ).stdout
+
+    assert _normalize_daytona_output(raw_output) == installed
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +289,26 @@ class TestExecute:
         result = env.execute("echo hello")
         assert "hello" in result["output"]
         assert result["returncode"] == 0
+
+    @pytest.mark.parametrize("exit_code", [0, 125])
+    def test_no_output_command_survives_sdk_newline_normalization(
+        self, make_env, exit_code
+    ):
+        sb = _make_sandbox()
+        sb.process.exec.side_effect = [
+            _make_exec_response(result="/root"),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=0),
+            _make_exec_response(result="", exit_code=exit_code),
+        ]
+        sb.state = "started"
+        env = make_env(sandbox=sb)
+
+        result = env.execute("true")
+
+        assert result == {"output": "", "returncode": exit_code}
+        assert env._session_mode == "snapshot"
 
     def test_sdk_timeout_passed_to_exec(self, make_env):
         """SDK native timeout is passed to sandbox.process.exec()."""

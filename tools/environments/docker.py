@@ -1064,7 +1064,13 @@ class DockerEnvironment(BaseEnvironment):
         if stdin_data is not None:
             cmd.append("-i")
         if clean:
-            cmd.extend(["-e", "BASH_ENV=/dev/null", "-e", "ENV=/dev/null"])
+            cmd.extend(
+                [
+                    "-e", "BASH_ENV=/dev/null",
+                    "-e", "ENV=/dev/null",
+                    "-e", "SHELLOPTS=",
+                ]
+            )
 
         # Only inject -e env args during init_session (login=True).
         # Subsequent commands get env vars from the snapshot.
@@ -1074,7 +1080,9 @@ class DockerEnvironment(BaseEnvironment):
         cmd.extend([self._container_id])
 
         if clean:
-            cmd.extend(["bash", "--noprofile", "--norc", "-c", cmd_string])
+            cmd.extend(
+                ["bash", "--noprofile", "--norc", "+x", "-c", cmd_string]
+            )
         elif login:
             cmd.extend(["bash", "-l", "-c", cmd_string])
         else:

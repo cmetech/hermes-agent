@@ -21,12 +21,19 @@ def test_local_clean_launch_suppresses_startup_hooks(monkeypatch):
     monkeypatch.setattr(local_mod.os, "getpgid", lambda pid: pid)
     env = local_mod.LocalEnvironment.__new__(local_mod.LocalEnvironment)
     env.cwd = "/tmp"
-    env.env = {"BASH_ENV": "/malicious", "ENV": "/malicious"}
+    env.env = {
+        "BASH_ENV": "/malicious",
+        "ENV": "/malicious",
+        "SHELLOPTS": "xtrace",
+    }
 
     assert env._run_bash("protected-script", clean=True) is proc
-    assert captured["args"] == ["/bin/bash", "--noprofile", "--norc", "-c", "protected-script"]
+    assert captured["args"] == [
+        "/bin/bash", "--noprofile", "--norc", "+x", "-c", "protected-script",
+    ]
     assert captured["kwargs"]["env"]["BASH_ENV"] == "/dev/null"
     assert captured["kwargs"]["env"]["ENV"] == "/dev/null"
+    assert captured["kwargs"]["env"]["SHELLOPTS"] == ""
 
 
 def test_docker_clean_launch_suppresses_startup_hooks(monkeypatch):
@@ -41,7 +48,8 @@ def test_docker_clean_launch_suppresses_startup_hooks(monkeypatch):
     assert env._run_bash("protected-script", clean=True) is sentinel
     assert captured["cmd"] == [
         "docker", "exec", "-e", "BASH_ENV=/dev/null", "-e", "ENV=/dev/null",
-        "container-id", "bash", "--noprofile", "--norc", "-c", "protected-script",
+        "-e", "SHELLOPTS=", "container-id", "bash", "--noprofile", "--norc",
+        "+x", "-c", "protected-script",
     ]
     assert captured["stdin"] is None
 
@@ -58,8 +66,8 @@ def test_singularity_clean_launch_suppresses_startup_hooks(monkeypatch):
     assert env._run_bash("protected-script", clean=True) is sentinel
     assert captured["cmd"] == [
         "apptainer", "exec", "instance://instance-id", "env",
-        "BASH_ENV=/dev/null", "ENV=/dev/null", "bash", "--noprofile", "--norc",
-        "-c", "protected-script",
+        "BASH_ENV=/dev/null", "ENV=/dev/null", "SHELLOPTS=", "bash",
+        "--noprofile", "--norc", "+x", "-c", "protected-script",
     ]
     assert captured["stdin"] is None
 
@@ -73,7 +81,10 @@ def test_ssh_clean_launch_suppresses_startup_hooks(monkeypatch):
 
     assert env._run_bash("protected-script", clean=True) is sentinel
     assert captured["cmd"][:2] == ["ssh", "remote"]
-    assert "BASH_ENV=/dev/null ENV=/dev/null bash --noprofile --norc -c" in captured["cmd"][-1]
+    assert (
+        "BASH_ENV=/dev/null ENV=/dev/null SHELLOPTS= "
+        "bash --noprofile --norc +x -c"
+    ) in captured["cmd"][-1]
     assert "protected-script" in captured["cmd"][-1]
     assert captured["stdin"] is None
 
@@ -94,8 +105,9 @@ def test_modal_clean_launch_uses_sdk_env_without_stdin_transport():
     handle = env._run_bash("protected-script", clean=True)
     assert handle.wait(2) == 0
     sandbox.exec.aio.assert_awaited_once_with(
-        "bash", "--noprofile", "--norc", "-c", "protected-script", timeout=120,
-        env={"BASH_ENV": "/dev/null", "ENV": "/dev/null"},
+        "bash", "--noprofile", "--norc", "+x", "-c", "protected-script",
+        timeout=120,
+        env={"BASH_ENV": "/dev/null", "ENV": "/dev/null", "SHELLOPTS": ""},
     )
     process.stdin.write.assert_not_called()
 
@@ -111,6 +123,7 @@ def test_daytona_clean_launch_uses_inner_hygienic_bash():
     assert handle.wait(2) == 0
     shell_cmd = sandbox.process.exec.call_args.args[0]
     assert shell_cmd == (
-        "BASH_ENV=/dev/null ENV=/dev/null bash --noprofile --norc -c protected-script"
+        "BASH_ENV=/dev/null ENV=/dev/null SHELLOPTS= "
+        "bash --noprofile --norc +x -c protected-script"
     )
     sandbox.process.exec.assert_called_once_with(shell_cmd, timeout=120)

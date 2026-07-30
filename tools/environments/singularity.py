@@ -241,7 +241,10 @@ class SingularityEnvironment(BaseEnvironment):
         cmd.append(f"instance://{self.instance_id}")
         if clean:
             cmd.extend(
-                ["env", "BASH_ENV=/dev/null", "ENV=/dev/null", "bash", "--noprofile", "--norc", "-c", cmd_string]
+                [
+                    "env", "BASH_ENV=/dev/null", "ENV=/dev/null", "SHELLOPTS=",
+                    "bash", "--noprofile", "--norc", "+x", "-c", cmd_string,
+                ]
             )
         elif login:
             cmd.extend(["bash", "-l", "-c", cmd_string])

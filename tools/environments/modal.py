@@ -420,14 +420,20 @@ class ModalEnvironment(BaseEnvironment):
             async def _do():
                 args = ["bash"]
                 if clean:
-                    args.extend(["--noprofile", "--norc", "-c", cmd_string])
+                    args.extend(
+                        ["--noprofile", "--norc", "+x", "-c", cmd_string]
+                    )
                 elif login:
                     args.extend(["-l", "-c", cmd_string])
                 else:
                     args.extend(["-c", cmd_string])
                 kwargs = {"timeout": timeout}
                 if clean:
-                    kwargs["env"] = {"BASH_ENV": "/dev/null", "ENV": "/dev/null"}
+                    kwargs["env"] = {
+                        "BASH_ENV": "/dev/null",
+                        "ENV": "/dev/null",
+                        "SHELLOPTS": "",
+                    }
                 process = await sandbox.exec.aio(*args, **kwargs)
                 stdout = await process.stdout.read.aio()
                 stderr = await process.stderr.read.aio()

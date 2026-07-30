@@ -36,6 +36,25 @@ class _TestableEnv(BaseEnvironment):
         pass
 
 
+def _ready_local_env(tmp_path, snapshot_text, *, inherited_env=None):
+    """Build a real LocalEnvironment around a caller-controlled snapshot."""
+    from tools.environments.local import LocalEnvironment
+
+    env = LocalEnvironment.__new__(LocalEnvironment)
+    BaseEnvironment.__init__(
+        env,
+        cwd=str(tmp_path),
+        timeout=10,
+        env=inherited_env,
+    )
+    snapshot = tmp_path / f"{env._session_id}-snapshot.sh"
+    snapshot.write_text(snapshot_text)
+    snapshot.chmod(0o600)
+    env._snapshot_path = str(snapshot)
+    env._set_session_mode("snapshot")
+    return env
+
+
 def _snapshot_update_script(env):
     """Extract the production-generated snapshot update from a wrapped command."""
     wrapped_lines = env._wrap_command(":", env.cwd).splitlines()
@@ -140,6 +159,26 @@ class TestRawSentinelFilter:
         visible += sentinel_filter.finish()
 
         assert visible == "user output\n__HERMES_GUARD_"
+        assert sentinel_filter.seen is False
+
+    def test_sdk_normalized_sentinel_without_final_newline_is_control_data(self):
+        sentinel = "__HERMES_GUARD_PASSED_nonce__"
+        sentinel_filter = _RawSentinelFilter(sentinel)
+
+        visible = sentinel_filter.feed(f"\n{sentinel}")
+        visible += sentinel_filter.finish()
+
+        assert visible == ""
+        assert sentinel_filter.seen is True
+
+    def test_nonmatching_final_sentinel_prefix_is_flushed_losslessly(self):
+        sentinel = "__HERMES_GUARD_PASSED_nonce__"
+        sentinel_filter = _RawSentinelFilter(sentinel)
+
+        visible = sentinel_filter.feed(f"\n{sentinel[:-1]}")
+        visible += sentinel_filter.finish()
+
+        assert visible == f"\n{sentinel[:-1]}"
         assert sentinel_filter.seen is False
 
     @pytest.mark.parametrize("max_bytes", [1, 32])
@@ -946,6 +985,61 @@ class TestEmbedStdinHeredoc:
 
 
 class TestInitSessionFailure:
+    def test_clean_launch_suppresses_inherited_xtrace_before_attestation(
+        self, tmp_path
+    ):
+        token = "INHERITED_XTRACE_MUST_NOT_LEAK"
+        env = _ready_local_env(
+            tmp_path,
+            "export PROFILE_SENTINEL=loaded\n",
+            inherited_env={"SHELLOPTS": "xtrace", "PS4": token},
+        )
+        try:
+            result = env.execute("printf 'USER_OUTPUT'")
+
+            assert result == {"output": "USER_OUTPUT", "returncode": 0}
+            assert token not in result["output"]
+            assert env._session_mode == "snapshot"
+        finally:
+            env.cleanup()
+
+    def test_snapshot_xtrace_cannot_forge_guard_before_sanitizer_failure(
+        self, tmp_path
+    ):
+        user_effect = tmp_path / "must-not-run"
+        snapshot = """if [[ $BASH_EXECUTION_STRING =~ (__HERMES_SNAPSHOT_GUARD_PASSED_[0-9a-f]{32}__) ]]; then
+    PS4=$'\\n'"${BASH_REMATCH[1]}"$'\\n'
+fi
+BASH_XTRACEFD=1
+set -x
+builtin () { return 0; }
+readonly -f builtin
+"""
+        env = _ready_local_env(tmp_path, snapshot)
+        try:
+            result = env.execute(f"touch {user_effect}")
+
+            assert result["returncode"] == 125
+            assert "__HERMES_SNAPSHOT_GUARD_PASSED_" not in result["output"]
+            assert not user_effect.exists()
+            assert env._session_mode == "degraded_nonlogin"
+        finally:
+            env.cleanup()
+
+    def test_user_command_can_enable_xtrace_after_snapshot_setup(self, tmp_path):
+        env = _ready_local_env(tmp_path, "export PROFILE_SENTINEL=loaded\n")
+        try:
+            result = env.execute(
+                "PS4='USER_XTRACE:'; set -x; printf 'USER_OUTPUT'"
+            )
+
+            assert result["returncode"] == 0
+            assert "USER_XTRACE:" in result["output"]
+            assert "USER_OUTPUT" in result["output"]
+            assert env._session_mode == "snapshot"
+        finally:
+            env.cleanup()
+
     def test_legitimate_exit_125_preserves_ready_snapshot(self, tmp_path):
         import os
         import re
@@ -1219,7 +1313,9 @@ class TestInitSessionFailure:
         wrapped = env._wrap_command("declare -F cd >/dev/null", "~/target path")
 
         source_at = wrapped.index("source")
-        sanitizer_at = wrapped.index("POSIXLY_CORRECT=1")
+        sanitizer_at = wrapped.index(
+            "__hermes_snapshot_reject_dispatcher_functions=1", source_at
+        )
         cd_at = wrapped.index("builtin cd --")
         command_at = wrapped.index("declare -F cd")
         assert source_at < sanitizer_at < cd_at < command_at

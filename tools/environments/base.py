@@ -233,6 +233,14 @@ class _RawSentinelFilter:
         return candidate
 
     def finish(self) -> str:
+        # Daytona 0.155 normalizes output through splitlines()/join(), which
+        # removes the final newline from a no-output command's framed sentinel.
+        # The remaining bytes are still exact control data; shorter prefixes
+        # and all nonmatches remain ordinary output and flush losslessly.
+        if not self.seen and self._pending == self._needle[:-1]:
+            self._pending = ""
+            self.seen = True
+            return ""
         pending = self._pending
         self._pending = ""
         return pending
@@ -806,21 +814,43 @@ class BaseEnvironment(ABC):
         # needs to survive the compromised shell.
         guarded_failure = f"POSIXLY_CORRECT=1; \\exit {_SNAPSHOT_GUARD_FAILURE_EXIT}"
 
-        # Source snapshot (env vars from previous commands).
-        # Redirect stdout to /dev/null: on macOS (bash 3.2 and certain
-        # Homebrew bash builds) sourcing a file containing ``declare -x``
-        # can emit the declarations to stdout, leaking ~60 lines of env
-        # vars into every tool response (issue #15459).  Linux bash is
-        # silent here, but the redirect is harmless.
+        # Source and sanitize the snapshot while xtrace is routed to a
+        # temporary /dev/null descriptor. A tampered snapshot can enable
+        # xtrace and choose PS4, including text resembling the guard-passed
+        # sentinel. The compound-command redirection opens fd 19 before the
+        # group and restores/closes it afterward without clobbering any caller
+        # fd 19. The group's stdout/stderr are also suppressed so a snapshot
+        # cannot redirect BASH_XTRACEFD back to 1 or 2 and forge control data.
+        # Trace is disabled and BASH_XTRACEFD restored only after the sanitizer
+        # succeeds; failure exits while trace remains suppressed.
+        #
+        # Snapshot stdout/stderr is also redirected: on macOS (bash 3.2 and
+        # certain Homebrew bash builds), sourcing ``declare -x`` can emit the
+        # declarations to stdout (issue #15459).
         if self._snapshot_ready:
             parts.extend(
                 (
+                    "if {",
+                    "__hermes_snapshot_had_xtracefd=0",
+                    "if [[ ${BASH_XTRACEFD+x} ]]; then "
+                    "__hermes_snapshot_had_xtracefd=1; "
+                    "__hermes_snapshot_old_xtracefd=$BASH_XTRACEFD; fi",
+                    f"BASH_XTRACEFD=19 || {{ {guarded_failure}; }}",
                     f"builtin source {_quoted_snap} >/dev/null 2>&1 || "
                     f"{{ {guarded_failure}; }}",
                     "__hermes_snapshot_reject_dispatcher_functions=1",
                     "if {",
                     _SNAPSHOT_OPERATION_PRELUDE,
                     f"}}; then :; else {guarded_failure}; fi",
+                    "builtin set +x",
+                    "if [[ $__hermes_snapshot_had_xtracefd == 1 ]]; then "
+                    "BASH_XTRACEFD=$__hermes_snapshot_old_xtracefd; "
+                    "else builtin unset BASH_XTRACEFD; fi || "
+                    f"{{ {guarded_failure}; }}",
+                    "builtin unset __hermes_snapshot_had_xtracefd "
+                    "__hermes_snapshot_old_xtracefd",
+                    f"}}; then :; else {guarded_failure}; "
+                    "fi 19>/dev/null >/dev/null 2>&1",
                 )
             )
 

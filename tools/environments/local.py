@@ -1372,13 +1372,16 @@ class LocalEnvironment(BaseEnvironment):
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         if clean:
-            args = [bash, "--noprofile", "--norc", "-c", cmd_string]
+            args = [bash, "--noprofile", "--norc", "+x", "-c", cmd_string]
         else:
             args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
         if clean:
             run_env["BASH_ENV"] = "/dev/null"
             run_env["ENV"] = "/dev/null"
+            # Bash imports exported SHELLOPTS after processing invocation
+            # flags, so +x alone cannot defeat a parent xtrace setting.
+            run_env["SHELLOPTS"] = ""
 
         # Recover when the cwd has been deleted out from under us — usually by
         # a previous tool call that ran ``rm -rf`` on its own working dir
