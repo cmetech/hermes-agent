@@ -4,9 +4,11 @@
 
 Task 7 is implemented in commits `908b00005`
 (`refactor(workflow): centralize archon output resolution`) and `2ceae14ec`
-(`fix(workflow): preserve resolved output authority`). Archon downstream
-consumers now resolve the successful attempt's canonical `output.*` descriptor
-once into a frozen `ResolvedNodeOutput`. The resolver verifies containment,
+(`fix(workflow): preserve resolved output authority`), with open output-type
+boundary alignment in `eda27235c` (`fix(workflow): preserve open output types`).
+Archon downstream consumers now resolve the successful attempt's canonical
+`output.*` descriptor once into a frozen `ResolvedNodeOutput`. The resolver
+verifies containment,
 regular-file identity, byte size, SHA-256, UTF-8, candidate/descriptor agreement,
 and the winning node/attempt identity before exposing canonical bytes, a frozen
 parsed value, deterministic text, media type, digest, producer, attempt, and
@@ -110,6 +112,24 @@ made that test and the full focused suite pass. A second targeted RED proved
 that preserving the authoritative parsed value required avoiding a second
 freeze/copy of an already immutable candidate value.
 
+### Review fix round 2 RED/GREEN
+
+The Archon scheduler E2E failed before completion when a valid 322-character
+mixed-case Unicode `output_type` reached the winning-candidate identity. The
+restore validator imposed an unsupported 256-character enum-style limit even
+though the language declares this field open and case-sensitive.
+
+Candidate validation now uses the existing durable attempt-metadata string
+contract of 16,384 characters. The E2E preserves the authored Unicode value
+exactly through schema loading, candidate retention, completion metadata, and
+resolution. Direct boundary coverage accepts and round-trips exactly 16,384
+characters without projection truncation, while non-string, empty,
+whitespace-only, and 16,385-character values raise a bounded integrity error.
+The whitespace-only case supplied a second RED before validation was aligned
+with the authoring schema's non-empty-string rule.
+
+The four-file focused suite passed 67/67 after the round-2 fix.
+
 ## Consumer invariants
 
 - Successful-attempt identity wins; failed/losing attempts cannot supply a
@@ -148,7 +168,7 @@ Exact required suite:
 scripts/run_tests.sh tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_language.py tests/plugins/workflow/test_bash_e2e.py tests/plugins/workflow/test_script_executor.py
 ```
 
-Fresh result after review fixes: 5 files, 69 passed, 0 failed.
+Fresh result after review fix round 2: 5 files, 75 passed, 0 failed.
 
 Adjacent Archon/condition/shared-context suite:
 
