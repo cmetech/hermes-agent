@@ -18,8 +18,8 @@ legacy compatibility or needs bytes shared with a pre-Phase-1 runtime.
 Before any command, resolve `PRODUCT_CLI` once from the active product. Read
 `$HERMES_HOME/brand.json` when available and use its `slug` as the executable:
 LOOP24 uses `loop24`, OTTO uses `otto`, and neutral Hermes Agent uses `hermes`.
-Replace `PRODUCT_CLI` in every template; never execute the placeholder or use
-another product's executable.
+Replace `PRODUCT_CLI` in every template; never execute the literal placeholder
+or use another product's executable.
 
 Read [references/portable-schema.md](references/portable-schema.md) completely
 before authoring. Use
