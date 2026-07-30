@@ -161,11 +161,11 @@ def test_ssh_clean_launch_suppresses_startup_hooks(monkeypatch):
 
     assert env._run_bash("protected-script", clean=True) is sentinel
     assert captured["cmd"][:2] == ["ssh", "remote"]
-    assert captured["cmd"][-1].startswith("POSIXLY_CORRECT=1 &&\n\\set +x")
+    assert captured["cmd"][-1].startswith("/bin/sh -c 'POSIXLY_CORRECT=1 &&")
     assert "command env BASH_ENV=/dev/null" in captured["cmd"][-1]
     assert "__hermes_outer_script=$(\\printf" in captured["cmd"][-1]
     assert captured["cmd"][-1].endswith(
-        'bash --noprofile --norc +x -c "$__hermes_outer_script"'
+        'bash --noprofile --norc +x -c "$__hermes_outer_script"\''
     )
     assert "protected-script" not in captured["cmd"][-1]
     assert captured["stdin"] is None
@@ -241,6 +241,42 @@ def test_ssh_encoded_wrapper_preserves_user_stdin(monkeypatch):
     assert completed.returncode == 0, completed.stdout
     assert completed.stdout == "STDIN=preserved-input"
     assert "preserved-input" not in captured["cmd"][-1]
+
+
+@pytest.mark.parametrize("account_shell_name", ["csh", "tcsh"])
+def test_ssh_clean_launch_crosses_non_posix_account_shell(
+    monkeypatch,
+    account_shell_name,
+):
+    account_shell = shutil.which(account_shell_name)
+    if account_shell is None:
+        pytest.skip(f"real {account_shell_name} is required for SSH launch coverage")
+    captured = {}
+    monkeypatch.setattr(
+        ssh_mod,
+        "_popen_bash",
+        lambda cmd, stdin: captured.update(cmd=cmd, stdin=stdin) or object(),
+    )
+    env = ssh_mod.SSHEnvironment.__new__(ssh_mod.SSHEnvironment)
+    env._build_ssh_command = lambda: ["ssh", "remote"]
+    script = (
+        "cd / && read value; "
+        "printf 'STDIN=<%s> CWD=<%s>' \"$value\" \"$PWD\"; exit 37"
+    )
+    user_stdin = "quoted ' $HOME ! value\n"
+
+    env._run_bash(script, clean=True, stdin_data=user_stdin)
+    completed = subprocess.run(
+        [account_shell, "-f", "-c", captured["cmd"][-1]],
+        input=captured["stdin"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 37, completed.stdout
+    assert completed.stdout == "STDIN=<quoted ' $HOME ! value> CWD=</>"
 
 
 def test_modal_clean_launch_uses_sdk_env_without_stdin_transport():

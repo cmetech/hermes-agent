@@ -356,13 +356,14 @@ class SSHEnvironment(BaseEnvironment):
             encoded_script = base64.b64encode(cmd_string.encode("utf-8")).decode(
                 "ascii"
             )
-            bash_command = (
+            posix_command = (
                 f"{_CLEAN_OUTER_SHELL_PRELUDE}"
-                "__hermes_outer_script=$(\\printf '%s' "
+                "__hermes_outer_script=$(\\printf %s "
                 f"{shlex.quote(encoded_script)} | \\command base64 -d) &&\n"
                 f"{_CLEAN_ENV_BASH}"
                 "--noprofile --norc +x -c \"$__hermes_outer_script\""
-            )
+            ).replace("\n", " ")
+            bash_command = f"/bin/sh -c {shlex.quote(posix_command)}"
         elif login:
             bash_command = f"bash -l -c {shlex.quote(cmd_string)}"
         else:
