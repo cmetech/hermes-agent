@@ -1005,6 +1005,8 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             base_url=getattr(agent, "_anthropic_base_url", None),
             fast_mode=(agent.request_overrides or {}).get("speed") == "fast",
             drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
+            provider_name=getattr(agent, "provider", ""),
+            structured_output=getattr(agent, "structured_output", None),
         )
 
     # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.
@@ -1079,6 +1081,9 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,
+            structured_output=getattr(agent, "structured_output", None),
+            provider_name=getattr(agent, "provider", ""),
+            base_url=agent.base_url,
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,
@@ -1190,6 +1195,8 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             anthropic_max_output=_ant_max,
             supports_reasoning=agent._supports_reasoning_extra_body(),
             qwen_session_metadata=_qwen_meta,
+            provider_name=getattr(agent, "provider", ""),
+            structured_output=getattr(agent, "structured_output", None),
         )
 
     # ── Legacy flag path ────────────────────────────────────────────
@@ -1237,6 +1244,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
+        structured_output=getattr(agent, "structured_output", None),
     )
 
 

@@ -5,6 +5,28 @@ from types import SimpleNamespace
 
 from agent.transports import get_transport
 from agent.transports.types import NormalizedResponse
+from agent.structured_output import (
+    StructuredOutputRequest,
+    StructuredOutputStrategy,
+    normalize_schema,
+)
+
+
+_STRUCTURED_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {"answer": {"type": "string"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
+
+def _structured_request(strategy: StructuredOutputStrategy) -> StructuredOutputRequest:
+    return StructuredOutputRequest(
+        schema=normalize_schema(_STRUCTURED_SCHEMA),
+        strategy=strategy,
+        adapter_version=1,
+    )
 
 
 @pytest.fixture
@@ -290,6 +312,70 @@ class TestChatCompletionsBuildKwargs:
         assert kw["model"] == "gpt-4o"
         assert kw["messages"][0]["content"] == "Hello"
         assert kw["timeout"] == 30.0
+
+    def test_direct_openai_native_schema_uses_exact_response_format(self, transport):
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert kwargs["response_format"] == {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "hermes_output",
+                "schema": _STRUCTURED_SCHEMA,
+                "strict": True,
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "strategy",
+        [
+            StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            StructuredOutputStrategy.NATIVE_JSON_MODE,
+            StructuredOutputStrategy.UNSUPPORTED,
+        ],
+    )
+    def test_non_schema_strategies_never_emit_response_format(
+        self, transport, strategy
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            structured_output=_structured_request(strategy),
+        )
+
+        assert "response_format" not in kwargs
+
+    @pytest.mark.parametrize(
+        ("provider_name", "base_url"),
+        [
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            ("custom", "https://gateway.example/v1"),
+            ("openai-api", "https://gateway.example/v1"),
+        ],
+    )
+    def test_non_direct_routes_never_emit_response_format(
+        self, transport, provider_name, base_url
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name=provider_name,
+            base_url=base_url,
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert "response_format" not in kwargs
 
     def test_developer_role_swap(self, transport):
         msgs = [{"role": "system", "content": "You are helpful"}, {"role": "user", "content": "Hi"}]

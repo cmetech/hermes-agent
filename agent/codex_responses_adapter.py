@@ -913,7 +913,7 @@ def _preflight_codex_api_kwargs(
         "model", "instructions", "input", "tools", "store",
         "reasoning", "include", "max_output_tokens", "temperature",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
-        "extra_headers", "extra_body", "timeout",
+        "extra_headers", "extra_body", "text", "timeout",
     }
     normalized: Dict[str, Any] = {
         "model": model,
@@ -934,6 +934,61 @@ def _preflight_codex_api_kwargs(
     service_tier = api_kwargs.get("service_tier")
     if isinstance(service_tier, str) and service_tier.strip():
         normalized["service_tier"] = service_tier.strip()
+
+    text_config = api_kwargs.get("text")
+    if text_config is not None:
+        if not isinstance(text_config, dict):
+            raise ValueError("Codex Responses request 'text' must be an object.")
+        unexpected_text_keys = sorted(set(text_config) - {"format", "verbosity"})
+        if unexpected_text_keys:
+            raise ValueError(
+                "Codex Responses request 'text' has unsupported field(s): "
+                f"{', '.join(unexpected_text_keys)}."
+            )
+        normalized_text: Dict[str, Any] = {}
+        verbosity = text_config.get("verbosity")
+        if verbosity is not None:
+            if verbosity not in {"low", "medium", "high"}:
+                raise ValueError(
+                    "Codex Responses request 'text.verbosity' must be low, medium, or high."
+                )
+            normalized_text["verbosity"] = verbosity
+        text_format = text_config.get("format")
+        if text_format is not None:
+            if not isinstance(text_format, dict):
+                raise ValueError(
+                    "Codex Responses request 'text.format' must be an object."
+                )
+            required_format_keys = {"type", "name", "schema", "strict"}
+            if set(text_format) != required_format_keys:
+                raise ValueError(
+                    "Codex Responses request 'text.format' must contain only "
+                    "type, name, schema, and strict."
+                )
+            if text_format.get("type") != "json_schema":
+                raise ValueError(
+                    "Codex Responses request 'text.format.type' must be json_schema."
+                )
+            if text_format.get("name") != "hermes_output":
+                raise ValueError(
+                    "Codex Responses request 'text.format.name' must be hermes_output."
+                )
+            if not isinstance(text_format.get("schema"), dict):
+                raise ValueError(
+                    "Codex Responses request 'text.format.schema' must be an object."
+                )
+            if text_format.get("strict") is not True:
+                raise ValueError(
+                    "Codex Responses request 'text.format.strict' must be true."
+                )
+            normalized_text["format"] = {
+                "type": "json_schema",
+                "name": "hermes_output",
+                "schema": dict(text_format["schema"]),
+                "strict": True,
+            }
+        if normalized_text:
+            normalized["text"] = normalized_text
 
     # Pass through max_output_tokens and temperature
     max_output_tokens = api_kwargs.get("max_output_tokens")

@@ -13,6 +13,59 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 
 
+def _build_native_text_format(
+    request: Any,
+    *,
+    provider_name: Any,
+    base_url: Any,
+    model: str,
+) -> dict[str, Any] | None:
+    """Build the direct OpenAI Responses schema contract."""
+    from agent.structured_output import (
+        StructuredOutputRequest,
+        StructuredOutputStrategy,
+    )
+
+    if (
+        not isinstance(request, StructuredOutputRequest)
+        or request.strategy is not StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+    ):
+        return None
+
+    from hermes_cli.runtime_provider import (
+        classify_resolved_execution_runtime,
+        resolve_structured_output_capability,
+    )
+
+    decision = resolve_structured_output_capability(
+        classify_resolved_execution_runtime(
+            {
+                "provider": provider_name,
+                "base_url": base_url,
+                "api_mode": "codex_responses",
+                "model": model,
+            },
+            target_model=model,
+        ),
+        schema_fingerprint=request.schema.schema_fingerprint,
+        model=model,
+    )
+    if (
+        decision.strategy is not request.strategy
+        or decision.adapter_version != request.adapter_version
+        or decision.schema_fingerprint != request.schema.schema_fingerprint
+    ):
+        return None
+
+    schema = json.loads(request.schema.canonical_schema_bytes.decode("utf-8"))
+    return {
+        "type": "json_schema",
+        "name": "hermes_output",
+        "schema": schema,
+        "strict": True,
+    }
+
+
 def _bounded_prompt_cache_key(value: Any) -> Optional[str]:
     """Return a provider-safe cache key without changing session identity."""
     if value is None:
@@ -317,6 +370,18 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+
+        text_format = _build_native_text_format(
+            params.get("structured_output"),
+            provider_name=params.get("provider_name"),
+            base_url=params.get("base_url"),
+            model=model,
+        )
+        if text_format is not None:
+            existing_text = kwargs.get("text")
+            merged_text = dict(existing_text) if isinstance(existing_text, dict) else {}
+            merged_text["format"] = text_format
+            kwargs["text"] = merged_text
 
         if "prompt_cache_key" in kwargs:
             bounded_cache_key = _bounded_prompt_cache_key(kwargs["prompt_cache_key"])

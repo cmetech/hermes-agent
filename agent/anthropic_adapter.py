@@ -2542,6 +2542,8 @@ def build_anthropic_kwargs(
     base_url: str | None = None,
     fast_mode: bool = False,
     drop_context_1m_beta: bool = False,
+    provider_name: str | None = None,
+    structured_output: Any = None,
 ) -> Dict[str, Any]:
     """Build kwargs for anthropic.messages.create().
 
@@ -2764,7 +2766,65 @@ def build_anthropic_kwargs(
         betas.append(_FAST_MODE_BETA)
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
+    output_format = _build_native_output_config_format(
+        structured_output,
+        provider_name=provider_name,
+        base_url=base_url,
+        model=model,
+    )
+    if output_format is not None:
+        output_config = kwargs.setdefault("output_config", {})
+        output_config["format"] = output_format
+
     return kwargs
+
+
+def _build_native_output_config_format(
+    request: Any,
+    *,
+    provider_name: Any,
+    base_url: Any,
+    model: str,
+) -> dict[str, Any] | None:
+    """Build the direct Anthropic Messages schema contract."""
+    from agent.structured_output import (
+        StructuredOutputRequest,
+        StructuredOutputStrategy,
+    )
+
+    if (
+        not isinstance(request, StructuredOutputRequest)
+        or request.strategy is not StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+    ):
+        return None
+
+    from hermes_cli.runtime_provider import (
+        classify_resolved_execution_runtime,
+        resolve_structured_output_capability,
+    )
+
+    decision = resolve_structured_output_capability(
+        classify_resolved_execution_runtime(
+            {
+                "provider": provider_name,
+                "base_url": base_url,
+                "api_mode": "anthropic_messages",
+                "model": model,
+            },
+            target_model=model,
+        ),
+        schema_fingerprint=request.schema.schema_fingerprint,
+        model=model,
+    )
+    if (
+        decision.strategy is not request.strategy
+        or decision.adapter_version != request.adapter_version
+        or decision.schema_fingerprint != request.schema.schema_fingerprint
+    ):
+        return None
+
+    schema = json.loads(request.schema.canonical_schema_bytes.decode("utf-8"))
+    return {"type": "json_schema", "schema": schema}
 
 
 # Keys that belong exclusively to the OpenAI Responses / Codex API shape.

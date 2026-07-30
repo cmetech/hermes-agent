@@ -261,6 +261,80 @@ def test_preflight_codex_input_items_keeps_short_message_id():
     assert items[0]["id"] == _VALID_ITEM_ID
 
 
+def test_preflight_codex_kwargs_preserves_exact_text_format_and_verbosity():
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    kwargs = _preflight_codex_api_kwargs(
+        {
+            "model": "gpt-5.4",
+            "instructions": "Return an answer",
+            "input": [{"role": "user", "content": "Now"}],
+            "store": False,
+            "text": {
+                "verbosity": "low",
+                "format": {
+                    "type": "json_schema",
+                    "name": "hermes_output",
+                    "schema": schema,
+                    "strict": True,
+                },
+            },
+        }
+    )
+
+    assert kwargs["text"] == {
+        "verbosity": "low",
+        "format": {
+            "type": "json_schema",
+            "name": "hermes_output",
+            "schema": schema,
+            "strict": True,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        {"unexpected": True},
+        {"verbosity": "maximum"},
+        {
+            "format": {
+                "type": "json_schema",
+                "name": "hermes_output",
+                "schema": {"type": "object"},
+                "strict": True,
+                "unexpected": True,
+            }
+        },
+        {
+            "format": {
+                "type": "json_object",
+                "name": "hermes_output",
+                "schema": {"type": "object"},
+                "strict": True,
+            }
+        },
+    ],
+)
+def test_preflight_codex_kwargs_rejects_unapproved_text_shapes(text):
+    with pytest.raises(ValueError, match="text"):
+        _preflight_codex_api_kwargs(
+            {
+                "model": "gpt-5.4",
+                "instructions": "Return an answer",
+                "input": [{"role": "user", "content": "Now"}],
+                "store": False,
+                "text": text,
+            }
+        )
+
+
 def test_preflight_codex_input_items_drops_short_id_for_github_responses():
     items = _preflight_codex_input_items(
         [
