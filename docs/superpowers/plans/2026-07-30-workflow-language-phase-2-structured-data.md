@@ -308,7 +308,7 @@
 - Modify: `tests/agent/test_anthropic_adapter.py`
 - Modify: `tests/agent/transports/test_transport.py`
 
-- [ ] Add failing exact-kwargs tests for the three approved native shapes.
+- [x] Add failing exact-kwargs tests for the three approved native shapes.
 
   Required wire values:
 
@@ -339,19 +339,19 @@
 
   Expected: FAIL on missing wire fields.
 
-- [ ] Pass `structured_output` through `build_api_kwargs()` to the selected transport and add transport-owned builders.
+- [x] Pass `structured_output` through `build_api_kwargs()` to the selected transport and add transport-owned builders.
 
   Native builders must verify the exact admitted strategy plus trusted provider identity before emitting a wire field. `ChatCompletionsTransport` owns `response_format`; `CodexResponsesTransport` owns `text.format`; the Anthropic adapter owns `output_config.format`.
 
-- [ ] Preserve existing transport fields while merging.
+- [x] Preserve existing transport fields while merging.
 
   Add `text` to the Codex Responses allowlist with strict nested validation. Merge Anthropic `output_config.format` with existing `output_config.effort` rather than replacing either member. Add regression tests for adaptive thinking, xhigh downgrade, streaming, request sanitization, and existing provider extras.
 
-- [ ] Add native JSON-mode support only if an existing direct declared route has a separately documented and tested JSON-mode parameter.
+- [x] Add native JSON-mode support only if an existing direct declared route has a separately documented and tested JSON-mode parameter.
 
   If none does, keep the enum/resolver branch but ship no native-JSON-mode provider declaration. Do not infer or probe it at runtime.
 
-- [ ] Run transport suites and commit.
+- [x] Run transport suites and commit.
 
   Run: `scripts/run_tests.sh tests/agent/transports/test_transport.py tests/agent/transports/test_chat_completions.py tests/agent/transports/test_codex_transport.py tests/agent/test_codex_responses_adapter.py tests/agent/test_anthropic_adapter.py tests/agent/test_anthropic_kwargs_sanitize.py`
 
