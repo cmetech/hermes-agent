@@ -50,6 +50,11 @@ _activity_callback_local = threading.local()
 # path for both bounded and unbounded modes.
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
+# Bootstrap status reserved for a healthy login shell whose profile contains
+# functions that cannot be represented without weakening the internal
+# dispatcher sanitizer. Keep using login shells per command in this case.
+_SNAPSHOT_PROFILE_FALLBACK_EXIT = 78
+
 
 # Bash resolves a function named ``builtin`` before ``\builtin``, including on
 # macOS's Bash 3.2.  Enter POSIX mode using assignment syntax (which cannot be
@@ -78,6 +83,10 @@ if __hermes_snapshot_shell_catalog=$(\set); then
 else
     [[ 0 == 1 ]]
 fi &&
+if [[ ${__hermes_snapshot_reject_dispatcher_functions:-0} == 1 &&
+      $__hermes_snapshot_had_dispatcher_functions == 1 ]]; then
+    \exit "$__hermes_snapshot_profile_fallback_exit"
+fi &&
 if \unset -f builtin unset set; then
     if [[ $__hermes_snapshot_had_posixly_correct == 1 ]]; then
         POSIXLY_CORRECT=$__hermes_snapshot_old_posixly_correct
@@ -90,7 +99,10 @@ if \unset -f builtin unset set; then
         \set +o posix
     fi &&
     \unset __hermes_snapshot_was_posix __hermes_snapshot_had_posixly_correct \
-        __hermes_snapshot_old_posixly_correct __hermes_snapshot_shell_catalog
+        __hermes_snapshot_old_posixly_correct __hermes_snapshot_shell_catalog \
+        __hermes_snapshot_had_dispatcher_functions \
+        __hermes_snapshot_reject_dispatcher_functions \
+        __hermes_snapshot_profile_fallback_exit
 else
     [[ 0 == 1 ]]
 fi"""
@@ -550,10 +562,11 @@ class BaseEnvironment(ABC):
         _builtin = r"\builtin"
         bootstrap = (
             "(\n"
+            "__hermes_snapshot_reject_dispatcher_functions=1\n"
+            f"__hermes_snapshot_profile_fallback_exit={_SNAPSHOT_PROFILE_FALLBACK_EXIT}\n"
             "if {\n"
             f"{_SNAPSHOT_OPERATION_PRELUDE}\n"
-            f"}} && [[ $__hermes_snapshot_had_dispatcher_functions == 0 ]] && "
-            f"{_builtin} unset __hermes_snapshot_had_dispatcher_functions; then\n"
+            "}; then\n"
             f"{_builtin} umask 077\n"
             # Gate the complete assembly and publication. A failure anywhere
             # leaves the prior snapshot in place and makes init_session reject
@@ -594,12 +607,15 @@ class BaseEnvironment(ABC):
             "fi\n"
             ")\n"
         )
+        profile_fallback = False
         try:
             proc = self._run_bash(bootstrap, login=True, timeout=self._snapshot_timeout)
             result = self._wait_for_process(proc, timeout=self._snapshot_timeout)
-            if int(result.get("returncode") or 0) != 0:
+            returncode = int(result.get("returncode") or 0)
+            if returncode != 0:
+                profile_fallback = returncode == _SNAPSHOT_PROFILE_FALLBACK_EXIT
                 raise RuntimeError(
-                    f"snapshot bootstrap failed with exit code {result.get('returncode')}"
+                    f"snapshot bootstrap failed with exit code {returncode}"
                 )
             self._snapshot_ready = True
             self._update_cwd(result)
@@ -610,6 +626,14 @@ class BaseEnvironment(ABC):
             )
         except Exception as exc:
             self._snapshot_ready = False
+            if profile_fallback:
+                self._prefer_nonlogin = False
+                logger.warning(
+                    "snapshot disabled (session=%s): login profile contains "
+                    "protected shell functions — falling back to bash -l per command",
+                    self._session_id,
+                )
+                return
             # Default fallback is bash -l per command so PATH/nvm/etc still
             # load.  If login itself is dead (classic Windows Git Bash
             # ``Directory \\drivers\\etc does not exist``), that fallback
@@ -716,10 +740,10 @@ class BaseEnvironment(ABC):
         # protected operation also uses a private umask.
         snapshot_update = [
             "(",
+            "__hermes_snapshot_reject_dispatcher_functions=0",
             "if {",
             _SNAPSHOT_OPERATION_PRELUDE,
-            f"}} && {_builtin} unset "
-            "__hermes_snapshot_had_dispatcher_functions; then",
+            "}; then",
             f"{_builtin} umask 077",
         ]
 

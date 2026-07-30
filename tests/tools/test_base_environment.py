@@ -394,24 +394,35 @@ class TestAtomicSnapshotWrite:
     def test_dispatcher_functions_reject_lossy_bootstrap_and_use_fallback(
         self, tmp_path
     ):
-        """Bootstrap must not claim success after dropping legitimate
-        dispatcher-named functions from an otherwise complete snapshot."""
+        """A rejected snapshot must retain the complete login profile on the
+        next execution instead of switching to a lossy non-login shell."""
         import shlex
         import subprocess
 
         _q = shlex.quote
         snap = tmp_path / "snapshot.sh"
         marker = tmp_path / "intercepted"
-        shadow = "\n".join(
-            f"{name} () {{ printf '%s\\n' {name} >> {_q(str(marker))}; return 0; }}"
-            for name in ("builtin", "set", "unset")
+        shadow = (
+            "builtin () {\n"
+            "    if [[ $1 == cd ]]; then shift; cd \"$@\"; return; fi\n"
+            f"    printf '%s\\n' builtin >> {_q(str(marker))}; return 0\n"
+            "}\n"
+            + "\n".join(
+                f"{name} () {{ printf '%s\\n' {name} >> {_q(str(marker))}; return 0; }}"
+                for name in ("set", "unset")
+            )
         )
-        login_profile = f"{shadow}\nordinary () {{ printf 'ordinary\\n'; }}\n"
+        login_profile = (
+            "export PROFILE_SENTINEL=profile-loaded\n"
+            f"{shadow}\nordinary () {{ printf 'ordinary-loaded\\n'; }}\n"
+        )
+        login_calls = []
 
         class LoginProfileEnv(_TestableEnv):
             def _run_bash(
                 self, cmd_string, *, login=False, timeout=120, stdin_data=None
             ):
+                login_calls.append(login)
                 script = f"{login_profile}{cmd_string}" if login else cmd_string
                 return subprocess.Popen(
                     ["/bin/bash", "--noprofile", "--norc", "-c", script],
@@ -428,9 +439,23 @@ class TestAtomicSnapshotWrite:
         env.init_session()
 
         assert env._snapshot_ready is False
-        assert env._prefer_nonlogin is True
+        assert env._prefer_nonlogin is False
         assert not snap.exists(), "bootstrap published a lossy function snapshot"
         assert not marker.exists(), "presence detection invoked a shadow function"
+
+        result = env.execute(
+            "printf 'ENV=%s\\n' \"$PROFILE_SENTINEL\"; "
+            "ordinary; "
+            "declare -F builtin set unset >/dev/null && printf 'FUNCTIONS=present\\n'"
+        )
+
+        assert result["returncode"] == 0, result["output"]
+        assert "ENV=profile-loaded" in result["output"]
+        assert "ordinary-loaded" in result["output"]
+        assert "FUNCTIONS=present" in result["output"]
+        assert login_calls == [True, True]
+        assert not snap.exists(), "fallback execute published a lossy snapshot"
+        assert not marker.exists(), "snapshot internals invoked a profile function"
 
     def test_readonly_shadow_functions_fail_bootstrap_closed(self, tmp_path):
         """A login profile can make dispatcher shadows readonly. Bootstrap
