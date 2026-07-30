@@ -37,6 +37,7 @@ from plugins.workflow.input_contract import (
     workflow_input_declarations,
 )
 from plugins.workflow.machine_contract import WorkflowConflict, projection_was_truncated
+from plugins.workflow.language_schema import DURABLE_METADATA_STRING_MAX_CHARS
 from plugins.workflow.lease_clock import (
     LeaseClockSample,
     lease_is_fresh,
@@ -51,6 +52,11 @@ from plugins.workflow.models import (
 from plugins.workflow.provenance import (
     TriggerProvenance,
     legacy_projection_provenance,
+)
+from plugins.workflow.output_resolution import (
+    ArchonOutputIntegrityError,
+    ArchonOutputUnavailableError,
+    _read_descriptor_relative,
 )
 from plugins.workflow.schedule_time import (
     ScheduleInstantError,
@@ -143,6 +149,29 @@ class ArtifactRef:
     sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class TypedPublicationCandidate:
+    attempt_relative_path: str
+    output_type: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    schema_fingerprint: str | None
+    canonicalization_version: int
+    session_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TypedPublicationRef:
+    publication_id: str
+    content_name: str
+    output_type: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    metadata_sha256: str
+
+
 @dataclass(frozen=True)
 class ForegroundExecutionLease:
     owner_id: str
@@ -220,6 +249,8 @@ _SECRET_DIAGNOSTIC = re.compile(
     r"(?i)(?:bearer\s+|(?:api[_ -]?key|token|password|secret)\s*[:=]\s*)"
     r"[^\s,;]+|\bsk-[A-Za-z0-9_-]{8,}\b"
 )
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_TYPED_PUBLICATION_METADATA_MAX_BYTES = 65_536
 
 
 def _utc_now() -> str:
@@ -394,6 +425,18 @@ def _atomic_text(path: Path, value: str) -> None:
         except OSError:
             pass
         raise
+
+
+def _typed_publication_fields(reference: TypedPublicationRef) -> dict[str, object]:
+    return {
+        "publication_id": reference.publication_id,
+        "content_name": reference.content_name,
+        "output_type": reference.output_type,
+        "media_type": reference.media_type,
+        "size_bytes": reference.size_bytes,
+        "sha256": reference.sha256,
+        "metadata_sha256": reference.metadata_sha256,
+    }
 
 
 def _file_ends_with_newline(path: Path) -> bool:
@@ -7052,12 +7095,170 @@ class RunStore:
                 )
             raise
 
+    def _publish_typed_bundle_locked(
+        self,
+        directory: Path,
+        projection: Mapping[str, object],
+        claim: NodeClaim,
+        artifacts: tuple[ArtifactRef, ...],
+        candidate: TypedPublicationCandidate,
+    ) -> TypedPublicationRef:
+        if (
+            not isinstance(candidate.attempt_relative_path, str)
+            or not candidate.attempt_relative_path
+            or not isinstance(candidate.output_type, str)
+            or not candidate.output_type.strip()
+            or len(candidate.output_type) > DURABLE_METADATA_STRING_MAX_CHARS
+            or not isinstance(candidate.media_type, str)
+            or not candidate.media_type
+            or len(candidate.media_type) > 128
+            or isinstance(candidate.size_bytes, bool)
+            or not isinstance(candidate.size_bytes, int)
+            or not 0 <= candidate.size_bytes <= 500_000
+            or not isinstance(candidate.sha256, str)
+            or _SHA256_PATTERN.fullmatch(candidate.sha256) is None
+            or (
+                candidate.schema_fingerprint is not None
+                and (
+                    not isinstance(candidate.schema_fingerprint, str)
+                    or _SHA256_PATTERN.fullmatch(candidate.schema_fingerprint) is None
+                )
+            )
+            or isinstance(candidate.canonicalization_version, bool)
+            or candidate.canonicalization_version != 1
+            or (
+                candidate.session_id is not None
+                and (
+                    not isinstance(candidate.session_id, str)
+                    or len(candidate.session_id)
+                    > DURABLE_METADATA_STRING_MAX_CHARS
+                )
+            )
+        ):
+            raise ArchonOutputIntegrityError(
+                "typed publication candidate is invalid"
+            )
+        language = projection.get("language")
+        language_profile = (
+            language.get("effective_profile")
+            if isinstance(language, Mapping)
+            else None
+        )
+        if language_profile != "archon-2026-07":
+            raise ArchonOutputIntegrityError(
+                "typed publication requires the Archon language profile"
+            )
+        matching = [
+            artifact
+            for artifact in artifacts
+            if artifact.relative_path == candidate.attempt_relative_path
+            and artifact.media_type == candidate.media_type
+            and artifact.size_bytes == candidate.size_bytes
+            and artifact.sha256 == candidate.sha256
+        ]
+        if len(matching) != 1:
+            raise ArchonOutputIntegrityError(
+                "typed publication candidate does not match one executor artifact"
+            )
+        try:
+            content = _read_descriptor_relative(
+                directory,
+                candidate.attempt_relative_path,
+                size_bytes=candidate.size_bytes,
+            )
+        except ArchonOutputUnavailableError as exc:
+            raise ArchonOutputIntegrityError(
+                "typed publication content is unavailable"
+            ) from exc
+        if (
+            len(content) != candidate.size_bytes
+            or _sha256(content) != candidate.sha256
+        ):
+            raise ArchonOutputIntegrityError(
+                "typed publication content digest does not match"
+            )
+
+        publication_id = uuid.uuid4().hex
+        content_name = (
+            "content.json"
+            if candidate.media_type == "application/json"
+            else "content.md"
+        )
+        metadata = {
+            "publication_id": publication_id,
+            "content_name": content_name,
+            "output_type": candidate.output_type,
+            "media_type": candidate.media_type,
+            "sha256": candidate.sha256,
+            "node_id": claim.node_id,
+            "attempt_id": claim.attempt_id,
+            "run_id": claim.run_id,
+            "language_profile": language_profile,
+            "schema_fingerprint": candidate.schema_fingerprint,
+            "size_bytes": candidate.size_bytes,
+            "produced_at": _utc_now(),
+            "session_id": candidate.session_id,
+            "canonicalization_version": candidate.canonicalization_version,
+        }
+        metadata_bytes = json.dumps(
+            metadata,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8") + b"\n"
+        if len(metadata_bytes) > _TYPED_PUBLICATION_METADATA_MAX_BYTES:
+            raise ArchonOutputIntegrityError(
+                "typed publication metadata exceeds its byte ceiling"
+            )
+
+        publications = directory / "publications"
+        publications.mkdir(mode=0o700, exist_ok=True)
+        _fsync_directory(directory)
+        staging = Path(
+            tempfile.mkdtemp(prefix=".staging-", dir=publications)
+        )
+        final = publications / publication_id
+        try:
+            if os.path.lexists(final):
+                raise ArchonOutputIntegrityError(
+                    "typed publication destination already exists"
+                )
+            for name, data in (
+                (content_name, content),
+                ("metadata.json", metadata_bytes),
+            ):
+                with (staging / name).open("xb") as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            _fsync_directory(staging)
+            if os.path.lexists(final):
+                raise ArchonOutputIntegrityError(
+                    "typed publication destination already exists"
+                )
+            os.rename(staging, final)
+            _fsync_directory(publications)
+        except BaseException:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            raise
+        return TypedPublicationRef(
+            publication_id=publication_id,
+            content_name=content_name,
+            output_type=candidate.output_type,
+            media_type=candidate.media_type,
+            size_bytes=candidate.size_bytes,
+            sha256=candidate.sha256,
+            metadata_sha256=_sha256(metadata_bytes),
+        )
+
     def complete_node(
         self,
         claim: NodeClaim,
         *,
         status: str,
         artifacts: Iterable[ArtifactRef] = (),
+        typed_publication: TypedPublicationCandidate | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
         metadata: Mapping[str, object] | None = None,
@@ -7071,6 +7272,7 @@ class RunStore:
             "paused",
         }:
             raise ValueError(f"invalid node completion state: {status}")
+        artifacts = tuple(artifacts)
         directory = self.run_directory(claim.run_id)
         with (
             self._terminal_completion_guard(claim),
@@ -7133,6 +7335,15 @@ class RunStore:
                         for key, value in dict(metadata or {}).items()
                         if key != "pending_interaction"
                     }
+            publication_ref = None
+            if status == "succeeded" and typed_publication is not None:
+                publication_ref = self._publish_typed_bundle_locked(
+                    directory,
+                    projection,
+                    claim,
+                    artifacts,
+                    typed_publication,
+                )
             node["state"] = status
             node.pop("claim", None)
             safe_error_message = _sanitize_diagnostic(error_message)
@@ -7196,6 +7407,12 @@ class RunStore:
                     "size_bytes": artifact.size_bytes,
                     "sha256": artifact.sha256,
                 }
+                if (
+                    publication_ref is not None
+                    and artifact.relative_path
+                    == typed_publication.attempt_relative_path
+                ):
+                    entry.update(_typed_publication_fields(publication_ref))
                 refs.append(entry)
                 if (claim.attempt_id, artifact.relative_path) not in existing_artifacts:
                     projection["artifacts"].append(entry)
@@ -9986,4 +10203,6 @@ __all__ = [
     "NodeClaim",
     "RunStore",
     "StorageQuotaError",
+    "TypedPublicationCandidate",
+    "TypedPublicationRef",
 ]

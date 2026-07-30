@@ -64,7 +64,12 @@ from plugins.workflow.output_resolution import (
 from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.schema import is_inline_script, load_workflow_snapshot
 from plugins.workflow.sessions import NodeSessionRegistry
-from plugins.workflow.store import NodeClaim, RunStore, StorageQuotaError
+from plugins.workflow.store import (
+    NodeClaim,
+    RunStore,
+    StorageQuotaError,
+    TypedPublicationCandidate,
+)
 from plugins.workflow.trust import (
     WORKFLOW_RESOURCE_MAX_FILE_BYTES,
     WORKFLOW_RESOURCE_MAX_FILES,
@@ -2401,6 +2406,28 @@ class RunScheduler:
                     candidate_identity
                 )
                 retained_candidate = result.primary_output
+            typed_publication = None
+            if (
+                retained_candidate is not None
+                and retained_candidate.output_type is not None
+            ):
+                session_id = completion_metadata.get("session_id")
+                typed_publication = TypedPublicationCandidate(
+                    attempt_relative_path=(
+                        retained_candidate.attempt_relative_path
+                    ),
+                    output_type=retained_candidate.output_type,
+                    media_type=retained_candidate.media_type,
+                    size_bytes=retained_candidate.size_bytes,
+                    sha256=retained_candidate.sha256,
+                    schema_fingerprint=(
+                        retained_candidate.schema_fingerprint
+                    ),
+                    canonicalization_version=(
+                        retained_candidate.canonicalization_version
+                    ),
+                    session_id=session_id if isinstance(session_id, str) else None,
+                )
             if retained_candidate is not None:
                 self._ensure_output_resolution_state()
                 with self._output_resolution_lock:
@@ -2413,6 +2440,7 @@ class RunScheduler:
                             claim,
                             status=result.status,
                             artifacts=result.artifacts,
+                            typed_publication=typed_publication,
                             error_code=result.error_code,
                             error_message=result.error_message,
                             metadata=completion_metadata,
