@@ -273,6 +273,68 @@ def test_fatal_and_unknown_side_effect_failures_are_not_retried(
         assert len(result["nodes"]["work"]["attempts"]) == 1
 
 
+def test_archon_trusted_structured_failure_is_terminal_without_freezing_legacy_retry(
+    tmp_path, workflow_writer
+):
+    def package_at(root, *, archon):
+        workflow = workflow_writer(
+            root,
+            name="archon-terminal" if archon else "legacy-retry",
+            nodes=[
+                {
+                    "id": "work",
+                    "prompt": "work",
+                    "retry": {
+                        "max_attempts": 3,
+                        "delay_ms": 1000,
+                        "on_error": "all",
+                    },
+                }
+            ],
+        )
+        if archon:
+            workflow.with_name("example.hermes.yaml").write_text(
+                "language_compatibility: archon-2026-07\n", encoding="utf-8"
+            )
+        return load_workflow(workflow)
+
+    class InvalidStructuredOutput:
+        def execute(self, _context):
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_invalid",
+                metadata={"archon_terminal_failure": True},
+            )
+
+    archon_store = RunStore(tmp_path / "archon-home")
+    archon = _start(
+        archon_store,
+        package_at(tmp_path / "archon-package", archon=True),
+        key="archon",
+    )
+    archon_scheduler = RunScheduler(archon_store)
+    archon_scheduler.executors["prompt"] = InvalidStructuredOutput()
+
+    archon_result = archon_scheduler.advance(archon.run_id)
+
+    assert archon_result["status"] == "failed"
+    assert len(archon_result["nodes"]["work"]["attempts"]) == 1
+
+    legacy_store = RunStore(tmp_path / "legacy-home")
+    legacy = _start(
+        legacy_store,
+        package_at(tmp_path / "legacy-package", archon=False),
+        key="legacy",
+    )
+    legacy_scheduler = RunScheduler(legacy_store)
+    legacy_scheduler.executors["prompt"] = InvalidStructuredOutput()
+
+    legacy_result = legacy_scheduler.advance(legacy.run_id)
+
+    assert legacy_result["status"] == "waiting_retry"
+    assert len(legacy_result["nodes"]["work"]["attempts"]) == 1
+
+
 def test_cancel_wins_over_due_retry_wakeup(tmp_path, workflow_writer):
     package = load_workflow(
         workflow_writer(

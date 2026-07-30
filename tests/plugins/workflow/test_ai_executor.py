@@ -1,29 +1,62 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
+from agent.structured_output import StructuredOutputStrategy, normalize_schema
+from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.models import (
     DeadlineBudget,
     RunExecutionLimits,
+    WorkflowLanguageProfile,
     WorkflowNode,
+    WorkflowStructuredOutput,
     freeze_value,
 )
 from plugins.workflow.resources import VariableContext
 
 
 class FakeAgentRunner:
-    def __init__(self, *responses: str):
+    def __init__(
+        self,
+        *responses: str,
+        provider_attempts: tuple[int, ...] | None = None,
+        model_calls: tuple[int, ...] | None = None,
+        audit_rows: tuple[dict[str, object], ...] | None = None,
+    ):
         self.requests = []
         self.responses = list(responses)
+        self.provider_attempts = provider_attempts
+        self.model_calls = model_calls
+        self.audit_rows = audit_rows
 
     def run(self, request, **_kwargs):
         self.requests.append(request)
+        index = len(self.requests) - 1
         output = self.responses.pop(0)
+        audit = dict(self.audit_rows[index]) if self.audit_rows else {}
+        structured_evidence = None
+        if request.structured_output is not None:
+            provider_attempts = (
+                self.provider_attempts[index] if self.provider_attempts else 1
+            )
+            model_calls = self.model_calls[index] if self.model_calls else 1
+            structured_evidence = {
+                "provider_attempts": provider_attempts,
+                "model_calls": model_calls,
+                "strategy": request.structured_output.strategy.value,
+                "adapter_version": request.structured_output.adapter_version,
+                "schema_fingerprint": (
+                    request.structured_output.schema.schema_fingerprint
+                ),
+                "declaration_source": "test",
+            }
+            audit.update(structured_evidence)
         return PluginAgentRunResult(
             final_response=output,
             session_id=f"session-{len(self.requests)}",
@@ -32,7 +65,8 @@ class FakeAgentRunner:
             status="completed",
             pending_interaction=None,
             usage={"input_tokens": 4, "output_tokens": 2},
-            audit={"tool_names": list(request.allowed_tools or ())},
+            audit={"tool_names": list(request.allowed_tools or ()), **audit},
+            structured_output=structured_evidence,
         )
 
 
@@ -50,7 +84,7 @@ def _node(node_id: str, prompt: str, **options) -> WorkflowNode:
 
 def _context(tmp_path: Path, node: WorkflowNode, **kwargs) -> NodeExecutionContext:
     run_directory = tmp_path / "run"
-    run_directory.mkdir(exist_ok=True)
+    run_directory.mkdir(parents=True, exist_ok=True)
     return NodeExecutionContext(
         run_id="run-1",
         run_directory=run_directory,
@@ -62,6 +96,45 @@ def _context(tmp_path: Path, node: WorkflowNode, **kwargs) -> NodeExecutionConte
             "model": "fake-model",
         }),
         variable_context=VariableContext(arguments="evidence", workflow_id="run-1"),
+        **kwargs,
+    )
+
+
+def _archon_context(
+    tmp_path: Path,
+    node: WorkflowNode,
+    *,
+    strategy: StructuredOutputStrategy = StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+    outward_action: bool = False,
+    **kwargs,
+) -> NodeExecutionContext:
+    def thaw(value):
+        if isinstance(value, dict) or hasattr(value, "items"):
+            return {str(key): thaw(item) for key, item in value.items()}
+        if isinstance(value, tuple | list):
+            return [thaw(item) for item in value]
+        return value
+
+    normalized = normalize_schema(thaw(node.options["output_format"]))
+    return _context(
+        tmp_path,
+        node,
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        structured_output=WorkflowStructuredOutput(
+            canonical_schema=normalized.canonical_schema,
+            schema_fingerprint=normalized.schema_fingerprint,
+        ),
+        structured_output_decision=StructuredOutputCapabilityDecision(
+            strategy=strategy,
+            effective_provider="fake-provider",
+            model="fake-model",
+            api_mode="chat_completions",
+            declaration_source="test",
+            adapter_version=1,
+            schema_fingerprint=normalized.schema_fingerprint,
+            rationale="test decision",
+        ),
+        outward_action=outward_action,
         **kwargs,
     )
 
@@ -139,6 +212,356 @@ def test_invalid_structured_output_fails_without_repairing_prose(tmp_path):
     assert result.status == "failed"
     assert result.error_code == "structured_output_invalid"
     assert not result.artifacts
+
+
+@pytest.mark.parametrize(
+    "provider_output",
+    [
+        '{"b":[true,null],"a":1}',
+        '  { "a" : 1, "b" : [ true, null ] }\n',
+    ],
+)
+def test_archon_structured_output_writes_one_canonical_primary_candidate(
+    tmp_path, provider_output
+):
+    runner = FakeAgentRunner(provider_output)
+    node = _node(
+        "canonical",
+        "Produce data",
+        output_type="analysis-result",
+        output_format={
+            "type": "object",
+            "required": ["a", "b"],
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"type": "array"},
+            },
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(_archon_context(tmp_path, node))
+
+    assert result.status == "succeeded"
+    assert runner.requests[0].structured_output is not None
+    assert result.primary_output is not None
+    assert result.primary_output.output_type == "analysis-result"
+    assert result.primary_output.media_type == "application/json"
+    assert result.primary_output.structured_value == {"a": 1, "b": (True, None)}
+    assert result.primary_output.schema_fingerprint == (
+        runner.requests[0].structured_output.schema.schema_fingerprint
+    )
+    output = tmp_path / "run" / result.primary_output.attempt_relative_path
+    assert output.read_bytes() == b'{"a":1,"b":[true,null]}'
+    assert result.artifacts[0].sha256 == result.primary_output.sha256
+
+
+@pytest.mark.parametrize(
+    ("provider_output", "case"),
+    [
+        ("I refuse to provide JSON", "refusal"),
+        ('{"answer":', "truncation"),
+        ('Result: {"answer":"ok"}', "prose"),
+        ('```json\n{"answer":"ok"}\n```', "fence"),
+        ('{"answer":"ok"} {"answer":"again"}', "multiple-values"),
+        ('{"answer":NaN}', "non-finite"),
+        ('"' + ("x" * 500_001) + '"', "oversize"),
+    ],
+    ids=(
+        "refusal",
+        "truncation",
+        "prose",
+        "fence",
+        "multiple-values",
+        "non-finite",
+        "oversize",
+    ),
+)
+@pytest.mark.parametrize(
+    "strategy",
+    (
+        StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+        StructuredOutputStrategy.NATIVE_JSON_MODE,
+    ),
+    ids=("native-schema", "native-json"),
+)
+def test_archon_native_invalid_output_is_terminal_and_never_repaired(
+    tmp_path, provider_output, case, strategy
+):
+    runner = FakeAgentRunner(provider_output)
+    node = _node(
+        "native-invalid",
+        "Produce data",
+        output_format={
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}},
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(
+        _archon_context(
+            tmp_path,
+            node,
+            strategy=strategy,
+        )
+    )
+
+    assert result.status == "failed", case
+    assert result.error_code == "structured_output_invalid"
+    assert result.metadata["archon_terminal_failure"] is True
+    assert result.metadata["repair_disposition"] == "ineligible_native_strategy"
+    assert len(runner.requests) == 1
+    assert provider_output not in repr(result.metadata)
+
+
+def test_prompt_adapter_repairs_once_in_a_fresh_action_free_request(tmp_path):
+    runner = FakeAgentRunner(
+        '{"answer":"wrong wrapper"} trailing',
+        '{"answer":"fixed"}',
+        provider_attempts=(1, 1),
+        model_calls=(2, 1),
+    )
+    node = _node(
+        "repairable",
+        "ORIGINAL TASK MUST NOT ENTER REPAIR",
+        allowed_tools=["read_file"],
+        fallbackModel="fallback-model",
+        systemPrompt="original system prompt",
+        agents={
+            "reviewer": {
+                "description": "review",
+                "prompt": "review it",
+            }
+        },
+        output_format={
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}},
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(
+        _archon_context(tmp_path, node, max_provider_attempts=3)
+    )
+
+    assert result.status == "succeeded"
+    assert len(runner.requests) == 2
+    repair = runner.requests[1]
+    assert repair.context_mode == "fresh"
+    assert repair.session_id is None
+    assert repair.allowed_tools == ()
+    assert repair.enabled_toolsets == ()
+    assert "delegate_task" in repair.denied_tools
+    assert repair.hooks == ()
+    assert repair.mcp_servers is None
+    assert repair.skills == ()
+    assert repair.inline_agents == {}
+    assert repair.fallback_model is None
+    assert repair.ephemeral_system_prompt is None
+    assert repair.max_iterations == 1
+    assert repair.max_api_attempts == 2
+    assert repair.reasoning_config is None
+    assert repair.request_overrides == {}
+    assert repair.sandbox_policy is None
+    assert repair.max_budget_usd is None
+    assert repair.approved_action_digest is None
+    repair_payload = json.loads(repair.prompt)
+    assert set(repair_payload) == {
+        "canonical_schema",
+        "invalid_response",
+        "validation_diagnostics",
+    }
+    assert repair_payload["invalid_response"] == (
+        '{"answer":"wrong wrapper"} trailing'
+    )
+    assert "ORIGINAL TASK MUST NOT ENTER REPAIR" not in repair.prompt
+    assert "original system prompt" not in repair.prompt
+    assert "wrong wrapper" in repair.prompt
+    assert '"required":["answer"]' in repair.prompt
+    assert "response contains trailing non-JSON content" in repair.prompt
+    assert result.metadata["usage"] == {"input_tokens": 8, "output_tokens": 4}
+    assert result.metadata["audit"]["provider_attempts"] == 2
+    assert result.metadata["audit"]["model_calls"] == 3
+    assert result.metadata["provider_attempts"] == 1
+    assert result.metadata["repair_disposition"] == "succeeded"
+    output = tmp_path / "run" / result.primary_output.attempt_relative_path
+    assert output.read_bytes() == b'{"answer":"fixed"}'
+
+
+@pytest.mark.parametrize(
+    ("context_changes", "runner_kwargs", "expected_disposition"),
+    [
+        ({"outward_action": True}, {}, "ineligible_outward_action"),
+        ({"is_cancelled": lambda: True}, {}, "ineligible_cancelled"),
+        ({"max_provider_attempts": 1}, {}, "ineligible_provider_attempts"),
+        ({}, {"model_calls": (90,)}, "ineligible_model_iterations"),
+        (
+            {},
+            {"audit_rows": ({"unknown_side_effect": True},)},
+            "ineligible_uncertain_effects",
+        ),
+    ],
+)
+def test_prompt_adapter_skips_repair_when_safety_or_attempt_allowance_is_gone(
+    tmp_path, context_changes, runner_kwargs, expected_disposition
+):
+    runner = FakeAgentRunner("not json", **runner_kwargs)
+    node = _node(
+        "not-repairable",
+        "work",
+        output_format={"type": "object"},
+    )
+
+    result = AgentNodeExecutor(runner).execute(
+        _archon_context(tmp_path, node, **context_changes)
+    )
+
+    assert result.error_code == "structured_output_invalid"
+    assert result.metadata["repair_disposition"] == expected_disposition
+    assert len(runner.requests) == 1
+
+
+def test_prompt_adapter_skips_repair_when_invalid_excerpt_cannot_be_bounded(tmp_path):
+    response = "x" * 256_001
+    runner = FakeAgentRunner(response)
+    node = _node(
+        "too-large-to-repair",
+        "work",
+        output_format={"type": "object"},
+    )
+
+    result = AgentNodeExecutor(runner).execute(_archon_context(tmp_path, node))
+
+    assert result.error_code == "structured_output_invalid"
+    assert result.metadata["repair_disposition"] == "ineligible_response_too_large"
+    assert len(runner.requests) == 1
+    assert response not in repr(result.metadata)
+
+
+def test_prompt_adapter_skips_repair_after_shared_wall_deadline_expires(tmp_path):
+    runner = FakeAgentRunner("not json")
+    node = _node(
+        "wall-exhausted",
+        "work",
+        output_format={"type": "object"},
+    )
+    times = iter((10.0, 31.0))
+    budget = DeadlineBudget.create(
+        now=10.0,
+        wall_seconds=20.0,
+        idle_seconds=8.0,
+        provider_seconds=6.0,
+    )
+
+    result = AgentNodeExecutor(runner).execute(
+        _archon_context(
+            tmp_path,
+            node,
+            deadline_budget=budget,
+            monotonic=lambda: next(times),
+        )
+    )
+
+    assert result.error_code == "structured_output_invalid"
+    assert result.metadata["repair_disposition"] == "ineligible_wall_time"
+    assert len(runner.requests) == 1
+
+
+def test_prompt_adapter_makes_only_one_repair_when_repair_is_still_invalid(tmp_path):
+    runner = FakeAgentRunner("not json", "still not json")
+    node = _node(
+        "repair-once",
+        "work",
+        output_format={"type": "object"},
+    )
+
+    result = AgentNodeExecutor(runner).execute(_archon_context(tmp_path, node))
+
+    assert result.error_code == "structured_output_invalid"
+    assert result.metadata["repair_disposition"] == "repair_invalid"
+    assert result.metadata["audit"]["provider_attempts"] == 2
+    assert result.metadata["audit"]["model_calls"] == 2
+    assert len(runner.requests) == 2
+    assert "still not json" not in repr(result.metadata)
+
+
+def test_archon_rejects_structured_audit_identity_that_differs_from_admission(
+    tmp_path,
+):
+    class MismatchedAuditRunner:
+        def __init__(self):
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            evidence = {
+                "provider_attempts": 1,
+                "model_calls": 1,
+                "strategy": StructuredOutputStrategy.NATIVE_JSON_SCHEMA.value,
+                "adapter_version": request.structured_output.adapter_version,
+                "schema_fingerprint": (
+                    request.structured_output.schema.schema_fingerprint
+                ),
+                "declaration_source": "test",
+            }
+            return PluginAgentRunResult(
+                final_response="{}",
+                session_id="session",
+                provider="fake-provider",
+                model="fake-model",
+                status="completed",
+                pending_interaction=None,
+                usage={},
+                audit=evidence,
+                structured_output=evidence,
+            )
+
+    runner = MismatchedAuditRunner()
+    node = _node(
+        "audit-drift",
+        "work",
+        output_format={"type": "object"},
+    )
+
+    result = AgentNodeExecutor(runner).execute(_archon_context(tmp_path, node))
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_capability_drift"
+    assert result.metadata["archon_terminal_failure"] is True
+    assert len(runner.requests) == 1
+    assert not (tmp_path / "run" / "nodes").exists()
+
+
+def test_archon_cache_fingerprint_includes_sealed_schema_identity(tmp_path):
+    runner = FakeAgentRunner('{"value":1}', '{"value":"one"}')
+    integer_node = _node(
+        "same-node",
+        "work",
+        output_format={
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+        },
+    )
+    string_node = _node(
+        "same-node",
+        "work",
+        output_format={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+        },
+    )
+
+    integer_result = AgentNodeExecutor(runner).execute(
+        _archon_context(tmp_path / "integer", integer_node)
+    )
+    string_result = AgentNodeExecutor(runner).execute(
+        _archon_context(tmp_path / "string", string_node)
+    )
+
+    assert (
+        integer_result.metadata["cache_fingerprint"]
+        != string_result.metadata["cache_fingerprint"]
+    )
 
 
 def test_shared_context_resumes_only_one_compatible_predecessor(tmp_path):

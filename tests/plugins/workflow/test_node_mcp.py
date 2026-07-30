@@ -33,7 +33,12 @@ from plugins.workflow.resources import (
 )
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from tools.registry import registry
-from tests.plugins.workflow.test_ai_executor import FakeAgentRunner, _context, _node
+from tests.plugins.workflow.test_ai_executor import (
+    FakeAgentRunner,
+    _archon_context,
+    _context,
+    _node,
+)
 from tools.mcp_tool import _interpolate_env_vars
 
 
@@ -1458,6 +1463,35 @@ def test_node_executor_passes_only_its_snapshotted_mcp_mapping(tmp_path):
 
     assert result.status == "succeeded"
     assert set(runner.requests[0].mcp_servers) == {"node_echo"}
+
+
+def test_structured_repair_does_not_restart_original_mcp_servers(tmp_path):
+    runner = FakeAgentRunner("not json", '{"answer":"fixed"}')
+    node = _node(
+        "mcp-repair",
+        "work",
+        mcp="echo",
+        output_format={
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}},
+        },
+    )
+    relative = "mcp/echo.yaml"
+    context = _archon_context(
+        tmp_path,
+        node,
+        sealed_resource_paths=frozenset({relative}),
+        sealed_resource_bytes={
+            relative: b"node_echo:\n  command: echo\n  args: [ok]\n"
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(context)
+
+    assert result.status == "succeeded"
+    assert set(runner.requests[0].mcp_servers) == {"node_echo"}
+    assert runner.requests[1].mcp_servers is None
 
 
 def test_real_plugin_agent_runs_request_mcp_and_reaps_it(tmp_path):

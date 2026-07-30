@@ -21,6 +21,8 @@ import uuid
 from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
 
+from agent.structured_output import StructuredOutputStrategy
+from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow.entitlement import AIEntitlementResolution, derive_ai_entitlement
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.approval import ApprovalExecutor
@@ -83,6 +85,17 @@ _LEGACY_NON_PACKAGE_FILES = frozenset(
 _LEGACY_NON_PACKAGE_ROOTS = frozenset(
     {"artifacts", "inputs", "node-agent-skills", "node-skills", "nodes"}
 )
+
+_SEALED_STRUCTURED_DECISION_FIELDS = frozenset({
+    "strategy",
+    "effective_provider",
+    "model",
+    "api_mode",
+    "declaration_source",
+    "adapter_version",
+    "schema_fingerprint",
+    "rationale",
+})
 
 
 class ConditionEvaluationError(ValueError):
@@ -151,6 +164,57 @@ def compute_retry_delay(
     factor = min(max(float(jitter()), 0.0), 1.0)
     base = (policy.delay_ms / 1000.0) * (2 ** (attempt - 1))
     return min(60.0, base * (0.5 + factor))
+
+
+def _sealed_structured_output_decision(
+    projection: Mapping[str, object],
+    node_id: str,
+    schema_fingerprint: str,
+) -> StructuredOutputCapabilityDecision:
+    metadata = projection.get("run_metadata")
+    key = (
+        "structured_output_decision."
+        + hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:16]
+    )
+    raw = metadata.get(key) if isinstance(metadata, Mapping) else None
+    if not isinstance(raw, str):
+        raise ValueError("sealed structured-output decision is missing")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("sealed structured-output decision is malformed") from exc
+    if not isinstance(value, Mapping) or set(value) != _SEALED_STRUCTURED_DECISION_FIELDS:
+        raise ValueError("sealed structured-output decision is malformed")
+    try:
+        decision = StructuredOutputCapabilityDecision(
+            strategy=StructuredOutputStrategy(value["strategy"]),
+            effective_provider=value["effective_provider"],
+            model=value["model"],
+            api_mode=value["api_mode"],
+            declaration_source=value["declaration_source"],
+            adapter_version=value["adapter_version"],
+            schema_fingerprint=value["schema_fingerprint"],
+            rationale=value["rationale"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("sealed structured-output decision is malformed") from exc
+    if (
+        decision.schema_fingerprint != schema_fingerprint
+        or type(decision.adapter_version) is not int
+        or decision.adapter_version <= 0
+        or any(
+            not isinstance(item, str)
+            for item in (
+                decision.effective_provider,
+                decision.model,
+                decision.api_mode,
+                decision.declaration_source,
+                decision.rationale,
+            )
+        )
+    ):
+        raise ValueError("sealed structured-output decision is contradictory")
+    return decision
 
 
 def evaluate_trigger_rule(rule: str, dependency_states: Iterable[str]) -> bool | None:
@@ -1760,6 +1824,18 @@ class RunScheduler:
                     if not self._renew_execution_owner(run_id):
                         self.store.release_claim_before_execution(claim)
                         return
+                    structured_output = package.language.structured_outputs.get(
+                        node.id
+                    )
+                    structured_output_decision = (
+                        _sealed_structured_output_decision(
+                            projection,
+                            node.id,
+                            structured_output.schema_fingerprint,
+                        )
+                        if structured_output is not None
+                        else None
+                    )
                     result = executor.execute(
                         NodeExecutionContext(
                             run_id=run_id,
@@ -1839,6 +1915,13 @@ class RunScheduler:
                             ),
                             sealed_resource_paths=sealed_resource_paths,
                             sealed_resource_bytes=sealed_resource_bytes,
+                            language_profile=package.language.effective_profile,
+                            structured_output=structured_output,
+                            structured_output_decision=structured_output_decision,
+                            outward_action=(
+                                node.id
+                                in package.sidecar.get("outward_action_nodes", ())
+                            ),
                             monotonic=self._monotonic,
                             termination_policy=TerminationPolicy(
                                 cooperative_grace_seconds=(
@@ -1925,10 +2008,18 @@ class RunScheduler:
             "resource_limit",
             "cleanup_failed",
         }
+        snapshot = read_language_snapshot(projection.get("language"))
+        archon_terminal_failure = (
+            snapshot is not None
+            and snapshot.effective_profile
+            is WorkflowLanguageProfile.ARCHON_2026_07
+            and result.metadata.get("archon_terminal_failure") is True
+        )
         if (
             policy.on_error == "all"
             and failure is FailureClass.FATAL
             and result.error_code not in never_retry
+            and not archon_terminal_failure
         ):
             failure = FailureClass.TRANSIENT
         metadata = {**result.metadata, "retry_consumed": consumed}

@@ -7,8 +7,16 @@ from pathlib import Path
 import time
 from typing import Any, BinaryIO, Callable, Mapping, Protocol
 
+from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow.entitlement import AIEntitlementResolution
-from plugins.workflow.models import DeadlineBudget, RunExecutionLimits, WorkflowNode
+from plugins.workflow.models import (
+    DeadlineBudget,
+    RunExecutionLimits,
+    WorkflowLanguageProfile,
+    WorkflowNode,
+    WorkflowStructuredOutput,
+)
+from plugins.workflow.output_resolution import PrimaryOutputCandidate
 from plugins.workflow.store import ArtifactRef
 from tools.managed_process import (
     ProcessIdentity,
@@ -63,6 +71,10 @@ class NodeExecutionContext:
     )
     sealed_resource_paths: frozenset[str] | None = None
     sealed_resource_bytes: Mapping[str, bytes] | None = None
+    language_profile: WorkflowLanguageProfile = WorkflowLanguageProfile.HERMES_LEGACY
+    structured_output: WorkflowStructuredOutput | None = None
+    structured_output_decision: StructuredOutputCapabilityDecision | None = None
+    outward_action: bool = False
 
 
 @dataclass(frozen=True)
@@ -72,6 +84,7 @@ class NodeExecutionResult:
     error_code: str | None = None
     error_message: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
+    primary_output: PrimaryOutputCandidate | None = None
 
 
 def validated_provider_retry_count(

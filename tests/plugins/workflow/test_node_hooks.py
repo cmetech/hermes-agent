@@ -10,7 +10,12 @@ from agent.plugin_agent_worker import (
 )
 from plugins.workflow.compat import MAPPED_HOOK_EVENTS, UNSUPPORTED_HOOK_EVENTS
 from plugins.workflow.executors.ai import AgentNodeExecutor
-from tests.plugins.workflow.test_ai_executor import FakeAgentRunner, _context, _node
+from tests.plugins.workflow.test_ai_executor import (
+    FakeAgentRunner,
+    _archon_context,
+    _context,
+    _node,
+)
 
 
 def _response(event, **specific):
@@ -139,6 +144,33 @@ def test_node_executor_sends_only_declared_hooks_to_isolated_worker(tmp_path):
     assert result.status == "succeeded"
     assert runner.requests[0].hooks[0]["event"] == "PreToolUse"
     assert runner.requests[0].hooks[0]["matcher"] == "^read_file$"
+
+
+def test_structured_repair_does_not_reinstall_original_node_hooks(tmp_path):
+    runner = FakeAgentRunner("not json", '{"answer":"fixed"}')
+    node = _node(
+        "hooked-repair",
+        "work",
+        hooks={
+            "PreToolUse": [
+                {
+                    "matcher": "^read_file$",
+                    "response": _response("PreToolUse", permissionDecision="deny"),
+                }
+            ]
+        },
+        output_format={
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}},
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(_archon_context(tmp_path, node))
+
+    assert result.status == "succeeded"
+    assert runner.requests[0].hooks
+    assert runner.requests[1].hooks == ()
 
 
 def test_installed_pre_tool_hook_rewrites_then_blocks_matching_call(monkeypatch):

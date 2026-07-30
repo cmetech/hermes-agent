@@ -8,7 +8,12 @@ from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 
-from tests.plugins.workflow.test_ai_executor import FakeAgentRunner, _context, _node
+from tests.plugins.workflow.test_ai_executor import (
+    FakeAgentRunner,
+    _archon_context,
+    _context,
+    _node,
+)
 
 
 def test_ordinary_node_denies_raw_delegation_and_has_no_inline_agents(tmp_path):
@@ -49,6 +54,34 @@ def test_declared_agents_are_scoped_and_aliases_resolve_without_delegate(tmp_pat
     assert child["denied_tools"] == ["terminal", "delegate_task"]
     assert child["max_iterations"] == 3
     assert "delegate_task" in runner.requests[0].denied_tools
+
+
+def test_structured_repair_has_no_inline_agents_or_delegation_surface(tmp_path):
+    runner = FakeAgentRunner("not json", '{"answer":"fixed"}')
+    node = _node(
+        "agent-repair",
+        "coordinate",
+        agents={
+            "reviewer": {
+                "description": "Review evidence",
+                "prompt": "Review it",
+            }
+        },
+        output_format={
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}},
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(_archon_context(tmp_path, node))
+
+    assert result.status == "succeeded"
+    assert runner.requests[0].inline_agents
+    assert runner.requests[1].inline_agents == {}
+    assert runner.requests[1].allowed_tools == ()
+    assert runner.requests[1].enabled_toolsets == ()
+    assert "delegate_task" in runner.requests[1].denied_tools
 
 
 @pytest.mark.parametrize("mutation", ["delete", "rename", "replace"])
