@@ -42,22 +42,83 @@ class ExecutionCapabilityContext:
     runtime_capabilities: ExecutionRuntimeCapabilities
     mcp_available: bool
 
+    def _runtime_capabilities_for_node(
+        self,
+        package: "WorkflowPackage",
+        node_id: str,
+    ) -> ExecutionRuntimeCapabilities:
+        """Classify the provider route the executor will use for one node."""
+        node = next(node for node in package.definition.nodes if node.id == node_id)
+        workflow_provider = package.definition.options.get("provider")
+        node_provider = node.options.get("provider")
+        configured_provider = node_provider or workflow_provider
+        configured_model = node.options.get("model") or package.definition.options.get(
+            "model"
+        )
+        if not isinstance(configured_provider, str) or not configured_provider.strip():
+            if not isinstance(configured_model, str) or not configured_model.strip():
+                return self.runtime_capabilities
+            return ExecutionRuntimeCapabilities(
+                api_mode=self.runtime_capabilities.api_mode,
+                hermes_managed_tool_loop=(
+                    self.runtime_capabilities.hermes_managed_tool_loop
+                ),
+                effective_provider=self.runtime_capabilities.effective_provider,
+                model=configured_model.strip(),
+                base_url_trust_class=(
+                    self.runtime_capabilities.base_url_trust_class
+                ),
+                declared_structured_output_strategy=(
+                    self.runtime_capabilities.declared_structured_output_strategy
+                ),
+                structured_output_declaration_source=(
+                    self.runtime_capabilities.structured_output_declaration_source
+                ),
+            )
+
+        provider = configured_provider.strip()
+        model = configured_model.strip() if isinstance(configured_model, str) else ""
+        return classify_execution_runtime(
+            provider=provider,
+            model_config={"provider": provider, "default": model},
+            target_model=model or None,
+        )
+
     def structured_output_decisions(
         self,
         package: "WorkflowPackage",
     ) -> Mapping[str, StructuredOutputCapabilityDecision]:
         """Return immutable per-node decisions for sealed Archon schemas."""
         decisions: dict[str, StructuredOutputCapabilityDecision] = {}
-        nodes_by_id = {node.id: node for node in package.definition.nodes}
         for node_id, output in sorted(package.language.structured_outputs.items()):
-            node = nodes_by_id[node_id]
-            configured_model = node.options.get("model")
+            runtime_capabilities = self._runtime_capabilities_for_node(
+                package, node_id
+            )
             decisions[node_id] = resolve_structured_output_capability(
-                self.runtime_capabilities,
+                runtime_capabilities,
                 schema_fingerprint=output.schema_fingerprint,
-                model=(configured_model if isinstance(configured_model, str) else None),
             )
         return MappingProxyType(decisions)
+
+    def structured_output_identity_material(
+        self,
+        package: "WorkflowPackage",
+    ) -> tuple[dict[str, object], ...]:
+        """Return canonical schema-free material for every sealed decision."""
+        return tuple(
+            {
+                "node_id": node_id,
+                "strategy": decision.strategy.value,
+                "effective_provider": decision.effective_provider,
+                "model": decision.model,
+                "api_mode": decision.api_mode,
+                "declaration_source": decision.declaration_source,
+                "adapter_version": decision.adapter_version,
+                "schema_fingerprint": decision.schema_fingerprint,
+                "rationale": decision.rationale,
+            }
+            for node_id, decision in self.structured_output_decisions(package).items()
+        )
 
     def structured_output_run_metadata(
         self,
@@ -98,12 +159,16 @@ class ExecutionCapabilityContext:
             "declaration_source": decision.declaration_source,
             "effective_provider": decision.effective_provider,
             "model": decision.model,
+            "rationale": decision.rationale,
+            "schema_fingerprint": decision.schema_fingerprint,
             "strategy": decision.strategy.value,
         }
 
-    @property
-    def identity_digest(self) -> str:
-        """Return the canonical identity sealed for scheduled revalidation."""
+    def _identity_digest(
+        self,
+        structured_output_decisions: object,
+    ) -> str:
+        """Hash shared execution authority plus structured-output decisions."""
         material = json.dumps(
             {
                 "entitlement": self.entitlement.value,
@@ -124,15 +189,22 @@ class ExecutionCapabilityContext:
                 "runtime_declared_structured_output_strategy": (
                     self.runtime_capabilities.declared_structured_output_strategy
                 ),
-                "structured_output_decision": (
-                    self._structured_output_runtime_identity
-                ),
+                "structured_output_decisions": structured_output_decisions,
                 "surface": self.surface,
             },
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(material).hexdigest()
+
+    @property
+    def identity_digest(self) -> str:
+        """Return the package-independent runtime identity for early checks."""
+        return self._identity_digest((self._structured_output_runtime_identity,))
+
+    def identity_digest_for(self, package: "WorkflowPackage") -> str:
+        """Return the identity sealing complete actual per-node decisions."""
+        return self._identity_digest(self.structured_output_identity_material(package))
 
 
 @dataclass(frozen=True, slots=True)

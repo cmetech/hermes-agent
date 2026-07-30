@@ -284,7 +284,8 @@ def test_scheduled_admission_persists_exact_fire_time_identity(
     assert metadata["package_digest"] == run["definition_digest"]
     assert metadata["risk_digest"]
     assert metadata["execution_identity"]
-    assert metadata["execution_identity"] == context.identity_digest
+    assert metadata["execution_identity"] == context.identity_digest_for(package)
+    assert metadata["execution_runtime_identity"] == context.identity_digest
     assert metadata["sealed_snapshot_digest"] == (
         scheduled_revalidation_module.sealed_snapshot_digest(
             store.run_directory(str(result["run_id"]))
@@ -364,7 +365,12 @@ def test_same_binding_refreshes_runtime_before_scheduled_admission(
         structured_output_declaration_source="provider_profile",
     )
     admitted = store.load_run(run_id)
-    assert admitted["run_metadata"]["execution_identity"] == context.identity_digest
+    assert admitted["run_metadata"]["execution_identity"] == (
+        context.identity_digest_for(_package)
+    )
+    assert admitted["run_metadata"]["execution_runtime_identity"] == (
+        context.identity_digest
+    )
 
     succeeded = _advance_with_binding(
         store,
@@ -378,7 +384,7 @@ def test_same_binding_refreshes_runtime_before_scheduled_admission(
     assert succeeded["status"] == "succeeded"
     assert succeeded["last_error"] is None
     assert succeeded["schedule_revalidation"]["execution_identity"] == (
-        context.identity_digest
+        context.identity_digest_for(_package)
     )
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -160,9 +160,9 @@ def test_execution_context_seals_structured_output_decisions_into_identity(
     )
     package = load_workflow(path)
     direct_runtime = classify_execution_runtime(
-        provider="openrouter",
+        provider="openai-api",
         model_config={
-            "provider": "openrouter",
+            "provider": "openai-api",
             "default": "gpt-5.4",
             "base_url": "https://api.openai.com/v1",
         },
@@ -240,9 +240,9 @@ def _runtime_binding(runtime, *, runtime_provider=None):
 
 def _direct_openai_runtime():
     return classify_execution_runtime(
-        provider="openrouter",
+        provider="openai-api",
         model_config={
-            "provider": "openrouter",
+            "provider": "openai-api",
             "default": "gpt-5.4",
             "base_url": "https://api.openai.com/v1",
         },
@@ -250,6 +250,160 @@ def _direct_openai_runtime():
             "api_mode": "codex_responses",
             "base_url": "https://api.openai.com/v1",
         },
+    )
+
+
+def test_package_identity_seals_complete_actual_structured_output_decisions(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    first = _structured_package(tmp_path / "first", workflow_writer, name="first")
+    second_path = workflow_writer(
+        tmp_path / "second",
+        name="second",
+        nodes=[
+            {
+                "id": "producer",
+                "prompt": "Return a report",
+                "output_format": {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer"}},
+                },
+            }
+        ],
+    )
+    second_path.with_name(f"{second_path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    second = load_workflow(second_path)
+    baseline_runtime = _direct_openai_runtime()
+
+    def context(runtime):
+        return execution_capability_context(
+            surface="background",
+            entitlement=AIEntitlementResolution("real"),
+            runner_capabilities=RunnerCapabilities(starts_request_mcp=True),
+            runtime_capabilities=runtime,
+        )
+
+    baseline = context(baseline_runtime)
+    changed_declaration = context(
+        replace(
+            baseline_runtime,
+            structured_output_declaration_source="provider_profile",
+        )
+    )
+    changed_provider = context(
+        replace(baseline_runtime, effective_provider="different-provider")
+    )
+    changed_model = context(replace(baseline_runtime, model="different-model"))
+
+    identity = baseline.identity_digest_for(first)
+    assert identity == baseline.identity_digest_for(first)
+    assert identity != baseline.identity_digest_for(second)
+    assert identity != changed_declaration.identity_digest_for(first)
+    assert identity != changed_provider.identity_digest_for(first)
+    assert identity != changed_model.identity_digest_for(first)
+    assert baseline.structured_output_decisions(first)["producer"].rationale == (
+        baseline.structured_output_identity_material(first)[0]["rationale"]
+    )
+
+
+def test_per_node_provider_overrides_seal_distinct_truthful_decisions(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    path = workflow_writer(
+        tmp_path,
+        name="per-node-provider-decisions",
+        nodes=[
+            {
+                "id": "anthropic-node",
+                "prompt": "Return Anthropic JSON",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "output_format": {"type": "object"},
+            },
+            {
+                "id": "openrouter-node",
+                "prompt": "Return aggregator JSON",
+                "provider": "openrouter",
+                "model": "openai/gpt-5.4",
+                "output_format": {"type": "object"},
+            },
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(path)
+    context = execution_capability_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+        runner_capabilities=RunnerCapabilities(starts_request_mcp=True),
+        runtime_capabilities=_direct_openai_runtime(),
+    )
+
+    decisions = context.structured_output_decisions(package)
+    metadata = {
+        json.loads(value)["effective_provider"]: json.loads(value)
+        for value in context.structured_output_run_metadata(package).values()
+    }
+
+    assert decisions["anthropic-node"].effective_provider == "anthropic"
+    assert decisions["anthropic-node"].model == "claude-sonnet-4-6"
+    assert decisions["anthropic-node"].strategy is (
+        StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+    )
+    assert decisions["openrouter-node"].effective_provider == "openrouter"
+    assert decisions["openrouter-node"].model == "openai/gpt-5.4"
+    assert decisions["openrouter-node"].strategy is (
+        StructuredOutputStrategy.PROMPT_JSON_SCHEMA
+    )
+    assert set(metadata) == {"anthropic", "openrouter"}
+    assert metadata["anthropic"]["strategy"] == "native_json_schema"
+    assert metadata["openrouter"]["strategy"] == "prompt_json_schema"
+
+
+def test_unknown_node_provider_override_is_unsupported_and_blocks(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    path = workflow_writer(
+        tmp_path,
+        name="unsupported-node-provider",
+        nodes=[
+            {
+                "id": "unsupported-node",
+                "prompt": "Return JSON",
+                "provider": "unconfigured-provider",
+                "model": "unknown-model",
+                "output_format": {"type": "object"},
+            }
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(path)
+    context = execution_capability_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+        runner_capabilities=RunnerCapabilities(starts_request_mcp=True),
+        runtime_capabilities=_direct_openai_runtime(),
+    )
+
+    compatibility, _risk = runner_binding_module.assess_package_execution(
+        package, context
+    )
+
+    assert context.structured_output_decisions(package)[
+        "unsupported-node"
+    ].strategy is StructuredOutputStrategy.UNSUPPORTED
+    assert compatibility.runnable is False
+    assert any(
+        finding.code == "structured_output_strategy_unsupported"
+        for finding in compatibility.blocking_findings
     )
 
 
@@ -345,7 +499,12 @@ def test_scheduled_admission_seals_complete_decision_and_detects_provider_drift(
         "rationale",
     }
     assert sealed["strategy"] == "native_json_schema"
-    assert run["run_metadata"]["execution_identity"] == admitted_context.identity_digest
+    assert run["run_metadata"]["execution_identity"] == (
+        admitted_context.identity_digest_for(package)
+    )
+    assert run["run_metadata"]["execution_runtime_identity"] == (
+        admitted_context.identity_digest
+    )
 
     current["runtime"] = classify_execution_runtime(
         provider="openrouter",

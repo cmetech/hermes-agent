@@ -454,10 +454,31 @@ def _structured_output_runtime_declaration(
     )
     hostname = (base_url_hostname(effective_base_url) or "").lower()
 
-    # Hermes historically labels a direct OpenAI API-key route as openrouter.
-    # The exact official host is the authority that safely recovers its actual
-    # provider identity. A user-selected generic custom route remains custom.
-    if hostname == "api.openai.com" and normalized_provider != "custom":
+    declared_strategy = None
+    declaration_source = None
+    if profile is not None and profile.structured_output_strategy is not None:
+        candidate = str(profile.structured_output_strategy).strip().lower()
+        if candidate in {strategy.value for strategy in StructuredOutputStrategy}:
+            declared_strategy = candidate
+            declaration_source = "provider_profile"
+
+    # Explicit provider declarations are authoritative. In particular, a
+    # provider that forbids adaptation cannot be promoted merely because its
+    # configured URL happens to use an official-looking hostname.
+    if declared_strategy == StructuredOutputStrategy.UNSUPPORTED.value:
+        return (
+            normalized_provider,
+            "unknown",
+            declared_strategy,
+            declaration_source,
+        )
+
+    # Native OpenAI support belongs only to Hermes' built-in API-key identity.
+    # Hostname alone is not provider authority: OAuth Codex, custom profiles,
+    # and arbitrary provider names can all be configured with the same URL.
+    if normalized_provider == "openai-api" and (
+        hostname == "api.openai.com" or not effective_base_url
+    ):
         strategy = (
             StructuredOutputStrategy.NATIVE_JSON_SCHEMA.value
             if api_mode in {"chat_completions", "codex_responses"}
@@ -475,14 +496,6 @@ def _structured_output_runtime_declaration(
         trust_class = "custom"
     else:
         trust_class = "unknown"
-
-    declared_strategy = None
-    declaration_source = None
-    if profile is not None and profile.structured_output_strategy is not None:
-        candidate = str(profile.structured_output_strategy).strip().lower()
-        if candidate in {strategy.value for strategy in StructuredOutputStrategy}:
-            declared_strategy = candidate
-            declaration_source = "provider_profile"
 
     return (
         normalized_provider,

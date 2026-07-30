@@ -605,9 +605,9 @@ class TestBaseProfile:
     ("provider", "model_config", "provider_config", "expected_strategy"),
     [
         pytest.param(
-            "openrouter",
+            "openai-api",
             {
-                "provider": "openrouter",
+                "provider": "openai-api",
                 "default": "gpt-5.4",
                 "base_url": "https://api.openai.com/v1",
             },
@@ -616,9 +616,9 @@ class TestBaseProfile:
             id="direct-openai-responses",
         ),
         pytest.param(
-            "openrouter",
+            "openai-api",
             {
-                "provider": "openrouter",
+                "provider": "openai-api",
                 "default": "gpt-4.1",
                 "base_url": "https://api.openai.com/v1",
             },
@@ -695,6 +695,34 @@ class TestBaseProfile:
             StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
             id="chatgpt-subscription-is-not-native",
         ),
+        pytest.param(
+            "openai-codex",
+            {
+                "provider": "openai-codex",
+                "default": "gpt-5.4-codex",
+                "base_url": "https://api.openai.com/v1",
+            },
+            {
+                "api_mode": "codex_responses",
+                "base_url": "https://api.openai.com/v1",
+            },
+            StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            id="openai-codex-cannot-promote-on-openai-host",
+        ),
+        pytest.param(
+            "arbitrary-provider",
+            {
+                "provider": "arbitrary-provider",
+                "default": "arbitrary-model",
+                "base_url": "https://api.openai.com/v1",
+            },
+            {
+                "api_mode": "chat_completions",
+                "base_url": "https://api.openai.com/v1",
+            },
+            StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            id="arbitrary-identity-cannot-promote-on-openai-host",
+        ),
     ],
 )
 def test_structured_output_capability_matrix_is_authority_based(
@@ -734,6 +762,44 @@ def test_explicit_unsupported_declaration_forbids_prompt_adaptation():
     decision = resolve_structured_output_capability(
         runtime,
         schema_fingerprint="b" * 64,
+    )
+
+    assert decision.strategy is StructuredOutputStrategy.UNSUPPORTED
+    assert decision.declaration_source == "explicit_unsupported"
+
+
+def test_explicit_unsupported_profile_wins_even_on_openai_host(monkeypatch):
+    import providers
+
+    original_get = providers.get_provider_profile
+
+    def profile_for(name):
+        if name == "locked-openai-host":
+            return ProviderProfile(
+                name=name,
+                api_mode="chat_completions",
+                base_url="https://api.openai.com/v1",
+                structured_output_strategy="unsupported",
+            )
+        return original_get(name)
+
+    monkeypatch.setattr(providers, "get_provider_profile", profile_for)
+
+    runtime = classify_execution_runtime(
+        provider="locked-openai-host",
+        model_config={
+            "provider": "locked-openai-host",
+            "default": "locked-model",
+            "base_url": "https://api.openai.com/v1",
+        },
+        provider_config={
+            "api_mode": "chat_completions",
+            "base_url": "https://api.openai.com/v1",
+        },
+    )
+    decision = resolve_structured_output_capability(
+        runtime,
+        schema_fingerprint="c" * 64,
     )
 
     assert decision.strategy is StructuredOutputStrategy.UNSUPPORTED

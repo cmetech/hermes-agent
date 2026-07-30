@@ -476,7 +476,10 @@ def revalidate_scheduled_run(
     if not isinstance(run_id, str) or not isinstance(state_version, int):
         raise ScheduledRunRevalidationError("scheduled run identity is missing")
     execution_identity = _required_digest(metadata, "execution_identity")
-    if execution_identity != execution_capability_context.identity_digest:
+    execution_runtime_identity = _required_digest(
+        metadata, "execution_runtime_identity"
+    )
+    if execution_runtime_identity != execution_capability_context.identity_digest:
         raise ScheduledRunRevalidationError("execution capability changed")
     package_identity = _required_digest(metadata, "package_digest")
     risk_identity = _required_digest(metadata, "risk_digest")
@@ -505,11 +508,17 @@ def revalidate_scheduled_run(
                 read_budget=budget,
                 force_reverify=True,
             )
+            if execution_identity != execution_capability_context.identity_digest_for(
+                verified.package
+            ):
+                raise ScheduledRunRevalidationError("execution capability changed")
             compatibility, risk = assess_package_execution(
                 verified.package,
                 execution_capability_context,
                 read_budget=budget,
             )
+        except ScheduledRunRevalidationError:
+            raise
         except Exception as exc:
             raise ScheduledRunRevalidationError("showcase verification failed") from exc
         comparisons = (
@@ -532,6 +541,10 @@ def revalidate_scheduled_run(
                 run,
                 hermes_home=Path(hermes_home),
             )
+            if execution_identity != execution_capability_context.identity_digest_for(
+                package
+            ):
+                raise ScheduledRunRevalidationError("execution capability changed")
             live_digest = compute_package_digest(package, read_budget=budget).sha256
             compatibility, risk = assess_package_execution(
                 package,

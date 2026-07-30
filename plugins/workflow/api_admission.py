@@ -506,7 +506,8 @@ def start_api_run(
             "catalog_source": (
                 "showcase" if verified_showcase is not None else str(package.source)
             ),
-            "execution_identity": execution_context.identity_digest,
+            "execution_identity": execution_context.identity_digest_for(package),
+            "execution_runtime_identity": execution_context.identity_digest,
             "package_digest": package_digest.sha256,
             "risk_digest": risk.risk_digest,
             "schedule_at": schedule_at,
