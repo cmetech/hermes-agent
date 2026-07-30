@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+from scripts import run_tests_parallel
+
 
 # Both tests share the same handoff file: the leaker writes here, the
 # verifier reads here. We park it in $TMPDIR with a unique-per-run name
@@ -231,7 +233,7 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
         pytest.param(
             None,
             (),
-            max(1, (os.cpu_count() or 4) // 2),
+            max(1, (os.cpu_count() or 1) // 2),
             id="resource-safe-default",
         ),
         pytest.param("3", (), 3, id="environment-override"),
@@ -247,7 +249,7 @@ def test_worker_selection_policy(
     """Reserve CPU for test-owned concurrency; preserve exact opt-in overrides."""
     probe_dir = _make_probe_dir(tmp_path)
     repo_root = Path(__file__).resolve().parent.parent
-    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    runner = repo_root / "scripts" / "run_tests.sh"
     env = os.environ.copy()
     if env_workers is None:
         env.pop("HERMES_TEST_WORKERS", None)
@@ -256,9 +258,7 @@ def test_worker_selection_policy(
 
     proc = subprocess.run(
         [
-            sys.executable,
             str(runner),
-            "--paths",
             str(probe_dir),
             "--file-retries",
             "0",
@@ -275,6 +275,26 @@ def test_worker_selection_policy(
 
     assert proc.returncode == 0, proc.stdout
     assert f"running with -j {expected_jobs}" in proc.stdout, proc.stdout
+
+
+@pytest.mark.parametrize(
+    ("cpu_count", "expected_jobs"),
+    [
+        pytest.param(None, 1, id="unknown-is-conservative"),
+        pytest.param(1, 1, id="single-cpu-clamps-to-one"),
+        pytest.param(2, 1, id="two-cpus-reserve-one"),
+        pytest.param(3, 1, id="odd-count-rounds-down"),
+        pytest.param(4, 2, id="even-count-halves"),
+        pytest.param(5, 2, id="larger-odd-count-rounds-down"),
+        pytest.param(28, 14, id="measured-host-halves"),
+    ],
+)
+def test_default_worker_count_policy(
+    cpu_count: int | None,
+    expected_jobs: int,
+) -> None:
+    """Unknown/low CPU counts fail safe; known hosts reserve half their CPUs."""
+    assert run_tests_parallel._default_worker_count(cpu_count) == expected_jobs
 
 
 def test_bare_q_flag_passes_through(tmp_path: Path) -> None:

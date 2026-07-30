@@ -4,7 +4,8 @@
 The minimum-viable replacement for pytest-xdist + a subprocess-isolation
 plugin. Discovers test files under ``tests/`` (excluding integration/e2e
 unless explicitly requested), then runs one ``python -m pytest <file>``
-subprocess per file, with bounded parallelism (default: ``os.cpu_count() // 2``).
+subprocess per file, with bounded parallelism (default: half the known logical
+CPU count, rounded down and clamped to one; one worker if the count is unknown).
 
 Why per-file rather than per-test?
     Per-test spawn overhead (~250ms × 17k tests = 70min CPU minimum)
@@ -31,7 +32,8 @@ Usage:
     a literal ``--`` is also passed through, and stacks with bare flags.
 
 Environment:
-    HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count() // 2)
+    HERMES_TEST_WORKERS  Override worker count (default: half the known logical
+                         CPU count, minimum 1; unknown count defaults to 1)
     HERMES_TEST_PATHS    Override discovery roots (colon-sep, default: 'tests')
 
 Exit code: 0 if every file's pytest exited 0; 1 otherwise.
@@ -54,11 +56,23 @@ from typing import Dict, List, Tuple
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
 
+
+def _default_worker_count(cpu_count: int | None) -> int:
+    """Reserve half of known CPUs for test-owned concurrency.
+
+    Unknown capacity fails safe at one worker. Known counts use floor division
+    and clamp to one, so one and two-CPU hosts both remain usable.
+    """
+    if cpu_count is None:
+        return 1
+    return max(1, cpu_count // 2)
+
+
 # A file subprocess is not a single execution context: many test files spawn
 # their own threads and child processes. Reserve half the schedulable CPUs for
 # that test-owned concurrency. Explicit -j / HERMES_TEST_WORKERS values remain
 # exact overrides for callers that know their workload.
-_DEFAULT_WORKERS = max(1, (os.cpu_count() or 4) // 2)
+_DEFAULT_WORKERS = _default_worker_count(os.cpu_count())
 
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
@@ -661,7 +675,10 @@ def main() -> int:
         "--jobs",
         type=int,
         default=int(os.environ.get("HERMES_TEST_WORKERS") or _DEFAULT_WORKERS),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count/2)",
+        help=(
+            "Parallel worker count (default: $HERMES_TEST_WORKERS or half "
+            "the known logical CPUs, minimum 1; unknown CPU count uses 1)"
+        ),
     )
     parser.add_argument(
         "--paths",
