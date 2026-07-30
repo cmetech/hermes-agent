@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import gc
 import hashlib
 import hmac
@@ -12,6 +14,8 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
+import sys
 import tempfile
 import threading
 import time
@@ -47,6 +51,7 @@ from plugins.workflow.models import (
     ApprovalDecision,
     ExecutionFence,
     TerminalJournalReserve,
+    WorkflowLanguageProfile,
     WorkflowPackage,
 )
 from plugins.workflow.provenance import (
@@ -58,6 +63,7 @@ from plugins.workflow.output_resolution import (
     ArchonOutputUnavailableError,
     _read_descriptor_relative,
     _safe_component,
+    write_archon_output_exclusive,
 )
 from plugins.workflow.schedule_time import (
     ScheduleInstantError,
@@ -343,6 +349,185 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def _publication_directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _publication_noreplace_primitive():
+    if os.name != "posix":
+        return None
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        primitive = getattr(library, "renameatx_np", None)
+        flag = 0x00000004  # RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        primitive = getattr(library, "renameat2", None)
+        flag = 1  # RENAME_NOREPLACE
+    else:
+        return None
+    if primitive is None:
+        return None
+    primitive.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    primitive.restype = ctypes.c_int
+    return primitive, flag
+
+
+def _require_secure_publication_io() -> None:
+    required_dir_fd_functions = {os.mkdir, os.open, os.rmdir, os.unlink}
+    if (
+        os.name != "posix"
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+        or not required_dir_fd_functions <= os.supports_dir_fd
+        or _publication_noreplace_primitive() is None
+    ):
+        raise ArchonOutputIntegrityError(
+            "secure atomic typed publication is unavailable on this host"
+        )
+
+
+def _fsync_publication_directory(descriptor: int, *, boundary: str) -> None:
+    """Strictly flush one publication directory or propagate the failure."""
+    os.fsync(descriptor)
+
+
+def _publication_directory_identity(descriptor: int) -> tuple[int, int]:
+    observed = os.fstat(descriptor)
+    if not stat.S_ISDIR(observed.st_mode):
+        raise ArchonOutputIntegrityError("typed publication directory is unsafe")
+    return observed.st_dev, observed.st_ino
+
+
+def _verify_publication_directory_identity(
+    run_descriptor: int,
+    publications_descriptor: int,
+    expected_identity: tuple[int, int],
+) -> None:
+    current_descriptor: int | None = None
+    try:
+        current_descriptor = os.open(
+            "publications",
+            _publication_directory_flags(),
+            dir_fd=run_descriptor,
+        )
+        if (
+            _publication_directory_identity(publications_descriptor)
+            != expected_identity
+            or _publication_directory_identity(current_descriptor)
+            != expected_identity
+        ):
+            raise ArchonOutputIntegrityError(
+                "typed publication directory identity changed"
+            )
+    except ArchonOutputIntegrityError:
+        raise
+    except OSError as exc:
+        raise ArchonOutputIntegrityError(
+            "typed publication directory identity changed"
+        ) from exc
+    finally:
+        if current_descriptor is not None:
+            os.close(current_descriptor)
+
+
+def _commit_publication_directory_noreplace(
+    run_descriptor: int,
+    publications_descriptor: int,
+    staging_name: str,
+    final_name: str,
+    expected_identity: tuple[int, int],
+) -> None:
+    _verify_publication_directory_identity(
+        run_descriptor,
+        publications_descriptor,
+        expected_identity,
+    )
+    loaded = _publication_noreplace_primitive()
+    if loaded is None:
+        raise ArchonOutputIntegrityError(
+            "secure atomic typed publication is unavailable on this host"
+        )
+    primitive, flag = loaded
+    result = primitive(
+        publications_descriptor,
+        os.fsencode(staging_name),
+        publications_descriptor,
+        os.fsencode(final_name),
+        flag,
+    )
+    if result == 0:
+        _verify_publication_directory_identity(
+            run_descriptor,
+            publications_descriptor,
+            expected_identity,
+        )
+        return
+    error = ctypes.get_errno()
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise ArchonOutputIntegrityError(
+            "typed publication destination already exists"
+        )
+    raise ArchonOutputIntegrityError(
+        "typed publication atomic commit failed"
+    ) from OSError(error, os.strerror(error))
+
+
+def _write_publication_file(
+    directory_descriptor: int,
+    name: str,
+    data: bytes,
+) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | os.O_NOFOLLOW
+    )
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_descriptor)
+    try:
+        os.fchmod(descriptor, 0o600)
+        remaining = memoryview(data)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("typed publication write made no progress")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _cleanup_publication_staging(
+    publications_descriptor: int,
+    staging_descriptor: int | None,
+    staging_name: str,
+    file_names: tuple[str, ...],
+) -> None:
+    if staging_descriptor is not None:
+        for name in file_names:
+            try:
+                os.unlink(name, dir_fd=staging_descriptor)
+            except OSError:
+                pass
+        os.close(staging_descriptor)
+    try:
+        os.rmdir(staging_name, dir_fd=publications_descriptor)
+    except OSError:
+        pass
+
+
 def _replace_with_retry(source: str | Path, target: str | Path) -> None:
     """Rename across the quarantine boundary, tolerating Windows file locking.
 
@@ -440,6 +625,33 @@ def _typed_publication_fields(reference: TypedPublicationRef) -> dict[str, objec
         "sha256": reference.sha256,
         "metadata_sha256": reference.metadata_sha256,
     }
+
+
+def _canonical_typed_publication_artifact(
+    artifacts: tuple[ArtifactRef, ...],
+    candidate: TypedPublicationCandidate,
+) -> ArtifactRef:
+    same_path = [
+        artifact
+        for artifact in artifacts
+        if artifact.relative_path == candidate.attempt_relative_path
+    ]
+    matching = [
+        artifact
+        for artifact in same_path
+        if artifact.media_type == candidate.media_type
+        and artifact.size_bytes == candidate.size_bytes
+        and artifact.sha256 == candidate.sha256
+    ]
+    if len(matching) != 1:
+        raise ArchonOutputIntegrityError(
+            "typed publication candidate does not match one executor artifact"
+        )
+    if len(same_path) != 1:
+        raise ArchonOutputIntegrityError(
+            "typed publication artifacts contain a conflicting same-path descriptor"
+        )
+    return matching[0]
 
 
 def _file_ends_with_newline(path: Path) -> bool:
@@ -7102,8 +7314,11 @@ class RunStore:
         self,
         directory: Path,
         projection: Mapping[str, object],
-        claim: NodeClaim,
-        artifacts: tuple[ArtifactRef, ...],
+        *,
+        run_id: str,
+        node_id: str,
+        attempt_id: str,
+        artifact: ArtifactRef,
         candidate: TypedPublicationCandidate,
     ) -> TypedPublicationRef:
         if (
@@ -7150,17 +7365,33 @@ class RunStore:
                 "typed publication candidate is invalid"
             )
         relative = PurePosixPath(candidate.attempt_relative_path)
-        raw_attempt_prefix = ("nodes", claim.node_id, claim.attempt_id)
-        secured_attempt_prefix = (
-            "nodes",
-            _safe_component("node", claim.node_id),
-            _safe_component("attempt", claim.attempt_id),
+        owned_prefixes = {
+            ("nodes", node_id, attempt_id),
+            (
+                "nodes",
+                _safe_component("node", node_id),
+                _safe_component("attempt", attempt_id),
+            ),
+        }
+        node_state = projection.get("nodes", {}).get(node_id, {})
+        loop_state = (
+            node_state.get("loop_state")
+            if isinstance(node_state, Mapping)
+            else None
         )
-        if (
-            len(relative.parts) <= 3
-            or relative.parts[:3]
-            not in {raw_attempt_prefix, secured_attempt_prefix}
-        ):
+        iteration = (
+            loop_state.get("iteration")
+            if isinstance(loop_state, Mapping)
+            else None
+        )
+        if isinstance(iteration, int) and not isinstance(iteration, bool):
+            nested_attempt = f"{attempt_id}/iteration-{iteration:04d}"
+            owned_prefixes.add((
+                "nodes",
+                _safe_component("node", node_id),
+                _safe_component("attempt", nested_attempt),
+            ))
+        if len(relative.parts) <= 3 or relative.parts[:3] not in owned_prefixes:
             raise ArchonOutputIntegrityError(
                 "typed publication content is not owned by the active attempt"
             )
@@ -7174,15 +7405,12 @@ class RunStore:
             raise ArchonOutputIntegrityError(
                 "typed publication requires the Archon language profile"
             )
-        matching = [
-            artifact
-            for artifact in artifacts
-            if artifact.relative_path == candidate.attempt_relative_path
-            and artifact.media_type == candidate.media_type
-            and artifact.size_bytes == candidate.size_bytes
-            and artifact.sha256 == candidate.sha256
-        ]
-        if len(matching) != 1:
+        if (
+            artifact.relative_path != candidate.attempt_relative_path
+            or artifact.media_type != candidate.media_type
+            or artifact.size_bytes != candidate.size_bytes
+            or artifact.sha256 != candidate.sha256
+        ):
             raise ArchonOutputIntegrityError(
                 "typed publication candidate does not match one executor artifact"
             )
@@ -7223,9 +7451,9 @@ class RunStore:
             "output_type": candidate.output_type,
             "media_type": candidate.media_type,
             "sha256": candidate.sha256,
-            "node_id": claim.node_id,
-            "attempt_id": claim.attempt_id,
-            "run_id": claim.run_id,
+            "node_id": node_id,
+            "attempt_id": attempt_id,
+            "run_id": run_id,
             "language_profile": language_profile,
             "schema_fingerprint": candidate.schema_fingerprint,
             "size_bytes": candidate.size_bytes,
@@ -7244,37 +7472,105 @@ class RunStore:
                 "typed publication metadata exceeds its byte ceiling"
             )
 
-        publications = directory / "publications"
-        publications.mkdir(mode=0o700, exist_ok=True)
-        _fsync_directory(directory)
-        staging = Path(
-            tempfile.mkdtemp(prefix=".staging-", dir=publications)
-        )
-        final = publications / publication_id
+        _require_secure_publication_io()
+        run_descriptor: int | None = None
+        publications_descriptor: int | None = None
+        staging_descriptor: int | None = None
+        staging_name = f".staging-{uuid.uuid4().hex}"
+        file_names = (content_name, "metadata.json")
+        staging_created = False
+        committed = False
         try:
-            if os.path.lexists(final):
-                raise ArchonOutputIntegrityError(
-                    "typed publication destination already exists"
+            run_descriptor = os.open(directory, _publication_directory_flags())
+            run_identity = _publication_directory_identity(run_descriptor)
+            publications_created = False
+            try:
+                os.mkdir(
+                    "publications",
+                    mode=0o700,
+                    dir_fd=run_descriptor,
                 )
+                publications_created = True
+            except FileExistsError:
+                pass
+            try:
+                publications_descriptor = os.open(
+                    "publications",
+                    _publication_directory_flags(),
+                    dir_fd=run_descriptor,
+                )
+            except OSError as exc:
+                raise ArchonOutputIntegrityError(
+                    "typed publication directory is unsafe"
+                ) from exc
+            publications_identity = _publication_directory_identity(
+                publications_descriptor
+            )
+            if publications_identity[0] != run_identity[0]:
+                raise ArchonOutputIntegrityError(
+                    "typed publication directory is not on the run filesystem"
+                )
+            if publications_created:
+                os.fchmod(publications_descriptor, 0o700)
+                _fsync_publication_directory(
+                    run_descriptor,
+                    boundary="run root",
+                )
+
+            os.mkdir(
+                staging_name,
+                mode=0o700,
+                dir_fd=publications_descriptor,
+            )
+            staging_created = True
+            staging_descriptor = os.open(
+                staging_name,
+                _publication_directory_flags(),
+                dir_fd=publications_descriptor,
+            )
+            os.fchmod(staging_descriptor, 0o700)
             for name, data in (
                 (content_name, content),
                 ("metadata.json", metadata_bytes),
             ):
-                with (staging / name).open("xb") as handle:
-                    handle.write(data)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            _fsync_directory(staging)
-            if os.path.lexists(final):
-                raise ArchonOutputIntegrityError(
-                    "typed publication destination already exists"
-                )
-            os.rename(staging, final)
-            _fsync_directory(publications)
+                _write_publication_file(staging_descriptor, name, data)
+            _fsync_publication_directory(
+                staging_descriptor,
+                boundary="staging",
+            )
+            _commit_publication_directory_noreplace(
+                run_descriptor,
+                publications_descriptor,
+                staging_name,
+                publication_id,
+                publications_identity,
+            )
+            committed = True
+            _fsync_publication_directory(
+                publications_descriptor,
+                boundary="publication parent",
+            )
         except BaseException:
-            if staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
+            if (
+                staging_created
+                and not committed
+                and publications_descriptor is not None
+            ):
+                _cleanup_publication_staging(
+                    publications_descriptor,
+                    staging_descriptor,
+                    staging_name,
+                    file_names,
+                )
+                staging_descriptor = None
             raise
+        finally:
+            if staging_descriptor is not None:
+                os.close(staging_descriptor)
+            if publications_descriptor is not None:
+                os.close(publications_descriptor)
+            if run_descriptor is not None:
+                os.close(run_descriptor)
         return TypedPublicationRef(
             publication_id=publication_id,
             content_name=content_name,
@@ -7369,13 +7665,38 @@ class RunStore:
                         if key != "pending_interaction"
                     }
             publication_ref = None
+            publication_artifact = None
             if status == "succeeded" and typed_publication is not None:
+                publication_artifact = _canonical_typed_publication_artifact(
+                    artifacts,
+                    typed_publication,
+                )
+                projected_matches = [
+                    entry
+                    for entry in projection["artifacts"]
+                    if isinstance(entry, dict)
+                    and entry.get("node_id") == claim.node_id
+                    and entry.get("attempt_id") == claim.attempt_id
+                    and entry.get("relative_path")
+                    == publication_artifact.relative_path
+                ]
+                if len(projected_matches) > 1 or any(
+                    entry.get("media_type") != publication_artifact.media_type
+                    or entry.get("size_bytes") != publication_artifact.size_bytes
+                    or entry.get("sha256") != publication_artifact.sha256
+                    for entry in projected_matches
+                ):
+                    raise ArchonOutputIntegrityError(
+                        "projected artifact conflicts with typed publication"
+                    )
                 publication_ref = self._publish_typed_bundle_locked(
                     directory,
                     projection,
-                    claim,
-                    artifacts,
-                    typed_publication,
+                    run_id=claim.run_id,
+                    node_id=claim.node_id,
+                    attempt_id=claim.attempt_id,
+                    artifact=publication_artifact,
+                    candidate=typed_publication,
                 )
             node["state"] = status
             node.pop("claim", None)
@@ -7426,11 +7747,6 @@ class RunStore:
                 if isinstance(warning, str) and warning not in projection["warnings"]:
                     projection["warnings"].append(warning)
             refs = []
-            existing_artifacts = {
-                (entry.get("attempt_id"), entry.get("relative_path"))
-                for entry in projection["artifacts"]
-                if isinstance(entry, dict)
-            }
             for artifact in artifacts:
                 entry = {
                     "node_id": claim.node_id,
@@ -7442,12 +7758,20 @@ class RunStore:
                 }
                 if (
                     publication_ref is not None
-                    and artifact.relative_path
-                    == typed_publication.attempt_relative_path
+                    and artifact == publication_artifact
                 ):
                     entry.update(_typed_publication_fields(publication_ref))
                 refs.append(entry)
-                if (claim.attempt_id, artifact.relative_path) not in existing_artifacts:
+                existing_indices = [
+                    index
+                    for index, existing in enumerate(projection["artifacts"])
+                    if isinstance(existing, dict)
+                    and existing.get("attempt_id") == claim.attempt_id
+                    and existing.get("relative_path") == artifact.relative_path
+                ]
+                if artifact == publication_artifact and existing_indices:
+                    projection["artifacts"][existing_indices[0]] = entry
+                elif not existing_indices:
                     projection["artifacts"].append(entry)
             self._append_locked(
                 directory,
@@ -9319,17 +9643,83 @@ class RunStore:
                     definition = definitions[node_id]
                     approval = definition.value
                     if bool(approval.get("capture_response")):
-                        relative = Path("nodes") / node_id / "approval" / "output.txt"
                         encoded = safe_response.encode("utf-8")
-                        _atomic_text(directory / relative, safe_response)
+                        output_type = definition.options.get("output_type")
+                        typed_approval = (
+                            projection.get("language", {}).get("effective_profile")
+                            == WorkflowLanguageProfile.ARCHON_2026_07.value
+                            and output_type is not None
+                        )
+                        attempt_id = (
+                            str(node["attempts"][-1]["attempt_id"])
+                            if typed_approval
+                            else None
+                        )
+                        if attempt_id is not None:
+                            output_path = write_archon_output_exclusive(
+                                directory,
+                                node_id=node_id,
+                                attempt_id=attempt_id,
+                                filename="output.md",
+                                data=encoded,
+                            )
+                            relative = output_path.relative_to(directory)
+                        else:
+                            relative = (
+                                Path("nodes")
+                                / node_id
+                                / "approval"
+                                / "output.txt"
+                            )
+                            _atomic_text(directory / relative, safe_response)
                         artifact = {
                             "node_id": node_id,
-                            "attempt_id": None,
+                            "attempt_id": attempt_id,
                             "relative_path": relative.as_posix(),
-                            "media_type": "text/plain",
+                            "media_type": (
+                                _TYPED_PUBLICATION_TEXT_MEDIA_TYPE
+                                if typed_approval
+                                else "text/plain"
+                            ),
                             "size_bytes": len(encoded),
                             "sha256": _sha256(encoded),
                         }
+                        if typed_approval:
+                            assert attempt_id is not None
+                            artifact_ref = ArtifactRef(
+                                relative_path=relative.as_posix(),
+                                media_type=_TYPED_PUBLICATION_TEXT_MEDIA_TYPE,
+                                size_bytes=len(encoded),
+                                sha256=_sha256(encoded),
+                            )
+                            publication_candidate = TypedPublicationCandidate(
+                                attempt_relative_path=relative.as_posix(),
+                                output_type=str(output_type),
+                                media_type=_TYPED_PUBLICATION_TEXT_MEDIA_TYPE,
+                                size_bytes=len(encoded),
+                                sha256=_sha256(encoded),
+                                schema_fingerprint=None,
+                                canonicalization_version=1,
+                                session_id=None,
+                            )
+                            canonical_artifact = (
+                                _canonical_typed_publication_artifact(
+                                    (artifact_ref,),
+                                    publication_candidate,
+                                )
+                            )
+                            publication_ref = self._publish_typed_bundle_locked(
+                                directory,
+                                projection,
+                                run_id=run_id,
+                                node_id=node_id,
+                                attempt_id=attempt_id,
+                                artifact=canonical_artifact,
+                                candidate=publication_candidate,
+                            )
+                            artifact.update(
+                                _typed_publication_fields(publication_ref)
+                            )
                         projection["artifacts"].append(artifact)
                         event_payload["artifact"] = artifact
                     node["state"] = "succeeded"

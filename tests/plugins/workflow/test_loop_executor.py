@@ -319,22 +319,25 @@ def test_scheduler_uses_ai_wall_deadline_for_loop_nodes(
 def test_scheduler_journals_each_loop_iteration_before_starting_the_next(
     tmp_path: Path, workflow_writer
 ) -> None:
-    package = load_workflow(
-        workflow_writer(
-            tmp_path / "package",
-            name="journaled-loop",
-            nodes=[
-                {
-                    "id": "iterate",
-                    "loop": {
-                        "prompt": "Refine",
-                        "until": "DONE",
-                        "max_iterations": 2,
-                    },
-                }
-            ],
-        )
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name="journaled-loop",
+        nodes=[
+            {
+                "id": "iterate",
+                "loop": {
+                    "prompt": "Refine",
+                    "until": "DONE",
+                    "max_iterations": 2,
+                },
+                "output_type": "LoopReport",
+            }
+        ],
     )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
     store = RunStore(tmp_path / "home")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -373,6 +376,23 @@ def test_scheduler_journals_each_loop_iteration_before_starting_the_next(
     ]
     assert [event["payload"]["iteration"] for event in iteration_events] == [1, 2]
     assert len(result["artifacts"]) == 2
+    published = [
+        artifact
+        for artifact in result["artifacts"]
+        if artifact.get("publication_id") is not None
+    ]
+    assert len(published) == 1
+    completion = next(
+        event
+        for event in store.tail_events(admitted.run_id)
+        if event["event_type"] == "node_succeeded"
+    )
+    journaled = next(
+        artifact
+        for artifact in completion["payload"]["artifacts"]
+        if artifact["relative_path"] == published[0]["relative_path"]
+    )
+    assert journaled == published[0]
 
 
 def test_scheduler_preserves_terminal_frames_when_loop_reaches_journal_quota(

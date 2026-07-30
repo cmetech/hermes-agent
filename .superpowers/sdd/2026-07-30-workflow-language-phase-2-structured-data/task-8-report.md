@@ -338,3 +338,203 @@ Result: Ruff passed and the diff whitespace check was clean.
 ### Fix-round concerns
 
 None within Task 8 scope.
+
+## Quality Fix Round 1 — production paths and atomic integrity
+
+Addressed all four Important findings from `task-8-quality-review.md`. The
+user authorized the minimal file-map expansion to
+`plugins/workflow/scheduled_revalidation.py` and
+`tests/plugins/workflow/test_schedule_revalidation.py` after the production
+approval restart exposed the required mutable `publications/` namespace.
+
+### RED evidence — real output-producing node paths
+
+Real Bash executor and scheduler:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_bash_e2e.py -k archon_bash_declared_output
+```
+
+Result: 1 file, 0 passed, 1 failed. The real Bash node succeeded but produced
+zero published descriptors.
+
+Real script executor and scheduler:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_script_executor.py -k scheduler_executes_snapshotted_named_script
+```
+
+Result: 1 file, 0 passed, 1 failed with `KeyError: 'publication_id'` on the
+real JSON stdout artifact.
+
+Real loop executor with only the model boundary stubbed:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_loop_executor.py -k scheduler_journals_each_loop_iteration
+```
+
+Result: 1 file, 0 passed, 1 failed. Both iterations were durably projected,
+but the successful loop had zero published descriptors.
+
+Real approval pause/restart/decision transaction:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_approval.py -k approval_survives_restart_captures_trimmed_output
+```
+
+Result: 1 file, 0 passed, 1 failed with `KeyError: 'publication_id'` on the
+captured approval artifact.
+
+### RED evidence — canonical descriptor authority
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py -k conflicting_same_path_artifact
+```
+
+Result: 1 file, 0 passed, 1 failed with `DID NOT RAISE`, proving one exact
+artifact plus a conflicting same-path artifact was accepted.
+
+The amended real-loop test also pinned the pre-projected case: after candidate
+integration first reached publication, it still found zero decorated projected
+artifacts because the completion payload and projection used different
+descriptor authorities.
+
+### RED evidence — sealed restart compatibility
+
+Corrected focused command:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_schedule_revalidation.py -k 'publication_runtime_root or unsafe_publication_runtime_entries'
+```
+
+Result: 1 file, 0 passed, 3 failed. A regular publication bundle was rejected
+as an unsealed path, while the symlink/FIFO cases stopped at that same root
+error before reaching their unsafe-entry guards.
+
+### RED evidence — destination and durability boundaries
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py -k 'preexisting_publications_symlink or atomically_rejects_existing_final_name or directory_swap_at_commit or directory_fsync_failure'
+```
+
+Result: 1 file, 1 passed, 4 failed. The pre-existing final-name control already
+passed; a `publications` symlink, a directory-identity swap at commit, and
+injected staging/post-rename parent fsync failures all completed without the
+required integrity failure.
+
+### Implementation changes
+
+- Added scheduler integration that attaches the authoritative
+  `NodeExecutionResult.primary_output` candidate for successful Archon Bash,
+  script, and loop nodes with a declared `output_type`. Bash/script select the
+  executor's primary first artifact; loop selects the exact current
+  `loop_state.output_artifact`.
+- Normalized typed loop iteration descriptors before their existing durable
+  pre-projection, keeping the final candidate, completion artifact, journal
+  payload, and projection identity aligned.
+- Routed approval capture through its existing store-owned locked decision
+  transaction. Typed approval bytes are written with the existing
+  descriptor-relative Archon output writer, published before the approval
+  event/projection update, and represented by one identical decorated
+  descriptor in both.
+- Replaced the universal all-node fake test with real command/prompt executors
+  using only a fake model runner. Added real Bash, script, loop, approval, and
+  cancel coverage in the approved production-path suites.
+- Resolved exactly one publication artifact by path/media/size/digest, rejected
+  conflicting same-path executor descriptors, verified any pre-projected
+  descriptor's full identity, updated it in place, and reused that same
+  canonical decorated dict in the completion journal.
+- Replaced pathname-based publication staging with descriptor-relative,
+  no-follow run/publication/staging opens; exclusive mode-`0600` file creates;
+  descriptor-relative bounded cleanup; strict directory fsync; and atomic
+  no-replace commit via Darwin `renameatx_np(RENAME_EXCL)` or Linux
+  `renameat2(RENAME_NOREPLACE)`. The implementation verifies the publication
+  directory identity immediately before and after commit.
+- Hosts without the required descriptor-relative and atomic no-replace
+  primitives fail closed before publication mutation.
+- Classified `publications/` as a non-authoritative mutable run root during
+  sealed-tree revalidation. Traversal remains active, so symlinks and special
+  files beneath it are still rejected and sealed-resource identity remains
+  unchanged.
+
+### Focused GREEN evidence
+
+Destination and fsync regressions:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py -k 'preexisting_publications_symlink or atomically_rejects_existing_final_name or directory_swap_at_commit or directory_fsync_failure'
+```
+
+Result: 1 file, 5 passed, 0 failed.
+
+Complete typed-publication suite:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py
+```
+
+Result: 1 file, 17 passed, 0 failed.
+
+Complete amended-path and scheduled-revalidation suite:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_bash_e2e.py tests/plugins/workflow/test_script_executor.py tests/plugins/workflow/test_loop_executor.py tests/plugins/workflow/test_approval.py tests/plugins/workflow/test_schedule_revalidation.py
+```
+
+Fresh result after the final GREEN refactors: 6 files, 131 passed, 0 failed.
+
+### Exact Task 8 acceptance
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_approval.py tests/plugins/workflow/test_loop_executor.py tests/plugins/workflow/test_script_executor.py tests/plugins/workflow/test_bash_e2e.py
+```
+
+Result: 7 files, 104 passed, 0 failed.
+
+### Task 7 interface regression gate
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_ai_e2e.py
+```
+
+Result: 3 files, 67 passed, 0 failed.
+
+### Static verification
+
+```text
+.venv/bin/ruff check plugins/workflow/store.py plugins/workflow/scheduler.py plugins/workflow/scheduled_revalidation.py tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_bash_e2e.py tests/plugins/workflow/test_script_executor.py tests/plugins/workflow/test_loop_executor.py tests/plugins/workflow/test_approval.py tests/plugins/workflow/test_schedule_revalidation.py
+git diff --check
+```
+
+Result before final report/commit verification: Ruff passed and the whitespace
+check was clean.
+
+### Quality-fix self-review
+
+- Confirmed the only model/process stubs are external boundaries; the real
+  scheduler and production executor/store paths perform every publication.
+- Confirmed `primary_output` remains the single executor-result authority seen
+  by persistence; scheduler integration fills that field before conversion to
+  the store-owned candidate rather than adding a parallel metadata channel.
+- Confirmed approval publication failure leaves the durable node paused and
+  emits no approval-success event; a post-rename fsync failure may leave only
+  an unjournaled orphan for the explicitly deferred Task 9 recovery path.
+- Confirmed source and destination reads/writes reject symlinks, destination
+  staging never follows a swappable pathname, cleanup unlinks only the two
+  known files through the staging descriptor, and final commit never replaces
+  an existing destination.
+- Confirmed directory fsync failures propagate and occur before completion
+  journal/projection success.
+- Confirmed full identity, not path alone, chooses the one decorated artifact;
+  a pre-projected loop artifact is replaced in place and the journal/projection
+  descriptors are equal.
+- Confirmed sealed-tree revalidation still walks mutable publication content
+  to reject symlink and special entries while excluding ordinary bundle bytes
+  from the immutable snapshot digest.
+- Confirmed no Task 9 recovery, mirroring, API, or UI behavior was added.
+
+### Quality-fix concerns
+
+Atomic typed publication is supported on Darwin and Linux with their native
+no-replace primitives. Other hosts deliberately fail closed before filesystem
+mutation until an equivalent descriptor-safe atomic primitive is implemented.

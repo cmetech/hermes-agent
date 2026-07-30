@@ -79,6 +79,46 @@ def test_two_dependent_bash_nodes_execute_and_persist_artifacts(
     )
 
 
+def test_archon_bash_declared_output_publishes_real_stdout(
+    tmp_path, workflow_writer
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name="bash-publication",
+        nodes=[
+            {
+                "id": "produce",
+                "bash": "printf 'bash output'",
+                "output_type": "BashReport",
+            }
+        ],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "home")
+    admitted = _start(store, package, key="bash-publication")
+
+    result = RunScheduler(store).advance(admitted.run_id)
+
+    published = [
+        artifact
+        for artifact in result["artifacts"]
+        if artifact.get("publication_id") is not None
+    ]
+    assert len(published) == 1
+    artifact = published[0]
+    bundle = (
+        store.run_directory(admitted.run_id)
+        / "publications"
+        / artifact["publication_id"]
+    )
+    assert artifact["relative_path"].endswith("/stdout.txt")
+    assert artifact["media_type"] == "text/markdown; charset=utf-8"
+    assert (bundle / "content.md").read_bytes() == b"bash output"
+
+
 def test_bash_nodes_substitute_arguments_predecessor_output_and_run_id_safely(
     tmp_path, workflow_writer
 ):

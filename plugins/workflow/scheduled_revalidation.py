@@ -51,10 +51,11 @@ _MUTABLE_RUN_FILES = frozenset({
     "events.jsonl",
     "run.json",
 })
-# These are the only namespaces written by node executors after admission.
+# These are the only namespaces written by node execution or typed publication
+# after admission.
 # They remain non-authoritative: resource resolution is separately restricted
 # to journal-corroborated sealed paths.
-_MUTABLE_RUN_ROOTS = frozenset({"artifacts", "nodes"})
+_MUTABLE_RUN_ROOTS = frozenset({"artifacts", "nodes", "publications"})
 
 
 class ScheduledRunRevalidationError(RuntimeError):

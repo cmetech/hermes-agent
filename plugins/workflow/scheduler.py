@@ -65,6 +65,7 @@ from plugins.workflow.resources import ResourceResolver, VariableContext
 from plugins.workflow.schema import is_inline_script, load_workflow_snapshot
 from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.store import (
+    ArtifactRef,
     NodeClaim,
     RunStore,
     StorageQuotaError,
@@ -2304,7 +2305,13 @@ class RunScheduler:
                             record_iteration=lambda artifacts, state: (
                                 self.store.record_loop_iteration(
                                     claim,
-                                    artifacts=artifacts,
+                                    artifacts=self._loop_iteration_artifacts(
+                                        artifacts,
+                                        node=node,
+                                        language_profile=(
+                                            package.language.effective_profile
+                                        ),
+                                    ),
                                     loop_state=state,
                                 )
                             ),
@@ -2388,6 +2395,75 @@ class RunScheduler:
                 self._active_executions -= 1
                 self._activity.notify_all()
 
+    @staticmethod
+    def _loop_iteration_artifacts(
+        artifacts: tuple[ArtifactRef, ...],
+        *,
+        node: WorkflowNode,
+        language_profile: WorkflowLanguageProfile,
+    ) -> tuple[ArtifactRef, ...]:
+        if (
+            language_profile is not WorkflowLanguageProfile.ARCHON_2026_07
+            or node.options.get("output_type") is None
+        ):
+            return artifacts
+        return tuple(
+            replace(
+                artifact,
+                media_type="text/markdown; charset=utf-8",
+            )
+            if artifact.media_type == "text/plain"
+            else artifact
+            for artifact in artifacts
+        )
+
+    @staticmethod
+    def _attach_declared_primary_output(
+        node: WorkflowNode,
+        result: NodeExecutionResult,
+        language_profile: WorkflowLanguageProfile,
+    ) -> NodeExecutionResult:
+        if (
+            result.status != "succeeded"
+            or result.primary_output is not None
+            or language_profile is not WorkflowLanguageProfile.ARCHON_2026_07
+            or node.node_type not in {"bash", "script", "loop"}
+            or node.options.get("output_type") is None
+        ):
+            return result
+        if node.node_type == "loop":
+            loop_state = result.metadata.get("loop_state")
+            relative_path = (
+                loop_state.get("output_artifact")
+                if isinstance(loop_state, Mapping)
+                else None
+            )
+            candidates = [
+                artifact
+                for artifact in result.artifacts
+                if artifact.relative_path == relative_path
+            ]
+        else:
+            candidates = list(result.artifacts[:1])
+        if len(candidates) != 1:
+            raise ArchonOutputIntegrityError(
+                "declared output does not identify one executor artifact"
+            )
+        artifact = candidates[0]
+        return replace(
+            result,
+            primary_output=PrimaryOutputCandidate(
+                attempt_relative_path=artifact.relative_path,
+                media_type=artifact.media_type,
+                size_bytes=artifact.size_bytes,
+                sha256=artifact.sha256,
+                structured_value=None,
+                schema_fingerprint=None,
+                canonicalization_version=1,
+                output_type=str(node.options["output_type"]),
+            ),
+        )
+
     def _persist_result(
         self,
         claim: NodeClaim,
@@ -2399,6 +2475,11 @@ class RunScheduler:
             WorkflowLanguageProfile.HERMES_LEGACY
         ),
     ) -> None:
+        result = self._attach_declared_primary_output(
+            node,
+            result,
+            language_profile,
+        )
         if result.status == "failed" and result.error_code == "cleanup_failed":
             self.store.block_cleanup_failed(
                 claim,

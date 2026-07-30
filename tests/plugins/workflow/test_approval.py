@@ -50,26 +50,29 @@ def _parser() -> argparse.ArgumentParser:
 def test_approval_survives_restart_captures_trimmed_output_and_continues(
     tmp_path, workflow_writer
 ):
-    package = load_workflow(
-        workflow_writer(
-            tmp_path / "package",
-            name="durable-gate",
-            nodes=[
-                {
-                    "id": "review",
-                    "approval": {
-                        "message": "Approve the proposed plan?",
-                        "capture_response": True,
-                    },
+    workflow = workflow_writer(
+        tmp_path / "package",
+        name="durable-gate",
+        nodes=[
+            {
+                "id": "review",
+                "approval": {
+                    "message": "Approve the proposed plan?",
+                    "capture_response": True,
                 },
-                {
-                    "id": "finish",
-                    "bash": "printf '%s' '$review.output'",
-                    "depends_on": ["review"],
-                },
-            ],
-        )
+                "output_type": "ApprovalDecision",
+            },
+            {
+                "id": "finish",
+                "bash": "printf '%s' '$review.output'",
+                "depends_on": ["review"],
+            },
+        ],
     )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
     home = tmp_path / "home"
     store = RunStore(home)
     admitted = _start(store, package)
@@ -97,23 +100,40 @@ def test_approval_survives_restart_captures_trimmed_output_and_continues(
         state_version=decision.state_version,
     )
 
-    completed = RunScheduler(RunStore(home)).advance(admitted.run_id)
-    assert completed["status"] == "succeeded"
+    decided = restarted.load_run(admitted.run_id)
     output = next(
         artifact
-        for artifact in completed["artifacts"]
+        for artifact in decided["artifacts"]
         if artifact["node_id"] == "review"
-        and artifact["relative_path"].endswith("output.txt")
+        and artifact.get("publication_id") is not None
     )
-    assert (
-        restarted.run_directory(admitted.run_id) / output["relative_path"]
-    ).read_text() == "looks good"
+    assert output["publication_id"]
+    assert output["media_type"] == "text/markdown; charset=utf-8"
+    bundle = (
+        restarted.run_directory(admitted.run_id)
+        / "publications"
+        / output["publication_id"]
+    )
+    assert (bundle / "content.md").read_bytes() == b"looks good"
     decision_event = next(
         event
         for event in restarted.tail_events(admitted.run_id)
         if event["event_type"] == "interaction_approved"
     )
-    assert decision_event["payload"]["artifact"]["sha256"] == output["sha256"]
+    assert decision_event["payload"]["artifact"] == output
+
+    completed = RunScheduler(RunStore(home)).advance(admitted.run_id)
+    assert completed["status"] == "succeeded"
+    completed_output = next(
+        artifact
+        for artifact in completed["artifacts"]
+        if artifact["node_id"] == "review"
+        and artifact.get("publication_id") is not None
+    )
+    assert (
+        restarted.run_directory(admitted.run_id) / completed_output["relative_path"]
+    ).read_text() == "looks good"
+    assert completed_output == output
 
     duplicate = restarted.approve_run(
         admitted.run_id,

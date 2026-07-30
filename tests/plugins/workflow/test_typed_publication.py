@@ -4,11 +4,14 @@ import hashlib
 import json
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 import pytest
 
+from agent.plugin_agent import PluginAgentRunResult
+import plugins.workflow.store as store_module
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.executors.base import NodeExecutionResult
 from plugins.workflow.output_resolution import (
@@ -129,53 +132,40 @@ class _OutputExecutor:
         )
 
 
+class _AgentRunner:
+    def __init__(self, response: str) -> None:
+        self.response = response
+
+    def run(self, request, **_kwargs) -> PluginAgentRunResult:
+        return PluginAgentRunResult(
+            final_response=self.response,
+            session_id="session-1",
+            provider=request.provider or "fake-provider",
+            model=request.model or "fake-model",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={},
+        )
+
+
 @pytest.mark.parametrize(
-    ("kind", "data", "executor_media_type", "published_media_type", "content_name"),
+    ("kind", "data", "published_media_type", "content_name"),
     [
         (
             "command",
-            b'{"answer":1}',
-            "application/json",
-            "application/json",
-            "content.json",
-        ),
-        ("prompt", b"", "text/plain", "text/markdown; charset=utf-8", "content.md"),
-        (
-            "bash",
-            b"bash output",
-            "text/plain",
+            b"command output",
             "text/markdown; charset=utf-8",
             "content.md",
         ),
-        (
-            "script",
-            b'{"script":true}',
-            "application/json",
-            "application/json",
-            "content.json",
-        ),
-        (
-            "loop",
-            b"loop output",
-            "text/plain",
-            "text/markdown; charset=utf-8",
-            "content.md",
-        ),
-        (
-            "approval",
-            b"approved",
-            "text/plain",
-            "text/markdown; charset=utf-8",
-            "content.md",
-        ),
+        ("prompt", b"", "text/markdown; charset=utf-8", "content.md"),
     ],
 )
-def test_each_successful_output_node_publishes_one_atomic_typed_bundle(
+def test_production_ai_output_node_publishes_one_atomic_typed_bundle(
     tmp_path,
     workflow_writer,
     kind,
     data,
-    executor_media_type,
     published_media_type,
     content_name,
 ) -> None:
@@ -187,8 +177,10 @@ def test_each_successful_output_node_publishes_one_atomic_typed_bundle(
         tmp_path / kind,
         _node(kind, output_type=output_type),
     )
-    scheduler = RunScheduler(store)
-    scheduler.executors[kind] = _OutputExecutor(data, executor_media_type)
+    scheduler = RunScheduler(
+        store,
+        agent_runner=_AgentRunner(data.decode("utf-8")),
+    )
 
     result = scheduler.advance(admitted.run_id)
 
@@ -230,7 +222,7 @@ def test_each_successful_output_node_publishes_one_atomic_typed_bundle(
     )
 
 
-def test_cancel_never_publishes_even_when_an_executor_returns_output(
+def test_production_cancel_never_publishes(
     tmp_path, workflow_writer
 ) -> None:
     store = RunStore(tmp_path / "home")
@@ -241,9 +233,6 @@ def test_cancel_never_publishes_even_when_an_executor_returns_output(
         _node("cancel", output_type="CancellationReceipt"),
     )
     scheduler = RunScheduler(store)
-    scheduler.executors["cancel"] = _OutputExecutor(
-        b"must not publish", "text/markdown", status="cancelled"
-    )
 
     result = scheduler.advance(admitted.run_id)
 
@@ -318,6 +307,37 @@ def test_typed_publication_rejects_candidate_artifact_media_disagreement(
         match="does not match one executor artifact",
     ):
         scheduler.advance(admitted.run_id)
+
+    assert not (store.run_directory(admitted.run_id) / "publications").exists()
+
+
+def test_typed_publication_rejects_conflicting_same_path_artifact(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_archon(
+        store,
+        workflow_writer,
+        tmp_path / "conflicting-descriptor",
+        _node("bash", output_type="Report"),
+    )
+    claim = store.claim_node(admitted.run_id, "produce", "active")
+    assert claim is not None
+    artifact, candidate = _attempt_publication(store, claim, b"report")
+    conflicting = ArtifactRef(
+        artifact.relative_path,
+        "application/json",
+        artifact.size_bytes,
+        artifact.sha256,
+    )
+
+    with pytest.raises(ArchonOutputIntegrityError, match="conflicting"):
+        store.complete_node(
+            claim,
+            status="succeeded",
+            artifacts=(artifact, conflicting),
+            typed_publication=candidate,
+        )
 
     assert not (store.run_directory(admitted.run_id) / "publications").exists()
 
@@ -437,6 +457,172 @@ def test_typed_publication_rejects_invalid_utf8_markdown(
         )
 
     assert not (store.run_directory(admitted.run_id) / "publications").exists()
+
+
+def test_typed_publication_rejects_preexisting_publications_symlink(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_archon(
+        store,
+        workflow_writer,
+        tmp_path / "publication-symlink",
+        _node("bash", output_type="Report"),
+    )
+    claim = store.claim_node(admitted.run_id, "produce", "active")
+    assert claim is not None
+    artifact, candidate = _attempt_publication(store, claim, b"report")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    publications = store.run_directory(admitted.run_id) / "publications"
+    publications.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ArchonOutputIntegrityError, match="publication directory"):
+        store.complete_node(
+            claim,
+            status="succeeded",
+            artifacts=(artifact,),
+            typed_publication=candidate,
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+def test_typed_publication_atomically_rejects_existing_final_name(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_archon(
+        store,
+        workflow_writer,
+        tmp_path / "publication-collision",
+        _node("bash", output_type="Report"),
+    )
+    claim = store.claim_node(admitted.run_id, "produce", "active")
+    assert claim is not None
+    artifact, candidate = _attempt_publication(store, claim, b"report")
+    publication_id = "a" * 32
+    monkeypatch.setattr(
+        store_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex=publication_id),
+    )
+    final = store.run_directory(admitted.run_id) / "publications" / publication_id
+    final.mkdir(parents=True)
+    sentinel = final / "sentinel"
+    sentinel.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(ArchonOutputIntegrityError, match="already exists"):
+        store.complete_node(
+            claim,
+            status="succeeded",
+            artifacts=(artifact,),
+            typed_publication=candidate,
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert sorted(path.name for path in final.parent.iterdir()) == [publication_id]
+
+
+def test_typed_publication_rejects_publications_directory_swap_at_commit(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_archon(
+        store,
+        workflow_writer,
+        tmp_path / "publication-swap",
+        _node("bash", output_type="Report"),
+    )
+    claim = store.claim_node(admitted.run_id, "produce", "active")
+    assert claim is not None
+    artifact, candidate = _attempt_publication(store, claim, b"report")
+    run_directory = store.run_directory(admitted.run_id)
+    publications = run_directory / "publications"
+    displaced = run_directory / "publications-displaced"
+    original_commit = getattr(
+        store_module,
+        "_commit_publication_directory_noreplace",
+        None,
+    )
+
+    def swap_then_commit(*args, **kwargs):
+        publications.rename(displaced)
+        publications.mkdir()
+        assert original_commit is not None
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store_module,
+        "_commit_publication_directory_noreplace",
+        swap_then_commit,
+        raising=False,
+    )
+
+    with pytest.raises(ArchonOutputIntegrityError, match="identity changed"):
+        store.complete_node(
+            claim,
+            status="succeeded",
+            artifacts=(artifact,),
+            typed_publication=candidate,
+        )
+
+    projection = store.load_run(admitted.run_id)
+    assert projection["nodes"]["produce"]["state"] != "succeeded"
+    assert not any(
+        event["event_type"] == "node_succeeded"
+        for event in store.tail_events(admitted.run_id)
+    )
+
+
+@pytest.mark.parametrize("failure_boundary", ["staging", "publication parent"])
+def test_typed_publication_directory_fsync_failure_prevents_completion(
+    tmp_path, workflow_writer, monkeypatch, failure_boundary
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_archon(
+        store,
+        workflow_writer,
+        tmp_path / failure_boundary.replace(" ", "-"),
+        _node("bash", output_type="Report"),
+    )
+    claim = store.claim_node(admitted.run_id, "produce", "active")
+    assert claim is not None
+    artifact, candidate = _attempt_publication(store, claim, b"report")
+    original_fsync = getattr(
+        store_module,
+        "_fsync_publication_directory",
+        None,
+    )
+
+    def fail_boundary(descriptor, *, boundary):
+        if boundary == failure_boundary:
+            raise OSError(f"{boundary} fsync failed")
+        if original_fsync is not None:
+            return original_fsync(descriptor, boundary=boundary)
+        return None
+
+    monkeypatch.setattr(
+        store_module,
+        "_fsync_publication_directory",
+        fail_boundary,
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match=failure_boundary):
+        store.complete_node(
+            claim,
+            status="succeeded",
+            artifacts=(artifact,),
+            typed_publication=candidate,
+        )
+
+    projection = store.load_run(admitted.run_id)
+    assert projection["nodes"]["produce"]["state"] != "succeeded"
+    assert not any(
+        event["event_type"] == "node_succeeded"
+        for event in store.tail_events(admitted.run_id)
+    )
 
 
 def test_stale_typed_completion_cannot_create_publication_staging_or_final_content(

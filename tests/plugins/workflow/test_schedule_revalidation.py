@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import shutil
 import time
@@ -600,6 +601,60 @@ def test_sealed_snapshot_revalidation_includes_language_identity(
         scheduled_revalidation_module.verify_sealed_snapshot(
             changed,
             run_directory=store.run_directory(run_id),
+        )
+
+
+def test_sealed_snapshot_allows_regular_publication_runtime_root(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+    sealed_paths = ("definition.yaml", "inputs.json", "resources.json")
+    (root / "definition.yaml").write_text("name: example\n", encoding="utf-8")
+    (root / "inputs.json").write_text("{}\n", encoding="utf-8")
+    (root / "resources.json").write_text("{}\n", encoding="utf-8")
+    expected = scheduled_revalidation_module.sealed_snapshot_digest(
+        root,
+        relative_paths=sealed_paths,
+    )
+    bundle = root / "publications" / "opaque-publication"
+    bundle.mkdir(parents=True)
+    (bundle / "content.md").write_text("result", encoding="utf-8")
+    (bundle / "metadata.json").write_text("{}\n", encoding="utf-8")
+
+    observed = scheduled_revalidation_module.sealed_snapshot_digest(
+        root,
+        relative_paths=sealed_paths,
+    )
+
+    assert observed == expected
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "fifo"])
+def test_sealed_snapshot_rejects_unsafe_publication_runtime_entries(
+    tmp_path: Path,
+    unsafe_kind: str,
+) -> None:
+    root = tmp_path / unsafe_kind
+    root.mkdir()
+    (root / "definition.yaml").write_text("name: example\n", encoding="utf-8")
+    (root / "inputs.json").write_text("{}\n", encoding="utf-8")
+    (root / "resources.json").write_text("{}\n", encoding="utf-8")
+    publications = root / "publications"
+    publications.mkdir()
+    unsafe = publications / "unsafe"
+    if unsafe_kind == "symlink":
+        unsafe.symlink_to(root / "definition.yaml")
+    else:
+        os.mkfifo(unsafe)
+
+    with pytest.raises(
+        scheduled_revalidation_module.ScheduledRunRevalidationError,
+        match="symlink|special file",
+    ):
+        scheduled_revalidation_module.sealed_snapshot_digest(
+            root,
+            relative_paths=("definition.yaml", "inputs.json", "resources.json"),
         )
 
 

@@ -503,13 +503,22 @@ def test_scheduler_executes_snapshotted_named_script(
     (scripts / "summarize.py").write_text(
         "import json; print(json.dumps({'status':'ok'}))\n", encoding="utf-8"
     )
-    package = load_workflow(
-        workflow_writer(
-            package_root / "workflows",
-            name="script-e2e",
-            nodes=[{"id": "summarize", "script": "summarize", "runtime": "uv"}],
-        )
+    workflow = workflow_writer(
+        package_root / "workflows",
+        name="script-e2e",
+        nodes=[
+            {
+                "id": "summarize",
+                "script": "summarize",
+                "runtime": "uv",
+                "output_type": "ScriptSummary",
+            }
+        ],
     )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
     store = RunStore(tmp_path / "home")
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -531,3 +540,11 @@ def test_scheduler_executes_snapshotted_named_script(
     artifact = result["artifacts"][0]
     output = store.run_directory(admitted.run_id) / artifact["relative_path"]
     assert json.loads(output.read_text()) == {"status": "ok"}
+    assert artifact["publication_id"]
+    bundle = (
+        store.run_directory(admitted.run_id)
+        / "publications"
+        / artifact["publication_id"]
+    )
+    assert artifact["media_type"] == "application/json"
+    assert (bundle / "content.json").read_bytes() == output.read_bytes()
