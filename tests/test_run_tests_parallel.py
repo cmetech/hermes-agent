@@ -225,6 +225,58 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
+@pytest.mark.parametrize(
+    ("env_workers", "cli_args", "expected_jobs"),
+    [
+        pytest.param(
+            None,
+            (),
+            max(1, (os.cpu_count() or 4) // 2),
+            id="resource-safe-default",
+        ),
+        pytest.param("3", (), 3, id="environment-override"),
+        pytest.param("3", ("-j", "2"), 2, id="cli-override"),
+    ],
+)
+def test_worker_selection_policy(
+    tmp_path: Path,
+    env_workers: str | None,
+    cli_args: tuple[str, ...],
+    expected_jobs: int,
+) -> None:
+    """Reserve CPU for test-owned concurrency; preserve exact opt-in overrides."""
+    probe_dir = _make_probe_dir(tmp_path)
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    env = os.environ.copy()
+    if env_workers is None:
+        env.pop("HERMES_TEST_WORKERS", None)
+    else:
+        env["HERMES_TEST_WORKERS"] = env_workers
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "--file-retries",
+            "0",
+            *cli_args,
+            "-q",
+        ],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    assert f"running with -j {expected_jobs}" in proc.stdout, proc.stdout
+
+
 def test_bare_q_flag_passes_through(tmp_path: Path) -> None:
     """A bare ``-q`` (no ``--``) runs clean instead of erroring out."""
     probe_dir = _make_probe_dir(tmp_path)

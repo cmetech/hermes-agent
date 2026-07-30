@@ -4,7 +4,7 @@
 The minimum-viable replacement for pytest-xdist + a subprocess-isolation
 plugin. Discovers test files under ``tests/`` (excluding integration/e2e
 unless explicitly requested), then runs one ``python -m pytest <file>``
-subprocess per file, with bounded parallelism (default: ``os.cpu_count()``).
+subprocess per file, with bounded parallelism (default: ``os.cpu_count() // 2``).
 
 Why per-file rather than per-test?
     Per-test spawn overhead (~250ms × 17k tests = 70min CPU minimum)
@@ -31,7 +31,7 @@ Usage:
     a literal ``--`` is also passed through, and stacks with bare flags.
 
 Environment:
-    HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
+    HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count() // 2)
     HERMES_TEST_PATHS    Override discovery roots (colon-sep, default: 'tests')
 
 Exit code: 0 if every file's pytest exited 0; 1 otherwise.
@@ -53,6 +53,12 @@ from typing import Dict, List, Tuple
 
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
+
+# A file subprocess is not a single execution context: many test files spawn
+# their own threads and child processes. Reserve half the schedulable CPUs for
+# that test-owned concurrency. Explicit -j / HERMES_TEST_WORKERS values remain
+# exact overrides for callers that know their workload.
+_DEFAULT_WORKERS = max(1, (os.cpu_count() or 4) // 2)
 
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
@@ -654,8 +660,8 @@ def main() -> int:
         "-j",
         "--jobs",
         type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
+        default=int(os.environ.get("HERMES_TEST_WORKERS") or _DEFAULT_WORKERS),
+        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count/2)",
     )
     parser.add_argument(
         "--paths",
