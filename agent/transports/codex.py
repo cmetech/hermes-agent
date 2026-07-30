@@ -371,6 +371,16 @@ class ResponsesApiTransport(ProviderTransport):
         if request_overrides:
             kwargs.update(request_overrides)
 
+        if params.get("structured_output") is not None:
+            existing_text = kwargs.get("text")
+            if isinstance(existing_text, dict) and "format" in existing_text:
+                reserved_text = dict(existing_text)
+                reserved_text.pop("format")
+                if reserved_text:
+                    kwargs["text"] = reserved_text
+                else:
+                    kwargs.pop("text")
+
         text_format = _build_native_text_format(
             params.get("structured_output"),
             provider_name=params.get("provider_name"),

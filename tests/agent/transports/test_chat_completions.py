@@ -377,6 +377,112 @@ class TestChatCompletionsBuildKwargs:
 
         assert "response_format" not in kwargs
 
+    @pytest.mark.parametrize(
+        ("strategy", "provider_name", "base_url", "profile_name"),
+        [
+            (
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+                "openai-api",
+                "https://api.openai.com/v1",
+                None,
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_MODE,
+                "openai-api",
+                "https://api.openai.com/v1",
+                None,
+            ),
+            (
+                StructuredOutputStrategy.UNSUPPORTED,
+                "openai-api",
+                "https://api.openai.com/v1",
+                None,
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+                "custom",
+                "https://gateway.example/v1",
+                "custom",
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "openrouter",
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+                "openai-codex",
+                "https://chatgpt.com/backend-api/codex",
+                None,
+            ),
+        ],
+    )
+    def test_structured_requests_reserve_response_format_from_overrides(
+        self, transport, strategy, provider_name, base_url, profile_name
+    ):
+        profile = None
+        if profile_name is not None:
+            from providers import get_provider_profile
+
+            profile = get_provider_profile(profile_name)
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name=provider_name,
+            base_url=base_url,
+            provider_profile=profile,
+            request_overrides={
+                "response_format": {"type": "json_object"},
+                "service_tier": "priority",
+            },
+            structured_output=_structured_request(strategy),
+        )
+
+        assert "response_format" not in kwargs
+        assert kwargs["service_tier"] == "priority"
+
+    @pytest.mark.parametrize("profile_name", [None, "openrouter"])
+    def test_legacy_calls_preserve_response_format_override(
+        self, transport, profile_name
+    ):
+        profile = None
+        if profile_name is not None:
+            from providers import get_provider_profile
+
+            profile = get_provider_profile(profile_name)
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_profile=profile,
+            request_overrides={"response_format": {"type": "json_object"}},
+        )
+
+        assert kwargs["response_format"] == {"type": "json_object"}
+
+    def test_native_schema_cannot_be_shadowed_by_response_format_override(
+        self, transport
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            request_overrides={"response_format": "malformed"},
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert kwargs["response_format"] == {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "hermes_output",
+                "schema": _STRUCTURED_SCHEMA,
+                "strict": True,
+            },
+        }
+
     def test_developer_role_swap(self, transport):
         msgs = [{"role": "system", "content": "You are helpful"}, {"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(model="gpt-5.4", messages=msgs, model_lower="gpt-5.4")

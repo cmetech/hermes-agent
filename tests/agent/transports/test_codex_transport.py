@@ -167,6 +167,114 @@ class TestCodexBuildKwargs:
 
         assert "format" not in kwargs.get("text", {})
 
+    @pytest.mark.parametrize(
+        ("strategy", "provider_name", "base_url"),
+        [
+            (
+                StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+                "openai-api",
+                "https://api.openai.com/v1",
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_MODE,
+                "openai-api",
+                "https://api.openai.com/v1",
+            ),
+            (
+                StructuredOutputStrategy.UNSUPPORTED,
+                "openai-api",
+                "https://api.openai.com/v1",
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+                "custom",
+                "https://gateway.example/v1",
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+            ),
+            (
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+                "openai-codex",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+        ],
+    )
+    def test_structured_requests_reserve_text_format_from_overrides(
+        self, transport, strategy, provider_name, base_url
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            provider_name=provider_name,
+            base_url=base_url,
+            request_overrides={
+                "text": {
+                    "verbosity": "low",
+                    "format": {
+                        "type": "json_schema",
+                        "name": "smuggled",
+                        "schema": {"type": "string"},
+                        "strict": False,
+                    },
+                },
+                "service_tier": "priority",
+            },
+            structured_output=_structured_request(strategy),
+        )
+
+        assert kwargs["text"] == {"verbosity": "low"}
+        assert kwargs["service_tier"] == "priority"
+
+    def test_legacy_call_preserves_text_format_override(self, transport):
+        override = {
+            "verbosity": "low",
+            "format": {
+                "type": "json_schema",
+                "name": "legacy_output",
+                "schema": {"type": "string"},
+                "strict": False,
+            },
+        }
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            request_overrides={"text": override},
+        )
+
+        assert kwargs["text"] == override
+
+    def test_native_schema_replaces_malformed_format_and_preserves_verbosity(
+        self, transport
+    ):
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            tools=[],
+            provider_name="openai-api",
+            base_url="https://api.openai.com/v1",
+            request_overrides={
+                "text": {"verbosity": "high", "format": "malformed"}
+            },
+            structured_output=_structured_request(
+                StructuredOutputStrategy.NATIVE_JSON_SCHEMA
+            ),
+        )
+
+        assert kwargs["text"] == {
+            "verbosity": "high",
+            "format": {
+                "type": "json_schema",
+                "name": "hermes_output",
+                "schema": _STRUCTURED_SCHEMA,
+                "strict": True,
+            },
+        }
+
     def test_system_extracted_from_messages(self, transport):
         messages = [
             {"role": "system", "content": "Custom system prompt"},

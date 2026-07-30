@@ -262,6 +262,82 @@ class TestAnthropicTransport:
             "format": {"type": "json_schema", "schema": schema}
         }
 
+    @pytest.mark.parametrize(
+        "strategy",
+        [
+            StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            StructuredOutputStrategy.NATIVE_JSON_MODE,
+            StructuredOutputStrategy.UNSUPPORTED,
+        ],
+    )
+    def test_request_overrides_cannot_inject_anthropic_output_format(
+        self, transport, strategy
+    ):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        }
+        request = StructuredOutputRequest(
+            schema=normalize_schema(schema),
+            strategy=strategy,
+            adapter_version=1,
+        )
+
+        kwargs = transport.build_kwargs(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            max_tokens=1024,
+            provider_name="anthropic",
+            base_url="https://api.anthropic.com",
+            request_overrides={
+                "output_config": {
+                    "effort": "low",
+                    "format": {"type": "json_schema", "schema": {"type": "string"}},
+                }
+            },
+            structured_output=request,
+        )
+
+        assert "format" not in kwargs.get("output_config", {})
+
+    def test_native_anthropic_format_ignores_shadow_override(self, transport):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        }
+        request = StructuredOutputRequest(
+            schema=normalize_schema(schema),
+            strategy=StructuredOutputStrategy.NATIVE_JSON_SCHEMA,
+            adapter_version=1,
+        )
+
+        kwargs = transport.build_kwargs(
+            model="claude-opus-4-6",
+            messages=[{"role": "user", "content": "Return an answer"}],
+            max_tokens=1024,
+            reasoning_config={"enabled": True, "effort": "high"},
+            provider_name="anthropic",
+            base_url="https://api.anthropic.com",
+            request_overrides={
+                "output_config": {
+                    "effort": "low",
+                    "format": {"type": "json_schema", "schema": {"type": "string"}},
+                }
+            },
+            structured_output=request,
+        )
+
+        assert kwargs["output_config"] == {
+            "effort": "high",
+            "format": {"type": "json_schema", "schema": schema},
+        }
+
     def test_convert_messages_extracts_system(self, transport):
         """Test convert_messages separates system from messages."""
         messages = [

@@ -395,6 +395,8 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs = self._build_kwargs_from_profile(
                 _profile, model, sanitized, tools, params
             )
+            if params.get("structured_output") is not None:
+                api_kwargs.pop("response_format", None)
             response_format = _build_native_response_format(
                 params.get("structured_output"),
                 provider_name=params.get("provider_name"),
@@ -574,6 +576,8 @@ class ChatCompletionsTransport(ProviderTransport):
         if overrides:
             api_kwargs.update(overrides)
 
+        if params.get("structured_output") is not None:
+            api_kwargs.pop("response_format", None)
         response_format = _build_native_response_format(
             params.get("structured_output"),
             provider_name=params.get("provider_name"),
