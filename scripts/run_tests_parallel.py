@@ -51,7 +51,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Tuple
 
@@ -501,12 +501,49 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
         pass
 
 
+class _ActiveProcessRegistry:
+    """Coordinate outer-runner cancellation with per-file process ownership."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._processes: dict[int, tuple[subprocess.Popen, int | None]] = {}
+
+    @property
+    def cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+    def register(self, proc: subprocess.Popen, pgid: int | None) -> None:
+        with self._lock:
+            cancelled = self._cancelled
+            if not cancelled:
+                self._processes[id(proc)] = (proc, pgid)
+        if cancelled:
+            # Cancellation may race the small window between Popen and
+            # registration. A late child must observe the cancellation too.
+            _kill_tree(proc, pgid=pgid)
+
+    def unregister(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self._processes.pop(id(proc), None)
+
+    def cancel_all(self) -> int:
+        with self._lock:
+            self._cancelled = True
+            active = tuple(self._processes.values())
+        for proc, pgid in active:
+            _kill_tree(proc, pgid=pgid)
+        return len(active)
+
+
 def _run_one_file(
     file: Path,
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
     retries: int = 0,
+    process_registry: _ActiveProcessRegistry | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -541,15 +578,19 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
+        file, pytest_args, repo_root, file_timeout, process_registry
     )
+    if process_registry is not None and process_registry.cancelled:
+        raise CancelledError
     attempt = 0
     while rc != 0 and attempt < retries:
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
+            file, pytest_args, repo_root, file_timeout, process_registry
         )
+        if process_registry is not None and process_registry.cancelled:
+            raise CancelledError
         subproc_wall += subproc_wall2
         if rc == 0:
             output = (
@@ -576,8 +617,11 @@ def _run_one_file_once(
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    process_registry: _ActiveProcessRegistry | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
+    if process_registry is not None and process_registry.cancelled:
+        raise CancelledError
     # Pytest's implicit temp root is a shared ``pytest-of-<user>`` numbered
     # namespace.  Every independent pytest process performs retention cleanup
     # there at exit, which lets one per-file process prune another process's
@@ -625,6 +669,9 @@ def _run_one_file_once(
         except (ProcessLookupError, PermissionError):
             pgid = None
 
+    if process_registry is not None:
+        process_registry.register(proc, pgid)
+
     try:
         try:
             output, _ = proc.communicate(timeout=file_timeout)
@@ -654,6 +701,8 @@ def _run_one_file_once(
     finally:
         # Cleanup happens only after the process-group boundary above, so no
         # test child can still be using its runner-owned tmp_path tree.
+        if process_registry is not None:
+            process_registry.unregister(proc)
         shutil.rmtree(attempt_temp_root, ignore_errors=True)
 
     if rc == 5:
@@ -1194,12 +1243,15 @@ def main() -> int:
     tests_passed = 0
     tests_failed = 0
     lock = threading.Lock()
+    process_registry = _ActiveProcessRegistry()
 
     def _on_done(file: Path, started_at: float, fut: "Future[Tuple[Path, int, str, dict[str, int], float]]") -> None:
         nonlocal files_done, tests_done, pass_count, fail_count, tests_passed, tests_failed
         n_tests = test_counts.get(file, 0)
         try:
             fpath, rc, output, summary, subproc_wall = fut.result()
+        except CancelledError:
+            return
         except Exception as exc:  # noqa: BLE001 — must always advance counter
             with lock:
                 files_done += 1
@@ -1237,21 +1289,46 @@ def main() -> int:
             if rc != 0:
                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures: List[Future] = []
+    pool = ThreadPoolExecutor(max_workers=args.jobs)
+    futures: List[Future] = []
+    interrupted = False
+    try:
         for file in files:
             t0 = time.monotonic()
             fut = pool.submit(
                 _run_one_file, file, pytest_passthrough, repo_root,
-                args.file_timeout, args.file_retries,
+                args.file_timeout, args.file_retries, process_registry,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
-        # Block until everything's done. ThreadPoolExecutor.__exit__ waits
-        # for all submitted work, but doing it explicitly here makes the
-        # control flow obvious.
+        # Block until everything's done. Keep this wait inside the explicit
+        # interrupt boundary: ThreadPoolExecutor.__exit__ waits for workers
+        # before control can reach an outer KeyboardInterrupt handler.
         for fut in futures:
-            fut.result() if fut.exception() is None else None
+            try:
+                fut.result()
+            except Exception:
+                # The completion callback records ordinary worker failures.
+                pass
+    except KeyboardInterrupt:
+        interrupted = True
+        active_count = process_registry.cancel_all()
+        for fut in futures:
+            fut.cancel()
+        # Workers reap their killed process groups and remove their private
+        # temp roots before this returns. Pending files never start.
+        pool.shutdown(wait=True, cancel_futures=True)
+        print(
+            f"\nInterrupted: terminated {active_count} active test file "
+            f"process tree{'s' if active_count != 1 else ''}; "
+            f"{files_done}/{len(files)} files completed, {fail_count} failed.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 130
+    finally:
+        if not interrupted:
+            pool.shutdown(wait=True)
 
     elapsed = time.monotonic() - started
     print()

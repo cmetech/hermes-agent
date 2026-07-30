@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import textwrap
@@ -189,6 +190,125 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
             f"diag={diag!r} test_pid={test_pid} test_pgid={test_pgid}; "
             f"runner output:\n{proc.stdout}"
         )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
+@pytest.mark.live_system_guard_bypass
+def test_sigint_kills_active_file_tree_before_runner_exits(tmp_path: Path) -> None:
+    """Interrupting the outer runner must promptly reap its active file tree."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "interrupt-probes"
+    probe_dir.mkdir()
+    failure_handoff = tmp_path / "failure-finished"
+    process_handoff = tmp_path / "active-process.json"
+
+    (probe_dir / "test_00_completed_failure.py").write_text(
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+
+            def test_completed_failure_is_visible():
+                Path({str(failure_handoff)!r}).write_text("finished")
+                assert False, "intentional completed failure"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (probe_dir / "test_10_hanging_tree.py").write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            import os
+            import subprocess
+            import sys
+            import time
+            from pathlib import Path
+
+            HANDOFF = Path({str(process_handoff)!r})
+
+            def test_hanging_tree(tmp_path):
+                child = subprocess.Popen([
+                    sys.executable,
+                    "-c",
+                    "import signal, time; "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    "time.sleep(600)",
+                ])
+                HANDOFF.write_text(json.dumps({{
+                    "test_pid": os.getpid(),
+                    "test_pgid": os.getpgid(0),
+                    "grandchild_pid": child.pid,
+                    "attempt_temp_root": str(tmp_path.parents[1]),
+                }}))
+                time.sleep(600)
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "1",
+            "--file-retries",
+            "0",
+            "--file-timeout",
+            "30",
+            "-q",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    handoff_data = None
+    output = ""
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if failure_handoff.exists() and process_handoff.exists():
+                handoff_data = json.loads(process_handoff.read_text())
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert handoff_data is not None, "runner never reached hanging probe"
+
+        interrupted_at = time.monotonic()
+        proc.send_signal(signal.SIGINT)
+        output, _ = proc.communicate(timeout=5)
+        elapsed = time.monotonic() - interrupted_at
+
+        assert proc.returncode == 130, output
+        assert elapsed < 5
+        assert "intentional completed failure" in output
+
+        for pid_key in ("test_pid", "grandchild_pid"):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if not _pid_alive(handoff_data[pid_key]):
+                    break
+                time.sleep(0.05)
+            else:
+                pytest.fail(f"{pid_key} survived runner SIGINT; output:\n{output}")
+        assert not Path(handoff_data["attempt_temp_root"]).exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+        if handoff_data is not None:
+            try:
+                os.killpg(handoff_data["test_pgid"], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 # ── Bare pytest-flag passthrough ─────────────────────────────────────────────
