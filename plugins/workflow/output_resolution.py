@@ -12,6 +12,8 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Callable, Mapping
 
+from plugins.workflow.language_schema import DURABLE_METADATA_STRING_MAX_CHARS
+
 
 _HAS_DESCRIPTOR_RELATIVE_IO = (
     os.open in os.supports_dir_fd
@@ -19,8 +21,6 @@ _HAS_DESCRIPTOR_RELATIVE_IO = (
     and os.unlink in os.supports_dir_fd
 )
 PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY = "primary_output_candidate"
-# Match the durable attempt-metadata sanitizer; reject instead of truncating identity.
-_DURABLE_METADATA_STRING_MAX_CHARS = 16_384
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _PRIMARY_OUTPUT_CANDIDATE_FIELDS = frozenset({
     "attempt_relative_path",
@@ -265,7 +265,7 @@ def primary_output_candidate_from_identity(
             and (
                 not isinstance(output_type, str)
                 or not output_type.strip()
-                or len(output_type) > _DURABLE_METADATA_STRING_MAX_CHARS
+                or len(output_type) > DURABLE_METADATA_STRING_MAX_CHARS
             )
         )
     ):

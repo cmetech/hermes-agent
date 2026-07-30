@@ -978,6 +978,33 @@ def test_archon_structured_output_fields_publish_supported_contracts(field):
     assert "archon_output_type_unavailable" not in codes
 
 
+def test_output_type_schema_publishes_the_direct_durable_metadata_boundary():
+    schema = definition_json_schema(WorkflowLanguageProfile.ARCHON_2026_07)
+    field_schema = _node_property(schema, "prompt", "output_type")
+    prefix = "MixedCase/分析/"
+    boundary = prefix + ("Ω" * (16_384 - len(prefix)))
+
+    assert field_schema["minLength"] == 1
+    assert field_schema["maxLength"] == 16_384
+    assert field_schema["pattern"] == r"\S"
+    Draft202012Validator(schema).validate(
+        _workflow({"id": "producer", "prompt": "produce", "output_type": boundary})
+    )
+
+    for invalid in (boundary + "x", "", " \t "):
+        errors = Draft202012Validator(schema).iter_errors(
+            _workflow({
+                "id": "producer",
+                "prompt": "produce",
+                "output_type": invalid,
+            })
+        )
+        assert any(
+            list(error.absolute_path) == ["nodes", 0, "output_type"]
+            for error in errors
+        )
+
+
 @pytest.mark.parametrize(
     ("node_type", "field_path", "code"),
     [

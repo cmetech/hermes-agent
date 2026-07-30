@@ -20,6 +20,7 @@ from plugins.workflow.models import WorkflowLanguageProfile
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 _PROFILES = tuple(WorkflowLanguageProfile)
 MAX_WORKFLOW_DOCUMENT_BYTES = 2 * 1024 * 1024
+DURABLE_METADATA_STRING_MAX_CHARS = 16_384
 CONTRACT_READER_VERSION = 1
 _NO_DEFAULT = object()
 WHEN_REFERENCE_PATTERN = r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*"
@@ -77,6 +78,7 @@ class WorkflowFieldSpec:
     value_role: str | None
     default_value: object
     pattern: str | None
+    max_length: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,6 +361,7 @@ def _field(
     value_role: str | None = None,
     default_value: object = _NO_DEFAULT,
     pattern: str | None = None,
+    max_length: int | None = None,
 ) -> WorkflowFieldSpec:
     return WorkflowFieldSpec(
         scope=scope,
@@ -389,6 +392,7 @@ def _field(
         value_role=value_role or _value_role_for(yaml_name),
         default_value=default_value,
         pattern=pattern,
+        max_length=max_length,
     )
 
 
@@ -497,6 +501,8 @@ _NODE_FIELDS = (
         phase=2,
         legacy_status="warning",
         legacy_code="legacy_output_type_not_published",
+        pattern=r"\S",
+        max_length=DURABLE_METADATA_STRING_MAX_CHARS,
     ),
     _field(
         "node",
@@ -851,6 +857,18 @@ def common_node_field_names() -> frozenset[str]:
     return _field_names("node")
 
 
+def field_max_length(scope: str, yaml_name: str) -> int | None:
+    """Return the canonical authored string bound for one direct field."""
+    matches = tuple(
+        spec
+        for spec in FIELD_INVENTORY
+        if spec.scope == scope and spec.yaml_name == yaml_name
+    )
+    if len(matches) != 1:
+        raise ValueError(f"unknown or ambiguous workflow field: {scope}.{yaml_name}")
+    return matches[0].max_length
+
+
 def structural_node_field_names(node_type: str) -> frozenset[str]:
     """Return node fields the loader and JSON Schema accept structurally."""
     if node_type not in NODE_TYPES:
@@ -1142,6 +1160,8 @@ def _field_schema(
         )
     if spec.pattern is not None:
         result["pattern"] = spec.pattern
+    if spec.max_length is not None:
+        result["maxLength"] = spec.max_length
     unit = _field_unit(spec, profile)
     if unit is not None:
         result["x-hermes-unit"] = unit

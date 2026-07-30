@@ -32,6 +32,7 @@ from plugins.workflow.language_schema import (
     approval_reject_field_names,
     common_node_field_names,
     definition_field_names,
+    field_max_length,
     hook_entry_field_names,
     hook_event_names,
     hook_response_field_names,
@@ -96,9 +97,21 @@ def _mapping(value: Any, path: str) -> Mapping[str, Any]:
     return value
 
 
-def _string(value: Any, path: str, *, allow_empty: bool = False) -> str:
+def _string(
+    value: Any,
+    path: str,
+    *,
+    allow_empty: bool = False,
+    max_length: int | None = None,
+) -> str:
     if not isinstance(value, str) or (not allow_empty and not value.strip()):
         _fail(path, "expected_string", f"{path} must be a non-empty string")
+    if max_length is not None and len(value) > max_length:
+        _fail(
+            path,
+            "string_too_long",
+            f"{path} exceeds the {max_length}-character limit",
+        )
     return value
 
 
@@ -377,7 +390,11 @@ def _validate_declared_options(node: Mapping[str, Any], path: str) -> None:
         if field in node:
             _boolean(node[field], f"{path}.{field}")
     if "output_type" in node:
-        _string(node["output_type"], f"{path}.output_type")
+        _string(
+            node["output_type"],
+            f"{path}.output_type",
+            max_length=field_max_length("node", "output_type"),
+        )
     for field in ("provider", "model", "systemPrompt", "fallbackModel"):
         if field in node:
             _string(node[field], f"{path}.{field}")

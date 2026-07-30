@@ -59,6 +59,62 @@ def test_archon_normalizes_output_format_and_accepts_output_type(
     }.intersection(finding.code for finding in package.compatibility_findings)
 
 
+def test_output_type_preserves_the_durable_metadata_boundary(
+    workflow_writer, tmp_path
+):
+    prefix = "MixedCase/分析/"
+    output_type = prefix + ("Ω" * (16_384 - len(prefix)))
+    accepted = load_workflow(
+        _archon_workflow(
+            workflow_writer,
+            tmp_path / "accepted",
+            nodes=[{
+                "id": "producer",
+                "prompt": "Return a report",
+                "output_type": output_type,
+            }],
+        )
+    )
+
+    assert accepted.definition.nodes[0].options["output_type"] == output_type
+
+    rejected = _archon_workflow(
+        workflow_writer,
+        tmp_path / "rejected",
+        nodes=[{
+            "id": "producer",
+            "prompt": "Return a report",
+            "output_type": output_type + "x",
+        }],
+    )
+    with pytest.raises(WorkflowValidationError) as exc:
+        load_workflow(rejected)
+
+    assert exc.value.issues[0].path == "nodes[0].output_type"
+    assert exc.value.issues[0].code == "string_too_long"
+
+
+@pytest.mark.parametrize("output_type", ("", " \t "))
+def test_output_type_keeps_nonempty_direct_field_diagnostic(
+    workflow_writer, tmp_path, output_type
+):
+    path = _archon_workflow(
+        workflow_writer,
+        tmp_path,
+        nodes=[{
+            "id": "producer",
+            "prompt": "Return a report",
+            "output_type": output_type,
+        }],
+    )
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        load_workflow(path)
+
+    assert exc.value.issues[0].path == "nodes[0].output_type"
+    assert exc.value.issues[0].code == "expected_string"
+
+
 def test_version_one_archon_package_keeps_structured_output_unavailability(
     workflow_writer, tmp_path
 ):
