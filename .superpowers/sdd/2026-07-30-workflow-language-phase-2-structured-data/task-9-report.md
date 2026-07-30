@@ -147,8 +147,81 @@ Final result: Ruff passed and the whitespace check was clean.
 - `tests/plugins/workflow/test_persisted_sessions.py`
 - `tests/plugins/workflow/test_retention.py`
 - `tests/plugins/workflow/test_security_boundaries.py`
+- `tests/plugins/workflow/test_typed_publication.py`
 - `.superpowers/sdd/2026-07-30-workflow-language-phase-2-structured-data/task-9-report.md`
 
 ## Concerns
 
 None within Task 9 scope.
+
+## Spec Fix Round 1 — sealed publication authority and reparse coverage
+
+The recovery validator now derives typed-publication obligations from each
+successful Archon node's `output_type` in the sealed `definition.yaml`, then
+requires exactly one matching checked-journal descriptor. Structured outputs
+must carry the exact schema fingerprint and canonicalization version from the
+sealed language projection; schemaless outputs must carry no fingerprint.
+Missing, demoted, duplicate, wrong-type, and wrong-fingerprint descriptors all
+enter stable `typed_publication_integrity` repair state before publication
+cleanup, preserving an existing valid bundle.
+
+Publication-root, publication-bundle, winning-source, mirror-directory,
+mirror-content, and mirror-index reparse branches now have injected stat-result
+coverage. The bundle branch was tightened to fail closed instead of treating a
+reparse-marked bundle as replaceable corruption. The existing Task 8
+case-sensitive output-type concurrency fixture was aligned so its sealed node
+declaration and publication candidate exercise the same valid contract.
+
+### Strict TDD evidence
+
+Focused RED:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_security_boundaries.py -k 'checked_journal_requires_exact_sealed_typed_publication_contract or reparse_point'
+```
+
+Observed expected RED: 2 files, 5 passed and 8 failed. All seven forged
+checked-journal variants were accepted, and the publication-bundle reparse
+point was silently discarded and rebuilt. The already-secure publication
+root/source and mirror branches passed as controls.
+
+Focused GREEN: the same command passed 13 tests with 0 failures.
+
+Exact Task 9 acceptance:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_fault_injection.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_retention.py tests/plugins/workflow/test_security_boundaries.py
+```
+
+Result: 7 files, 121 passed, 0 failed.
+
+Task 8 typed-publication and loop regression:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_loop_executor.py
+```
+
+Result: 2 files, 29 passed, 0 failed.
+
+Static verification:
+
+```text
+.venv/bin/ruff check plugins/workflow/store.py plugins/workflow/sessions.py tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_fault_injection.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_retention.py tests/plugins/workflow/test_security_boundaries.py
+git diff --check
+```
+
+Result: Ruff and the whitespace check passed.
+
+### Spec-fix self-review
+
+- Confirmed obligation discovery is independent of optional descriptor marker
+  fields and therefore catches whole-descriptor omission and demotion.
+- Confirmed output type is compared case-sensitively with the sealed workflow
+  declaration and schema identity is compared exactly with the language
+  snapshot.
+- Confirmed validation precedes orphan/staging cleanup, so malformed authority
+  cannot delete a valid publication bundle.
+- Confirmed every requested publication and mirror reparse branch fails closed
+  while an external sentinel remains unchanged.
+
+Concerns: none within the spec-fix scope.

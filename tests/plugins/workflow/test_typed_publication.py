@@ -663,11 +663,12 @@ def test_concurrent_completions_publish_only_the_active_attempt(
     tmp_path, workflow_writer
 ) -> None:
     store = RunStore(tmp_path / "home")
+    output_type = "CaseSensitive/" + ("Ω" * 200)
     admitted = _start_archon(
         store,
         workflow_writer,
         tmp_path / "winner",
-        _node("bash", output_type="Report"),
+        _node("bash", output_type=output_type),
     )
     stale = store.claim_node(admitted.run_id, "produce", "stale", lease_seconds=1)
     assert stale is not None
@@ -685,7 +686,7 @@ def test_concurrent_completions_publish_only_the_active_attempt(
         store,
         active,
         b"winner",
-        output_type="CaseSensitive/" + ("Ω" * 200),
+        output_type=output_type,
     )
     start = threading.Barrier(2)
 

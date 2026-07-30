@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import stat
 
 import pytest
 
@@ -23,6 +24,31 @@ from plugins.workflow.sessions import (
 
 
 SHOWCASES = Path(__file__).parents[3] / "plugins/workflow/showcases"
+
+
+class _ReparseStat:
+    def __init__(self, observed: object) -> None:
+        self._observed = observed
+        self.st_file_attributes = getattr(
+            stat,
+            "FILE_ATTRIBUTE_REPARSE_POINT",
+            0x400,
+        )
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._observed, name)
+
+
+def _inject_reparse(monkeypatch, target: Path) -> None:
+    original_lstat = Path.lstat
+
+    def injected(path: Path):
+        observed = original_lstat(path)
+        if path == target:
+            return _ReparseStat(observed)
+        return observed
+
+    monkeypatch.setattr(Path, "lstat", injected)
 
 
 def _log_path(tmp_path, workflow_writer, *, name: str):
@@ -252,3 +278,56 @@ def test_typed_mirror_content_symlink_never_reaches_outside_profile(tmp_path) ->
         mirrors.complete(obligation, data)
 
     assert outside.read_bytes() == b"keep"
+
+
+def test_typed_mirror_directory_reparse_point_fails_closed(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "profile"
+    mirrors = TypedMirrorStore(home)
+    sentinel = tmp_path / "outside-directory-sentinel"
+    sentinel.write_bytes(b"keep")
+    _inject_reparse(monkeypatch, mirrors.root)
+
+    with pytest.raises(TypedMirrorIntegrityError, match="directory is unsafe"):
+        TypedMirrorStore(home)
+
+    assert sentinel.read_bytes() == b"keep"
+
+
+def test_typed_mirror_content_reparse_point_fails_closed(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    data = b"safe"
+    mirrors = TypedMirrorStore(tmp_path / "profile")
+    obligation = _mirror_obligation(data)
+    mirrors.stage(obligation, data)
+    content = mirrors.content_root / obligation.sha256
+    sentinel = tmp_path / "outside-content-sentinel"
+    sentinel.write_bytes(b"keep")
+    _inject_reparse(monkeypatch, content)
+
+    with pytest.raises(TypedMirrorIntegrityError, match="file is unsafe"):
+        mirrors.stage(obligation, data)
+
+    assert sentinel.read_bytes() == b"keep"
+
+
+def test_typed_mirror_index_reparse_point_is_invisible(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    data = b"safe"
+    mirrors = TypedMirrorStore(tmp_path / "profile")
+    obligation = _mirror_obligation(data)
+    mirrors.complete(obligation, data)
+    index = mirrors.index_root / mirrors._scope_id("workflow", "node", "scope")
+    index = index.with_suffix(".json")
+    sentinel = tmp_path / "outside-index-sentinel"
+    sentinel.write_bytes(b"keep")
+    _inject_reparse(monkeypatch, index)
+
+    assert mirrors.get("workflow", "node", "scope") is None
+    assert sentinel.read_bytes() == b"keep"

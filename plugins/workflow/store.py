@@ -207,6 +207,19 @@ class _JournaledTypedPublication:
     relative_path: str
 
 
+@dataclass(frozen=True, slots=True)
+class _DeclaredTypedOutput:
+    output_type: str
+    has_structured_schema: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RequiredTypedPublication:
+    output_type: str
+    schema_fingerprint: str | None
+    canonicalization_version: int
+
+
 @dataclass(frozen=True)
 class ForegroundExecutionLease:
     owner_id: str
@@ -699,8 +712,83 @@ def _typed_publication_metadata_bytes(
     ).encode("utf-8") + b"\n"
 
 
+def _sealed_typed_output_declarations(
+    directory: Path,
+    projection: Mapping[str, object],
+) -> dict[str, _DeclaredTypedOutput]:
+    language = projection.get("language")
+    if (
+        not isinstance(language, Mapping)
+        or language.get("effective_profile") != "archon-2026-07"
+    ):
+        return {}
+    definition = directory / "definition.yaml"
+    try:
+        observed = definition.lstat()
+        reparse_marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_size > 2 * 1024 * 1024
+            or (
+                reparse_marker
+                and getattr(observed, "st_file_attributes", 0) & reparse_marker
+            )
+        ):
+            raise JournalRecoveryError(
+                "typed publication sealed definition is unsafe"
+            )
+        document = yaml.safe_load(
+            _read_descriptor_relative(
+                directory,
+                "definition.yaml",
+                size_bytes=observed.st_size,
+            )
+        )
+    except (
+        ArchonOutputIntegrityError,
+        ArchonOutputUnavailableError,
+        OSError,
+        yaml.YAMLError,
+    ) as exc:
+        raise JournalRecoveryError(
+            "typed publication sealed definition is unavailable"
+        ) from exc
+    if not isinstance(document, Mapping) or not isinstance(
+        document.get("nodes"), list
+    ):
+        raise JournalRecoveryError(
+            "typed publication sealed definition is malformed"
+        )
+    declarations: dict[str, _DeclaredTypedOutput] = {}
+    for node in document["nodes"]:
+        if not isinstance(node, Mapping) or not isinstance(node.get("id"), str):
+            raise JournalRecoveryError(
+                "typed publication sealed node declaration is malformed"
+            )
+        if "output_type" not in node:
+            continue
+        node_id = node["id"]
+        output_type = node.get("output_type")
+        if (
+            not node_id
+            or node_id in declarations
+            or not isinstance(output_type, str)
+            or not output_type.strip()
+            or len(output_type) > DURABLE_METADATA_STRING_MAX_CHARS
+        ):
+            raise JournalRecoveryError(
+                "typed publication sealed output declaration is malformed"
+            )
+        declarations[node_id] = _DeclaredTypedOutput(
+            output_type=output_type,
+            has_structured_schema=node.get("output_format") is not None,
+        )
+    return declarations
+
+
 def _journaled_typed_publications(
     projection: Mapping[str, object],
+    declared_outputs: Mapping[str, _DeclaredTypedOutput],
 ) -> tuple[_JournaledTypedPublication, ...]:
     run_id = projection.get("run_id")
     nodes = projection.get("nodes")
@@ -709,6 +797,54 @@ def _journaled_typed_publications(
         artifacts, list
     ):
         raise JournalRecoveryError("typed publication descriptor authority is invalid")
+    language = projection.get("language")
+    archon = (
+        isinstance(language, Mapping)
+        and language.get("effective_profile") == "archon-2026-07"
+    )
+    structured_outputs = language.get("structured_outputs") if archon else None
+    if archon and not isinstance(structured_outputs, Mapping):
+        raise JournalRecoveryError(
+            "typed publication language authority is invalid"
+        )
+    requirements: dict[str, _RequiredTypedPublication] = {}
+    for node_id, declaration in declared_outputs.items():
+        node = nodes.get(node_id)
+        if not isinstance(node, Mapping):
+            raise JournalRecoveryError(
+                "typed publication node authority is invalid"
+            )
+        if not archon or node.get("state") != "succeeded":
+            continue
+        structured = structured_outputs.get(node_id)
+        if declaration.has_structured_schema:
+            if not isinstance(structured, Mapping):
+                raise JournalRecoveryError(
+                    "typed publication schema authority is invalid"
+                )
+            fingerprint = structured.get("schema_fingerprint")
+            version = structured.get("canonicalization_version")
+            if (
+                not isinstance(fingerprint, str)
+                or _SHA256_PATTERN.fullmatch(fingerprint) is None
+                or isinstance(version, bool)
+                or version != 1
+            ):
+                raise JournalRecoveryError(
+                    "typed publication schema authority is invalid"
+                )
+        else:
+            if structured is not None:
+                raise JournalRecoveryError(
+                    "typed publication schema authority is invalid"
+                )
+            fingerprint = None
+            version = 1
+        requirements[node_id] = _RequiredTypedPublication(
+            output_type=declaration.output_type,
+            schema_fingerprint=fingerprint,
+            canonicalization_version=version,
+        )
     descriptors: list[_JournaledTypedPublication] = []
     publication_ids: set[str] = set()
     for artifact in artifacts:
@@ -838,11 +974,7 @@ def _journaled_typed_publications(
             raise JournalRecoveryError(
                 "typed publication winning attempt is not corroborated"
             )
-        language = projection.get("language")
-        if (
-            not isinstance(language, Mapping)
-            or language.get("effective_profile") != "archon-2026-07"
-        ):
+        if not archon:
             raise JournalRecoveryError(
                 "typed publication language authority is invalid"
             )
@@ -866,6 +998,29 @@ def _journaled_typed_publications(
                 relative_path=relative_path,
             )
         )
+    descriptors_by_node: dict[str, list[_JournaledTypedPublication]] = {}
+    for descriptor in descriptors:
+        descriptors_by_node.setdefault(descriptor.node_id, []).append(descriptor)
+    if set(descriptors_by_node) - set(requirements):
+        raise JournalRecoveryError(
+            "typed publication descriptor has no sealed output authority"
+        )
+    for node_id, requirement in requirements.items():
+        matches = descriptors_by_node.get(node_id, [])
+        if len(matches) != 1:
+            raise JournalRecoveryError(
+                "typed publication requires exactly one winning descriptor"
+            )
+        descriptor = matches[0]
+        if (
+            descriptor.output_type != requirement.output_type
+            or descriptor.schema_fingerprint != requirement.schema_fingerprint
+            or descriptor.canonicalization_version
+            != requirement.canonicalization_version
+        ):
+            raise JournalRecoveryError(
+                "typed publication descriptor conflicts with sealed output authority"
+            )
     return tuple(descriptors)
 
 
@@ -4789,7 +4944,11 @@ class RunStore:
                 if checksum != _projection_digest(snapshot):
                     raise JournalRecoveryError("journal projection digest mismatch")
                 try:
-                    _journaled_typed_publications(snapshot)
+                    declared_outputs = _sealed_typed_output_declarations(
+                        directory,
+                        snapshot,
+                    )
+                    _journaled_typed_publications(snapshot, declared_outputs)
                 except JournalRecoveryError:
                     self._transition_run_repair(
                         "typed_publication_integrity",
@@ -8021,12 +8180,15 @@ class RunStore:
             return None
         reparse_marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
         if (
+            reparse_marker
+            and getattr(observed, "st_file_attributes", 0) & reparse_marker
+        ):
+            raise JournalRecoveryError(
+                "typed publication integrity: bundle is a reparse point"
+            )
+        if (
             not stat.S_ISDIR(observed.st_mode)
             or stat.S_ISLNK(observed.st_mode)
-            or (
-                reparse_marker
-                and getattr(observed, "st_file_attributes", 0) & reparse_marker
-            )
         ):
             return None
         try:
@@ -8069,7 +8231,14 @@ class RunStore:
     ) -> dict[str, bytes]:
         run_id = str(projection["run_id"])
         try:
-            descriptors = _journaled_typed_publications(projection)
+            declared_outputs = _sealed_typed_output_declarations(
+                directory,
+                projection,
+            )
+            descriptors = _journaled_typed_publications(
+                projection,
+                declared_outputs,
+            )
             expected = {descriptor.publication_id: descriptor for descriptor in descriptors}
             publications = directory / "publications"
             if publications.exists() or publications.is_symlink():
@@ -8336,7 +8505,10 @@ class RunStore:
     ) -> None:
         descriptors = {
             descriptor.publication_id: descriptor
-            for descriptor in _journaled_typed_publications(projection)
+            for descriptor in _journaled_typed_publications(
+                projection,
+                _sealed_typed_output_declarations(directory, projection),
+            )
         }
         expected = {
             obligation.mirror_id: obligation
