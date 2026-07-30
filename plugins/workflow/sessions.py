@@ -461,28 +461,37 @@ class TypedMirrorStore:
                 raise TypedMirrorIntegrityError("typed mirror staged record conflicts")
             generation = 0
             try:
-                current = json.loads(
-                    _read_regular(index_path, max_bytes=_MIRROR_MAX_DOCUMENT_BYTES)
-                )
-                if not isinstance(current, dict):
-                    raise TypedMirrorIntegrityError("typed mirror index is malformed")
-                if current.get("entry_id") == record.entry_id:
-                    current_record = self._verified_record(record.entry_id)
-                    if current_record == record:
-                        return True
-                if isinstance(current.get("generation"), int) and not isinstance(
-                    current.get("generation"), bool
-                ):
-                    generation = int(current["generation"])
-            except (
-                FileNotFoundError,
-                TypeError,
-                UnicodeDecodeError,
-                ValueError,
-                json.JSONDecodeError,
-                TypedMirrorIntegrityError,
-            ):
+                index_path.lstat()
+            except FileNotFoundError:
                 pass
+            except OSError as exc:
+                raise TypedMirrorIntegrityError(
+                    "typed mirror index is unavailable"
+                ) from exc
+            else:
+                try:
+                    current = json.loads(
+                        _read_regular(
+                            index_path,
+                            max_bytes=_MIRROR_MAX_DOCUMENT_BYTES,
+                        )
+                    )
+                    if isinstance(current, dict):
+                        if current.get("entry_id") == record.entry_id:
+                            current_record = self._verified_record(record.entry_id)
+                            if current_record == record:
+                                return True
+                        if isinstance(
+                            current.get("generation"), int
+                        ) and not isinstance(current.get("generation"), bool):
+                            generation = int(current["generation"])
+                except (
+                    TypeError,
+                    UnicodeDecodeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ):
+                    pass
             if not replace_current:
                 current_id = self._read_index_entry_id(index_path)
                 if current_id is not None:

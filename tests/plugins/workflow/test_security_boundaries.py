@@ -289,6 +289,14 @@ def test_typed_mirror_directory_reparse_point_fails_closed(
     sentinel = tmp_path / "outside-directory-sentinel"
     sentinel.write_bytes(b"keep")
     _inject_reparse(monkeypatch, mirrors.root)
+    original_mkdir = Path.mkdir
+
+    def trapped_descendant_mkdir(path: Path, *args, **kwargs):
+        if mirrors.root in path.parents:
+            sentinel.write_bytes(b"continued through unsafe directory")
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", trapped_descendant_mkdir)
 
     with pytest.raises(TypedMirrorIntegrityError, match="directory is unsafe"):
         TypedMirrorStore(home)
@@ -308,6 +316,14 @@ def test_typed_mirror_content_reparse_point_fails_closed(
     sentinel = tmp_path / "outside-content-sentinel"
     sentinel.write_bytes(b"keep")
     _inject_reparse(monkeypatch, content)
+    original_link = os.link
+
+    def trapped_content_link(source, destination, *args, **kwargs):
+        if Path(destination) == content:
+            sentinel.write_bytes(b"continued through unsafe content")
+        return original_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", trapped_content_link)
 
     with pytest.raises(TypedMirrorIntegrityError, match="file is unsafe"):
         mirrors.stage(obligation, data)
@@ -328,6 +344,47 @@ def test_typed_mirror_index_reparse_point_is_invisible(
     sentinel = tmp_path / "outside-index-sentinel"
     sentinel.write_bytes(b"keep")
     _inject_reparse(monkeypatch, index)
+    original_open = os.open
+
+    def trapped_index_open(path, flags, mode=0o777, *, dir_fd=None):
+        if Path(path) == index:
+            sentinel.write_bytes(b"followed unsafe index")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", trapped_index_open)
 
     assert mirrors.get("workflow", "node", "scope") is None
+    assert sentinel.read_bytes() == b"keep"
+
+
+def test_typed_mirror_completion_rejects_reparse_index_before_replace(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    mirrors = TypedMirrorStore(tmp_path / "profile")
+    first_data = b"first"
+    mirrors.complete(_mirror_obligation(first_data), first_data)
+    index = mirrors.index_root / mirrors._scope_id("workflow", "node", "scope")
+    index = index.with_suffix(".json")
+    original_index = index.read_bytes()
+    sentinel = tmp_path / "outside-index-write-sentinel"
+    sentinel.write_bytes(b"keep")
+    _inject_reparse(monkeypatch, index)
+    original_replace = os.replace
+
+    def trapped_index_replace(source, destination):
+        if Path(destination) == index:
+            sentinel.write_bytes(b"replaced unsafe index")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", trapped_index_replace)
+    second_data = b"second"
+
+    with pytest.raises(TypedMirrorIntegrityError, match="file is unsafe"):
+        mirrors.complete(
+            _mirror_obligation(second_data, run_id="run-2"),
+            second_data,
+        )
+
+    assert index.read_bytes() == original_index
     assert sentinel.read_bytes() == b"keep"

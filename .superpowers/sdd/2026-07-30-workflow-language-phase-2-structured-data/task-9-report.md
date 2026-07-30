@@ -225,3 +225,73 @@ Result: Ruff and the whitespace check passed.
   while an external sentinel remains unchanged.
 
 Concerns: none within the spec-fix scope.
+
+## Spec Fix Round 2 — mirror-index write fail-closed behavior
+
+`TypedMirrorStore.point()` now distinguishes a genuinely absent scope index
+from an existing index that cannot be read safely. A missing index can still be
+created, but a reparse-marked or otherwise unsafe existing index propagates
+`TypedMirrorIntegrityError` before `_atomic_bytes()` can replace it.
+
+The mirror-index coverage now exercises the public `complete()` write path
+against an existing reparse-marked index. Its replacement trap is bound to the
+exact index target and mutates an external sentinel if execution reaches
+`os.replace`; the corrected path raises first, preserves the original index
+bytes, and leaves the sentinel untouched. The publication root/bundle/source
+and mirror directory/content/read-index cases likewise install target-bound
+continuation traps, so their sentinel assertions prove that iteration,
+replacement, following, or continued writes do not occur after reparse
+detection.
+
+### Strict TDD evidence
+
+Focused RED:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_security_boundaries.py -k reparse
+```
+
+Observed expected RED: 2 files, 6 passed and 1 failed. Mirror completion did
+not raise for the reparse-marked existing index and reached the exact-target
+replacement trap. All already-guarded publication and mirror branches passed
+with their connected traps.
+
+Focused GREEN: the same command passed 7 tests with 0 failures.
+
+Exact Task 9 acceptance:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_fault_injection.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_retention.py tests/plugins/workflow/test_security_boundaries.py
+```
+
+Result: 7 files, 122 passed, 0 failed.
+
+Task 8 typed-publication and loop regression:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_loop_executor.py
+```
+
+Result: 2 files, 29 passed, 0 failed.
+
+Static verification:
+
+```text
+.venv/bin/ruff check plugins/workflow/store.py plugins/workflow/sessions.py tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_typed_publication_recovery.py tests/plugins/workflow/test_crash_recovery.py tests/plugins/workflow/test_fault_injection.py tests/plugins/workflow/test_shutdown_recovery.py tests/plugins/workflow/test_persisted_sessions.py tests/plugins/workflow/test_retention.py tests/plugins/workflow/test_security_boundaries.py
+git diff --check
+```
+
+Result: Ruff and the whitespace check passed.
+
+### Spec-fix self-review
+
+- Confirmed unsafe existing index reads cannot fall through to atomic
+  replacement, including `replace_current=False` callers.
+- Confirmed a genuinely missing index still reaches normal first-generation
+  creation.
+- Confirmed the write-side regression uses `complete()` rather than only the
+  read-side `get()` path and retains the original index bytes on failure.
+- Confirmed each reparse sentinel is connected to the exact operation that
+  would demonstrate continued traversal or mutation after the guard.
+
+Concerns: none within the spec-fix scope.

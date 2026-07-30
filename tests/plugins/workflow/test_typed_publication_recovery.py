@@ -623,6 +623,33 @@ def test_publication_reparse_points_fail_closed_without_touching_external_data(
         return observed
 
     monkeypatch.setattr(Path, "lstat", injected_reparse)
+    if reparse_branch == "root":
+        original_iterdir = Path.iterdir
+
+        def trapped_root_iteration(path: Path):
+            if path == target:
+                sentinel.write_bytes(b"continued through unsafe root")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", trapped_root_iteration)
+    elif reparse_branch == "bundle":
+        original_replace = store_module.os.replace
+
+        def trapped_bundle_replace(source_path, destination_path):
+            if Path(source_path) == target:
+                sentinel.write_bytes(b"replaced unsafe bundle")
+            return original_replace(source_path, destination_path)
+
+        monkeypatch.setattr(store_module.os, "replace", trapped_bundle_replace)
+    else:
+        original_open = store_module.os.open
+
+        def trapped_source_open(path, flags, mode=0o777, *, dir_fd=None):
+            if path == source.name and dir_fd is not None:
+                sentinel.write_bytes(b"followed unsafe source")
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(store_module.os, "open", trapped_source_open)
 
     with pytest.raises(JournalRecoveryError, match="typed publication integrity"):
         store.load_run(admitted.run_id)
