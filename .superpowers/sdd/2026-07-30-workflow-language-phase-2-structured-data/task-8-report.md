@@ -140,3 +140,127 @@ Result: Ruff passed and the diff whitespace check was clean.
 None within Task 8 scope. Crash recovery for a bundle renamed immediately
 before a later journal/projection failure remains intentionally deferred to
 Task 9 as specified.
+
+## Fix Round 1 — specification compliance
+
+Addressed all three Important findings in `task-8-spec-review.md` with a
+separate TDD cycle.
+
+### RED evidence
+
+Legacy-profile scheduler gate:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py -k hermes_legacy_primary_output
+```
+
+Result: 0 passed, 1 failed. The scheduler attempted typed publication for a
+legacy run and surfaced `ArchonOutputIntegrityError('typed publication
+requires the Archon language profile')`, proving the store defense existed
+but the scheduler gate was missing.
+
+Active-attempt locality:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py -k another_attempt
+```
+
+Result: 0 passed, 1 failed. The direct-store regression did not raise
+`ArchonOutputIntegrityError`, proving that a contained path owned by another
+attempt could be published.
+
+Canonical media type and UTF-8 content contract:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py -k 'each_successful_output_node or noncanonical_text_media_type or invalid_utf8_markdown'
+```
+
+Result: 2 passed, 7 failed. Four text-producing node-kind rows retained
+`text/plain` instead of `text/markdown; charset=utf-8`; direct-store
+regressions accepted `text/markdown`, `application/octet-stream`, and invalid
+UTF-8 Markdown bytes.
+
+### Implementation changes
+
+- Passed the sealed `WorkflowLanguageProfile` through every scheduler
+  persistence path and only constructs a typed-publication candidate for
+  `ARCHON_2026_07`; the store's independent profile defense remains intact.
+- Canonicalized known executor `text/plain` primary outputs to
+  `text/markdown; charset=utf-8` for Archon typed publication, updating the
+  retained candidate and matching artifact descriptor together so Task 7
+  corroboration remains consistent.
+- Required candidate paths to belong to the active claim's node and attempt,
+  recognizing both raw executor paths and the existing securely hashed AI
+  attempt paths.
+- Restricted typed publication to exact `application/json` or
+  `text/markdown; charset=utf-8`, and validated canonical Markdown bytes as
+  UTF-8 before staging a bundle.
+- Preserved legacy completion behavior: the original `text/plain` artifact is
+  retained and no publication directory is created.
+
+### Added and updated coverage
+
+- Updated all successful output-node rows to assert executor media separately
+  from the canonical published media.
+- Added a legacy-profile primary-output regression covering scheduler
+  completion and unchanged artifact shape.
+- Added a contained-but-foreign attempt-path rejection regression.
+- Added rejection coverage for `text/markdown`,
+  `application/octet-stream`, and invalid UTF-8 canonical Markdown.
+
+### GREEN evidence
+
+Focused typed-publication suite:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py
+```
+
+Result: 1 file, 14 passed, 0 failed.
+
+Task 7 interface regression gate:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_ai_e2e.py
+```
+
+Result: 3 files, 67 passed, 0 failed.
+
+Exact Task 8 acceptance command:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_approval.py tests/plugins/workflow/test_loop_executor.py tests/plugins/workflow/test_script_executor.py tests/plugins/workflow/test_bash_e2e.py
+```
+
+Result before final documentation/commit verification: 7 files, 100 passed,
+0 failed.
+
+Static verification:
+
+```text
+.venv/bin/ruff check plugins/workflow/store.py plugins/workflow/scheduler.py tests/plugins/workflow/test_typed_publication.py
+git diff --check
+```
+
+Result: Ruff passed and the diff whitespace check was clean.
+
+### Fix-round self-review
+
+- Confirmed scheduler gating uses the sealed enum, not mutable or inferred
+  runtime metadata, and every `_persist_result` call from execution passes it.
+- Confirmed the default on `_persist_result` keeps direct legacy callers safe
+  while the store remains the final enforcement boundary.
+- Confirmed path ownership is checked before any publication staging/final
+  directory can be created and rejects a sibling attempt within the run root.
+- Confirmed media validation is exact rather than prefix-based, JSON continues
+  to publish as `content.json`, and all other accepted content is canonical
+  UTF-8 Markdown published as `content.md`.
+- Confirmed scheduler normalization keeps the candidate identity, artifact
+  corroboration, and decorated completion descriptor aligned.
+- Confirmed no Task 9 recovery behavior was introduced.
+
+### Fix-round concerns
+
+None within Task 8 scope. Scheduler normalization intentionally covers the
+known legacy executor contract (`text/plain`); all other noncanonical media
+types are rejected by the store instead of being guessed or silently coerced.

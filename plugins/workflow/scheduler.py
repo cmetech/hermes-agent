@@ -2148,6 +2148,7 @@ class RunScheduler:
                             error_code=self._cancellation_reason(run_id) or "cancelled",
                         ),
                         execution_limits,
+                        language_profile=package.language.effective_profile,
                     )
                     return
                 node_state = dict(projection["nodes"][node.id])
@@ -2166,6 +2167,7 @@ class RunScheduler:
                             error_message="combined retry budget is exhausted",
                         ),
                         execution_limits,
+                        language_profile=package.language.effective_profile,
                     )
                     return
                 approved_action_digest = self.store.consume_action_grant(claim)
@@ -2368,7 +2370,13 @@ class RunScheduler:
                     heartbeat_thread.join(timeout=self.heartbeat_seconds)
                 if ownership_lost.is_set():
                     return
-            self._persist_result(claim, node, result, execution_limits)
+            self._persist_result(
+                claim,
+                node,
+                result,
+                execution_limits,
+                language_profile=package.language.effective_profile,
+            )
         except RuntimeError as exc:
             if "execution fence" in str(exc):
                 self.store.release_claim_before_execution(claim)
@@ -2386,6 +2394,10 @@ class RunScheduler:
         node: WorkflowNode,
         result: NodeExecutionResult,
         execution_limits: RunExecutionLimits,
+        *,
+        language_profile: WorkflowLanguageProfile = (
+            WorkflowLanguageProfile.HERMES_LEGACY
+        ),
     ) -> None:
         if result.status == "failed" and result.error_code == "cleanup_failed":
             self.store.block_cleanup_failed(
@@ -2396,19 +2408,42 @@ class RunScheduler:
             return
         if result.status != "failed":
             completion_metadata = dict(result.metadata)
+            completion_artifacts = result.artifacts
             retained_candidate = None
             if result.status == "succeeded" and result.primary_output is not None:
+                retained_candidate = result.primary_output
+                if (
+                    language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+                    and retained_candidate.output_type is not None
+                    and retained_candidate.media_type == "text/plain"
+                ):
+                    canonical_media_type = "text/markdown; charset=utf-8"
+                    retained_candidate = replace(
+                        retained_candidate,
+                        media_type=canonical_media_type,
+                    )
+                    completion_artifacts = tuple(
+                        replace(artifact, media_type=canonical_media_type)
+                        if (
+                            artifact.relative_path
+                            == retained_candidate.attempt_relative_path
+                            and artifact.size_bytes == retained_candidate.size_bytes
+                            and artifact.sha256 == retained_candidate.sha256
+                        )
+                        else artifact
+                        for artifact in result.artifacts
+                    )
                 candidate_identity = primary_output_candidate_identity(
-                    result.primary_output
+                    retained_candidate
                 )
                 primary_output_candidate_from_identity(candidate_identity)
                 completion_metadata[PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY] = (
                     candidate_identity
                 )
-                retained_candidate = result.primary_output
             typed_publication = None
             if (
-                retained_candidate is not None
+                language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+                and retained_candidate is not None
                 and retained_candidate.output_type is not None
             ):
                 session_id = completion_metadata.get("session_id")
@@ -2439,7 +2474,7 @@ class RunScheduler:
                         self.store.complete_node(
                             claim,
                             status=result.status,
-                            artifacts=result.artifacts,
+                            artifacts=completion_artifacts,
                             typed_publication=typed_publication,
                             error_code=result.error_code,
                             error_message=result.error_message,

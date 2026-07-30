@@ -19,7 +19,7 @@ import uuid
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import AbstractSet, Callable, Iterable, Mapping
 
 import yaml
@@ -57,6 +57,7 @@ from plugins.workflow.output_resolution import (
     ArchonOutputIntegrityError,
     ArchonOutputUnavailableError,
     _read_descriptor_relative,
+    _safe_component,
 )
 from plugins.workflow.schedule_time import (
     ScheduleInstantError,
@@ -251,6 +252,8 @@ _SECRET_DIAGNOSTIC = re.compile(
 )
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _TYPED_PUBLICATION_METADATA_MAX_BYTES = 65_536
+_TYPED_PUBLICATION_JSON_MEDIA_TYPE = "application/json"
+_TYPED_PUBLICATION_TEXT_MEDIA_TYPE = "text/markdown; charset=utf-8"
 
 
 def _utc_now() -> str:
@@ -7104,14 +7107,22 @@ class RunStore:
         candidate: TypedPublicationCandidate,
     ) -> TypedPublicationRef:
         if (
+            not isinstance(candidate.media_type, str)
+            or candidate.media_type
+            not in {
+                _TYPED_PUBLICATION_JSON_MEDIA_TYPE,
+                _TYPED_PUBLICATION_TEXT_MEDIA_TYPE,
+            }
+        ):
+            raise ArchonOutputIntegrityError(
+                "typed publication media type is invalid"
+            )
+        if (
             not isinstance(candidate.attempt_relative_path, str)
             or not candidate.attempt_relative_path
             or not isinstance(candidate.output_type, str)
             or not candidate.output_type.strip()
             or len(candidate.output_type) > DURABLE_METADATA_STRING_MAX_CHARS
-            or not isinstance(candidate.media_type, str)
-            or not candidate.media_type
-            or len(candidate.media_type) > 128
             or isinstance(candidate.size_bytes, bool)
             or not isinstance(candidate.size_bytes, int)
             or not 0 <= candidate.size_bytes <= 500_000
@@ -7137,6 +7148,21 @@ class RunStore:
         ):
             raise ArchonOutputIntegrityError(
                 "typed publication candidate is invalid"
+            )
+        relative = PurePosixPath(candidate.attempt_relative_path)
+        raw_attempt_prefix = ("nodes", claim.node_id, claim.attempt_id)
+        secured_attempt_prefix = (
+            "nodes",
+            _safe_component("node", claim.node_id),
+            _safe_component("attempt", claim.attempt_id),
+        )
+        if (
+            len(relative.parts) <= 3
+            or relative.parts[:3]
+            not in {raw_attempt_prefix, secured_attempt_prefix}
+        ):
+            raise ArchonOutputIntegrityError(
+                "typed publication content is not owned by the active attempt"
             )
         language = projection.get("language")
         language_profile = (
@@ -7177,11 +7203,18 @@ class RunStore:
             raise ArchonOutputIntegrityError(
                 "typed publication content digest does not match"
             )
+        if candidate.media_type == _TYPED_PUBLICATION_TEXT_MEDIA_TYPE:
+            try:
+                content.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ArchonOutputIntegrityError(
+                    "typed publication Markdown content is not valid UTF-8"
+                ) from exc
 
         publication_id = uuid.uuid4().hex
         content_name = (
             "content.json"
-            if candidate.media_type == "application/json"
+            if candidate.media_type == _TYPED_PUBLICATION_JSON_MEDIA_TYPE
             else "content.md"
         )
         metadata = {

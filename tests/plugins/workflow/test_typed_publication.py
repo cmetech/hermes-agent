@@ -11,7 +11,10 @@ import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.executors.base import NodeExecutionResult
-from plugins.workflow.output_resolution import PrimaryOutputCandidate
+from plugins.workflow.output_resolution import (
+    ArchonOutputIntegrityError,
+    PrimaryOutputCandidate,
+)
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import (
@@ -37,16 +40,24 @@ def _node(kind: str, *, output_type: str) -> dict[str, object]:
     return node
 
 
-def _start_archon(store: RunStore, workflow_writer, root: Path, node):
+def _start_archon(
+    store: RunStore,
+    workflow_writer,
+    root: Path,
+    node,
+    *,
+    profile: str | None = "archon-2026-07",
+):
     workflow = workflow_writer(root, name="typed-publication", nodes=[node])
     if "command" in node:
         (root / "commands").mkdir()
         (root / "commands" / "produce.md").write_text(
             "---\ndescription: Produce\n---\nProduce", encoding="utf-8"
         )
-    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
-        "language_compatibility: archon-2026-07\n", encoding="utf-8"
-    )
+    if profile is not None:
+        workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+            f"language_compatibility: {profile}\n", encoding="utf-8"
+        )
     package = load_workflow(workflow)
     prepared = store.prepare_run_snapshot(package)
     admitted = store.start_run(
@@ -106,18 +117,54 @@ class _OutputExecutor:
 
 
 @pytest.mark.parametrize(
-    ("kind", "data", "media_type", "content_name"),
+    ("kind", "data", "executor_media_type", "published_media_type", "content_name"),
     [
-        ("command", b'{"answer":1}', "application/json", "content.json"),
-        ("prompt", b"", "text/markdown", "content.md"),
-        ("bash", b"bash output", "text/markdown", "content.md"),
-        ("script", b'{"script":true}', "application/json", "content.json"),
-        ("loop", b"loop output", "text/markdown", "content.md"),
-        ("approval", b"approved", "text/markdown", "content.md"),
+        (
+            "command",
+            b'{"answer":1}',
+            "application/json",
+            "application/json",
+            "content.json",
+        ),
+        ("prompt", b"", "text/plain", "text/markdown; charset=utf-8", "content.md"),
+        (
+            "bash",
+            b"bash output",
+            "text/plain",
+            "text/markdown; charset=utf-8",
+            "content.md",
+        ),
+        (
+            "script",
+            b'{"script":true}',
+            "application/json",
+            "application/json",
+            "content.json",
+        ),
+        (
+            "loop",
+            b"loop output",
+            "text/plain",
+            "text/markdown; charset=utf-8",
+            "content.md",
+        ),
+        (
+            "approval",
+            b"approved",
+            "text/plain",
+            "text/markdown; charset=utf-8",
+            "content.md",
+        ),
     ],
 )
 def test_each_successful_output_node_publishes_one_atomic_typed_bundle(
-    tmp_path, workflow_writer, kind, data, media_type, content_name
+    tmp_path,
+    workflow_writer,
+    kind,
+    data,
+    executor_media_type,
+    published_media_type,
+    content_name,
 ) -> None:
     output_type = "MixedCase/Result-分析"
     store = RunStore(tmp_path / "home")
@@ -128,7 +175,7 @@ def test_each_successful_output_node_publishes_one_atomic_typed_bundle(
         _node(kind, output_type=output_type),
     )
     scheduler = RunScheduler(store)
-    scheduler.executors[kind] = _OutputExecutor(data, media_type)
+    scheduler.executors[kind] = _OutputExecutor(data, executor_media_type)
 
     result = scheduler.advance(admitted.run_id)
 
@@ -145,13 +192,14 @@ def test_each_successful_output_node_publishes_one_atomic_typed_bundle(
     ]
     assert artifact["content_name"] == content_name
     assert artifact["output_type"] == output_type
+    assert artifact["media_type"] == published_media_type
     assert artifact["metadata_sha256"] == hashlib.sha256(metadata_bytes).hexdigest()
     assert metadata == {
         "attempt_id": artifact["attempt_id"],
         "canonicalization_version": 1,
         "content_name": content_name,
         "language_profile": "archon-2026-07",
-        "media_type": media_type,
+        "media_type": published_media_type,
         "node_id": "produce",
         "output_type": output_type,
         "produced_at": metadata["produced_at"],
@@ -191,29 +239,75 @@ def test_cancel_never_publishes_even_when_an_executor_returns_output(
     assert all("publication_id" not in artifact for artifact in result["artifacts"])
 
 
+def test_hermes_legacy_primary_output_completes_without_publication(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_archon(
+        store,
+        workflow_writer,
+        tmp_path / "legacy",
+        _node("prompt", output_type="LegacyResult"),
+        profile=None,
+    )
+    scheduler = RunScheduler(store)
+    scheduler.executors["prompt"] = _OutputExecutor(b"legacy output", "text/plain")
+    observed_error = None
+
+    try:
+        result = scheduler.advance(admitted.run_id)
+    except RuntimeError as exc:
+        observed_error = exc
+        result = store.load_run(admitted.run_id)
+
+    assert observed_error is None
+    assert result["status"] == "succeeded"
+    assert not (store.run_directory(admitted.run_id) / "publications").exists()
+    assert len(result["artifacts"]) == 1
+    artifact = result["artifacts"][0]
+    assert set(artifact) == {
+        "attempt_id",
+        "media_type",
+        "node_id",
+        "relative_path",
+        "sha256",
+        "size_bytes",
+    }
+    assert artifact["attempt_id"] == result["nodes"]["produce"]["attempts"][-1][
+        "attempt_id"
+    ]
+    assert artifact["media_type"] == "text/plain"
+    assert artifact["node_id"] == "produce"
+    assert artifact["relative_path"].endswith("/output.md")
+    assert artifact["sha256"] == hashlib.sha256(b"legacy output").hexdigest()
+    assert artifact["size_bytes"] == len(b"legacy output")
+
+
 def _attempt_publication(
     store: RunStore,
     claim,
     data: bytes,
     *,
     output_type: str = "Report",
+    media_type: str = "text/markdown; charset=utf-8",
+    path_attempt_id: str | None = None,
 ) -> tuple[ArtifactRef, TypedPublicationCandidate]:
     path = (
         store.run_directory(claim.run_id)
         / "nodes"
         / claim.node_id
-        / claim.attempt_id
+        / (path_attempt_id or claim.attempt_id)
         / "output.md"
     )
     path.parent.mkdir(parents=True, exist_ok=False)
     path.write_bytes(data)
     relative = path.relative_to(store.run_directory(claim.run_id)).as_posix()
     digest = hashlib.sha256(data).hexdigest()
-    artifact = ArtifactRef(relative, "text/markdown", len(data), digest)
+    artifact = ArtifactRef(relative, media_type, len(data), digest)
     candidate = TypedPublicationCandidate(
         attempt_relative_path=relative,
         output_type=output_type,
-        media_type="text/markdown",
+        media_type=media_type,
         size_bytes=len(data),
         sha256=digest,
         schema_fingerprint=None,
@@ -221,6 +315,89 @@ def _attempt_publication(
         session_id=None,
     )
     return artifact, candidate
+
+
+def test_typed_publication_rejects_contained_output_from_another_attempt(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_archon(
+        store,
+        workflow_writer,
+        tmp_path / "wrong-attempt",
+        _node("bash", output_type="Report"),
+    )
+    active = store.claim_node(admitted.run_id, "produce", "active")
+    assert active is not None
+    artifact, candidate = _attempt_publication(
+        store,
+        active,
+        b"foreign attempt",
+        path_attempt_id="attempt-that-does-not-own-the-claim",
+    )
+
+    with pytest.raises(ArchonOutputIntegrityError, match="active attempt"):
+        store.complete_node(
+            active,
+            status="succeeded",
+            artifacts=(artifact,),
+            typed_publication=candidate,
+        )
+
+    assert not (store.run_directory(admitted.run_id) / "publications").exists()
+
+
+@pytest.mark.parametrize("media_type", ["text/markdown", "application/octet-stream"])
+def test_typed_publication_rejects_noncanonical_text_media_type(
+    tmp_path, workflow_writer, media_type
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_archon(
+        store,
+        workflow_writer,
+        tmp_path / media_type.replace("/", "-"),
+        _node("bash", output_type="Report"),
+    )
+    claim = store.claim_node(admitted.run_id, "produce", "active")
+    assert claim is not None
+    artifact, candidate = _attempt_publication(
+        store, claim, b"text", media_type=media_type
+    )
+
+    with pytest.raises(ArchonOutputIntegrityError, match="media type"):
+        store.complete_node(
+            claim,
+            status="succeeded",
+            artifacts=(artifact,),
+            typed_publication=candidate,
+        )
+
+    assert not (store.run_directory(admitted.run_id) / "publications").exists()
+
+
+def test_typed_publication_rejects_invalid_utf8_markdown(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "home")
+    admitted = _start_archon(
+        store,
+        workflow_writer,
+        tmp_path / "invalid-utf8",
+        _node("bash", output_type="Report"),
+    )
+    claim = store.claim_node(admitted.run_id, "produce", "active")
+    assert claim is not None
+    artifact, candidate = _attempt_publication(store, claim, b"\xff\xfe")
+
+    with pytest.raises(ArchonOutputIntegrityError, match="UTF-8"):
+        store.complete_node(
+            claim,
+            status="succeeded",
+            artifacts=(artifact,),
+            typed_publication=candidate,
+        )
+
+    assert not (store.run_directory(admitted.run_id) / "publications").exists()
 
 
 def test_stale_typed_completion_cannot_create_publication_staging_or_final_content(
