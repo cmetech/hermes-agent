@@ -52,10 +52,15 @@ def test_notify_supports_systemd_abstract_socket(monkeypatch):
     monkeypatch.setenv("NOTIFY_SOCKET", "@hermes-test-notify")
     import gateway.systemd_notify as notify_mod
 
-    monkeypatch.setattr(notify_mod.socket, "socket", lambda *_args: _Sender())
+    def _socket(family, kind):
+        calls.append(("socket", family, kind))
+        return _Sender()
+
+    monkeypatch.setattr(notify_mod.socket, "socket", _socket)
 
     assert notify_mod.notify("WATCHDOG=1") is True
     assert calls == [
+        ("socket", socket.AF_UNIX, socket.SOCK_DGRAM),
         ("setblocking", False),
         ("connect", "\0hermes-test-notify"),
         ("send", b"WATCHDOG=1"),
