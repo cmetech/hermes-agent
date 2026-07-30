@@ -627,6 +627,41 @@ def _typed_publication_fields(reference: TypedPublicationRef) -> dict[str, objec
     }
 
 
+def _write_or_reuse_typed_approval_output(
+    run_directory: Path,
+    *,
+    node_id: str,
+    attempt_id: str,
+    data: bytes,
+) -> PurePosixPath:
+    relative = PurePosixPath(
+        "nodes",
+        _safe_component("node", node_id),
+        _safe_component("attempt", attempt_id),
+        "output.md",
+    )
+    try:
+        output_path = write_archon_output_exclusive(
+            run_directory,
+            node_id=node_id,
+            attempt_id=attempt_id,
+            filename="output.md",
+            data=data,
+        )
+    except ArchonOutputIntegrityError:
+        existing = _read_descriptor_relative(
+            run_directory,
+            relative.as_posix(),
+            size_bytes=len(data),
+        )
+        if not hmac.compare_digest(_sha256(existing), _sha256(data)):
+            raise ArchonOutputIntegrityError(
+                "typed approval output source identity changed"
+            )
+        return relative
+    return PurePosixPath(output_path.relative_to(run_directory).as_posix())
+
+
 def _canonical_typed_publication_artifact(
     artifacts: tuple[ArtifactRef, ...],
     candidate: TypedPublicationCandidate,
@@ -9656,14 +9691,12 @@ class RunStore:
                             else None
                         )
                         if attempt_id is not None:
-                            output_path = write_archon_output_exclusive(
+                            relative = _write_or_reuse_typed_approval_output(
                                 directory,
                                 node_id=node_id,
                                 attempt_id=attempt_id,
-                                filename="output.md",
                                 data=encoded,
                             )
-                            relative = output_path.relative_to(directory)
                         else:
                             relative = (
                                 Path("nodes")

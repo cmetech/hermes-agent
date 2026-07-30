@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import time
 
 import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
+import plugins.workflow.store as store_module
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import register_cli
 from plugins.workflow.executors.approval import ApprovalExecutor
@@ -19,6 +21,7 @@ from plugins.workflow.models import (
     WorkflowNode,
     freeze_value,
 )
+from plugins.workflow.output_resolution import ArchonOutputIntegrityError
 from plugins.workflow.resources import VariableContext
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
@@ -142,6 +145,131 @@ def test_approval_survives_restart_captures_trimmed_output_and_continues(
     )
     assert duplicate.outcome == "already_decided"
     assert duplicate.decision == "approved"
+
+
+def test_typed_approval_retries_after_publication_fails_post_source_write(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    workflow = workflow_writer(
+        tmp_path / "retry-package",
+        name="retry-durable-gate",
+        nodes=[
+            {
+                "id": "review",
+                "approval": {
+                    "message": "Approve the proposed plan?",
+                    "capture_response": True,
+                },
+                "output_type": "ApprovalDecision",
+            },
+        ],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow(workflow)
+    store = RunStore(tmp_path / "retry-home")
+    admitted = _start(store, package, key="approval-publication-retry")
+    paused = RunScheduler(store).advance(admitted.run_id)
+    pending = paused["nodes"]["review"]["pending_interaction"]
+    original_fsync = store_module._fsync_publication_directory
+
+    def fail_staging_fsync(descriptor, *, boundary):
+        if boundary == "staging":
+            raise OSError("staging fsync failed")
+        return original_fsync(descriptor, boundary=boundary)
+
+    monkeypatch.setattr(
+        store_module,
+        "_fsync_publication_directory",
+        fail_staging_fsync,
+    )
+
+    with pytest.raises(OSError, match="staging fsync failed"):
+        store.approve_run(
+            admitted.run_id,
+            comment="  looks good  ",
+            expected_state_version=paused["state_version"],
+            interaction_id=pending["interaction_id"],
+            actor="operator-1",
+            channel="cli",
+        )
+
+    still_paused = store.load_run(admitted.run_id)
+    assert still_paused["status"] == "paused"
+    assert still_paused["nodes"]["review"]["state"] == "paused"
+    assert still_paused["nodes"]["review"]["pending_interaction"] == pending
+    assert not any(
+        artifact.get("publication_id") is not None
+        for artifact in still_paused["artifacts"]
+    )
+    assert not any(
+        event["event_type"] == "interaction_approved"
+        for event in store.tail_events(admitted.run_id)
+    )
+    source_paths = list(
+        store.run_directory(admitted.run_id).glob("nodes/*/*/output.md")
+    )
+    assert len(source_paths) == 1
+
+    monkeypatch.setattr(
+        store_module,
+        "_fsync_publication_directory",
+        original_fsync,
+    )
+    source_paths[0].write_bytes(b"looks evil")
+    with pytest.raises(
+        ArchonOutputIntegrityError,
+        match="typed approval output source identity changed",
+    ):
+        store.approve_run(
+            admitted.run_id,
+            comment="  looks good  ",
+            expected_state_version=paused["state_version"],
+            interaction_id=pending["interaction_id"],
+            actor="operator-1",
+            channel="cli",
+        )
+    source_paths[0].write_bytes(b"looks good")
+
+    decision = store.approve_run(
+        admitted.run_id,
+        comment="  looks good  ",
+        expected_state_version=paused["state_version"],
+        interaction_id=pending["interaction_id"],
+        actor="operator-1",
+        channel="cli",
+    )
+    assert decision.outcome == "applied"
+
+    decided = store.load_run(admitted.run_id)
+    publications = [
+        artifact
+        for artifact in decided["artifacts"]
+        if artifact.get("publication_id") is not None
+    ]
+    assert len(publications) == 1
+    output = publications[0]
+    assert output["node_id"] == "review"
+    assert output["attempt_id"] == paused["nodes"]["review"]["attempts"][-1][
+        "attempt_id"
+    ]
+    assert output["media_type"] == "text/markdown; charset=utf-8"
+    assert output["size_bytes"] == len(b"looks good")
+    assert output["sha256"] == hashlib.sha256(b"looks good").hexdigest()
+    bundle = (
+        store.run_directory(admitted.run_id)
+        / "publications"
+        / output["publication_id"]
+    )
+    assert (bundle / "content.md").read_bytes() == b"looks good"
+    events = [
+        event
+        for event in store.tail_events(admitted.run_id)
+        if event["event_type"] == "interaction_approved"
+    ]
+    assert len(events) == 1
+    assert events[0]["payload"]["artifact"] == output
 
 
 class ReworkRunner:

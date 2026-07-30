@@ -538,3 +538,68 @@ check was clean.
 Atomic typed publication is supported on Darwin and Linux with their native
 no-replace primitives. Other hosts deliberately fail closed before filesystem
 mutation until an equivalent descriptor-safe atomic primitive is implemented.
+
+## Quality Fix Round 2
+
+Addressed the quality re-review's remaining Important approval-retry finding.
+Typed approval capture now treats its deterministic descriptor-relative source
+as idempotent only when a retry reads the exact expected path and verifies the
+expected byte size and SHA-256 digest. A conflicting same-size source is
+rejected before publication. The retry path does not delete by pathname and
+does not add Task 9 orphan recovery behavior.
+
+### TDD RED evidence
+
+The initial public-API regression injected a staging-directory fsync failure
+after `output.md` was created, restored the fsync boundary, and retried the same
+pending interaction:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_approval.py -k typed_approval_retries_after_publication_fails_post_source_write
+```
+
+Initial result: 1 failed. The retry raised
+`ArchonOutputIntegrityError: Archon output attempt already exists`.
+
+After adding descriptor-relative source reuse, the same test was extended with
+a same-size byte substitution. Its second RED run failed because rejection was
+still deferred to bundle publication (`typed publication content digest does
+not match`) instead of the approval-source identity boundary.
+
+### GREEN evidence
+
+The focused retry and identity regression passed after exact source verification:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_approval.py -k typed_approval_retries_after_publication_fails_post_source_write
+```
+
+Result: 1 passed, 0 failed.
+
+Approval and typed-publication suites:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_approval.py tests/plugins/workflow/test_typed_publication.py
+```
+
+Result: 29 passed, 0 failed.
+
+Exact Task 8 acceptance:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_typed_publication.py tests/plugins/workflow/test_store.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_approval.py tests/plugins/workflow/test_loop_executor.py tests/plugins/workflow/test_script_executor.py tests/plugins/workflow/test_bash_e2e.py
+```
+
+Result: 105 passed, 0 failed.
+
+Task 7 interface regression gate:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_resources.py tests/plugins/workflow/test_ai_e2e.py
+```
+
+Result: 67 passed, 0 failed.
+
+Scheduled revalidation was not rerun in this round because neither its
+implementation nor its tests changed. Ruff and `git diff --check` were clean
+for the amended production and test paths before the final verification gate.
