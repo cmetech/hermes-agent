@@ -259,6 +259,50 @@ def test_catalog_and_detail_models_accept_all_authoritative_source_projections(
         module.WorkflowDetailResponse.model_validate(response.json())
 
 
+def test_workflow_catalog_never_opens_artifact_bodies(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.chdir(workdir)
+    workflow_writer(
+        home / "workflows",
+        name="metadata-only-catalog",
+        filename="metadata-only-catalog.yaml",
+    )
+    body = (
+        home
+        / "workflow_runs"
+        / "runs"
+        / "opaque-run"
+        / "publications"
+        / ("a" * 32)
+        / "content.md"
+    )
+    body.parent.mkdir(parents=True)
+    body.write_bytes(b"CATALOG_MUST_NOT_OPEN_THIS_BODY")
+    real_open = Path.open
+
+    def reject_artifact_body(path, *args, **kwargs):
+        if path == body:
+            pytest.fail("workflow catalog must not open artifact bodies")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", reject_artifact_body)
+
+    response = TestClient(_app(_module().router, token=_reader())).get(
+        "/api/plugins/workflow/workflows"
+    )
+
+    assert response.status_code == 200
+    assert any(
+        item.get("name") == "metadata-only-catalog"
+        for item in response.json()["items"]
+    )
+
+
 def test_workflow_detail_model_accepts_real_maximum_node_compatibility_report(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
@@ -274,7 +318,6 @@ def test_workflow_detail_model_accepts_real_maximum_node_compatibility_report(
                 "bash": "true",
                 "timeout": 1,
                 "retry": {"max_attempts": 1},
-                "output_format": {"type": "object"},
                 "output_type": "text",
                 "maxBudgetUsd": 1,
                 "sandbox": {"enabled": True},
@@ -909,7 +952,7 @@ def test_workflow_detail_is_full_read_only_preflight_with_coordinator_down(
         "declared_profile": None,
         "effective_profile": "hermes-legacy",
         "legacy": True,
-        "normalizer_version": 1,
+        "normalizer_version": 2,
         "normalized_definition_digest": load_workflow(path).language.normalized_definition_digest,
     }
     assert "semantic_fingerprint" not in payload["language"]

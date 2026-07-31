@@ -58,7 +58,11 @@ from plugins.workflow.scheduled_revalidation import (
 )
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.store import RunStore
+from plugins.workflow.store import (
+    ArtifactRef,
+    RunStore,
+    TypedPublicationCandidate,
+)
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.showcase import run_showcase
 from plugins.workflow.trust import (
@@ -124,6 +128,75 @@ def _start(store, package, key, *, scope=None):
         ),
         immutable_snapshot=prepared,
     )
+
+
+def _published_run(
+    home,
+    workflow_writer,
+    root,
+    *,
+    data: bytes,
+    media_type: str,
+    scope: str | None = None,
+):
+    workflow = workflow_writer(
+        root,
+        name=f"artifact-{root.name}",
+        nodes=[{
+            "id": "produce",
+            "bash": "true",
+            "output_type": "DesktopReport",
+        }],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(home)
+    admitted = _start(store, package, root.name, scope=scope)
+    claim = store.claim_node(admitted.run_id, "produce", "desktop-api-worker")
+    assert claim is not None
+    suffix = "json" if media_type == "application/json" else "md"
+    source = (
+        store.run_directory(admitted.run_id)
+        / "nodes"
+        / claim.node_id
+        / claim.attempt_id
+        / f"output.{suffix}"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_bytes(data)
+    relative_path = source.relative_to(
+        store.run_directory(admitted.run_id)
+    ).as_posix()
+    digest = sha256(data).hexdigest()
+    store.complete_node(
+        claim,
+        status="succeeded",
+        artifacts=(
+            ArtifactRef(relative_path, media_type, len(data), digest),
+        ),
+        typed_publication=TypedPublicationCandidate(
+            attempt_relative_path=relative_path,
+            output_type="DesktopReport",
+            media_type=media_type,
+            size_bytes=len(data),
+            sha256=digest,
+            schema_fingerprint=None,
+            canonicalization_version=1,
+            session_id="desktop-artifact-session",
+        ),
+    )
+    artifact = next(
+        item
+        for item in store.get_run_status(
+            admitted.run_id,
+            operator_scope=scope,
+        )["artifacts"]
+        if "publication_id" in item
+    )
+    return store, admitted, artifact
 
 
 def _trusted_catalog_workflow(home, workflow_writer, *, name, nodes=None, **options):
@@ -670,6 +743,9 @@ def test_future_schedule_is_queued_with_server_owned_identity_and_no_execution(
     assert result["status"] == "queued"
     run = store.get_run_status(result["run_id"])
     risk = build_risk_summary(package, assess_compatibility(package))
+    execution_context = background_execution_context(
+        production_workflow_runner_binding(), requires_ai=None
+    )
     assert run["status"] == "queued"
     assert run["execution_mode"] == "background"
     assert run["started_at"] is None
@@ -678,9 +754,8 @@ def test_future_schedule_is_queued_with_server_owned_identity_and_no_execution(
         "catalog_source": "profile",
         "catalog_source_relative": "scheduled-api.yaml",
         "catalog_source_root": str((home / "workflows").resolve()),
-        "execution_identity": background_execution_context(
-            production_workflow_runner_binding(), requires_ai=None
-        ).identity_digest,
+        "execution_identity": execution_context.identity_digest_for(package),
+        "execution_runtime_identity": execution_context.identity_digest,
         "package_digest": risk.package_digest,
         "risk_digest": risk.risk_digest,
         "schedule_at": SCHEDULE_AT,
@@ -2883,6 +2958,211 @@ def test_events_cursor_and_stale_action_conflict(
     assert evidence.status_code == 200
     assert evidence.json()["kind"] == "timeline"
     assert evidence.json()["items"][0]["event_type"] == "run_admitted"
+
+
+@pytest.mark.parametrize("endpoint", ["preview", "download"])
+def test_artifact_endpoints_require_verified_authentication(endpoint) -> None:
+    client = TestClient(_app(_router(), local_admin=False))
+
+    response = client.get(
+        "/api/plugins/workflow/runs/run-id/artifacts/"
+        f"{'a' * 32}/{endpoint}"
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {
+        "detail": {"code": "authentication_required"}
+    }
+
+
+def test_text_artifact_preview_is_bounded_and_download_streams_verified_bytes(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    data = ("é" * 40_000).encode("utf-8")
+    _store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / "text-preview",
+        data=data,
+        media_type="text/markdown; charset=utf-8",
+    )
+    publication_id = artifact["publication_id"]
+    base = (
+        f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+        f"{publication_id}"
+    )
+
+    with TestClient(_app(_router())) as client:
+        preview = client.get(f"{base}/preview")
+        download = client.get(f"{base}/download")
+
+    assert preview.status_code == 200
+    payload = preview.json()
+    assert payload["publication_id"] == publication_id
+    assert payload["media_type"] == "text/markdown; charset=utf-8"
+    assert payload["size_bytes"] == len(data)
+    assert payload["bytes_returned"] == 65_536
+    assert payload["truncated"] is True
+    assert isinstance(payload["content"], str)
+    assert len(payload["content"].encode("utf-8")) <= 65_539
+    assert len(preview.content) < 70_000
+    assert download.status_code == 200
+    assert download.content == data
+    assert download.headers["content-type"] == "text/markdown; charset=utf-8"
+    assert download.headers["content-length"] == str(len(data))
+    assert download.headers["content-disposition"] == (
+        f'attachment; filename="{publication_id}-content.md"'
+    )
+
+
+@pytest.mark.parametrize(
+    ("data", "expected_content", "expected_bytes", "truncated"),
+    [
+        (b'{"answer":42}', {"answer": 42}, 13, False),
+        (
+            json.dumps(
+                {"payload": "x" * 70_000},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            None,
+            0,
+            True,
+        ),
+    ],
+)
+def test_json_artifact_preview_is_complete_or_omitted(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    data,
+    expected_content,
+    expected_bytes,
+    truncated,
+) -> None:
+    home = tmp_path / f"home-{len(data)}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / f"json-preview-{len(data)}",
+        data=data,
+        media_type="application/json",
+    )
+
+    with TestClient(_app(_router())) as client:
+        response = client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+            f"{artifact['publication_id']}/preview"
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["content"] == expected_content
+    assert payload["bytes_returned"] == expected_bytes
+    assert payload["size_bytes"] == len(data)
+    assert payload["truncated"] is truncated
+    assert len(response.content) < 70_000
+
+
+def test_json_artifact_preview_rejects_noncanonical_nonfinite_content(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "home-nonfinite-json"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / "json-preview-nonfinite",
+        data=b'{"value":NaN}',
+        media_type="application/json",
+    )
+
+    with TestClient(
+        _app(_router()),
+        raise_server_exceptions=False,
+    ) as client:
+        response = client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+            f"{artifact['publication_id']}/preview"
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "typed_publication_integrity"
+
+
+@pytest.mark.parametrize(
+    ("publication_id", "expected_code"),
+    [
+        ("f" * 32, "artifact_not_found"),
+        ("..%2Fmetadata.json", None),
+    ],
+)
+def test_artifact_endpoints_reject_unknown_and_path_like_ids(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    publication_id,
+    expected_code,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _store, admitted, _artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / f"unknown-id-{publication_id[0]}",
+        data=b"body",
+        media_type="text/markdown; charset=utf-8",
+    )
+
+    with TestClient(_app(_router())) as client:
+        response = client.get(
+            f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+            f"{publication_id}/preview"
+        )
+
+    assert response.status_code == 404
+    if expected_code is not None:
+        assert response.json()["detail"]["code"] == expected_code
+
+
+def test_artifact_lookup_enforces_operator_scope_and_profile(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "owner-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    owner_scope = "service:test:owner"
+    _store, admitted, artifact = _published_run(
+        home,
+        workflow_writer,
+        tmp_path / "owned-artifact",
+        data=b"owned",
+        media_type="text/markdown; charset=utf-8",
+        scope=owner_scope,
+    )
+    reader = TokenPrincipal(
+        principal="other",
+        provider="test",
+        scopes=("workflow:read",),
+    )
+    path = (
+        f"/api/plugins/workflow/runs/{admitted.run_id}/artifacts/"
+        f"{artifact['publication_id']}/preview"
+    )
+
+    with TestClient(_app(_router(), token=reader)) as client:
+        wrong_scope = client.get(path)
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other-home"))
+    with TestClient(_app(_router())) as client:
+        wrong_profile = client.get(path)
+
+    assert wrong_scope.status_code == 404
+    assert wrong_scope.json()["detail"]["code"] == "run_not_found"
+    assert wrong_profile.status_code == 404
+    assert wrong_profile.json()["detail"]["code"] == "run_not_found"
 
 
 @pytest.mark.parametrize(

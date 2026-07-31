@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Iterator, Literal, Mapping
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -35,7 +36,13 @@ from plugins.workflow.compat import (
     WORKFLOW_COMPATIBILITY_PAYLOAD_MAX_BYTES,
     derive_compatibility_report_state,
 )
-from plugins.workflow.evidence import EVIDENCE_KINDS, EvidenceReader
+from plugins.workflow.evidence import (
+    EVIDENCE_KINDS,
+    EvidenceReader,
+    PublicationIntegrityError,
+    PublicationNotFoundError,
+    VerifiedPublication,
+)
 from plugins.workflow.language import WorkflowLanguageCompatibilityError
 from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.runtime import (
@@ -44,7 +51,11 @@ from plugins.workflow.runtime import (
     WorkflowApiRuntime,
     WorkflowRetentionPolicy,
 )
-from plugins.workflow.sanitize import public_run_projection, sanitize_projection
+from plugins.workflow.sanitize import (
+    public_run_projection,
+    sanitize_evidence_bytes,
+    sanitize_projection,
+)
 from plugins.workflow.store import JournalRecoveryError, RunStore
 
 
@@ -52,11 +63,16 @@ _CURSOR_SECRET = secrets.token_bytes(32)
 _RUNTIME: WorkflowApiRuntime | None = None
 _RUNTIME_LOCK = threading.Lock()
 _WORKFLOW_RESPONSE_TEXT_MAX = 16_384
+_ARTIFACT_PREVIEW_BYTES_MAX = 64 * 1024
 WORKFLOW_COMPATIBILITY_UNKNOWN_PATH = "<unknown-path>"
 _WORKFLOW_COMPATIBILITY_SENTINEL_MESSAGE = re.compile(
     r"^Compatibility findings truncated: ([1-9][0-9]{0,8}) omitted; "
     r"aggregate level (portable|mapped|unsupported)$"
 )
+
+
+def _reject_nonfinite_json(value: str):
+    raise ValueError(f"non-finite JSON constant: {value}")
 
 
 def _runtime() -> WorkflowApiRuntime:
@@ -273,7 +289,7 @@ class WorkflowDetailLanguageStatus(BaseModel):
     declared_profile: WorkflowLanguageProfile | None
     effective_profile: WorkflowLanguageProfile
     legacy: StrictBool
-    normalizer_version: StrictInt = Field(..., ge=1, le=1)
+    normalizer_version: StrictInt = Field(..., ge=1, le=2)
     normalized_definition_digest: str = Field(
         ..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )
@@ -1628,6 +1644,128 @@ def evidence(
             limit=limit,
             operator_scope=None if operator.unrestricted else operator.scope,
         )
+
+
+def _verified_publication(
+    store: RunStore,
+    run_id: str,
+    publication_id: str,
+    operator: WorkflowAuthority,
+) -> VerifiedPublication:
+    try:
+        return EvidenceReader(store).lookup_publication(
+            run_id,
+            publication_id,
+            operator_scope=None if operator.unrestricted else operator.scope,
+        )
+    except PublicationNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "artifact_not_found"},
+        ) from exc
+    except (PublicationIntegrityError, JournalRecoveryError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "typed_publication_integrity"},
+        ) from exc
+    except (KeyError, OSError) as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "run_not_found"},
+        ) from exc
+
+
+def _artifact_preview_payload(
+    publication: VerifiedPublication,
+) -> dict[str, object]:
+    if publication.media_type == "application/json":
+        if publication.size_bytes > _ARTIFACT_PREVIEW_BYTES_MAX:
+            content: object = None
+            bytes_returned = 0
+            truncated = True
+        else:
+            try:
+                content = json.loads(
+                    publication.content.decode("utf-8"),
+                    parse_constant=_reject_nonfinite_json,
+                )
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise PublicationIntegrityError(
+                    "canonical JSON publication is invalid"
+                ) from exc
+            bytes_returned = publication.size_bytes
+            truncated = False
+    else:
+        preview_bytes = publication.content[:_ARTIFACT_PREVIEW_BYTES_MAX]
+        content, sanitized_truncated = sanitize_evidence_bytes(
+            preview_bytes,
+            max_chars=_ARTIFACT_PREVIEW_BYTES_MAX,
+        )
+        bytes_returned = len(preview_bytes)
+        truncated = (
+            sanitized_truncated
+            or publication.size_bytes > bytes_returned
+        )
+    return {
+        "publication_id": publication.publication_id,
+        "media_type": publication.media_type,
+        "content": content,
+        "bytes_returned": bytes_returned,
+        "size_bytes": publication.size_bytes,
+        "truncated": truncated,
+    }
+
+
+@router.get("/runs/{run_id}/artifacts/{publication_id}/preview")
+def artifact_preview(
+    request: Request,
+    run_id: str,
+    publication_id: str,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request, operator_scope)
+    operator.require("read")
+    with _store_lease() as store:
+        publication = _verified_publication(
+            store,
+            run_id,
+            publication_id,
+            operator,
+        )
+        try:
+            return _artifact_preview_payload(publication)
+        except PublicationIntegrityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "typed_publication_integrity"},
+            ) from exc
+
+
+@router.get("/runs/{run_id}/artifacts/{publication_id}/download")
+def artifact_download(
+    request: Request,
+    run_id: str,
+    publication_id: str,
+    operator_scope: str | None = Header(None, alias="X-Hermes-Operator-Scope"),
+):
+    operator = _verified_operator(request, operator_scope)
+    operator.require("read")
+    with _store_lease() as store:
+        publication = _verified_publication(
+            store,
+            run_id,
+            publication_id,
+            operator,
+        )
+    filename = f"{publication.publication_id}-{publication.content_name}"
+    return StreamingResponse(
+        iter((publication.content,)),
+        media_type=publication.media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(publication.size_bytes),
+        },
+    )
 
 
 class ActionRequest(BaseModel):
