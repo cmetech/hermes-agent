@@ -223,21 +223,22 @@ result. Use an explicit declaration only for one of these contracts:
 | `native_json_mode` | The direct transport guarantees JSON syntax; Hermes still validates the portable schema. |
 | `unsupported` | The runtime cannot safely constrain and validate output; do not use prompt adaptation. |
 
-For a route the central runtime already classifies as trusted direct, declare
-the strategy after the transport test proves the contract:
+The profile field is only one half of native enablement. A new bundled,
+first-party direct route also needs a reviewed change to Hermes' central runtime
+trust classifier. That change must identify the exact provider, authentication
+authority, and official host without trusting hostname lookalikes, custom URLs,
+or aliases. Transport tests must prove the declared wire contract, and runtime
+tests must prove the intended route becomes `trusted_direct` while custom,
+aggregator, subscription/OAuth, and drifted variants do not. Only after both
+pieces are reviewed should that first-party profile set
+`structured_output_strategy="native_json_schema"` or
+`"native_json_mode"`.
 
-```python
-direct_profile = ProviderProfile(
-    name="direct-provider",
-    base_url="https://api.example.com/v1",
-    structured_output_strategy="native_json_schema",
-)
-```
-
-Do not copy this declaration into an untested provider merely because its API
-is OpenAI-compatible. The declaration does not itself make a new or custom URL
-a trusted-direct route; absent that independent runtime classification, Hermes
-uses prompt adaptation.
+A community or custom provider cannot establish `trusted_direct` status through
+`ProviderProfile`, model metadata, or URL shape. Leave the strategy unset to use
+bounded prompt adaptation inside Hermes' managed loop, or declare `unsupported`
+when adaptation is unsafe. Do not copy a native declaration merely because an
+API is OpenAI-compatible.
 
 Native declarations are honored only on a trusted direct provider route.
 Custom base URLs and aggregator routes fall back to prompt adaptation even if
@@ -253,12 +254,13 @@ credential, provider, URL, and API mode again. A mismatch that cannot honor the
 sealed strategy fails with `structured_output_capability_drift`; it never
 silently downgrades from native enforcement to prompt adaptation.
 
-For a native declaration, add tests that exercise the real adapter boundary
-and assert the exact schema field sent on the wire. Also cover custom and
-aggregator URLs, an undeclared managed-loop route, explicit unsupported mode,
-and admission/runtime drift before any provider call. Native responses still
-undergo local parse, schema validation, and canonicalization, so transport
-grammar is not a substitute for the optional validator.
+For a first-party native declaration, add tests that exercise the real adapter
+boundary and assert the exact schema field sent on the wire. Also cover the
+central trust classification, custom and aggregator URLs, an undeclared
+managed-loop route, explicit unsupported mode, and admission/runtime drift
+before any provider call. Native responses still undergo local parse, schema
+validation, and canonicalization, so transport grammar is not a substitute for
+the optional validator.
 
 ## User overrides — replace a built-in without editing the repo
 
